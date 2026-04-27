@@ -1,0 +1,35 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Git\CodeyBox.Git.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Agents\CodeyBox.Agents.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Process\CodeyBox.Sandbox.Process.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Upstream\CodeyBox.Upstream.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Upstream.GitHub\CodeyBox.Upstream.GitHub.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Audit\CodeyBox.Audit.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Audit.Llm\CodeyBox.Audit.Llm.csproj" />
+  </ItemGroup>
+
+</Project>

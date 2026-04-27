@@ -1,0 +1,11 @@
+bin/
+obj/
+*.user
+.vs/
+.vscode/
+.idea/
+
+# Local state
+*.db
+*.db-journal
+/local-state/

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
+    <ProjectReference Include="..\CodeyBox.Sandbox.Process\CodeyBox.Sandbox.Process.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Copilot\CodeyBox.Agents.Copilot.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Codex\CodeyBox.Agents.Codex.csproj" />
+    <ProjectReference Include="..\CodeyBox.Upstream.GitHub\CodeyBox.Upstream.GitHub.csproj" />
+    <ProjectReference Include="..\CodeyBox.Git\CodeyBox.Git.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
