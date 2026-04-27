@@ -13,6 +13,7 @@ using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.CrunVm;
 using CodeyBox.Sandbox.GVisor;
 using CodeyBox.Sandbox.Kata;
+using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.Process;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -41,6 +42,9 @@ ApiKeyAuth.Configure(builder);
 //                 Development env unless DangerouslyAllowProcessSandbox=true.
 //   bubblewrap  — Namespace + seccomp isolation, no daemon. Single package
 //                 install. Shares the host kernel.
+//   multipass   — Real Ubuntu VMs via Canonical's snap. Separate guest
+//                 kernel. Single 'snap install multipass' on Ubuntu, no
+//                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
 //   gvisor      — User-space kernel (runsc). Single package + one line in
 //                 ~/.config/containers/containers.conf. Real syscall isolation.
 //   kata        — Microvm with separate guest kernel. Defaults to QEMU
@@ -71,7 +75,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         {
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
-                "Choose one of: bubblewrap, gvisor, kata, crun-vm, process " +
+                "Choose one of: bubblewrap, multipass, gvisor, kata, crun-vm, process " +
                 "(see docs/sandbox-providers.md for trade-offs).");
         }
     }
@@ -82,6 +86,9 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         "bubblewrap" => new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions(),
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>()),
+        "multipass" => new MultipassSandboxProvider(
+            new MultipassSandboxOptions { ExtraCloudInit = opts.MultipassExtraCloudInit },
+            loggerFactory.CreateLogger<MultipassSandboxProvider>()),
         "gvisor" => new GVisorSandboxProvider(
             new GVisorSandboxOptions { NetworkName = opts.SandboxNetworkName },
             loggerFactory.CreateLogger<GVisorSandboxProvider>()),
@@ -92,7 +99,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             new CrunVmSandboxOptions { NetworkName = opts.SandboxNetworkName },
             loggerFactory.CreateLogger<CrunVmSandboxProvider>()),
         _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: bubblewrap, gvisor, kata, crun-vm, process"),
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: bubblewrap, multipass, gvisor, kata, crun-vm, process"),
     };
 }
 
@@ -213,5 +220,13 @@ namespace CodeyBox.Api
         /// Don't.
         /// </summary>
         public bool DangerouslyAllowProcessSandbox { get; set; }
+
+        /// <summary>
+        /// Extra cloud-init YAML appended to the auto-generated network policy
+        /// when SandboxProvider=multipass. Use to install agent CLIs in the
+        /// VM at first boot (e.g. apt-installing nodejs and npm-installing
+        /// the agent CLI).
+        /// </summary>
+        public string? MultipassExtraCloudInit { get; set; }
     }
 }

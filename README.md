@@ -47,6 +47,7 @@ Five sandbox providers — pick by `CodeyBox.SandboxProvider`:
 |-------------------|-----------------------------------------|---------------------------------|
 | `process`         | None                                    | UNSAFE; dev only                |
 | `bubblewrap`      | `apt install bubblewrap`                | **Working, integration-tested** |
+| `multipass`       | `snap install multipass`                | **Working, integration-tested (kernel isolation)** |
 | `gvisor`          | install runsc + 1 line user config      | Code-reviewed                   |
 | `kata` (QEMU)     | install kata + `usermod -aG kvm`        | Code-reviewed                   |
 | `kata` (Firecracker) | as above + edit `/etc/kata-containers/configuration.toml` | Code-reviewed |
