@@ -1,25 +1,26 @@
 # Sandbox providers
 
-CodeyBox ships five providers. Pick one with `CodeyBox.SandboxProvider` in
+CodeyBox ships six providers. Pick one with `CodeyBox.SandboxProvider` in
 `appsettings.json` (or `CodeyBox__SandboxProvider` env). Setup difficulty
 ranges from "single package" to "needs a Linux config session" — pick the
 one whose security/operational trade-off matches your deployment.
 
 ## Comparison
 
-| Provider          | Isolation                               | Setup                                                                     | Status      |
-|-------------------|-----------------------------------------|---------------------------------------------------------------------------|-------------|
-| `process`         | None (UNSAFE)                           | nothing                                                                   | Working     |
-| `bubblewrap`      | Linux namespaces + seccomp; shared kernel | `apt install bubblewrap` — no daemon, no /etc edits                     | **Working, integration-tested** |
-| `gvisor`          | User-space kernel (syscall interception)| install runsc + one line in `~/.config/containers/containers.conf`        | Code-reviewed |
-| `kata` (default QEMU) | Microvm with separate guest kernel      | install kata + add user to kvm group + lines in user containers.conf      | Code-reviewed |
-| `kata` (Firecracker)  | Microvm with separate guest kernel      | as above + edit `/etc/kata-containers/configuration.toml` (root config)   | Code-reviewed |
-| `crun-vm`         | Microvm via libkrun                     | install crun-vm + register OCI runtime                                    | Code-reviewed |
+| Provider              | Isolation                                    | Setup                                                                     | Status      |
+|-----------------------|----------------------------------------------|---------------------------------------------------------------------------|-------------|
+| `process`             | None (UNSAFE)                                | nothing                                                                   | Working     |
+| `bubblewrap`          | Linux namespaces + seccomp; shared kernel    | `apt install bubblewrap` — no daemon, no /etc edits                       | **Working, integration-tested** |
+| **`multipass`**       | **Real Ubuntu VM (separate guest kernel)**   | **`snap install multipass` — single command, no /etc edits**              | **Working, integration-tested** |
+| `gvisor`              | User-space kernel (syscall interception)     | install runsc + one line in `~/.config/containers/containers.conf`        | Code-reviewed |
+| `kata` (default QEMU) | Microvm with separate guest kernel           | install kata + add user to kvm group + lines in user containers.conf      | Code-reviewed |
+| `kata` (Firecracker)  | Microvm with separate guest kernel           | as above + edit `/etc/kata-containers/configuration.toml` (root config)   | Code-reviewed |
+| `crun-vm`             | Microvm via libkrun                          | install crun-vm + register OCI runtime                                    | Code-reviewed |
 
-The *Working / Code-reviewed* status is honest: only the Process and
-Bubblewrap providers have been runtime-tested on the dev host. The others
-are written against well-documented OCI / podman interfaces but need
-runtime validation on a properly-configured host.
+The *Working / Code-reviewed* status is honest: only the Process,
+Bubblewrap, and Multipass providers have been runtime-tested on the dev
+host. The others are written against well-documented OCI / podman
+interfaces but need runtime validation on a properly-configured host.
 
 ## `process` (dev only — refuses to load in production)
 
@@ -67,7 +68,70 @@ Then in `appsettings.json`:
 ```
 That's it. No daemon to start, no config to edit.
 
-## `gvisor` — recommended for production with minimal config
+## `multipass` — recommended for kernel isolation with zero config
+
+Real Ubuntu VMs via Canonical's snap. Each sandbox is a microVM with its
+own guest kernel — a kernel exploit in the agent escapes into a VM that
+gets purged when the sandbox is disposed, never reaching the host.
+
+**Setup (one command on Ubuntu):**
+```bash
+sudo snap install multipass
+```
+That's it. No daemon configuration, no /etc edits, no podman, no KVM
+group dance (multipass handles its own KVM access). Confirm with
+`multipass version`.
+
+**In `appsettings.json`:**
+```json
+{ "CodeyBox": { "SandboxProvider": "multipass" } }
+```
+
+**Trade-offs:**
+
+* **Slow.** VM launch is ~30-45 seconds. A work item with audit phases
+  spawns multiple VMs in sequence; expect ~1-2 minutes of pure VM-launch
+  overhead per work item.
+* **Snap-confined.** Multipass-as-snap can read paths under
+  `~/snap/multipass/common/` only. CodeyBox auto-stages cloud-init and
+  bind-mount sources there. **Important**: set
+  `CodeyBox.GitRootDirectory` to a path under `~/snap/multipass/common/`
+  too (e.g. `~/snap/multipass/common/codeybox-repos`), otherwise the
+  per-work-item bare repo can't be bind-mounted into the VM.
+* **Egress allowlist via in-VM systemd firewall.** A `codeybox-firewall`
+  systemd service applies on every VM boot, dropping all OUTPUT except
+  loopback, DNS, established/related, and IPs resolved from
+  `AgentAllowedHosts` at sandbox-creation time. Persists across the
+  stop/start cycle that native mounts require.
+* **Image bring-up.** First launch downloads the default Ubuntu image
+  (~600 MB) to the multipass cache. Subsequent launches reuse it.
+
+**Integration-tested**: end-to-end on a real Ubuntu 25.10 host. Two
+shipped tests verify VM launch, native bind-mount visibility, env-from-
+file (with explicit no-argv-leak verification via in-VM `ps` grep),
+stdin piping, working-directory enforcement, and the firewall actually
+blocking outbound traffic when `AllowedHosts` is empty.
+
+**Putting agents in the VM.** The default Ubuntu image doesn't include
+Claude Code, Codex, etc. Two options:
+
+1. **Cloud-init at first boot** — set `CodeyBox.MultipassExtraCloudInit`
+   to install agents:
+   ```yaml
+   packages:
+     - nodejs
+     - npm
+   runcmd:
+     - npm install -g @anthropic-ai/claude-code
+   ```
+   Note: extra-cloud-init runs after the egress firewall is enabled, so
+   package downloads need their destinations on the AllowedHosts list.
+2. **Custom multipass image** — build a base image with agents
+   pre-installed (`multipass launch` + customise + snapshot), then
+   reference via `SandboxSpec.ImageReference`. Faster startup, no
+   firewall race.
+
+## `gvisor` — alternative for production with minimal config
 
 Runs containers under `runsc`, gVisor's user-space kernel that intercepts
 syscalls instead of forwarding them to the host kernel. A kernel exploit
@@ -166,14 +230,15 @@ EOF
 
 ## Choosing
 
-| Use case                                            | Pick           |
-|-----------------------------------------------------|----------------|
-| Local development of the orchestrator itself        | `process`      |
-| Pre-prod / trusted prompts / "just give me a sandbox" | `bubblewrap` |
-| Production / untrusted prompts / minimal config     | `gvisor`       |
-| Production / strongest isolation / OK with `usermod` | `kata` (QEMU) |
-| Production / fastest VMs / OK with /etc edit        | `kata` (Firecracker) |
-| You already run libkrun                             | `crun-vm`      |
+| Use case                                                    | Pick                  |
+|-------------------------------------------------------------|-----------------------|
+| Local development of the orchestrator itself                | `process`             |
+| Pre-prod / trusted prompts / "just give me a sandbox"       | `bubblewrap`          |
+| **Production on Ubuntu / kernel isolation / zero config**   | **`multipass`**       |
+| Production / fast container-style start / minimal config    | `gvisor`              |
+| Production / strongest isolation / OK with `usermod`        | `kata` (QEMU)         |
+| Production / fastest VMs / OK with /etc edit                | `kata` (Firecracker)  |
+| You already run libkrun                                     | `crun-vm`             |
 
 ## Adding a new provider
 
