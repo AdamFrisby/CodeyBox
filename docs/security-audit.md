@@ -26,6 +26,45 @@ Each finding lists:
 
 ## Findings
 
+### U — Merge sandbox now carries agent credentials  &nbsp; *MEDIUM, ACCEPTED*
+
+**Where:** `src/CodeyBox.Orchestrator/PipelineRunner.cs::RunAgentMergePhaseAsync`
+
+The original merge phase ran `git merge --no-ff` in a sandbox with NO
+agent credentials — even if the work-phase agent committed exfiltration
+code, that code couldn't reach an LLM API in the merge sandbox.
+
+The merge phase now invokes the work-item's agent (Claude/Codex/etc.) so
+non-trivial conflicts can be resolved instead of failing the merge. This
+is a deliberate trade-off: better robustness (real merges happen), at
+the cost of a wider attack surface — file content committed by the work
+agent is read by the merge agent, so prompt-injection in committed files
+could in theory hijack the merge agent and call the LLM API with the
+agent's credential.
+
+**Mitigations:**
+
+1. **Network policy is unchanged.** The merge sandbox can reach only the
+   agent's API endpoint (e.g. `api.anthropic.com`) and the host git
+   endpoint — not arbitrary `attacker.com`. Any LLM API call from a
+   prompt-injected merge agent goes to the legitimate provider; it
+   cannot exfiltrate elsewhere via plain HTTP.
+2. **Orchestrator verifies the merge** (see `VerifyMergeStateAsync`)
+   before pushing: clean working tree, HEAD on `baseBranch`, work branch
+   reachable from HEAD, HEAD advanced past pre-merge SHA. The agent
+   cannot push a no-op or sneak onto a different branch.
+3. **The merge sandbox is fresh per work item.** Nothing carries over
+   from the work sandbox.
+
+**Why accepted:** the user explicitly chose this trade-off — without LLM
+involvement, real merge conflicts always fail the work item, which
+defeats the purpose of an agent-driven pipeline. The mitigations bound
+the blast radius to "exfiltration via the agent's own LLM API" which is
+already the work-phase risk.
+
+**Test:** `PipelineIntegrationTests.MergeAgentDoesNothing_PipelineFailsVerification`
+asserts the verifier rejects a no-op merge agent.
+
 ### A — Cross-work-item bare-repo exposure  &nbsp; *MEDIUM, FIXED*
 
 **Where:** `src/CodeyBox.Git/LocalGitHost.cs::GetSandboxAccess`

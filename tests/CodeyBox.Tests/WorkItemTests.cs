@@ -7,9 +7,9 @@ public sealed class WorkItemTests
     private static WorkItem Sample() => new()
     {
         Id = WorkItemId.New(),
+        ProjectId = new ProjectId("test-project"),
         Title = "t",
         Prompt = "p",
-        RepositoryUrl = "https://example.com/x.git",
         Agent = AgentKind.Claude,
     };
 

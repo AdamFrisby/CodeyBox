@@ -1,12 +1,23 @@
 namespace CodeyBox.Core;
 
 /// <summary>
-/// A unit of work to be performed by an agent inside a sandbox. Immutable;
-/// state transitions produce new instances via <see cref="With"/>.
+/// A unit of work to be performed by an agent inside a sandbox. Bound to a
+/// <see cref="Project"/> by <see cref="ProjectId"/>; per-project config
+/// (repository URL, upstream, auditors, default agent, default branch) is
+/// resolved at pipeline time.
+///
+/// Per-item fields (Title, Prompt) describe the task; per-item overrides
+/// (Agent, BaseBranch, WorkBranch, PushUpstream) win over project defaults
+/// when set, otherwise inherit from the project.
+///
+/// Immutable; state transitions produce new instances via <see cref="With"/>.
 /// </summary>
 public sealed record WorkItem
 {
     public required WorkItemId Id { get; init; }
+
+    /// <summary>The project this work item belongs to.</summary>
+    public required ProjectId ProjectId { get; init; }
 
     /// <summary>Human-readable label for logs and the API.</summary>
     public required string Title { get; init; }
@@ -14,25 +25,22 @@ public sealed record WorkItem
     /// <summary>The natural-language task to give to the agent.</summary>
     public required string Prompt { get; init; }
 
-    /// <summary>Origin git URL the work-phase sandbox clones from. Resolved by the host (typically a local bare repo it manages).</summary>
-    public required string RepositoryUrl { get; init; }
-
-    /// <summary>Branch to base the agent's work on. Defaults to the host repo's default branch.</summary>
+    /// <summary>If set, overrides the project's default base branch.</summary>
     public string? BaseBranch { get; init; }
 
     /// <summary>Branch the agent pushes its work to. Generated if null.</summary>
     public string? WorkBranch { get; init; }
 
-    /// <summary>Which agent runner to use.</summary>
-    public required AgentKind Agent { get; init; }
+    /// <summary>If set, overrides the project's default agent.</summary>
+    public AgentKind? Agent { get; init; }
 
     /// <summary>Wall-clock budget for the work phase.</summary>
     public TimeSpan WorkTimeout { get; init; } = TimeSpan.FromMinutes(30);
 
     /// <summary>Wall-clock budget for the merge phase.</summary>
-    public TimeSpan MergeTimeout { get; init; } = TimeSpan.FromMinutes(5);
+    public TimeSpan MergeTimeout { get; init; } = TimeSpan.FromMinutes(15);
 
-    /// <summary>If true and an upstream is configured, push main to it after merge.</summary>
+    /// <summary>If true and the project has an upstream, push to it after merge.</summary>
     public bool PushUpstream { get; init; } = true;
 
     public WorkItemState State { get; init; } = WorkItemState.Queued;

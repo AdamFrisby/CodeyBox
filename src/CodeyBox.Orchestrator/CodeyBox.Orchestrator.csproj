@@ -7,6 +7,7 @@
     <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
     <ProjectReference Include="..\CodeyBox.Upstream\CodeyBox.Upstream.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit\CodeyBox.Audit.csproj" />
+    <ProjectReference Include="..\CodeyBox.Projects\CodeyBox.Projects.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -6,11 +6,13 @@
     <Project Path="src/CodeyBox.Agents/CodeyBox.Agents.csproj" />
     <Project Path="src/CodeyBox.Api/CodeyBox.Api.csproj" />
     <Project Path="src/CodeyBox.Audit.Llm/CodeyBox.Audit.Llm.csproj" />
+    <Project Path="src/CodeyBox.Audit.Presets/CodeyBox.Audit.Presets.csproj" />
     <Project Path="src/CodeyBox.Audit.Shell/CodeyBox.Audit.Shell.csproj" />
     <Project Path="src/CodeyBox.Audit/CodeyBox.Audit.csproj" />
     <Project Path="src/CodeyBox.Core/CodeyBox.Core.csproj" />
     <Project Path="src/CodeyBox.Git/CodeyBox.Git.csproj" />
     <Project Path="src/CodeyBox.Orchestrator/CodeyBox.Orchestrator.csproj" />
+    <Project Path="src/CodeyBox.Projects/CodeyBox.Projects.csproj" />
     <Project Path="src/CodeyBox.Sandbox.CrunVm/CodeyBox.Sandbox.CrunVm.csproj" />
     <Project Path="src/CodeyBox.Sandbox.Kata/CodeyBox.Sandbox.Kata.csproj" />
     <Project Path="src/CodeyBox.Sandbox.Process/CodeyBox.Sandbox.Process.csproj" />

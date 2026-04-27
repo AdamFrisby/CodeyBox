@@ -1,0 +1,216 @@
+# Projects
+
+A CodeyBox orchestrator manages multiple **projects** independently. Each
+project has its own upstream git URL, its own credentials (per-project
+GitHub PAT etc.), its own auditors, and its own defaults. Work items are
+bound to a project via `projectId`; the pipeline resolves the project at
+pickup time and uses its config for every phase.
+
+## Why projects
+
+* **Multi-repo from one orchestrator.** One CodeyBox instance can drive
+  agents against many independent repositories — a website, an internal
+  tool, a CLI — without sharing config or credentials.
+* **Per-project tokens.** Each project's GitHub PAT is read from its own
+  env var. A token leak from one project doesn't expose any other.
+* **Per-project audit policy.** A Python service might require ruff +
+  pyright + bandit + the architecture LLM review. A Rust binary might
+  want clippy + the cheating-detector. Both run side-by-side without
+  config interference.
+
+## Configuration
+
+Project config lives in `appsettings.json` (or any standard config
+provider). Everything sits under the `CodeyBox` section:
+
+```json
+{
+  "CodeyBox": {
+    "Defaults": {
+      "Agent": "claude",
+      "BaseBranch": "main",
+      "Audit": {
+        "MaxIterations": 3,
+        "FailingSeverity": "Error",
+        "AuditTypes": ["security", "architecture"]
+      }
+    },
+    "Projects": [
+      {
+        "Id": "my-app",
+        "DisplayName": "My App",
+        "RepositoryUrl": "https://github.com/me/my-app.git",
+        "BaseBranch": "main",
+        "Agent": "claude",
+        "Upstream": {
+          "Kind": "github",
+          "GitHubOwner": "me",
+          "GitHubRepository": "my-app",
+          "TokenEnvVar": "MY_APP_GITHUB_TOKEN"
+        },
+        "Audit": {
+          "Languages": ["typescript"],
+          "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"]
+        }
+      },
+      {
+        "Id": "internal-py",
+        "RepositoryUrl": "https://github.com/me/internal.git",
+        "Audit": { "Languages": ["python"] }
+      }
+    ]
+  }
+}
+```
+
+### Inheritance from `Defaults`
+
+Anything a project omits comes from `Defaults` (shallow merge):
+
+* `Agent` — default agent for new work items
+* `BaseBranch` — default integration branch
+* `Audit.*` — every field in `ProjectAudit` falls through individually
+
+`Languages` and `AuditTypes` are list-typed and not append-merged: if a
+project sets `AuditTypes`, it replaces the defaults entirely. Choose your
+defaults expecting them to be replaced wholesale by per-project overrides.
+
+### Project ID rules
+
+* ASCII alphanumeric + `-` and `_`
+* 1–64 characters
+* Used in REST URLs and the SQLite `project_id` column
+
+## Audit configuration
+
+```json
+"Audit": {
+  "MaxIterations": 3,
+  "FailingSeverity": "Error",
+  "PerIterationTimeoutMinutes": 10,
+  "StopOnFirstFailure": false,
+  "Languages": ["python", "typescript"],
+  "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"],
+  "Custom": [
+    { "Kind": "shell", "Name": "tests", "Argv": ["npm", "test"] },
+    { "Kind": "diff-pattern", "Name": "no-console-log", "Patterns": [
+      { "Description": "console.log added", "Regex": "console\\.log\\(" }
+    ] },
+    { "Kind": "llm", "Name": "ux-review",
+      "ReviewFocus": "- Confusing user-facing strings\n- Inaccessible UI patterns" }
+  ]
+}
+```
+
+The orchestrator's effective auditor list for each project is:
+
+```
+Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
+```
+
+### Languages (built-in presets)
+
+| Preset       | Tools                                                              |
+|--------------|--------------------------------------------------------------------|
+| `python`     | `ruff check`, `ruff format --check`, `pyright`, `bandit`           |
+| `typescript` | `npx eslint`, `npx tsc --noEmit`, `npx prettier --check`           |
+| `javascript` | `npx eslint`, `npx prettier --check`                               |
+| `go`         | `golangci-lint run`, `go vet`                                      |
+| `rust`       | `cargo clippy --all-targets -- -D warnings`, `cargo fmt -- --check`|
+| `csharp`     | `dotnet format --verify-no-changes`, `dotnet build /warnaserror`   |
+| `ruby`       | `rubocop`, `brakeman`                                              |
+| `shell`      | `shellcheck` over tracked `*.sh` files                             |
+
+All language presets are tool-only (no agent credentials). A buggy linter
+cannot exfiltrate the agent's API key — the audit phase runs them in a
+credential-free sandbox.
+
+### Audit types (built-in presets)
+
+| Preset         | Capability      | What it does                                                                                                                  |
+|----------------|-----------------|-------------------------------------------------------------------------------------------------------------------------------|
+| `security`     | tool + LLM      | gitleaks (secrets), semgrep auto (SAST), and a comprehensive LLM review aligned to OWASP ASVS 5.0 + Top 10 + CWE Top 25 + LLM-specific issues. Categories include: injection, output encoding/XSS, validation/business logic, API/web service, file handling (path traversal, deserialisation, XXE), authentication, sessions/JWT, authorization (IDOR, mass assignment), OAuth/OIDC, cryptography, secure communication, configuration, data protection (hardcoded secrets, PII), SSRF, resource exhaustion/DoS, logging/error handling, memory safety in unsafe code, race conditions, dependencies, prompt injection / LLM-tool-abuse, and business-logic flaws. |
+| `architecture` | LLM             | Loose-coupling, leaking internals, layering violations                                                                        |
+| `quality`      | LLM             | Dead code, magic numbers, naming, error handling                                                                              |
+| `completeness` | LLM             | TODO markers, missing tests, half-finished implementations                                                                    |
+| `cheating`     | tool + LLM      | Suppression markers (`@ts-ignore`, `# noqa`, `#pragma warning disable`, …) and LLM review for shortcuts/stubbed implementations |
+| `tests`        | tool + LLM      | Deterministic patterns for no-op assertions (`Assert.True(true)`, `expect(x).toBe(x)`, `assert 1 == 1`, etc.) plus an LLM "are these tests meaningful?" reviewer. Catches implementation-mirroring tests (where `test_add` asserts `add(1,2) == 1+2`), pure-mock tests that only verify mock setup, missing tests for new code paths, missing failure-path coverage, and skipped/removed tests without replacement. |
+
+The `cheating` preset is specifically for catching agent shortcuts: an
+LLM that's struggling sometimes disables warnings, stubs functions with
+`NotImplementedException`, catches exceptions too broadly, or skips
+failing tests. The deterministic diff-pattern auditor catches the most
+common suppression markers; the LLM reviewer catches subtler shortcuts
+by comparing the diff against the original task.
+
+### Custom auditors
+
+Three kinds, all configured in JSON:
+
+| Kind           | Required fields           | Notes                                  |
+|----------------|---------------------------|----------------------------------------|
+| `shell`        | `Name`, `Argv`            | Exit 0 = pass; non-zero = Error finding|
+| `diff-pattern` | `Name`, `Patterns[]`      | Regex against added lines in diff      |
+| `llm`          | `Name`, `ReviewFocus`     | LLM review with the project's agent    |
+
+## Per-project upstream
+
+Each project specifies its own upstream:
+
+```json
+"Upstream": {
+  "Kind": "github",                        // "noop" | "git-generic" | "github"
+  "GitHubOwner": "me",
+  "GitHubRepository": "my-app",
+  "TokenEnvVar": "MY_APP_GITHUB_TOKEN"     // env var holding the PAT
+}
+```
+
+The `TokenEnvVar` indirection is deliberate: tokens never appear in
+config files. Each project reads its token fresh from the env every push.
+Rotating a token is `unset / set` of the env var before the next work
+item; in-flight pushes keep their pre-rotation value.
+
+For `git-generic`, set `GenericUrl` and rely on the host git config
+(askpass, SSH agent) for auth. For `noop`, no upstream push happens and
+the host bare repo is the source of truth.
+
+## REST API
+
+```
+GET  /projects             — list all configured projects
+GET  /projects/{id}        — single project
+POST /workitems            — body now requires "projectId" instead of "repositoryUrl"
+```
+
+`POST /workitems`:
+
+```json
+{
+  "projectId": "my-app",
+  "title": "Add JSON config support",
+  "prompt": "Add a --config flag that reads settings from a JSON file.",
+  "agent": null,           // optional — overrides project default
+  "baseBranch": null,      // optional — overrides project default
+  "workBranch": null,      // optional — defaults to "codeybox/<short id>"
+  "pushUpstream": true     // optional — gates phase 4 push
+}
+```
+
+## Plugging in a different project source
+
+`IProjectRepository` is the single read surface. The default impl is
+config-backed and immutable after startup. To support runtime
+CRUD (e.g. to manage projects via a UI), implement `IProjectRepository`
+on top of SQLite/Postgres and register it in DI. Nothing else changes;
+the orchestrator only reads through the interface.
+
+## Adding a language or audit-type preset
+
+1. New project (or new file in `CodeyBox.Audit.Presets`) registering with
+   `PresetCatalog.RegisterLanguage` or `RegisterAuditType`.
+2. Return your bundle of `IAuditor`s with truthful capability flags.
+3. Document the new preset in this file.
+
+For one-off auditors that don't need a preset (project-specific build
+checks, etc.), use a `Custom` entry in the project config — no code change.

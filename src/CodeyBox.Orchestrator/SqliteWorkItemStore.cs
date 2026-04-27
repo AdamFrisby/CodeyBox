@@ -26,12 +26,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS work_items (
                 id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
                 title TEXT NOT NULL,
                 prompt TEXT NOT NULL,
-                repository_url TEXT NOT NULL,
                 base_branch TEXT,
                 work_branch TEXT,
-                agent TEXT NOT NULL,
+                agent TEXT,
                 work_timeout_ticks INTEGER NOT NULL,
                 merge_timeout_ticks INTEGER NOT NULL,
                 push_upstream INTEGER NOT NULL,
@@ -42,6 +42,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 upstream_push_attempts INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_work_items_state ON work_items(state);
+            CREATE INDEX IF NOT EXISTS idx_work_items_project ON work_items(project_id);
             """;
         cmd.ExecuteNonQuery();
     }
@@ -53,10 +54,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO work_items (id, title, prompt, repository_url, base_branch, work_branch, agent,
+                INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts)
-                VALUES ($id, $title, $prompt, $repo, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att);
+                VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -75,7 +76,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
                 UPDATE work_items SET
-                    title = $title, prompt = $prompt, repository_url = $repo,
+                    project_id = $project_id, title = $title, prompt = $prompt,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
@@ -128,12 +129,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
     private static void Bind(SqliteCommand cmd, WorkItem item)
     {
         cmd.Parameters.AddWithValue("$id", item.Id.ToString());
+        cmd.Parameters.AddWithValue("$project_id", item.ProjectId.Value);
         cmd.Parameters.AddWithValue("$title", item.Title);
         cmd.Parameters.AddWithValue("$prompt", item.Prompt);
-        cmd.Parameters.AddWithValue("$repo", item.RepositoryUrl);
         cmd.Parameters.AddWithValue("$base", (object?)item.BaseBranch ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$work", (object?)item.WorkBranch ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$agent", item.Agent.Value);
+        cmd.Parameters.AddWithValue("$agent", (object?)item.Agent?.Value ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$wt", item.WorkTimeout.Ticks);
         cmd.Parameters.AddWithValue("$mt", item.MergeTimeout.Ticks);
         cmd.Parameters.AddWithValue("$pu", item.PushUpstream ? 1 : 0);
@@ -147,12 +148,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
     private static WorkItem Read(SqliteDataReader r) => new()
     {
         Id = WorkItemId.Parse(r.GetString(r.GetOrdinal("id"))),
+        ProjectId = new ProjectId(r.GetString(r.GetOrdinal("project_id"))),
         Title = r.GetString(r.GetOrdinal("title")),
         Prompt = r.GetString(r.GetOrdinal("prompt")),
-        RepositoryUrl = r.GetString(r.GetOrdinal("repository_url")),
         BaseBranch = r.IsDBNull(r.GetOrdinal("base_branch")) ? null : r.GetString(r.GetOrdinal("base_branch")),
         WorkBranch = r.IsDBNull(r.GetOrdinal("work_branch")) ? null : r.GetString(r.GetOrdinal("work_branch")),
-        Agent = new AgentKind(r.GetString(r.GetOrdinal("agent"))),
+        Agent = r.IsDBNull(r.GetOrdinal("agent")) ? null : new AgentKind(r.GetString(r.GetOrdinal("agent"))),
         WorkTimeout = new TimeSpan(r.GetInt64(r.GetOrdinal("work_timeout_ticks"))),
         MergeTimeout = new TimeSpan(r.GetInt64(r.GetOrdinal("merge_timeout_ticks"))),
         PushUpstream = r.GetInt32(r.GetOrdinal("push_upstream")) != 0,

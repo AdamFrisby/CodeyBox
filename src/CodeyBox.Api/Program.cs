@@ -4,13 +4,12 @@ using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Api;
-using CodeyBox.Audit;
+using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
 using CodeyBox.Sandbox.Process;
-using CodeyBox.Upstream;
-using CodeyBox.Upstream.GitHub;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -26,6 +25,7 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 }
 
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
+builder.Services.Configure<ProjectsOptions>(builder.Configuration.GetSection("CodeyBox"));
 
 ApiKeyAuth.Configure(builder);
 
@@ -54,6 +54,9 @@ builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 
 // --- Credentials -------------------------------------------------------------
+// Each agent's API key has a per-agent host env var that maps to the
+// canonical sandbox env var the agent CLI reads. Operators add new agents
+// by appending to this list (or registering a different ICredentialProvider).
 builder.Services.AddSingleton<ICredentialProvider>(_ => new EnvironmentCredentialProvider(new[]
 {
     new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CLAUDE_API_KEY", "ANTHROPIC_API_KEY"),
@@ -61,30 +64,11 @@ builder.Services.AddSingleton<ICredentialProvider>(_ => new EnvironmentCredentia
     new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
 }));
 
-// --- Upstream remote ---------------------------------------------------------
-builder.Services.AddSingleton<IUpstreamRemote>(sp =>
-{
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return opts.Upstream.Kind switch
-    {
-        "github" => new GitHubUpstreamRemote(
-            sp.GetRequiredService<IGitHost>(),
-            new GitHubUpstreamOptions
-            {
-                Owner = opts.Upstream.GitHubOwner ?? throw new InvalidOperationException("Upstream:GitHubOwner required"),
-                Repository = opts.Upstream.GitHubRepository ?? throw new InvalidOperationException("Upstream:GitHubRepository required"),
-                Token = Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_TOKEN")
-                    ?? throw new InvalidOperationException("CODEYBOX_GITHUB_TOKEN required when using github upstream"),
-            }),
-        "git-generic" => new GitGenericUpstreamRemote(
-            sp.GetRequiredService<IGitHost>(),
-            new GitGenericUpstreamOptions
-            {
-                UpstreamUrl = opts.Upstream.GenericUrl ?? throw new InvalidOperationException("Upstream:GenericUrl required"),
-            }),
-        _ => new NoopUpstreamRemote(),
-    };
-});
+// --- Projects + per-project upstream + audit composer ------------------------
+builder.Services.AddSingleton<IProjectRepository, ProjectRepository>();
+builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
+builder.Services.AddSingleton<IPresetCatalog, PresetCatalog>();
+builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Persistence + queue + pipeline + worker pool ----------------------------
 builder.Services.AddSingleton<IWorkItemStore>(sp =>
@@ -104,21 +88,6 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         AgentAllowedHosts = opts.AgentAllowedHosts,
         UpstreamPushMaxAttempts = opts.UpstreamPushMaxAttempts,
         UpstreamPushBackoff = TimeSpan.FromSeconds(opts.UpstreamPushBackoffSeconds),
-    };
-});
-// Auditors: register IAuditor instances here (or in a separate composition
-// module). The default deployment ships with no auditors — the audit phase
-// is a no-op until at least one is registered.
-builder.Services.AddSingleton<IAuditorRegistry, AuditorRegistry>();
-builder.Services.AddSingleton(sp =>
-{
-    var section = builder.Configuration.GetSection("CodeyBox:Audit");
-    return new AuditOptions
-    {
-        MaxIterations = section.GetValue("MaxIterations", 3),
-        FailingSeverity = Enum.TryParse<AuditSeverity>(section["FailingSeverity"], out var s) ? s : AuditSeverity.Error,
-        StopOnFirstFailure = section.GetValue("StopOnFirstFailure", false),
-        PerIterationTimeout = TimeSpan.FromMinutes(section.GetValue("PerIterationTimeoutMinutes", 10)),
     };
 });
 builder.Services.AddSingleton<PipelineRunner>();
@@ -149,14 +118,5 @@ namespace CodeyBox.Api
         public int Concurrency { get; set; } = 2;
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
-        public UpstreamConfig Upstream { get; set; } = new();
-
-        public sealed class UpstreamConfig
-        {
-            public string Kind { get; set; } = "noop";
-            public string? GitHubOwner { get; set; }
-            public string? GitHubRepository { get; set; }
-            public string? GenericUrl { get; set; }
-        }
     }
 }

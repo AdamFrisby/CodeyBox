@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using CodeyBox.Audit;
 using CodeyBox.Core;
+using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Orchestrator;
@@ -8,16 +9,24 @@ namespace CodeyBox.Orchestrator;
 /// <summary>
 /// Per-work-item pipeline:
 ///
-///   Work phase  →  Audit + rework loop  →  Merge phase  →  Upstream push
+///   Work phase  →  Audit + rework loop  →  Merge phase (agent-driven)  →  Upstream push
 ///
-/// Work, audit (with rework iterations), and merge together are the atomic
-/// unit: failure of any of them marks the item Failed (or AuditFailed for
-/// the specific case of audit not converging). UpstreamPush runs after
-/// success and is retried independently.
+/// The work, audit, and merge phases together are the atomic unit:
+/// failure of any of them marks the item Failed (or AuditFailed for the
+/// specific case of audit not converging). UpstreamPush runs after success
+/// and is retried independently.
 ///
-/// The audit loop is skipped entirely if no <see cref="IAuditor"/> is
-/// registered — keeping the pipeline backward-compatible with deployments
-/// that don't want the extra phase.
+/// Project-scoped: each work item is bound to a <see cref="Project"/> via
+/// <see cref="WorkItem.ProjectId"/>. The pipeline resolves the project at
+/// the start of each run and uses its config (repository, default agent,
+/// auditor list, upstream remote) for every phase. Different projects
+/// running concurrently never share creds — per-project upstream tokens
+/// are read fresh from the env, never persisted between runs.
+///
+/// Merge phase invokes the work item's agent (Claude / Codex / etc.) so
+/// non-trivial conflicts can be resolved instead of failing the merge.
+/// The orchestrator verifies the agent's output before pushing — see
+/// <see cref="VerifyMergeStateAsync"/>.
 /// </summary>
 public sealed class PipelineRunner
 {
@@ -26,10 +35,10 @@ public sealed class PipelineRunner
     private readonly IAgentRegistry _agents;
     private readonly ICredentialProvider _credentials;
     private readonly IPullRequestService _prs;
-    private readonly IUpstreamRemote _upstream;
+    private readonly IProjectRepository _projects;
+    private readonly IUpstreamRemoteFactory _upstreamFactory;
+    private readonly ProjectAuditorComposer _auditorComposer;
     private readonly IWorkItemStore _store;
-    private readonly IAuditorRegistry _auditors;
-    private readonly AuditOptions _auditOpts;
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
 
@@ -39,10 +48,10 @@ public sealed class PipelineRunner
         IAgentRegistry agents,
         ICredentialProvider credentials,
         IPullRequestService prs,
-        IUpstreamRemote upstream,
+        IProjectRepository projects,
+        IUpstreamRemoteFactory upstreamFactory,
+        ProjectAuditorComposer auditorComposer,
         IWorkItemStore store,
-        IAuditorRegistry auditors,
-        AuditOptions auditOpts,
         PipelineOptions opts,
         ILogger<PipelineRunner> log)
     {
@@ -51,21 +60,40 @@ public sealed class PipelineRunner
         _agents = agents;
         _credentials = credentials;
         _prs = prs;
-        _upstream = upstream;
+        _projects = projects;
+        _upstreamFactory = upstreamFactory;
+        _auditorComposer = auditorComposer;
         _store = store;
-        _auditors = auditors;
-        _auditOpts = auditOpts;
         _opts = opts;
         _log = log;
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct)
     {
+        Project project;
         try
         {
-            // Resolve repo on host (idempotent).
-            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, item.RepositoryUrl, ct);
-            var baseBranch = item.BaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
+            project = await _projects.GetAsync(item.ProjectId, ct)
+                ?? throw new InvalidOperationException($"Unknown project '{item.ProjectId}'");
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Work item {Id} could not resolve project", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None);
+            return;
+        }
+
+        var agentKind = item.Agent ?? project.DefaultAgent;
+        if (!_agents.TryGet(agentKind, out var agentRunner))
+        {
+            await TransitionFailed(item, $"No runner registered for agent '{agentKind}'", CancellationToken.None);
+            return;
+        }
+
+        try
+        {
+            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, ct);
+            var baseBranch = item.BaseBranch ?? project.DefaultBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
             var workBranch = item.WorkBranch ?? $"codeybox/{item.Id.ToString()[..8]}";
             if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
                 throw new InvalidOperationException(
@@ -76,15 +104,16 @@ public sealed class PipelineRunner
             using (var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 workCts.CancelAfter(item.WorkTimeout);
-                await RunAgentPhaseAsync(item, repoId, baseBranch, workBranch, item.Prompt, isInitial: true, workCts.Token);
+                await RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
+                    item.Prompt, isInitial: true, workCts.Token);
             }
-
             await Transition(item, WorkItemState.WorkComplete, ct);
 
             // -------- Phase 1.5: Audit + rework loop --------
-            if (_auditors.All.Count > 0)
+            var auditors = _auditorComposer.Compose(project, agentRunner);
+            if (auditors.Count > 0)
             {
-                await RunAuditLoopAsync(item, repoId, baseBranch, workBranch, ct);
+                await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct);
                 await Transition(item, WorkItemState.AuditPassed, ct);
             }
 
@@ -94,23 +123,24 @@ public sealed class PipelineRunner
                 SourceBranch: workBranch,
                 TargetBranch: baseBranch,
                 Title: item.Title,
-                Description: $"Work item {item.Id} via {item.Agent.Value}"), ct);
+                Description: $"Work item {item.Id} via {agentKind.Value} (project {project.Id})"), ct);
 
-            // -------- Phase 2: Merge (atomic with Phase 1 + audit) --------
+            // -------- Phase 2: Merge (agent-driven) --------
             await Transition(item, WorkItemState.Merging, ct);
             string mergeSha;
             using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 mergeCts.CancelAfter(item.MergeTimeout);
-                mergeSha = await RunMergePhaseAsync(repoId, baseBranch, workBranch, mergeCts.Token);
+                mergeSha = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch, mergeCts.Token);
             }
             await _prs.MarkMergedAsync(pr.Id, mergeSha, ct);
             await Transition(item, WorkItemState.Merged, ct);
 
             // -------- Phase 3: Upstream push (separate atomic unit) --------
-            if (item.PushUpstream && _upstream is not Upstream.NoopUpstreamRemote)
+            var upstream = _upstreamFactory.Create(project);
+            if (item.PushUpstream && project.Upstream.Kind != "noop")
             {
-                await RunUpstreamPushPhaseAsync(item, repoId, baseBranch, ct);
+                await RunUpstreamPushPhaseAsync(item, upstream, repoId, baseBranch, ct);
             }
             else
             {
@@ -133,7 +163,7 @@ public sealed class PipelineRunner
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);
-            await TransitionFailed(item, ex.Message, ct: CancellationToken.None);
+            await TransitionFailed(item, ex.Message, CancellationToken.None);
         }
     }
 
@@ -146,6 +176,7 @@ public sealed class PipelineRunner
     /// </summary>
     private async Task RunAgentPhaseAsync(
         WorkItem item,
+        IAgentRunner runner,
         string repoId,
         string baseBranch,
         string branch,
@@ -153,10 +184,7 @@ public sealed class PipelineRunner
         bool isInitial,
         CancellationToken ct)
     {
-        if (!_agents.TryGet(item.Agent, out var runner))
-            throw new InvalidOperationException($"No runner registered for agent '{item.Agent}'");
-
-        var credential = await _credentials.GetAsync(item.Agent, ct);
+        var credential = await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true);
 
@@ -167,14 +195,9 @@ public sealed class PipelineRunner
 
         await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
         if (isInitial)
-        {
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch);
-        }
         else
-        {
-            // Rework: branch already exists in the bare repo; check it out.
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", branch);
-        }
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", "codeybox@local");
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", "CodeyBox");
 
@@ -189,9 +212,6 @@ public sealed class PipelineRunner
         }, ct);
         if (diff.ExitCode == 0)
         {
-            // No changes. On the initial work phase this is always a failure.
-            // On a rework iteration this means the agent didn't address the
-            // findings; fail fast rather than looping uselessly.
             var msg = isInitial
                 ? "Agent produced no changes to commit"
                 : "Rework agent produced no changes; cannot resolve audit findings";
@@ -200,29 +220,31 @@ public sealed class PipelineRunner
 
         var commitMessage = isInitial
             ? $"codeybox: {item.Title}"
-            : $"codeybox rework: address audit findings";
+            : "codeybox rework: address audit findings";
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
     }
 
-    /// <summary>
-    /// Runs all configured auditors against the latest workBranch. On
-    /// failure, hands findings to the agent and re-runs. Caps at
-    /// <see cref="AuditOptions.MaxIterations"/> rounds before throwing
-    /// <see cref="AuditFailedException"/>.
-    /// </summary>
-    private async Task RunAuditLoopAsync(WorkItem item, string repoId, string baseBranch, string workBranch, CancellationToken ct)
+    private async Task RunAuditLoopAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        IReadOnlyList<IAuditor> auditors,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct)
     {
-        for (var iteration = 1; iteration <= _auditOpts.MaxIterations; iteration++)
+        for (var iteration = 1; iteration <= project.Audit.MaxIterations; iteration++)
         {
             await Transition(item, WorkItemState.Auditing, ct);
             using var auditCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            auditCts.CancelAfter(_auditOpts.PerIterationTimeout);
+            auditCts.CancelAfter(project.Audit.PerIterationTimeout);
 
             var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt);
-            var findings = await CollectFindingsAsync(repoId, ctx, auditCts.Token);
+            var findings = await CollectFindingsAsync(project, runner, auditors, repoId, ctx, auditCts.Token);
 
-            var blocking = findings.Where(f => f.Severity >= _auditOpts.FailingSeverity).ToList();
+            var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
             if (blocking.Count == 0)
             {
                 _log.LogInformation("Audit iteration {Iter} passed for {Id} ({NonBlocking} non-blocking findings)",
@@ -231,66 +253,49 @@ public sealed class PipelineRunner
             }
 
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
-                iteration, _auditOpts.MaxIterations, blocking.Count, item.Id);
+                iteration, project.Audit.MaxIterations, blocking.Count, item.Id);
 
-            if (iteration == _auditOpts.MaxIterations)
+            if (iteration == project.Audit.MaxIterations)
             {
                 var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
             }
 
-            // Rework: hand findings to the agent and ask it to fix.
             await Transition(item, WorkItemState.Reworking, ct);
-            var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, _auditOpts.MaxIterations);
+            var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations);
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
-            await RunAgentPhaseAsync(item, repoId, baseBranch, workBranch, reworkPrompt, isInitial: false, reworkCts.Token);
+            await RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
+                reworkPrompt, isInitial: false, reworkCts.Token);
         }
     }
 
-    /// <summary>
-    /// Groups auditors by capability and spawns a separate sandbox per
-    /// group. Tool-only auditors (no agent creds, no network) run first in
-    /// a credential-free sandbox; LLM auditors run after in a sandbox with
-    /// agent creds + network. Findings are merged.
-    /// </summary>
-    private async Task<IReadOnlyList<AuditFinding>> CollectFindingsAsync(string repoId, AuditContext ctx, CancellationToken ct)
+    private async Task<IReadOnlyList<AuditFinding>> CollectFindingsAsync(
+        Project project,
+        IAgentRunner runner,
+        IReadOnlyList<IAuditor> auditors,
+        string repoId,
+        AuditContext ctx,
+        CancellationToken ct)
     {
         var findings = new List<AuditFinding>();
-        var byCaps = _auditors.All.GroupBy(a => a.Required).ToList();
+        var byCaps = auditors.GroupBy(a => a.Required).ToList();
 
         foreach (var group in byCaps)
         {
             var needsCreds = group.Key.HasFlag(AuditCapabilities.AgentCredentials);
             var needsNetwork = group.Key.HasFlag(AuditCapabilities.Network);
 
-            // Build a SandboxSpec scoped to this capability set. A
-            // credential-free sandbox cannot exfiltrate the agent's API key
-            // even if a tool inside it tries to.
-            AgentCredential? credential = null;
-            if (needsCreds)
-            {
-                // The work item's agent is the default audit agent too. An
-                // operator wanting a different identity for review should
-                // register an LlmReviewAuditor that wraps a different
-                // IAgentRunner with its own credential mapping.
-                credential = await _credentials.GetAsync(ctx.WorkItemId.ToString() is { } ? AgentKindForAudit() : default, ct);
-            }
-
+            AgentCredential? credential = needsCreds ? await _credentials.GetAsync(runner.Kind, ct) : null;
             var access = _gitHost.GetSandboxAccess(repoId);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork);
-            // Audit sandbox needs an /audit dir for LLM auditors to drop their JSON verdict.
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
             if (credential is not null && credential.Files.Count > 0)
                 await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-            // Clone the work branch read-mostly. Auditors should not need
-            // to push; they may write into /work transiently. The bare repo
-            // mount is technically writable, but auditors are not expected
-            // to touch it.
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
 
@@ -299,7 +304,7 @@ public sealed class PipelineRunner
                 _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
                 var result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, ctx, ct);
                 findings.AddRange(result.Findings);
-                if (_auditOpts.StopOnFirstFailure && result.Findings.Any(f => f.Severity >= _auditOpts.FailingSeverity))
+                if (project.Audit.StopOnFirstFailure && result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
                     return findings;
             }
         }
@@ -307,37 +312,137 @@ public sealed class PipelineRunner
         return findings;
     }
 
-    // The audit phase uses the same agent kind as the work item. Pulled out
-    // for symmetry with future per-auditor agent overrides.
-    private static AgentKind AgentKindForAudit() => AgentKind.Claude;
-
-    private async Task<string> RunMergePhaseAsync(string repoId, string baseBranch, string workBranch, CancellationToken ct)
+    /// <summary>
+    /// Merge phase: invoke the work-item's agent inside a sandbox to perform
+    /// the merge, including conflict resolution. The agent does not push;
+    /// the orchestrator verifies the merge state and pushes itself.
+    ///
+    /// Security note: the merge sandbox NOW carries agent credentials (so
+    /// the agent can call its API to reason about conflicts). This widens
+    /// the attack surface compared to the previous deterministic merge —
+    /// see docs/security-audit.md (Finding U). The mitigation is the same
+    /// network policy as the work sandbox: only the agent's API endpoint
+    /// is reachable.
+    /// </summary>
+    private async Task<string> RunAgentMergePhaseAsync(
+        WorkItem item,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct)
     {
-        // Merge sandbox: NO agent credentials. Even if the merge sandbox is
-        // compromised, it cannot reach any LLM API. Network is constrained
-        // to the host git endpoint only.
+        var credential = await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
-        var spec = BuildSandboxSpec(access, includeAgentCredential: null, allowAgentNetwork: false);
+        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true);
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        if (credential is not null && credential.Files.Count > 0)
+            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
         await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", "codeybox@local");
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", "CodeyBox");
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "merge", "--no-ff",
-            "-m", $"codeybox: merge {workBranch}", $"origin/{workBranch}");
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
 
-        var sha = await sandbox.ExecAsync(new SandboxExec
+        var preMerge = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
         }, ct);
-        if (!sha.Success) throw new InvalidOperationException($"rev-parse failed: {sha.Stderr}");
+        if (!preMerge.Success) throw new InvalidOperationException($"pre-merge rev-parse failed: {preMerge.Stderr}");
+        var preMergeSha = preMerge.Stdout.Trim();
+
+        var prompt = BuildMergePrompt(baseBranch, workBranch);
+        var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, ct);
+        if (!agentResult.Success)
+            throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
+
+        var mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
 
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{baseBranch}:{baseBranch}");
-        return sha.Stdout.Trim();
+        return mergeSha;
     }
 
-    private async Task RunUpstreamPushPhaseAsync(WorkItem item, string repoId, string baseBranch, CancellationToken ct)
+    /// <summary>
+    /// Sanity-check the agent's merge before letting the orchestrator push:
+    ///   - working tree is clean (no unmerged paths, no leftover &lt;&lt;&lt;&lt;&lt;&lt;&lt; markers)
+    ///   - HEAD advanced past the pre-merge sha
+    ///   - the work branch is now reachable from HEAD (i.e. it actually merged)
+    ///   - HEAD is on baseBranch (agent didn't sneak onto a different branch)
+    /// Throws on any violation.
+    /// </summary>
+    private static async Task<string> VerifyMergeStateAsync(
+        ISandbox sandbox, string baseBranch, string workBranch, string preMergeSha, CancellationToken ct)
+    {
+        var status = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
+        }, ct);
+        if (!status.Success) throw new InvalidOperationException($"git status failed: {status.Stderr}");
+        if (!string.IsNullOrWhiteSpace(status.Stdout))
+            throw new InvalidOperationException($"merge agent left unstaged or conflicting changes:\n{status.Stdout}");
+
+        var current = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "branch", "--show-current"],
+        }, ct);
+        if (!current.Success || current.Stdout.Trim() != baseBranch)
+            throw new InvalidOperationException($"merge agent left HEAD on '{current.Stdout.Trim()}', expected '{baseBranch}'");
+
+        var head = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+        }, ct);
+        if (!head.Success) throw new InvalidOperationException($"post-merge rev-parse failed: {head.Stderr}");
+        var headSha = head.Stdout.Trim();
+        if (headSha == preMergeSha)
+            throw new InvalidOperationException("merge agent produced no merge commit (HEAD unchanged)");
+
+        var ancestor = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "merge-base", "--is-ancestor", $"origin/{workBranch}", "HEAD"],
+        }, ct);
+        if (ancestor.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"merge agent did not actually merge '{workBranch}' into '{baseBranch}' (workBranch tip not an ancestor of HEAD)");
+
+        return headSha;
+    }
+
+    private static string BuildMergePrompt(string baseBranch, string workBranch) => $$"""
+        # Merge task
+
+        You are operating inside a sandbox at /work that contains a clone of a
+        git repository. Your task: merge branch `{{workBranch}}` into branch `{{baseBranch}}`.
+
+        Constraints:
+          - DO NOT push. The orchestrator pushes after verifying your work.
+          - DO NOT amend or rebase the existing history.
+          - DO NOT delete or comment out code to make conflicts go away.
+          - DO NOT take one side blindly when resolving — read both versions
+            and preserve the intent of each.
+
+        Steps:
+          1. `git fetch origin` (already done by the orchestrator, but safe to repeat)
+          2. Confirm you are on `{{baseBranch}}`: `git branch --show-current`
+          3. Merge: `git merge --no-ff origin/{{workBranch}} -m "codeybox: merge {{workBranch}}"`
+          4. If the merge succeeds without conflicts, you are done. Verify with
+             `git log --oneline -3` and exit.
+          5. If there are conflicts:
+             a. List conflicting files: `git status`
+             b. For each file, read both sides (look for `<<<<<<<`, `=======`, `>>>>>>>`)
+             c. Resolve carefully, preserving both sides' intent
+             d. `git add <file>` for each resolved file
+             e. `git commit` (the merge message is already prepared)
+             f. Verify: `git status` should be clean; `git log --oneline -3`
+
+        After committing, exit. The orchestrator will:
+          - run `git status --porcelain` (must be empty)
+          - confirm HEAD is on `{{baseBranch}}`
+          - confirm `{{workBranch}}` is reachable from HEAD
+          - push `{{baseBranch}}` back to the host bare repo
+        """;
+
+    private async Task RunUpstreamPushPhaseAsync(WorkItem item, IUpstreamRemote upstream, string repoId, string baseBranch, CancellationToken ct)
     {
         await Transition(item, WorkItemState.UpstreamPushing, ct);
         for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
@@ -345,7 +450,7 @@ public sealed class PipelineRunner
             var current = await _store.GetAsync(item.Id, ct) ?? item;
             await _store.UpdateAsync(current with { UpstreamPushAttempts = attempt }, ct);
 
-            var result = await _upstream.PushAsync(repoId, baseBranch, ct);
+            var result = await upstream.PushAsync(repoId, baseBranch, ct);
             if (result.Success)
             {
                 await Transition(item, WorkItemState.Done, ct);

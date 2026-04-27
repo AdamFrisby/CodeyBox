@@ -103,6 +103,23 @@ non-zero on findings.
 
 Capability: `None`.
 
+### Built-in audit-type presets
+
+CodeyBox ships these audit-type presets, registered automatically with
+`PresetCatalog`:
+
+| Preset         | Bundles                                                                |
+|----------------|------------------------------------------------------------------------|
+| `security`     | gitleaks + semgrep + comprehensive LLM review (ASVS 5.0 + Top 10 + LLM-specific). The review prompt walks 21 categories — injection, XSS, validation, files, XXE, authn, authz, sessions/JWT, OAuth, crypto, transport, config, data protection, SSRF, DoS, logging, memory safety, races, dependencies, AI/prompt-injection, business logic. |
+| `architecture` | LLM review for coupling, layering, leaking internals.                  |
+| `quality`      | LLM review for dead code, magic numbers, naming, error handling.       |
+| `completeness` | LLM review for TODOs, missing tests, half-finished impls.              |
+| `cheating`     | Diff-pattern matcher + LLM review for agent shortcuts (suppression markers, stubbed implementations, skipped tests, hardcoded "mock" returns). |
+| `tests`        | Diff-pattern matcher for no-op assertions + LLM review for test meaningfulness (implementation-mirroring tests, pure-mock tests, missing failure-path coverage). |
+
+A project enables a preset by listing its name in
+`Audit.AuditTypes` (see `docs/projects.md`).
+
 ### `LlmReviewAuditor` (`CodeyBox.Audit.Llm`)
 
 Runs an `IAgentRunner` with a review-style prompt. The agent is
