@@ -117,8 +117,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             await LaunchAsync(name, spec, cloudInitPath, ct);
             await WaitForRunningAsync(name, ct);
             await SetUpMountsAsync(name, bindMounts, ct);
-            var envFile = await TransferEnvAsync(name, spec.Environment, sandboxRoot, ct);
-            await TransferExecWrapperAsync(name, ct);
+            await TransferEnvAsync(name, spec.Environment, sandboxRoot, ct);
+            // The exec wrapper is installed by cloud-init at boot
+            // (see BuildCloudInit's write_files), so no post-launch
+            // transfer is needed. This also means we don't depend on the
+            // ubuntu user having sudo to install it — sudo is removed
+            // from ubuntu by cloud-init runcmd to harden the VM against
+            // a compromised agent flushing iptables.
             return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log);
         }
         catch
@@ -253,45 +258,36 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         return "/home/ubuntu/.codeybox-env";
     }
 
-    private async Task TransferExecWrapperAsync(string name, CancellationToken ct)
-    {
-        // Wrapper script: sources the env file (if present), changes to the
-        // target working directory, and exec's the user command. Lives at
-        // /usr/local/bin/codeybox-exec inside the VM. Staged under the
-        // multipass-readable directory so the daemon can transfer it.
-        const string wrapper = """
-            #!/bin/sh
-            set -a
-            [ -r "$HOME/.codeybox-env" ] && . "$HOME/.codeybox-env"
-            set +a
-            cd "$1" || exit 127
-            shift
-            exec "$@"
-            """;
-        var tmp = Path.Combine(_stagingRoot, $"codeybox-exec-{Guid.NewGuid():N}");
-        await File.WriteAllTextAsync(tmp, wrapper, ct);
-        try
-        {
-            var tx = await RunAsync(
-                [_opts.MultipassBinary, "transfer", tmp, $"{name}:/tmp/codeybox-exec"],
-                stdin: null, ct: ct);
-            if (tx.ExitCode != 0)
-                throw new InvalidOperationException($"multipass transfer exec wrapper failed: {tx.Stderr}");
-            var install = await RunAsync(
-                [_opts.MultipassBinary, "exec", name, "--", "sudo", "install", "-m", "0755",
-                 "/tmp/codeybox-exec", "/usr/local/bin/codeybox-exec"],
-                stdin: null, ct: ct);
-            if (install.ExitCode != 0)
-                throw new InvalidOperationException($"failed to install exec wrapper in VM: {install.Stderr}");
-        }
-        finally { try { File.Delete(tmp); } catch { } }
-    }
+    /// <summary>
+    /// The exec wrapper script content. Sources the env file (if present),
+    /// cds to the target working directory, exec's the user command. Lives
+    /// at /usr/local/bin/codeybox-exec inside the VM, owned by root with
+    /// mode 0755 so the agent (running as the unprivileged ubuntu user
+    /// without sudo) can run but cannot modify it.
+    /// </summary>
+    private const string ExecWrapperScript = """
+        #!/bin/sh
+        set -a
+        [ -r "$HOME/.codeybox-env" ] && . "$HOME/.codeybox-env"
+        set +a
+        cd "$1" || exit 127
+        shift
+        exec "$@"
+        """;
 
     /// <summary>
-    /// Builds a cloud-init document that installs a systemd-managed
-    /// iptables egress allowlist. The firewall is re-applied on every
-    /// boot — important because we stop/start the VM to add native mounts,
-    /// and naked iptables rules are kernel-state-only (lost on reboot).
+    /// Builds a cloud-init document that:
+    ///   - Installs the exec wrapper at /usr/local/bin/codeybox-exec (root-
+    ///     owned, mode 0755) so the agent can execute but not modify it.
+    ///   - Installs a systemd-managed iptables egress allowlist that
+    ///     re-applies on every boot (important because we stop/start the
+    ///     VM to add native mounts, and naked iptables rules are
+    ///     kernel-state-only).
+    ///   - Removes passwordless sudo from the ubuntu user. Without this,
+    ///     a compromised agent could run <c>sudo iptables -F</c> and
+    ///     disable the firewall — the entire egress allowlist would be
+    ///     voluntary. After this step the agent's runtime is strictly
+    ///     unprivileged.
     ///
     /// Only the OUTPUT chain is restricted — that's the exfiltration vector.
     /// The INPUT chain is left at Ubuntu's default (ACCEPT) because
@@ -320,9 +316,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             rules.Append("-A OUTPUT -d ").Append(ip).AppendLine(" -j ACCEPT");
         }
         rules.AppendLine("COMMIT");
+        var rulesIndented = string.Join("\n      ", rules.ToString().TrimEnd('\n').Split('\n'));
 
-        // YAML-escape the rules block (each line indented under content: |).
-        var indented = string.Join("\n      ", rules.ToString().TrimEnd('\n').Split('\n'));
+        // Wrapper script indented for YAML content.
+        var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
 
         var sb = new StringBuilder();
         sb.AppendLine("#cloud-config");
@@ -330,7 +327,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         sb.AppendLine("  - path: /etc/codeybox-iptables.rules");
         sb.AppendLine("    permissions: '0644'");
         sb.AppendLine("    content: |");
-        sb.Append("      ").AppendLine(indented);
+        sb.Append("      ").AppendLine(rulesIndented);
         sb.AppendLine("  - path: /etc/systemd/system/codeybox-firewall.service");
         sb.AppendLine("    permissions: '0644'");
         sb.AppendLine("    content: |");
@@ -345,9 +342,20 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         sb.AppendLine("      RemainAfterExit=yes");
         sb.AppendLine("      [Install]");
         sb.AppendLine("      WantedBy=multi-user.target");
+        sb.AppendLine("  - path: /usr/local/bin/codeybox-exec");
+        sb.AppendLine("    permissions: '0755'");
+        sb.AppendLine("    content: |");
+        sb.Append("      ").AppendLine(wrapperIndented);
         sb.AppendLine("runcmd:");
         sb.AppendLine("  - systemctl daemon-reload");
         sb.AppendLine("  - systemctl enable --now codeybox-firewall.service");
+        // Note: the in-VM firewall is ADVISORY — a compromised agent with
+        // sudo (which we leave intact so the operator can install dev
+        // tooling) can flush iptables and undo it. Real egress enforcement
+        // happens on the host via nftables on the multipass bridge —
+        // see HostFirewall in this project. Keeping the in-VM rules is
+        // defence-in-depth and useful when the agent is well-behaved but
+        // wrong-default; do not rely on them against a hostile agent.
         if (!string.IsNullOrWhiteSpace(extra))
         {
             sb.AppendLine();
