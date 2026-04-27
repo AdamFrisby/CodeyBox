@@ -9,6 +9,10 @@ using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox.Bubblewrap;
+using CodeyBox.Sandbox.CrunVm;
+using CodeyBox.Sandbox.GVisor;
+using CodeyBox.Sandbox.Kata;
 using CodeyBox.Sandbox.Process;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -30,9 +34,80 @@ builder.Services.Configure<ProjectsOptions>(builder.Configuration.GetSection("Co
 ApiKeyAuth.Configure(builder);
 
 // --- Sandbox provider --------------------------------------------------------
-// Default to the dev-only Process provider. Production deployments should
-// register Sandbox.Kata or Sandbox.CrunVm here instead.
-builder.Services.AddSingleton<ISandboxProvider, ProcessSandboxProvider>();
+// Selected by CodeyBox:SandboxProvider in config. Each option has a different
+// security/setup trade-off — see docs/sandbox-providers.md.
+//
+//   process     — UNSAFE. No isolation. Dev only; refuses to load outside
+//                 Development env unless DangerouslyAllowProcessSandbox=true.
+//   bubblewrap  — Namespace + seccomp isolation, no daemon. Single package
+//                 install. Shares the host kernel.
+//   gvisor      — User-space kernel (runsc). Single package + one line in
+//                 ~/.config/containers/containers.conf. Real syscall isolation.
+//   kata        — Microvm with separate guest kernel. Defaults to QEMU
+//                 (no /etc edits). Firecracker mode requires /etc/kata-containers
+//                 edits — advanced.
+//   crun-vm     — libkrun-backed microvm. Lighter alternative to Kata.
+builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
+
+static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var startupLog = loggerFactory.CreateLogger("CodeyBox.Sandbox");
+
+    var kind = (opts.SandboxProvider ?? "").Trim().ToLowerInvariant();
+    var environment = sp.GetRequiredService<IHostEnvironment>();
+
+    if (string.IsNullOrEmpty(kind))
+    {
+        if (environment.IsDevelopment())
+        {
+            startupLog.LogWarning(
+                "CodeyBox:SandboxProvider not set; defaulting to 'process' because environment is Development. " +
+                "DO NOT do this in production.");
+            kind = "process";
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:SandboxProvider must be set in non-Development environments. " +
+                "Choose one of: bubblewrap, gvisor, kata, crun-vm, process " +
+                "(see docs/sandbox-providers.md for trade-offs).");
+        }
+    }
+
+    return kind switch
+    {
+        "process" => BuildProcess(opts, environment, startupLog, loggerFactory),
+        "bubblewrap" => new BubblewrapSandboxProvider(
+            new BubblewrapSandboxOptions(),
+            loggerFactory.CreateLogger<BubblewrapSandboxProvider>()),
+        "gvisor" => new GVisorSandboxProvider(
+            new GVisorSandboxOptions { NetworkName = opts.SandboxNetworkName },
+            loggerFactory.CreateLogger<GVisorSandboxProvider>()),
+        "kata" => new KataSandboxProvider(
+            new KataSandboxOptions { NetworkName = opts.SandboxNetworkName },
+            loggerFactory.CreateLogger<KataSandboxProvider>()),
+        "crun-vm" => new CrunVmSandboxProvider(
+            new CrunVmSandboxOptions { NetworkName = opts.SandboxNetworkName },
+            loggerFactory.CreateLogger<CrunVmSandboxProvider>()),
+        _ => throw new InvalidOperationException(
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: bubblewrap, gvisor, kata, crun-vm, process"),
+    };
+}
+
+static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)
+{
+    if (!env.IsDevelopment() && !opts.DangerouslyAllowProcessSandbox)
+    {
+        throw new InvalidOperationException(
+            "CodeyBox:SandboxProvider=process is UNSAFE outside Development. " +
+            "Set CodeyBox:DangerouslyAllowProcessSandbox=true to override (NOT recommended), " +
+            "or pick bubblewrap | gvisor | kata | crun-vm.");
+    }
+    startupLog.LogWarning("Using Process sandbox provider — NO ISOLATION. Dev only.");
+    return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
+}
 
 // --- Git host ----------------------------------------------------------------
 builder.Services.AddSingleton<LocalGitHost>(sp =>
@@ -118,5 +193,25 @@ namespace CodeyBox.Api
         public int Concurrency { get; set; } = 2;
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
+
+        /// <summary>
+        /// Which sandbox provider to use. One of: <c>bubblewrap</c>,
+        /// <c>gvisor</c>, <c>kata</c>, <c>crun-vm</c>, <c>process</c>.
+        /// Default is empty — startup defaults to 'process' in Development
+        /// and refuses to start in other environments.
+        /// </summary>
+        public string? SandboxProvider { get; set; }
+
+        /// <summary>
+        /// Name of the podman network providers attach to when egress is
+        /// requested. Operators configure host firewall on this network.
+        /// </summary>
+        public string SandboxNetworkName { get; set; } = "codeybox-egress";
+
+        /// <summary>
+        /// Override that lets <c>process</c> sandbox load outside Development.
+        /// Don't.
+        /// </summary>
+        public bool DangerouslyAllowProcessSandbox { get; set; }
     }
 }

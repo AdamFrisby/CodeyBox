@@ -5,17 +5,21 @@ short — the framework is small.
 
 ## First-time host setup
 
-1. Linux host with KVM (`/dev/kvm` exists, user has access).
+1. Linux host. KVM optional — only needed for Kata / crun-vm providers.
 2. .NET 10 SDK if building from source; otherwise just the runtime.
-3. Either Kata Containers + Firecracker or crun-vm + libkrun (see
-   `docs/sandbox-providers.md`).
+3. A sandbox provider — pick from `docs/sandbox-providers.md`. Quick start:
+   - **Easiest**: `sudo apt install bubblewrap` and set
+     `CodeyBox.SandboxProvider=bubblewrap`. Done.
+   - **Better isolation, still single-package**: install gVisor (`runsc`),
+     add one line to `~/.config/containers/containers.conf`, set
+     `CodeyBox.SandboxProvider=gvisor`.
+   - **Strongest** (microvm): install Kata, `usermod -aG kvm`, add user-
+     level podman runtime config, set `CodeyBox.SandboxProvider=kata`.
 4. `git` on the host (used by `IGitHost` for cloning seeds and pushing
    upstream).
 5. Service user with:
-   * Access to `/dev/kvm`.
    * Write access to `GitRootDirectory` and `StateDatabasePath` parents.
-   * Membership in whatever group the container engine requires
-     (e.g. `podman` rootless setup).
+   * Access to `/dev/kvm` ONLY if you picked Kata or crun-vm.
    * **No** SSH or other host privileges beyond the above.
 
 ## Running

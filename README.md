@@ -41,10 +41,18 @@ Built and building clean:
 * `CodeyBox.Orchestrator` — pipeline runner + worker pool + SQLite store
 * `CodeyBox.Api` — REST host wiring everything together
 
-Skeletons (interface implemented, body throws):
+Five sandbox providers — pick by `CodeyBox.SandboxProvider`:
 
-* `CodeyBox.Sandbox.Kata` — Firecracker via Kata Containers
-* `CodeyBox.Sandbox.CrunVm` — libkrun via crun-vm
+| Provider          | Setup                                   | Status                          |
+|-------------------|-----------------------------------------|---------------------------------|
+| `process`         | None                                    | UNSAFE; dev only                |
+| `bubblewrap`      | `apt install bubblewrap`                | **Working, integration-tested** |
+| `gvisor`          | install runsc + 1 line user config      | Code-reviewed                   |
+| `kata` (QEMU)     | install kata + `usermod -aG kvm`        | Code-reviewed                   |
+| `kata` (Firecracker) | as above + edit `/etc/kata-containers/configuration.toml` | Code-reviewed |
+| `crun-vm`         | install crun-vm + register OCI runtime  | Code-reviewed                   |
+
+See `docs/sandbox-providers.md` for the full setup and trade-offs of each.
 
 See [`docs/`](docs/README.md) for the full write-up. **Read
 [`docs/security.md`](docs/security.md) before deploying.**

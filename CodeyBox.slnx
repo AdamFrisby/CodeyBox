@@ -13,7 +13,9 @@
     <Project Path="src/CodeyBox.Git/CodeyBox.Git.csproj" />
     <Project Path="src/CodeyBox.Orchestrator/CodeyBox.Orchestrator.csproj" />
     <Project Path="src/CodeyBox.Projects/CodeyBox.Projects.csproj" />
+    <Project Path="src/CodeyBox.Sandbox.Bubblewrap/CodeyBox.Sandbox.Bubblewrap.csproj" />
     <Project Path="src/CodeyBox.Sandbox.CrunVm/CodeyBox.Sandbox.CrunVm.csproj" />
+    <Project Path="src/CodeyBox.Sandbox.GVisor/CodeyBox.Sandbox.GVisor.csproj" />
     <Project Path="src/CodeyBox.Sandbox.Kata/CodeyBox.Sandbox.Kata.csproj" />
     <Project Path="src/CodeyBox.Sandbox.Process/CodeyBox.Sandbox.Process.csproj" />
     <Project Path="src/CodeyBox.Sandbox/CodeyBox.Sandbox.csproj" />

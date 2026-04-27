@@ -30,6 +30,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Audit\CodeyBox.Audit.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Audit.Llm\CodeyBox.Audit.Llm.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
   </ItemGroup>
 
 </Project>
