@@ -135,19 +135,47 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         }
     }
 
-    private async Task LaunchAsync(string name, SandboxSpec spec, string cloudInitPath, CancellationToken ct)
+    internal IReadOnlyList<string> BuildLaunchArgv(string name, SandboxSpec spec, string cloudInitPath)
     {
         var argv = new List<string> { _opts.MultipassBinary, "launch", "--name", name };
         if (spec.Limits.CpuCount is { } cpus) argv.AddRange(["--cpus", cpus.ToString()]);
         if (spec.Limits.MemoryBytes is { } mem) argv.AddRange(["--memory", $"{mem / (1024 * 1024)}M"]);
         if (spec.Limits.DiskBytes is { } disk) argv.AddRange(["--disk", $"{disk / (1024 * 1024)}M"]);
         argv.AddRange(["--cloud-init", cloudInitPath]);
+
+        // Host-enforced egress profile. When the spec names a profile and
+        // the provider has a bridge mapped for it, attach the VM to that
+        // bridge as a SECONDARY network. The agent's only viable internet
+        // path is via this bridge — the operator's host-side nftables on
+        // the bridge enforces the allowlist; the agent cannot subvert it
+        // because the rules live in the host kernel, not the VM.
+        // Multipass's default mpqemubr0 is still attached (control plane
+        // needs it), but setup-host-networks.sh blocks all forwarding on
+        // it so it doesn't carry user traffic.
+        if (!string.IsNullOrWhiteSpace(spec.Network.ProfileName))
+        {
+            if (!_opts.NetworkProfiles.TryGetValue(spec.Network.ProfileName, out var bridge))
+                throw new InvalidOperationException(
+                    $"Network profile '{spec.Network.ProfileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
+                    $"Configured profiles: [{string.Join(", ", _opts.NetworkProfiles.Keys)}]. " +
+                    "Either add the profile to options or run setup-host-networks.sh and update appsettings.");
+            argv.AddRange(["--network", $"name={bridge},mode=auto"]);
+        }
+
         // ImageReference: empty/null => multipass picks the default image.
         if (!string.IsNullOrWhiteSpace(spec.ImageReference) && spec.ImageReference != "ignored")
             argv.Add(spec.ImageReference);
         else if (!string.IsNullOrWhiteSpace(_opts.DefaultImage))
             argv.Add(_opts.DefaultImage);
 
+        return argv;
+    }
+
+    private async Task LaunchAsync(string name, SandboxSpec spec, string cloudInitPath, CancellationToken ct)
+    {
+        var argv = BuildLaunchArgv(name, spec, cloudInitPath);
+        if (!string.IsNullOrWhiteSpace(spec.Network.ProfileName))
+            _log.LogInformation("Sandbox {Name}: host-enforced network profile {Profile}", name, spec.Network.ProfileName);
         _log.LogInformation("Launching multipass VM {Name} (this takes 10-30s)", name);
         var run = await RunAsync(argv, stdin: null, ct: ct);
         if (run.ExitCode != 0)
@@ -452,6 +480,29 @@ public sealed record MultipassSandboxOptions
     /// only if your Multipass install reads a different prefix.
     /// </summary>
     public string? StagingDirectory { get; init; }
+
+    /// <summary>
+    /// Maps logical network-profile names (selected via
+    /// <c>SandboxNetworkPolicy.ProfileName</c>) to host bridge interface
+    /// names. The bridges must already exist on the host with their
+    /// nftables egress rules — operators set this up once via
+    /// <c>scripts/setup-host-networks.sh</c>.
+    ///
+    /// Example:
+    /// <code>
+    /// new Dictionary&lt;string, string&gt; {
+    ///     ["isolated"]  = "codeybox-net-isolated",
+    ///     ["claude"]    = "codeybox-net-claude",
+    ///     ["multi-llm"] = "codeybox-net-multi-llm",
+    /// }
+    /// </code>
+    ///
+    /// When a sandbox spec selects a profile not in this map, the
+    /// provider throws at launch time — it never silently falls back to
+    /// "no enforcement."
+    /// </summary>
+    public IReadOnlyDictionary<string, string> NetworkProfiles { get; init; }
+        = new Dictionary<string, string>();
 }
 
 internal sealed class MultipassSandbox : ISandbox

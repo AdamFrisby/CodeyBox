@@ -12,6 +12,9 @@ Start here if you're new:
    upstream/auditors, defaults inheritance, language + audit-type presets.
 5. [`sandbox-providers.md`](sandbox-providers.md) — Process / Kata / crun-vm
    trade-offs and host setup.
+6. [`host-firewall.md`](host-firewall.md) — host-side egress enforcement
+   for the Multipass provider (operator setup, profile model, what it
+   protects against).
 6. [`agents.md`](agents.md) — built-in agents and how to add new ones.
 7. [`audit.md`](audit.md) — opt-in audit phase between work and merge,
    capability-grouped sandboxes, rework loop.

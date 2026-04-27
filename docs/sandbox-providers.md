@@ -98,11 +98,19 @@ group dance (multipass handles its own KVM access). Confirm with
   `CodeyBox.GitRootDirectory` to a path under `~/snap/multipass/common/`
   too (e.g. `~/snap/multipass/common/codeybox-repos`), otherwise the
   per-work-item bare repo can't be bind-mounted into the VM.
-* **Egress allowlist via in-VM systemd firewall.** A `codeybox-firewall`
-  systemd service applies on every VM boot, dropping all OUTPUT except
-  loopback, DNS, established/related, and IPs resolved from
-  `AgentAllowedHosts` at sandbox-creation time. Persists across the
-  stop/start cycle that native mounts require.
+* **Egress enforcement is host-side via nftables on per-profile bridges**
+  (see [`host-firewall.md`](host-firewall.md)). Operator runs
+  `scripts/setup-host-networks.sh` once, defining one bridge per
+  profile (e.g. `claude`, `multi-llm`, `isolated`). The orchestrator's
+  `SandboxNetworkProfiles` config maps profile names to bridges; the
+  provider passes `--network <bridge>` at launch. Forward traffic on
+  Multipass's default `mpqemubr0` is dropped by the host, so the only
+  viable internet path is via the chosen bridge — and that bridge's
+  egress is filtered in the host kernel, where the agent (even with
+  sudo inside the VM) cannot touch it.
+* **In-VM advisory firewall** is also installed as defence-in-depth.
+  An agent with sudo can disable it; the host bridge filtering is the
+  real boundary.
 * **Image bring-up.** First launch downloads the default Ubuntu image
   (~600 MB) to the multipass cache. Subsequent launches reuse it.
 

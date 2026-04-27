@@ -87,7 +87,11 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             new BubblewrapSandboxOptions(),
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>()),
         "multipass" => new MultipassSandboxProvider(
-            new MultipassSandboxOptions { ExtraCloudInit = opts.MultipassExtraCloudInit },
+            new MultipassSandboxOptions
+            {
+                ExtraCloudInit = opts.MultipassExtraCloudInit,
+                NetworkProfiles = opts.SandboxNetworkProfiles,
+            },
             loggerFactory.CreateLogger<MultipassSandboxProvider>()),
         "gvisor" => new GVisorSandboxProvider(
             new GVisorSandboxOptions { NetworkName = opts.SandboxNetworkName },
@@ -228,5 +232,26 @@ namespace CodeyBox.Api
         /// the agent CLI).
         /// </summary>
         public string? MultipassExtraCloudInit { get; set; }
+
+        /// <summary>
+        /// Maps logical network-profile names → host bridge names. Operators
+        /// configure these bridges once via scripts/setup-host-networks.sh;
+        /// the orchestrator then attaches each VM to the matching bridge,
+        /// where host-side nftables rules enforce egress.
+        ///
+        /// Empty → no host-enforced profile, sandboxes use only the in-VM
+        /// (advisory) firewall. For real enforcement against compromised
+        /// agents, populate this and run setup-host-networks.sh.
+        ///
+        /// Example:
+        /// <code>
+        /// "SandboxNetworkProfiles": {
+        ///   "isolated":  "codeybox-net-isolated",
+        ///   "claude":    "codeybox-net-claude",
+        ///   "multi-llm": "codeybox-net-multi-llm"
+        /// }
+        /// </code>
+        /// </summary>
+        public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = [];
     }
 }
