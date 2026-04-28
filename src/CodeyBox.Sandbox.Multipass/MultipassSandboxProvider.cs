@@ -45,6 +45,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private readonly MultipassSandboxOptions _opts;
     private readonly ILogger<MultipassSandboxProvider> _log;
     private readonly string _stagingRoot;
+    // Per-baseline-name semaphore: serialises bake operations so two
+    // concurrent CreateAsync calls for the same profile don't both try to
+    // launch the same baseline VM. Lazily populated.
+    private readonly Dictionary<string, SemaphoreSlim> _baselineLocks = new();
+    private readonly object _baselineLocksGuard = new();
 
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log)
     {
@@ -129,19 +134,40 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
         }
 
-        var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit);
-        var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
-        await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
-
         try
         {
-            await LaunchAsync(name, spec, cloudInitPath, ct);
-            await WaitForRunningAsync(name, ct);
+            // Choose between two boot paths:
+            //   - Baseline-clone path (UseBaselineImages=true + profile is set):
+            //     bake one VM per profile lazily on first use, then `multipass
+            //     clone` from it for every subsequent sandbox. Saves the 5-10
+            //     min cold-install cost (Node, claude-code, .NET SDK) per VM.
+            //   - Launch path (default): every VM goes through cloud-init.
+            //     Slower per VM but works without prior baking.
+            var useBaseline = _opts.UseBaselineImages
+                && !string.IsNullOrWhiteSpace(spec.Network.ProfileName);
+
+            if (useBaseline)
+            {
+                var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, ct);
+                await CloneFromBaselineAsync(name, baselineName, ct);
+                await WaitForRunningAsync(name, ct);
+            }
+            else
+            {
+                var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit);
+                var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
+                await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
+                await LaunchAsync(name, spec, cloudInitPath, ct);
+                await WaitForRunningAsync(name, ct);
+            }
+
             await SetUpMountsAsync(name, bindMounts, ct);
             await TransferEnvAsync(name, spec.Environment, sandboxRoot, ct);
             // The exec wrapper is installed by cloud-init at boot
-            // (see BuildCloudInit's write_files), so no post-launch
-            // transfer is needed.
+            // (see BuildCloudInit's write_files); on the clone path it's
+            // already baked into the source VM's filesystem, so the clone
+            // inherits it. The codeybox-route systemd service runs on every
+            // boot in both paths.
             return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log);
         }
         catch
@@ -151,6 +177,146 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             try { Directory.Delete(sandboxRoot, recursive: true); } catch { }
             throw;
         }
+    }
+
+    /// <summary>
+    /// Ensures the baseline VM for <paramref name="profileName"/> exists.
+    /// Bakes it on first call (~5-10 min: launch with cloud-init, install
+    /// agent CLIs and runtime, stop). Subsequent calls return the existing
+    /// baseline name.
+    ///
+    /// We bake one baseline per profile because <c>multipass clone</c>
+    /// inherits the source VM's network attachments — a baseline launched
+    /// with <c>--network cb-net</c> can only produce clones attached to
+    /// <c>cb-net</c>. Per-profile baselines also cleanly isolate "what each
+    /// profile installed" if profiles ever need different toolchains.
+    /// </summary>
+    private async Task<string> EnsureBaselineForProfileAsync(string profileName, CancellationToken ct)
+    {
+        if (!_opts.NetworkProfiles.TryGetValue(profileName, out _))
+            throw new InvalidOperationException(
+                $"Network profile '{profileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
+                $"Configured profiles: [{string.Join(", ", _opts.NetworkProfiles.Keys)}]");
+
+        var baselineName = _opts.BaselineNamePrefix + profileName;
+        // multipass instance names cap at 24 chars; trim if a long profile
+        // name pushes us over. We hash the tail for uniqueness so two long
+        // profile names don't collide.
+        if (baselineName.Length > 24)
+        {
+            var hash = (uint)baselineName.GetHashCode();
+            baselineName = string.Concat(baselineName.AsSpan(0, 16), "-", hash.ToString("x"))[..24];
+        }
+
+        var sem = GetBaselineLock(baselineName);
+        await sem.WaitAsync(ct);
+        try
+        {
+            if (await BaselineVmExistsAsync(baselineName, ct))
+                return baselineName;
+            await BakeBaselineAsync(baselineName, profileName, ct);
+            return baselineName;
+        }
+        finally
+        {
+            sem.Release();
+        }
+    }
+
+    private SemaphoreSlim GetBaselineLock(string baselineName)
+    {
+        lock (_baselineLocksGuard)
+        {
+            if (!_baselineLocks.TryGetValue(baselineName, out var sem))
+            {
+                sem = new SemaphoreSlim(1, 1);
+                _baselineLocks[baselineName] = sem;
+            }
+            return sem;
+        }
+    }
+
+    private async Task<bool> BaselineVmExistsAsync(string name, CancellationToken ct)
+    {
+        var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct);
+        return info.ExitCode == 0;
+    }
+
+    private async Task BakeBaselineAsync(string baselineName, string profileName, CancellationToken ct)
+    {
+        var bridge = _opts.NetworkProfiles[profileName];
+        _log.LogInformation(
+            "Baking Multipass baseline {Name} for profile {Profile} on bridge {Bridge} — one-time, ~5-10 minutes",
+            baselineName, profileName, bridge);
+
+        // The baseline runs the SAME cloud-init the launch path uses. The
+        // exec wrapper, route service, and any caller-supplied install
+        // runcmds (Node, claude-code, .NET SDK) are baked into the
+        // baseline's filesystem. Clones inherit all of it.
+        var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit);
+        var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
+        Directory.CreateDirectory(stagingDir);
+        TryChmod0700(stagingDir);
+        var cloudInitPath = Path.Combine(stagingDir, "cloud-init.yaml");
+        await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
+
+        var argv = new List<string> {
+            _opts.MultipassBinary, "launch", "--name", baselineName,
+            "--cloud-init", cloudInitPath,
+            "--network", $"name={bridge},mode=auto",
+        };
+        if (!string.IsNullOrWhiteSpace(_opts.DefaultImage))
+            argv.Add(_opts.DefaultImage);
+
+        try
+        {
+            var run = await RunAsync(argv, stdin: null, ct: ct);
+            if (run.ExitCode != 0)
+                throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
+
+            // Wait for cloud-init to finish — the runcmd installs are the
+            // whole reason we're baking. WaitForRunningAsync also calls
+            // `cloud-init status --wait` which blocks until done.
+            await WaitForRunningAsync(baselineName, ct);
+
+            // Stop the baseline so `multipass clone` can use it as a source
+            // (clone requires source stopped).
+            var stop = await RunAsync([_opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+            if (stop.ExitCode != 0)
+                throw new InvalidOperationException($"baseline stop failed: {stop.Stderr}");
+
+            _log.LogInformation("Baseline {Name} baked and stopped, ready to clone", baselineName);
+        }
+        catch
+        {
+            // If bake half-succeeded, leave a partial baseline that the operator
+            // can `multipass delete --purge` and we'll re-bake. Don't auto-purge
+            // — losing partial install progress on transient errors is wasteful.
+            _log.LogError("Baseline bake for {Name} failed; you may need to `multipass delete --purge {PurgeTarget}` and retry", baselineName, baselineName);
+            throw;
+        }
+    }
+
+    private async Task CloneFromBaselineAsync(string newName, string baselineName, CancellationToken ct)
+    {
+        // Defensive: ensure source is stopped before clone. Multipass clone
+        // requires it, but the baseline can get inadvertently restarted
+        // (e.g. operator runs `multipass exec` against it, which auto-starts
+        // stopped instances). Stop is idempotent — exits 0 if already stopped.
+        await RunAsync([_opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+
+        _log.LogInformation("Cloning {New} from baseline {Baseline}", newName, baselineName);
+        var clone = await RunAsync(
+            [_opts.MultipassBinary, "clone", baselineName, "--name", newName],
+            stdin: null, ct: ct);
+        if (clone.ExitCode != 0)
+            throw new InvalidOperationException($"multipass clone failed: {clone.Stderr}");
+
+        var start = await RunAsync(
+            [_opts.MultipassBinary, "start", newName],
+            stdin: null, ct: ct);
+        if (start.ExitCode != 0)
+            throw new InvalidOperationException($"multipass start (after clone) failed: {start.Stderr}");
     }
 
     internal IReadOnlyList<string> BuildLaunchArgv(string name, SandboxSpec spec, string cloudInitPath)
@@ -314,28 +480,54 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// </summary>
     private const string ExecWrapperScript = """
         #!/bin/sh
+        # Non-interactive defaults. Set BEFORE sourcing user env so user env
+        # can override if needed. CI=true is respected by many CLIs to skip
+        # prompts; DEBIAN_FRONTEND=noninteractive disables apt's tty prompts;
+        # GIT_TERMINAL_PROMPT=0 stops git asking for credentials interactively.
+        export CI=true
+        export DEBIAN_FRONTEND=noninteractive
+        export GIT_TERMINAL_PROMPT=0
         set -a
         [ -r "$HOME/.codeybox-env" ] && . "$HOME/.codeybox-env"
         set +a
+        # First positional may be a sentinel asking to preserve stdin. By
+        # default we redirect stdin from /dev/null so any tool that reads
+        # stdin (e.g. dotnet fsi with no args, vim, ssh confirmation, apt
+        # without -y, an unterminated heredoc) hits EOF immediately and
+        # exits, instead of blocking the agent forever. The orchestrator
+        # passes --keep-stdin when ExecAsync.Stdin is non-null.
+        keep_stdin=0
+        if [ "$1" = "--keep-stdin" ]; then
+            keep_stdin=1
+            shift
+        fi
         cd "$1" || exit 127
         shift
-        exec "$@"
+        if [ "$keep_stdin" = "1" ]; then
+            exec "$@"
+        else
+            exec "$@" </dev/null
+        fi
         """;
 
     /// <summary>
     /// Builds a cloud-init document that:
     ///   - Installs the exec wrapper at /usr/local/bin/codeybox-exec (root-
     ///     owned, mode 0755) so the agent can execute but not modify it.
-    ///   - Swaps the VM's default route to the secondary NIC (the
-    ///     profile bridge) at first boot. Without this, Linux defaults
-    ///     to eth0 (mpqemubr0), whose forwarding is dropped at the host
-    ///     and the agent's traffic dies there.
+    ///   - Installs a systemd service (codeybox-route.service) that swaps
+    ///     the VM's default route to the secondary NIC (the profile bridge)
+    ///     on EVERY boot. Without this, Linux defaults to eth0 (mpqemubr0),
+    ///     whose forwarding is dropped at the host and the agent's traffic
+    ///     dies there. We use a systemd service rather than cloud-init's
+    ///     runcmd because the orchestrator stop/starts the VM to add native
+    ///     mounts, and cloud-init runcmd only runs on the FIRST boot — the
+    ///     route would be lost on the post-mount restart.
     ///   - Splices any caller-supplied <paramref name="extraRuncmd"/>
-    ///     entries INTO our runcmd block. Don't try to add a separate
-    ///     <c>runcmd:</c> via <paramref name="extraCloudInit"/> — cloud-init
-    ///     uses PyYAML, which keeps only the LAST occurrence of a duplicated
-    ///     top-level key, so a second runcmd block would clobber the route
-    ///     swap.
+    ///     entries INTO our runcmd block (first-boot one-shots like apt
+    ///     install). Don't try to add a separate <c>runcmd:</c> via
+    ///     <paramref name="extraCloudInit"/> — cloud-init uses PyYAML, which
+    ///     keeps only the LAST occurrence of a duplicated top-level key,
+    ///     so a second runcmd block would clobber the orchestrator's runcmd.
     ///
     /// Egress filtering is NOT installed in the guest. It lives entirely
     /// on the host (nftables on the profile bridge — see
@@ -344,9 +536,30 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// host bridge enforcement is in the host kernel, where the agent has
     /// no view, and is the only egress boundary we treat as load-bearing.
     /// </summary>
+    /// <summary>
+    /// Standalone shell script run by codeybox-route.service on every boot
+    /// to point the default route at the profile bridge. Idempotent — if
+    /// the default route is already correct, the del+add is a no-op
+    /// modulo a brief flap.
+    /// </summary>
+    private const string RouteSwapScript = """
+        #!/bin/sh
+        set -e
+        iface=$(ip -4 -o addr show | awk '/inet 10\.99\./{print $2; exit}')
+        if [ -z "$iface" ]; then
+            echo "codeybox-route: no 10.99.x.x interface present; nothing to do"
+            exit 0
+        fi
+        gw=$(ip -4 -o addr show "$iface" | awk '{print $4}' | awk -F. '{print $1"."$2"."$3".1"}')
+        ip route del default 2>/dev/null || true
+        ip route add default via "$gw" dev "$iface"
+        echo "codeybox-route: default via $gw dev $iface"
+        """;
+
     internal static string BuildCloudInit(IReadOnlyList<string>? extraRuncmd, string? extraCloudInit)
     {
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
+        var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
 
         var sb = new StringBuilder();
         sb.AppendLine("#cloud-config");
@@ -355,24 +568,29 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         sb.AppendLine("    permissions: '0755'");
         sb.AppendLine("    content: |");
         sb.Append("      ").AppendLine(wrapperIndented);
+        sb.AppendLine("  - path: /usr/local/sbin/codeybox-route");
+        sb.AppendLine("    permissions: '0755'");
+        sb.AppendLine("    content: |");
+        sb.Append("      ").AppendLine(routeScriptIndented);
+        sb.AppendLine("  - path: /etc/systemd/system/codeybox-route.service");
+        sb.AppendLine("    permissions: '0644'");
+        sb.AppendLine("    content: |");
+        sb.AppendLine("      [Unit]");
+        sb.AppendLine("      Description=CodeyBox default-route swap to profile bridge");
+        sb.AppendLine("      After=network-online.target");
+        sb.AppendLine("      Wants=network-online.target");
+        sb.AppendLine("      [Service]");
+        sb.AppendLine("      Type=oneshot");
+        sb.AppendLine("      ExecStart=/usr/local/sbin/codeybox-route");
+        sb.AppendLine("      RemainAfterExit=yes");
+        sb.AppendLine("      [Install]");
+        sb.AppendLine("      WantedBy=multi-user.target");
         sb.AppendLine("runcmd:");
-        // Force the default route over to the secondary NIC (the bridge
-        // attached via --network). Without this, Linux often picks eth0
-        // (mpqemubr0) as the default route — but mpqemubr0 forwarding is
-        // dropped by the host's nftables, so the agent's traffic dies
-        // there. By convention, our profile bridges live in 10.99.0.0/16,
-        // so we detect "the interface with a 10.99.x.x IP" and route
-        // through it.
-        //
-        // This runs once at first boot. The VM's routing table persists
-        // through subsequent multipass exec calls.
-        sb.AppendLine("  - |");
-        sb.AppendLine("      iface=$(ip -4 -o addr show | awk '/inet 10\\.99\\./{print $2; exit}')");
-        sb.AppendLine("      if [ -n \"$iface\" ]; then");
-        sb.AppendLine("        gw=$(ip -4 -o addr show \"$iface\" | awk '{print $4}' | awk -F. '{print $1\".\"$2\".\"$3\".1\"}')");
-        sb.AppendLine("        ip route del default 2>/dev/null || true");
-        sb.AppendLine("        ip route add default via \"$gw\" dev \"$iface\"");
-        sb.AppendLine("      fi");
+        // Enable the route service. --now runs it once immediately so the
+        // first boot's traffic uses the profile bridge before any
+        // extraRuncmd installs run.
+        sb.AppendLine("  - systemctl daemon-reload");
+        sb.AppendLine("  - systemctl enable --now codeybox-route.service");
         // Splice caller-supplied runcmd entries into the same block, AFTER
         // the route swap so they have working egress.
         if (extraRuncmd is not null)
@@ -504,6 +722,33 @@ public sealed record MultipassSandboxOptions
     /// </summary>
     public IReadOnlyDictionary<string, string> NetworkProfiles { get; init; }
         = new Dictionary<string, string>();
+
+    /// <summary>
+    /// When true, the provider bakes a per-profile baseline VM
+    /// (<c>{BaselineNamePrefix}{profile}</c>) on first use of each profile
+    /// by launching with cloud-init, running the install runcmds, and
+    /// stopping. Subsequent sandboxes for that profile use
+    /// <c>multipass clone</c> from the baseline (~10s) instead of relaunching
+    /// + reinstalling (~5-10 min). The baseline VM stays stopped at rest.
+    ///
+    /// Operator caveats:
+    ///  - The bake requires egress to whatever the install runcmd reaches
+    ///    (Ubuntu archive, npm registry, microsoft.com). Profiles with a
+    ///    strict hostname allowlist that doesn't include those will fail to
+    ///    bake — use <c>internet-only</c> or a wider profile.
+    ///  - If <see cref="ExtraRuncmd"/> changes (e.g. a new tool added),
+    ///    delete the baseline VMs (<c>multipass delete --purge cb-baseline-*</c>)
+    ///    so they get re-baked with the new install commands.
+    /// </summary>
+    public bool UseBaselineImages { get; init; } = false;
+
+    /// <summary>
+    /// Prefix for baseline VM names. Default <c>cb-baseline-</c>; final
+    /// names are <c>{prefix}{profile}</c> (e.g. <c>cb-baseline-internet-only</c>).
+    /// Names are truncated to 24 chars (multipass instance-name limit) with
+    /// a hash suffix if the full name would overflow.
+    /// </summary>
+    public string BaselineNamePrefix { get; init; } = "cb-baseline-";
 }
 
 internal sealed class MultipassSandbox : ISandbox
@@ -542,7 +787,15 @@ internal sealed class MultipassSandbox : ISandbox
         // simplicity we always inline as KEY=VALUE prefix args to env(1).
         var argv = new List<string> { _opts.MultipassBinary, "exec", _name, "--" };
 
-        var wrapped = new List<string> { "/usr/local/bin/codeybox-exec", exec.WorkingDirectory ?? _spec.WorkingDirectory };
+        // The codeybox-exec wrapper closes stdin by default to prevent
+        // tools that read stdin from hanging the sandbox. When the
+        // orchestrator deliberately pipes stdin (e.g. git commit -F-),
+        // pass --keep-stdin as the first wrapper arg so it preserves
+        // the pipe.
+        var wrapped = new List<string> { "/usr/local/bin/codeybox-exec" };
+        if (exec.Stdin is not null)
+            wrapped.Add("--keep-stdin");
+        wrapped.Add(exec.WorkingDirectory ?? _spec.WorkingDirectory);
         if (exec.ExtraEnvironment is not null && exec.ExtraEnvironment.Count > 0)
         {
             // env(1) takes KEY=VALUE pairs followed by the command. Per-exec

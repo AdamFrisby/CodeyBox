@@ -99,46 +99,67 @@ public sealed class PipelineRunner
                 throw new InvalidOperationException(
                     $"workBranch must differ from baseBranch (both '{baseBranch}'); refusing to bypass merge-phase containment");
 
+            // The retry endpoint sets the entry state to a pre-phase marker
+            // (Queued / WorkComplete / AuditPassed / Merged) so we resume at
+            // the matching phase. Read once at the top so we don't re-fetch
+            // mid-pipeline (TransitionFailed/restart-recovery already handle
+            // mid-phase failures).
+            var entry = item.State;
+            var skipWork  = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged;
+            var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged;
+            var skipMerge = entry is WorkItemState.Merged;
+
             // -------- Phase 1: Work --------
-            await Transition(item, WorkItemState.Working, ct);
-            using (var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            if (!skipWork)
             {
-                workCts.CancelAfter(item.WorkTimeout);
-                await RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                    item.Prompt, isInitial: true,
-                    networkProfile: project.NetworkProfiles.Work,
-                    workCts.Token);
+                await Transition(item, WorkItemState.Working, ct);
+                using (var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    workCts.CancelAfter(item.WorkTimeout);
+                    await RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
+                        item.Prompt, isInitial: true,
+                        networkProfile: project.NetworkProfiles.Work,
+                        workCts.Token);
+                }
+                await Transition(item, WorkItemState.WorkComplete, ct);
             }
-            await Transition(item, WorkItemState.WorkComplete, ct);
 
             // -------- Phase 1.5: Audit + rework loop --------
             var auditors = _auditorComposer.Compose(project, agentRunner);
-            if (auditors.Count > 0)
+            if (auditors.Count > 0 && !skipAudit)
             {
                 await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct);
                 await Transition(item, WorkItemState.AuditPassed, ct);
             }
 
             // Open PR record (local metadata) AFTER the audit converges.
-            var pr = await _prs.OpenAsync(new OpenPullRequest(
-                RepositoryId: repoId,
-                SourceBranch: workBranch,
-                TargetBranch: baseBranch,
-                Title: item.Title,
-                Description: $"Work item {item.Id} via {agentKind.Value} (project {project.Id})"), ct);
+            // Skip if we're resuming past merge — merge is the only consumer.
+            PullRequest? pr = null;
+            if (!skipMerge)
+            {
+                pr = await _prs.OpenAsync(new OpenPullRequest(
+                    RepositoryId: repoId,
+                    SourceBranch: workBranch,
+                    TargetBranch: baseBranch,
+                    Title: item.Title,
+                    Description: $"Work item {item.Id} via {agentKind.Value} (project {project.Id})"), ct);
+            }
 
             // -------- Phase 2: Merge (agent-driven) --------
-            await Transition(item, WorkItemState.Merging, ct);
-            string mergeSha;
-            using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            if (!skipMerge)
             {
-                mergeCts.CancelAfter(item.MergeTimeout);
-                mergeSha = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                    networkProfile: project.NetworkProfiles.Merge,
-                    mergeCts.Token);
+                await Transition(item, WorkItemState.Merging, ct);
+                string mergeSha;
+                using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    mergeCts.CancelAfter(item.MergeTimeout);
+                    mergeSha = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
+                        networkProfile: project.NetworkProfiles.Merge,
+                        mergeCts.Token);
+                }
+                await _prs.MarkMergedAsync(pr!.Id, mergeSha, ct);
+                await Transition(item, WorkItemState.Merged, ct);
             }
-            await _prs.MarkMergedAsync(pr.Id, mergeSha, ct);
-            await Transition(item, WorkItemState.Merged, ct);
 
             // -------- Phase 3: Upstream push (separate atomic unit) --------
             var upstream = _upstreamFactory.Create(project);
@@ -208,7 +229,18 @@ public sealed class PipelineRunner
 
         var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, ct);
         if (!agentResult.Success)
-            throw new InvalidOperationException($"Agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
+        {
+            // Include both streams: many CLI agents write diagnostics to
+            // stdout (especially under --print / non-interactive modes),
+            // so stderr alone may be empty even on failure.
+            var detail = string.Join("\n",
+                new[] {
+                    $"Agent {runner.Kind} reported failure: {agentResult.Summary}",
+                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{agentResult.Stderr}" : null,
+                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{agentResult.Stdout}" : null,
+                }.Where(s => s is not null));
+            throw new InvalidOperationException(detail);
+        }
 
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
         var diff = await sandbox.ExecAsync(new SandboxExec

@@ -93,6 +93,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
                 ExtraCloudInit = opts.MultipassExtraCloudInit,
                 ExtraRuncmd = opts.MultipassExtraRuncmd,
                 NetworkProfiles = opts.SandboxNetworkProfiles,
+                UseBaselineImages = opts.MultipassUseBaselineImages,
             },
             loggerFactory.CreateLogger<MultipassSandboxProvider>()),
         _ => throw new InvalidOperationException(
@@ -257,5 +258,17 @@ namespace CodeyBox.Api
         /// agent CLIs. Each entry is one shell command (multi-line OK).
         /// </summary>
         public List<string> MultipassExtraRuncmd { get; set; } = [];
+
+        /// <summary>
+        /// When true, the Multipass provider lazily bakes a per-profile
+        /// baseline VM on first use (running the standard cloud-init +
+        /// MultipassExtraRuncmd install once), then clones it for every
+        /// subsequent sandbox of that profile. Cuts each VM cold-start from
+        /// ~5-10 min to ~10s. The baselines stay stopped at rest.
+        ///
+        /// Delete the baselines (<c>multipass delete --purge cb-baseline-*</c>)
+        /// to force a re-bake after changing MultipassExtraRuncmd.
+        /// </summary>
+        public bool MultipassUseBaselineImages { get; set; } = false;
     }
 }
