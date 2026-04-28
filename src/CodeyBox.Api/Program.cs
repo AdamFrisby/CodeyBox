@@ -246,11 +246,13 @@ namespace CodeyBox.Api
         /// Example:
         /// <code>
         /// "SandboxNetworkProfiles": {
-        ///   "isolated":  "codeybox-net-isolated",
-        ///   "claude":    "codeybox-net-claude",
-        ///   "multi-llm": "codeybox-net-multi-llm"
+        ///   "isolated":  "cb-iso",
+        ///   "claude":    "cb-claude",
+        ///   "multi-llm": "cb-multi-llm"
         /// }
         /// </code>
+        /// Bridge names are limited to 15 characters by Linux IFNAMSIZ.
+        /// Profile names (the keys) have no such limit.
         /// </summary>
         public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = [];
     }

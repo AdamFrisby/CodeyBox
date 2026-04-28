@@ -23,13 +23,15 @@
 # If no config file is given, /etc/codeybox/networks.conf is used. Format:
 # one profile per line, columns separated by whitespace —
 #
-#   # name           bridge                    subnet         allowed-hosts
-#   isolated         codeybox-net-isolated     10.99.1.0/24   -
-#   claude           codeybox-net-claude       10.99.2.0/24   api.anthropic.com
-#   codex            codeybox-net-codex        10.99.3.0/24   api.openai.com
-#   multi-llm        codeybox-net-multi        10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
+#   # name           bridge          subnet         allowed-hosts
+#   isolated         cb-iso          10.99.1.0/24   -
+#   claude           cb-claude       10.99.2.0/24   api.anthropic.com
+#   codex            cb-codex        10.99.3.0/24   api.openai.com
+#   multi-llm        cb-multi-llm    10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
 #
 # allowed-hosts of "-" means no egress (fully isolated; only DNS + lo).
+# Bridge names (column 2) must be ≤15 chars (Linux IFNAMSIZ limit).
+# Profile names (column 1) have no length limit.
 #
 # Idempotent — re-run after editing the config or to refresh resolved IPs
 # (useful when CDN endpoints rotate).
@@ -53,9 +55,9 @@ config file $CONFIG_FILE not found.
 Create it as: <name> <bridge> <subnet> <allowed-hosts-comma-sep-or-dash>
 
 Example:
-  # name           bridge                    subnet         allowed-hosts
-  isolated         codeybox-net-isolated     10.99.1.0/24   -
-  claude           codeybox-net-claude       10.99.2.0/24   api.anthropic.com
+  # name           bridge          subnet         allowed-hosts
+  isolated         cb-iso          10.99.1.0/24   -
+  claude           cb-claude       10.99.2.0/24   api.anthropic.com
 
 Then re-run: sudo $0 [path/to/config]
 EOF

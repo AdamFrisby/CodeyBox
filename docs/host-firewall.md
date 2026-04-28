@@ -27,7 +27,7 @@ This document describes how to set up the host-side enforcement.
      guest agent for `exec`, `mount`, `transfer`). Forward traffic on
      this bridge is dropped by host nftables, so it can't reach
      internet.
-   - `eth1` on the chosen `codeybox-net-*` bridge — the only viable path
+   - `eth1` on the chosen `cb-*` bridge — the only viable path
      to the outside, with the bridge's host-side filtering applied.
 
 A compromised agent doing `sudo iptables -F` inside the VM affects
@@ -46,10 +46,10 @@ sudo snap install multipass
 sudo mkdir -p /etc/codeybox
 sudo tee /etc/codeybox/networks.conf > /dev/null <<'EOF'
 # name           bridge                       subnet         allowed-hosts
-isolated         codeybox-net-isolated        10.99.1.0/24   -
-claude           codeybox-net-claude          10.99.2.0/24   api.anthropic.com
-codex            codeybox-net-codex           10.99.3.0/24   api.openai.com
-multi-llm        codeybox-net-multi-llm       10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
+isolated         cb-iso        10.99.1.0/24   -
+claude           cb-claude          10.99.2.0/24   api.anthropic.com
+codex            cb-codex           10.99.3.0/24   api.openai.com
+multi-llm        cb-multi-llm       10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
 EOF
 
 # 3. Run the setup script (creates bridges, applies nftables, persists rules).
@@ -75,10 +75,10 @@ Two layers of config:
   "CodeyBox": {
     "SandboxProvider": "multipass",
     "SandboxNetworkProfiles": {
-      "isolated":  "codeybox-net-isolated",
-      "claude":    "codeybox-net-claude",
-      "codex":     "codeybox-net-codex",
-      "multi-llm": "codeybox-net-multi-llm"
+      "isolated":  "cb-iso",
+      "claude":    "cb-claude",
+      "codex":     "cb-codex",
+      "multi-llm": "cb-multi-llm"
     }
   }
 }

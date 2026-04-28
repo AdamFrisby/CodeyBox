@@ -514,11 +514,12 @@ public sealed record MultipassSandboxOptions
     /// Example:
     /// <code>
     /// new Dictionary&lt;string, string&gt; {
-    ///     ["isolated"]  = "codeybox-net-isolated",
-    ///     ["claude"]    = "codeybox-net-claude",
-    ///     ["multi-llm"] = "codeybox-net-multi-llm",
+    ///     ["isolated"]  = "cb-iso",
+    ///     ["claude"]    = "cb-claude",
+    ///     ["multi-llm"] = "cb-multi-llm",
     /// }
     /// </code>
+    /// Bridge names are limited to 15 characters by Linux IFNAMSIZ.
     ///
     /// When a sandbox spec selects a profile not in this map, the
     /// provider throws at launch time — it never silently falls back to
