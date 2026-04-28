@@ -105,7 +105,7 @@ public sealed record ProjectUpstream
 /// </summary>
 public sealed record ProjectAudit
 {
-    public int MaxIterations { get; init; } = 3;
+    public int MaxIterations { get; init; } = 10;
     public AuditSeverity FailingSeverity { get; init; } = AuditSeverity.Error;
     public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(10);
     public bool StopOnFirstFailure { get; init; }
