@@ -146,11 +146,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             var useBaseline = _opts.UseBaselineImages
                 && !string.IsNullOrWhiteSpace(spec.Network.ProfileName);
 
+            // After this block the VM is in Stopped state, ready for native
+            // mounts. The launch path goes through a stop-mount-start cycle;
+            // the clone path skips the start (clone is born Stopped).
             if (useBaseline)
             {
                 var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, ct);
                 await CloneFromBaselineAsync(name, baselineName, ct);
-                await WaitForRunningAsync(name, ct);
+                // Clone is Stopped after `multipass clone`; no start yet.
             }
             else
             {
@@ -159,9 +162,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                 await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
                 await LaunchAsync(name, spec, cloudInitPath, ct);
                 await WaitForRunningAsync(name, ct);
+                // Stop the freshly-launched VM so we can mount.
+                var stop = await RunAsync([_opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
+                if (stop.ExitCode != 0)
+                    throw new InvalidOperationException($"multipass stop (for mount) failed: {stop.Stderr}");
+                await WaitForStoppedAsync(name, ct);
             }
 
-            await SetUpMountsAsync(name, bindMounts, ct);
+            // Apply native mounts while VM is Stopped, then start.
+            await ApplyMountsAsync(name, bindMounts, ct);
+            await StartAndWaitForRunningAsync(name, ct);
+
             await TransferEnvAsync(name, spec.Environment, sandboxRoot, ct);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files); on the clone path it's
@@ -356,11 +367,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         if (clone.ExitCode != 0)
             throw new InvalidOperationException($"multipass clone failed: {clone.Stderr}");
 
-        var start = await RunAsync(
-            [_opts.MultipassBinary, "start", newName],
-            stdin: null, ct: ct);
-        if (start.ExitCode != 0)
-            throw new InvalidOperationException($"multipass start (after clone) failed: {start.Stderr}");
+        // NOTE: deliberately do NOT start the clone here. multipass clone
+        // creates the new VM in Stopped state, which is exactly what
+        // SetUpMountsAsync's `mount --type=native` requires. Starting now
+        // and stopping again later created a stop-state race where the
+        // mount could fire before multipassd had fully released the VM.
     }
 
     internal IReadOnlyList<string> BuildLaunchArgv(string name, SandboxSpec spec, string cloudInitPath)
@@ -460,28 +471,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         throw new InvalidOperationException($"multipass VM {name} did not reach Stopped state within 2 minutes");
     }
 
-    private async Task SetUpMountsAsync(string name, List<(string Host, string Sandbox)> binds, CancellationToken ct)
+    /// <summary>
+    /// Adds native (virtiofs/9p passthrough) mounts to a Stopped VM.
+    /// Caller is responsible for ensuring the VM is in Stopped state
+    /// — `multipass mount --type=native` rejects any other state.
+    /// We use --type=native rather than the default sshfs-based "classic"
+    /// mount because classic requires the multipass-sshfs snap inside
+    /// the guest, and our host firewall typically blocks the snap store.
+    /// </summary>
+    private async Task ApplyMountsAsync(string name, List<(string Host, string Sandbox)> binds, CancellationToken ct)
     {
         if (binds.Count == 0) return;
-
-        // Use --type=native (9p/virtiofs passthrough) rather than the
-        // default sshfs-based "classic" mount: classic requires the
-        // multipass-sshfs snap installed inside the guest. Native mounts
-        // use the hypervisor's filesystem passthrough and need no
-        // in-guest install — they also don't depend on the snap store
-        // reachability, which our host firewall typically blocks.
-        //
-        // Native mounts can only be CONFIGURED while the VM is stopped.
-        // Sequence: stop → wait-for-stopped → mount (each) → start → wait-for-running.
-        // The wait-for-stopped is needed because `multipass stop` returns
-        // when the request is queued, not when the VM is fully stopped;
-        // calling `mount --type=native` against a still-Stopping VM gets
-        // "Please stop the instance ... before attempting native mounts".
-        var stop = await RunAsync([_opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
-        if (stop.ExitCode != 0)
-            throw new InvalidOperationException($"multipass stop (for mount) failed: {stop.Stderr}");
-        await WaitForStoppedAsync(name, ct);
-
         foreach (var (host, sandbox) in binds)
         {
             var run = await RunAsync(
@@ -490,10 +490,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             if (run.ExitCode != 0)
                 throw new InvalidOperationException($"multipass mount {host} -> {name}:{sandbox} failed: {run.Stderr}");
         }
+    }
 
+    private async Task StartAndWaitForRunningAsync(string name, CancellationToken ct)
+    {
         var start = await RunAsync([_opts.MultipassBinary, "start", name], stdin: null, ct: ct);
         if (start.ExitCode != 0)
-            throw new InvalidOperationException($"multipass start (after mount) failed: {start.Stderr}");
+            throw new InvalidOperationException($"multipass start failed: {start.Stderr}");
         await WaitForRunningAsync(name, ct);
     }
 
