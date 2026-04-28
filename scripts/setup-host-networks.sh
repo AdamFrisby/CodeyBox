@@ -28,8 +28,16 @@
 #   claude           cb-claude       10.99.2.0/24   api.anthropic.com
 #   codex            cb-codex        10.99.3.0/24   api.openai.com
 #   multi-llm        cb-multi-llm    10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
+#   internet-only    cb-net          10.99.5.0/24   internet
 #
-# allowed-hosts of "-" means no egress (fully isolated; only DNS + lo).
+# allowed-hosts column accepts:
+#   "-"                     — no egress (only DNS + loopback + replies)
+#   "internet"              — full public internet, but block RFC1918 /
+#                             link-local / cloud-metadata / multicast etc.
+#                             Useful for "wide reach but no LAN attacks."
+#   "host1,host2,…"         — comma-separated hostname allowlist (current
+#                             list is resolved to IPs at setup time)
+#
 # Bridge names (column 2) must be ≤15 chars (Linux IFNAMSIZ limit).
 # Profile names (column 1) have no length limit.
 #
@@ -180,7 +188,38 @@ for i in "${!NAMES[@]}"; do
         tcp dport 53 accept
 EOF
 
-    if [[ "$hosts" != "-" ]]; then
+    if [[ "$hosts" == "internet" ]]; then
+        # Internet-only mode: drop all LAN/private/local destinations,
+        # accept public internet. Useful when you want to give the agent
+        # broad reach (any external API) while preventing it from being a
+        # staging ground for attacks against the local network.
+        #
+        # Forward-chain semantics: only forwarded packets hit these rules.
+        # The bridge's own traffic (VM <-> bridge gateway, VM <-> VM on the
+        # same bridge) goes through L2 and never reaches forward, so
+        # dropping 10.0.0.0/8 here doesn't break the VM's connectivity to
+        # the bridge gateway it's actually using (10.99.x.1).
+        cat <<'INNER'
+        # IPv4 LAN / private / local / metadata-service ranges — drop.
+        ip daddr 10.0.0.0/8 drop          comment "RFC1918 / multipass private"
+        ip daddr 172.16.0.0/12 drop       comment "RFC1918"
+        ip daddr 192.168.0.0/16 drop      comment "RFC1918"
+        ip daddr 100.64.0.0/10 drop       comment "CGNAT"
+        ip daddr 169.254.0.0/16 drop      comment "link-local + cloud metadata (169.254.169.254)"
+        ip daddr 127.0.0.0/8 drop         comment "loopback"
+        ip daddr 224.0.0.0/4 drop         comment "multicast"
+        ip daddr 240.0.0.0/4 drop         comment "reserved"
+        # IPv6 LAN / private / local — drop.
+        ip6 daddr fc00::/7 drop           comment "ULA"
+        ip6 daddr fe80::/10 drop          comment "link-local"
+        ip6 daddr ::1/128 drop            comment "loopback"
+        ip6 daddr ::/128 drop             comment "unspecified"
+        ip6 daddr ff00::/8 drop           comment "multicast"
+        # Default: accept (public internet).
+        accept
+INNER
+    elif [[ "$hosts" != "-" ]]; then
+        # Specific hostname allowlist mode.
         IFS=',' read -ra hostarr <<< "$hosts"
         for h in "${hostarr[@]}"; do
             h_trimmed="${h//[[:space:]]/}"
@@ -195,13 +234,23 @@ EOF
                 printf '        ip daddr %s accept comment "%s"\n' "$ip" "$h_trimmed"
             done
         done
-    fi
-
-    cat <<EOF
+        cat <<EOF
         # Default deny — anything else from this bridge is dropped.
         drop
-    }
 EOF
+    else
+        # No-egress mode: nothing past the preamble (DNS, ICMP, established
+        # — though ICMP/DNS to anywhere from a no-egress profile is mostly
+        # academic, since ICMP/DNS to external IPs would still go through
+        # forward and need somewhere to go; in practice the bridge's DHCP
+        # resolver is the only DNS target reachable, which is fine).
+        cat <<EOF
+        # No egress.
+        drop
+EOF
+    fi
+
+    echo "    }"
 done
 
 echo "}"

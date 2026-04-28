@@ -52,6 +52,31 @@ several seconds to fall back to IPv4. If you need IPv6 reachability,
 extend the script to resolve `ahostsv6` and emit `ip6 daddr ... accept`
 rules per allowed host.
 
+## Profile modes
+
+The `allowed-hosts` column in `networks.conf` accepts three forms:
+
+| Value                  | Semantics                                                                 | Use case                                                |
+|------------------------|---------------------------------------------------------------------------|---------------------------------------------------------|
+| `-`                    | No egress at all (only DNS, loopback, established/related).               | Tool-only audits, isolated merge phases, gitops sandboxes. |
+| `internet`             | Block RFC1918 / link-local / loopback / multicast / cloud-metadata; accept everything else. | "Wide reach but no LAN attacks" — agent can hit any external service but can't pivot to your home/office network or cloud-metadata endpoints. |
+| `host1,host2,…`        | Specific hostname allowlist; the script resolves each to IPv4 IPs at setup time and emits accept rules for those IPs.       | Production agents bound to known APIs (api.anthropic.com etc.). Strict but requires re-running setup if CDN IPs rotate. |
+
+The `internet` mode drops these explicitly:
+
+- **IPv4**: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (all RFC1918);
+  `100.64.0.0/10` (CGNAT); `169.254.0.0/16` (link-local + AWS/GCP metadata
+  IP `169.254.169.254`); `127.0.0.0/8` (loopback); `224.0.0.0/4` (multicast);
+  `240.0.0.0/4` (reserved).
+- **IPv6**: `fc00::/7` (ULA); `fe80::/10` (link-local); `::1`, `::`,
+  `ff00::/8` (multicast).
+
+The bridge subnet itself (e.g. `10.99.5.0/24`) is in `10.0.0.0/8`, but that's
+fine: VM↔bridge-gateway and VM↔VM-on-same-bridge traffic is L2-bridged and
+never traverses the `forward` chain. The drops only apply to traffic the host
+would ROUTE between interfaces — exactly the case where the agent tries to
+reach LAN hosts via the host's other interfaces.
+
 ## Operator setup
 
 Once per host:
@@ -64,8 +89,9 @@ sudo snap install multipass
 sudo mkdir -p /etc/codeybox
 sudo tee /etc/codeybox/networks.conf > /dev/null <<'EOF'
 # name           bridge                       subnet         allowed-hosts
-isolated         cb-iso        10.99.1.0/24   -
-claude           cb-claude          10.99.2.0/24   api.anthropic.com
+isolated         cb-iso          10.99.1.0/24   -
+claude           cb-claude       10.99.2.0/24   api.anthropic.com
+internet-only    cb-net          10.99.5.0/24   internet
 codex            cb-codex           10.99.3.0/24   api.openai.com
 multi-llm        cb-multi-llm       10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
 EOF
