@@ -686,13 +686,18 @@ public sealed class PipelineRunner
         var next = current.With(WorkItemState.Failed, error);
         await _store.UpdateAsync(next, ct);
         _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
-        if (project is not null)
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "work_item.failed",
-                WorkItem = next,
-                Project = project,
-            }, CancellationToken.None);
+        var effectiveProject = project ?? new Project
+        {
+            Id = item.ProjectId,
+            DisplayName = item.ProjectId.Value,
+            RepositoryUrl = string.Empty,
+        };
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "work_item.failed",
+            WorkItem = next,
+            Project = effectiveProject,
+        }, CancellationToken.None);
     }
 
     private static string StateToEventName(WorkItemState state) => state switch
