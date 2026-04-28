@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/CodeyBox.Cli/CodeyBox.Cli.csproj" />
     <Project Path="src/CodeyBox.Agents.Claude/CodeyBox.Agents.Claude.csproj" />
     <Project Path="src/CodeyBox.Agents.Codex/CodeyBox.Agents.Codex.csproj" />
     <Project Path="src/CodeyBox.Agents.Copilot/CodeyBox.Agents.Copilot.csproj" />
