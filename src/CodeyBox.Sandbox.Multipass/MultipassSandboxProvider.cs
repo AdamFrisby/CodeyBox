@@ -279,6 +279,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // generously over-allocate; the disk is sparse so unused space
             // costs nothing on the host until written.
             "--disk", $"{_opts.BaselineDiskGB}G",
+            // Default 1G memory is too tight for claude-code over long
+            // sessions — it keeps the conversation in memory and OOMs after
+            // ~30-80 min of edit-verify cycles. Clones inherit the
+            // baseline's hardware config.
+            "--memory", $"{_opts.BaselineMemoryGB}G",
+            // Default 1 CPU is fine but bump slightly so dotnet build and
+            // semgrep don't bottleneck the agent loop.
+            "--cpus", _opts.BaselineCpus.ToString(),
         };
         if (!string.IsNullOrWhiteSpace(_opts.DefaultImage))
             argv.Add(_opts.DefaultImage);
@@ -789,6 +797,20 @@ public sealed record MultipassSandboxOptions
     /// on the host until written.
     /// </summary>
     public int BaselineDiskGB { get; init; } = 12;
+
+    /// <summary>
+    /// Memory (gibibytes) for the baseline VM. Default 4 GiB. Multipass's
+    /// default of 1 GiB is too tight for a long claude-code session (the
+    /// agent keeps its conversation history in memory and OOMs after
+    /// ~30-80 min of edit-verify cycles). Clones inherit this allocation.
+    /// </summary>
+    public int BaselineMemoryGB { get; init; } = 4;
+
+    /// <summary>
+    /// vCPU count for the baseline VM. Default 2. Multipass's default is
+    /// 1; bumping speeds up dotnet build / semgrep / clone cold-starts.
+    /// </summary>
+    public int BaselineCpus { get; init; } = 2;
 }
 
 internal sealed class MultipassSandbox : ISandbox

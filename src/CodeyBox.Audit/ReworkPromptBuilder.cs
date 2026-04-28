@@ -16,16 +16,7 @@ public static class ReworkPromptBuilder
         sb.AppendLine("## Rework requested");
         sb.AppendLine();
         sb.Append("Audit iteration ").Append(iteration).Append(" of ").Append(maxIterations)
-          .AppendLine(" found issues with your previous changes. Please address every Error finding below.");
-        sb.AppendLine();
-        sb.AppendLine("**Before committing**, you MUST run the tool auditors yourself in /work and confirm they pass:");
-        sb.AppendLine();
-        sb.AppendLine("- `dotnet build CodeyBox.slnx /warnaserror` — must exit 0");
-        sb.AppendLine("- `dotnet format --verify-no-changes CodeyBox.slnx` — must exit 0 (run `dotnet format` to fix and stage the result)");
-        sb.AppendLine("- `gitleaks detect --source . --no-banner --no-color --redact` — must exit 0");
-        sb.AppendLine("- `semgrep --config auto --error --quiet` — must exit 0");
-        sb.AppendLine();
-        sb.AppendLine("Re-running these BEFORE you commit is the cheapest way to converge — the orchestrator runs the same commands and will fail audit again if any of them exit non-zero. If a tool reports a finding you genuinely cannot fix (e.g. a false-positive in a third-party file), fix what you can and explain the residue in your commit message.");
+          .AppendLine(" found issues with your previous changes. Please address every Error-severity finding below, then commit. The orchestrator re-runs the full audit suite after your commit; it will fail with new findings if anything is still wrong, and you'll get another chance to address them.");
         sb.AppendLine();
         sb.AppendLine("Make new commits — do not amend.");
         sb.AppendLine();
