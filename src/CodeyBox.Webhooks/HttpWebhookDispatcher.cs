@@ -76,9 +76,10 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
             var rawSecret = Environment.GetEnvironmentVariable(ep.SecretEnvVar);
             if (rawSecret is null)
                 _log.LogWarning(
-                    "Webhook {Endpoint}: SecretEnvVar '{EnvVar}' is set in config but the environment variable is not present; HMAC will be computed with an empty key",
+                    "Webhook {Endpoint}: SecretEnvVar '{EnvVar}' is set in config but the environment variable is not present; delivery will be sent unsigned",
                     ep.Name, ep.SecretEnvVar);
-            signature = ComputeSignature(bodyBytes, rawSecret ?? string.Empty);
+            else
+                signature = ComputeSignature(bodyBytes, rawSecret);
         }
 
         var backoff = TimeSpan.FromSeconds(ep.InitialBackoffSeconds);

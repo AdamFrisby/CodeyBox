@@ -98,6 +98,20 @@ public sealed class WebhookDispatcherTests
     }
 
     [Fact]
+    public async Task SignedEndpoint_MissingEnvVar_OmitsSignatureHeader()
+    {
+        const string envVar = "TEST_WEBHOOK_SECRET_ABSENT_XYZ";
+        Environment.SetEnvironmentVariable(envVar, null);
+
+        var (dispatcher, requests, _) = BuildDispatcher(HttpStatusCode.OK, Endpoint(secretEnvVar: envVar));
+        await dispatcher.PublishAsync(MakeEvent(), CancellationToken.None);
+        await dispatcher.DisposeAsync();
+
+        var req = Assert.Single(requests);
+        Assert.False(req.Headers.Contains("X-CodeyBox-Signature"));
+    }
+
+    [Fact]
     public async Task UnsignedEndpoint_OmitsSignatureHeader()
     {
         var (dispatcher, requests, _) = BuildDispatcher(HttpStatusCode.OK, Endpoint(secretEnvVar: null));
