@@ -227,12 +227,27 @@ public sealed class PipelineRunner
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", "codeybox@local");
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", "CodeyBox");
 
+        // Capture HEAD before the agent runs. The rework prompt explicitly
+        // asks the agent to make new commits, so the agent may move HEAD
+        // itself. We compare before/after to distinguish "agent committed"
+        // from "agent did nothing" — both end with a clean working tree
+        // but only the former is success.
+        var beforeHead = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+        }, ct);
+        if (!beforeHead.Success)
+            throw new InvalidOperationException($"Failed to read HEAD before agent: {beforeHead.Stderr}");
+        var shaBefore = beforeHead.Stdout.Trim();
+
         var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, ct);
+        // Always log a truncated tail of agent output, regardless of
+        // success. This is critical when an agent finishes "successfully"
+        // but produces no useful diff — without this log, we have no
+        // visibility into what the agent reasoned.
+        LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
-            // Include both streams: many CLI agents write diagnostics to
-            // stdout (especially under --print / non-interactive modes),
-            // so stderr alone may be empty even on failure.
             var detail = string.Join("\n",
                 new[] {
                     $"Agent {runner.Kind} reported failure: {agentResult.Summary}",
@@ -242,12 +257,35 @@ public sealed class PipelineRunner
             throw new InvalidOperationException(detail);
         }
 
+        // Stage anything the agent left dirty in the working tree. If the
+        // agent already committed (per the rework prompt's instruction
+        // to make new commits), `git add -A` is a no-op.
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
-        var diff = await sandbox.ExecAsync(new SandboxExec
+        var staged = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
         }, ct);
-        if (diff.ExitCode == 0)
+        // diff --cached --quiet exits 0 on no-diff, 1 on diff.
+        var hasStagedDiff = staged.ExitCode != 0;
+
+        if (hasStagedDiff)
+        {
+            var commitMessage = isInitial
+                ? $"codeybox: {item.Title}"
+                : "codeybox rework: address audit findings";
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+        }
+
+        // Did HEAD advance — either via the agent committing itself or
+        // via our just-now commit?
+        var afterHead = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+        }, ct);
+        if (!afterHead.Success)
+            throw new InvalidOperationException($"Failed to read HEAD after agent: {afterHead.Stderr}");
+        var shaAfter = afterHead.Stdout.Trim();
+        if (string.Equals(shaBefore, shaAfter, StringComparison.Ordinal))
         {
             var msg = isInitial
                 ? "Agent produced no changes to commit"
@@ -255,11 +293,23 @@ public sealed class PipelineRunner
             throw new InvalidOperationException(msg);
         }
 
-        var commitMessage = isInitial
-            ? $"codeybox: {item.Title}"
-            : "codeybox rework: address audit findings";
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
+    }
+
+    /// <summary>
+    /// Logs a truncated tail of agent stdout/stderr at Information level.
+    /// Truncated because agent output can be tens of KB; the tail is
+    /// usually where the conclusion / "I'm done" / refusal message lives.
+    /// </summary>
+    private static void LogAgentOutput(ILogger log, AgentKind kind, AgentResult result)
+    {
+        const int tailBytes = 2000;
+        static string Tail(string? s) =>
+            string.IsNullOrEmpty(s) ? "(empty)" :
+            s.Length <= tailBytes ? s : "…" + s[^tailBytes..];
+        log.LogInformation(
+            "Agent {Kind} finished: success={Success} exit={Summary}\nstdout-tail:\n{StdoutTail}\nstderr-tail:\n{StderrTail}",
+            kind.Value, result.Success, result.Summary, Tail(result.Stdout), Tail(result.Stderr));
     }
 
     private async Task RunAuditLoopAsync(
