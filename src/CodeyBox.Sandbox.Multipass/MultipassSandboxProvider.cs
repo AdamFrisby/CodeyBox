@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Net;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -24,11 +23,15 @@ namespace CodeyBox.Sandbox.Multipass;
 /// overhead per phase. Pick this when the threat model justifies it; pick
 /// <c>bubblewrap</c> when speed matters more than kernel isolation.</para>
 ///
-/// <para><b>Network policy:</b> applied via cloud-init at VM launch using
-/// iptables. AllowedHosts are resolved on the host, and only the resulting
-/// IPs are accepted as egress destinations. Loopback + DNS to the VM's
-/// configured resolver is also allowed. With <c>AllowedHosts</c> empty,
-/// all egress is dropped (loopback only).</para>
+/// <para><b>Network policy:</b> enforced ENTIRELY on the host via
+/// nftables on per-profile bridges. The provider attaches the VM to the
+/// bridge mapped from <c>SandboxNetworkPolicy.ProfileName</c>; the
+/// bridge's host-side rules drop everything not on the profile's
+/// allowlist. The provider deliberately installs NO in-VM firewall —
+/// any in-guest enforcement is voluntary and a compromised agent with
+/// sudo could flush it, so we don't pretend it's a boundary.
+/// See <c>scripts/setup-host-networks.sh</c> and
+/// <c>docs/host-firewall.md</c>.</para>
 ///
 /// <para><b>Image:</b> defaults to Multipass's current LTS Ubuntu image.
 /// The agent CLI binaries (claude, codex, etc.) need to be installed in
@@ -126,12 +129,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
         }
 
-        // Host-resolve the allowed hosts so the VM-side iptables rules can
-        // be IP-based. DNS-based hostname allowlisting at L3 is brittle
-        // (CDN drift, DNS rebinding) but better than no policy at all.
-        // Documented in docs/sandbox-providers.md.
-        var allowedIps = await ResolveHostsAsync(spec.Network.AllowedHosts, ct);
-        var cloudInit = BuildCloudInit(allowedIps, _opts.ExtraCloudInit);
+        var cloudInit = BuildCloudInit(_opts.ExtraCloudInit);
         var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
         await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
 
@@ -143,10 +141,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             await TransferEnvAsync(name, spec.Environment, sandboxRoot, ct);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files), so no post-launch
-            // transfer is needed. This also means we don't depend on the
-            // ubuntu user having sudo to install it — sudo is removed
-            // from ubuntu by cloud-init runcmd to harden the VM against
-            // a compromised agent flushing iptables.
+            // transfer is needed.
             return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log);
         }
         catch
@@ -208,10 +203,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private async Task WaitForRunningAsync(string name, CancellationToken ct)
     {
         // Two waits: first the VM enters "Running" state, then cloud-init
-        // finishes applying runcmd (which is where our iptables rules
-        // land). If we let the agent run before cloud-init completes, the
-        // firewall isn't on yet — egress is wide open and the policy is
-        // a lie. The cloud-init wait is the real correctness gate.
+        // finishes applying runcmd (which installs the exec wrapper and
+        // swaps the default route to the profile bridge). The exec
+        // wrapper is needed before any ExecAsync; the route swap is
+        // needed before any agent traffic actually leaves the VM via
+        // the host-enforced bridge.
         var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(3);
         while (DateTime.UtcNow < deadline)
         {
@@ -239,10 +235,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
         // Use --type=native (9p/virtiofs passthrough) rather than the
         // default sshfs-based "classic" mount: classic requires the
-        // multipass-sshfs snap installed inside the guest, and our cloud-
-        // init firewall blocks the snap-store reachability needed for
-        // that auto-install on first mount. Native mounts use the
-        // hypervisor's filesystem passthrough and need no in-guest install.
+        // multipass-sshfs snap installed inside the guest. Native mounts
+        // use the hypervisor's filesystem passthrough and need no
+        // in-guest install — they also don't depend on the snap store
+        // reachability, which our host firewall typically blocks.
         //
         // Native mounts can only be CONFIGURED while the VM is stopped.
         // Sequence: stop → mount (each) → start → wait-for-running.
@@ -330,76 +326,30 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// Builds a cloud-init document that:
     ///   - Installs the exec wrapper at /usr/local/bin/codeybox-exec (root-
     ///     owned, mode 0755) so the agent can execute but not modify it.
-    ///   - Installs a systemd-managed iptables egress allowlist that
-    ///     re-applies on every boot (important because we stop/start the
-    ///     VM to add native mounts, and naked iptables rules are
-    ///     kernel-state-only).
-    ///   - Removes passwordless sudo from the ubuntu user. Without this,
-    ///     a compromised agent could run <c>sudo iptables -F</c> and
-    ///     disable the firewall — the entire egress allowlist would be
-    ///     voluntary. After this step the agent's runtime is strictly
-    ///     unprivileged.
+    ///   - Swaps the VM's default route to the secondary NIC (the
+    ///     profile bridge) at first boot. Without this, Linux defaults
+    ///     to eth0 (mpqemubr0), whose forwarding is dropped at the host
+    ///     and the agent's traffic dies there.
     ///
-    /// Only the OUTPUT chain is restricted — that's the exfiltration vector.
-    /// The INPUT chain is left at Ubuntu's default (ACCEPT) because
-    /// Multipass's daemon needs to reach the guest over its private network
-    /// for status checks, exec, and mount; an INPUT DROP breaks Multipass's
-    /// own initialisation handshake.
-    ///
-    /// Empty <paramref name="allowedIps"/> → outbound is dropped except
-    /// loopback, DNS, and replies to incoming connections.
+    /// Egress filtering is NOT installed in the guest. It lives entirely
+    /// on the host (nftables on the profile bridge — see
+    /// <c>scripts/setup-host-networks.sh</c>). An in-guest firewall would
+    /// be voluntary: a compromised agent with sudo could flush it. The
+    /// host bridge enforcement is in the host kernel, where the agent has
+    /// no view, and is the only egress boundary we treat as load-bearing.
     /// </summary>
-    private static string BuildCloudInit(IReadOnlyList<string> allowedIps, string? extra)
+    private static string BuildCloudInit(string? extra)
     {
-        // Build the iptables-restore rules text.
-        var rules = new StringBuilder();
-        rules.AppendLine("*filter");
-        rules.AppendLine(":INPUT ACCEPT [0:0]");
-        rules.AppendLine(":FORWARD ACCEPT [0:0]");
-        rules.AppendLine(":OUTPUT DROP [0:0]");
-        rules.AppendLine("-A OUTPUT -o lo -j ACCEPT");
-        rules.AppendLine("-A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT");
-        rules.AppendLine("-A OUTPUT -p udp --dport 53 -j ACCEPT");
-        rules.AppendLine("-A OUTPUT -p tcp --dport 53 -j ACCEPT");
-        foreach (var ip in allowedIps)
-        {
-            // Only IPv4/IPv6 literals reach here (DNS resolution result).
-            rules.Append("-A OUTPUT -d ").Append(ip).AppendLine(" -j ACCEPT");
-        }
-        rules.AppendLine("COMMIT");
-        var rulesIndented = string.Join("\n      ", rules.ToString().TrimEnd('\n').Split('\n'));
-
-        // Wrapper script indented for YAML content.
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
 
         var sb = new StringBuilder();
         sb.AppendLine("#cloud-config");
         sb.AppendLine("write_files:");
-        sb.AppendLine("  - path: /etc/codeybox-iptables.rules");
-        sb.AppendLine("    permissions: '0644'");
-        sb.AppendLine("    content: |");
-        sb.Append("      ").AppendLine(rulesIndented);
-        sb.AppendLine("  - path: /etc/systemd/system/codeybox-firewall.service");
-        sb.AppendLine("    permissions: '0644'");
-        sb.AppendLine("    content: |");
-        sb.AppendLine("      [Unit]");
-        sb.AppendLine("      Description=CodeyBox egress firewall");
-        sb.AppendLine("      DefaultDependencies=no");
-        sb.AppendLine("      Before=network-pre.target");
-        sb.AppendLine("      Wants=network-pre.target");
-        sb.AppendLine("      [Service]");
-        sb.AppendLine("      Type=oneshot");
-        sb.AppendLine("      ExecStart=/usr/sbin/iptables-restore /etc/codeybox-iptables.rules");
-        sb.AppendLine("      RemainAfterExit=yes");
-        sb.AppendLine("      [Install]");
-        sb.AppendLine("      WantedBy=multi-user.target");
         sb.AppendLine("  - path: /usr/local/bin/codeybox-exec");
         sb.AppendLine("    permissions: '0755'");
         sb.AppendLine("    content: |");
         sb.Append("      ").AppendLine(wrapperIndented);
         sb.AppendLine("runcmd:");
-        sb.AppendLine("  - systemctl daemon-reload");
-        sb.AppendLine("  - systemctl enable --now codeybox-firewall.service");
         // Force the default route over to the secondary NIC (the bridge
         // attached via --network). Without this, Linux often picks eth0
         // (mpqemubr0) as the default route — but mpqemubr0 forwarding is
@@ -417,13 +367,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         sb.AppendLine("        ip route del default 2>/dev/null || true");
         sb.AppendLine("        ip route add default via \"$gw\" dev \"$iface\"");
         sb.AppendLine("      fi");
-        // Note: the in-VM firewall is ADVISORY — a compromised agent with
-        // sudo (which we leave intact so the operator can install dev
-        // tooling) can flush iptables and undo it. Real egress enforcement
-        // happens on the host via nftables on the multipass bridge —
-        // see scripts/setup-host-networks.sh. Keeping the in-VM rules is
-        // defence-in-depth and useful when the agent is well-behaved but
-        // wrong-default; do not rely on them against a hostile agent.
         if (!string.IsNullOrWhiteSpace(extra))
         {
             sb.AppendLine();
@@ -431,27 +374,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             sb.AppendLine(extra);
         }
         return sb.ToString();
-    }
-
-    private static async Task<List<string>> ResolveHostsAsync(IReadOnlyList<string> hosts, CancellationToken ct)
-    {
-        var ips = new List<string>();
-        foreach (var host in hosts)
-        {
-            try
-            {
-                var addrs = await Dns.GetHostAddressesAsync(host, ct);
-                foreach (var a in addrs)
-                    ips.Add(a.ToString());
-            }
-            catch
-            {
-                // If a hostname doesn't resolve at launch time, the agent
-                // simply can't reach it. The launch still succeeds; the
-                // failure surfaces when the agent tries to connect.
-            }
-        }
-        return ips;
     }
 
     private async Task<RunResult> RunAsync(IReadOnlyList<string> argv, string? stdin, CancellationToken ct)
@@ -508,8 +430,9 @@ public sealed record MultipassSandboxOptions
     public string? DefaultImage { get; init; }
 
     /// <summary>
-    /// Extra cloud-init YAML appended after the egress-allowlist rules.
-    /// Use to apt-install agent CLIs or configure additional VM state.
+    /// Extra cloud-init YAML appended after the orchestrator's own
+    /// runcmd entries. Use to apt-install agent CLIs or configure
+    /// additional VM state.
     /// </summary>
     public string? ExtraCloudInit { get; init; }
 

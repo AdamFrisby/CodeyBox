@@ -56,9 +56,13 @@ public sealed record Project
 /// sandbox provider's profile map to a host bridge with its own egress
 /// allowlist enforced by host-side nftables.
 ///
-/// <para>Null for any phase → no host-enforced profile (the in-VM
-/// advisory firewall is the only protection for that phase). For real
-/// enforcement, populate every phase the project actually runs.</para>
+/// <para>Null for any phase → that phase's sandbox is launched with
+/// no host-enforced egress profile. The Multipass provider falls back
+/// to its default network (Multipass's `mpqemubr0`), which
+/// <c>scripts/setup-host-networks.sh</c> blocks at the host — so an
+/// unset profile means the sandbox effectively has no internet, which
+/// will break any phase that needs the LLM API. Populate every phase
+/// the project actually runs.</para>
 ///
 /// <para>Phases:</para>
 /// <list type="bullet">

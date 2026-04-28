@@ -64,12 +64,16 @@ are gone. In-VM enforcement against an in-VM root user is theatre.
    boot that points the default route at the secondary NIC. Without
    this, Linux picks the primary NIC (mpqemubr0 → blocked) by default.
 
-4. The in-VM iptables firewall remains as defence-in-depth, explicitly
-   labelled advisory. Removing it doesn't matter because host
-   nftables on the bridges still drop disallowed traffic.
+4. The in-VM iptables rules were retained as advisory defence-in-depth
+   for a while, then removed entirely (commit removing in-VM firewall):
+   "voluntary defence in depth" was indistinguishable from "we wrote
+   firewall code", and the cleaner story is that egress lives on the
+   host, period. The host nftables on the bridges drop disallowed
+   traffic regardless of what the agent does inside the guest.
 
 **Why this works against a hostile agent:**
-- `sudo iptables -F` inside the VM: doesn't touch host nftables.
+- Anything `sudo` inside the VM: doesn't touch host nftables — there's
+  no in-guest firewall to flush in the first place.
 - `sudo ip route ...` to revert the route swap: traffic returns to
   mpqemubr0, where the host's drop rule kills it. Self-DOS, not bypass.
 - VM kernel exploit: the VM has its own kernel (separate from host),

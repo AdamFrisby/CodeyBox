@@ -215,9 +215,10 @@ namespace CodeyBox.Api
         /// the orchestrator then attaches each VM to the matching bridge,
         /// where host-side nftables rules enforce egress.
         ///
-        /// Empty → no host-enforced profile, sandboxes use only the in-VM
-        /// (advisory) firewall. For real enforcement against compromised
-        /// agents, populate this and run setup-host-networks.sh.
+        /// Empty → no host-enforced profile is selectable; sandboxes
+        /// fall back to Multipass's default bridge, which
+        /// setup-host-networks.sh blocks at the host. For functional
+        /// egress, populate this and run setup-host-networks.sh.
         ///
         /// Example:
         /// <code>

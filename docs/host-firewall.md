@@ -2,8 +2,10 @@
 
 For a sandbox provider that gives kernel isolation (Multipass), egress
 filtering belongs on the **host**, not inside the VM. An agent in the VM
-with sudo can flush iptables and undo any in-VM rule. The host's nftables
-runs in the host kernel and is unreachable from inside the guest.
+with sudo could flush any in-guest iptables rule, so the orchestrator
+deliberately installs **no** in-VM firewall — egress enforcement lives
+entirely in the host kernel via nftables on per-profile bridges, where
+the agent has no view and no privileged access.
 
 This document describes how to set up the host-side enforcement.
 
@@ -35,11 +37,11 @@ This document describes how to set up the host-side enforcement.
    Linux defaults to the first NIC (mpqemubr0 → blocked) and the agent's
    traffic dies before reaching our filtered bridge.
 
-A compromised agent doing `sudo iptables -F` inside the VM affects
-nothing — the drops happen in the host kernel, on bridges the agent
-has no view into. A compromised agent restoring the default route to
-mpqemubr0 (`sudo ip route ...`) just self-DOSes — that traffic still
-hits the host nftables drop and times out.
+There is nothing in the VM for a compromised agent to flush — the
+drops happen in the host kernel, on bridges the agent has no view
+into. A compromised agent restoring the default route to mpqemubr0
+(`sudo ip route ...`) just self-DOSes — that traffic still hits the
+host nftables drop and times out.
 
 ### IPv4 only
 
@@ -198,8 +200,10 @@ root's permissions don't drift back to default 0755.
 
 ## What this does protect against
 
-- **Agent + sudo flushing in-VM iptables.** Doesn't matter — host rules
-  still drop the traffic.
+- **Agent + sudo running anything inside the VM.** The orchestrator no
+  longer relies on any in-guest firewall, so there's nothing in the VM
+  to flush — host rules drop the traffic regardless of what the agent
+  does inside.
 - **Agent installing arbitrary packages, running arbitrary code,
   attempting outbound connections to attacker-controlled hosts.** Drops
   at the host's bridge nftables before the packet reaches the host's

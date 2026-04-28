@@ -88,10 +88,10 @@ public sealed class MultipassIntegrationTests : IDisposable
             {
                 ["TEST_SECRET"] = "topsecret-12345",
             },
-            // Empty AllowedHosts → cloud-init drops all egress except loopback.
-            // We don't assert network blocking here (would require an attempt
-            // to reach an external host inside the VM); see the dedicated
-            // network test below.
+            // Egress filtering is host-side (host nftables on the
+            // profile bridge); not asserted here because that needs the
+            // operator to have run scripts/setup-host-networks.sh.
+            // local/verify-host-firewall.sh exercises that path.
             WorkingDirectory = "/work",
         };
 
@@ -139,33 +139,9 @@ public sealed class MultipassIntegrationTests : IDisposable
         Assert.Equal("0", spawnSpy.Stdout.Trim());
     }
 
-    /// <summary>
-    /// With AllowedHosts empty, cloud-init drops all egress; any attempt to
-    /// reach an external host should fail. This test assumes the VM has
-    /// finished cloud-init (which our WaitForRunning gives time for).
-    /// Run separately because it adds another VM-launch tax.
-    /// </summary>
-    [Fact]
-    public async Task Multipass_NoEgress_WhenAllowedHostsEmpty()
-    {
-        if (!_multipassAvailable) return;
-        var spec = new SandboxSpec
-        {
-            ImageReference = "ignored",
-            Mounts = [new SandboxMount { SandboxPath = "/work", Tmpfs = true }],
-            WorkingDirectory = "/work",
-            // empty AllowedHosts
-        };
-        await using var sb = await NewProvider().CreateAsync(spec, CancellationToken.None);
-        // curl with a 5-second timeout to a public IP. With egress dropped,
-        // the connect should fail (exit non-zero). We use a literal IP to
-        // bypass DNS — DNS is allowed in our cloud-init for resolution but
-        // the actual connect is what egress filters block.
-        var r = await sb.ExecAsync(new SandboxExec
-        {
-            Argv = ["sh", "-c", "curl --max-time 5 -fsS https://1.1.1.1/ || echo BLOCKED"],
-        });
-        Assert.True(r.Success);
-        Assert.Contains("BLOCKED", r.Stdout);
-    }
+    // Egress enforcement is exercised by local/verify-host-firewall.sh
+    // and local/verify-internet-only.sh (operator-side, requires
+    // setup-host-networks.sh to have been run). The provider itself no
+    // longer installs an in-VM firewall, so there's nothing to assert
+    // about network policy from the provider's CLI surface alone.
 }

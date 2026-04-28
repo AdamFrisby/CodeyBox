@@ -99,7 +99,8 @@ curl -X POST http://localhost:5000/workitems \
 ## Host-side egress enforcement (recommended)
 
 For Multipass, egress filtering belongs on the host — an in-VM firewall
-can be flushed by a compromised agent with sudo. CodeyBox ships
+would be voluntary (a compromised agent with sudo could flush it), so
+the orchestrator installs none. CodeyBox ships
 `scripts/setup-host-networks.sh` which (with sudo, once) creates a Linux
 bridge per network profile and writes nftables rules that drop
 everything not on the profile's allowlist. Profiles support three modes:

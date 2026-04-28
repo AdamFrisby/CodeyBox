@@ -80,21 +80,18 @@ public sealed record SandboxResourceLimits
 }
 
 /// <summary>
-/// Sandbox network policy. Default is deny-all; agents are explicitly granted
-/// only the destinations they need (their API endpoint and the host git
-/// endpoint). Upstream remotes (GitHub) are NEVER allowed from inside.
+/// Sandbox network policy. Egress filtering is host-side: the provider
+/// attaches the sandbox to the host bridge mapped from
+/// <see cref="ProfileName"/>, and the bridge's nftables rules (set up
+/// once by <c>scripts/setup-host-networks.sh</c>) drop everything not
+/// on that profile's allowlist. The agent cannot disable this —
+/// enforcement lives in the host kernel.
 ///
-/// <para>Two enforcement modes (provider-dependent):</para>
-/// <list type="bullet">
-///   <item><b>Advisory (in-VM):</b> the provider applies an in-sandbox firewall
-///   based on <see cref="AllowedHosts"/>. A privileged agent inside the sandbox
-///   can disable this; useful only against well-behaved agents.</item>
-///   <item><b>Enforced (host-side, profile-based):</b> when <see cref="ProfileName"/>
-///   is set and the provider supports it, the orchestrator selects a pre-
-///   configured host-side network profile (e.g. a bridge with nftables rules
-///   the operator set up via setup-host-networks.sh). The agent cannot
-///   disable this — enforcement lives in the host kernel.</item>
-/// </list>
+/// <para><see cref="AllowedHosts"/> is a documentation/intent field
+/// describing what the agent expects to reach; it does not by itself
+/// install any in-sandbox rule. The Bubblewrap provider uses it only
+/// to gate "any network" vs "no network". The Process provider has no
+/// network isolation at all.</para>
 /// </summary>
 public sealed record SandboxNetworkPolicy
 {

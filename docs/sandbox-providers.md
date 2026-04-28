@@ -111,9 +111,11 @@ group dance (multipass handles its own KVM access). Confirm with
   itself runs in-VM and is therefore reversible by a privileged agent;
   reverting it just sends traffic back to mpqemubr0 where the host's
   drop rule kills it (self-DOS, not a bypass).
-* **In-VM advisory firewall** is also installed as defence-in-depth.
-  An agent with sudo can disable it; the host bridge filtering is the
-  real boundary.
+* **No in-VM firewall.** The provider deliberately installs no
+  in-guest iptables rules — they would be voluntary (an agent with
+  sudo could flush them) and pretending otherwise was misleading. The
+  host bridge filtering is the only egress boundary, and that's what
+  we treat as load-bearing.
 * **IPv4-only enforcement.** The host's `cb-*` chains accept by
   IPv4 destination IP only. IPv6 traffic on the `cb-*` bridges falls
   through to `drop`. This is safe (default-deny) but causes a
@@ -123,11 +125,12 @@ group dance (multipass handles its own KVM access). Confirm with
 * **Image bring-up.** First launch downloads the default Ubuntu image
   (~600 MB) to the multipass cache. Subsequent launches reuse it.
 
-**Integration-tested**: end-to-end on a real Ubuntu 25.10 host. Two
-shipped tests verify VM launch, native bind-mount visibility, env-from-
-file (with explicit no-argv-leak verification via in-VM `ps` grep),
-stdin piping, working-directory enforcement, and the firewall actually
-blocking outbound traffic when `AllowedHosts` is empty.
+**Integration-tested**: end-to-end on a real Ubuntu 25.10 host. The
+shipped test verifies VM launch, native bind-mount visibility,
+env-from-file (with explicit no-argv-leak verification via in-VM `ps`
+grep), stdin piping, and working-directory enforcement. Egress
+filtering is verified separately by `local/verify-host-firewall.sh`
+and `local/verify-internet-only.sh` against the real host bridges.
 
 **Putting agents in the VM.** The default Ubuntu image doesn't include
 Claude Code, Codex, etc. Two options:
@@ -141,12 +144,13 @@ Claude Code, Codex, etc. Two options:
    runcmd:
      - npm install -g @anthropic-ai/claude-code
    ```
-   Note: extra-cloud-init runs after the egress firewall is enabled, so
-   package downloads need their destinations on the AllowedHosts list.
+   Note: package downloads from extra-cloud-init go out via the
+   profile's host bridge, so their destinations need to be on the
+   bridge's allowlist (or use a profile in `internet` mode).
 2. **Custom multipass image** — build a base image with agents
    pre-installed (`multipass launch` + customise + snapshot), then
    reference via `SandboxSpec.ImageReference`. Faster startup, no
-   firewall race.
+   bring-up reachability requirements.
 
 ## Choosing
 
