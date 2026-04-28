@@ -15,6 +15,16 @@ using CodeyBox.Sandbox.Process;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Optional extra-config file pointed at by CODEYBOX_EXTRA_CONFIG. Lets
+// operator-side configuration (e.g. dev/test setups in a gitignored
+// local/ directory) layer on top of the committed appsettings.json
+// without copying files into the API project. Loaded LAST so it wins.
+{
+    var extra = Environment.GetEnvironmentVariable("CODEYBOX_EXTRA_CONFIG");
+    if (!string.IsNullOrEmpty(extra))
+        builder.Configuration.AddJsonFile(extra, optional: false, reloadOnChange: false);
+}
+
 // Default to loopback-only. Operators putting a TLS-terminating reverse
 // proxy in front should override via ASPNETCORE_URLS or appsettings.
 // Anything beyond localhost MUST be intentional, since the API can spawn
@@ -81,6 +91,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             new MultipassSandboxOptions
             {
                 ExtraCloudInit = opts.MultipassExtraCloudInit,
+                ExtraRuncmd = opts.MultipassExtraRuncmd,
                 NetworkProfiles = opts.SandboxNetworkProfiles,
             },
             loggerFactory.CreateLogger<MultipassSandboxProvider>()),
@@ -127,7 +138,13 @@ builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 // by appending to this list (or registering a different ICredentialProvider).
 builder.Services.AddSingleton<ICredentialProvider>(_ => new EnvironmentCredentialProvider(new[]
 {
-    new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CLAUDE_API_KEY", "ANTHROPIC_API_KEY"),
+    // Claude Code accepts either ANTHROPIC_API_KEY (real API key, format
+    // sk-ant-api03-…) or CLAUDE_CODE_OAUTH_TOKEN (OAuth access token,
+    // format sk-ant-oat01-…). Default mapping is OAuth so subscription
+    // users (Pro/Max/Team/Enterprise) can run without a separate API
+    // key. Operators with a raw API key can change the in-sandbox name
+    // to ANTHROPIC_API_KEY here.
+    new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
     new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
     new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
 }));
@@ -232,5 +249,13 @@ namespace CodeyBox.Api
         /// Profile names (the keys) have no such limit.
         /// </summary>
         public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = [];
+
+        /// <summary>
+        /// Shell commands spliced into the orchestrator's cloud-init runcmd
+        /// block (after the route swap, so they have working egress). Use
+        /// for first-boot installs like apt-install + npm-install of
+        /// agent CLIs. Each entry is one shell command (multi-line OK).
+        /// </summary>
+        public List<string> MultipassExtraRuncmd { get; set; } = [];
     }
 }

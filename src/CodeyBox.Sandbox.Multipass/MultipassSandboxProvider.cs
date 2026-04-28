@@ -129,7 +129,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
         }
 
-        var cloudInit = BuildCloudInit(_opts.ExtraCloudInit);
+        var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit);
         var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
         await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
 
@@ -330,6 +330,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     ///     profile bridge) at first boot. Without this, Linux defaults
     ///     to eth0 (mpqemubr0), whose forwarding is dropped at the host
     ///     and the agent's traffic dies there.
+    ///   - Splices any caller-supplied <paramref name="extraRuncmd"/>
+    ///     entries INTO our runcmd block. Don't try to add a separate
+    ///     <c>runcmd:</c> via <paramref name="extraCloudInit"/> — cloud-init
+    ///     uses PyYAML, which keeps only the LAST occurrence of a duplicated
+    ///     top-level key, so a second runcmd block would clobber the route
+    ///     swap.
     ///
     /// Egress filtering is NOT installed in the guest. It lives entirely
     /// on the host (nftables on the profile bridge — see
@@ -338,7 +344,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// host bridge enforcement is in the host kernel, where the agent has
     /// no view, and is the only egress boundary we treat as load-bearing.
     /// </summary>
-    private static string BuildCloudInit(string? extra)
+    internal static string BuildCloudInit(IReadOnlyList<string>? extraRuncmd, string? extraCloudInit)
     {
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
 
@@ -367,11 +373,26 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         sb.AppendLine("        ip route del default 2>/dev/null || true");
         sb.AppendLine("        ip route add default via \"$gw\" dev \"$iface\"");
         sb.AppendLine("      fi");
-        if (!string.IsNullOrWhiteSpace(extra))
+        // Splice caller-supplied runcmd entries into the same block, AFTER
+        // the route swap so they have working egress.
+        if (extraRuncmd is not null)
+        {
+            foreach (var cmd in extraRuncmd)
+            {
+                if (string.IsNullOrWhiteSpace(cmd)) continue;
+                // Each entry is a single shell command. We use the YAML
+                // block-literal form (`- |`) so multi-line commands work
+                // and we don't have to worry about escaping.
+                sb.AppendLine("  - |");
+                foreach (var line in cmd.Split('\n'))
+                    sb.Append("      ").AppendLine(line);
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(extraCloudInit))
         {
             sb.AppendLine();
             sb.AppendLine("# --- extra cloud-init from MultipassSandboxOptions.ExtraCloudInit ---");
-            sb.AppendLine(extra);
+            sb.AppendLine(extraCloudInit);
         }
         return sb.ToString();
     }
@@ -430,9 +451,25 @@ public sealed record MultipassSandboxOptions
     public string? DefaultImage { get; init; }
 
     /// <summary>
+    /// Shell commands to splice into the orchestrator's own runcmd block,
+    /// AFTER the default-route swap (so they have working egress). Use
+    /// for one-shot first-boot installs like apt-install + npm-install
+    /// of agent CLIs. Each entry is one shell command (multi-line OK).
+    ///
+    /// Prefer this over <see cref="ExtraCloudInit"/> when you need to run
+    /// commands at boot — extra cloud-init that adds its own
+    /// <c>runcmd:</c> would clobber the orchestrator's route swap.
+    /// </summary>
+    public IReadOnlyList<string> ExtraRuncmd { get; init; } = [];
+
+    /// <summary>
     /// Extra cloud-init YAML appended after the orchestrator's own
-    /// runcmd entries. Use to apt-install agent CLIs or configure
-    /// additional VM state.
+    /// directives. Safe for non-runcmd keys (<c>packages:</c>,
+    /// <c>write_files:</c>, <c>apt:</c>, etc.). Do NOT use this to add a
+    /// <c>runcmd:</c> block — cloud-init's PyYAML parser keeps only the
+    /// last occurrence of a duplicated top-level key, so a second runcmd
+    /// would clobber the route swap. Use <see cref="ExtraRuncmd"/> for
+    /// boot-time commands.
     /// </summary>
     public string? ExtraCloudInit { get; init; }
 
