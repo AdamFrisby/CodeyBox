@@ -38,6 +38,44 @@ public sealed record Project
 
     /// <summary>Audit configuration. Empty list disables the audit phase for this project.</summary>
     public ProjectAudit Audit { get; init; } = new();
+
+    /// <summary>
+    /// Per-phase host-enforced network profile selection. Each profile name
+    /// references an entry in the sandbox provider's
+    /// <c>NetworkProfiles</c> map (which maps logical names to host bridge
+    /// names set up by the operator's setup-host-networks.sh).
+    ///
+    /// Per-project so a project whose tests need network access at merge
+    /// time can grant it; another project's merge phase can stay isolated.
+    /// </summary>
+    public ProjectNetworkProfiles NetworkProfiles { get; init; } = new();
+}
+
+/// <summary>
+/// Network profile names, one per pipeline phase. Each maps via the
+/// sandbox provider's profile map to a host bridge with its own egress
+/// allowlist enforced by host-side nftables.
+///
+/// <para>Null for any phase → no host-enforced profile (the in-VM
+/// advisory firewall is the only protection for that phase). For real
+/// enforcement, populate every phase the project actually runs.</para>
+///
+/// <para>Phases:</para>
+/// <list type="bullet">
+///   <item><b>Work</b>: agent does the initial change. Needs LLM API.</item>
+///   <item><b>Rework</b>: agent fixes audit findings. Same network needs as work.</item>
+///   <item><b>AuditAgent</b>: LLM-driven auditors (architecture, security review, …). Needs LLM API.</item>
+///   <item><b>AuditTool</b>: tool-only auditors (linters, scanners). Should be isolated — no LLM API access lives in this sandbox.</item>
+///   <item><b>Merge</b>: agent resolves merge conflicts. Often needs LLM API; may also need network if your tests reach external services.</item>
+/// </list>
+/// </summary>
+public sealed record ProjectNetworkProfiles
+{
+    public string? Work { get; init; }
+    public string? Rework { get; init; }
+    public string? AuditAgent { get; init; }
+    public string? AuditTool { get; init; }
+    public string? Merge { get; init; }
 }
 
 /// <summary>

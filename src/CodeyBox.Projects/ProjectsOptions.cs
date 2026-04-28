@@ -18,6 +18,7 @@ public sealed class ProjectDefaultsConfig
     public string? Agent { get; set; }
     public string? BaseBranch { get; set; }
     public ProjectAuditConfig? Audit { get; set; }
+    public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
 }
 
 public sealed class ProjectConfig
@@ -29,6 +30,16 @@ public sealed class ProjectConfig
     public string? Agent { get; set; }
     public ProjectUpstreamConfig? Upstream { get; set; }
     public ProjectAuditConfig? Audit { get; set; }
+    public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
+}
+
+public sealed class ProjectNetworkProfilesConfig
+{
+    public string? Work { get; set; }
+    public string? Rework { get; set; }
+    public string? AuditAgent { get; set; }
+    public string? AuditTool { get; set; }
+    public string? Merge { get; set; }
 }
 
 public sealed class ProjectUpstreamConfig

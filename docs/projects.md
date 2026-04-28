@@ -143,6 +143,34 @@ failing tests. The deterministic diff-pattern auditor catches the most
 common suppression markers; the LLM reviewer catches subtler shortcuts
 by comparing the diff against the original task.
 
+### Per-phase network profiles
+
+Each project can specify which host-enforced network profile applies to
+each pipeline phase. Profile names map (via the orchestrator's
+`SandboxNetworkProfiles` config) to host bridges set up by
+`scripts/setup-host-networks.sh`.
+
+```yaml
+networkProfiles:
+  work:        claude              # work + (default for) rework
+  rework:      claude              # explicit override; falls back to Work if omitted
+  auditAgent:  claude              # LLM auditors (architecture, security review, …)
+  auditTool:   isolated            # tool-only auditors (linters, scanners — no LLM API needed)
+  merge:       claude-with-tests   # merge agent; pick a profile that allows test-suite egress if your tests reach the network
+```
+
+**Why per-project, per-phase**: project A's tests might hit a staging
+API at merge time and need network; project B's merge phase wants to be
+maximally isolated. Each project decides what its phases need.
+
+Defaults inherit from `Defaults.NetworkProfiles` if a project omits a
+field. `Rework` additionally falls back to `Work` (so the common case
+of "agent uses the same network for both" doesn't have to be repeated).
+
+A profile referenced in project config but not configured in
+`SandboxNetworkProfiles` makes the provider fail loudly at sandbox
+creation — never silently degrades to "no enforcement."
+
 ### Custom auditors
 
 Three kinds, all configured in JSON:

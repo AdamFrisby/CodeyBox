@@ -66,7 +66,9 @@ rules).
 
 ## CodeyBox configuration
 
-In `appsettings.json`:
+Two layers of config:
+
+**1. The orchestrator-wide profile→bridge map** in `appsettings.json`:
 
 ```json
 {
@@ -82,15 +84,54 @@ In `appsettings.json`:
 }
 ```
 
-The keys are logical profile names; the orchestrator picks them by name
-based on what each phase needs (work phase = "claude" if the agent is
-Claude, merge phase could be "multi-llm" for the agent-driven merge,
-tool-only audit phases = "isolated"). The values are the host bridge
-names from `networks.conf`.
+These keys are *logical profile names* — labels the orchestrator uses
+internally. The values are the host bridge names from `networks.conf`.
 
-If the orchestrator asks for a profile that isn't in the map, the
-provider throws at launch — never silently falls back to "no
-enforcement."
+**2. Per-project, per-phase profile selection** in each project's config
+(see [`projects.md`](projects.md)):
+
+```yaml
+networkProfiles:
+  work:        claude
+  rework:      claude
+  auditAgent:  claude
+  auditTool:   isolated
+  merge:       claude
+```
+
+Each phase picks a profile by name. The orchestrator looks up the
+matching bridge from `SandboxNetworkProfiles` at sandbox creation.
+
+**Why per-project, per-phase**: a project whose tests need network
+access at merge time can grant it via `merge: claude-with-tests`
+(assuming you've defined that profile); a strict project keeps merge
+isolated. The merge agent runs `git merge` plus whatever the project's
+test suite does — the merge phase is no longer purely deterministic, so
+its egress needs are project-specific.
+
+If a profile referenced in project config isn't in
+`SandboxNetworkProfiles`, the provider fails loudly at sandbox
+creation — never silently degrades to "no enforcement."
+
+## Sandbox staging directory hardening
+
+Multipass-snap reads cloud-init files and bind-mount sources from
+`~/snap/multipass/common/codeybox-staging/`. Each sandbox gets its own
+subdirectory under there. To prevent cross-sandbox visibility at the
+host filesystem level:
+
+* The staging root and each sandbox subdirectory are created with mode
+  `0700` (operator-only). Other host users cannot list or read either.
+* Multipass bind-mounts are scoped to a single per-sandbox subdirectory;
+  virtio-fs prevents `..`-traversal past the mount root, so VM A cannot
+  walk into VM B's staging through the mount.
+* The orchestrator process owns all staging dirs. It is itself a trust
+  boundary — a compromised orchestrator process can read every sandbox's
+  data, but that's the same trust assumption as everything else the
+  orchestrator does (selecting profiles, transferring credentials, etc).
+
+A regression test (`MultipassStagingPermsTests`) verifies the staging
+root's permissions don't drift back to default 0755.
 
 ## What this does not protect against
 

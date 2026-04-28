@@ -49,6 +49,23 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         _log = log;
         _stagingRoot = ResolveStagingRoot(opts);
         Directory.CreateDirectory(_stagingRoot);
+        // 0700 on the staging root: only the orchestrator user can read or
+        // list its contents. Per-sandbox subdirs sit under here, each
+        // containing their own host bind-mount sources and cloud-init files.
+        // Without this, default 0755 perms would let other host users walk
+        // every sandbox's staging dir.
+        TryChmod0700(_stagingRoot);
+    }
+
+    private static void TryChmod0700(string path)
+    {
+        if (OperatingSystem.IsWindows()) return;
+        try
+        {
+            File.SetUnixFileMode(path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        catch { /* best-effort: not all filesystems honour mode bits */ }
     }
 
     /// <summary>
@@ -85,6 +102,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         var name = $"codeybox-{Guid.NewGuid():N}"[..23]; // multipass max name length is 24
         var sandboxRoot = Path.Combine(_stagingRoot, name);
         Directory.CreateDirectory(sandboxRoot);
+        // Lock down per-sandbox dir to operator-only. Defence in depth:
+        // even if the orchestrator's path handling has a bug that crosses
+        // sandbox roots, OS perms prevent another user (or another
+        // process not running as us) from reading another sandbox's data.
+        TryChmod0700(sandboxRoot);
 
         // Pre-create host directories for tmpfs-equivalent mounts so we can
         // bind-mount them into the VM after launch.
@@ -95,6 +117,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             {
                 var hostPath = Path.Combine(sandboxRoot, "fs" + m.SandboxPath.Replace('/', '-'));
                 Directory.CreateDirectory(hostPath);
+                TryChmod0700(hostPath);
                 bindMounts.Add((hostPath, m.SandboxPath));
             }
             else if (m.HostPath is not null)

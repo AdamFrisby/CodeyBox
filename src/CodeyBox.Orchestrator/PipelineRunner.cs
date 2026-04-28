@@ -105,7 +105,9 @@ public sealed class PipelineRunner
             {
                 workCts.CancelAfter(item.WorkTimeout);
                 await RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                    item.Prompt, isInitial: true, workCts.Token);
+                    item.Prompt, isInitial: true,
+                    networkProfile: project.NetworkProfiles.Work,
+                    workCts.Token);
             }
             await Transition(item, WorkItemState.WorkComplete, ct);
 
@@ -131,7 +133,9 @@ public sealed class PipelineRunner
             using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 mergeCts.CancelAfter(item.MergeTimeout);
-                mergeSha = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch, mergeCts.Token);
+                mergeSha = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
+                    networkProfile: project.NetworkProfiles.Merge,
+                    mergeCts.Token);
             }
             await _prs.MarkMergedAsync(pr.Id, mergeSha, ct);
             await Transition(item, WorkItemState.Merged, ct);
@@ -182,11 +186,12 @@ public sealed class PipelineRunner
         string branch,
         string prompt,
         bool isInitial,
+        string? networkProfile,
         CancellationToken ct)
     {
         var credential = await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
-        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true);
+        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true, hostNetworkProfile: networkProfile);
 
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
 
@@ -267,7 +272,9 @@ public sealed class PipelineRunner
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
             await RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
-                reworkPrompt, isInitial: false, reworkCts.Token);
+                reworkPrompt, isInitial: false,
+                networkProfile: project.NetworkProfiles.Rework,
+                reworkCts.Token);
         }
     }
 
@@ -289,7 +296,11 @@ public sealed class PipelineRunner
 
             AgentCredential? credential = needsCreds ? await _credentials.GetAsync(runner.Kind, ct) : null;
             var access = _gitHost.GetSandboxAccess(repoId);
-            var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork);
+            // Tool-only auditors get the project's "audit-tool" profile
+            // (typically isolated/no-egress); LLM-driven auditors get the
+            // "audit-agent" profile (typically same as the work profile).
+            var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
+            var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork, hostNetworkProfile: profile);
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
@@ -330,11 +341,12 @@ public sealed class PipelineRunner
         string repoId,
         string baseBranch,
         string workBranch,
+        string? networkProfile,
         CancellationToken ct)
     {
         var credential = await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
-        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true);
+        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true, hostNetworkProfile: networkProfile);
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
@@ -464,7 +476,11 @@ public sealed class PipelineRunner
         }
     }
 
-    private SandboxSpec BuildSandboxSpec(SandboxRepositoryAccess access, AgentCredential? includeAgentCredential, bool allowAgentNetwork)
+    private SandboxSpec BuildSandboxSpec(
+        SandboxRepositoryAccess access,
+        AgentCredential? includeAgentCredential,
+        bool allowAgentNetwork,
+        string? hostNetworkProfile = null)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
@@ -489,6 +505,7 @@ public sealed class PipelineRunner
         {
             AllowedHosts = allowedHosts,
             HostGitEndpoint = access.Network.HostGitEndpoint,
+            ProfileName = hostNetworkProfile,
         };
 
         return new SandboxSpec

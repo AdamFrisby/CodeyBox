@@ -57,8 +57,19 @@ public sealed class ProjectRepository : IProjectRepository
             DefaultAgent = ParseAgent(pc.Agent ?? defaults.Agent),
             Upstream = ResolveUpstream(pc.Upstream),
             Audit = ResolveAudit(pc.Audit, defaults.Audit),
+            NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),
         };
     }
+
+    private static ProjectNetworkProfiles ResolveNetworkProfiles(ProjectNetworkProfilesConfig? project, ProjectNetworkProfilesConfig? defaults) => new()
+    {
+        // Shallow merge per-field: project wins, defaults fill gaps.
+        Work = project?.Work ?? defaults?.Work,
+        Rework = project?.Rework ?? defaults?.Rework ?? project?.Work ?? defaults?.Work,
+        AuditAgent = project?.AuditAgent ?? defaults?.AuditAgent,
+        AuditTool = project?.AuditTool ?? defaults?.AuditTool,
+        Merge = project?.Merge ?? defaults?.Merge,
+    };
 
     private static AgentKind ParseAgent(string? value)
         => string.IsNullOrWhiteSpace(value) ? AgentKind.Claude : new AgentKind(value);
