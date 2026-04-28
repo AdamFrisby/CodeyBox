@@ -158,7 +158,13 @@ builder.Services.AddSingleton<IPresetCatalog, PresetCatalog>();
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Webhooks ----------------------------------------------------------------
-builder.Services.AddHttpClient();
+// AllowAutoRedirect=false prevents SSRF via HTTP 3xx redirects to private
+// addresses that bypass the blocklist in ValidateWebhookUrl.
+builder.Services.AddHttpClient("webhook")
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false,
+    });
 builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;

@@ -144,7 +144,7 @@ Add a `Webhooks` array inside the `CodeyBox` config section. Each entry configur
       },
       {
         "Name": "audit-log",
-        "Url": "https://audit.internal/codeybox",
+        "Url": "https://audit.example.com/codeybox",
         "SecretEnvVar": "WEBHOOK_SECRET_AUDIT",
         "MaxAttempts": 5,
         "InitialBackoffSeconds": 2,

@@ -99,7 +99,7 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
             try
             {
                 using var request = BuildRequest(ep, evt, bodyBytes, signature);
-                using var client = _httpClientFactory.CreateClient();
+                using var client = _httpClientFactory.CreateClient("webhook");
                 client.Timeout = TimeSpan.FromSeconds(ep.TimeoutSeconds);
 
                 using var response = await client.SendAsync(request, ct);
