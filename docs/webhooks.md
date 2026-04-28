@@ -41,6 +41,7 @@ Every event is a JSON object POSTed as the request body.
     "projectId": "my-project",
     "title": "Add dark-mode support",
     "agent": "claude",
+    "repositoryUrl": "https://github.com/example/repo",
     "baseBranch": "main",
     "workBranch": "codeybox/a1b2c3d4",
     "state": "AuditPassed",

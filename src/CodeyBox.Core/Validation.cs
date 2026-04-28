@@ -82,7 +82,7 @@ public static partial class Validation
         if (string.IsNullOrEmpty(host))
             throw new ArgumentException($"{fieldName} must have a non-empty host", fieldName);
 
-        // Reject well-known internal hostnames (DNS-resolution not performed)
+        // Reject well-known internal hostnames
         if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
             host.Equals("metadata.google.internal", StringComparison.OrdinalIgnoreCase) ||
             host.EndsWith(".internal", StringComparison.OrdinalIgnoreCase) ||
@@ -94,6 +94,31 @@ public static partial class Validation
         if (IPAddress.TryParse(host, out var ipAddr) && IsRestrictedAddress(ipAddr))
             throw new ArgumentException(
                 $"{fieldName} must not point to a private, loopback, or reserved IP address", fieldName);
+
+        // Resolve non-IP hostnames and reject those that map to private/reserved addresses.
+        // This prevents DNS-rebinding bypasses such as 169-254-169-254.nip.io → 169.254.169.254.
+        // DNS failures are allowed through — the downstream HTTP client will fail safely.
+        if (!IPAddress.TryParse(host, out _))
+        {
+            try
+            {
+                var addresses = Dns.GetHostAddresses(host);
+                foreach (var addr in addresses)
+                {
+                    if (IsRestrictedAddress(addr))
+                        throw new ArgumentException(
+                            $"{fieldName} hostname '{host}' resolves to a private or reserved address", fieldName);
+                }
+            }
+            catch (ArgumentException)
+            {
+                throw;
+            }
+            catch (SocketException)
+            {
+                // DNS resolution failed — allow; downstream HTTP call will fail if unreachable
+            }
+        }
     }
 
     private static bool IsRestrictedAddress(IPAddress addr)

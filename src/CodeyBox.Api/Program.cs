@@ -180,6 +180,8 @@ builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
             throw new InvalidOperationException($"Webhook endpoint Name '{w.Name}' must not contain control characters");
         if (!seenNames.Add(w.Name))
             throw new InvalidOperationException($"Webhook endpoint Name '{w.Name}' is not unique");
+        if (w.SecretEnvVar is not null && w.SecretEnvVar.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+            throw new InvalidOperationException($"Webhooks[{w.Name}].SecretEnvVar must not contain control characters");
         Validation.ValidateWebhookUrl(w.Url, $"Webhooks[{w.Name}].Url");
         if (w.MaxAttempts < 1)
             throw new InvalidOperationException($"Webhooks[{w.Name}].MaxAttempts must be >= 1");

@@ -93,12 +93,13 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
 
         var backoff = TimeSpan.FromSeconds(ep.InitialBackoffSeconds);
         HttpStatusCode? lastStatus = null;
+        string? lastErrorMessage = null;
 
         for (var attempt = 1; attempt <= ep.MaxAttempts; attempt++)
         {
             try
             {
-                using var request = BuildRequest(ep, evt, bodyBytes, signature);
+                var request = BuildRequest(ep, evt, bodyBytes, signature);
                 using var client = _httpClientFactory.CreateClient("webhook");
                 client.Timeout = TimeSpan.FromSeconds(ep.TimeoutSeconds);
 
@@ -107,12 +108,14 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
                     return;
 
                 lastStatus = response.StatusCode;
+                lastErrorMessage = null;
                 _log.LogWarning(
                     "Webhook {Endpoint} returned {Status} for delivery {DeliveryId} event {Event} (attempt {Attempt}/{Max})",
                     ep.Name, (int)response.StatusCode, evt.DeliveryId, evt.Event, attempt, ep.MaxAttempts);
             }
             catch (Exception ex)  // ct is always CancellationToken.None; swallow all transient failures including timeouts
             {
+                lastErrorMessage = ex.Message;
                 _log.LogWarning(ex,
                     "Webhook {Endpoint} threw on delivery {DeliveryId} event {Event} (attempt {Attempt}/{Max})",
                     ep.Name, evt.DeliveryId, evt.Event, attempt, ep.MaxAttempts);
@@ -121,9 +124,14 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
             if (attempt < ep.MaxAttempts)
                 await Task.Delay(backoff, ct);
             else
+            {
+                var lastFailure = lastStatus.HasValue
+                    ? $"HTTP {(int)lastStatus.Value}"
+                    : (lastErrorMessage ?? "unknown error");
                 _log.LogWarning(
-                    "Webhook {Endpoint} gave up after {Max} attempts for event {Event} delivery {DeliveryId}; last status {Status}",
-                    ep.Name, ep.MaxAttempts, evt.Event, evt.DeliveryId, lastStatus.HasValue ? (int)lastStatus.Value : 0);
+                    "Webhook {Endpoint} gave up after {Max} attempts for event {Event} delivery {DeliveryId}; last failure: {LastFailure}",
+                    ep.Name, ep.MaxAttempts, evt.Event, evt.DeliveryId, lastFailure);
+            }
 
             backoff = TimeSpan.FromTicks(backoff.Ticks * 2);
         }
@@ -147,24 +155,25 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
 
     public static string BuildPayload(WebhookEvent evt)
     {
+        var repoUrl = StripUserInfo(evt.Project.RepositoryUrl);
         var payload = new WebhookPayload(
             Event: evt.Event,
             OccurredAt: evt.OccurredAt,
-            WorkItem: MapWorkItem(evt.WorkItem, evt.Project.RepositoryUrl),
+            WorkItem: MapWorkItem(evt.WorkItem, repoUrl, evt.Project.DefaultAgent),
             Project: new WebhookProjectPayload(
                 evt.Project.Id.Value,
                 evt.Project.DisplayName,
-                evt.Project.RepositoryUrl),
+                repoUrl),
             Details: evt.Details);
 
         return JsonSerializer.Serialize(payload, JsonOptions);
     }
 
-    private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string repositoryUrl) => new(
+    private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string repositoryUrl, AgentKind projectDefaultAgent) => new(
         Id: item.Id.ToString(),
         ProjectId: item.ProjectId.Value,
         Title: item.Title,
-        Agent: (item.Agent ?? AgentKind.Claude).Value,
+        Agent: (item.Agent ?? projectDefaultAgent).Value,
         RepositoryUrl: repositoryUrl,
         BaseBranch: item.BaseBranch,
         WorkBranch: item.WorkBranch,
@@ -173,6 +182,13 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
         UpdatedAt: item.UpdatedAt,
         LastError: item.LastError,
         UpstreamPushAttempts: item.UpstreamPushAttempts);
+
+    private static string StripUserInfo(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.UserInfo))
+            return url;
+        return $"{uri.Scheme}://{uri.Host}{(uri.IsDefaultPort ? "" : $":{uri.Port}")}{uri.AbsolutePath}{uri.Query}{uri.Fragment}";
+    }
 
     public static string ComputeSignature(byte[] bodyBytes, string secret)
     {

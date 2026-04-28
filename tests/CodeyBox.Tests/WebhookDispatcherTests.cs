@@ -282,7 +282,12 @@ internal sealed class RecordingHandler : HttpMessageHandler
 
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
-        lock (_captured) _captured.Add(request);
+        // Snapshot into a new message so tests can read headers and URI safely
+        // after the caller disposes the original request.
+        var snapshot = new HttpRequestMessage(request.Method, request.RequestUri);
+        foreach (var (name, values) in request.Headers)
+            snapshot.Headers.TryAddWithoutValidation(name, values);
+        lock (_captured) _captured.Add(snapshot);
         return Task.FromResult(new HttpResponseMessage(_statusCode));
     }
 }
