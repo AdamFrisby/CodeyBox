@@ -108,9 +108,22 @@ group dance (multipass handles its own KVM access). Confirm with
   viable internet path is via the chosen bridge — and that bridge's
   egress is filtered in the host kernel, where the agent (even with
   sudo inside the VM) cannot touch it.
+* **Cloud-init route swap.** The provider's cloud-init pushes the VM's
+  default route over to the secondary NIC (the chosen `cb-*` bridge)
+  at first boot. Without this, Linux defaults to the first NIC
+  (mpqemubr0 → blocked at host) and traffic times out. The route swap
+  itself runs in-VM and is therefore reversible by a privileged agent;
+  reverting it just sends traffic back to mpqemubr0 where the host's
+  drop rule kills it (self-DOS, not a bypass).
 * **In-VM advisory firewall** is also installed as defence-in-depth.
   An agent with sudo can disable it; the host bridge filtering is the
   real boundary.
+* **IPv4-only enforcement.** The host's `cb-*` chains accept by
+  IPv4 destination IP only. IPv6 traffic on the `cb-*` bridges falls
+  through to `drop`. This is safe (default-deny) but causes a
+  several-second delay when clients try IPv6 first then fall back —
+  curl, `getent hosts`, etc. If you need IPv6 reachability, extend
+  setup-host-networks.sh to resolve and emit `ip6 daddr` rules.
 * **Image bring-up.** First launch downloads the default Ubuntu image
   (~600 MB) to the multipass cache. Subsequent launches reuse it.
 

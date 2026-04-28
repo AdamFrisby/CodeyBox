@@ -23,16 +23,34 @@ This document describes how to set up the host-side enforcement.
 3. **At sandbox creation**, the orchestrator passes
    `--network <bridge>` to `multipass launch` based on the profile the
    work-item phase needs. The VM ends up with two NICs:
-   - `eth0` on `mpqemubr0` — used by Multipass's control plane (host →
-     guest agent for `exec`, `mount`, `transfer`). Forward traffic on
-     this bridge is dropped by host nftables, so it can't reach
-     internet.
-   - `eth1` on the chosen `cb-*` bridge — the only viable path
-     to the outside, with the bridge's host-side filtering applied.
+   - First NIC on `mpqemubr0` — used by Multipass's control plane
+     (host → guest agent for `exec`, `mount`, `transfer`). Forward
+     traffic on this bridge is dropped by host nftables, so it can't
+     reach the internet.
+   - Second NIC on the chosen `cb-*` bridge — the only viable path
+     out, with the bridge's host-side filtering applied.
+4. **The orchestrator's cloud-init runs a one-shot route swap at first
+   boot** that detects which interface has an IP in the `10.99.0.0/16`
+   profile-bridge range and sets it as the default route. Without this,
+   Linux defaults to the first NIC (mpqemubr0 → blocked) and the agent's
+   traffic dies before reaching our filtered bridge.
 
 A compromised agent doing `sudo iptables -F` inside the VM affects
 nothing — the drops happen in the host kernel, on bridges the agent
-has no view into.
+has no view into. A compromised agent restoring the default route to
+mpqemubr0 (`sudo ip route ...`) just self-DOSes — that traffic still
+hits the host nftables drop and times out.
+
+### IPv4 only
+
+The `setup-host-networks.sh` script writes `ip daddr ...` rules — IPv4
+only. Traffic to IPv6 destinations is currently blocked at the host
+because the `cb-*` chains have no `ip6 daddr accept` rules and end with
+`drop`. That's the safe-default, but it has a visible cost: clients
+that try IPv6 first (curl with happy-eyeballs, `getent hosts`) take
+several seconds to fall back to IPv4. If you need IPv6 reachability,
+extend the script to resolve `ahostsv6` and emit `ip6 daddr ... accept`
+rules per allowed host.
 
 ## Operator setup
 

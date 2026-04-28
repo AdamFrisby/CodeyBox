@@ -26,6 +26,68 @@ Each finding lists:
 
 ## Findings
 
+### V — Egress enforcement is host-side, not in-VM  &nbsp; *MEDIUM-impact, FIXED*
+
+**Where:** Multipass provider + `scripts/setup-host-networks.sh` +
+`docs/host-firewall.md`.
+
+Earlier iterations relied on iptables rules running INSIDE the VM via
+cloud-init's systemd-firewall service. Adam pointed out the obvious:
+that's voluntary — an agent with `sudo` can `iptables -F` and the rules
+are gone. In-VM enforcement against an in-VM root user is theatre.
+
+**Fix:** real enforcement now lives on the host:
+
+1. The operator runs `scripts/setup-host-networks.sh` once. It creates
+   per-profile Linux bridges (`cb-iso`, `cb-claude`, `cb-multi-llm`, …)
+   via systemd-networkd, each with its own subnet under 10.99.0.0/16
+   and DHCP server. It writes nftables rules that:
+   - Drop ALL forward traffic on Multipass's default `mpqemubr0` bridge.
+     The default NIC every Multipass VM gets has no path to the
+     internet.
+   - Per cb-bridge: accept loopback, established/related, DNS, and the
+     resolved IPs of the configured allowed hosts. Default-deny end of
+     chain.
+
+2. The orchestrator launches each VM with `--network <bridge>` based on
+   the project's per-phase `NetworkProfiles`. The VM's only viable path
+   to the internet is via the chosen bridge.
+
+3. The orchestrator's cloud-init runs a one-shot route swap at first
+   boot that points the default route at the secondary NIC. Without
+   this, Linux picks the primary NIC (mpqemubr0 → blocked) by default.
+
+4. The in-VM iptables firewall remains as defence-in-depth, explicitly
+   labelled advisory. Removing it doesn't matter because host
+   nftables on the bridges still drop disallowed traffic.
+
+**Why this works against a hostile agent:**
+- `sudo iptables -F` inside the VM: doesn't touch host nftables.
+- `sudo ip route ...` to revert the route swap: traffic returns to
+  mpqemubr0, where the host's drop rule kills it. Self-DOS, not bypass.
+- VM kernel exploit: the VM has its own kernel (separate from host),
+  this is the entire reason we use Multipass / kernel isolation.
+- Compromised orchestrator process: this is a trust boundary we can't
+  defend against; same assumption as elsewhere.
+
+**Verified end-to-end on a real Ubuntu 25.10 host**: launching a VM
+on the `cb-claude` profile and curling `1.1.1.1` (not allowlisted) →
+times out (blocked); curling `api.anthropic.com` (allowlisted) →
+succeeds. Captured in `local/verify-host-firewall.sh` for
+reproducibility.
+
+**Known limitation: IPv4-only.** The `cb-*` chains accept by IPv4
+destination only. IPv6 traffic falls through to drop. This is safe
+(default-deny) but causes a ~5s curl delay when happy-eyeballs tries
+v6 first. Extend `setup-host-networks.sh` with `ip6 daddr` rules if
+your deployment needs IPv6.
+
+**Known limitation: nftables setup needs sudo at install time.**
+There's no way around this on Linux without elevated privileges.
+The trade-off is deliberate — operator runs `setup-host-networks.sh`
+once with sudo at install time, the orchestrator runs unprivileged
+forever after.
+
 ### U — Merge sandbox now carries agent credentials  &nbsp; *MEDIUM, ACCEPTED*
 
 **Where:** `src/CodeyBox.Orchestrator/PipelineRunner.cs::RunAgentMergePhaseAsync`
