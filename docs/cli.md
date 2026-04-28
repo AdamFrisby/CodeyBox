@@ -40,16 +40,34 @@ See [projects.md](projects.md) for what each preset runs.
 
 ### Network profile names
 
-The wizard presents a selection of four built-in profile names (`claude`,
+By default the wizard presents the four built-in profile names (`claude`,
 `isolated`, `internet`, `internet-only`) plus a *skip* option. Skip means
-the phase inherits its profile from `Defaults.NetworkProfiles`. To use a
-custom profile defined in `SandboxNetworkProfiles`, edit the generated
-JSON snippet directly before pasting it into `appsettings.json`.
+the phase inherits its profile from `Defaults.NetworkProfiles`.
+
+To present your own custom profile names instead, set the
+`CODEYBOX_NETWORK_PROFILES` environment variable to a comma-separated list
+before running the wizard:
+
+```bash
+CODEYBOX_NETWORK_PROFILES=claude,restricted,outbound \
+  dotnet run --project src/CodeyBox.Cli
+```
+
+The names must match keys you have configured in `SandboxNetworkProfiles`
+in `appsettings.json`.
 
 ## Output
 
-After all prompts the wizard prints the generated JSON and optionally
-writes it to a file you specify:
+After all prompts the wizard prints the generated JSON. In an interactive
+terminal it renders inside a styled panel. When stdout is redirected the
+wizard writes plain JSON, making it safe to capture directly:
+
+```bash
+dotnet run --project src/CodeyBox.Cli > snippet.json
+```
+
+The wizard also offers to write the JSON to a file of your choice before
+exiting. Example output:
 
 ```json
 {

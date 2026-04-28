@@ -21,7 +21,8 @@ var projectId = AnsiConsole.Prompt(
         }));
 
 // ── Display name ──────────────────────────────────────────────────────────────
-var displayName = AnsiConsole.Ask<string>("[bold yellow]Display name[/]:");
+var displayName = AnsiConsole.Prompt(
+    new TextPrompt<string>("[bold yellow]Display name[/]:").PromptStyle("green"));
 
 // ── Repository URL ────────────────────────────────────────────────────────────
 var repositoryUrl = AnsiConsole.Prompt(
@@ -31,6 +32,8 @@ var repositoryUrl = AnsiConsole.Prompt(
         {
             if (string.IsNullOrWhiteSpace(url) || url[0] == '-')
                 return ValidationResult.Error("Enter a non-empty URL that does not start with '-'.");
+            if (url.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+                return ValidationResult.Error("URL must not contain control characters.");
             if (url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
                 url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
                 url.StartsWith("git@", StringComparison.OrdinalIgnoreCase) ||
@@ -46,9 +49,15 @@ var baseBranch = AnsiConsole.Prompt(
         .DefaultValue("main")
         .Validate(branch =>
         {
+            if (branch.Contains("..", StringComparison.Ordinal))
+                return ValidationResult.Error("Branch name must not contain '..'.");
+            if (branch.EndsWith(".lock", StringComparison.Ordinal))
+                return ValidationResult.Error("Branch name must not end with '.lock'.");
             if (Wizard.BranchNameRegex().IsMatch(branch))
                 return ValidationResult.Success();
-            return ValidationResult.Error("Branch name must be 1–200 chars containing only letters, digits, '.', '_', '/', or '-'.");
+            return ValidationResult.Error(
+                "Branch name must start with a letter or digit, be 1–200 chars, " +
+                "and contain only letters, digits, '.', '_', '/', or '-'.");
         }));
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
@@ -95,13 +104,26 @@ var selectedAuditTypes = AnsiConsole.Prompt(
         .AddChoices("security", "architecture", "quality", "completeness", "cheating", "tests"));
 
 // ── Network profiles ──────────────────────────────────────────────────────────
+// Profile names come from CODEYBOX_NETWORK_PROFILES (comma-separated) when
+// the operator has defined custom profiles in SandboxNetworkProfiles; falls
+// back to the four built-in names if the env var is not set.
 AnsiConsole.WriteLine();
 AnsiConsole.MarkupLine("[bold yellow]Network profiles[/] [dim](per-phase; skip to inherit from Defaults)[/]:");
-AnsiConsole.MarkupLine("[dim]Available built-ins: claude · isolated · internet · internet-only[/]");
+
+string[] builtInProfiles = ["claude", "isolated", "internet", "internet-only"];
+var envProfiles = Environment.GetEnvironmentVariable("CODEYBOX_NETWORK_PROFILES");
+string[] availableProfiles = envProfiles is { Length: > 0 }
+    ? envProfiles.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    : builtInProfiles;
+
+var profileHint = envProfiles is { Length: > 0 }
+    ? $"[dim]Profiles (from CODEYBOX_NETWORK_PROFILES): {string.Join(" · ", availableProfiles)}[/]"
+    : "[dim]Available built-ins: claude · isolated · internet · internet-only[/]";
+AnsiConsole.MarkupLine(profileHint);
 AnsiConsole.WriteLine();
 
 const string SkipChoice = "(skip — use default)";
-string[] profileChoices = [SkipChoice, "claude", "isolated", "internet", "internet-only"];
+string[] profileChoices = [SkipChoice, .. availableProfiles];
 string[] pipelinePhases = ["Work", "Rework", "AuditAgent", "AuditTool", "Merge"];
 var phaseProfiles = new Dictionary<string, string?>(pipelinePhases.Length);
 
@@ -160,13 +182,23 @@ var jsonOptions = new JsonSerializerOptions
 var json = JsonSerializer.Serialize(entry, jsonOptions);
 
 // ── Display result ────────────────────────────────────────────────────────────
-AnsiConsole.WriteLine();
-AnsiConsole.Write(new Rule("[bold green]Generated entry[/]").RuleStyle(new Style(Color.Green)));
-AnsiConsole.WriteLine();
-AnsiConsole.Write(
-    new Panel(new Text(json))
-        .Header("Paste into CodeyBox.Projects[] in appsettings.json")
-        .Expand());
+// When stdout is redirected (e.g. `dotnet run ... > snippet.json`), write
+// plain JSON so the captured file is valid JSON. In an interactive terminal,
+// render the fancy panel instead.
+if (Console.IsOutputRedirected)
+{
+    Console.WriteLine(json);
+}
+else
+{
+    AnsiConsole.WriteLine();
+    AnsiConsole.Write(new Rule("[bold green]Generated entry[/]").RuleStyle(new Style(Color.Green)));
+    AnsiConsole.WriteLine();
+    AnsiConsole.Write(
+        new Panel(new Text(json))
+            .Header("Paste into CodeyBox.Projects[] in appsettings.json")
+            .Expand());
+}
 
 // ── Save to file ──────────────────────────────────────────────────────────────
 AnsiConsole.WriteLine();
@@ -211,13 +243,35 @@ internal static partial class Wizard
     [GeneratedRegex(@"^[A-Za-z0-9_\-]{1,64}$")]
     internal static partial Regex ProjectIdRegex();
 
-    [GeneratedRegex(@"^[A-Za-z0-9._/\-]{1,200}$")]
+    // First char must be alphanumeric (mirrors Validation.ValidateBranchName).
+    // Callers also check for ".." and ".lock" explicitly.
+    [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,199}$")]
     internal static partial Regex BranchNameRegex();
 
     internal static UpstreamEntry BuildGitHubUpstream()
     {
-        var owner = AnsiConsole.Ask<string>("  [bold]GitHub owner[/] (user or org):");
-        var repo = AnsiConsole.Ask<string>("  [bold]GitHub repository[/] name:");
+        var owner = AnsiConsole.Prompt(
+            new TextPrompt<string>("  [bold]GitHub owner[/] (user or org):")
+                .PromptStyle("green")
+                .Validate(o =>
+                {
+                    if (string.IsNullOrWhiteSpace(o) || o[0] == '-')
+                        return ValidationResult.Error("Owner must not be empty or start with '-'.");
+                    if (o.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+                        return ValidationResult.Error("Owner must not contain control characters.");
+                    return ValidationResult.Success();
+                }));
+        var repo = AnsiConsole.Prompt(
+            new TextPrompt<string>("  [bold]GitHub repository[/] name:")
+                .PromptStyle("green")
+                .Validate(r =>
+                {
+                    if (string.IsNullOrWhiteSpace(r) || r[0] == '-')
+                        return ValidationResult.Error("Repository must not be empty or start with '-'.");
+                    if (r.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+                        return ValidationResult.Error("Repository must not contain control characters.");
+                    return ValidationResult.Success();
+                }));
         var tokenVar = AnsiConsole.Ask<string>("  [bold]Token env var[/] (env var holding the PAT):");
         return new UpstreamEntry
         {
@@ -235,9 +289,18 @@ internal static partial class Wizard
                 .PromptStyle("green")
                 .Validate(u =>
                 {
-                    if (!string.IsNullOrWhiteSpace(u) && u[0] != '-')
+                    if (string.IsNullOrWhiteSpace(u) || u[0] == '-')
+                        return ValidationResult.Error("Enter a non-empty URL that does not start with '-'.");
+                    if (u.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+                        return ValidationResult.Error("URL must not contain control characters.");
+                    if (u.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
+                        u.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                        u.StartsWith("git@", StringComparison.OrdinalIgnoreCase) ||
+                        u.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) ||
+                        Path.IsPathRooted(u))
                         return ValidationResult.Success();
-                    return ValidationResult.Error("Enter a non-empty URL that does not start with '-'.");
+                    return ValidationResult.Error(
+                        "Must start with https://, http://, git@, ssh://, or be an absolute filesystem path.");
                 }));
         var tokenVar = AnsiConsole.Prompt(
             new TextPrompt<string>("  [bold]Token env var[/] [dim](optional — press Enter to skip)[/]:")
