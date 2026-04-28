@@ -156,8 +156,17 @@ networkProfiles:
   rework:      claude              # explicit override; falls back to Work if omitted
   auditAgent:  claude              # LLM auditors (architecture, security review, …)
   auditTool:   isolated            # tool-only auditors (linters, scanners — no LLM API needed)
-  merge:       claude-with-tests   # merge agent; pick a profile that allows test-suite egress if your tests reach the network
+  merge:       internet-only       # merge agent; pick a profile that allows test-suite egress if your tests reach the network
 ```
+
+The host-side `networks.conf` accepts three profile modes (full
+discussion in [`host-firewall.md`](host-firewall.md)):
+
+| Mode             | Egress                                                                | Use case                                                          |
+|------------------|-----------------------------------------------------------------------|-------------------------------------------------------------------|
+| `-`              | None (DNS + loopback + established only).                             | Tool-only audits, deterministic merge phases, gitops sandboxes.   |
+| `internet`       | Block RFC1918 / link-local / cloud-metadata / loopback / multicast; accept the rest. | "Wide reach but no LAN attacks" — agent can hit any external service but can't pivot to your home/office network or cloud-metadata endpoints. |
+| `host1,host2,…`  | Strict hostname allowlist; resolved to IPv4 IPs at setup time.        | Production agents bound to known APIs (e.g. `api.anthropic.com`). |
 
 **Why per-project, per-phase**: project A's tests might hit a staging
 API at merge time and need network; project B's merge phase wants to be

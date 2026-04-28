@@ -45,13 +45,18 @@ See [`audit.md`](audit.md) for the audit phase in detail.
 | Component                    | Lives in           | Trusts             | Holds upstream creds? | Holds agent API keys? |
 |------------------------------|--------------------|--------------------|-----------------------|-----------------------|
 | Orchestrator (REST + workers)| Host               | Host OS only       | **Yes**               | Yes (to inject)       |
-| Work sandbox                 | VM (Firecracker)   | Nothing            | No                    | Yes (only its own)    |
-| Merge sandbox                | VM (Firecracker)   | Nothing            | No                    | **No**                |
+| Work / Rework sandbox        | VM (Multipass/KVM) | Nothing            | No                    | Yes (only its own)    |
+| Audit-tool sandbox           | VM (Multipass/KVM) | Nothing            | No                    | **No**                |
+| Audit-LLM / Merge sandbox    | VM (Multipass/KVM) | Nothing            | No                    | Yes (only its own)    |
 | Host git server              | Host (or sidecar)  | Sandbox network    | No                    | No                    |
 | Upstream remote (e.g. GitHub)| External           | —                  | —                     | —                     |
 
-The merge sandbox deliberately gets no agent credentials: a compromised agent
-output cannot exfiltrate secrets via the merge phase.
+The merge phase is **agent-driven**: it gets agent credentials so the
+agent can resolve merge conflicts and run the project's test suite. The
+orchestrator verifies merge state (head matches the expected post-merge
+SHA, working tree is clean) before allowing phase 4. The egress reduction
+that protects the merge phase against exfiltration is the project's
+`merge` network profile — typically the same as `work`, or stricter.
 
 ## State machine
 
@@ -104,15 +109,16 @@ intent is that you can swap any of these without touching the orchestrator:
 * **Upstream is a second tier.** Pushing to GitHub failing shouldn't poison
   the local result. The local bare repo is the source of truth; upstream is
   replication.
-* **Credentials follow least privilege.** Each sandbox sees only the minimum
-  it needs. The merge sandbox sees no agent secrets at all. Upstream creds
-  live only in the orchestrator process.
+* **Credentials follow least privilege.** Each sandbox sees only the
+  minimum it needs. Tool-only audit sandboxes see no agent secrets.
+  Upstream creds live only in the orchestrator process and never cross
+  the sandbox boundary.
 
 ## What's not built yet
 
-* The Kata and crun-vm sandbox providers are skeletons. The interface and the
-  rest of the pipeline are real.
-* No tests yet — the next thing to add is a couple of integration tests that
-  exercise the Process provider end-to-end against a local bare repo.
-* The Gitea / GitHub-PR upstream variant currently pushes the merged branch
-  directly; opening a real upstream PR is a future enhancement.
+* The Gitea / GitHub-PR upstream variant currently pushes the merged
+  branch directly; opening a real upstream PR is a future enhancement.
+* `scripts/setup-host-networks.sh` resolves hostnames at setup time and
+  writes IP rules. CDN rotation past resolved IPs fails closed (correct
+  direction); for high-stakes use, swap the per-profile chain for an
+  allowlist-aware proxy (squid, mitmproxy with hostname allowlist).

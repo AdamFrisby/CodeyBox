@@ -9,25 +9,35 @@ shepherd state.
 ## Why
 
 Plain containers share the host kernel; an agent that finds a Linux LPE
-escapes into the host. CodeyBox runs each agent inside a Firecracker
-microVM (via Kata Containers or crun-vm/libkrun) so a guest kernel exploit
-doesn't reach the host. Credentials are tiered: each sandbox sees only what
-it needs, and upstream remote credentials (e.g. a GitHub PAT) live only in
-the orchestrator process and are never visible to any sandbox.
+escapes into the host. CodeyBox runs each agent inside a real VM — the
+recommended provider is **Multipass** (KVM-backed, single-package install)
+— so a guest kernel exploit doesn't reach the host. Egress is enforced on
+the *host* via per-profile nftables bridges, so a compromised agent with
+sudo cannot disable its own network policy. Credentials are tiered: each
+sandbox sees only what it needs, and upstream remote credentials (e.g. a
+GitHub PAT) live only in the orchestrator process and are never visible to
+any sandbox.
 
 ## Pipeline
 
-For each work item:
+For each work item, the orchestrator resolves the project's per-phase
+network profile and spawns a fresh sandbox:
 
 1. **Work sandbox** clones the host bare repo, runs the agent, commits, and
    pushes a feature branch.
-2. **Merge sandbox** (separate VM, no agent credentials) clones, merges the
-   feature branch, and pushes the target branch.
-3. **Upstream push** (host, no sandbox) replicates the target branch to
+2. **Audit + rework loop** (skipped if no auditors are registered) runs
+   tool auditors in a credential-free sandbox and LLM auditors in a
+   sandbox with agent credentials. On failure the agent reworks; on
+   convergence we proceed.
+3. **Merge sandbox** runs the agent against the merge — `git merge` is the
+   nominal path, but the agent can resolve conflicts and run the project's
+   tests if the project's `merge` network profile allows it. The
+   orchestrator verifies merge state before pushing.
+4. **Upstream push** (host, no sandbox) replicates the target branch to
    GitHub (or any git URL).
 
-Phases 1 and 2 together are the atomic unit: failure of either marks the
-item failed. Phase 3 is retried independently.
+Phases 1–3 together are the atomic unit: failure of any of them marks the
+item failed. Phase 4 is retried independently.
 
 ## Status
 
@@ -74,15 +84,28 @@ export CODEYBOX_CLAUDE_API_KEY=...
 dotnet run --project src/CodeyBox.Api
 ```
 
-POST a work item:
+POST a work item (project must be configured first — see
+[`docs/projects.md`](docs/projects.md)):
 
 ```bash
 curl -X POST http://localhost:5000/workitems \
+  -H 'authorization: Bearer <CODEYBOX_API_KEY>' \
   -H 'content-type: application/json' \
   -d '{
+    "projectId": "my-app",
     "title": "demo",
     "prompt": "Add a hello.txt file with the word hello.",
-    "repositoryUrl": "/path/to/some/local/seed.git",
     "agent": "claude"
   }'
 ```
+
+## Host-side egress enforcement (recommended)
+
+For Multipass, egress filtering belongs on the host — an in-VM firewall
+can be flushed by a compromised agent with sudo. CodeyBox ships
+`scripts/setup-host-networks.sh` which (with sudo, once) creates a Linux
+bridge per network profile and writes nftables rules that drop
+everything not on the profile's allowlist. Profiles support three modes:
+no egress, "internet" (block RFC1918/link-local/cloud-metadata), or a
+specific hostname allowlist. Per-project, per-phase profile selection
+lives in project config. See [`docs/host-firewall.md`](docs/host-firewall.md).

@@ -34,33 +34,33 @@ Queue a new work item.
 
 ```json
 {
+  "projectId": "my-app",
   "title": "Add JSON config support",
   "prompt": "Add a --config flag that reads settings from a JSON file. Update README.",
-  "repositoryUrl": "https://github.com/example/widget.git",
-  "agent": "claude",
-  "baseBranch": "main",
+  "agent": null,
+  "baseBranch": null,
   "workBranch": null,
   "pushUpstream": true
 }
 ```
 
+* `projectId` — required. Must match a configured project (see
+  [`projects.md`](projects.md)). Unknown ids are rejected.
 * `title` — short label, ≤ 200 chars, no leading dash, no control chars.
 * `prompt` — what to give to the agent. ≤ 64 KB.
-* `repositoryUrl` — origin URL for seeding the host bare repo. Cloned by the
-  orchestrator (using host creds) on first reference. Must be an https/http,
-  git/ssh, or absolute filesystem path; option-like values (e.g.
-  `--upload-pack=…`) are rejected.
-* `agent` — `"claude"`, `"copilot"`, `"codex"`, or any kind registered with
-  the `IAgentRegistry`. Unknown agents are rejected with the list of
+* `agent` — optional override. `"claude"`, `"copilot"`, `"codex"`, or any
+  kind registered with the `IAgentRegistry`. Defaults to the project's
+  configured agent. Unknown agents are rejected with the list of
   available kinds.
-* `baseBranch` — defaults to the resolved default branch. Conservative
-  branch-name rules apply (ASCII alnum + `._/-`, no leading dash, no
-  `..`, no `.lock`).
+* `baseBranch` — optional override. Defaults to the project's
+  `BaseBranch` (or the resolved default branch). Conservative branch-name
+  rules apply (ASCII alnum + `._/-`, no leading dash, no `..`, no
+  `.lock`).
 * `workBranch` — defaults to `codeybox/<short id>`. Must differ from
   `baseBranch` (the merge sandbox is the agent containment boundary; a
   caller cannot bypass it by aliasing the two).
-* `pushUpstream` — if `true` *and* an upstream is configured, push to it
-  after merge.
+* `pushUpstream` — if `true` *and* the project has an upstream configured,
+  push to it after merge.
 
 Response: `201 Created` with the work item record.
 
@@ -94,9 +94,9 @@ Liveness probe. Returns `{ "status": "ok" }`.
 ```json
 {
   "id": "5b6e...",
+  "projectId": "my-app",
   "title": "...",
   "agent": "claude",
-  "repositoryUrl": "https://github.com/example/widget.git",
   "baseBranch": "main",
   "workBranch": "codeybox/5b6e7c41",
   "state": "Working",
@@ -107,8 +107,11 @@ Liveness probe. Returns `{ "status": "ok" }`.
 }
 ```
 
-`state` is one of: `Queued`, `Working`, `WorkComplete`, `Merging`, `Merged`,
-`UpstreamPushing`, `Done`, `Failed`, `Cancelled`.
+`state` is one of: `Queued`, `Working`, `WorkComplete`, `Auditing`,
+`AuditPassed`, `Reworking`, `AuditFailed`, `Merging`, `Merged`,
+`UpstreamPushing`, `Done`, `Failed`, `Cancelled`. Audit states only
+appear when the deployment has registered auditors (see
+[`audit.md`](audit.md)).
 
 ## Configuration
 
@@ -117,25 +120,35 @@ Liveness probe. Returns `{ "status": "ok" }`.
 ```json
 {
   "CodeyBox": {
+    "SandboxProvider": "multipass",
     "GitRootDirectory": "/var/lib/codeybox/repos",
     "StateDatabasePath": "/var/lib/codeybox/state.db",
     "SandboxImageReference": "codeybox/agent@sha256:…",
-    "AgentAllowedHosts": ["api.anthropic.com", "api.openai.com"],
     "Concurrency": 2,
     "UpstreamPushMaxAttempts": 5,
     "UpstreamPushBackoffSeconds": 15,
-    "Upstream": {
-      "Kind": "github",
-      "GitHubOwner": "your-org",
-      "GitHubRepository": "your-repo"
-    }
+    "SandboxNetworkProfiles": {
+      "isolated": "cb-iso",
+      "claude":   "cb-claude",
+      "internet-only": "cb-net"
+    },
+    "Defaults": { "Agent": "claude", "BaseBranch": "main" },
+    "Projects": [
+      { "Id": "my-app", "RepositoryUrl": "...", "Upstream": { "Kind": "github", "TokenEnvVar": "MY_APP_GITHUB_TOKEN", "...": "..." } }
+    ]
   }
 }
 ```
 
+Per-project config (upstream, audit policy, per-phase network profiles)
+lives under `Projects[]` — see [`projects.md`](projects.md). Host-side
+network profile setup lives in [`host-firewall.md`](host-firewall.md).
+
 Secrets come from environment variables (never `appsettings.json`):
 
+* `CODEYBOX_API_KEY` (REST bearer token)
 * `CODEYBOX_CLAUDE_API_KEY`
 * `CODEYBOX_COPILOT_TOKEN`
 * `CODEYBOX_CODEX_API_KEY`
-* `CODEYBOX_GITHUB_TOKEN` (only when `Upstream.Kind == "github"`)
+* The env var named in each project's `Upstream.TokenEnvVar` (per-project
+  upstream credentials — never shared across projects).

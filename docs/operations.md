@@ -5,22 +5,32 @@ short — the framework is small.
 
 ## First-time host setup
 
-1. Linux host. KVM optional — only needed for Kata / crun-vm providers.
+1. Linux host with KVM available (`/dev/kvm`).
 2. .NET 10 SDK if building from source; otherwise just the runtime.
 3. A sandbox provider — pick from `docs/sandbox-providers.md`. Quick start:
-   - **Easiest**: `sudo apt install bubblewrap` and set
-     `CodeyBox.SandboxProvider=bubblewrap`. Done.
-   - **Better isolation, still single-package**: install gVisor (`runsc`),
-     add one line to `~/.config/containers/containers.conf`, set
-     `CodeyBox.SandboxProvider=gvisor`.
-   - **Strongest** (microvm): install Kata, `usermod -aG kvm`, add user-
-     level podman runtime config, set `CodeyBox.SandboxProvider=kata`.
+   - **Recommended (real VM, integration-tested)**: install Multipass with
+     `sudo snap install multipass`, then run
+     `sudo scripts/setup-host-networks.sh` to create the network profile
+     bridges + nftables rules. Set `CodeyBox.SandboxProvider=multipass`.
+     See [`host-firewall.md`](host-firewall.md) for the network setup.
+   - **Single-package fallback (shared-kernel, dev-friendly)**:
+     `sudo apt install bubblewrap`, set
+     `CodeyBox.SandboxProvider=bubblewrap`. No host firewall enforcement.
+   - **Container-runtime alternatives** (Kata, gVisor, crun-vm) — see
+     `docs/sandbox-providers.md`.
 4. `git` on the host (used by `IGitHost` for cloning seeds and pushing
    upstream).
 5. Service user with:
    * Write access to `GitRootDirectory` and `StateDatabasePath` parents.
-   * Access to `/dev/kvm` ONLY if you picked Kata or crun-vm.
+   * Access to `/dev/kvm` (Multipass / Kata / crun-vm).
+   * Permission to run `multipass` (the snap installs a group automatically).
    * **No** SSH or other host privileges beyond the above.
+
+The repository ships gitignored helper scripts under `local/` for
+operator-side verification (`local/setup-test-networks.sh`,
+`local/verify-host-firewall.sh`, `local/verify-internet-only.sh`,
+`local/teardown-test-networks.sh`). Use these to confirm host-side
+egress enforcement is working before running real prompts.
 
 ## Running
 
@@ -45,15 +55,19 @@ by default). Put a reverse proxy in front of it for TLS and auth.
 ## Restarts
 
 On startup the orchestrator queries the work item store for non-terminal
-items (`Queued`, `Working`, `WorkComplete`, `Merging`, `Merged`,
-`UpstreamPushing`) and re-enqueues them. The pipeline phases are written to
-be re-runnable:
+items (`Queued`, `Working`, `WorkComplete`, `Auditing`, `AuditPassed`,
+`Reworking`, `Merging`, `Merged`, `UpstreamPushing`) and re-enqueues them.
+The pipeline phases are written to be re-runnable:
 
-* Work phase replay: re-creating the same branch with new commits is fine —
-  the push is `<branch>:<branch>`, which is fast-forward when the prior run
-  succeeded and a no-op of the same commits when interrupted mid-way.
-* Merge phase replay: a second `git merge` on a branch that's already merged
-  is a no-op, then the push is a no-op.
+* Work / Rework phase replay: re-creating the same branch with new
+  commits is fine — the push is `<branch>:<branch>`, which is
+  fast-forward when the prior run succeeded and a no-op of the same
+  commits when interrupted mid-way.
+* Audit phase replay: auditors are stateless against the working tree;
+  re-running them is idempotent.
+* Merge phase replay: re-running the agent against an already-merged
+  base is fine — the orchestrator's post-merge verification accepts an
+  already-correct merge state and the push is a no-op.
 * UpstreamPush replay: idempotent push.
 
 You should still expect duplicate work in the rare case where the agent ran,
@@ -62,23 +76,30 @@ The agent is invoked again; commits stack on the same work branch.
 
 ## Capacity
 
-`Concurrency` controls the number of worker threads. Each worker holds one
-sandbox at a time. With Kata + Firecracker, plan for ~512 MB host RAM per
-running sandbox plus the agent's memory needs.
+`Concurrency` controls the number of worker threads. Each worker holds
+one sandbox at a time. With Multipass on KVM, plan for ~1 GB host RAM
+per running sandbox plus the agent's memory needs (Multipass's default
+VM is larger than a Firecracker microVM).
 
 ## Failure modes you'll actually see
 
-* **Agent produced no changes.** Work phase fails with "Agent produced no
-  changes to commit". Usually a too-narrow prompt.
-* **Merge conflict.** Merge phase fails with git's conflict output. Resolve
-  manually: clone the host bare repo, merge by hand, push, and mark the
-  work item Done in SQLite.
-* **Upstream push rejected.** Often a branch protection rule (force-push
-  blocked, required reviews). The local merge is still in place; either
-  loosen the protection for the push user or move the upstream push behind
-  a manual gate.
-* **Sandbox image pull fails.** Pin by digest so this is deterministic and
-  cache the image locally.
+* **Agent produced no changes.** Work phase fails with "Agent produced
+  no changes to commit". Usually a too-narrow prompt.
+* **Audit didn't converge.** After `MaxIterations` of rework the audit
+  phase still has Error-severity findings; the work item flips to
+  `AuditFailed`. Inspect the auditor findings on the record and decide
+  whether to relax the audit policy, fix the prompt, or merge by hand.
+* **Merge phase verification failed.** The agent ran but the orchestrator's
+  post-merge check (expected SHA / clean working tree) failed. The work
+  item flips to `Failed`; nothing was pushed to the host bare repo's
+  base branch.
+* **Upstream push rejected.** Often a branch protection rule
+  (force-push blocked, required reviews). The local merge is still in
+  place; either loosen the protection for the push user or move the
+  upstream push behind a manual gate.
+* **VM can't reach allowed host.** Check `nft list table inet codeybox`
+  for the resolved IPs and re-run `setup-host-networks.sh` if a CDN has
+  rotated. See [`host-firewall.md`](host-firewall.md) troubleshooting.
 
 ## Backups
 

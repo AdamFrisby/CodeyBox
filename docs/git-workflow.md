@@ -14,18 +14,20 @@ way it does.
                 ┌─────────────▼──────────────────┐
                 │ Host bare repo  (per work item)│  ← source of truth
                 │ /var/lib/codeybox/repos/<id> │
-                └─────┬───────────────────┬──────┘
-                phase 1 (clone+push)  phase 2 (clone+merge+push)
-                      ▼                   ▼
-              ┌─────────────────┐  ┌─────────────────┐
-              │ Work sandbox    │  │ Merge sandbox   │
-              │ (agent + creds) │  │ (no agent creds)│
-              └─────────────────┘  └─────────────────┘
+                └─┬──────────┬───────────────┬───┘
+       phase 1   │  phase 2 │      phase 3   │
+       (clone+   ▼  (audit+ ▼     (clone+    ▼
+        push)              rework)            agent merge+push)
+        ┌─────────────┐  ┌─────────────────┐  ┌─────────────────┐
+        │ Work sbx    │  │ Audit sandboxes │  │ Merge sbx       │
+        │(agent+creds)│  │ tool: no creds  │  │ (agent+creds,   │
+        │             │  │ llm: agent creds│  │  merge profile) │
+        └─────────────┘  └─────────────────┘  └─────────────────┘
 ```
 
-The host bare repo is the *source of truth*. The work and merge sandboxes
-each clone and push to it. The orchestrator pushes from it to upstream.
-Sandboxes never see the upstream URL or creds.
+The host bare repo is the *source of truth*. Work, audit, rework, and
+merge sandboxes each clone and push to it. The orchestrator pushes from
+it to upstream. Sandboxes never see the upstream URL or creds.
 
 ## Phase 1: Work
 
@@ -50,26 +52,37 @@ The orchestrator then opens a PR record via `IPullRequestService`. With the
 default in-memory impl this is just metadata; with a Gitea/Forgejo backend
 it would be a real PR on a self-hosted forge.
 
-## Phase 2: Merge
+## Phase 2: Audit + rework loop
 
-The merge sandbox is a **fresh** sandbox — different filesystem, different
-network policy (no agent endpoints), no credentials.
+Skipped if no auditors are registered. See [`audit.md`](audit.md) for
+the full breakdown. Tool auditors run in a credential-free sandbox; LLM
+auditors run in a sandbox with agent credentials. On failure the agent
+reworks (pushing further commits onto the same `codeybox/<id>` branch)
+and the loop reruns. On `MaxIterations` without convergence the work
+item flips to `AuditFailed`.
+
+## Phase 3: Merge (agent-driven)
+
+The merge sandbox is a **fresh** sandbox under the project's `merge`
+network profile. The agent is invoked to perform the merge — it can
+resolve `git merge` conflicts and run the project's test suite if the
+profile allows the necessary egress. The orchestrator then verifies
+merge state before pushing:
 
 ```bash
-# Inside the merge sandbox:
-git clone /repos/<id>.git /work
-cd /work
-git checkout <baseBranch>
-git config user.email codeybox@local
-git config user.name CodeyBox
-git merge --no-ff -m "codeybox: merge codeybox/<id>" origin/codeybox/<id>
-git rev-parse HEAD                       # → captured as merge SHA
+# The orchestrator verifies that, post-agent:
+#   1. The current branch is <baseBranch>
+#   2. HEAD's parents include the workBranch's tip
+#   3. Working tree is clean
+# Failures here flip the item to Failed; the agent cannot push something
+# other than the merge.
+
 git push origin <baseBranch>:<baseBranch>
 ```
 
 The merge is `--no-ff` so the work-branch is preserved in the history.
 
-## Phase 3: Upstream push (host)
+## Phase 4: Upstream push (host)
 
 The orchestrator runs on the host:
 
@@ -103,9 +116,8 @@ upstream URL — `IGitHost` is the abstraction to evolve.
 
 ## Conflict handling
 
-Currently: phase 2's `git merge` fails the merge sandbox if the work branch
-has conflicts with `baseBranch`. The work item flips to Failed.
-
-Future: a conflict-resolution phase that re-runs the agent with the
-conflict context. This is a natural place to add — it's just a third
-sandbox spawn before phase 2 retries.
+The agent-driven merge phase resolves conflicts directly: the agent is
+invoked with the merge state and can edit files, run tests, and commit.
+The orchestrator's post-merge verification catches the case where the
+agent didn't actually produce a valid merge and flips the item to
+`Failed` rather than letting it push.
