@@ -10,9 +10,6 @@ using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox.Bubblewrap;
-using CodeyBox.Sandbox.CrunVm;
-using CodeyBox.Sandbox.GVisor;
-using CodeyBox.Sandbox.Kata;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.Process;
 
@@ -45,12 +42,6 @@ ApiKeyAuth.Configure(builder);
 //   multipass   — Real Ubuntu VMs via Canonical's snap. Separate guest
 //                 kernel. Single 'snap install multipass' on Ubuntu, no
 //                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
-//   gvisor      — User-space kernel (runsc). Single package + one line in
-//                 ~/.config/containers/containers.conf. Real syscall isolation.
-//   kata        — Microvm with separate guest kernel. Defaults to QEMU
-//                 (no /etc edits). Firecracker mode requires /etc/kata-containers
-//                 edits — advanced.
-//   crun-vm     — libkrun-backed microvm. Lighter alternative to Kata.
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
 static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
@@ -75,7 +66,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         {
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
-                "Choose one of: bubblewrap, multipass, gvisor, kata, crun-vm, process " +
+                "Choose one of: multipass, bubblewrap, process " +
                 "(see docs/sandbox-providers.md for trade-offs).");
         }
     }
@@ -93,17 +84,8 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
                 NetworkProfiles = opts.SandboxNetworkProfiles,
             },
             loggerFactory.CreateLogger<MultipassSandboxProvider>()),
-        "gvisor" => new GVisorSandboxProvider(
-            new GVisorSandboxOptions { NetworkName = opts.SandboxNetworkName },
-            loggerFactory.CreateLogger<GVisorSandboxProvider>()),
-        "kata" => new KataSandboxProvider(
-            new KataSandboxOptions { NetworkName = opts.SandboxNetworkName },
-            loggerFactory.CreateLogger<KataSandboxProvider>()),
-        "crun-vm" => new CrunVmSandboxProvider(
-            new CrunVmSandboxOptions { NetworkName = opts.SandboxNetworkName },
-            loggerFactory.CreateLogger<CrunVmSandboxProvider>()),
         _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: bubblewrap, multipass, gvisor, kata, crun-vm, process"),
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, bubblewrap, process"),
     };
 }
 
@@ -114,7 +96,7 @@ static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env,
         throw new InvalidOperationException(
             "CodeyBox:SandboxProvider=process is UNSAFE outside Development. " +
             "Set CodeyBox:DangerouslyAllowProcessSandbox=true to override (NOT recommended), " +
-            "or pick bubblewrap | gvisor | kata | crun-vm.");
+            "or pick multipass | bubblewrap.");
     }
     startupLog.LogWarning("Using Process sandbox provider — NO ISOLATION. Dev only.");
     return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
@@ -206,18 +188,12 @@ namespace CodeyBox.Api
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
 
         /// <summary>
-        /// Which sandbox provider to use. One of: <c>bubblewrap</c>,
-        /// <c>gvisor</c>, <c>kata</c>, <c>crun-vm</c>, <c>process</c>.
+        /// Which sandbox provider to use. One of: <c>multipass</c>,
+        /// <c>bubblewrap</c>, <c>process</c>.
         /// Default is empty — startup defaults to 'process' in Development
         /// and refuses to start in other environments.
         /// </summary>
         public string? SandboxProvider { get; set; }
-
-        /// <summary>
-        /// Name of the podman network providers attach to when egress is
-        /// requested. Operators configure host firewall on this network.
-        /// </summary>
-        public string SandboxNetworkName { get; set; } = "codeybox-egress";
 
         /// <summary>
         /// Override that lets <c>process</c> sandbox load outside Development.

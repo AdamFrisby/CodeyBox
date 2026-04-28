@@ -17,7 +17,7 @@ namespace CodeyBox.Sandbox.Bubblewrap;
 ///
 /// <para><b>What you don't get:</b> a separate guest kernel. A Linux
 /// kernel exploit in the agent reaches the host kernel — same fundamental
-/// risk as plain containers. Pick gVisor or Kata if that matters.</para>
+/// risk as plain containers. Pick Multipass if that matters.</para>
 ///
 /// <para><b>Network:</b> bubblewrap can either share the host network
 /// namespace (full network access) or unshare it (no network). It cannot
@@ -25,8 +25,9 @@ namespace CodeyBox.Sandbox.Bubblewrap;
 /// This provider takes the pragmatic path: if the spec requests any
 /// network egress, share the host network. The orchestrator's
 /// <c>AgentAllowedHosts</c> setting is documented but not enforced here —
-/// operators wanting hostname allowlisting should pick gVisor or Kata
-/// where the runtime + CNI / nftables can enforce it.</para>
+/// operators wanting hostname allowlisting should pick Multipass and
+/// configure the host nftables bridges from
+/// <c>scripts/setup-host-networks.sh</c>.</para>
 ///
 /// <para><b>Resource limits:</b> bubblewrap doesn't enforce CPU/memory
 /// caps. Wrap with <c>systemd-run</c> if you need them; or just don't
@@ -79,7 +80,8 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
         if (hasNet)
             _log.LogWarning(
                 "Bubblewrap sandbox {Id}: agent network policy is NOT enforced by this provider. " +
-                "The agent has full host network access. For hostname allowlisting use gVisor or Kata.", id);
+                "The agent has full host network access. For hostname allowlisting use Multipass " +
+                "with scripts/setup-host-networks.sh.", id);
         return Task.FromResult<ISandbox>(sandbox);
     }
 }

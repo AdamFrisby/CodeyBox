@@ -51,19 +51,16 @@ Built and building clean:
 * `CodeyBox.Orchestrator` — pipeline runner + worker pool + SQLite store
 * `CodeyBox.Api` — REST host wiring everything together
 
-Five sandbox providers — pick by `CodeyBox.SandboxProvider`:
+Three sandbox providers — pick by `CodeyBox.SandboxProvider`:
 
-| Provider          | Setup                                   | Status                          |
-|-------------------|-----------------------------------------|---------------------------------|
-| `process`         | None                                    | UNSAFE; dev only                |
-| `bubblewrap`      | `apt install bubblewrap`                | **Working, integration-tested** |
-| `multipass`       | `snap install multipass`                | **Working, integration-tested (kernel isolation)** |
-| `gvisor`          | install runsc + 1 line user config      | Code-reviewed                   |
-| `kata` (QEMU)     | install kata + `usermod -aG kvm`        | Code-reviewed                   |
-| `kata` (Firecracker) | as above + edit `/etc/kata-containers/configuration.toml` | Code-reviewed |
-| `crun-vm`         | install crun-vm + register OCI runtime  | Code-reviewed                   |
+| Provider     | Setup                       | Status                                             |
+|--------------|-----------------------------|----------------------------------------------------|
+| `process`    | None                        | UNSAFE; dev only                                   |
+| `bubblewrap` | `apt install bubblewrap`    | **Working, integration-tested** (shared kernel)    |
+| `multipass`  | `snap install multipass`    | **Working, integration-tested (kernel isolation)** |
 
-See `docs/sandbox-providers.md` for the full setup and trade-offs of each.
+See `docs/sandbox-providers.md` for the full setup and trade-offs of
+each.
 
 See [`docs/`](docs/README.md) for the full write-up. **Read
 [`docs/security.md`](docs/security.md) before deploying.**

@@ -16,13 +16,11 @@ short — the framework is small.
    - **Single-package fallback (shared-kernel, dev-friendly)**:
      `sudo apt install bubblewrap`, set
      `CodeyBox.SandboxProvider=bubblewrap`. No host firewall enforcement.
-   - **Container-runtime alternatives** (Kata, gVisor, crun-vm) — see
-     `docs/sandbox-providers.md`.
 4. `git` on the host (used by `IGitHost` for cloning seeds and pushing
    upstream).
 5. Service user with:
    * Write access to `GitRootDirectory` and `StateDatabasePath` parents.
-   * Access to `/dev/kvm` (Multipass / Kata / crun-vm).
+   * Access to `/dev/kvm` (Multipass).
    * Permission to run `multipass` (the snap installs a group automatically).
    * **No** SSH or other host privileges beyond the above.
 
@@ -78,8 +76,7 @@ The agent is invoked again; commits stack on the same work branch.
 
 `Concurrency` controls the number of worker threads. Each worker holds
 one sandbox at a time. With Multipass on KVM, plan for ~1 GB host RAM
-per running sandbox plus the agent's memory needs (Multipass's default
-VM is larger than a Firecracker microVM).
+per running sandbox plus the agent's memory needs.
 
 ## Failure modes you'll actually see
 

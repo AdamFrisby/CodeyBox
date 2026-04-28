@@ -10,8 +10,8 @@ Start here if you're new:
    findings with severities and status.
 4. [`projects.md`](projects.md) — multi-project config, per-project
    upstream/auditors, defaults inheritance, language + audit-type presets.
-5. [`sandbox-providers.md`](sandbox-providers.md) — Multipass, Kata,
-   gVisor, crun-vm, Bubblewrap, Process trade-offs and host setup.
+5. [`sandbox-providers.md`](sandbox-providers.md) — Multipass,
+   Bubblewrap, and Process trade-offs and host setup.
 6. [`host-firewall.md`](host-firewall.md) — host-side egress enforcement
    for the Multipass provider (operator setup, profile model, what it
    protects against).

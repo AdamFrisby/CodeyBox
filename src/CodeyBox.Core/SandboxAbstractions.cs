@@ -2,13 +2,14 @@ namespace CodeyBox.Core;
 
 /// <summary>
 /// Builds and starts isolated execution sandboxes. Implementations include a
-/// plain-process dev runner (UNSAFE; for local testing only), Kata Containers
-/// with the Firecracker VMM (preferred for production), and crun-vm/libkrun.
-/// The orchestrator picks one provider per deployment.
+/// plain-process dev runner (UNSAFE; for local testing only), bubblewrap
+/// (namespace isolation, shared kernel), and Multipass (KVM-backed VMs with
+/// a separate guest kernel — recommended for production). The orchestrator
+/// picks one provider per deployment.
 /// </summary>
 public interface ISandboxProvider
 {
-    /// <summary>Stable identifier for diagnostics ("process", "kata", "crun-vm").</summary>
+    /// <summary>Stable identifier for diagnostics ("process", "bubblewrap", "multipass").</summary>
     string Name { get; }
 
     /// <summary>

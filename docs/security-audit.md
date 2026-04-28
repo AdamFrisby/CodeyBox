@@ -1,9 +1,16 @@
 # Security audit — initial pass
 
 This is a complete-codebase review of CodeyBox as of the commit that
-introduced the Kata + crun-vm providers, REST auth, live-cancel, and
-integration tests. The audit was performed by the same author who wrote the
-code; see "Limitations" at the end.
+introduced REST auth, live-cancel, and integration tests. The audit was
+performed by the same author who wrote the code; see "Limitations" at
+the end.
+
+> **Note (2026-04):** When this audit was written CodeyBox shipped Kata,
+> gVisor, and crun-vm provider scaffolds. Those were removed because
+> they were code-reviewed but never runtime-tested. Findings below that
+> reference `PodmanDriver` or those providers describe historical state;
+> the corresponding code is gone. Multipass is now the recommended
+> kernel-isolated path and is integration-tested end-to-end.
 
 Each finding lists:
 - **Where**: file paths.
@@ -365,22 +372,21 @@ provider is repeatedly labelled UNSAFE and is intended only for
 developing the orchestrator pipeline.
 
 **Status:** By design. The README and security docs say "do not use in
-production." Production deployments must select Kata or crun-vm.
+production." Production deployments must select Multipass.
 
-### O — Network egress allowlist is documented, not enforced by driver  &nbsp; *MEDIUM, MITIGATED*
+### O — Network egress allowlist is documented, not enforced by driver  &nbsp; *RESOLVED — provider removed*
 
-**Where:** `src/CodeyBox.Sandbox/PodmanDriver.cs`
+**Where (historical):** `src/CodeyBox.Sandbox/PodmanDriver.cs`
 
-When the spec lists `AllowedHosts`, the driver attaches the container to
-the operator-configured CNI network (`codeybox-egress`). The driver
-does NOT add nftables rules to actually constrain egress to the
-allowlist — that requires root and host firewall changes. A startup log
-line warns when the policy isn't enforceable from inside the container.
+The PodmanDriver shipped with the Kata / gVisor / crun-vm provider
+scaffolds. It attached containers to a podman CNI network but did not
+add nftables rules itself, so the documented allowlist was effectively
+trust-the-operator. That code was removed alongside its providers.
 
-**Status:** Mitigated by documentation. The host setup checklist in
-`docs/sandbox-providers.md` includes an nftables snippet that drops
-egress except to the allowlist. Without that host config, allowed-hosts
-becomes "any host" — operators must follow the checklist.
+**Status:** Resolved. The current Multipass provider relies on
+host-side nftables on per-profile bridges, configured once via
+`scripts/setup-host-networks.sh`. See [`host-firewall.md`](host-firewall.md)
+— this is real enforcement, not advisory.
 
 ### P — InMemoryPullRequestService has unbounded growth  &nbsp; *LOW, ACCEPTED*
 
@@ -467,29 +473,17 @@ behind one is a small refactor).
 
 1. **Same author.** I wrote the code and the audit. An independent
    reviewer would catch things I'm blind to.
-2. **No runtime testing of Kata or crun-vm.** Code reviewed only. The
-   host setup required to run them is documented but I have no way to
-   verify the resulting microVM enforces what we expect (e.g. `--read-only`
-   actually preventing writes outside tmpfs mounts, the egress policy
-   actually being applied at the network namespace).
-3. **No fuzz testing.** Validation rules are tested with hand-picked
+2. **No fuzz testing.** Validation rules are tested with hand-picked
    adversarial inputs, not generative fuzzing.
-4. **Dependencies not audited.** `LibGit2Sharp`, `Microsoft.Data.Sqlite`,
+3. **Dependencies not audited.** `LibGit2Sharp`, `Microsoft.Data.Sqlite`,
    xUnit, and the .NET 10 base libraries are trusted as-is.
 
 ## Recommended next steps
 
-1. **Run on a real Kata host.** Verify the PodmanDriver actually
-   provisions Firecracker microVMs as expected, and that `--read-only`
-   plus tmpfs mounts give the agent a writable `/work` only.
-2. **Configure host nftables** for the egress policy (sample snippet in
-   `docs/sandbox-providers.md`). Re-run the integration suite against
-   a host with the rules in place; confirm allowlisted destinations
-   reach and others don't.
-3. **Add a fuzz test** for `Validation.ValidateRepositoryUrl` and
+1. **Add a fuzz test** for `Validation.ValidateRepositoryUrl` and
    `ValidateBranchName`. Aim for a corpus including the known git
    option-injection vectors.
-4. **Independent review** of the API surface and the git workflow.
+2. **Independent review** of the API surface and the git workflow.
    A second pair of eyes on `WorkItemEndpoints` and `LocalGitHost` is
    the highest-value review left.
 5. **Threat-model multi-tenancy.** If you ever want multiple users on

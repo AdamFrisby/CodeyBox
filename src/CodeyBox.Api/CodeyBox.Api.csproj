@@ -12,9 +12,6 @@
     <ProjectReference Include="..\CodeyBox.Projects\CodeyBox.Projects.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit.Presets\CodeyBox.Audit.Presets.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
-    <ProjectReference Include="..\CodeyBox.Sandbox.GVisor\CodeyBox.Sandbox.GVisor.csproj" />
-    <ProjectReference Include="..\CodeyBox.Sandbox.Kata\CodeyBox.Sandbox.Kata.csproj" />
-    <ProjectReference Include="..\CodeyBox.Sandbox.CrunVm\CodeyBox.Sandbox.CrunVm.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
   </ItemGroup>
 

@@ -86,7 +86,7 @@ intent is that you can swap any of these without touching the orchestrator:
 
 | Interface                | Default impl                         | Replace when…                          |
 |--------------------------|--------------------------------------|----------------------------------------|
-| `ISandboxProvider`       | `ProcessSandboxProvider` (UNSAFE)    | Going to production → Kata or crun-vm  |
+| `ISandboxProvider`       | `ProcessSandboxProvider` (UNSAFE)    | Going to production → Multipass        |
 | `IGitHost`               | `LocalGitHost`                       | You need a remote git daemon model     |
 | `IAgentRunner`           | `Claude` / `Copilot` / `Codex`       | Adding a new agent (Aider, Goose, …)   |
 | `IAgentRegistry`         | `AgentRegistry`                      | Multi-tenant routing                   |

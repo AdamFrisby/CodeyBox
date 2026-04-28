@@ -31,16 +31,14 @@ We do **not** defend against:
 
 The headline reason this framework exists. With plain containers, every
 container shares the host kernel. A Linux LPE (and there are several per
-year) becomes a host compromise. With Multipass (KVM-backed), Kata +
-Firecracker, or crun-vm / libkrun, each sandbox runs its own kernel
-inside a VM. A guest kernel exploit doesn't get the attacker out of the
-VM.
+year) becomes a host compromise. With Multipass (KVM-backed), each
+sandbox runs its own kernel inside a real VM. A guest kernel exploit
+doesn't get the attacker out of the VM.
 
 The recommended provider is Multipass — single-package install, no root
-config edits — and it is the only provider that has been integration-
-tested end-to-end. The bubblewrap and gVisor providers reduce attack
-surface but remain shared-kernel; choose them only when full virt-
-isolation isn't available.
+config edits, and the kernel-isolated path that has been
+integration-tested end-to-end. Bubblewrap reduces attack surface but
+remains shared-kernel; choose it only when KVM isn't available.
 
 The dev-only `Sandbox.Process` provider has **none** of these properties.
 It is for local pipeline development only. Do not run it against
@@ -104,10 +102,10 @@ secret never lands on a persistent disk inside the VM.
 
 ### 5. Resource bounds
 
-`SandboxResourceLimits` caps CPU, memory, disk, and wall-clock. The
-production providers must enforce these via cgroups (Kata config) or
-libkrun limits. The orchestrator additionally enforces per-phase
-`WorkTimeout` and `MergeTimeout` via `CancellationTokenSource.CancelAfter`.
+`SandboxResourceLimits` caps CPU, memory, disk, and wall-clock.
+Multipass enforces memory and CPU limits at VM-launch time. The
+orchestrator additionally enforces per-phase `WorkTimeout` and
+`MergeTimeout` via `CancellationTokenSource.CancelAfter`.
 
 ### 6. State persistence is host-side only
 
@@ -148,9 +146,10 @@ items.
 `Sandbox.Process` runs commands as the host's normal user, with read-only
 copies for read-only mounts and *symlinks* for writable mounts. It does
 not enforce the network policy. It exists so the orchestrator pipeline
-can be developed and tested without a Kata/Firecracker setup. Do not ship
-this provider to production. Configuration that selects it should fail
-loudly when `ASPNETCORE_ENVIRONMENT != Development`.
+can be developed and tested without a Multipass setup. Do not ship this
+provider to production. Configuration that selects it fails loudly when
+`ASPNETCORE_ENVIRONMENT != Development` unless
+`DangerouslyAllowProcessSandbox=true` is explicitly set.
 
 ### B. Sandbox image trust
 
