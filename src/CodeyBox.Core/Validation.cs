@@ -98,6 +98,9 @@ public static partial class Validation
 
     private static bool IsRestrictedAddress(IPAddress addr)
     {
+        if (addr.IsIPv4MappedToIPv6)
+            return IsRestrictedAddress(addr.MapToIPv4());
+
         if (IPAddress.IsLoopback(addr))
             return true;
 
