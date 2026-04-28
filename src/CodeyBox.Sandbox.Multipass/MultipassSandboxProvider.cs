@@ -319,10 +319,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
 
             // Stop the baseline so `multipass clone` can use it as a source
-            // (clone requires source stopped).
+            // (clone requires source stopped). Wait for the state to flip
+            // so a subsequent clone doesn't race a still-Stopping VM.
             var stop = await RunAsync([_opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
             if (stop.ExitCode != 0)
                 throw new InvalidOperationException($"baseline stop failed: {stop.Stderr}");
+            await WaitForStoppedAsync(baselineName, ct);
 
             _log.LogInformation("Baseline {Name} baked and stopped, ready to clone", baselineName);
         }
@@ -338,11 +340,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     private async Task CloneFromBaselineAsync(string newName, string baselineName, CancellationToken ct)
     {
-        // Defensive: ensure source is stopped before clone. Multipass clone
-        // requires it, but the baseline can get inadvertently restarted
-        // (e.g. operator runs `multipass exec` against it, which auto-starts
-        // stopped instances). Stop is idempotent — exits 0 if already stopped.
+        // Defensive: ensure source is fully stopped before clone. Multipass
+        // clone requires it, but the baseline can get inadvertently
+        // restarted (e.g. operator runs `multipass exec` against it, which
+        // auto-starts stopped instances). Stop is idempotent — exits 0 if
+        // already stopped — and we wait for the state to flip because
+        // `multipass stop` returns when the request is queued.
         await RunAsync([_opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+        await WaitForStoppedAsync(baselineName, ct);
 
         _log.LogInformation("Cloning {New} from baseline {Baseline}", newName, baselineName);
         var clone = await RunAsync(
@@ -434,6 +439,27 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             stdin: null, ct: ct);
     }
 
+    /// <summary>
+    /// Polls `multipass info` until the VM's State is "Stopped". Multipass
+    /// returns from `multipass stop` once the request is queued, but the
+    /// State doesn't flip to Stopped until the QEMU process is fully gone
+    /// — and `multipass mount --type=native` rejects any other state
+    /// with "Please stop the instance ... before attempting native mounts".
+    /// </summary>
+    private async Task WaitForStoppedAsync(string name, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct);
+            if (info.ExitCode == 0 && info.Stdout.Contains("Stopped", StringComparison.Ordinal))
+                return;
+            await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
+        }
+        throw new InvalidOperationException($"multipass VM {name} did not reach Stopped state within 2 minutes");
+    }
+
     private async Task SetUpMountsAsync(string name, List<(string Host, string Sandbox)> binds, CancellationToken ct)
     {
         if (binds.Count == 0) return;
@@ -446,10 +472,15 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // reachability, which our host firewall typically blocks.
         //
         // Native mounts can only be CONFIGURED while the VM is stopped.
-        // Sequence: stop → mount (each) → start → wait-for-running.
+        // Sequence: stop → wait-for-stopped → mount (each) → start → wait-for-running.
+        // The wait-for-stopped is needed because `multipass stop` returns
+        // when the request is queued, not when the VM is fully stopped;
+        // calling `mount --type=native` against a still-Stopping VM gets
+        // "Please stop the instance ... before attempting native mounts".
         var stop = await RunAsync([_opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
         if (stop.ExitCode != 0)
             throw new InvalidOperationException($"multipass stop (for mount) failed: {stop.Stderr}");
+        await WaitForStoppedAsync(name, ct);
 
         foreach (var (host, sandbox) in binds)
         {
