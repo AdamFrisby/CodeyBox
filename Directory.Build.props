@@ -7,6 +7,9 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <AnalysisLevel>latest</AnalysisLevel>
+    <!-- Skip satellite-assembly scanning during ResolveAssemblyReference to avoid ENOMEM on fork-heavy hosts. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <ResolveAssemblyReferencesFindRelatedSatellites>false</ResolveAssemblyReferencesFindRelatedSatellites>
   </PropertyGroup>
 
 </Project>

@@ -40,10 +40,11 @@ See [projects.md](projects.md) for what each preset runs.
 
 ### Network profile names
 
-The wizard lists four built-in profile names (`claude`, `isolated`,
-`internet`, `internet-only`) plus a *skip* option. Skip means the phase
-inherits its profile from `Defaults.NetworkProfiles`. You can type any
-name that matches a profile configured in `SandboxNetworkProfiles`.
+The wizard presents a selection of four built-in profile names (`claude`,
+`isolated`, `internet`, `internet-only`) plus a *skip* option. Skip means
+the phase inherits its profile from `Defaults.NetworkProfiles`. To use a
+custom profile defined in `SandboxNetworkProfiles`, edit the generated
+JSON snippet directly before pasting it into `appsettings.json`.
 
 ## Output
 

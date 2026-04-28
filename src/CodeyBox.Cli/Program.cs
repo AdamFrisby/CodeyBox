@@ -25,21 +25,34 @@ var displayName = AnsiConsole.Ask<string>("[bold yellow]Display name[/]:");
 
 // ── Repository URL ────────────────────────────────────────────────────────────
 var repositoryUrl = AnsiConsole.Prompt(
-    new TextPrompt<string>("[bold yellow]Repository URL[/] [dim](git/https/ssh URL or filesystem path)[/]:")
+    new TextPrompt<string>("[bold yellow]Repository URL[/] [dim](https://, http://, git@, ssh://, or absolute path)[/]:")
         .PromptStyle("green")
         .Validate(url =>
         {
-            if (!string.IsNullOrWhiteSpace(url) && url[0] != '-')
+            if (string.IsNullOrWhiteSpace(url) || url[0] == '-')
+                return ValidationResult.Error("Enter a non-empty URL that does not start with '-'.");
+            if (url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("git@", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) ||
+                Path.IsPathRooted(url))
                 return ValidationResult.Success();
-            return ValidationResult.Error("Enter a non-empty URL that does not start with '-'.");
+            return ValidationResult.Error("Must start with https://, http://, git@, ssh://, or be an absolute filesystem path.");
         }));
 
 // ── Base branch ───────────────────────────────────────────────────────────────
 var baseBranch = AnsiConsole.Prompt(
     new TextPrompt<string>("[bold yellow]Base branch[/]:")
-        .DefaultValue("main"));
+        .DefaultValue("main")
+        .Validate(branch =>
+        {
+            if (Wizard.BranchNameRegex().IsMatch(branch))
+                return ValidationResult.Success();
+            return ValidationResult.Error("Branch name must be 1–200 chars containing only letters, digits, '.', '_', '/', or '-'.");
+        }));
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
+// "claude" is listed first so Spectre.Console highlights it as the default.
 var agent = AnsiConsole.Prompt(
     new SelectionPrompt<string>()
         .Title("[bold yellow]Agent[/]:")
@@ -53,11 +66,12 @@ var upstreamKind = AnsiConsole.Prompt(
         .HighlightStyle(new Style(Color.Cyan1, decoration: Decoration.Bold))
         .AddChoices("noop", "github", "git-generic"));
 
-UpstreamEntry? upstream = upstreamKind switch
+// Noop is emitted explicitly so the config snippet encodes the choice.
+UpstreamEntry upstream = upstreamKind switch
 {
     "github" => Wizard.BuildGitHubUpstream(),
     "git-generic" => Wizard.BuildGenericUpstream(),
-    _ => null,
+    _ => new UpstreamEntry { Kind = "noop" },
 };
 
 // ── Audit: Languages ──────────────────────────────────────────────────────────
@@ -158,9 +172,30 @@ AnsiConsole.Write(
 AnsiConsole.WriteLine();
 if (AnsiConsole.Confirm("Save to file?", defaultValue: false))
 {
-    var filePath = AnsiConsole.Ask<string>("Output file path:");
-    File.WriteAllText(filePath, json);
-    AnsiConsole.MarkupLine($"[green]Written to[/] [bold]{Markup.Escape(filePath)}[/]");
+    var rawPath = AnsiConsole.Ask<string>("Output file path:");
+    var resolvedPath = Path.GetFullPath(rawPath);
+    AnsiConsole.MarkupLine($"[dim]Resolved path:[/] [bold]{Markup.Escape(resolvedPath)}[/]");
+
+    var doWrite = true;
+    if (File.Exists(resolvedPath))
+        doWrite = AnsiConsole.Confirm("[yellow]File already exists. Overwrite?[/]", defaultValue: false);
+
+    if (doWrite)
+    {
+        try
+        {
+            File.WriteAllText(resolvedPath, json);
+            AnsiConsole.MarkupLine($"[green]Written to[/] [bold]{Markup.Escape(resolvedPath)}[/]");
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Could not write file:[/] {Markup.Escape(ex.Message)}");
+        }
+    }
+    else
+    {
+        AnsiConsole.MarkupLine("[yellow]Write cancelled.[/]");
+    }
 }
 
 AnsiConsole.WriteLine();
@@ -175,6 +210,9 @@ internal static partial class Wizard
 {
     [GeneratedRegex(@"^[A-Za-z0-9_\-]{1,64}$")]
     internal static partial Regex ProjectIdRegex();
+
+    [GeneratedRegex(@"^[A-Za-z0-9._/\-]{1,200}$")]
+    internal static partial Regex BranchNameRegex();
 
     internal static UpstreamEntry BuildGitHubUpstream()
     {
@@ -192,7 +230,15 @@ internal static partial class Wizard
 
     internal static UpstreamEntry BuildGenericUpstream()
     {
-        var url = AnsiConsole.Ask<string>("  [bold]Generic URL[/]:");
+        var url = AnsiConsole.Prompt(
+            new TextPrompt<string>("  [bold]Generic URL[/]:")
+                .PromptStyle("green")
+                .Validate(u =>
+                {
+                    if (!string.IsNullOrWhiteSpace(u) && u[0] != '-')
+                        return ValidationResult.Success();
+                    return ValidationResult.Error("Enter a non-empty URL that does not start with '-'.");
+                }));
         var tokenVar = AnsiConsole.Prompt(
             new TextPrompt<string>("  [bold]Token env var[/] [dim](optional — press Enter to skip)[/]:")
                 .AllowEmpty());
