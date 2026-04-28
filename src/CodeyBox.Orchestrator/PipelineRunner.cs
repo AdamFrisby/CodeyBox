@@ -146,18 +146,20 @@ public sealed class PipelineRunner
             }
 
             // -------- Phase 2: Merge (agent-driven) --------
+            string? mergeSha = null;
             if (!skipMerge)
             {
                 await Transition(item, WorkItemState.Merging, ct);
-                string mergeSha;
+                string localMergeSha;
                 using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
                     mergeCts.CancelAfter(item.MergeTimeout);
-                    mergeSha = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
+                    localMergeSha = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
                         networkProfile: project.NetworkProfiles.Merge,
                         mergeCts.Token);
                 }
-                await _prs.MarkMergedAsync(pr!.Id, mergeSha, ct);
+                mergeSha = localMergeSha;
+                await _prs.MarkMergedAsync(pr!.Id, localMergeSha, ct);
                 await Transition(item, WorkItemState.Merged, ct);
             }
 
@@ -165,7 +167,7 @@ public sealed class PipelineRunner
             var upstream = _upstreamFactory.Create(project);
             if (item.PushUpstream && project.Upstream.Kind != "noop")
             {
-                await RunUpstreamPushPhaseAsync(item, upstream, repoId, baseBranch, ct);
+                await RunUpstreamPushPhaseAsync(item, upstream, repoId, baseBranch, workBranch, mergeSha, ct);
             }
             else
             {
@@ -536,25 +538,52 @@ public sealed class PipelineRunner
           - push `{{baseBranch}}` back to the host bare repo
         """;
 
-    private async Task RunUpstreamPushPhaseAsync(WorkItem item, IUpstreamRemote upstream, string repoId, string baseBranch, CancellationToken ct)
+    private async Task RunUpstreamPushPhaseAsync(
+        WorkItem item,
+        IUpstreamRemote upstream,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        string? mergeSha,
+        CancellationToken ct)
     {
         await Transition(item, WorkItemState.UpstreamPushing, ct);
+
+        var request = new UpstreamCompletionRequest
+        {
+            RepositoryId = repoId,
+            WorkBranch = workBranch,
+            BaseBranch = baseBranch,
+            MergeSha = mergeSha,
+            Title = item.Title,
+            Description = $"Automated via CodeyBox — work item {item.Id}",
+        };
+
         for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
         {
             var current = await _store.GetAsync(item.Id, ct) ?? item;
             await _store.UpdateAsync(current with { UpstreamPushAttempts = attempt }, ct);
 
-            var result = await upstream.PushAsync(repoId, baseBranch, ct);
-            if (result.Success)
+            try
             {
+                var outcome = await upstream.CompleteAsync(request, ct);
+                if (outcome.PullRequestUrl is not null)
+                    _log.LogInformation("Upstream PR: {Url}", outcome.PullRequestUrl);
+                if (outcome.MergedSha is not null)
+                    _log.LogInformation("Upstream PR auto-merged: {Sha}", outcome.MergedSha);
+                if (outcome.Notes is not null)
+                    _log.LogInformation("Upstream notes: {Notes}", outcome.Notes);
                 await Transition(item, WorkItemState.Done, ct);
                 return;
             }
-            _log.LogWarning("Upstream push attempt {Attempt} failed: {Error}", attempt, result.Error);
-            if (attempt < _opts.UpstreamPushMaxAttempts)
-                await Task.Delay(_opts.UpstreamPushBackoff, ct);
-            else
-                await TransitionFailed(item, $"upstream push failed after {attempt} attempts: {result.Error}", ct);
+            catch (Exception ex)
+            {
+                _log.LogWarning("Upstream complete attempt {Attempt} failed: {Error}", attempt, ex.Message);
+                if (attempt < _opts.UpstreamPushMaxAttempts)
+                    await Task.Delay(_opts.UpstreamPushBackoff, ct);
+                else
+                    await TransitionFailed(item, $"upstream complete failed after {attempt} attempts: {ex.Message}", ct);
+            }
         }
     }
 

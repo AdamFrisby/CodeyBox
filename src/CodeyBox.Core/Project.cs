@@ -95,6 +95,17 @@ public sealed record ProjectUpstream
     public string? GenericUrl { get; init; }
     public string? TokenEnvVar { get; init; }
 
+    // GitHub-specific completion options
+    /// <summary>How GitHub merges the PR. One of "merge" | "squash" | "rebase". Default "merge".</summary>
+    public string MergeMethod { get; init; } = "merge";
+    /// <summary>When true, merges the opened PR via the GitHub API immediately after creation.</summary>
+    public bool AutoMerge { get; init; }
+    /// <summary>
+    /// Optional PR title template. Supports {title} (work item title) and
+    /// {branch} (work branch name) placeholders. Defaults to the work item title.
+    /// </summary>
+    public string? PullRequestTitleTemplate { get; init; }
+
     public static ProjectUpstream Noop { get; } = new();
 }
 

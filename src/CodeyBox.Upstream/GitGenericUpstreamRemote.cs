@@ -32,6 +32,13 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
             return new UpstreamPushResult(false, ex.Message);
         }
     }
+
+    public async Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
+    {
+        // Generic git has no PR concept — push baseBranch and report done.
+        await _gitHost.PushToUpstreamAsync(request.RepositoryId, _opts.UpstreamUrl, request.BaseBranch, _opts.ExtraEnvironment, ct);
+        return new UpstreamCompletionOutcome { BranchPushed = true };
+    }
 }
 
 public sealed record GitGenericUpstreamOptions
