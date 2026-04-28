@@ -9,3 +9,6 @@ obj/
 *.db
 *.db-journal
 /local-state/
+
+# Per-developer dev/test helpers (see local/README.md after creation).
+/local/
