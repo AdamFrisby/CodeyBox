@@ -165,11 +165,22 @@ builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
     if (opts.Webhooks.Count == 0)
         return new NullWebhookDispatcher();
 
+    var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     var endpointConfigs = opts.Webhooks.Select(w =>
     {
+        if (string.IsNullOrWhiteSpace(w.Name))
+            throw new InvalidOperationException("Each webhook endpoint must have a non-empty Name");
+        if (w.Name.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+            throw new InvalidOperationException($"Webhook endpoint Name '{w.Name}' must not contain control characters");
+        if (!seenNames.Add(w.Name))
+            throw new InvalidOperationException($"Webhook endpoint Name '{w.Name}' is not unique");
         Validation.ValidateWebhookUrl(w.Url, $"Webhooks[{w.Name}].Url");
         if (w.MaxAttempts < 1)
             throw new InvalidOperationException($"Webhooks[{w.Name}].MaxAttempts must be >= 1");
+        if (w.InitialBackoffSeconds < 0)
+            throw new InvalidOperationException($"Webhooks[{w.Name}].InitialBackoffSeconds must be >= 0");
+        if (w.TimeoutSeconds < 1)
+            throw new InvalidOperationException($"Webhooks[{w.Name}].TimeoutSeconds must be >= 1");
         return new WebhookEndpointConfig
         {
             Name = w.Name,

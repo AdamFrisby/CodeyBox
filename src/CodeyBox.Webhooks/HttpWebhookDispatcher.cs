@@ -52,15 +52,24 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
     {
         await foreach (var evt in _channel.Reader.ReadAllAsync())
         {
-            var body = BuildPayload(evt);
-            var bodyBytes = Encoding.UTF8.GetBytes(body);
+            try
+            {
+                var body = BuildPayload(evt);
+                var bodyBytes = Encoding.UTF8.GetBytes(body);
 
-            var matchingEndpoints = _options.Endpoints
-                .Where(ep => MatchesFilter(ep, evt.Event))
-                .ToList();
+                var matchingEndpoints = _options.Endpoints
+                    .Where(ep => MatchesFilter(ep, evt.Event))
+                    .ToList();
 
-            await Task.WhenAll(matchingEndpoints.Select(ep =>
-                DispatchToEndpointAsync(ep, evt, bodyBytes, CancellationToken.None)));
+                await Task.WhenAll(matchingEndpoints.Select(ep =>
+                    DispatchToEndpointAsync(ep, evt, bodyBytes, CancellationToken.None)));
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex,
+                    "Unhandled error processing webhook event {Event} delivery {DeliveryId}; event dropped",
+                    evt.Event, evt.DeliveryId);
+            }
         }
     }
 
@@ -102,7 +111,7 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
                     "Webhook {Endpoint} returned {Status} for delivery {DeliveryId} event {Event} (attempt {Attempt}/{Max})",
                     ep.Name, (int)response.StatusCode, evt.DeliveryId, evt.Event, attempt, ep.MaxAttempts);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex)  // ct is always CancellationToken.None; swallow all transient failures including timeouts
             {
                 _log.LogWarning(ex,
                     "Webhook {Endpoint} threw on delivery {DeliveryId} event {Event} (attempt {Attempt}/{Max})",
@@ -141,7 +150,7 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
         var payload = new WebhookPayload(
             Event: evt.Event,
             OccurredAt: evt.OccurredAt,
-            WorkItem: MapWorkItem(evt.WorkItem),
+            WorkItem: MapWorkItem(evt.WorkItem, evt.Project.RepositoryUrl),
             Project: new WebhookProjectPayload(
                 evt.Project.Id.Value,
                 evt.Project.DisplayName,
@@ -151,11 +160,12 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
         return JsonSerializer.Serialize(payload, JsonOptions);
     }
 
-    private static WebhookWorkItemPayload MapWorkItem(WorkItem item) => new(
+    private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string repositoryUrl) => new(
         Id: item.Id.ToString(),
         ProjectId: item.ProjectId.Value,
         Title: item.Title,
         Agent: (item.Agent ?? AgentKind.Claude).Value,
+        RepositoryUrl: repositoryUrl,
         BaseBranch: item.BaseBranch,
         WorkBranch: item.WorkBranch,
         State: item.State.ToString(),
@@ -203,6 +213,7 @@ internal sealed record WebhookWorkItemPayload(
     string ProjectId,
     string Title,
     string Agent,
+    string? RepositoryUrl,
     string? BaseBranch,
     string? WorkBranch,
     string State,

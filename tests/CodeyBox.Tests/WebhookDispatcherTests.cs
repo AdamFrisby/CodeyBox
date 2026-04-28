@@ -217,6 +217,24 @@ public sealed class WebhookDispatcherTests
         Assert.Null(ex);
     }
 
+    [Fact]
+    public async Task TimeoutException_DoesNotPropagateOutOfDispatcher()
+    {
+        // TaskCanceledException (subclass of OperationCanceledException) is what
+        // HttpClient throws on timeout.  The old filter `when (ex is not
+        // OperationCanceledException)` let this escape and crash the drain loop.
+        var handler = new TimeoutHandler();
+        using var factory = new SingletonHttpClientFactory(handler);
+        var dispatcher = new HttpWebhookDispatcher(
+            new WebhookDispatcherOptions { Endpoints = [Endpoint(maxAttempts: 2)] },
+            factory,
+            NullLogger<HttpWebhookDispatcher>.Instance);
+
+        await dispatcher.PublishAsync(MakeEvent(), CancellationToken.None);
+        var ex = await Record.ExceptionAsync(async () => await dispatcher.DisposeAsync());
+        Assert.Null(ex);
+    }
+
     // ── NullWebhookDispatcher ────────────────────────────────────────────────
 
     [Fact]
@@ -273,6 +291,12 @@ internal sealed class ThrowingHandler : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         => throw new HttpRequestException("simulated network failure");
+}
+
+internal sealed class TimeoutHandler : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        => throw new TaskCanceledException("simulated HTTP timeout");
 }
 
 internal sealed class SingletonHttpClientFactory : IHttpClientFactory, IDisposable

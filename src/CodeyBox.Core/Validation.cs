@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using System.Text.RegularExpressions;
 
 namespace CodeyBox.Core;
@@ -57,8 +59,9 @@ public static partial class Validation
 
     /// <summary>
     /// Validates a webhook delivery URL. Only http:// and https:// are
-    /// accepted; option-like values (leading '-') and control characters are
-    /// rejected to prevent SSRF via config-injection.
+    /// accepted. Option-like values, control characters, and private/internal
+    /// IP ranges (RFC-1918, loopback, link-local, cloud-metadata endpoints)
+    /// are rejected to prevent SSRF via config-injection.
     /// </summary>
     public static void ValidateWebhookUrl(string url, string fieldName)
     {
@@ -71,6 +74,47 @@ public static partial class Validation
         if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
             !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException($"{fieldName} must be an http:// or https:// URL", fieldName);
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            throw new ArgumentException($"{fieldName} is not a valid URL", fieldName);
+
+        var host = uri.Host;
+        if (string.IsNullOrEmpty(host))
+            throw new ArgumentException($"{fieldName} must have a non-empty host", fieldName);
+
+        // Reject well-known internal hostnames (DNS-resolution not performed)
+        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+            host.Equals("metadata.google.internal", StringComparison.OrdinalIgnoreCase) ||
+            host.EndsWith(".internal", StringComparison.OrdinalIgnoreCase) ||
+            host.EndsWith(".local", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException(
+                $"{fieldName} must not point to a loopback or internal host", fieldName);
+
+        // Reject private/reserved IP literals (Uri strips brackets from IPv6)
+        if (IPAddress.TryParse(host, out var ipAddr) && IsRestrictedAddress(ipAddr))
+            throw new ArgumentException(
+                $"{fieldName} must not point to a private, loopback, or reserved IP address", fieldName);
+    }
+
+    private static bool IsRestrictedAddress(IPAddress addr)
+    {
+        if (IPAddress.IsLoopback(addr))
+            return true;
+
+        var bytes = addr.GetAddressBytes();
+        if (addr.AddressFamily == AddressFamily.InterNetwork)
+        {
+            return bytes[0] == 10                                           // 10.0.0.0/8
+                || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)  // 172.16.0.0/12
+                || (bytes[0] == 192 && bytes[1] == 168)                   // 192.168.0.0/16
+                || (bytes[0] == 169 && bytes[1] == 254);                  // 169.254.0.0/16 (link-local/metadata)
+        }
+        if (addr.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            return (bytes[0] & 0xFE) == 0xFC                              // fc00::/7 (ULA, includes fd00:ec2::254)
+                || (bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80);      // fe80::/10 (link-local)
+        }
+        return false;
     }
 
     /// <summary>
