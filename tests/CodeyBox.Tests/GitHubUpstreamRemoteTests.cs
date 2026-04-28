@@ -39,13 +39,15 @@ public sealed class GitHubUpstreamRemoteTests
     private static GitHubUpstreamRemote BuildRemote(
         FakeGitHost gitHost,
         FakeHttpMessageHandler handler,
-        GitHubUpstreamOptions? opts = null)
+        GitHubUpstreamOptions? opts = null,
+        IWebhookDispatcher? webhooks = null)
     {
         opts ??= DefaultOpts;
         var factory = new FakeHttpClientFactory(handler, userAgent: "codeybox");
         return new GitHubUpstreamRemote(
             gitHost,
             factory,
+            webhooks ?? NullWebhookDispatcher.Instance,
             NullLogger<GitHubUpstreamRemote>.Instance,
             opts);
     }

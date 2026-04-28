@@ -19,15 +19,18 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
 {
     private readonly IGitHost _gitHost;
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IWebhookDispatcher _webhooks;
     private readonly ILogger<GitHubUpstreamRemote> _githubLog;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
         IHttpClientFactory httpClientFactory,
+        IWebhookDispatcher webhooks,
         ILogger<GitHubUpstreamRemote> githubLog)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
+        _webhooks = webhooks;
         _githubLog = githubLog;
     }
 
@@ -36,7 +39,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         var u = project.Upstream;
         return u.Kind?.ToLowerInvariant() switch
         {
-            "github" => new GitHubUpstreamRemote(_gitHost, _httpClientFactory, _githubLog, new GitHubUpstreamOptions
+            "github" => new GitHubUpstreamRemote(_gitHost, _httpClientFactory, _webhooks, _githubLog, new GitHubUpstreamOptions
             {
                 Owner = u.GitHubOwner ?? throw new InvalidOperationException(
                     $"Project {project.Id}: Upstream.Kind=github requires GitHubOwner"),

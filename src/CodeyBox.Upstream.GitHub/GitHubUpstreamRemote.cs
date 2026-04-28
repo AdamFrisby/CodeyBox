@@ -25,17 +25,20 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 {
     private readonly IGitHost _gitHost;
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IWebhookDispatcher _webhooks;
     private readonly ILogger<GitHubUpstreamRemote> _log;
     private readonly GitHubUpstreamOptions _opts;
 
     public GitHubUpstreamRemote(
         IGitHost gitHost,
         IHttpClientFactory httpClientFactory,
+        IWebhookDispatcher webhooks,
         ILogger<GitHubUpstreamRemote> log,
         GitHubUpstreamOptions opts)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
+        _webhooks = webhooks;
         _log = log;
         _opts = opts;
         if (string.IsNullOrEmpty(_opts.Token))
@@ -104,6 +107,14 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
 
         _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
+
+        await _webhooks.DispatchAsync("work_item.pull_request_opened", new PullRequestOpenedPayload
+        {
+            WorkBranch = request.WorkBranch,
+            BaseBranch = request.BaseBranch,
+            PullRequestNumber = pr.Number,
+            PullRequestUrl = pr.HtmlUrl ?? string.Empty,
+        }, ct);
 
         if (!_opts.AutoMerge)
         {
@@ -217,15 +228,15 @@ public sealed record GitHubUpstreamOptions
 
 internal sealed record GitHubCreatePrRequest(
     [property: JsonPropertyName("title")] string Title,
-    [property: JsonPropertyName("body")]  string Body,
-    [property: JsonPropertyName("head")]  string Head,
-    [property: JsonPropertyName("base")]  string Base);
+    [property: JsonPropertyName("body")] string Body,
+    [property: JsonPropertyName("head")] string Head,
+    [property: JsonPropertyName("base")] string Base);
 
 internal sealed record GitHubMergeRequest(
     [property: JsonPropertyName("merge_method")] string MergeMethod);
 
 internal sealed record GitHubPrResponse(
-    [property: JsonPropertyName("number")]   int     Number,
+    [property: JsonPropertyName("number")] int Number,
     [property: JsonPropertyName("html_url")] string? HtmlUrl);
 
 internal sealed record GitHubMergeResponse(

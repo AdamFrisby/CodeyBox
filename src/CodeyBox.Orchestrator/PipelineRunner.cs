@@ -105,7 +105,7 @@ public sealed class PipelineRunner
             // mid-pipeline (TransitionFailed/restart-recovery already handle
             // mid-phase failures).
             var entry = item.State;
-            var skipWork  = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged;
+            var skipWork = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged;
             var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged;
             var skipMerge = entry is WorkItemState.Merged;
 

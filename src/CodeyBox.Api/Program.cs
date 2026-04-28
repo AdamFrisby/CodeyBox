@@ -158,6 +158,11 @@ builder.Services.AddHttpClient("github-upstream", client =>
     client.DefaultRequestHeaders.UserAgent.ParseAdd("codeybox");
 });
 
+// --- Webhook dispatcher ------------------------------------------------------
+// No webhook endpoints are configured by default; operators wire up their own
+// IWebhookDispatcher by replacing this registration.
+builder.Services.AddSingleton<IWebhookDispatcher, NullWebhookDispatcher>();
+
 // --- Projects + per-project upstream + audit composer ------------------------
 builder.Services.AddSingleton<IProjectRepository, ProjectRepository>();
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
