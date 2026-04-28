@@ -200,12 +200,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
         var baselineName = _opts.BaselineNamePrefix + profileName;
         // multipass instance names cap at 24 chars; trim if a long profile
-        // name pushes us over. We hash the tail for uniqueness so two long
-        // profile names don't collide.
+        // name pushes us over. We use a STABLE hash (SHA-256, first 6 hex
+        // chars) for uniqueness so two long profile names don't collide.
+        // string.GetHashCode() can't be used here — it's randomised per
+        // process, so each orchestrator restart would produce a different
+        // baseline name and re-bake unnecessarily.
         if (baselineName.Length > 24)
         {
-            var hash = (uint)baselineName.GetHashCode();
-            baselineName = string.Concat(baselineName.AsSpan(0, 16), "-", hash.ToString("x"))[..24];
+            var bytes = System.Text.Encoding.UTF8.GetBytes(baselineName);
+            var hash = System.Security.Cryptography.SHA256.HashData(bytes);
+            var hex = Convert.ToHexString(hash.AsSpan(0, 3)).ToLowerInvariant();
+            baselineName = string.Concat(baselineName.AsSpan(0, 16), "-", hex);
         }
 
         var sem = GetBaselineLock(baselineName);
@@ -249,11 +254,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             "Baking Multipass baseline {Name} for profile {Profile} on bridge {Bridge} — one-time, ~5-10 minutes",
             baselineName, profileName, bridge);
 
-        // The baseline runs the SAME cloud-init the launch path uses. The
-        // exec wrapper, route service, and any caller-supplied install
-        // runcmds (Node, claude-code, .NET SDK) are baked into the
-        // baseline's filesystem. Clones inherit all of it.
-        var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit);
+        // Cloud-init for the baseline contains ONLY idempotent file-writes
+        // (exec wrapper, route systemd service). The install commands —
+        // apt, npm, dotnet, gitleaks, etc. — run via `multipass exec`
+        // AFTER launch instead. Why: when we `multipass clone` the
+        // baseline, multipass assigns the clone a fresh instance-id, so
+        // cloud-init thinks it's a brand-new instance and re-runs every
+        // per-instance module including runcmd. Putting installs in
+        // runcmd would mean re-running them on every clone — slow and
+        // can fill the disk.
+        var cloudInit = BuildCloudInit(extraRuncmd: null, _opts.ExtraCloudInit);
         var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
         Directory.CreateDirectory(stagingDir);
         TryChmod0700(stagingDir);
@@ -264,6 +274,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             _opts.MultipassBinary, "launch", "--name", baselineName,
             "--cloud-init", cloudInitPath,
             "--network", $"name={bridge},mode=auto",
+            // Default 5G is too tight once the install adds Node + claude-code +
+            // .NET SDK + Python deps (semgrep alone is ~200MB extracted). We
+            // generously over-allocate; the disk is sparse so unused space
+            // costs nothing on the host until written.
+            "--disk", $"{_opts.BaselineDiskGB}G",
         };
         if (!string.IsNullOrWhiteSpace(_opts.DefaultImage))
             argv.Add(_opts.DefaultImage);
@@ -274,10 +289,26 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             if (run.ExitCode != 0)
                 throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
 
-            // Wait for cloud-init to finish — the runcmd installs are the
-            // whole reason we're baking. WaitForRunningAsync also calls
-            // `cloud-init status --wait` which blocks until done.
+            // Wait for the (now-minimal) cloud-init to finish — write_files
+            // and the route service install. Doesn't include the heavy
+            // installs, so should be fast.
             await WaitForRunningAsync(baselineName, ct);
+
+            // Run the install commands now, via multipass exec under sudo.
+            // Each entry in ExtraRuncmd is a single shell command.
+            for (var i = 0; i < _opts.ExtraRuncmd.Count; i++)
+            {
+                var cmd = _opts.ExtraRuncmd[i];
+                if (string.IsNullOrWhiteSpace(cmd)) continue;
+                _log.LogInformation("Baseline install step {N}/{Total}", i + 1, _opts.ExtraRuncmd.Count);
+                var execRun = await RunAsync(
+                    [_opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", cmd],
+                    stdin: null, ct: ct);
+                if (execRun.ExitCode != 0)
+                    throw new InvalidOperationException(
+                        $"baseline install step {i + 1} failed (exit {execRun.ExitCode}):\n" +
+                        $"stderr: {execRun.Stderr}\nstdout-tail: {(execRun.Stdout.Length > 1000 ? "…" + execRun.Stdout[^1000..] : execRun.Stdout)}");
+            }
 
             // Stop the baseline so `multipass clone` can use it as a source
             // (clone requires source stopped).
@@ -749,6 +780,15 @@ public sealed record MultipassSandboxOptions
     /// a hash suffix if the full name would overflow.
     /// </summary>
     public string BaselineNamePrefix { get; init; } = "cb-baseline-";
+
+    /// <summary>
+    /// Disk allocation (gibibytes) for the baseline VM. Default 12 GiB,
+    /// generous because the install runs combine apt + npm + pip + .NET
+    /// SDK and have a long tail (semgrep alone pulls ~200MB of Python
+    /// deps). Multipass uses sparse qcow2, so unused space costs nothing
+    /// on the host until written.
+    /// </summary>
+    public int BaselineDiskGB { get; init; } = 12;
 }
 
 internal sealed class MultipassSandbox : ISandbox
