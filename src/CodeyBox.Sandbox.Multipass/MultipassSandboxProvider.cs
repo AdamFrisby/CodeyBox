@@ -139,8 +139,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // Choose between two boot paths:
             //   - Baseline-clone path (UseBaselineImages=true + profile is set):
             //     bake one VM per profile lazily on first use, then `multipass
-            //     clone` from it for every subsequent sandbox. Saves the 5-10
-            //     min cold-install cost (Node, claude-code, .NET SDK) per VM.
+            //     clone` from it for every subsequent sandbox. Pays the
+            //     install runcmd cost once per profile instead of per sandbox.
             //   - Launch path (default): every VM goes through cloud-init.
             //     Slower per VM but works without prior baking.
             var useBaseline = _opts.UseBaselineImages
@@ -266,14 +266,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             baselineName, profileName, bridge);
 
         // Cloud-init for the baseline contains ONLY idempotent file-writes
-        // (exec wrapper, route systemd service). The install commands —
-        // apt, npm, dotnet, gitleaks, etc. — run via `multipass exec`
-        // AFTER launch instead. Why: when we `multipass clone` the
-        // baseline, multipass assigns the clone a fresh instance-id, so
-        // cloud-init thinks it's a brand-new instance and re-runs every
-        // per-instance module including runcmd. Putting installs in
-        // runcmd would mean re-running them on every clone — slow and
-        // can fill the disk.
+        // (exec wrapper, route systemd service). Caller-supplied install
+        // runcmds run via `multipass exec` AFTER launch instead. Why: when
+        // we `multipass clone` the baseline, multipass assigns the clone a
+        // fresh instance-id, so cloud-init thinks it's a brand-new instance
+        // and re-runs every per-instance module including runcmd. Putting
+        // installs in runcmd would mean re-running them on every clone —
+        // slow, and possibly disk-filling.
         var cloudInit = BuildCloudInit(extraRuncmd: null, _opts.ExtraCloudInit);
         var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
         Directory.CreateDirectory(stagingDir);
@@ -285,18 +284,15 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             _opts.MultipassBinary, "launch", "--name", baselineName,
             "--cloud-init", cloudInitPath,
             "--network", $"name={bridge},mode=auto",
-            // Default 5G is too tight once the install adds Node + claude-code +
-            // .NET SDK + Python deps (semgrep alone is ~200MB extracted). We
-            // generously over-allocate; the disk is sparse so unused space
-            // costs nothing on the host until written.
+            // Multipass defaults (5G disk / 1G RAM / 1 vCPU) are tight for
+            // a typical project install — language toolchain + agent CLI +
+            // any auditor binaries. Defaults here are operator-tunable via
+            // BaselineDiskGB / BaselineMemoryGB / BaselineCpus options;
+            // raise them if your install runs OOM or run out of disk
+            // mid-bake. qcow2 disks are sparse so unused disk space costs
+            // nothing on the host until written.
             "--disk", $"{_opts.BaselineDiskGB}G",
-            // Default 1G memory is too tight for claude-code over long
-            // sessions — it keeps the conversation in memory and OOMs after
-            // ~30-80 min of edit-verify cycles. Clones inherit the
-            // baseline's hardware config.
             "--memory", $"{_opts.BaselineMemoryGB}G",
-            // Default 1 CPU is fine but bump slightly so dotnet build and
-            // semgrep don't bottleneck the agent loop.
             "--cpus", _opts.BaselineCpus.ToString(),
         };
         if (!string.IsNullOrWhiteSpace(_opts.DefaultImage))
@@ -742,10 +738,12 @@ public sealed record MultipassSandboxOptions
     public string? DefaultImage { get; init; }
 
     /// <summary>
-    /// Shell commands to splice into the orchestrator's own runcmd block,
-    /// AFTER the default-route swap (so they have working egress). Use
-    /// for one-shot first-boot installs like apt-install + npm-install
-    /// of agent CLIs. Each entry is one shell command (multi-line OK).
+    /// Shell commands to run inside the sandbox VM at first boot, after
+    /// the default-route swap (so they have working egress). Use for
+    /// one-shot setup the project needs in the sandbox — installing the
+    /// agent CLI, the language toolchain, any auditor tools the project's
+    /// audit policy expects to be present. Each entry is a single shell
+    /// command (multi-line OK).
     ///
     /// Prefer this over <see cref="ExtraCloudInit"/> when you need to run
     /// commands at boot — extra cloud-init that adds its own
@@ -805,12 +803,13 @@ public sealed record MultipassSandboxOptions
     /// + reinstalling (~5-10 min). The baseline VM stays stopped at rest.
     ///
     /// Operator caveats:
-    ///  - The bake requires egress to whatever the install runcmd reaches
-    ///    (Ubuntu archive, npm registry, microsoft.com). Profiles with a
-    ///    strict hostname allowlist that doesn't include those will fail to
-    ///    bake — use <c>internet-only</c> or a wider profile.
+    ///  - The bake needs egress to wherever the install runcmd reaches
+    ///    (apt archive, package registries, …). Profiles with a strict
+    ///    hostname allowlist that doesn't cover those destinations will
+    ///    fail to bake — pick a wider profile, or extend the allowlist
+    ///    in scripts/setup-host-networks.sh.
     ///  - If <see cref="ExtraRuncmd"/> changes (e.g. a new tool added),
-    ///    delete the baseline VMs (<c>multipass delete --purge cb-baseline-*</c>)
+    ///    delete the baseline VMs (<c>multipass delete --purge {prefix}*</c>)
     ///    so they get re-baked with the new install commands.
     /// </summary>
     public bool UseBaselineImages { get; init; } = false;
@@ -824,25 +823,28 @@ public sealed record MultipassSandboxOptions
     public string BaselineNamePrefix { get; init; } = "cb-baseline-";
 
     /// <summary>
-    /// Disk allocation (gibibytes) for the baseline VM. Default 12 GiB,
-    /// generous because the install runs combine apt + npm + pip + .NET
-    /// SDK and have a long tail (semgrep alone pulls ~200MB of Python
-    /// deps). Multipass uses sparse qcow2, so unused space costs nothing
-    /// on the host until written.
+    /// Disk allocation (gibibytes) for the baseline VM. Default 12 GiB.
+    /// Multipass's default of 5 GiB is enough for a base Ubuntu cloud
+    /// image but tight once a project install adds language toolchains,
+    /// agent CLIs, and auditor binaries. qcow2 disks are sparse, so
+    /// unused space costs nothing on the host until written. Lower
+    /// freely if your install set is small.
     /// </summary>
     public int BaselineDiskGB { get; init; } = 12;
 
     /// <summary>
     /// Memory (gibibytes) for the baseline VM. Default 4 GiB. Multipass's
-    /// default of 1 GiB is too tight for a long claude-code session (the
-    /// agent keeps its conversation history in memory and OOMs after
-    /// ~30-80 min of edit-verify cycles). Clones inherit this allocation.
+    /// default of 1 GiB is too tight for the long-running agent sessions
+    /// the rework loop produces — agents that keep their conversation
+    /// history in memory can OOM mid-rework. Clones inherit this
+    /// allocation. Lower if your sessions are short.
     /// </summary>
     public int BaselineMemoryGB { get; init; } = 4;
 
     /// <summary>
     /// vCPU count for the baseline VM. Default 2. Multipass's default is
-    /// 1; bumping speeds up dotnet build / semgrep / clone cold-starts.
+    /// 1; bumping speeds up build / scan / install cold-starts when the
+    /// underlying tools parallelise.
     /// </summary>
     public int BaselineCpus { get; init; } = 2;
 }

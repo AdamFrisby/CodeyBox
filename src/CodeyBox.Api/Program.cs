@@ -252,10 +252,12 @@ namespace CodeyBox.Api
         public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = [];
 
         /// <summary>
-        /// Shell commands spliced into the orchestrator's cloud-init runcmd
-        /// block (after the route swap, so they have working egress). Use
-        /// for first-boot installs like apt-install + npm-install of
-        /// agent CLIs. Each entry is one shell command (multi-line OK).
+        /// Shell commands run inside the sandbox VM at first boot, after
+        /// the orchestrator's route swap (so they have working egress).
+        /// Use for one-shot setup the project needs in the sandbox —
+        /// installing the agent CLI, the language toolchain, any auditor
+        /// tools the audit policy expects to be present. Each entry is a
+        /// single shell command (multi-line OK).
         /// </summary>
         public List<string> MultipassExtraRuncmd { get; set; } = [];
 
