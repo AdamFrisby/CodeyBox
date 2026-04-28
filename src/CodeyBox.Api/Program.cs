@@ -12,6 +12,7 @@ using CodeyBox.Projects;
 using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.Process;
+using CodeyBox.Webhooks;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -156,6 +157,31 @@ builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton<IPresetCatalog, PresetCatalog>();
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
+// --- Webhooks ----------------------------------------------------------------
+builder.Services.AddHttpClient();
+builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    if (opts.Webhooks.Count == 0)
+        return new NullWebhookDispatcher();
+
+    var endpointConfigs = opts.Webhooks.Select(w => new WebhookEndpointConfig
+    {
+        Name                 = w.Name,
+        Url                  = w.Url,
+        SecretEnvVar         = w.SecretEnvVar,
+        EventFilter          = w.EventFilter,
+        MaxAttempts          = w.MaxAttempts,
+        InitialBackoffSeconds = w.InitialBackoffSeconds,
+        TimeoutSeconds       = w.TimeoutSeconds,
+    }).ToList();
+
+    return new HttpWebhookDispatcher(
+        new WebhookDispatcherOptions { Endpoints = endpointConfigs },
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILogger<HttpWebhookDispatcher>>());
+});
+
 // --- Persistence + queue + pipeline + worker pool ----------------------------
 builder.Services.AddSingleton<IWorkItemStore>(sp =>
 {
@@ -272,5 +298,25 @@ namespace CodeyBox.Api
         /// to force a re-bake after changing MultipassExtraRuncmd.
         /// </summary>
         public bool MultipassUseBaselineImages { get; set; } = false;
+
+        /// <summary>
+        /// Outbound webhook endpoints. Empty list disables webhooks entirely.
+        /// Each entry configures one HTTPS target that receives pipeline events.
+        /// </summary>
+        public List<WebhookEndpointOptions> Webhooks { get; set; } = [];
+    }
+
+    /// <summary>
+    /// Per-endpoint webhook options, bound from the CodeyBox:Webhooks config array.
+    /// </summary>
+    public sealed class WebhookEndpointOptions
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Url { get; set; } = string.Empty;
+        public string? SecretEnvVar { get; set; }
+        public List<string> EventFilter { get; set; } = [];
+        public int MaxAttempts { get; set; } = 3;
+        public int InitialBackoffSeconds { get; set; } = 1;
+        public int TimeoutSeconds { get; set; } = 10;
     }
 }

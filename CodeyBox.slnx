@@ -19,6 +19,7 @@
     <Project Path="src/CodeyBox.Sandbox/CodeyBox.Sandbox.csproj" />
     <Project Path="src/CodeyBox.Upstream.GitHub/CodeyBox.Upstream.GitHub.csproj" />
     <Project Path="src/CodeyBox.Upstream/CodeyBox.Upstream.csproj" />
+    <Project Path="src/CodeyBox.Webhooks/CodeyBox.Webhooks.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />

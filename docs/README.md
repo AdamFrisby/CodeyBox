@@ -22,3 +22,4 @@ Start here if you're new:
    and merge phases actually do at the git level.
 10. [`api.md`](api.md) — REST endpoints, configuration, and authentication.
 11. [`operations.md`](operations.md) — running, logs, restarts, failure modes.
+12. [`webhooks.md`](webhooks.md) — outbound webhook events, payload shape, HMAC signing, and configuration.

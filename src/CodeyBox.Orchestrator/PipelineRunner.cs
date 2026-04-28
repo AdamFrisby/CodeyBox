@@ -39,6 +39,7 @@ public sealed class PipelineRunner
     private readonly IUpstreamRemoteFactory _upstreamFactory;
     private readonly ProjectAuditorComposer _auditorComposer;
     private readonly IWorkItemStore _store;
+    private readonly IWebhookDispatcher _webhooks;
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
 
@@ -52,6 +53,7 @@ public sealed class PipelineRunner
         IUpstreamRemoteFactory upstreamFactory,
         ProjectAuditorComposer auditorComposer,
         IWorkItemStore store,
+        IWebhookDispatcher webhooks,
         PipelineOptions opts,
         ILogger<PipelineRunner> log)
     {
@@ -64,6 +66,7 @@ public sealed class PipelineRunner
         _upstreamFactory = upstreamFactory;
         _auditorComposer = auditorComposer;
         _store = store;
+        _webhooks = webhooks;
         _opts = opts;
         _log = log;
     }
@@ -79,14 +82,14 @@ public sealed class PipelineRunner
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} could not resolve project", item.Id);
-            await TransitionFailed(item, ex.Message, CancellationToken.None);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project: null);
             return;
         }
 
         var agentKind = item.Agent ?? project.DefaultAgent;
         if (!_agents.TryGet(agentKind, out var agentRunner))
         {
-            await TransitionFailed(item, $"No runner registered for agent '{agentKind}'", CancellationToken.None);
+            await TransitionFailed(item, $"No runner registered for agent '{agentKind}'", CancellationToken.None, project);
             return;
         }
 
@@ -112,7 +115,7 @@ public sealed class PipelineRunner
             // -------- Phase 1: Work --------
             if (!skipWork)
             {
-                await Transition(item, WorkItemState.Working, ct);
+                await Transition(item, WorkItemState.Working, ct, project);
                 using (var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
                     workCts.CancelAfter(item.WorkTimeout);
@@ -121,7 +124,7 @@ public sealed class PipelineRunner
                         networkProfile: project.NetworkProfiles.Work,
                         workCts.Token);
                 }
-                await Transition(item, WorkItemState.WorkComplete, ct);
+                await Transition(item, WorkItemState.WorkComplete, ct, project);
             }
 
             // -------- Phase 1.5: Audit + rework loop --------
@@ -129,7 +132,7 @@ public sealed class PipelineRunner
             if (auditors.Count > 0 && !skipAudit)
             {
                 await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct);
-                await Transition(item, WorkItemState.AuditPassed, ct);
+                await Transition(item, WorkItemState.AuditPassed, ct, project);
             }
 
             // Open PR record (local metadata) AFTER the audit converges.
@@ -148,7 +151,7 @@ public sealed class PipelineRunner
             // -------- Phase 2: Merge (agent-driven) --------
             if (!skipMerge)
             {
-                await Transition(item, WorkItemState.Merging, ct);
+                await Transition(item, WorkItemState.Merging, ct, project);
                 string mergeSha;
                 using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
@@ -158,37 +161,53 @@ public sealed class PipelineRunner
                         mergeCts.Token);
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha, ct);
-                await Transition(item, WorkItemState.Merged, ct);
+                await Transition(item, WorkItemState.Merged, ct, project);
             }
 
             // -------- Phase 3: Upstream push (separate atomic unit) --------
             var upstream = _upstreamFactory.Create(project);
             if (item.PushUpstream && project.Upstream.Kind != "noop")
             {
-                await RunUpstreamPushPhaseAsync(item, upstream, repoId, baseBranch, ct);
+                await RunUpstreamPushPhaseAsync(item, project, upstream, repoId, baseBranch, ct);
             }
             else
             {
-                await Transition(item, WorkItemState.Done, ct);
+                await Transition(item, WorkItemState.Done, ct, project);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
             if (current.State is not WorkItemState.Done and not WorkItemState.Failed)
-                await _store.UpdateAsync(current.With(WorkItemState.Cancelled, "cancelled"), CancellationToken.None);
+            {
+                var cancelled = current.With(WorkItemState.Cancelled, "cancelled");
+                await _store.UpdateAsync(cancelled, CancellationToken.None);
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.cancelled",
+                    WorkItem = cancelled,
+                    Project = project,
+                }, CancellationToken.None);
+            }
             throw;
         }
         catch (AuditFailedException ex)
         {
             _log.LogWarning("Work item {Id} audit failed: {Error}", item.Id, ex.Message);
             var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-            await _store.UpdateAsync(current.With(WorkItemState.AuditFailed, ex.Message), CancellationToken.None);
+            var failed = current.With(WorkItemState.AuditFailed, ex.Message);
+            await _store.UpdateAsync(failed, CancellationToken.None);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.audit_failed",
+                WorkItem = failed,
+                Project = project,
+            }, CancellationToken.None);
         }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);
-            await TransitionFailed(item, ex.Message, CancellationToken.None);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project);
         }
     }
 
@@ -324,7 +343,7 @@ public sealed class PipelineRunner
     {
         for (var iteration = 1; iteration <= project.Audit.MaxIterations; iteration++)
         {
-            await Transition(item, WorkItemState.Auditing, ct);
+            await Transition(item, WorkItemState.Auditing, ct, project);
             using var auditCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             auditCts.CancelAfter(project.Audit.PerIterationTimeout);
 
@@ -332,10 +351,20 @@ public sealed class PipelineRunner
             var findings = await CollectFindingsAsync(project, runner, auditors, repoId, ctx, auditCts.Token);
 
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
+            var nonBlocking = findings.Count - blocking.Count;
+
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.audit_iteration",
+                WorkItem = await _store.GetAsync(item.Id, ct) ?? item,
+                Project = project,
+                Details = new AuditIterationDetails(iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking),
+            }, CancellationToken.None);
+
             if (blocking.Count == 0)
             {
                 _log.LogInformation("Audit iteration {Iter} passed for {Id} ({NonBlocking} non-blocking findings)",
-                    iteration, item.Id, findings.Count);
+                    iteration, item.Id, nonBlocking);
                 return;
             }
 
@@ -349,7 +378,7 @@ public sealed class PipelineRunner
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
             }
 
-            await Transition(item, WorkItemState.Reworking, ct);
+            await Transition(item, WorkItemState.Reworking, ct, project);
             var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations);
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
@@ -536,9 +565,9 @@ public sealed class PipelineRunner
           - push `{{baseBranch}}` back to the host bare repo
         """;
 
-    private async Task RunUpstreamPushPhaseAsync(WorkItem item, IUpstreamRemote upstream, string repoId, string baseBranch, CancellationToken ct)
+    private async Task RunUpstreamPushPhaseAsync(WorkItem item, Project project, IUpstreamRemote upstream, string repoId, string baseBranch, CancellationToken ct)
     {
-        await Transition(item, WorkItemState.UpstreamPushing, ct);
+        await Transition(item, WorkItemState.UpstreamPushing, ct, project);
         for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
         {
             var current = await _store.GetAsync(item.Id, ct) ?? item;
@@ -547,14 +576,14 @@ public sealed class PipelineRunner
             var result = await upstream.PushAsync(repoId, baseBranch, ct);
             if (result.Success)
             {
-                await Transition(item, WorkItemState.Done, ct);
+                await Transition(item, WorkItemState.Done, ct, project);
                 return;
             }
             _log.LogWarning("Upstream push attempt {Attempt} failed: {Error}", attempt, result.Error);
             if (attempt < _opts.UpstreamPushMaxAttempts)
                 await Task.Delay(_opts.UpstreamPushBackoff, ct);
             else
-                await TransitionFailed(item, $"upstream push failed after {attempt} attempts: {result.Error}", ct);
+                await TransitionFailed(item, $"upstream push failed after {attempt} attempts: {result.Error}", ct, project);
         }
     }
 
@@ -636,26 +665,64 @@ public sealed class PipelineRunner
         return trimmed;
     }
 
-    private async Task Transition(WorkItem item, WorkItemState state, CancellationToken ct)
+    private async Task Transition(WorkItem item, WorkItemState state, CancellationToken ct, Project? project = null)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
         var next = current.With(state);
         await _store.UpdateAsync(next, ct);
         _log.LogInformation("Work item {Id} → {State}", item.Id, state);
+        if (project is not null)
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = StateToEventName(state),
+                WorkItem = next,
+                Project = project,
+            }, CancellationToken.None);
     }
 
-    private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct)
+    private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
-        await _store.UpdateAsync(current.With(WorkItemState.Failed, error), ct);
+        var next = current.With(WorkItemState.Failed, error);
+        await _store.UpdateAsync(next, ct);
         _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
+        if (project is not null)
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.failed",
+                WorkItem = next,
+                Project = project,
+            }, CancellationToken.None);
     }
+
+    private static string StateToEventName(WorkItemState state) => state switch
+    {
+        WorkItemState.Working         => "work_item.working",
+        WorkItemState.WorkComplete    => "work_item.work_complete",
+        WorkItemState.Auditing        => "work_item.auditing",
+        WorkItemState.AuditPassed     => "work_item.audit_passed",
+        WorkItemState.Reworking       => "work_item.reworking",
+        WorkItemState.AuditFailed     => "work_item.audit_failed",
+        WorkItemState.Merging         => "work_item.merging",
+        WorkItemState.Merged          => "work_item.merged",
+        WorkItemState.UpstreamPushing => "work_item.upstream_pushing",
+        WorkItemState.Done            => "work_item.done",
+        WorkItemState.Failed          => "work_item.failed",
+        WorkItemState.Cancelled       => "work_item.cancelled",
+        _                             => $"work_item.{state.ToString().ToLowerInvariant()}",
+    };
 }
 
 internal sealed class AuditFailedException : Exception
 {
     public AuditFailedException(string message) : base(message) { }
 }
+
+internal sealed record AuditIterationDetails(
+    int Iteration,
+    int TotalIterations,
+    int BlockingFindings,
+    int NonBlockingFindings);
 
 public sealed record PipelineOptions
 {
