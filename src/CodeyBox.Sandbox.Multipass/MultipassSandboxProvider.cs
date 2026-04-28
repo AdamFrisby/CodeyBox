@@ -400,11 +400,28 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         sb.AppendLine("runcmd:");
         sb.AppendLine("  - systemctl daemon-reload");
         sb.AppendLine("  - systemctl enable --now codeybox-firewall.service");
+        // Force the default route over to the secondary NIC (the bridge
+        // attached via --network). Without this, Linux often picks eth0
+        // (mpqemubr0) as the default route — but mpqemubr0 forwarding is
+        // dropped by the host's nftables, so the agent's traffic dies
+        // there. By convention, our profile bridges live in 10.99.0.0/16,
+        // so we detect "the interface with a 10.99.x.x IP" and route
+        // through it.
+        //
+        // This runs once at first boot. The VM's routing table persists
+        // through subsequent multipass exec calls.
+        sb.AppendLine("  - |");
+        sb.AppendLine("      iface=$(ip -4 -o addr show | awk '/inet 10\\.99\\./{print $2; exit}')");
+        sb.AppendLine("      if [ -n \"$iface\" ]; then");
+        sb.AppendLine("        gw=$(ip -4 -o addr show \"$iface\" | awk '{print $4}' | awk -F. '{print $1\".\"$2\".\"$3\".1\"}')");
+        sb.AppendLine("        ip route del default 2>/dev/null || true");
+        sb.AppendLine("        ip route add default via \"$gw\" dev \"$iface\"");
+        sb.AppendLine("      fi");
         // Note: the in-VM firewall is ADVISORY — a compromised agent with
         // sudo (which we leave intact so the operator can install dev
         // tooling) can flush iptables and undo it. Real egress enforcement
         // happens on the host via nftables on the multipass bridge —
-        // see HostFirewall in this project. Keeping the in-VM rules is
+        // see scripts/setup-host-networks.sh. Keeping the in-VM rules is
         // defence-in-depth and useful when the agent is well-behaved but
         // wrong-default; do not rely on them against a hostile agent.
         if (!string.IsNullOrWhiteSpace(extra))
