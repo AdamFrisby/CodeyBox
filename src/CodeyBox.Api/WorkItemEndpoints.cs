@@ -147,9 +147,9 @@ internal static class WorkItemEndpoints
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
         var resumeState = from switch
         {
-            "work"     => WorkItemState.Queued,
-            "audit"    => WorkItemState.WorkComplete,
-            "merge"    => WorkItemState.AuditPassed,
+            "work" => WorkItemState.Queued,
+            "audit" => WorkItemState.WorkComplete,
+            "merge" => WorkItemState.AuditPassed,
             "upstream" => WorkItemState.Merged,
             _ => (WorkItemState?)null,
         };

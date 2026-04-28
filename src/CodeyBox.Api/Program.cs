@@ -165,15 +165,21 @@ builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
     if (opts.Webhooks.Count == 0)
         return new NullWebhookDispatcher();
 
-    var endpointConfigs = opts.Webhooks.Select(w => new WebhookEndpointConfig
+    var endpointConfigs = opts.Webhooks.Select(w =>
     {
-        Name                 = w.Name,
-        Url                  = w.Url,
-        SecretEnvVar         = w.SecretEnvVar,
-        EventFilter          = w.EventFilter,
-        MaxAttempts          = w.MaxAttempts,
-        InitialBackoffSeconds = w.InitialBackoffSeconds,
-        TimeoutSeconds       = w.TimeoutSeconds,
+        Validation.ValidateWebhookUrl(w.Url, $"Webhooks[{w.Name}].Url");
+        if (w.MaxAttempts < 1)
+            throw new InvalidOperationException($"Webhooks[{w.Name}].MaxAttempts must be >= 1");
+        return new WebhookEndpointConfig
+        {
+            Name = w.Name,
+            Url = w.Url,
+            SecretEnvVar = w.SecretEnvVar,
+            EventFilter = w.EventFilter,
+            MaxAttempts = w.MaxAttempts,
+            InitialBackoffSeconds = w.InitialBackoffSeconds,
+            TimeoutSeconds = w.TimeoutSeconds,
+        };
     }).ToList();
 
     return new HttpWebhookDispatcher(

@@ -1,5 +1,4 @@
 using System.Net;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Core;
@@ -35,15 +34,15 @@ public sealed class WebhookDispatcherTests
         string? secretEnvVar = null,
         IReadOnlyList<string>? filter = null,
         int maxAttempts = 1) => new()
-    {
-        Name = "test",
-        Url = url,
-        SecretEnvVar = secretEnvVar,
-        EventFilter = filter ?? [],
-        MaxAttempts = maxAttempts,
-        InitialBackoffSeconds = 0,
-        TimeoutSeconds = 5,
-    };
+        {
+            Name = "test",
+            Url = url,
+            SecretEnvVar = secretEnvVar,
+            EventFilter = filter ?? [],
+            MaxAttempts = maxAttempts,
+            InitialBackoffSeconds = 0,
+            TimeoutSeconds = 5,
+        };
 
     private static (HttpWebhookDispatcher dispatcher, List<HttpRequestMessage> requests, RecordingHandler handler)
         BuildDispatcher(HttpStatusCode statusCode, params WebhookEndpointConfig[] endpoints)
@@ -63,17 +62,18 @@ public sealed class WebhookDispatcherTests
     [Fact]
     public void ComputeSignature_MatchesKnownValue()
     {
+        // Known-answer vector derived independently via Python:
+        //   import hashlib, hmac
+        //   hmac.new(b"test-secret", b'{"event":"work_item.working"}', hashlib.sha256).hexdigest()
+        // → b6590508b853f3ebb35926f22c7b40d2c469e7efcbf60b969ac6b9fc493da7cf
         const string secret = "test-secret";
         const string body = """{"event":"work_item.working"}""";
-        var bodyBytes = Encoding.UTF8.GetBytes(body);
+        const string expected = "b6590508b853f3ebb35926f22c7b40d2c469e7efcbf60b969ac6b9fc493da7cf";
 
-        var keyBytes = Encoding.UTF8.GetBytes(secret);
-        var expected = Convert.ToHexString(HMACSHA256.HashData(keyBytes, bodyBytes)).ToLowerInvariant();
-
-        var actual = HttpWebhookDispatcher.ComputeSignature(bodyBytes, secret);
+        var actual = HttpWebhookDispatcher.ComputeSignature(Encoding.UTF8.GetBytes(body), secret);
 
         Assert.Equal(expected, actual);
-        Assert.Equal(64, actual.Length); // 32-byte SHA256 → 64 hex chars
+        Assert.Equal(64, actual.Length);
     }
 
     [Fact]

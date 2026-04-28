@@ -108,7 +108,7 @@ public sealed class PipelineRunner
             // mid-pipeline (TransitionFailed/restart-recovery already handle
             // mid-phase failures).
             var entry = item.State;
-            var skipWork  = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged;
+            var skipWork = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged;
             var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged;
             var skipMerge = entry is WorkItemState.Merged;
 
@@ -697,19 +697,19 @@ public sealed class PipelineRunner
 
     private static string StateToEventName(WorkItemState state) => state switch
     {
-        WorkItemState.Working         => "work_item.working",
-        WorkItemState.WorkComplete    => "work_item.work_complete",
-        WorkItemState.Auditing        => "work_item.auditing",
-        WorkItemState.AuditPassed     => "work_item.audit_passed",
-        WorkItemState.Reworking       => "work_item.reworking",
-        WorkItemState.AuditFailed     => "work_item.audit_failed",
-        WorkItemState.Merging         => "work_item.merging",
-        WorkItemState.Merged          => "work_item.merged",
+        WorkItemState.Working => "work_item.working",
+        WorkItemState.WorkComplete => "work_item.work_complete",
+        WorkItemState.Auditing => "work_item.auditing",
+        WorkItemState.AuditPassed => "work_item.audit_passed",
+        WorkItemState.Reworking => "work_item.reworking",
+        WorkItemState.AuditFailed => "work_item.audit_failed",
+        WorkItemState.Merging => "work_item.merging",
+        WorkItemState.Merged => "work_item.merged",
         WorkItemState.UpstreamPushing => "work_item.upstream_pushing",
-        WorkItemState.Done            => "work_item.done",
-        WorkItemState.Failed          => "work_item.failed",
-        WorkItemState.Cancelled       => "work_item.cancelled",
-        _                             => $"work_item.{state.ToString().ToLowerInvariant()}",
+        WorkItemState.Done => "work_item.done",
+        WorkItemState.Failed => "work_item.failed",
+        WorkItemState.Cancelled => "work_item.cancelled",
+        _ => $"work_item.{state.ToString().ToLowerInvariant()}",
     };
 }
 

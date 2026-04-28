@@ -60,24 +60,25 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
                 .ToList();
 
             await Task.WhenAll(matchingEndpoints.Select(ep =>
-                DispatchToEndpointAsync(ep, evt, body, bodyBytes, CancellationToken.None)));
+                DispatchToEndpointAsync(ep, evt, bodyBytes, CancellationToken.None)));
         }
     }
 
     private async Task DispatchToEndpointAsync(
         WebhookEndpointConfig ep,
         WebhookEvent evt,
-        string body,
         byte[] bodyBytes,
         CancellationToken ct)
     {
-        _ = body; // payload is captured via bodyBytes; body kept for future debug use
-
         string? signature = null;
         if (ep.SecretEnvVar is not null)
         {
-            var secret = Environment.GetEnvironmentVariable(ep.SecretEnvVar) ?? string.Empty;
-            signature = ComputeSignature(bodyBytes, secret);
+            var rawSecret = Environment.GetEnvironmentVariable(ep.SecretEnvVar);
+            if (rawSecret is null)
+                _log.LogWarning(
+                    "Webhook {Endpoint}: SecretEnvVar '{EnvVar}' is set in config but the environment variable is not present; HMAC will be computed with an empty key",
+                    ep.Name, ep.SecretEnvVar);
+            signature = ComputeSignature(bodyBytes, rawSecret ?? string.Empty);
         }
 
         var backoff = TimeSpan.FromSeconds(ep.InitialBackoffSeconds);

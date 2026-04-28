@@ -56,6 +56,24 @@ public static partial class Validation
     }
 
     /// <summary>
+    /// Validates a webhook delivery URL. Only http:// and https:// are
+    /// accepted; option-like values (leading '-') and control characters are
+    /// rejected to prevent SSRF via config-injection.
+    /// </summary>
+    public static void ValidateWebhookUrl(string url, string fieldName)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            throw new ArgumentException($"{fieldName} must not be empty", fieldName);
+        if (url.StartsWith('-'))
+            throw new ArgumentException($"{fieldName} must not start with '-'", fieldName);
+        if (url.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+            throw new ArgumentException($"{fieldName} must not contain control characters", fieldName);
+        if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+            !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException($"{fieldName} must be an http:// or https:// URL", fieldName);
+    }
+
+    /// <summary>
     /// Validates a string used as a positional argument for a tool that may
     /// otherwise interpret leading '-' as an option, and forbids control
     /// characters that could affect log/audit fidelity.
