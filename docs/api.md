@@ -40,7 +40,8 @@ Queue a new work item.
   "agent": null,
   "baseBranch": null,
   "workBranch": null,
-  "pushUpstream": true
+  "pushUpstream": true,
+  "dependsOn": []
 }
 ```
 
@@ -61,6 +62,11 @@ Queue a new work item.
   caller cannot bypass it by aliasing the two).
 * `pushUpstream` — if `true` *and* the project has an upstream configured,
   push to it after merge.
+* `dependsOn` — optional array of work item IDs. The item will not be
+  picked up until every listed dependency has reached a terminal state
+  (`Done`, `Failed`, `AuditFailed`, or `Cancelled`). Unknown IDs, self
+  references, and cycles are rejected with `400`. See
+  [`work-items.md`](work-items.md) for details.
 
 Response: `201 Created` with the work item record.
 
@@ -72,6 +78,12 @@ List all work items, newest first.
 
 Fetch a single work item by id (UUID).
 
+### `GET /workitems/{id}/dependents`
+
+List work items that directly depend on this one. Useful for inspecting
+blast radius before cancelling. Returns the same record shape as
+`GET /workitems/{id}`.
+
 ### `DELETE /workitems/{id}`
 
 Cancel a non-terminal work item.
@@ -82,6 +94,9 @@ Cancel a non-terminal work item.
   item to `Cancelled`.
 * If the item is queued but not yet picked up, it's marked `Cancelled`
   directly; the worker's pre-run check skips it.
+* All `Queued` items that transitively depend on this one are also
+  transitioned to `Cancelled` (`lastError = "parent dependency cancelled"`).
+  In-flight dependents are left to run their course.
 
 Returns `202 Accepted`.
 
@@ -103,7 +118,9 @@ Liveness probe. Returns `{ "status": "ok" }`.
   "createdAt": "2026-04-27T10:18:11+00:00",
   "updatedAt": "2026-04-27T10:18:14+00:00",
   "lastError": null,
-  "upstreamPushAttempts": 0
+  "upstreamPushAttempts": 0,
+  "dependsOn": [],
+  "dependsOnSatisfied": true
 }
 ```
 
@@ -112,6 +129,10 @@ Liveness probe. Returns `{ "status": "ok" }`.
 `UpstreamPushing`, `Done`, `Failed`, `Cancelled`. Audit states only
 appear when the deployment has registered auditors (see
 [`audit.md`](audit.md)).
+
+`dependsOn` lists the IDs of work items this item depends on.
+`dependsOnSatisfied` is `true` when all dependencies are in a terminal
+state (or when there are no dependencies). See [`work-items.md`](work-items.md).
 
 ## Configuration
 

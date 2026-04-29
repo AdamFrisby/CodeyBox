@@ -53,6 +53,13 @@ public sealed record WorkItem
     /// <summary>Number of attempts that have been made on the upstream-push phase.</summary>
     public int UpstreamPushAttempts { get; init; }
 
+    /// <summary>
+    /// IDs of work items this item depends on. The orchestrator will not pick
+    /// this item up until every dependency has reached a terminal state
+    /// (Done, Failed, AuditFailed, or Cancelled). Immutable after creation.
+    /// </summary>
+    public IReadOnlyList<WorkItemId> DependsOn { get; init; } = [];
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,

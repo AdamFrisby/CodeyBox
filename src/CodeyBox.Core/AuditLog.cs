@@ -55,6 +55,15 @@ public static class AuditLog
         Audit("work_item.picked_up")
             .Information("Worker {WorkerId} picked up work item {WorkItemId}", workerId, id.ToString());
 
+    public static void WorkItemDependenciesResolved(WorkItemId id) =>
+        Audit("work_item.dependencies_resolved")
+            .Information("Work item {WorkItemId} enqueued: all dependencies reached terminal state", id.ToString());
+
+    public static void WorkItemDependentCancelled(WorkItemId id, WorkItemId parentId) =>
+        Audit("work_item.dependent_cancelled")
+            .Information("Work item {WorkItemId} cascade-cancelled because parent {ParentWorkItemId} was cancelled",
+                id.ToString(), parentId.ToString());
+
     // ── Agent lifecycle ──────────────────────────────────────────────────────
 
     public static void AgentStarted(AgentKind agent, string sandboxName, string phase) =>
