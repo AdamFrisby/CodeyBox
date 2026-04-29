@@ -1,41 +1,200 @@
-# Webhook Events
+# Webhooks
 
-CodeyBox can notify external systems of pipeline lifecycle events via webhooks.
-Register a custom `IWebhookDispatcher` implementation in `Program.cs` to deliver
-events to your endpoints. The default registration is a no-op.
+CodeyBox can POST JSON events to one or more HTTPS endpoints as a work item moves through the pipeline. Use this to integrate with Slack, audit-log services, custom dashboards, or any HTTP receiver.
 
-## Event table
+---
 
-| Event name | Dispatched by | When fired | Payload fields |
-|---|---|---|---|
-| `work_item.upstream_pushing` | Orchestrator (github, git-generic) | Phase 4 begins (before push/PR) — only when `PushUpstream=true` and `Kind != noop` | `workItemId`, `projectId` |
-| `work_item.pull_request_opened` | `GitHubUpstreamRemote` only | After a GitHub PR is successfully opened | `workItemId`, `projectId`, `workBranch`, `baseBranch`, `pullRequestNumber`, `pullRequestUrl` |
-| `work_item.done` | Orchestrator (all upstream kinds) | Work item transitions to the Done state | `workItemId`, `projectId` |
+## Event taxonomy
 
-> **Note:** `work_item.pull_request_opened` is only fired by `GitHubUpstreamRemote`.
-> Projects using `Upstream.Kind=git-generic` do not emit this event but still receive
-> `work_item.upstream_pushing` and `work_item.done`.
->
-> `work_item.upstream_pushing` is **not** dispatched in two cases:
-> 1. `Upstream.Kind=noop` — the upstream push phase is skipped entirely.
-> 2. `PushUpstream=false` — regardless of `Kind` (including `github` and `git-generic`).
->
-> In both cases, `work_item.done` is still dispatched when the work item completes.
+One event is fired per state transition. Events follow the naming convention `work_item.<state>`:
 
-## Implementing IWebhookDispatcher
+| Event | Fired when |
+|---|---|
+| `work_item.working` | Agent starts the work phase |
+| `work_item.work_complete` | Work phase succeeded; agent committed changes |
+| `work_item.auditing` | Audit phase starts (once per iteration) |
+| `work_item.audit_iteration` | Each audit iteration completes (see [Details](#audit_iteration-details)) |
+| `work_item.audit_passed` | All iterations passed; moving to merge |
+| `work_item.reworking` | Audit found blocking findings; agent starts rework |
+| `work_item.audit_failed` | Audit did not converge after max iterations |
+| `work_item.merging` | Merge phase starts |
+| `work_item.merged` | Merge phase succeeded |
+| `work_item.upstream_pushing` | Upstream push starts |
+| `work_item.pull_request_opened` | A GitHub pull request was opened for the work branch (only fires from `Upstream.Kind=github`; see [Details](#pull_request_opened-details)) |
+| `work_item.done` | Work item completed successfully |
+| `work_item.failed` | Work item failed (unrecoverable error) |
+| `work_item.cancelled` | Work item was cancelled via the API |
 
-```csharp
-public sealed class MyWebhookDispatcher : IWebhookDispatcher
+`work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
+
+---
+
+## Payload shape
+
+Every event is a JSON object POSTed as the request body.
+
+```json
 {
-    public async Task DispatchAsync(string eventName, object payload, CancellationToken ct = default)
-    {
-        // serialize and POST payload to your endpoint
-    }
+  "event": "work_item.audit_passed",
+  "occurredAt": "2026-04-29T12:34:56.789+00:00",
+  "workItem": {
+    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "projectId": "my-project",
+    "title": "Add dark-mode support",
+    "agent": "claude",
+    "repositoryUrl": "https://github.com/example/repo",
+    "baseBranch": "main",
+    "workBranch": "codeybox/a1b2c3d4",
+    "state": "AuditPassed",
+    "createdAt": "2026-04-29T12:00:00.000+00:00",
+    "updatedAt": "2026-04-29T12:34:56.789+00:00",
+    "lastError": null,
+    "upstreamPushAttempts": 0
+  },
+  "project": {
+    "id": "my-project",
+    "displayName": "My Project",
+    "repositoryUrl": "https://github.com/example/repo"
+  },
+  "details": null
 }
 ```
 
-Register in `Program.cs`:
+### `audit_iteration` details
 
-```csharp
-builder.Services.AddSingleton<IWebhookDispatcher, MyWebhookDispatcher>();
+When `event` is `work_item.audit_iteration`, the `details` field is populated:
+
+```json
+{
+  "details": {
+    "iteration": 1,
+    "totalIterations": 3,
+    "blockingFindings": 2,
+    "nonBlockingFindings": 1
+  }
+}
 ```
+
+### `pull_request_opened` details
+
+When `event` is `work_item.pull_request_opened` (only emitted by `Upstream.Kind=github`), the `details` field carries the PR coordinates and, if `Upstream.AutoMerge=true`, the merge SHA:
+
+```json
+{
+  "details": {
+    "workBranch": "codeybox/a1b2c3d4",
+    "baseBranch": "main",
+    "pullRequestNumber": 42,
+    "pullRequestUrl": "https://github.com/example/repo/pull/42",
+    "mergedSha": "abc123def456..."
+  }
+}
+```
+
+`mergedSha` is `null` when `AutoMerge=false` or when GitHub refused the auto-merge (e.g. branch protection); the PR is still left open in that case.
+
+---
+
+## Request headers
+
+| Header | Value |
+|---|---|
+| `Content-Type` | `application/json; charset=utf-8` |
+| `X-CodeyBox-Event` | Event name, e.g. `work_item.done` |
+| `X-CodeyBox-Delivery` | Random UUID, unique per delivery attempt batch |
+| `X-CodeyBox-Signature` | `sha256=<hex>` — only present when `SecretEnvVar` is configured |
+
+---
+
+## Signing (HMAC-SHA256)
+
+When `SecretEnvVar` is set, CodeyBox computes an HMAC-SHA256 over the **raw UTF-8 request body** using the secret read from that environment variable, then sends it in the `X-CodeyBox-Signature` header as `sha256=<lowercase hex>`.
+
+### Verification example (Python)
+
+```python
+import hashlib, hmac
+
+def verify(secret: str, body: bytes, signature_header: str) -> bool:
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+```
+
+### Verification example (Node.js)
+
+```js
+const crypto = require("crypto");
+
+function verify(secret, bodyBuffer, signatureHeader) {
+  const expected = "sha256=" + crypto
+    .createHmac("sha256", secret)
+    .update(bodyBuffer)
+    .digest("hex");
+  return crypto.timingSafeEqual(
+    Buffer.from(expected),
+    Buffer.from(signatureHeader),
+  );
+}
+```
+
+Always use a constant-time comparison (`hmac.compare_digest` / `timingSafeEqual`) to avoid timing attacks.
+
+---
+
+## Configuration
+
+Add a `Webhooks` array inside the `CodeyBox` config section. Each entry configures one endpoint.
+
+```json
+{
+  "CodeyBox": {
+    "Webhooks": [
+      {
+        "Name": "slack-notifications",
+        "Url": "https://hooks.slack.com/services/...",
+        "SecretEnvVar": "WEBHOOK_SECRET_SLACK",
+        "EventFilter": ["work_item.done", "work_item.failed", "work_item.audit_failed"],
+        "MaxAttempts": 3,
+        "InitialBackoffSeconds": 1,
+        "TimeoutSeconds": 10
+      },
+      {
+        "Name": "audit-log",
+        "Url": "https://audit.example.com/codeybox",
+        "SecretEnvVar": "WEBHOOK_SECRET_AUDIT",
+        "MaxAttempts": 5,
+        "InitialBackoffSeconds": 2,
+        "TimeoutSeconds": 15
+      }
+    ]
+  }
+}
+```
+
+### Field reference
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `Name` | yes | — | Human label used in logs. Must be unique. |
+| `Url` | yes | — | HTTPS (or HTTP) URL to POST events to. |
+| `SecretEnvVar` | no | — | Name of the env var holding the HMAC key. Omit to send unsigned. |
+| `EventFilter` | no | `[]` | List of event names to deliver. Empty = deliver ALL events. |
+| `MaxAttempts` | no | `3` | Delivery attempts before giving up. |
+| `InitialBackoffSeconds` | no | `1` | Seconds before first retry; doubles each attempt (1s, 2s, 4s, …). |
+| `TimeoutSeconds` | no | `10` | Per-request HTTP timeout. |
+
+The HMAC secret itself must **never** appear in config files. Put it in an environment variable and reference it by name via `SecretEnvVar`.
+
+---
+
+## Delivery semantics
+
+- Delivery is **fire-and-forget** from the pipeline's perspective. Webhook failures never affect work-item state.
+- The dispatcher runs a background channel-drain loop; `PublishAsync` enqueues and returns immediately.
+- Failed deliveries are retried up to `MaxAttempts` times with exponential back-off. After that, a warning is logged and the delivery is abandoned.
+- On graceful shutdown the dispatcher drains in-flight deliveries (up to 30 s timeout).
+- When no endpoints are configured, a no-op dispatcher is used — zero overhead.

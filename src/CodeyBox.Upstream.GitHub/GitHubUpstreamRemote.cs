@@ -25,20 +25,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 {
     private readonly IGitHost _gitHost;
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly IWebhookDispatcher _webhooks;
     private readonly ILogger<GitHubUpstreamRemote> _log;
     private readonly GitHubUpstreamOptions _opts;
 
     public GitHubUpstreamRemote(
         IGitHost gitHost,
         IHttpClientFactory httpClientFactory,
-        IWebhookDispatcher webhooks,
         ILogger<GitHubUpstreamRemote> log,
         GitHubUpstreamOptions opts)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
-        _webhooks = webhooks;
         _log = log;
         _opts = opts;
         if (string.IsNullOrEmpty(_opts.Token))
@@ -139,33 +136,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
 
-        // Only dispatch the webhook when we have a concrete PR URL; emitting a
-        // pull_request_opened event with an empty URL would confuse consumers.
-        // A misbehaving dispatcher must not abort the auto-merge step — the
-        // interface contract says implementations should not throw, but we guard
-        // defensively so a faulty custom dispatcher cannot silently skip AutoMerge.
-        if (pr.HtmlUrl is not null)
+        if (pr.HtmlUrl is null)
         {
-            try
-            {
-                await _webhooks.DispatchAsync("work_item.pull_request_opened", new PullRequestOpenedPayload
-                {
-                    WorkItemId = request.WorkItemId.ToString(),
-                    ProjectId = request.ProjectId.ToString(),
-                    WorkBranch = request.WorkBranch,
-                    BaseBranch = request.BaseBranch,
-                    PullRequestNumber = pr.Number,
-                    PullRequestUrl = pr.HtmlUrl,
-                }, ct);
-            }
-            catch (Exception dispatchEx)
-            {
-                _log.LogWarning(dispatchEx, "pull_request_opened webhook dispatch failed; auto-merge (if configured) will still proceed");
-            }
-        }
-        else
-        {
-            _log.LogWarning("GitHub PR response did not include html_url; skipping pull_request_opened webhook event");
+            _log.LogWarning("GitHub PR response did not include html_url; pull_request_opened webhook event will not fire");
         }
 
         if (!_opts.AutoMerge)

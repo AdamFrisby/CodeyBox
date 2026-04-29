@@ -12,6 +12,7 @@ using CodeyBox.Projects;
 using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.Process;
+using CodeyBox.Webhooks;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -161,16 +162,61 @@ builder.Services.AddHttpClient("github-upstream", client =>
     client.Timeout = TimeSpan.FromSeconds(30);
 });
 
-// --- Webhook dispatcher ------------------------------------------------------
-// No webhook endpoints are configured by default; operators wire up their own
-// IWebhookDispatcher by replacing this registration.
-builder.Services.AddSingleton<IWebhookDispatcher, NullWebhookDispatcher>();
-
 // --- Projects + per-project upstream + audit composer ------------------------
 builder.Services.AddSingleton<IProjectRepository, ProjectRepository>();
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton<IPresetCatalog, PresetCatalog>();
 builder.Services.AddSingleton<ProjectAuditorComposer>();
+
+// --- Webhooks ----------------------------------------------------------------
+// AllowAutoRedirect=false prevents SSRF via HTTP 3xx redirects to private
+// addresses that bypass the blocklist in ValidateWebhookUrl.
+builder.Services.AddHttpClient("webhook")
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false,
+    });
+builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    if (opts.Webhooks.Count == 0)
+        return new NullWebhookDispatcher();
+
+    var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var endpointConfigs = opts.Webhooks.Select(w =>
+    {
+        if (string.IsNullOrWhiteSpace(w.Name))
+            throw new InvalidOperationException("Each webhook endpoint must have a non-empty Name");
+        if (w.Name.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+            throw new InvalidOperationException($"Webhook endpoint Name '{w.Name}' must not contain control characters");
+        if (!seenNames.Add(w.Name))
+            throw new InvalidOperationException($"Webhook endpoint Name '{w.Name}' is not unique");
+        if (w.SecretEnvVar is not null && w.SecretEnvVar.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+            throw new InvalidOperationException($"Webhooks[{w.Name}].SecretEnvVar must not contain control characters");
+        Validation.ValidateWebhookUrl(w.Url, $"Webhooks[{w.Name}].Url");
+        if (w.MaxAttempts < 1)
+            throw new InvalidOperationException($"Webhooks[{w.Name}].MaxAttempts must be >= 1");
+        if (w.InitialBackoffSeconds < 0)
+            throw new InvalidOperationException($"Webhooks[{w.Name}].InitialBackoffSeconds must be >= 0");
+        if (w.TimeoutSeconds < 1)
+            throw new InvalidOperationException($"Webhooks[{w.Name}].TimeoutSeconds must be >= 1");
+        return new WebhookEndpointConfig
+        {
+            Name = w.Name,
+            Url = w.Url,
+            SecretEnvVar = w.SecretEnvVar,
+            EventFilter = w.EventFilter,
+            MaxAttempts = w.MaxAttempts,
+            InitialBackoffSeconds = w.InitialBackoffSeconds,
+            TimeoutSeconds = w.TimeoutSeconds,
+        };
+    }).ToList();
+
+    return new HttpWebhookDispatcher(
+        new WebhookDispatcherOptions { Endpoints = endpointConfigs },
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILogger<HttpWebhookDispatcher>>());
+});
 
 // --- Persistence + queue + pipeline + worker pool ----------------------------
 builder.Services.AddSingleton<IWorkItemStore>(sp =>
@@ -288,5 +334,25 @@ namespace CodeyBox.Api
         /// to force a re-bake after changing MultipassExtraRuncmd.
         /// </summary>
         public bool MultipassUseBaselineImages { get; set; } = false;
+
+        /// <summary>
+        /// Outbound webhook endpoints. Empty list disables webhooks entirely.
+        /// Each entry configures one HTTPS target that receives pipeline events.
+        /// </summary>
+        public List<WebhookEndpointOptions> Webhooks { get; set; } = [];
+    }
+
+    /// <summary>
+    /// Per-endpoint webhook options, bound from the CodeyBox:Webhooks config array.
+    /// </summary>
+    public sealed class WebhookEndpointOptions
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Url { get; set; } = string.Empty;
+        public string? SecretEnvVar { get; set; }
+        public List<string> EventFilter { get; set; } = [];
+        public int MaxAttempts { get; set; } = 3;
+        public int InitialBackoffSeconds { get; set; } = 1;
+        public int TimeoutSeconds { get; set; } = 10;
     }
 }

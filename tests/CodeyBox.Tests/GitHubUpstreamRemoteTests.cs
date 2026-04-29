@@ -41,15 +41,13 @@ public sealed class GitHubUpstreamRemoteTests
     private static GitHubUpstreamRemote BuildRemote(
         IGitHost gitHost,
         FakeHttpMessageHandler handler,
-        GitHubUpstreamOptions? opts = null,
-        IWebhookDispatcher? webhooks = null)
+        GitHubUpstreamOptions? opts = null)
     {
         opts ??= DefaultOpts;
         var factory = new FakeHttpClientFactory(handler, userAgent: "codeybox");
         return new GitHubUpstreamRemote(
             gitHost,
             factory,
-            webhooks ?? NullWebhookDispatcher.Instance,
             NullLogger<GitHubUpstreamRemote>.Instance,
             opts);
     }
@@ -214,44 +212,6 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
-    public async Task CompleteAsync_PrCreated_DispatchesPullRequestOpenedWebhookEvent()
-    {
-        var gitHost = new FakeGitHost();
-        var handler = new FakeHttpMessageHandler();
-        handler.Enqueue(PrCreatedResponse(42, "https://github.com/myorg/myrepo/pull/42"));
-
-        var dispatcher = new FakeWebhookDispatcher();
-        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = false }, webhooks: dispatcher);
-        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
-
-        Assert.Single(dispatcher.Events);
-        var (eventName, payload) = dispatcher.Events[0];
-        Assert.Equal("work_item.pull_request_opened", eventName);
-        var prPayload = Assert.IsType<PullRequestOpenedPayload>(payload);
-        Assert.Equal(SampleRequest.WorkBranch, prPayload.WorkBranch);
-        Assert.Equal(SampleRequest.BaseBranch, prPayload.BaseBranch);
-        Assert.Equal(42, prPayload.PullRequestNumber);
-        Assert.Equal("https://github.com/myorg/myrepo/pull/42", prPayload.PullRequestUrl);
-        Assert.Equal(SampleRequest.WorkItemId.ToString(), prPayload.WorkItemId);
-        Assert.Equal(SampleRequest.ProjectId.ToString(), prPayload.ProjectId);
-    }
-
-    [Fact]
-    public async Task CompleteAsync_PullsReturns422_DoesNotDispatchWebhookEvent()
-    {
-        var gitHost = new FakeGitHost();
-        var handler = new FakeHttpMessageHandler();
-        handler.Enqueue(JsonResponse(HttpStatusCode.UnprocessableEntity,
-            """{"message":"Validation Failed"}"""));
-
-        var dispatcher = new FakeWebhookDispatcher();
-        var remote = BuildRemote(gitHost, handler, webhooks: dispatcher);
-        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
-
-        Assert.Empty(dispatcher.Events);
-    }
-
-    [Fact]
     public async Task CompleteAsync_PushToUpstreamThrows_PropagatesExceptionWithoutCallingGitHubApi()
     {
         // Verifies that a PushToUpstreamAsync failure is rethrown so the
@@ -341,17 +301,6 @@ internal sealed class FakeHttpClientFactory : IHttpClientFactory
     {
         Assert.Equal("github-upstream", name);
         return _client;
-    }
-}
-
-internal sealed class FakeWebhookDispatcher : IWebhookDispatcher
-{
-    public List<(string EventName, object Payload)> Events { get; } = new();
-
-    public Task DispatchAsync(string eventName, object payload, CancellationToken ct = default)
-    {
-        Events.Add((eventName, payload));
-        return Task.CompletedTask;
     }
 }
 

@@ -13,6 +13,7 @@
     <ProjectReference Include="..\CodeyBox.Audit.Presets\CodeyBox.Audit.Presets.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
+    <ProjectReference Include="..\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

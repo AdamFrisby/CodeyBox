@@ -11,6 +11,7 @@ using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Upstream;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -104,7 +105,7 @@ internal static class TestSupport
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, upstreamFactory, composer,
             store,
-            NullWebhookDispatcher.Instance,
+            new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance);
 

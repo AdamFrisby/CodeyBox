@@ -176,7 +176,13 @@ internal static class WorkItemEndpoints
         return Results.Accepted($"/workitems/{id}", new { id, from, state = resumeState.Value.ToString() });
     }
 
-    private static async Task<IResult> CancelAsync(string id, IWorkItemStore store, CancellationRegistry cancellations, CancellationToken ct)
+    private static async Task<IResult> CancelAsync(
+        string id,
+        IWorkItemStore store,
+        CancellationRegistry cancellations,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
     {
         if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
         var workItemId = new WorkItemId(g);
@@ -187,7 +193,18 @@ internal static class WorkItemEndpoints
 
         var wasActive = cancellations.Cancel(workItemId);
         if (!wasActive)
-            await store.UpdateAsync(item.With(WorkItemState.Cancelled, "cancelled via API"), ct);
+        {
+            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API");
+            await store.UpdateAsync(cancelled, ct);
+            var project = await projects.GetAsync(item.ProjectId, ct);
+            if (project is not null)
+                await webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.cancelled",
+                    WorkItem = cancelled,
+                    Project = project,
+                }, ct);
+        }
         return Results.Accepted($"/workitems/{id}");
     }
 
