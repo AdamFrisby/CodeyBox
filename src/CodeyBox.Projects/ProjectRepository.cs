@@ -55,6 +55,7 @@ public sealed class ProjectRepository : IProjectRepository
             RepositoryUrl = pc.RepositoryUrl,
             DefaultBaseBranch = pc.BaseBranch ?? defaults.BaseBranch,
             DefaultAgent = ParseAgent(pc.Agent ?? defaults.Agent),
+            DefaultAgentClass = pc.DefaultAgentClass,
             Upstream = ResolveUpstream(pc.Upstream),
             Audit = ResolveAudit(pc.Audit, defaults.Audit),
             NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),

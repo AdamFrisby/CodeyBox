@@ -28,6 +28,7 @@ public sealed class ProjectConfig
     public string? RepositoryUrl { get; set; }
     public string? BaseBranch { get; set; }
     public string? Agent { get; set; }
+    public string? DefaultAgentClass { get; set; }
     public ProjectUpstreamConfig? Upstream { get; set; }
     public ProjectAuditConfig? Audit { get; set; }
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }

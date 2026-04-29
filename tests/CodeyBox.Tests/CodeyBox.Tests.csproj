@@ -20,8 +20,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.7" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Agents.Codex\CodeyBox.Agents.Codex.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents\CodeyBox.Agents.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />

@@ -60,6 +60,22 @@ public sealed record WorkItem
     /// </summary>
     public IReadOnlyList<WorkItemId> DependsOn { get; init; } = [];
 
+    /// <summary>
+    /// If set, the orchestrator routes this item via the named <see cref="AgentClass"/>
+    /// instead of using <see cref="Agent"/> directly. Quota is probed across class
+    /// members in preference order; exhausted subscription members fall back to peers.
+    /// When null, falls back to <see cref="Project.DefaultAgentClass"/> and then to
+    /// direct <see cref="Agent"/> pick (no quota probe, identical to legacy behaviour).
+    /// </summary>
+    public string? AgentClassId { get; init; }
+
+    /// <summary>
+    /// Runtime-only model override set by the quota router when a class member specifies
+    /// a ModelId. Not persisted; resolved fresh at each pickup from the chosen
+    /// <see cref="AgentMembership"/>. Passed to the agent CLI as <c>--model &lt;ModelId&gt;</c>.
+    /// </summary>
+    public string? ModelId { get; init; }
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,

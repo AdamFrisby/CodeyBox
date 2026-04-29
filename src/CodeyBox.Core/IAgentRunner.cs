@@ -18,6 +18,7 @@ public interface IAgentRunner
         string workingDirectory,
         string prompt,
         AgentCredential? credential,
+        string? modelId = null,
         CancellationToken ct = default);
 }
 

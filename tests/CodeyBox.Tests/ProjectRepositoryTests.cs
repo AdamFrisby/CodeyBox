@@ -122,6 +122,42 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public async Task DefaultAgentClass_LoadedFromConfig()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://github.com/me/alpha.git",
+                    DefaultAgentClass = "frontier-coding",
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(p);
+        Assert.Equal("frontier-coding", p!.DefaultAgentClass);
+    }
+
+    [Fact]
+    public async Task DefaultAgentClass_NullWhenNotConfigured()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig { Id = "alpha", RepositoryUrl = "https://github.com/me/alpha.git" },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Null(p!.DefaultAgentClass);
+    }
+
+    [Fact]
     public void InvalidMergeMethod_ThrowsAtStartup()
     {
         var opts = new ProjectsOptions

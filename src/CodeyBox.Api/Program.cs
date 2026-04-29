@@ -180,6 +180,56 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
     };
 }
 
+static IReadOnlyList<AgentClass> BuildAndValidateAgentClasses(
+    List<AgentClassOptions> options, ILogger log)
+{
+    var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var result = new List<AgentClass>();
+
+    foreach (var classOpts in options)
+    {
+        if (string.IsNullOrWhiteSpace(classOpts.Id))
+            throw new InvalidOperationException("Each AgentClass must have a non-empty Id");
+        if (!seenIds.Add(classOpts.Id))
+            throw new InvalidOperationException($"AgentClass Id '{classOpts.Id}' is not unique");
+        if (classOpts.Members.Count == 0)
+            throw new InvalidOperationException($"AgentClass '{classOpts.Id}' must have at least one member");
+
+        var members = new List<AgentMembership>();
+        foreach (var m in classOpts.Members)
+        {
+            if (string.IsNullOrWhiteSpace(m.Agent))
+                throw new InvalidOperationException($"AgentClass '{classOpts.Id}': member Agent must be non-empty");
+            if (!Enum.TryParse<AgentBilling>(m.Billing, ignoreCase: true, out var billing))
+                throw new InvalidOperationException(
+                    $"AgentClass '{classOpts.Id}': unknown Billing '{m.Billing}'. Expected Subscription or PayPerApi");
+            members.Add(new AgentMembership
+            {
+                Agent = new AgentKind(m.Agent),
+                Billing = billing,
+                ModelId = m.ModelId,
+            });
+        }
+
+        var hasOnlySubscription = members.All(m => m.Billing == AgentBilling.Subscription);
+        if (hasOnlySubscription)
+            log.LogWarning(
+                "AgentClass '{ClassId}' has no PayPerApi fallback — items may wait indefinitely if all subscriptions are exhausted",
+                classOpts.Id);
+
+        result.Add(new AgentClass
+        {
+            Id = classOpts.Id,
+            DisplayName = string.IsNullOrWhiteSpace(classOpts.DisplayName)
+                ? classOpts.Id
+                : classOpts.DisplayName,
+            Members = members,
+        });
+    }
+
+    return result;
+}
+
 static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)
 {
     if (!env.IsDevelopment() && !opts.DangerouslyAllowProcessSandbox)
@@ -238,6 +288,58 @@ builder.Services.AddHttpClient("github-upstream", client =>
     // Shorter timeout than the 100 s .NET default: bounds the stall window per
     // attempt given the orchestrator retries up to UpstreamPushMaxAttempts times.
     client.Timeout = TimeSpan.FromSeconds(30);
+});
+
+// Named client for quota probes. Short timeout — quota probes are on the hot
+// path and must not stall the worker pickup loop. Authorization is added per-
+// request; headers are never logged (see SensitiveDataRedactionEnricher).
+builder.Services.AddHttpClient("agent-quota", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(10);
+});
+
+// --- Quota probes ------------------------------------------------------------
+// Registered as IEnumerable<IAgentQuotaProbe>; the router resolves by Kind.
+// Tokens are read from host env vars here (not in the probes) to keep the
+// probe implementations independently testable.
+builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var qr = cbOpts.QuotaRouter;
+    return new QuotaRouterOptions
+    {
+        MinQuotaPct = qr.MinQuotaPct,
+        QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
+        QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
+    };
+});
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+    new ClaudeQuotaProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY"),
+        sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<ClaudeQuotaProbe>()));
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+    new CodexQuotaProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
+        sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CodexQuotaProbe>()));
+
+// --- Agent class router ------------------------------------------------------
+builder.Services.AddSingleton<AgentClassRouter>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentClasses");
+
+    // Build and validate the catalog.
+    var catalog = BuildAndValidateAgentClasses(cbOpts.AgentClasses, startupLog);
+
+    return new AgentClassRouter(
+        catalog,
+        sp.GetServices<IAgentQuotaProbe>(),
+        sp.GetRequiredService<QuotaRouterOptions>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentClassRouter>());
 });
 
 // --- Projects + per-project upstream + audit composer ------------------------
@@ -326,7 +428,15 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
     new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
-builder.Services.AddSingleton<OrchestratorService>();
+builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService(
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<IPipelineRunner>(),
+    sp.GetRequiredService<CancellationRegistry>(),
+    sp.GetRequiredService<OrchestratorOptions>(),
+    sp.GetRequiredService<ILogger<OrchestratorService>>(),
+    sp.GetRequiredService<AgentClassRouter>(),
+    sp.GetRequiredService<IProjectRepository>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 
 var app = builder.Build();
@@ -450,6 +560,45 @@ namespace CodeyBox.Api
         /// Audit log configuration: rolling file paths, retention, and size caps.
         /// </summary>
         public AuditLogOptions AuditLog { get; set; } = new();
+
+        /// <summary>
+        /// Agent class definitions for quota-aware routing. Each class lists one or
+        /// more agent members in preference order. See docs/agent-classes.md.
+        /// </summary>
+        public List<AgentClassOptions> AgentClasses { get; set; } = [];
+
+        /// <summary>Quota router tuning knobs.</summary>
+        public QuotaRouterConfig QuotaRouter { get; set; } = new();
+    }
+
+    /// <summary>Config binding for a single agent class (see CodeyBox:AgentClasses).</summary>
+    public sealed class AgentClassOptions
+    {
+        public string Id { get; set; } = string.Empty;
+        public string DisplayName { get; set; } = string.Empty;
+        public List<AgentMembershipOptions> Members { get; set; } = [];
+    }
+
+    /// <summary>Config binding for one member of an agent class.</summary>
+    public sealed class AgentMembershipOptions
+    {
+        /// <summary>Agent kind value, e.g. "claude", "codex".</summary>
+        public string Agent { get; set; } = string.Empty;
+        /// <summary>"Subscription" or "PayPerApi".</summary>
+        public string Billing { get; set; } = "Subscription";
+        /// <summary>Optional model override, e.g. "claude-opus-4-7".</summary>
+        public string? ModelId { get; set; }
+    }
+
+    /// <summary>Quota router tuning. Bound from CodeyBox:QuotaRouter.</summary>
+    public sealed class QuotaRouterConfig
+    {
+        /// <summary>Minimum available-quota percentage to consider a member viable. Default 10.</summary>
+        public double MinQuotaPct { get; set; } = 10.0;
+        /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
+        public int QuotaRecheckIntervalSeconds { get; set; } = 300;
+        /// <summary>Seconds to cache a probe result. Default 60.</summary>
+        public int QuotaCacheTtlSeconds { get; set; } = 60;
     }
 
     /// <summary>

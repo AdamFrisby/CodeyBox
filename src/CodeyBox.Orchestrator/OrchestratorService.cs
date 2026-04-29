@@ -5,6 +5,7 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
+
 /// <summary>
 /// Background service that drives a concurrency-capped, spawn-paced worker
 /// pool over the task queue. A single dispatch loop dequeues items; a
@@ -20,6 +21,8 @@ public sealed class OrchestratorService : BackgroundService
     private readonly CancellationRegistry _cancellations;
     private readonly OrchestratorOptions _opts;
     private readonly ILogger<OrchestratorService> _log;
+    private readonly AgentClassRouter? _router;
+    private readonly IProjectRepository? _projects;
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -40,13 +43,19 @@ public sealed class OrchestratorService : BackgroundService
     // Snapshot for the /workers/status endpoint.
     private int _currentlyRunning = 0;
 
+    // Count of background deferral tasks currently waiting to re-enqueue items.
+    private int _pendingDeferrals = 0;
+    private const int DeferralWarningThreshold = 100;
+
     public OrchestratorService(
         ITaskQueue queue,
         IWorkItemStore store,
         IPipelineRunner pipeline,
         CancellationRegistry cancellations,
         OrchestratorOptions opts,
-        ILogger<OrchestratorService> log)
+        ILogger<OrchestratorService> log,
+        AgentClassRouter? router = null,
+        IProjectRepository? projects = null)
     {
         _queue = queue;
         _store = store;
@@ -54,6 +63,8 @@ public sealed class OrchestratorService : BackgroundService
         _cancellations = cancellations;
         _opts = opts;
         _log = log;
+        _router = router;
+        _projects = projects;
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
     }
 
@@ -243,6 +254,31 @@ public sealed class OrchestratorService : BackgroundService
                 }
             }
 
+            // Quota routing: resolve which agent to use, or decide to wait.
+            // Skipped entirely (no probe, no wait) when no agent class is configured.
+            if (_router is not null)
+            {
+                Project? project = null;
+                if (_projects is not null)
+                {
+                    try { project = await _projects.GetAsync(item.ProjectId, ct); }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "Worker {WorkerId}: could not load project for quota routing; routing skipped", workerIndex);
+                    }
+                }
+
+                var decision = await _router.ResolveAsync(item, project, ct);
+                if (decision.ShouldWait)
+                {
+                    AuditLog.QuotaRouterDeferred(item.Id, decision.SuggestedRecheckIn);
+                    ScheduleDeferredRequeue(item.Id, decision.SuggestedRecheckIn, ct);
+                    return;
+                }
+                if (decision.Chosen is { } chosen)
+                    item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId };
+            }
+
             using var registration = _cancellations.Register(item.Id);
             AuditLog.WorkItemPickedUp(workerIndex, item.Id);
             try
@@ -270,6 +306,46 @@ public sealed class OrchestratorService : BackgroundService
         // After the pipeline finishes (any outcome), check whether any
         // Queued items were waiting on this item and are now unblocked.
         await EnqueueSatisfiedDependentsAsync(id, ct);
+    }
+
+    /// <summary>
+    /// Fires a background task that re-enqueues <paramref name="id"/> after
+    /// <paramref name="delay"/>. Used when the quota router defers a work item
+    /// because all subscription-billed members are exhausted. The item remains
+    /// in Queued state; the deferred task simply puts it back on the channel so
+    /// the next pickup attempt re-probes quota. On shutdown (stoppingToken
+    /// cancelled), the delayed task exits cleanly; the item is recovered via
+    /// ReplayPendingAsync on the next start.
+    /// </summary>
+    private void ScheduleDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken)
+    {
+        var count = Interlocked.Increment(ref _pendingDeferrals);
+        if (count > DeferralWarningThreshold)
+            _log.LogWarning(
+                "Deferred requeue backlog is {Count} items; quota exhaustion may be sustained across many work items",
+                count);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(delay, stoppingToken);
+                _log.LogInformation("Re-enqueueing deferred work item {Id} after quota recheck interval", id);
+                await _queue.EnqueueAsync(id, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // Service is shutting down; item will be recovered on next start.
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Failed to re-enqueue deferred work item {Id}", id);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _pendingDeferrals);
+            }
+        }, CancellationToken.None);
     }
 
     /// <summary>
