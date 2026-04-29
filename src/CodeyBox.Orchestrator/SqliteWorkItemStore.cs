@@ -131,7 +131,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     base_branch = $base, work_branch = $work, agent = $agent,
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
-                    upstream_push_attempts = $att, depends_on_json = $deps
+                    upstream_push_attempts = $att, depends_on_json = $deps,
+                    agent_class_id = $class_id
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);

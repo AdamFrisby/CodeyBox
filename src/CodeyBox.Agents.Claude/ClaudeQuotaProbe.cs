@@ -64,6 +64,8 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         }
     }
 
+    private const int MaxResponseChars = 64 * 1024; // 64 KiB
+
     private async Task<AgentQuotaSnapshot> FetchAsync(CancellationToken ct)
     {
         try
@@ -82,7 +84,8 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
             }
 
             // Do NOT log the response body — it may contain account identifiers.
-            var body = await response.Content.ReadAsStringAsync(ct);
+            var body = await ReadCappedAsync(response.Content, ct);
+            if (body is null) return Unknown("response too large");
             return ParseResponse(body);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -92,8 +95,25 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Claude quota probe failed; treating quota as unknown");
-            return Unknown(ex.Message);
+            return Unknown("network error");
         }
+    }
+
+    private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
+    {
+        // Allocate one extra char so we can detect bodies that exceed the cap.
+        await using var stream = await content.ReadAsStreamAsync(ct);
+        using var reader = new StreamReader(stream);
+        var buffer = new char[MaxResponseChars + 1];
+        int totalRead = 0, chunk;
+        do
+        {
+            chunk = await reader.ReadAsync(buffer.AsMemory(totalRead, buffer.Length - totalRead), ct);
+            totalRead += chunk;
+        }
+        while (chunk > 0 && totalRead < buffer.Length);
+        if (totalRead > MaxResponseChars) return null;
+        return new string(buffer, 0, totalRead);
     }
 
     /// <summary>

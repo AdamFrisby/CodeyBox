@@ -169,10 +169,10 @@ public static class AuditLog
 
     // ── Quota router ─────────────────────────────────────────────────────────
 
-    public static void QuotaProbed(AgentKind agent, string classId, double availablePct, DateTimeOffset? resetAt) =>
+    public static void QuotaProbed(AgentKind agent, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null) =>
         Audit("quota_router.probed")
-            .Information("Quota probe: agent={Agent} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt}",
-                agent.Value, classId, availablePct, resetAt);
+            .Information("Quota probe: agent={Agent} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt} notes={Notes}",
+                agent.Value, classId, availablePct, resetAt, notes);
 
     public static void QuotaRouterWaiting(string classId, WorkItemId id, TimeSpan recheckIn) =>
         Audit("quota_router.waiting")

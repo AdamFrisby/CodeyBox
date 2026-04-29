@@ -11,6 +11,8 @@ namespace CodeyBox.Orchestrator;
 /// <list type="number">
 ///   <item>Determine the class: <see cref="WorkItem.AgentClassId"/> → <see cref="Project.DefaultAgentClass"/> → null (no routing).</item>
 ///   <item>For each member in preference order: probe quota via the registered <see cref="IAgentQuotaProbe"/>.</item>
+///   <item>PayPerApi members are handled by <see cref="PayPerApiQuotaProbe"/> (always 100%).</item>
+///   <item>Subscription members with no registered probe fall back to <see cref="NullQuotaProbe"/> (unknown → fail-open).</item>
 ///   <item>Pick the first member where AvailablePct &lt; 0 (unknown → fail-open) or AvailablePct ≥ MinQuotaPct.</item>
 ///   <item>If no member qualifies and at least one Subscription member exists → ShouldWait=true, re-enqueue later.</item>
 ///   <item>If only PayPerApi members exist → fire the first member regardless (exceeding quota costs money; it never fails the call).</item>
@@ -23,6 +25,8 @@ public sealed class AgentClassRouter
 {
     private readonly IReadOnlyDictionary<string, AgentClass> _catalog;
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe> _probesByKind;
+    private readonly IAgentQuotaProbe _payPerApiProbe;
+    private readonly IAgentQuotaProbe _nullProbe;
     private readonly QuotaRouterOptions _opts;
     private readonly ILogger<AgentClassRouter> _log;
 
@@ -33,9 +37,25 @@ public sealed class AgentClassRouter
         ILogger<AgentClassRouter> log)
     {
         _catalog = catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
-        _probesByKind = probes.ToDictionary(p => p.Kind);
+        var probeList = probes.ToList();
+        // PayPerApiQuotaProbe and NullQuotaProbe are selected by billing type, not kind;
+        // exclude them from the kind-based lookup to avoid polluting the dictionary.
+        _probesByKind = probeList
+            .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
+            .ToDictionary(p => p.Kind);
+        _payPerApiProbe = probeList.OfType<PayPerApiQuotaProbe>().FirstOrDefault() ?? new PayPerApiQuotaProbe();
+        _nullProbe = probeList.OfType<NullQuotaProbe>().FirstOrDefault() ?? new NullQuotaProbe();
         _opts = opts;
         _log = log;
+
+        // Emit a startup warning for every member that has ModelId configured but
+        // cannot yet be dispatched — operators need to know their override is a no-op.
+        foreach (var cls in catalog)
+            foreach (var m in cls.Members.Where(m => m.ModelId is not null))
+                log.LogWarning(
+                    "Agent class '{ClassId}' member {Agent}/{Billing} has ModelId='{ModelId}' configured, " +
+                    "but ModelId dispatch to the agent CLI is not yet implemented — the override will be silently ignored.",
+                    cls.Id, m.Agent, m.Billing, m.ModelId);
     }
 
     /// <summary>
@@ -64,18 +84,11 @@ public sealed class AgentClassRouter
 
         foreach (var member in agentClass.Members)
         {
-            AgentQuotaSnapshot snapshot;
-            if (member.Billing == AgentBilling.PayPerApi)
-            {
-                // PayPerApi never fails; no HTTP call needed.
-                snapshot = new AgentQuotaSnapshot { AvailablePct = 100.0, Notes = "PayPerApi — never gated" };
-            }
-            else
-            {
-                snapshot = await ProbeAsync(member, ct);
-            }
+            var snapshot = await ProbeAsync(member, ct);
 
-            AuditLog.QuotaProbed(member.Agent, classId, snapshot.AvailablePct, snapshot.ResetAt);
+            // Include notes so PayPerApi synthetic probes are distinguishable from real
+            // measurements in the audit log.
+            AuditLog.QuotaProbed(member.Agent, classId, snapshot.AvailablePct, snapshot.ResetAt, snapshot.Notes);
 
             // AvailablePct < 0 means unknown → fail-open (treat as available).
             if (snapshot.AvailablePct < 0 || snapshot.AvailablePct >= _opts.MinQuotaPct)
@@ -119,14 +132,11 @@ public sealed class AgentClassRouter
 
     private Task<AgentQuotaSnapshot> ProbeAsync(AgentMembership member, CancellationToken ct)
     {
+        if (member.Billing == AgentBilling.PayPerApi)
+            return _payPerApiProbe.GetAvailabilityAsync(member, ct);
         if (_probesByKind.TryGetValue(member.Agent, out var probe))
             return probe.GetAvailabilityAsync(member, ct);
-        // No probe registered → unknown → fail-open.
-        return Task.FromResult(new AgentQuotaSnapshot
-        {
-            AvailablePct = -1,
-            Notes = $"no probe registered for {member.Agent}",
-        });
+        return _nullProbe.GetAvailabilityAsync(member, ct);
     }
 }
 
@@ -177,4 +187,38 @@ public sealed class QuotaRouterOptions
     /// Default 60 seconds.
     /// </summary>
     public TimeSpan QuotaCacheTtl { get; set; } = TimeSpan.FromSeconds(60);
+}
+
+/// <summary>
+/// Quota probe for <see cref="AgentBilling.PayPerApi"/> members. Always returns
+/// <c>AvailablePct = 100</c> — pay-per-API usage costs money but never hard-fails
+/// the call, so the orchestrator never gates on it.
+/// </summary>
+public sealed class PayPerApiQuotaProbe : IAgentQuotaProbe
+{
+    public AgentKind Kind => new("pay-per-api");
+
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        => Task.FromResult(new AgentQuotaSnapshot
+        {
+            AvailablePct = 100.0,
+            Notes = "PayPerApi — never gated",
+        });
+}
+
+/// <summary>
+/// Fallback quota probe used when no probe is registered for an agent kind.
+/// Returns <c>AvailablePct = -1</c> (unknown) so the router fails open rather
+/// than blocking work items.
+/// </summary>
+public sealed class NullQuotaProbe : IAgentQuotaProbe
+{
+    public AgentKind Kind => new("null");
+
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        => Task.FromResult(new AgentQuotaSnapshot
+        {
+            AvailablePct = -1,
+            Notes = $"no probe registered for {member.Agent}",
+        });
 }

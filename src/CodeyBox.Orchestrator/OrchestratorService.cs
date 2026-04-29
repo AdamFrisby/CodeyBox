@@ -43,6 +43,10 @@ public sealed class OrchestratorService : BackgroundService
     // Snapshot for the /workers/status endpoint.
     private int _currentlyRunning = 0;
 
+    // Count of background deferral tasks currently waiting to re-enqueue items.
+    private int _pendingDeferrals = 0;
+    private const int DeferralWarningThreshold = 100;
+
     public OrchestratorService(
         ITaskQueue queue,
         IWorkItemStore store,
@@ -315,6 +319,12 @@ public sealed class OrchestratorService : BackgroundService
     /// </summary>
     private void ScheduleDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken)
     {
+        var count = Interlocked.Increment(ref _pendingDeferrals);
+        if (count > DeferralWarningThreshold)
+            _log.LogWarning(
+                "Deferred requeue backlog is {Count} items; quota exhaustion may be sustained across many work items",
+                count);
+
         _ = Task.Run(async () =>
         {
             try
@@ -330,6 +340,10 @@ public sealed class OrchestratorService : BackgroundService
             catch (Exception ex)
             {
                 _log.LogError(ex, "Failed to re-enqueue deferred work item {Id}", id);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _pendingDeferrals);
             }
         }, CancellationToken.None);
     }
