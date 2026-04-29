@@ -91,6 +91,44 @@ public sealed class WorkItemDependencyValidationTests
         Assert.False(WorkItemDependencies.AreSatisfied([dep], states));
     }
 
+    // ── FindMissingDependency ─────────────────────────────────────────────────
+
+    [Fact]
+    public void FindMissingDependency_EmptyDeps_ReturnsNull()
+    {
+        var result = WorkItemDependencies.FindMissingDependency([], []);
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void FindMissingDependency_AllDepsExist_ReturnsNull()
+    {
+        var a = WorkItemId.New();
+        var b = WorkItemId.New();
+        var existing = new List<WorkItem> { Item(a), Item(b) };
+        var result = WorkItemDependencies.FindMissingDependency([a, b], existing);
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void FindMissingDependency_OneMissing_ReturnsMissingId()
+    {
+        var a = WorkItemId.New();
+        var missing = WorkItemId.New();
+        var existing = new List<WorkItem> { Item(a) };
+        var result = WorkItemDependencies.FindMissingDependency([a, missing], existing);
+        Assert.Equal(missing, result);
+    }
+
+    [Fact]
+    public void FindMissingDependency_AllMissing_ReturnsFirst()
+    {
+        var first = WorkItemId.New();
+        var second = WorkItemId.New();
+        var result = WorkItemDependencies.FindMissingDependency([first, second], []);
+        Assert.Equal(first, result);
+    }
+
     // ── FindCycle ─────────────────────────────────────────────────────────────
 
     [Fact]

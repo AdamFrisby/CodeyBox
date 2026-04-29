@@ -92,26 +92,19 @@ internal static class WorkItemEndpoints
             dependsOnIds.Add(new WorkItemId(g));
         }
 
-        // Assign the new item's ID now so we can check for self-dependency.
         var newId = WorkItemId.New();
 
-        // Self-dependency check.
-        if (dependsOnIds.Contains(newId))
-            return Results.BadRequest(new { error = "a work item cannot depend on itself" });
-
-        // Existence check: every dep must already be in the store.
-        foreach (var depId in dependsOnIds)
-        {
-            var dep = await store.GetAsync(depId, ct);
-            if (dep is null)
-                return Results.BadRequest(new { error = $"dependency {depId} not found" });
-        }
-
-        // Cycle check: build the full graph (existing items + proposed new item)
-        // and verify the graph remains acyclic. O(V + E).
+        // Load all existing items once — used for both existence and cycle checks.
         var allItems = new List<WorkItem>();
         await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
 
+        // Existence check: every dep must already be in the store.
+        var missingDep = WorkItemDependencies.FindMissingDependency(dependsOnIds, allItems);
+        if (missingDep is not null)
+            return Results.BadRequest(new { error = $"dependency {missingDep} not found" });
+
+        // Cycle check: build the full graph (existing items + proposed new item)
+        // and verify the graph remains acyclic. O(V + E).
         var cyclePath = WorkItemDependencies.FindCycle(newId, dependsOnIds, allItems);
         if (cyclePath is not null)
             return Results.BadRequest(new { error = $"circular dependency detected: {cyclePath}" });
@@ -138,14 +131,20 @@ internal static class WorkItemEndpoints
         await store.CreateAsync(item, ct);
         AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
 
-        // Only enqueue immediately if all dependencies are already terminal.
-        // Otherwise the item sits Queued in the DB until its deps complete.
-        var statesById = WorkItemDependencies.BuildStateMap(allItems);
-        // Include any dependency states that may have just been loaded.
-        if (WorkItemDependencies.AreSatisfied(item.DependsOn, statesById))
+        // Re-read dep states after persisting to avoid TOCTOU: a dep may have
+        // transitioned to terminal between the allItems snapshot and the commit.
+        // Using fresh reads ensures we don't miss the initial enqueue.
+        var freshDepStates = new Dictionary<WorkItemId, WorkItemState>();
+        foreach (var depId in dependsOnIds)
+        {
+            var dep = await store.GetAsync(depId, ct);
+            if (dep is not null)
+                freshDepStates[depId] = dep.State;
+        }
+        if (WorkItemDependencies.AreSatisfied(item.DependsOn, freshDepStates))
             await queue.EnqueueAsync(item.Id, ct);
 
-        return Results.Created($"/workitems/{item.Id}", ToDto(item, project, statesById));
+        return Results.Created($"/workitems/{item.Id}", ToDto(item, project, freshDepStates));
     }
 
     private static async Task<IResult> ListAsync(IWorkItemStore store, IProjectRepository projects, CancellationToken ct)
@@ -169,10 +168,14 @@ internal static class WorkItemEndpoints
         var item = await store.GetAsync(new WorkItemId(g), ct);
         if (item is null) return Results.NotFound();
 
-        // Build state map for dep satisfaction check.
-        var allItems = new List<WorkItem>();
-        await foreach (var i in store.ListAsync(ct)) allItems.Add(i);
-        var statesById = WorkItemDependencies.BuildStateMap(allItems);
+        // Read only the dep states needed — avoids an O(N) full-store scan.
+        var statesById = new Dictionary<WorkItemId, WorkItemState>();
+        foreach (var depId in item.DependsOn)
+        {
+            var dep = await store.GetAsync(depId, ct);
+            if (dep is not null)
+                statesById[depId] = dep.State;
+        }
 
         var project = await projects.GetAsync(item.ProjectId, ct);
         return Results.Ok(ToDto(item, project, statesById));
@@ -318,7 +321,11 @@ internal static class WorkItemEndpoints
         var targets = WorkItemDependencies.FindCascadeCancelTargets(cancelledId, allItems);
         foreach (var target in targets)
         {
-            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled");
+            // Re-read current state: the worker may have picked up this item
+            // between the snapshot and now. Skip if no longer Queued.
+            var current = await store.GetAsync(target.Id, ct);
+            if (current?.State != WorkItemState.Queued) continue;
+            var cancelled = current.With(WorkItemState.Cancelled, "parent dependency cancelled");
             await store.UpdateAsync(cancelled, ct);
             AuditLog.WorkItemDependentCancelled(target.Id, cancelledId);
         }

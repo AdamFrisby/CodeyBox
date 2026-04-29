@@ -47,11 +47,8 @@ public static class WorkItemDependencies
     /// cycle path string like "a -> b -> c -> a" if a cycle is reachable from
     /// <paramref name="newId"/>, or null if the graph remains acyclic.
     ///
-    /// Starting DFS only from <paramref name="newId"/> limits detection to
-    /// cycles reachable through the new item's dependency chain — cycles in
-    /// unrelated parts of the graph do not block this item's creation. The
-    /// check guards against DB corruption or concurrent races that leave a
-    /// dependency subgraph in a cyclic state.
+    /// Uses an iterative DFS with an explicit stack to avoid unbounded call-stack
+    /// growth on long dependency chains (StackOverflowException risk with recursion).
     /// </summary>
     public static string? FindCycle(
         WorkItemId newId,
@@ -66,44 +63,71 @@ public static class WorkItemDependencies
 
         var visited = new HashSet<string>();
         var onStack = new HashSet<string>();
-        var stackPath = new List<string>(); // tracks current DFS path for cycle reporting
+        var stackPath = new List<string>();
+        // Each frame: (node, next-neighbor-index-to-visit).
+        var dfsStack = new Stack<(string Node, int NeighborIdx)>();
 
-        string? cyclePath = null;
+        var start = newId.ToString();
+        visited.Add(start);
+        onStack.Add(start);
+        stackPath.Add(start);
+        dfsStack.Push((start, 0));
 
-        bool Visit(string node)
+        while (dfsStack.Count > 0)
         {
-            if (onStack.Contains(node))
-            {
-                // Found back-edge: reconstruct the cycle segment.
-                var cycleStart = stackPath.IndexOf(node);
-                var cycle = stackPath.Skip(cycleStart).ToList();
-                cycle.Add(node);
-                cyclePath = string.Join(" -> ", cycle);
-                return true;
-            }
-            if (visited.Contains(node)) return false;
+            var (node, idx) = dfsStack.Peek();
+            adj.TryGetValue(node, out var neighbors);
 
-            visited.Add(node);
-            onStack.Add(node);
-            stackPath.Add(node);
-
-            if (adj.TryGetValue(node, out var deps))
+            if (neighbors is null || idx >= neighbors.Count)
             {
-                foreach (var dep in deps)
-                {
-                    if (Visit(dep)) return true;
-                }
+                // All neighbors of this node processed — backtrack.
+                dfsStack.Pop();
+                onStack.Remove(node);
+                stackPath.RemoveAt(stackPath.Count - 1);
+                continue;
             }
 
-            stackPath.RemoveAt(stackPath.Count - 1);
-            onStack.Remove(node);
-            return false;
+            // Advance the neighbor index for this frame before pushing.
+            dfsStack.Pop();
+            dfsStack.Push((node, idx + 1));
+
+            var neighbor = neighbors[idx];
+
+            if (onStack.Contains(neighbor))
+            {
+                // Back-edge found: reconstruct the cycle segment.
+                var cycleStart = stackPath.IndexOf(neighbor);
+                var cycle = stackPath.Skip(cycleStart).Append(neighbor).ToList();
+                return string.Join(" -> ", cycle);
+            }
+
+            if (!visited.Contains(neighbor))
+            {
+                visited.Add(neighbor);
+                onStack.Add(neighbor);
+                stackPath.Add(neighbor);
+                dfsStack.Push((neighbor, 0));
+            }
         }
 
-        // Only traverse the subgraph reachable from newId. This catches cycles
-        // that involve newId's dep chain (e.g., DB corruption where an existing
-        // item already references newId, completing a loop back to it).
-        return Visit(newId.ToString()) ? cyclePath : null;
+        return null;
+    }
+
+    /// <summary>
+    /// Returns the first ID in <paramref name="dependsOnIds"/> that does not
+    /// appear in <paramref name="existingItems"/>, or null if every dep exists.
+    /// </summary>
+    public static WorkItemId? FindMissingDependency(
+        IReadOnlyList<WorkItemId> dependsOnIds,
+        IReadOnlyList<WorkItem> existingItems)
+    {
+        var existingIds = new HashSet<WorkItemId>(existingItems.Select(i => i.Id));
+        foreach (var id in dependsOnIds)
+        {
+            if (!existingIds.Contains(id))
+                return id;
+        }
+        return null;
     }
 
     /// <summary>

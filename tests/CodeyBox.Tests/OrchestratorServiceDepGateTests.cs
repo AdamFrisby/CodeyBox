@@ -31,14 +31,14 @@ public sealed class OrchestratorServiceDepGateTests : IDisposable
     private static WorkItem Sample(
         WorkItemState state = WorkItemState.Queued,
         params WorkItemId[] deps) => new()
-    {
-        Id = WorkItemId.New(),
-        ProjectId = new ProjectId("test-project"),
-        Title = "t",
-        Prompt = "p",
-        State = state,
-        DependsOn = deps,
-    };
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "t",
+            Prompt = "p",
+            State = state,
+            DependsOn = deps,
+        };
 
     private (OrchestratorService svc, InMemoryTaskQueue queue, FakePipelineRunner pipeline,
              CancellationRegistry registry)
