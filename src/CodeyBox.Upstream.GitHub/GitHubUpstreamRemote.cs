@@ -43,7 +43,19 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         _opts = opts;
         if (string.IsNullOrEmpty(_opts.Token))
             throw new ArgumentException("GitHub PAT must be provided", nameof(opts));
+        if (!IsValidRemoteName(_opts.Owner))
+            throw new ArgumentException($"GitHub Owner contains invalid characters: '{_opts.Owner}'", nameof(opts));
+        if (!IsValidRemoteName(_opts.Repository))
+            throw new ArgumentException($"GitHub Repository contains invalid characters: '{_opts.Repository}'", nameof(opts));
     }
+
+    private static bool IsValidRemoteName(string name) =>
+        !string.IsNullOrEmpty(name) &&
+        !name.Contains('/') &&
+        !name.Contains('?') &&
+        !name.Contains('#') &&
+        !name.Contains("..") &&
+        !name.Any(char.IsWhiteSpace);
 
     public string Name => "github";
 
@@ -89,7 +101,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         catch (Exception ex)
         {
             var scrubbed = Scrub(ex.Message);
-            throw new InvalidOperationException($"Failed to push work branch '{request.WorkBranch}': {scrubbed}", ex);
+            throw new InvalidOperationException($"Failed to push work branch '{request.WorkBranch}': {scrubbed}");
         }
 
         // Step 2: open PR
@@ -110,6 +122,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         await _webhooks.DispatchAsync("work_item.pull_request_opened", new PullRequestOpenedPayload
         {
+            WorkItemId = request.WorkItemId.ToString(),
+            ProjectId = request.ProjectId.ToString(),
             WorkBranch = request.WorkBranch,
             BaseBranch = request.BaseBranch,
             PullRequestNumber = pr.Number,
@@ -162,7 +176,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
 
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<GitHubPrResponse>(ct);
+        return await response.Content.ReadFromJsonAsync<GitHubPrResponse>(ct)
+            ?? throw new InvalidOperationException(
+                $"GitHub POST /pulls returned success but response body could not be deserialised (head={request.WorkBranch})");
     }
 
     private async Task<string?> MergePullRequestAsync(int prNumber, CancellationToken ct)

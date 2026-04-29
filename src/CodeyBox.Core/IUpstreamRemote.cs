@@ -34,6 +34,8 @@ public sealed record UpstreamPushResult(bool Success, string? Error);
 public sealed record UpstreamCompletionRequest
 {
     public required string RepositoryId { get; init; }
+    public required WorkItemId WorkItemId { get; init; }
+    public required ProjectId ProjectId { get; init; }
     public required string WorkBranch { get; init; }
     public required string BaseBranch { get; init; }
     /// <summary>SHA produced by the local merge. Null when resuming past the merge phase.</summary>

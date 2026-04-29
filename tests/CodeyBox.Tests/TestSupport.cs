@@ -104,6 +104,7 @@ internal static class TestSupport
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, upstreamFactory, composer,
             store,
+            NullWebhookDispatcher.Instance,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance);
 

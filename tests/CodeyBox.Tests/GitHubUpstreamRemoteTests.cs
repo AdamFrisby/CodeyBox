@@ -21,7 +21,7 @@ public sealed class GitHubUpstreamRemoteTests
     {
         Owner = "myorg",
         Repository = "myrepo",
-        Token = "ghp_testtoken123",
+        Token = "test-token-not-a-real-pat",
         MergeMethod = "merge",
         AutoMerge = false,
     };
@@ -29,6 +29,8 @@ public sealed class GitHubUpstreamRemoteTests
     private static readonly UpstreamCompletionRequest SampleRequest = new()
     {
         RepositoryId = "repo-id",
+        WorkItemId = new WorkItemId(Guid.Parse("00000000-0000-0000-0000-000000000001")),
+        ProjectId = new ProjectId("test-project"),
         WorkBranch = "codeybox/abc123",
         BaseBranch = "main",
         MergeSha = "deadbeef",
@@ -207,6 +209,44 @@ public sealed class GitHubUpstreamRemoteTests
         // The POST /pulls body should contain the resolved title
         Assert.Contains("[bot] Add feature X (codeybox/abc123)", handler.RequestBodies[0]);
     }
+
+    [Fact]
+    public async Task CompleteAsync_PrCreated_DispatchesPullRequestOpenedWebhookEvent()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(42, "https://github.com/myorg/myrepo/pull/42"));
+
+        var dispatcher = new FakeWebhookDispatcher();
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = false }, webhooks: dispatcher);
+        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.Single(dispatcher.Events);
+        var (eventName, payload) = dispatcher.Events[0];
+        Assert.Equal("work_item.pull_request_opened", eventName);
+        var prPayload = Assert.IsType<PullRequestOpenedPayload>(payload);
+        Assert.Equal(SampleRequest.WorkBranch, prPayload.WorkBranch);
+        Assert.Equal(SampleRequest.BaseBranch, prPayload.BaseBranch);
+        Assert.Equal(42, prPayload.PullRequestNumber);
+        Assert.Equal("https://github.com/myorg/myrepo/pull/42", prPayload.PullRequestUrl);
+        Assert.Equal(SampleRequest.WorkItemId.ToString(), prPayload.WorkItemId);
+        Assert.Equal(SampleRequest.ProjectId.ToString(), prPayload.ProjectId);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_PullsReturns422_DoesNotDispatchWebhookEvent()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(JsonResponse(HttpStatusCode.UnprocessableEntity,
+            """{"message":"Validation Failed"}"""));
+
+        var dispatcher = new FakeWebhookDispatcher();
+        var remote = BuildRemote(gitHost, handler, webhooks: dispatcher);
+        await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.Empty(dispatcher.Events);
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -277,5 +317,20 @@ internal sealed class FakeHttpClientFactory : IHttpClientFactory
             _client.DefaultRequestHeaders.UserAgent.ParseAdd(userAgent);
     }
 
-    public HttpClient CreateClient(string name) => _client;
+    public HttpClient CreateClient(string name)
+    {
+        Assert.Equal("github-upstream", name);
+        return _client;
+    }
+}
+
+internal sealed class FakeWebhookDispatcher : IWebhookDispatcher
+{
+    public List<(string EventName, object Payload)> Events { get; } = new();
+
+    public Task DispatchAsync(string eventName, object payload, CancellationToken ct = default)
+    {
+        Events.Add((eventName, payload));
+        return Task.CompletedTask;
+    }
 }

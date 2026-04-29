@@ -23,11 +23,27 @@ public sealed class NullWebhookDispatcher : IWebhookDispatcher
         => Task.CompletedTask;
 }
 
+/// <summary>Payload for the <c>work_item.upstream_pushing</c> event.</summary>
+public sealed record UpstreamPushingPayload
+{
+    public required string WorkItemId { get; init; }
+    public required string ProjectId { get; init; }
+}
+
 /// <summary>Payload for the <c>work_item.pull_request_opened</c> event.</summary>
 public sealed record PullRequestOpenedPayload
 {
+    public required string WorkItemId { get; init; }
+    public required string ProjectId { get; init; }
     public required string WorkBranch { get; init; }
     public required string BaseBranch { get; init; }
     public required int PullRequestNumber { get; init; }
     public required string PullRequestUrl { get; init; }
+}
+
+/// <summary>Payload for the <c>work_item.done</c> event.</summary>
+public sealed record WorkItemDonePayload
+{
+    public required string WorkItemId { get; init; }
+    public required string ProjectId { get; init; }
 }
