@@ -91,6 +91,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     /// </summary>
     public async Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
     {
+        // Reject branch names with whitespace/control chars to prevent log injection.
+        if (string.IsNullOrEmpty(request.WorkBranch) || request.WorkBranch.Any(char.IsWhiteSpace))
+            throw new ArgumentException(
+                $"WorkBranch contains invalid characters (whitespace not allowed): '{SanitizeForLog(request.WorkBranch)}'",
+                nameof(request));
+
         // Step 1: push work branch
         var repoUrl = RepoUrl();
         using var askpass = GitCredentialHelper.CreateAskPassFor(_opts.Token, "x-access-token");
@@ -101,7 +107,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         catch (Exception ex)
         {
             var scrubbed = Scrub(ex.Message);
-            throw new InvalidOperationException($"Failed to push work branch '{request.WorkBranch}': {scrubbed}");
+            throw new InvalidOperationException($"Failed to push work branch '{SanitizeForLog(request.WorkBranch)}': {scrubbed}");
         }
 
         // Step 2: open PR
@@ -141,7 +147,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
 
         // Step 3: auto-merge
-        var mergedSha = await MergePullRequestAsync(pr.Number, ct);
+        var (mergedSha, mergeNotes) = await MergePullRequestAsync(pr.Number, ct);
         if (mergedSha is not null)
             _log.LogInformation("GitHub PR #{N} auto-merged: {Sha}", pr.Number, mergedSha);
 
@@ -151,6 +157,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             PullRequestUrl = pr.HtmlUrl,
             PullRequestNumber = pr.Number,
             MergedSha = mergedSha,
+            Notes = mergeNotes,
         };
     }
 
@@ -181,7 +188,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 $"GitHub POST /pulls returned success but response body could not be deserialised (head={request.WorkBranch})");
     }
 
-    private async Task<string?> MergePullRequestAsync(int prNumber, CancellationToken ct)
+    private async Task<(string? Sha, string? Notes)> MergePullRequestAsync(int prNumber, CancellationToken ct)
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}/merge";
         var body = new GitHubMergeRequest(_opts.MergeMethod);
@@ -193,15 +200,16 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         if (response.StatusCode == HttpStatusCode.MethodNotAllowed)
         {
+            const string note = "Auto-merge blocked (405 — branch protection or PR not mergeable); PR left open";
             _log.LogWarning(
                 "GitHub PUT /pulls/{N}/merge returned 405 (PR not mergeable, e.g. branch protection); leaving PR open",
                 prNumber);
-            return null;
+            return (null, note);
         }
 
         response.EnsureSuccessStatusCode();
         var result = await response.Content.ReadFromJsonAsync<GitHubMergeResponse>(ct);
-        return result?.Sha;
+        return (result?.Sha, null);
     }
 
     private HttpRequestMessage BuildRequest(HttpMethod method, string url)
@@ -218,6 +226,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
     private string Scrub(string message) =>
         message.Replace(_opts.Token, "***", StringComparison.Ordinal);
+
+    private static string SanitizeForLog(string? value) =>
+        value?.Replace("\n", "\\n", StringComparison.Ordinal)
+              .Replace("\r", "\\r", StringComparison.Ordinal) ?? "(null)";
 
     private string BuildPrTitle(string title, string workBranch)
     {

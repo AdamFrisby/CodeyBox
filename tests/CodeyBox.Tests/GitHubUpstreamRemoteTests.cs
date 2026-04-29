@@ -158,6 +158,9 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Equal("https://github.com/myorg/myrepo/pull/99", outcome.PullRequestUrl);
         Assert.Equal(99, outcome.PullRequestNumber);
         Assert.Null(outcome.MergedSha);  // graceful — PR left open
+        // Notes must be populated so operators get an orchestrator-level diagnostic.
+        Assert.NotNull(outcome.Notes);
+        Assert.Contains("405", outcome.Notes);
     }
 
     [Fact]

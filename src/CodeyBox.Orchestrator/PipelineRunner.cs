@@ -519,7 +519,9 @@ public sealed class PipelineRunner
             return summary;
         const int tailChars = 2000;
         var tail = agentStdout.Length <= tailChars ? agentStdout : "…" + agentStdout[^tailChars..];
-        return $"{summary}\n\n## Agent output\n\n```\n{tail}\n```";
+        // Escape any triple-backtick sequences so they cannot close the code fence early.
+        var escaped = tail.Replace("```", @"\`\`\`", StringComparison.Ordinal);
+        return $"{summary}\n\n## Agent output\n\n```\n{escaped}\n```";
     }
 
     private static string BuildMergePrompt(string baseBranch, string workBranch) => $$"""

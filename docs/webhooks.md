@@ -8,13 +8,15 @@ events to your endpoints. The default registration is a no-op.
 
 | Event name | Dispatched by | When fired | Payload fields |
 |---|---|---|---|
-| `work_item.upstream_pushing` | Orchestrator (all upstream kinds) | Phase 4 begins (before push/PR) | `workItemId`, `projectId` |
+| `work_item.upstream_pushing` | Orchestrator (github, git-generic) | Phase 4 begins (before push/PR) | `workItemId`, `projectId` |
 | `work_item.pull_request_opened` | `GitHubUpstreamRemote` only | After a GitHub PR is successfully opened | `workItemId`, `projectId`, `workBranch`, `baseBranch`, `pullRequestNumber`, `pullRequestUrl` |
 | `work_item.done` | Orchestrator (all upstream kinds) | Work item transitions to the Done state | `workItemId`, `projectId` |
 
 > **Note:** `work_item.pull_request_opened` is only fired by `GitHubUpstreamRemote`.
-> Projects using `Upstream.Kind=noop` or `Upstream.Kind=git-generic` do not emit this event but
-> still receive `work_item.upstream_pushing` and `work_item.done`.
+> Projects using `Upstream.Kind=git-generic` do not emit this event but still receive
+> `work_item.upstream_pushing` and `work_item.done`.
+> Projects using `Upstream.Kind=noop` skip the upstream push phase entirely and only receive
+> `work_item.done` — `work_item.upstream_pushing` is **not** dispatched for noop projects.
 
 ## Implementing IWebhookDispatcher
 

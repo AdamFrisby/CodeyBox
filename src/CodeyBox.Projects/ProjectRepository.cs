@@ -74,14 +74,31 @@ public sealed class ProjectRepository : IProjectRepository
     private static AgentKind ParseAgent(string? value)
         => string.IsNullOrWhiteSpace(value) ? AgentKind.Claude : new AgentKind(value);
 
-    private static ProjectUpstream ResolveUpstream(ProjectUpstreamConfig? c) => c is null ? ProjectUpstream.Noop : new ProjectUpstream
+    private static ProjectUpstream ResolveUpstream(ProjectUpstreamConfig? c)
     {
-        Kind = c.Kind ?? "noop",
-        GitHubOwner = c.GitHubOwner,
-        GitHubRepository = c.GitHubRepository,
-        GenericUrl = c.GenericUrl,
-        TokenEnvVar = c.TokenEnvVar,
-    };
+        if (c is null) return ProjectUpstream.Noop;
+
+        var kind = c.Kind ?? "noop";
+        var mergeMethod = c.MergeMethod ?? "merge";
+
+        // Validate at startup so misconfigured MergeMethod surfaces immediately.
+        if (kind.Equals("github", StringComparison.OrdinalIgnoreCase) &&
+            mergeMethod is not ("merge" or "squash" or "rebase"))
+            throw new InvalidOperationException(
+                $"Upstream.MergeMethod '{mergeMethod}' is invalid; valid values: merge, squash, rebase");
+
+        return new ProjectUpstream
+        {
+            Kind = kind,
+            GitHubOwner = c.GitHubOwner,
+            GitHubRepository = c.GitHubRepository,
+            GenericUrl = c.GenericUrl,
+            TokenEnvVar = c.TokenEnvVar,
+            MergeMethod = mergeMethod,
+            AutoMerge = c.AutoMerge ?? false,
+            PullRequestTitleTemplate = c.PullRequestTitleTemplate,
+        };
+    }
 
     private static ProjectAudit ResolveAudit(ProjectAuditConfig? project, ProjectAuditConfig? defaults)
     {
