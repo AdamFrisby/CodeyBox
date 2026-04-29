@@ -151,6 +151,17 @@ builder.Services.AddSingleton<ICredentialProvider>(_ => new EnvironmentCredentia
     new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
 }));
 
+// --- HTTP clients ------------------------------------------------------------
+// Named client for GitHub upstream. GitHub requires a User-Agent header.
+// Authorization is added per-request in GitHubUpstreamRemote (per-project PAT).
+builder.Services.AddHttpClient("github-upstream", client =>
+{
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("codeybox");
+    // Shorter timeout than the 100 s .NET default: bounds the stall window per
+    // attempt given the orchestrator retries up to UpstreamPushMaxAttempts times.
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+
 // --- Projects + per-project upstream + audit composer ------------------------
 builder.Services.AddSingleton<IProjectRepository, ProjectRepository>();
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();

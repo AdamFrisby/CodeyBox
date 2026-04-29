@@ -20,6 +20,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.merging` | Merge phase starts |
 | `work_item.merged` | Merge phase succeeded |
 | `work_item.upstream_pushing` | Upstream push starts |
+| `work_item.pull_request_opened` | A GitHub pull request was opened for the work branch (only fires from `Upstream.Kind=github`; see [Details](#pull_request_opened-details)) |
 | `work_item.done` | Work item completed successfully |
 | `work_item.failed` | Work item failed (unrecoverable error) |
 | `work_item.cancelled` | Work item was cancelled via the API |
@@ -73,6 +74,24 @@ When `event` is `work_item.audit_iteration`, the `details` field is populated:
   }
 }
 ```
+
+### `pull_request_opened` details
+
+When `event` is `work_item.pull_request_opened` (only emitted by `Upstream.Kind=github`), the `details` field carries the PR coordinates and, if `Upstream.AutoMerge=true`, the merge SHA:
+
+```json
+{
+  "details": {
+    "workBranch": "codeybox/a1b2c3d4",
+    "baseBranch": "main",
+    "pullRequestNumber": 42,
+    "pullRequestUrl": "https://github.com/example/repo/pull/42",
+    "mergedSha": "abc123def456..."
+  }
+}
+```
+
+`mergedSha` is `null` when `AutoMerge=false` or when GitHub refused the auto-merge (e.g. branch protection); the PR is still left open in that case.
 
 ---
 

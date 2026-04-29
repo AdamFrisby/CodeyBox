@@ -469,8 +469,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     /// <summary>
     /// Adds native (virtiofs/9p passthrough) mounts to a Stopped VM.
-    /// Caller is responsible for ensuring the VM is in Stopped state
-    /// — `multipass mount --type=native` rejects any other state.
+    /// We wait for State=Stopped on entry as defence-in-depth: callers
+    /// give us a freshly-cloned or freshly-stopped VM, but `multipass
+    /// info` can briefly report State=Unknown right after the operation
+    /// returns, and `multipass mount --type=native` rejects any
+    /// non-Stopped state with "Please stop the instance ..."
     /// We use --type=native rather than the default sshfs-based "classic"
     /// mount because classic requires the multipass-sshfs snap inside
     /// the guest, and our host firewall typically blocks the snap store.
@@ -478,6 +481,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private async Task ApplyMountsAsync(string name, List<(string Host, string Sandbox)> binds, CancellationToken ct)
     {
         if (binds.Count == 0) return;
+        await WaitForStoppedAsync(name, ct);
         foreach (var (host, sandbox) in binds)
         {
             var run = await RunAsync(
