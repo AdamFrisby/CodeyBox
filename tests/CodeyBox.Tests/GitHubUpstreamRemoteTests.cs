@@ -39,7 +39,7 @@ public sealed class GitHubUpstreamRemoteTests
     };
 
     private static GitHubUpstreamRemote BuildRemote(
-        FakeGitHost gitHost,
+        IGitHost gitHost,
         FakeHttpMessageHandler handler,
         GitHubUpstreamOptions? opts = null,
         IWebhookDispatcher? webhooks = null)
@@ -250,6 +250,23 @@ public sealed class GitHubUpstreamRemoteTests
 
         Assert.Empty(dispatcher.Events);
     }
+
+    [Fact]
+    public async Task CompleteAsync_PushToUpstreamThrows_PropagatesExceptionWithoutCallingGitHubApi()
+    {
+        // Verifies that a PushToUpstreamAsync failure is rethrown so the
+        // orchestrator retry loop can engage, and that no GitHub API calls
+        // are made when the push step itself fails.
+        var gitHost = new ThrowingFakeGitHost(new InvalidOperationException("git push failed: connection refused"));
+        var handler = new FakeHttpMessageHandler();
+
+        var remote = BuildRemote(gitHost, handler);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Empty(handler.Requests);
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -336,4 +353,33 @@ internal sealed class FakeWebhookDispatcher : IWebhookDispatcher
         Events.Add((eventName, payload));
         return Task.CompletedTask;
     }
+}
+
+internal sealed class ThrowingFakeGitHost : IGitHost
+{
+    private readonly Exception _ex;
+    public ThrowingFakeGitHost(Exception ex) => _ex = ex;
+
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+        => Task.FromResult(id.ToString());
+
+    public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
+        => throw new NotSupportedException();
+
+    public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+        => Task.FromResult("main");
+
+    public Task PushToUpstreamAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+        => throw _ex;
+
+    public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
+        => Task.FromResult(true);
 }

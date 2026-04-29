@@ -54,6 +54,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         !name.Contains('/') &&
         !name.Contains('?') &&
         !name.Contains('#') &&
+        !name.Contains('%') &&
         !name.Contains("..") &&
         !name.Any(char.IsWhiteSpace);
 
@@ -96,6 +97,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             throw new ArgumentException(
                 $"WorkBranch contains invalid characters (whitespace not allowed): '{SanitizeForLog(request.WorkBranch)}'",
                 nameof(request));
+        if (string.IsNullOrEmpty(request.BaseBranch) || request.BaseBranch.Any(char.IsWhiteSpace))
+            throw new ArgumentException(
+                $"BaseBranch contains invalid characters (whitespace not allowed): '{SanitizeForLog(request.BaseBranch)}'",
+                nameof(request));
 
         // Step 1: push work branch
         var repoUrl = RepoUrl();
@@ -106,6 +111,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
         catch (Exception ex)
         {
+            // Log original exception at Debug so the full stack trace is available
+            // in verbose logs without forwarding potential credential noise to Info+.
+            _log.LogDebug(ex, "Work-branch push to upstream threw (details may contain credentials)");
             var scrubbed = Scrub(ex.Message);
             throw new InvalidOperationException($"Failed to push work branch '{SanitizeForLog(request.WorkBranch)}': {scrubbed}");
         }
@@ -250,6 +258,11 @@ public sealed record GitHubUpstreamOptions
     public string MergeMethod { get; init; } = "merge";
     public bool AutoMerge { get; init; }
     public string? PullRequestTitleTemplate { get; init; }
+
+    // Prevent the auto-generated record ToString() from rendering Token in plaintext
+    // (e.g. when the instance is passed to a structured logger via {Opts}).
+    public override string ToString() =>
+        $"GitHubUpstreamOptions {{ Owner = {Owner}, Repository = {Repository}, Token = ***, MergeMethod = {MergeMethod}, AutoMerge = {AutoMerge} }}";
 }
 
 // Internal DTOs — only used for GitHub REST serialisation, never exposed.

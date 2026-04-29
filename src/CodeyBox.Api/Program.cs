@@ -156,6 +156,9 @@ builder.Services.AddSingleton<ICredentialProvider>(_ => new EnvironmentCredentia
 builder.Services.AddHttpClient("github-upstream", client =>
 {
     client.DefaultRequestHeaders.UserAgent.ParseAdd("codeybox");
+    // Shorter timeout than the 100 s .NET default: bounds the stall window per
+    // attempt given the orchestrator retries up to UpstreamPushMaxAttempts times.
+    client.Timeout = TimeSpan.FromSeconds(30);
 });
 
 // --- Webhook dispatcher ------------------------------------------------------
