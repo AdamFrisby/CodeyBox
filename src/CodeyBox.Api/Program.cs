@@ -319,10 +319,15 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
 builder.Services.AddSingleton<PipelineRunner>();
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
-    new OrchestratorOptions { Concurrency = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Concurrency });
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.Orchestrator");
+    return OrchestratorOptionsFactory.Build(cbOpts.Concurrency, cbOpts.WorkerPool, startupLog);
+});
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
     new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
-builder.Services.AddHostedService<OrchestratorService>();
+builder.Services.AddSingleton<OrchestratorService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 
 var app = builder.Build();
 
@@ -354,7 +359,16 @@ namespace CodeyBox.Api
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public string SandboxImageReference { get; set; } = "codeybox/agent:latest";
         public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com"];
-        public int Concurrency { get; set; } = 2;
+        /// <summary>
+        /// Legacy concurrency knob. If set, treated as
+        /// <see cref="WorkerPool"/>.<see cref="WorkerPoolOptions.MaxConcurrentWorkers"/>
+        /// and a deprecation warning is emitted. Prefer WorkerPool instead.
+        /// </summary>
+        public int? Concurrency { get; set; }
+
+        /// <summary>Worker pool sizing and spawn-pacing configuration.</summary>
+        public WorkerPoolOptions WorkerPool { get; set; } = new();
+
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
 

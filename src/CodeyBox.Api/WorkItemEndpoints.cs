@@ -18,6 +18,20 @@ internal static class WorkItemEndpoints
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
         projects.MapGet("/{id}", GetProjectAsync);
+
+        app.MapGet("/workers/status", GetWorkerStatusAsync);
+    }
+
+    private static IResult GetWorkerStatusAsync(OrchestratorService orchestrator)
+    {
+        var status = orchestrator.GetStatus();
+        return Results.Ok(new
+        {
+            maxConcurrent = status.MaxConcurrent,
+            currentlyRunning = status.CurrentlyRunning,
+            queuedCount = status.QueuedCount,
+            lastSpawnAt = status.LastSpawnAt,
+        });
     }
 
     private static async Task<IResult> CreateAsync(

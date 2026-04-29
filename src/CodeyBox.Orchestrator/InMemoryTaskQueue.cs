@@ -16,6 +16,8 @@ public sealed class InMemoryTaskQueue : ITaskQueue
     public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
         => _channel.Writer.WriteAsync(id, ct);
 
+    public int Count => _channel.Reader.Count;
+
     public async ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
     {
         try

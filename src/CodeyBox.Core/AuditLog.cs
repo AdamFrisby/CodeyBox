@@ -55,6 +55,22 @@ public static class AuditLog
         Audit("work_item.picked_up")
             .Information("Worker {WorkerId} picked up work item {WorkItemId}", workerId, id.ToString());
 
+    // ── Worker pool lifecycle ────────────────────────────────────────────────
+
+    public static void WorkerPoolSpawnThrottled(long waitMs) =>
+        Audit("worker_pool.spawn_throttled")
+            .Information("Worker spawn throttled by spawn interval: waiting {WaitMs}ms", waitMs);
+
+    public static void WorkerPoolWorkerStarted(int workerIndex, WorkItemId id) =>
+        Audit("worker_pool.worker_started")
+            .Information("Worker pool: worker {WorkerIndex} started for work item {WorkItemId}",
+                workerIndex, id.ToString());
+
+    public static void WorkerPoolWorkerFinished(int workerIndex, WorkItemId id) =>
+        Audit("worker_pool.worker_finished")
+            .Information("Worker pool: worker {WorkerIndex} finished for work item {WorkItemId}",
+                workerIndex, id.ToString());
+
     public static void WorkItemDependenciesResolved(WorkItemId id) =>
         Audit("work_item.dependencies_resolved")
             .Information("Work item {WorkItemId} enqueued: all dependencies reached terminal state", id.ToString());
