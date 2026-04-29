@@ -84,22 +84,47 @@ The merge is `--no-ff` so the work-branch is preserved in the history.
 
 ## Phase 4: Upstream push (host)
 
-The orchestrator runs on the host:
+The orchestrator calls `IUpstreamRemote.CompleteAsync` with the work branch
+name, base branch, and the merge SHA from phase 3. The implementation
+decides what "complete" means for its upstream type.
+
+### git-generic
 
 ```bash
-# Pseudo: actual impl uses git via Process and never logs the token
-git -C /var/lib/codeybox/repos/<id>.git push <upstream> <baseBranch>:<baseBranch>
+git -C /var/lib/codeybox/repos/<id>.git push <url> <baseBranch>:<baseBranch>
 ```
 
-For GitHub: `IUpstreamRemote` impl rebuilds the URL with
-`x-access-token:<PAT>` once, in memory, for the single push. The token never
-hits a config file, never touches argv, and is scrubbed from any error
-message returned to the orchestrator.
+Pushes the merged base branch. No PR concept.
 
-If push fails (network, branch protection, conflict), it is retried
-`UpstreamPushMaxAttempts` times with `UpstreamPushBackoff` between
-attempts. After exhaustion the work item is marked Failed; the local merge
-is still in place and an operator can retry by re-queuing.
+### GitHub
+
+```
+1. git push origin <workBranch>:<workBranch>   # token via GIT_ASKPASS
+2. POST https://api.github.com/repos/{owner}/{repo}/pulls
+       { "title": "<pr title>", "head": "<workBranch>", "base": "<baseBranch>" }
+3. [if AutoMerge=true]
+   PUT  https://api.github.com/repos/{owner}/{repo}/pulls/{n}/merge
+       { "merge_method": "<merge|squash|rebase>" }
+```
+
+The PAT is set as a per-request `Authorization: token <PAT>` header; it
+never appears on argv, in config files, or in log output (scrubbed from
+any error message). The named `HttpClient "github-upstream"` carries the
+`User-Agent: codeybox` header required by the GitHub API.
+
+**Soft failures** are handled gracefully without retrying:
+
+| Status | Scenario | Behaviour |
+|---|---|---|
+| 422 on POST /pulls | Branch already has an open PR | Log warning, return BranchPushed=true, PR fields null |
+| 405 on PUT /pulls/N/merge | Branch protection prevents merge | Log warning, return PullRequestUrl set, MergedSha null |
+
+All other errors throw, triggering the orchestrator retry loop.
+
+If every attempt fails (network outage, unexpected HTTP errors), the item
+is marked Failed after `UpstreamPushMaxAttempts` retries with
+`UpstreamPushBackoff` between them. The local merge in the host bare repo
+is unaffected; an operator can re-queue to retry phase 4 independently.
 
 ## Why bare repos per work item
 

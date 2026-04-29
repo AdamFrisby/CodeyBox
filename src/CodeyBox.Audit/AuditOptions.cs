@@ -5,7 +5,7 @@ namespace CodeyBox.Audit;
 public sealed record AuditOptions
 {
     /// <summary>Maximum audit + rework cycles before giving up.</summary>
-    public int MaxIterations { get; init; } = 3;
+    public int MaxIterations { get; init; } = 10;
 
     /// <summary>
     /// Findings at or above this severity cause the audit to fail. Lower-

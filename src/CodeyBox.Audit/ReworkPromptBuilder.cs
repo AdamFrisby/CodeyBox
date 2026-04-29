@@ -16,7 +16,9 @@ public static class ReworkPromptBuilder
         sb.AppendLine("## Rework requested");
         sb.AppendLine();
         sb.Append("Audit iteration ").Append(iteration).Append(" of ").Append(maxIterations)
-          .AppendLine(" found issues with your previous changes. Please address every error below, then ensure all auditors would pass on a re-run. Make new commits — do not amend.");
+          .AppendLine(" found issues with your previous changes. Please address every Error-severity finding below, then commit. The orchestrator re-runs the full audit suite after your commit; it will fail with new findings if anything is still wrong, and you'll get another chance to address them.");
+        sb.AppendLine();
+        sb.AppendLine("Make new commits — do not amend.");
         sb.AppendLine();
 
         var grouped = findings.GroupBy(f => f.AuditorName);

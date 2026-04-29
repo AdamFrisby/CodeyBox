@@ -9,6 +9,7 @@ internal static class WorkItemEndpoints
     {
         var group = app.MapGroup("/workitems");
         group.MapPost("/", CreateAsync);
+        group.MapPost("/{id}/retry", RetryAsync);
         group.MapGet("/", ListAsync);
         group.MapGet("/{id}", GetAsync);
         group.MapDelete("/{id}", CancelAsync);
@@ -85,6 +86,13 @@ internal static class WorkItemEndpoints
             Agent = agentOverride,
             PushUpstream = req.PushUpstream ?? true,
         };
+        // Optional caller-supplied timeout overrides. Bounded so a typo
+        // can't queue a never-cancelled work item. The defaults baked
+        // into WorkItem (30 / 15 minutes) apply when these are unset.
+        if (req.WorkTimeoutMinutes is { } w)
+            item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
+        if (req.MergeTimeoutMinutes is { } m)
+            item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
         await store.CreateAsync(item, ct);
         await queue.EnqueueAsync(item.Id, ct);
         return Results.Created($"/workitems/{item.Id}", ToDto(item, project));
@@ -111,7 +119,70 @@ internal static class WorkItemEndpoints
         return Results.Ok(ToDto(item, project));
     }
 
-    private static async Task<IResult> CancelAsync(string id, IWorkItemStore store, CancellationRegistry cancellations, CancellationToken ct)
+    /// <summary>
+    /// Retry a terminal-failed work item from a specific phase. Resets the
+    /// state to the matching pre-phase marker and re-enqueues; the pipeline
+    /// runner gates each phase by entry state, so earlier phases are
+    /// skipped (their output — branch / merged base — is still in the bare
+    /// repo from the prior run).
+    /// </summary>
+    private static async Task<IResult> RetryAsync(
+        string id,
+        RetryWorkItemRequest? body,
+        IWorkItemStore store,
+        ITaskQueue queue,
+        IGitHost gitHost,
+        CancellationToken ct)
+    {
+        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
+        var workItemId = new WorkItemId(g);
+        var item = await store.GetAsync(workItemId, ct);
+        if (item is null) return Results.NotFound();
+
+        // Only resume from terminal-failed states. Done items have nothing
+        // to retry; non-terminal states would race the pipeline.
+        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled))
+            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
+
+        var from = (body?.From ?? "work").Trim().ToLowerInvariant();
+        var resumeState = from switch
+        {
+            "work" => WorkItemState.Queued,
+            "audit" => WorkItemState.WorkComplete,
+            "merge" => WorkItemState.AuditPassed,
+            "upstream" => WorkItemState.Merged,
+            _ => (WorkItemState?)null,
+        };
+        if (resumeState is null)
+            return Results.BadRequest(new { error = $"invalid 'from' value '{from}'", valid = new[] { "work", "audit", "merge", "upstream" } });
+
+        // For from != "work", the pipeline expects the bare repo (with the
+        // work branch and any later merges) to still be present. If the
+        // operator deleted it, fail loudly rather than re-clone empty.
+        if (resumeState != WorkItemState.Queued)
+        {
+            var present = await gitHost.RepositoryExistsAsync(item.Id, ct);
+            if (!present)
+                return Results.Conflict(new
+                {
+                    error = $"cannot retry from '{from}': bare repo for work item {id} no longer exists",
+                    hint = "retry with from=\"work\" to start over from a fresh clone"
+                });
+        }
+
+        var resumed = item.With(resumeState.Value, error: null);
+        await store.UpdateAsync(resumed, ct);
+        await queue.EnqueueAsync(resumed.Id, ct);
+        return Results.Accepted($"/workitems/{id}", new { id, from, state = resumeState.Value.ToString() });
+    }
+
+    private static async Task<IResult> CancelAsync(
+        string id,
+        IWorkItemStore store,
+        CancellationRegistry cancellations,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
     {
         if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
         var workItemId = new WorkItemId(g);
@@ -122,7 +193,18 @@ internal static class WorkItemEndpoints
 
         var wasActive = cancellations.Cancel(workItemId);
         if (!wasActive)
-            await store.UpdateAsync(item.With(WorkItemState.Cancelled, "cancelled via API"), ct);
+        {
+            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API");
+            await store.UpdateAsync(cancelled, ct);
+            var project = await projects.GetAsync(item.ProjectId, ct);
+            if (project is not null)
+                await webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.cancelled",
+                    WorkItem = cancelled,
+                    Project = project,
+                }, ct);
+        }
         return Results.Accepted($"/workitems/{id}");
     }
 
@@ -174,7 +256,11 @@ public sealed record CreateWorkItemRequest(
     string? Agent,
     string? BaseBranch,
     string? WorkBranch,
-    bool? PushUpstream);
+    bool? PushUpstream,
+    int? WorkTimeoutMinutes,
+    int? MergeTimeoutMinutes);
+
+public sealed record RetryWorkItemRequest(string? From);
 
 public sealed record WorkItemDto(
     string Id,

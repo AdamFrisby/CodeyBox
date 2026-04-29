@@ -132,25 +132,35 @@ grep), stdin piping, and working-directory enforcement. Egress
 filtering is verified separately by `local/verify-host-firewall.sh`
 and `local/verify-internet-only.sh` against the real host bridges.
 
-**Putting agents in the VM.** The default Ubuntu image doesn't include
-Claude Code, Codex, etc. Two options:
+**Putting your project's tooling in the VM.** The default Ubuntu image
+is bare — no agent CLI, no language toolchain, no auditor binaries.
+Three ways to install what your project needs:
 
-1. **Cloud-init at first boot** — set `CodeyBox.MultipassExtraCloudInit`
-   to install agents:
-   ```yaml
-   packages:
-     - nodejs
-     - npm
-   runcmd:
-     - npm install -g @anthropic-ai/claude-code
+1. **`CodeyBox.MultipassExtraRuncmd` (recommended)** — a list of shell
+   commands run via `multipass exec` after first boot. Use this for
+   anything that needs a runcmd-style invocation. Example for a project
+   whose work agent is Claude Code and whose audit policy uses gitleaks:
+   ```json
+   "CodeyBox": {
+     "MultipassExtraRuncmd": [
+       "set -eux\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y nodejs npm\nnpm install -g @anthropic-ai/claude-code\ncurl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xzC /usr/local/bin gitleaks"
+     ]
+   }
    ```
-   Note: package downloads from extra-cloud-init go out via the
+   Each entry is one shell command; the orchestrator splices them into
+   its own runcmd block in order. Package downloads go out via the
    profile's host bridge, so their destinations need to be on the
    bridge's allowlist (or use a profile in `internet` mode).
-2. **Custom multipass image** — build a base image with agents
-   pre-installed (`multipass launch` + customise + snapshot), then
-   reference via `SandboxSpec.ImageReference`. Faster startup, no
-   bring-up reachability requirements.
+2. **`CodeyBox.MultipassExtraCloudInit`** — extra cloud-init YAML for
+   non-runcmd directives (`packages:`, `write_files:`, `apt:`, etc.).
+   Don't use this to add a `runcmd:` block — cloud-init's PyYAML parser
+   keeps only the last occurrence of duplicated top-level keys, so a
+   second runcmd would clobber the orchestrator's route swap.
+3. **Custom multipass image** — pre-bake everything (`multipass launch`
+   + customise + snapshot) and reference via `SandboxSpec.ImageReference`.
+   Faster startup, no bring-up reachability requirements. Useful when
+   your install set is heavy enough that the per-profile baseline bake
+   gets long.
 
 ## Choosing
 

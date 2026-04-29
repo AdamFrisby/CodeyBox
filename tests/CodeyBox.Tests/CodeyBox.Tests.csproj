@@ -32,6 +32,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Audit.Llm\CodeyBox.Audit.Llm.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />
   </ItemGroup>
 
 </Project>

@@ -29,6 +29,14 @@ public interface IGitHost
 
     /// <summary>Discards the host-side state for a finished work item.</summary>
     Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns true if a host-side bare repo for the given work item id is
+    /// present and usable. Used by the retry endpoint to validate that
+    /// "resume from a later phase" is actually possible — the resumed
+    /// phases need the prior phase's branch/merge state in the bare repo.
+    /// </summary>
+    Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default);
 }
 
 /// <summary>

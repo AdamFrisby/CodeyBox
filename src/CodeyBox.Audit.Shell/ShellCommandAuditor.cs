@@ -37,10 +37,24 @@ public sealed class ShellCommandAuditor : IAuditor
             return new AuditResult(true, []);
 
         var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+
+        // Exit 127 means the shell couldn't find the command — i.e. the tool
+        // isn't installed in the audit sandbox. That's an operator-level
+        // configuration gap, not something the agent can fix by editing
+        // code. Emit it as an INFO finding so it shows up in the report
+        // (operator should install the tool and re-run audit) but doesn't
+        // gate merge or trigger an unfixable rework loop.
+        var severity = result.ExitCode == 127
+            ? AuditSeverity.Info
+            : AuditSeverity.Error;
+        var title = result.ExitCode == 127
+            ? $"tool not installed in sandbox: {_opts.Argv[0]} (auditor skipped — install the tool in MultipassExtraRuncmd)"
+            : $"command exited {result.ExitCode}: {string.Join(' ', _opts.Argv)}";
+
         var finding = new AuditFinding(
             AuditorName: Name,
-            Severity: AuditSeverity.Error,
-            Title: $"command exited {result.ExitCode}: {string.Join(' ', _opts.Argv)}",
+            Severity: severity,
+            Title: title,
             Description: description.TrimEnd());
         return new AuditResult(false, [finding]);
     }

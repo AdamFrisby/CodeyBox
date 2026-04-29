@@ -12,4 +12,7 @@ public sealed class NoopUpstreamRemote : IUpstreamRemote
 
     public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
         => Task.FromResult(new UpstreamPushResult(true, null));
+
+    public Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
+        => Task.FromResult(new UpstreamCompletionOutcome { Skipped = true });
 }
