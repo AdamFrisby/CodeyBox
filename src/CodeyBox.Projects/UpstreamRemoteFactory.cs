@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Upstream;
 using CodeyBox.Upstream.GitHub;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Projects;
 
@@ -17,10 +18,20 @@ namespace CodeyBox.Projects;
 public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
 {
     private readonly IGitHost _gitHost;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IWebhookDispatcher _webhooks;
+    private readonly ILogger<GitHubUpstreamRemote> _githubLog;
 
-    public UpstreamRemoteFactory(IGitHost gitHost)
+    public UpstreamRemoteFactory(
+        IGitHost gitHost,
+        IHttpClientFactory httpClientFactory,
+        IWebhookDispatcher webhooks,
+        ILogger<GitHubUpstreamRemote> githubLog)
     {
         _gitHost = gitHost;
+        _httpClientFactory = httpClientFactory;
+        _webhooks = webhooks;
+        _githubLog = githubLog;
     }
 
     public IUpstreamRemote Create(Project project)
@@ -28,13 +39,16 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         var u = project.Upstream;
         return u.Kind?.ToLowerInvariant() switch
         {
-            "github" => new GitHubUpstreamRemote(_gitHost, new GitHubUpstreamOptions
+            "github" => new GitHubUpstreamRemote(_gitHost, _httpClientFactory, _webhooks, _githubLog, new GitHubUpstreamOptions
             {
                 Owner = u.GitHubOwner ?? throw new InvalidOperationException(
                     $"Project {project.Id}: Upstream.Kind=github requires GitHubOwner"),
                 Repository = u.GitHubRepository ?? throw new InvalidOperationException(
                     $"Project {project.Id}: Upstream.Kind=github requires GitHubRepository"),
                 Token = ReadToken(project, u),
+                MergeMethod = ValidateMergeMethod(project.Id, u.MergeMethod),
+                AutoMerge = u.AutoMerge,
+                PullRequestTitleTemplate = u.PullRequestTitleTemplate,
             }),
             "git-generic" => new GitGenericUpstreamRemote(_gitHost, new GitGenericUpstreamOptions
             {
@@ -43,6 +57,15 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
             }),
             _ => new NoopUpstreamRemote(),
         };
+    }
+
+    private static string ValidateMergeMethod(ProjectId projectId, string mergeMethod)
+    {
+        if (mergeMethod is "merge" or "squash" or "rebase")
+            return mergeMethod;
+        throw new InvalidOperationException(
+            $"Project {projectId}: Upstream.MergeMethod '{mergeMethod}' is invalid; " +
+            "valid values: merge, squash, rebase");
     }
 
     private static string ReadToken(Project project, ProjectUpstream u)

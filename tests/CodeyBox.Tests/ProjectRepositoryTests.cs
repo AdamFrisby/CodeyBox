@@ -120,4 +120,63 @@ public sealed class ProjectRepositoryTests
         };
         Assert.Throws<ArgumentException>(() => new ProjectRepository(Options.Create(opts)));
     }
+
+    [Fact]
+    public void InvalidMergeMethod_ThrowsAtStartup()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://github.com/me/alpha.git",
+                    Upstream = new ProjectUpstreamConfig
+                    {
+                        Kind = "github",
+                        GitHubOwner = "me",
+                        GitHubRepository = "alpha",
+                        TokenEnvVar = "GH_TOKEN",
+                        MergeMethod = "invalid-value",
+                    },
+                },
+            ],
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => new ProjectRepository(Options.Create(opts)));
+        Assert.Contains("invalid-value", ex.Message);
+    }
+
+    [Fact]
+    public async Task UpstreamFields_LoadedFromConfig()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://github.com/me/alpha.git",
+                    Upstream = new ProjectUpstreamConfig
+                    {
+                        Kind = "github",
+                        GitHubOwner = "me",
+                        GitHubRepository = "alpha",
+                        TokenEnvVar = "GH_TOKEN",
+                        MergeMethod = "squash",
+                        AutoMerge = true,
+                        PullRequestTitleTemplate = "[bot] {title}",
+                    },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(p);
+        Assert.Equal("github", p!.Upstream.Kind);
+        Assert.Equal("squash", p.Upstream.MergeMethod);
+        Assert.True(p.Upstream.AutoMerge);
+        Assert.Equal("[bot] {title}", p.Upstream.PullRequestTitleTemplate);
+    }
 }

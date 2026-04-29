@@ -212,6 +212,42 @@ For `git-generic`, set `GenericUrl` and rely on the host git config
 (askpass, SSH agent) for auth. For `noop`, no upstream push happens and
 the host bare repo is the source of truth.
 
+### GitHub upstream: pull request flow
+
+When `Kind=github`, phase 4 now pushes the **work branch** to GitHub
+and opens a pull request (workBranch → baseBranch) rather than pushing
+the merged base branch directly. This leaves a PR and code-review trail
+on GitHub even for fully-automated merges.
+
+Three additional options control the behaviour:
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `MergeMethod` | `"merge"` \| `"squash"` \| `"rebase"` | `"merge"` | Merge strategy used when `AutoMerge=true`. |
+| `AutoMerge` | bool | `false` | When `true`, merges the PR via the GitHub API immediately after opening it. When `false`, the PR is left open for human review. Either way the work item transitions to `Done`. |
+| `PullRequestTitleTemplate` | string? | — | Template for the PR title. Supports `{title}` (work item title) and `{branch}` (work branch name) placeholders. Defaults to the work item title. |
+
+**Example — auto-merge with squash:**
+
+```json
+"Upstream": {
+  "Kind": "github",
+  "GitHubOwner": "me",
+  "GitHubRepository": "my-app",
+  "TokenEnvVar": "MY_APP_GITHUB_TOKEN",
+  "AutoMerge": true,
+  "MergeMethod": "squash",
+  "PullRequestTitleTemplate": "[bot] {title}"
+}
+```
+
+**Backward compatibility:** Projects upgrading from the old push-only
+behaviour (where phase 4 pushed baseBranch directly) will now get a PR
+instead. The local merge produced by phase 3 is still in the host bare
+repo; the upstream push is additive. If your branch protection rules
+prevent the PAT from merging, leave `AutoMerge=false` and approve the PR
+manually.
+
 ## REST API
 
 ```
