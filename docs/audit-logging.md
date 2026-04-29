@@ -93,7 +93,7 @@ Audit-tier events additionally carry:
 
 | `EventName` | Level | Emitted by | Properties |
 |-------------|-------|-----------|------------|
-| `auditor.run` | Info | `PipelineRunner.CollectFindingsAsync` | `AuditorName`, `WorseSeverity` (`none`/`Info`/`Warning`/`Error`), `DurationMs` |
+| `auditor.run` | Info | `PipelineRunner.CollectFindingsAsync` | `AuditorName`, `WorstSeverity` (`none`/`Info`/`Warning`/`Error`), `DurationMs` |
 | `audit.iteration_complete` | Info | `PipelineRunner.RunAuditLoopAsync` | `Iteration`, `MaxIterations`, `BlockingCount`, `NonBlockingCount` |
 | `audit.passed` | Info | Same | `Iteration` |
 | `audit.failed` | Warning | Same | `Iteration`, `BlockingCount` |

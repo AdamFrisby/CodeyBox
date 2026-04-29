@@ -281,11 +281,17 @@ public sealed class PipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
+            // Truncate agent-controlled output to prevent unbounded content from
+            // reaching the audit log via the exception message chain.
+            const int MaxOutputBytes = 4096;
+            static string Truncate(string s) =>
+                s.Length <= MaxOutputBytes ? s : s[..MaxOutputBytes] + $"… [{s.Length - MaxOutputBytes} bytes truncated]";
+
             var detail = string.Join("\n",
                 new[] {
                     $"Agent {runner.Kind} reported failure: {agentResult.Summary}",
-                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{agentResult.Stderr}" : null,
-                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{agentResult.Stdout}" : null,
+                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{Truncate(agentResult.Stderr)}" : null,
+                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{Truncate(agentResult.Stdout)}" : null,
                 }.Where(s => s is not null));
             throw new InvalidOperationException(detail);
         }

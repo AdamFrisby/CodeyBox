@@ -135,13 +135,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
 
         _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
-        if (pr.HtmlUrl is not null)
-            AuditLog.UpstreamPrOpened(pr.Number, pr.HtmlUrl, request.WorkBranch, request.BaseBranch);
+        AuditLog.UpstreamPrOpened(pr.Number, pr.HtmlUrl, request.WorkBranch, request.BaseBranch);
 
         if (pr.HtmlUrl is null)
-        {
             _log.LogWarning("GitHub PR response did not include html_url; pull_request_opened webhook event will not fire");
-        }
 
         if (!_opts.AutoMerge)
         {

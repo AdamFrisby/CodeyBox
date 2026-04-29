@@ -43,6 +43,10 @@ public static class AuditLog
         Audit("work_item.cancelled")
             .Information("Work item {WorkItemId} cancelled", id.ToString());
 
+    public static void WorkItemRetried(WorkItemId id, string from) =>
+        Audit("work_item.retried")
+            .Information("Work item {WorkItemId} retried from phase {From}", id.ToString(), from);
+
     public static void WorkItemFailed(WorkItemId id, string error) =>
         Audit("work_item.failed")
             .Warning("Work item {WorkItemId} failed: {Error}", id.ToString(), error);
@@ -60,8 +64,8 @@ public static class AuditLog
 
     public static void AgentFinished(AgentKind agent, string sandboxName, bool success, int? exitCode, TimeSpan duration) =>
         Audit("agent.finished")
-            .Information("Agent {Agent} finished: success={Success} exit={ExitCode} duration={DurationMs}ms",
-                agent.Value, success, exitCode, (long)duration.TotalMilliseconds);
+            .Information("Agent {Agent} finished in sandbox {Sandbox}: success={Success} exit={ExitCode} duration={DurationMs}ms",
+                agent.Value, sandboxName, success, exitCode, (long)duration.TotalMilliseconds);
 
     // ── Sandbox lifecycle ────────────────────────────────────────────────────
 
@@ -76,7 +80,7 @@ public static class AuditLog
 
     // ── Upstream remote ──────────────────────────────────────────────────────
 
-    public static void UpstreamPrOpened(int prNumber, string prUrl, string workBranch, string baseBranch) =>
+    public static void UpstreamPrOpened(int prNumber, string? prUrl, string workBranch, string baseBranch) =>
         Audit("upstream.pr_opened")
             .Information("Upstream PR #{PrNumber} opened: {PrUrl} ({WorkBranch} → {BaseBranch})",
                 prNumber, prUrl, workBranch, baseBranch);
@@ -109,7 +113,7 @@ public static class AuditLog
 
     public static void AuditorRun(string auditorName, string worstSeverity, TimeSpan duration) =>
         Audit("auditor.run")
-            .Information("Auditor {AuditorName} completed: worstSeverity={WorseSeverity} duration={DurationMs}ms",
+            .Information("Auditor {AuditorName} completed: worstSeverity={WorstSeverity} duration={DurationMs}ms",
                 auditorName, worstSeverity, (long)duration.TotalMilliseconds);
 
     public static void AuditIterationComplete(int iteration, int maxIterations, int blockingCount, int nonBlockingCount) =>

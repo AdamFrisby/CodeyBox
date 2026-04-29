@@ -59,6 +59,8 @@ public sealed class AuditLogTests : IDisposable
         var evt = Assert.Single(_sink.Events);
         Assert.Equal("agent.finished", GetScalar<string>(evt, "EventName"));
         Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("claude", GetScalar<string>(evt, "Agent"));
+        Assert.Equal("vm-03", GetScalar<string>(evt, "Sandbox"));
         Assert.True(GetScalar<bool>(evt, "Success"));
         Assert.Equal(30_000L, GetScalar<long>(evt, "DurationMs"));
     }
@@ -167,6 +169,17 @@ public sealed class AuditLogTests : IDisposable
 
         var evt = Assert.Single(_sink.Events);
         Assert.Equal("***", GetScalar<string>(evt, "Authorization"));
+    }
+
+    [Fact]
+    public void RedactionEnricher_redacts_property_whose_name_contains_ApiKey()
+    {
+        Log.Logger
+            .ForContext("OpenAiApiKey", "sk-proj-test123")
+            .Information("test");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("***", GetScalar<string>(evt, "OpenAiApiKey"));
     }
 
     [Fact]
@@ -282,6 +295,19 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal("webhook.delivered", GetScalar<string>(evt, "EventName"));
         Assert.Equal("my-endpoint", GetScalar<string>(evt, "Endpoint"));
         Assert.Equal(200, GetScalar<int>(evt, "StatusCode"));
+    }
+
+    [Fact]
+    public void AuditorRun_emits_auditor_run_event_with_correct_properties()
+    {
+        AuditLog.AuditorRun("security:llm-review", "Warning", TimeSpan.FromSeconds(5));
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("auditor.run", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("security:llm-review", GetScalar<string>(evt, "AuditorName"));
+        Assert.Equal("Warning", GetScalar<string>(evt, "WorstSeverity"));
+        Assert.Equal(5_000L, GetScalar<long>(evt, "DurationMs"));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

@@ -173,6 +173,7 @@ internal static class WorkItemEndpoints
 
         var resumed = item.With(resumeState.Value, error: null);
         await store.UpdateAsync(resumed, ct);
+        AuditLog.WorkItemRetried(workItemId, from);
         await queue.EnqueueAsync(resumed.Id, ct);
         return Results.Accepted($"/workitems/{id}", new { id, from, state = resumeState.Value.ToString() });
     }
@@ -197,6 +198,7 @@ internal static class WorkItemEndpoints
         {
             var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API");
             await store.UpdateAsync(cancelled, ct);
+            AuditLog.WorkItemCancelled(workItemId);
             var project = await projects.GetAsync(item.ProjectId, ct);
             if (project is not null)
                 await webhooks.PublishAsync(new WebhookEvent
