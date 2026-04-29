@@ -79,7 +79,8 @@ public sealed class OrchestratorService : BackgroundService
         await ReplayPendingAsync(stoppingToken);
 
         // Collect in-flight item tasks so we can await them all on shutdown.
-        var inFlight = new ConcurrentBag<Task>();
+        // List is safe here: only the dispatch loop (single logical thread) touches it.
+        var inFlight = new List<Task>();
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -117,9 +118,13 @@ public sealed class OrchestratorService : BackgroundService
 
             // Record spawn timestamp before launching the task.
             lock (_spawnTimeLock) { _lastSpawnAtTicks = DateTimeOffset.UtcNow.Ticks; }
+            _opts.OnWorkerSpawned?.Invoke();
             var workerIndex = Interlocked.Increment(ref _nextWorkerId);
 
             var capturedId = id.Value;
+            // Increment before Task.Run so the counter is never transiently negative
+            // if the task's finally block executes before we reach the increment.
+            Interlocked.Increment(ref _currentlyRunning);
             var task = Task.Run(async () =>
             {
                 AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
@@ -135,8 +140,9 @@ public sealed class OrchestratorService : BackgroundService
                 }
             });
 
-            Interlocked.Increment(ref _currentlyRunning);
             inFlight.Add(task);
+            // Prune completed tasks on every iteration to prevent unbounded growth.
+            inFlight.RemoveAll(t => t.IsCompleted);
         }
 
         // Drain in-flight tasks before the hosted service exits.
@@ -288,8 +294,15 @@ public sealed class OrchestratorService : BackgroundService
 /// </summary>
 public sealed record OrchestratorOptions
 {
-    public int MaxConcurrentWorkers { get; init; } = 1;
+    public int MaxConcurrentWorkers { get; init; } = 2;
     public TimeSpan MinSpawnInterval { get; init; } = TimeSpan.Zero;
+
+    /// <summary>
+    /// Called by the dispatch loop immediately after the spawn timestamp is
+    /// written, before <see cref="Task.Run"/>. Used by tests to capture the
+    /// true spawn time rather than the thread-pool scheduling time.
+    /// </summary>
+    internal Action? OnWorkerSpawned { get; init; }
 
     /// <summary>
     /// Legacy alias for <see cref="MaxConcurrentWorkers"/>.

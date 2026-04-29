@@ -41,10 +41,11 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
         const int spawnIntervalMs = 200;
         const int slackMs = 50; // allowance for scheduler jitter
 
+        // Timestamps captured at the dispatch loop level (OnWorkerSpawned) rather than
+        // inside RunAsync, so thread-pool scheduling latency doesn't consume the slack.
         var spawnTimes = new ConcurrentBag<DateTimeOffset>();
 
-        var pipeline = new TimestampingPipelineRunner(_store, onStart: () =>
-            spawnTimes.Add(DateTimeOffset.UtcNow));
+        var pipeline = new TimestampingPipelineRunner(_store);
 
         var queue = new InMemoryTaskQueue();
         var registry = new CancellationRegistry(CancellationToken.None);
@@ -52,9 +53,17 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
         {
             MaxConcurrentWorkers = itemCount,
             MinSpawnInterval = TimeSpan.FromMilliseconds(spawnIntervalMs),
+            OnWorkerSpawned = () => spawnTimes.Add(DateTimeOffset.UtcNow),
         };
         var svc = new OrchestratorService(queue, _store, pipeline, registry, opts,
             NullLogger<OrchestratorService>.Instance);
+
+        // Start before enqueuing so ReplayPendingAsync sees an empty store and
+        // never double-enqueues items (which would produce spurious OnWorkerSpawned
+        // callbacks for already-Done items on the second pass).
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+        await Task.Delay(50); // let ReplayPendingAsync finish on the empty store
 
         for (int i = 0; i < itemCount; i++)
         {
@@ -62,9 +71,6 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
             await _store.CreateAsync(item);
             await queue.EnqueueAsync(item.Id);
         }
-
-        using var _ = registry;
-        await svc.StartAsync(CancellationToken.None);
 
         // Wait for all items to complete. Generous timeout: 3 spawns × 200 ms + padding.
         var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
@@ -98,8 +104,7 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
         const int itemCount = 3;
         var spawnTimes = new ConcurrentBag<DateTimeOffset>();
 
-        var pipeline = new TimestampingPipelineRunner(_store, onStart: () =>
-            spawnTimes.Add(DateTimeOffset.UtcNow));
+        var pipeline = new TimestampingPipelineRunner(_store);
 
         var queue = new InMemoryTaskQueue();
         var registry = new CancellationRegistry(CancellationToken.None);
@@ -107,9 +112,15 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
         {
             MaxConcurrentWorkers = itemCount,
             MinSpawnInterval = TimeSpan.Zero,
+            OnWorkerSpawned = () => spawnTimes.Add(DateTimeOffset.UtcNow),
         };
         var svc = new OrchestratorService(queue, _store, pipeline, registry, opts,
             NullLogger<OrchestratorService>.Instance);
+
+        // Start before enqueuing so ReplayPendingAsync sees an empty store.
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+        await Task.Delay(50); // let ReplayPendingAsync finish on the empty store
 
         for (int i = 0; i < itemCount; i++)
         {
@@ -117,9 +128,6 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
             await _store.CreateAsync(item);
             await queue.EnqueueAsync(item.Id);
         }
-
-        using var _ = registry;
-        await svc.StartAsync(CancellationToken.None);
 
         var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
         while (DateTimeOffset.UtcNow < deadline)
@@ -146,17 +154,9 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
 internal sealed class TimestampingPipelineRunner : IPipelineRunner
 {
     private readonly IWorkItemStore _store;
-    private readonly Action _onStart;
 
-    public TimestampingPipelineRunner(IWorkItemStore store, Action onStart)
-    {
-        _store = store;
-        _onStart = onStart;
-    }
+    public TimestampingPipelineRunner(IWorkItemStore store) => _store = store;
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
-    {
-        _onStart();
+    public async Task RunAsync(WorkItem item, CancellationToken ct) =>
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
-    }
 }

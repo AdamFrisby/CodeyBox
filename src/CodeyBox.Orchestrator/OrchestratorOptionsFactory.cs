@@ -28,11 +28,14 @@ public static class OrchestratorOptionsFactory
 
         if (legacyConcurrency is { } legacyValue)
         {
+            var discardSuffix = wp.MaxConcurrentWorkers != legacyValue
+                ? $" Ignoring WorkerPool:MaxConcurrentWorkers={wp.MaxConcurrentWorkers}."
+                : string.Empty;
             log.LogWarning(
                 "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
                 "Use CodeyBox:WorkerPool:MaxConcurrentWorkers instead. " +
-                "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.",
-                legacyValue);
+                "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.{DiscardSuffix}",
+                legacyValue, discardSuffix);
             wp = new WorkerPoolOptions
             {
                 MaxConcurrentWorkers = legacyValue,
