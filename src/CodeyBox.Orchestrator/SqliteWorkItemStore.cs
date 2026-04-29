@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using CodeyBox.Core;
 
@@ -45,6 +46,19 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             CREATE INDEX IF NOT EXISTS idx_work_items_project ON work_items(project_id);
             """;
         cmd.ExecuteNonQuery();
+
+        // Additive migration: add depends_on_json column if it doesn't exist yet.
+        // Existing rows get the default '[]' so behaviour is unchanged.
+        try
+        {
+            using var migrate = _conn.CreateCommand();
+            migrate.CommandText = "ALTER TABLE work_items ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';";
+            migrate.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
+        {
+            // Column already exists from a previous startup — nothing to do.
+        }
     }
 
     public async Task CreateAsync(WorkItem item, CancellationToken ct = default)
@@ -56,8 +70,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             cmd.CommandText = """
                 INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
-                    last_error, upstream_push_attempts)
-                VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att);
+                    last_error, upstream_push_attempts, depends_on_json)
+                VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -80,11 +94,36 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     base_branch = $base, work_branch = $work, agent = $agent,
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
-                    upstream_push_attempts = $att
+                    upstream_push_attempts = $att, depends_on_json = $deps
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    project_id = $project_id, title = $title, prompt = $prompt,
+                    base_branch = $base, work_branch = $work, agent = $agent,
+                    work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                    state = $state, updated_at = $ua, last_error = $err,
+                    upstream_push_attempts = $att, depends_on_json = $deps
+                WHERE id = $id AND state = $only_if_state;
+                """;
+            Bind(cmd, item);
+            cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+            return await cmd.ExecuteNonQueryAsync(ct) > 0;
         }
         finally
         {
@@ -143,6 +182,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$ua", item.UpdatedAt.ToString("O"));
         cmd.Parameters.AddWithValue("$err", (object?)item.LastError ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$att", item.UpstreamPushAttempts);
+        cmd.Parameters.AddWithValue("$deps",
+            JsonSerializer.Serialize(item.DependsOn.Select(id => id.ToString()).ToList()));
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -162,5 +203,24 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         UpdatedAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("updated_at")), System.Globalization.CultureInfo.InvariantCulture),
         LastError = r.IsDBNull(r.GetOrdinal("last_error")) ? null : r.GetString(r.GetOrdinal("last_error")),
         UpstreamPushAttempts = r.GetInt32(r.GetOrdinal("upstream_push_attempts")),
+        DependsOn = ReadDependsOn(r),
     };
+
+    private static IReadOnlyList<WorkItemId> ReadDependsOn(SqliteDataReader r)
+    {
+        var ordinal = r.GetOrdinal("depends_on_json");
+        if (r.IsDBNull(ordinal)) return [];
+        var json = r.GetString(ordinal);
+        var ids = JsonSerializer.Deserialize<string[]>(json);
+        if (ids is null || ids.Length == 0) return [];
+        // Guard against malformed GUIDs from DB corruption: skip bad entries
+        // rather than crashing all callers (including ReplayPendingAsync at boot).
+        var result = new List<WorkItemId>(ids.Length);
+        foreach (var raw in ids)
+        {
+            if (Guid.TryParse(raw, out var g))
+                result.Add(new WorkItemId(g));
+        }
+        return result;
+    }
 }

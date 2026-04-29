@@ -76,4 +76,33 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.Single(results);
         Assert.Equal(working.Id, results[0].Id);
     }
+
+    [Fact]
+    public async Task RoundTrip_NonEmptyDependsOn_Preserved()
+    {
+        var dep1 = Sample();
+        var dep2 = Sample();
+        await _store.CreateAsync(dep1);
+        await _store.CreateAsync(dep2);
+
+        var item = Sample() with { DependsOn = [dep1.Id, dep2.Id] };
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(2, read!.DependsOn.Count);
+        Assert.Contains(dep1.Id, read.DependsOn);
+        Assert.Contains(dep2.Id, read.DependsOn);
+    }
+
+    [Fact]
+    public async Task RoundTrip_EmptyDependsOn_Preserved()
+    {
+        var item = Sample() with { DependsOn = [] };
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Empty(read!.DependsOn);
+    }
 }
