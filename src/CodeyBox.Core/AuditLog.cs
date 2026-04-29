@@ -167,6 +167,23 @@ public static class AuditLog
             .Warning("Webhook delivery failed: endpoint={Endpoint} event={WebhookEvent} after {Attempts} attempts: {LastFailure}",
                 endpoint, eventName, attempts, lastFailure);
 
+    // ── Quota router ─────────────────────────────────────────────────────────
+
+    public static void QuotaProbed(AgentKind agent, string classId, double availablePct, DateTimeOffset? resetAt) =>
+        Audit("quota_router.probed")
+            .Information("Quota probe: agent={Agent} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt}",
+                agent.Value, classId, availablePct, resetAt);
+
+    public static void QuotaRouterWaiting(string classId, WorkItemId id, TimeSpan recheckIn) =>
+        Audit("quota_router.waiting")
+            .Warning("Quota router: work item {WorkItemId} waiting — all members of class '{ClassId}' are exhausted; recheck in {RecheckMs}ms",
+                id.ToString(), classId, (long)recheckIn.TotalMilliseconds);
+
+    public static void QuotaRouterDeferred(WorkItemId id, TimeSpan recheckIn) =>
+        Audit("quota_router.deferred")
+            .Information("Quota router: work item {WorkItemId} deferred — re-enqueue scheduled in {RecheckMs}ms",
+                id.ToString(), (long)recheckIn.TotalMilliseconds);
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>

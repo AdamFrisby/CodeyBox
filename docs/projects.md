@@ -42,6 +42,7 @@ provider). Everything sits under the `CodeyBox` section:
         "RepositoryUrl": "https://github.com/me/my-app.git",
         "BaseBranch": "main",
         "Agent": "claude",
+        "DefaultAgentClass": "frontier-coding",
         "Upstream": {
           "Kind": "github",
           "GitHubOwner": "me",
@@ -62,6 +63,16 @@ provider). Everything sits under the `CodeyBox` section:
   }
 }
 ```
+
+### `DefaultAgentClass`
+
+Set `DefaultAgentClass` to a class ID from `CodeyBox:AgentClasses` to enable
+quota-aware routing for all work items in this project without requiring
+per-item `agentClassId` in the API payload. See
+[docs/agent-classes.md](agent-classes.md) for the full routing model.
+
+A per-item `agentClassId` overrides the project default. Set it to `null`
+(omit it in the JSON payload) to fall back to legacy direct `Agent` pick.
 
 ### Inheritance from `Defaults`
 

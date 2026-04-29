@@ -30,6 +30,14 @@ public sealed record Project
     public AgentKind DefaultAgent { get; init; } = AgentKind.Claude;
 
     /// <summary>
+    /// Default agent class for work items that don't set their own
+    /// <see cref="WorkItem.AgentClassId"/>. When set, quota routing applies to all
+    /// items in this project. May be overridden per-item by setting
+    /// <see cref="WorkItem.AgentClassId"/> to a different class or to null.
+    /// </summary>
+    public string? DefaultAgentClass { get; init; }
+
+    /// <summary>
     /// Where to push merged work. Each project has its own upstream — the
     /// orchestrator resolves and instantiates the matching IUpstreamRemote
     /// at pipeline time so per-project tokens never cross project boundaries.
