@@ -105,7 +105,10 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
 
                 using var response = await client.SendAsync(request, ct);
                 if (response.IsSuccessStatusCode)
+                {
+                    AuditLog.WebhookDelivered(ep.Name, evt.Event, (int)response.StatusCode, attempt);
                     return;
+                }
 
                 lastStatus = response.StatusCode;
                 lastErrorMessage = null;
@@ -131,6 +134,7 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
                 _log.LogWarning(
                     "Webhook {Endpoint} gave up after {Max} attempts for event {Event} delivery {DeliveryId}; last failure: {LastFailure}",
                     ep.Name, ep.MaxAttempts, evt.Event, evt.DeliveryId, lastFailure);
+                AuditLog.WebhookDeliveryFailed(ep.Name, evt.Event, lastFailure, ep.MaxAttempts);
             }
 
             backoff = TimeSpan.FromTicks(backoff.Ticks * 2);

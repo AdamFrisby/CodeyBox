@@ -91,6 +91,7 @@ public sealed class OrchestratorService : BackgroundService
             }
 
             using var registration = _cancellations.Register(item.Id);
+            AuditLog.WorkItemPickedUp(workerId, item.Id);
             try
             {
                 await _pipeline.RunAsync(item, registration.Token);

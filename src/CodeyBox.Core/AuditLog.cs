@@ -1,0 +1,147 @@
+using Serilog;
+using Serilog.Context;
+
+namespace CodeyBox.Core;
+
+/// <summary>
+/// Structured audit-tier event helpers. Every method emits a Serilog event
+/// tagged <c>Audit=true</c> so the audit-only file sink can filter them.
+/// Properties pushed via <see cref="WorkItemScope"/> / <see cref="ProjectScope"/>
+/// are inherited by all events logged while those scopes are active.
+///
+/// All methods are non-throwing: Serilog's self-log swallows internal errors,
+/// so a misconfigured or unreachable sink never aborts a pipeline phase.
+/// </summary>
+public static class AuditLog
+{
+    /// <summary>
+    /// Pushes <c>WorkItemId</c> into the ambient log context for the lifetime
+    /// of the returned scope. Dispose the scope to remove the property.
+    /// </summary>
+    public static IDisposable WorkItemScope(WorkItemId id) =>
+        LogContext.PushProperty("WorkItemId", id.ToString());
+
+    /// <summary>
+    /// Pushes <c>ProjectId</c> into the ambient log context for the lifetime
+    /// of the returned scope. Dispose the scope to remove the property.
+    /// </summary>
+    public static IDisposable ProjectScope(ProjectId id) =>
+        LogContext.PushProperty("ProjectId", id.Value);
+
+    // ── Work item lifecycle ──────────────────────────────────────────────────
+
+    public static void WorkItemCreated(WorkItemId id, ProjectId projectId, string title) =>
+        Audit("work_item.created")
+            .Information("Work item {WorkItemId} created for project {ProjectId}: {Title}",
+                id.ToString(), projectId.Value, title);
+
+    public static void WorkItemTransitioned(WorkItemId id, string toState) =>
+        Audit("work_item.transitioned")
+            .Information("Work item {WorkItemId} → {State}", id.ToString(), toState);
+
+    public static void WorkItemCancelled(WorkItemId id) =>
+        Audit("work_item.cancelled")
+            .Information("Work item {WorkItemId} cancelled", id.ToString());
+
+    public static void WorkItemFailed(WorkItemId id, string error) =>
+        Audit("work_item.failed")
+            .Warning("Work item {WorkItemId} failed: {Error}", id.ToString(), error);
+
+    public static void WorkItemPickedUp(int workerId, WorkItemId id) =>
+        Audit("work_item.picked_up")
+            .Information("Worker {WorkerId} picked up work item {WorkItemId}", workerId, id.ToString());
+
+    // ── Agent lifecycle ──────────────────────────────────────────────────────
+
+    public static void AgentStarted(AgentKind agent, string sandboxName, string phase) =>
+        Audit("agent.started")
+            .Information("Agent {Agent} started in sandbox {Sandbox} for phase {Phase}",
+                agent.Value, sandboxName, phase);
+
+    public static void AgentFinished(AgentKind agent, string sandboxName, bool success, int? exitCode, TimeSpan duration) =>
+        Audit("agent.finished")
+            .Information("Agent {Agent} finished: success={Success} exit={ExitCode} duration={DurationMs}ms",
+                agent.Value, success, exitCode, (long)duration.TotalMilliseconds);
+
+    // ── Sandbox lifecycle ────────────────────────────────────────────────────
+
+    public static void SandboxCreated(string vmName, string? networkProfile) =>
+        Audit("sandbox.created")
+            .Information("Sandbox {VmName} created with network profile {NetworkProfile}",
+                vmName, networkProfile);
+
+    public static void SandboxDisposed(string vmName) =>
+        Audit("sandbox.disposed")
+            .Information("Sandbox {VmName} disposed", vmName);
+
+    // ── Upstream remote ──────────────────────────────────────────────────────
+
+    public static void UpstreamPrOpened(int prNumber, string prUrl, string workBranch, string baseBranch) =>
+        Audit("upstream.pr_opened")
+            .Information("Upstream PR #{PrNumber} opened: {PrUrl} ({WorkBranch} → {BaseBranch})",
+                prNumber, prUrl, workBranch, baseBranch);
+
+    public static void UpstreamPrMerged(int prNumber, string mergeSha) =>
+        Audit("upstream.pr_merged")
+            .Information("Upstream PR #{PrNumber} merged: {MergeSha}", prNumber, mergeSha);
+
+    public static void UpstreamPush(string branch, string safeRemoteUrl) =>
+        Audit("upstream.push")
+            .Information("Upstream push: branch {Branch} to {RemoteUrl}", branch, safeRemoteUrl);
+
+    public static void UpstreamApiCallFailed(string operation, int statusCode, string owner, string repo) =>
+        Audit("upstream.api_call_failed")
+            .Warning("Upstream API call failed: {Operation} returned HTTP {StatusCode} for {Owner}/{Repo}",
+                operation, statusCode, owner, repo);
+
+    // ── Authentication ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Logs that a token was read from an environment variable. Logs only the
+    /// env-var NAME — never the token value itself.
+    /// </summary>
+    public static void TokenRead(string envVar, ProjectId projectId) =>
+        Audit("auth.token_read")
+            .Information("Token read from env var {EnvVar} for project {ProjectId}",
+                envVar, projectId.Value);
+
+    // ── Auditor / audit loop ─────────────────────────────────────────────────
+
+    public static void AuditorRun(string auditorName, string worstSeverity, TimeSpan duration) =>
+        Audit("auditor.run")
+            .Information("Auditor {AuditorName} completed: worstSeverity={WorseSeverity} duration={DurationMs}ms",
+                auditorName, worstSeverity, (long)duration.TotalMilliseconds);
+
+    public static void AuditIterationComplete(int iteration, int maxIterations, int blockingCount, int nonBlockingCount) =>
+        Audit("audit.iteration_complete")
+            .Information("Audit iteration {Iteration}/{MaxIterations}: blocking={BlockingCount} non-blocking={NonBlockingCount}",
+                iteration, maxIterations, blockingCount, nonBlockingCount);
+
+    public static void AuditPassed(int iteration) =>
+        Audit("audit.passed")
+            .Information("Audit passed on iteration {Iteration}", iteration);
+
+    public static void AuditFailed(int iteration, int blockingCount) =>
+        Audit("audit.failed")
+            .Warning("Audit failed after {Iteration} iterations: {BlockingCount} blocking findings",
+                iteration, blockingCount);
+
+    // ── Webhook delivery ─────────────────────────────────────────────────────
+
+    public static void WebhookDelivered(string endpoint, string eventName, int statusCode, int attempt) =>
+        Audit("webhook.delivered")
+            .Information("Webhook delivered: endpoint={Endpoint} event={WebhookEvent} status={StatusCode} attempt={Attempt}",
+                endpoint, eventName, statusCode, attempt);
+
+    public static void WebhookDeliveryFailed(string endpoint, string eventName, string lastFailure, int attempts) =>
+        Audit("webhook.delivery_failed")
+            .Warning("Webhook delivery failed: endpoint={Endpoint} event={WebhookEvent} after {Attempts} attempts: {LastFailure}",
+                endpoint, eventName, attempts, lastFailure);
+
+    // ── Internal helper ──────────────────────────────────────────────────────
+
+    private static Serilog.ILogger Audit(string eventName) =>
+        Log.Logger
+            .ForContext("Audit", true)
+            .ForContext("EventName", eventName);
+}

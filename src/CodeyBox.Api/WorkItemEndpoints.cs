@@ -94,6 +94,7 @@ internal static class WorkItemEndpoints
         if (req.MergeTimeoutMinutes is { } m)
             item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
         await store.CreateAsync(item, ct);
+        AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
         await queue.EnqueueAsync(item.Id, ct);
         return Results.Created($"/workitems/{item.Id}", ToDto(item, project));
     }
