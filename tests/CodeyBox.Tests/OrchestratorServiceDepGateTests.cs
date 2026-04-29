@@ -47,7 +47,7 @@ public sealed class OrchestratorServiceDepGateTests : IDisposable
         var queue = new InMemoryTaskQueue();
         var registry = new CancellationRegistry(CancellationToken.None);
         var pipeline = new FakePipelineRunner(_store);
-        var opts = new OrchestratorOptions { Concurrency = concurrency };
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = concurrency };
         var svc = new OrchestratorService(
             queue, _store, pipeline, registry, opts,
             NullLogger<OrchestratorService>.Instance);

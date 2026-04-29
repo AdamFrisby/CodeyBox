@@ -319,10 +319,47 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
 builder.Services.AddSingleton<PipelineRunner>();
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
-    new OrchestratorOptions { Concurrency = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Concurrency });
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var wp = cbOpts.WorkerPool;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.Orchestrator");
+
+    // Legacy fallback: if the operator set CodeyBox:Concurrency but not
+    // CodeyBox:WorkerPool:MaxConcurrentWorkers, honour the old value.
+    if (cbOpts.Concurrency is { } legacyConcurrency)
+    {
+        startupLog.LogWarning(
+            "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
+            "Use CodeyBox:WorkerPool:MaxConcurrentWorkers instead. " +
+            "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.",
+            legacyConcurrency);
+        wp = new WorkerPoolOptions
+        {
+            MaxConcurrentWorkers = legacyConcurrency,
+            MinSpawnInterval = wp.MinSpawnInterval,
+        };
+    }
+
+    if (wp.MaxConcurrentWorkers < 1)
+        throw new InvalidOperationException(
+            "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
+    if (wp.MinSpawnInterval < TimeSpan.Zero)
+        throw new InvalidOperationException(
+            "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
+    if (wp.MinSpawnInterval >= TimeSpan.FromHours(1))
+        throw new InvalidOperationException(
+            "CodeyBox:WorkerPool:MinSpawnInterval must be < 1 hour (values >= 1h are almost certainly a configuration error)");
+
+    return new OrchestratorOptions
+    {
+        MaxConcurrentWorkers = wp.MaxConcurrentWorkers,
+        MinSpawnInterval = wp.MinSpawnInterval,
+    };
+});
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
     new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
-builder.Services.AddHostedService<OrchestratorService>();
+builder.Services.AddSingleton<OrchestratorService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 
 var app = builder.Build();
 
@@ -354,7 +391,16 @@ namespace CodeyBox.Api
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public string SandboxImageReference { get; set; } = "codeybox/agent:latest";
         public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com"];
-        public int Concurrency { get; set; } = 2;
+        /// <summary>
+        /// Legacy concurrency knob. If set, treated as
+        /// <see cref="WorkerPool"/>.<see cref="WorkerPoolOptions.MaxConcurrentWorkers"/>
+        /// and a deprecation warning is emitted. Prefer WorkerPool instead.
+        /// </summary>
+        public int? Concurrency { get; set; }
+
+        /// <summary>Worker pool sizing and spawn-pacing configuration.</summary>
+        public WorkerPoolOptions WorkerPool { get; set; } = new();
+
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
 
