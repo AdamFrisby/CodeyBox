@@ -94,6 +94,10 @@ internal static class WorkItemEndpoints
 
         var newId = WorkItemId.New();
 
+        // Self-dependency check: explicit guard per spec.
+        if (dependsOnIds.Contains(newId))
+            return Results.BadRequest(new { error = "a work item cannot depend on itself" });
+
         // Load all existing items once — used for both existence and cycle checks.
         var allItems = new List<WorkItem>();
         await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
@@ -321,13 +325,14 @@ internal static class WorkItemEndpoints
         var targets = WorkItemDependencies.FindCascadeCancelTargets(cancelledId, allItems);
         foreach (var target in targets)
         {
-            // Re-read current state: the worker may have picked up this item
-            // between the snapshot and now. Skip if no longer Queued.
-            var current = await store.GetAsync(target.Id, ct);
-            if (current?.State != WorkItemState.Queued) continue;
-            var cancelled = current.With(WorkItemState.Cancelled, "parent dependency cancelled");
-            await store.UpdateAsync(cancelled, ct);
-            AuditLog.WorkItemDependentCancelled(target.Id, cancelledId);
+            // Atomic conditional update: only writes Cancelled when the item is still
+            // Queued in the DB. If a worker raced and transitioned it to Working between
+            // the ListAsync snapshot and now, the WHERE guard returns 0 rows and we skip
+            // the audit log — no spurious WorkItemDependentCancelled for in-flight items.
+            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled");
+            var updated = await store.TryUpdateIfStateAsync(cancelled, WorkItemState.Queued, ct);
+            if (updated)
+                AuditLog.WorkItemDependentCancelled(target.Id, cancelledId);
         }
     }
 

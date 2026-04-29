@@ -106,6 +106,31 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    public async Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    project_id = $project_id, title = $title, prompt = $prompt,
+                    base_branch = $base, work_branch = $work, agent = $agent,
+                    work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                    state = $state, updated_at = $ua, last_error = $err,
+                    upstream_push_attempts = $att, depends_on_json = $deps
+                WHERE id = $id AND state = $only_if_state;
+                """;
+            Bind(cmd, item);
+            cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)
     {
         using var cmd = _conn.CreateCommand();
