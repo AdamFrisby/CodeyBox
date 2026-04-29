@@ -276,7 +276,7 @@ public sealed class OrchestratorService : BackgroundService
                     return;
                 }
                 if (decision.Chosen is { } chosen)
-                    item = item with { Agent = chosen.Agent };
+                    item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId };
             }
 
             using var registration = _cancellations.Register(item.Id);

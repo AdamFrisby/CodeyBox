@@ -48,14 +48,6 @@ public sealed class AgentClassRouter
         _opts = opts;
         _log = log;
 
-        // Emit a startup warning for every member that has ModelId configured but
-        // cannot yet be dispatched — operators need to know their override is a no-op.
-        foreach (var cls in catalog)
-            foreach (var m in cls.Members.Where(m => m.ModelId is not null))
-                log.LogWarning(
-                    "Agent class '{ClassId}' member {Agent}/{Billing} has ModelId='{ModelId}' configured, " +
-                    "but ModelId dispatch to the agent CLI is not yet implemented — the override will be silently ignored.",
-                    cls.Id, m.Agent, m.Billing, m.ModelId);
     }
 
     /// <summary>

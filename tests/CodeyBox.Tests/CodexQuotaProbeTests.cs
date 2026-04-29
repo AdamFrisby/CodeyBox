@@ -19,7 +19,7 @@ public sealed class CodexQuotaProbeTests
     };
 
     // Default subscription and usage bodies that produce a valid snapshot.
-    private const string DefaultSubBody   = """{"hard_limit_usd":100.0}""";
+    private const string DefaultSubBody = """{"hard_limit_usd":100.0}""";
     private const string DefaultUsageBody = """{"data":[],"total_usage":5000}"""; // 50 USD of 100 USD used → 50% available
 
     private static CodexQuotaProbe BuildProbe(
@@ -39,10 +39,10 @@ public sealed class CodexQuotaProbeTests
     /// Routes requests: subscription URL → subBody/subStatus, usage URL → usageBody/usageStatus.
     /// </summary>
     private static QuotaUrlRoutingHandler DualHandler(
-        string subBody   = DefaultSubBody,
+        string subBody = DefaultSubBody,
         string usageBody = DefaultUsageBody,
         Action<HttpRequestMessage>? capture = null,
-        HttpStatusCode subStatus   = HttpStatusCode.OK,
+        HttpStatusCode subStatus = HttpStatusCode.OK,
         HttpStatusCode usageStatus = HttpStatusCode.OK)
     {
         return new QuotaUrlRoutingHandler(req =>
@@ -90,7 +90,7 @@ public sealed class CodexQuotaProbeTests
     {
         // 10000 cents = $100 used of $100 limit → 0%
         var handler = DualHandler(
-            subBody:   """{"hard_limit_usd":100.0}""",
+            subBody: """{"hard_limit_usd":100.0}""",
             usageBody: """{"data":[],"total_usage":10000}""");
         var probe = BuildProbe(handler);
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
@@ -102,7 +102,7 @@ public sealed class CodexQuotaProbeTests
     {
         // 5000 cents = $50 used of $100 limit → 50%
         var handler = DualHandler(
-            subBody:   """{"hard_limit_usd":100.0}""",
+            subBody: """{"hard_limit_usd":100.0}""",
             usageBody: """{"data":[],"total_usage":5000}""");
         var probe = BuildProbe(handler);
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
@@ -114,7 +114,7 @@ public sealed class CodexQuotaProbeTests
     {
         // 0 cents used of $100 limit → 100%
         var handler = DualHandler(
-            subBody:   """{"hard_limit_usd":100.0}""",
+            subBody: """{"hard_limit_usd":100.0}""",
             usageBody: """{"data":[],"total_usage":0}""");
         var probe = BuildProbe(handler);
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
@@ -126,7 +126,7 @@ public sealed class CodexQuotaProbeTests
     {
         // 20000 cents = $200 used of $100 limit → floors at 0%
         var handler = DualHandler(
-            subBody:   """{"hard_limit_usd":100.0}""",
+            subBody: """{"hard_limit_usd":100.0}""",
             usageBody: """{"data":[],"total_usage":20000}""");
         var probe = BuildProbe(handler);
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);

@@ -129,6 +129,14 @@ internal static class WorkItemEndpoints
 
         // ── Build and persist ─────────────────────────────────────────────────
 
+        string? agentClassId = null;
+        if (!string.IsNullOrWhiteSpace(req.AgentClassId))
+        {
+            if (req.AgentClassId.Length > 200)
+                return Results.BadRequest(new { error = "agentClassId must be <= 200 chars" });
+            agentClassId = req.AgentClassId.Trim();
+        }
+
         var item = new WorkItem
         {
             Id = newId,
@@ -138,6 +146,7 @@ internal static class WorkItemEndpoints
             BaseBranch = req.BaseBranch,
             WorkBranch = req.WorkBranch,
             Agent = agentOverride,
+            AgentClassId = agentClassId,
             PushUpstream = req.PushUpstream ?? true,
             DependsOn = dependsOnIds,
         };
@@ -402,6 +411,7 @@ public sealed record CreateWorkItemRequest(
     string Title,
     string Prompt,
     string? Agent,
+    string? AgentClassId,
     string? BaseBranch,
     string? WorkBranch,
     bool? PushUpstream,

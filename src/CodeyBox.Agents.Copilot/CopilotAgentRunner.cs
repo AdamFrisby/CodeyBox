@@ -14,17 +14,12 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
 
     public string Binary { get; init; } = "copilot";
 
-    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential)
+    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null)
     {
         // The Copilot CLI accepts a one-shot prompt with `-p`. Argument shape
         // may need adjusting per Copilot CLI version; centralised here so
         // updates don't ripple into the orchestrator.
-        var argv = new List<string>
-        {
-            Binary,
-            "-p",
-            prompt,
-        };
-        return new AgentInvocation(argv);
+        // modelId is intentionally ignored: Copilot CLI does not expose a --model flag.
+        return new AgentInvocation([Binary, "-p", prompt]);
     }
 }

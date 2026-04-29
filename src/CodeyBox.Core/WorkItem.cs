@@ -69,6 +69,13 @@ public sealed record WorkItem
     /// </summary>
     public string? AgentClassId { get; init; }
 
+    /// <summary>
+    /// Runtime-only model override set by the quota router when a class member specifies
+    /// a ModelId. Not persisted; resolved fresh at each pickup from the chosen
+    /// <see cref="AgentMembership"/>. Passed to the agent CLI as <c>--model &lt;ModelId&gt;</c>.
+    /// </summary>
+    public string? ModelId { get; init; }
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,

@@ -22,7 +22,7 @@ namespace CodeyBox.Agents.Codex;
 public sealed class CodexQuotaProbe : IAgentQuotaProbe
 {
     internal const string SubscriptionEndpoint = "https://api.openai.com/v1/dashboard/billing/subscription";
-    internal const string UsageEndpointBase    = "https://api.openai.com/v1/dashboard/billing/usage";
+    internal const string UsageEndpointBase = "https://api.openai.com/v1/dashboard/billing/usage";
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
 
@@ -98,8 +98,8 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
             // Step 2: fetch current-month usage.
             var today = DateTimeOffset.UtcNow;
             var startDate = new DateTimeOffset(today.Year, today.Month, 1, 0, 0, 0, TimeSpan.Zero).ToString("yyyy-MM-dd");
-            var endDate   = today.AddDays(1).ToString("yyyy-MM-dd");
-            var usageUrl  = $"{UsageEndpointBase}?start_date={startDate}&end_date={endDate}";
+            var endDate = today.AddDays(1).ToString("yyyy-MM-dd");
+            var usageUrl = $"{UsageEndpointBase}?start_date={startDate}&end_date={endDate}";
 
             using var usageReq = new HttpRequestMessage(HttpMethod.Get, usageUrl);
             usageReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);

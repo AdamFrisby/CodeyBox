@@ -42,7 +42,7 @@ public sealed class LlmReviewAuditor : IAuditor
         await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", "/audit"] }, ct);
 
         var prompt = BuildPrompt(context);
-        var agentResult = await _opts.Agent.RunAsync(sandbox, workingDirectory, prompt, credential: null, ct);
+        var agentResult = await _opts.Agent.RunAsync(sandbox, workingDirectory, prompt, credential: null, modelId: null, ct);
 
         // The pipeline already populates SandboxSpec.Environment with the
         // agent credential (set on the container at boot), so we don't pass

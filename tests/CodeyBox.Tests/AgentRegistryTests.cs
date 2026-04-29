@@ -9,7 +9,7 @@ public sealed class AgentRegistryTests
     {
         public AgentKind Kind { get; }
         public FakeRunner(AgentKind kind) { Kind = kind; }
-        public Task<AgentResult> RunAsync(ISandbox _, string __, string ___, AgentCredential? ____, CancellationToken _____ = default)
+        public Task<AgentResult> RunAsync(ISandbox _, string __, string ___, AgentCredential? ____, string? _____ = null, CancellationToken ______ = default)
             => Task.FromResult(new AgentResult(true, "ok", null, null));
     }
 

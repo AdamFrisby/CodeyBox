@@ -25,9 +25,10 @@ public sealed record AgentMembership
     public required AgentBilling Billing { get; init; }
 
     /// <summary>
-    /// Optional model override, e.g. "claude-opus-4-7", "codex-5.5". Null means
-    /// the agent uses its own default. Reserved for agent CLIs that support a
-    /// --model flag.
+    /// Optional model override, e.g. "claude-opus-4-7", "codex-5.5". When set,
+    /// the orchestrator passes <c>--model &lt;ModelId&gt;</c> to the agent CLI.
+    /// Null means the agent uses its own default. Copilot ignores this field
+    /// (its CLI does not expose a --model flag).
     /// </summary>
     public string? ModelId { get; init; }
 }

@@ -270,7 +270,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditLog.AgentStarted(runner.Kind, sandbox.Id, agentPhase);
         var agentSw = Stopwatch.StartNew();
 
-        var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, ct);
+        var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
 
         agentSw.Stop();
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed);
@@ -508,7 +508,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
         var mergeSw = Stopwatch.StartNew();
 
-        var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, ct);
+        var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
 
         mergeSw.Stop();
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed);

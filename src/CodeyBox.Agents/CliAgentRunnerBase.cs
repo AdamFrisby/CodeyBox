@@ -16,19 +16,20 @@ public abstract class CliAgentRunnerBase : IAgentRunner
     /// Build the argv to execute inside the sandbox for a given prompt. The
     /// prompt may be passed via argv, stdin, or a file; subclasses choose.
     /// </summary>
-    protected abstract AgentInvocation BuildInvocation(string prompt, AgentCredential? credential);
+    protected abstract AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null);
 
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
         string prompt,
         AgentCredential? credential,
+        string? modelId = null,
         CancellationToken ct = default)
     {
         // The credential env is set on the container at boot via SandboxSpec.Environment
         // so secrets don't land on per-exec argv. We deliberately do NOT merge
         // credential.EnvironmentVariables into the per-exec ExtraEnvironment.
-        var invocation = BuildInvocation(prompt, credential);
+        var invocation = BuildInvocation(prompt, credential, modelId);
         var exec = new SandboxExec
         {
             Argv = invocation.Argv,

@@ -13,16 +13,16 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
 
     public string Binary { get; init; } = "codex";
 
-    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential)
+    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null)
     {
         // Codex CLI: `codex exec <prompt>` runs a non-interactive turn and exits.
-        var argv = new List<string>
+        var argv = new List<string> { Binary, "exec", "--full-auto" };
+        if (!string.IsNullOrEmpty(modelId))
         {
-            Binary,
-            "exec",
-            "--full-auto",
-            prompt,
-        };
+            argv.Add("--model");
+            argv.Add(modelId);
+        }
+        argv.Add(prompt);
         return new AgentInvocation(argv);
     }
 }
