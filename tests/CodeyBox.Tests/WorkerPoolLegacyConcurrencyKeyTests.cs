@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -6,9 +7,10 @@ using CodeyBox.Orchestrator;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Verifies that an OrchestratorOptions built via the legacy Concurrency
-/// property (the backward-compat alias) still produces a working pool that
-/// respects the configured max concurrency.
+/// Verifies the legacy CodeyBox:Concurrency config key path:
+/// - OrchestratorOptionsFactory.Build maps it to MaxConcurrentWorkers
+/// - A deprecation warning is emitted
+/// - The resulting pool actually enforces the configured concurrency
 /// </summary>
 public sealed class WorkerPoolLegacyConcurrencyKeyTests : IDisposable
 {
@@ -34,13 +36,47 @@ public sealed class WorkerPoolLegacyConcurrencyKeyTests : IDisposable
     };
 
     [Fact]
-    public async Task LegacyConcurrencyProperty_PoolFunctions()
+    public void LegacyConcurrencyKey_MapsToMaxConcurrentWorkers_AndEmitsWarning()
     {
-        // Simulate a config built from the legacy CodeyBox:Concurrency path
-        // (Program.cs DI factory maps it to MaxConcurrentWorkers).
-        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
+        // Simulate what Program.cs DI factory does when CodeyBox:Concurrency is set
+        // in config but CodeyBox:WorkerPool is not.
+        var capturingLogger = new CapturingLogger();
+        var legacyConcurrency = 3;
+        var defaultWorkerPool = new WorkerPoolOptions(); // as if CodeyBox:WorkerPool is absent
+
+        var opts = OrchestratorOptionsFactory.Build(legacyConcurrency, defaultWorkerPool, capturingLogger);
+
+        // The legacy value must be honoured as MaxConcurrentWorkers.
+        Assert.Equal(legacyConcurrency, opts.MaxConcurrentWorkers);
+
+        // The factory must emit exactly one deprecation warning that mentions the old key.
+        var warnings = capturingLogger.Entries
+            .Where(e => e.Level == LogLevel.Warning)
+            .ToList();
+        Assert.Single(warnings);
+        Assert.Contains("CodeyBox:Concurrency", warnings[0].Message);
+        Assert.Contains("deprecated", warnings[0].Message);
+    }
+
+    [Fact]
+    public void LegacyConcurrencyKey_AbsentConcurrency_NoWarningEmitted()
+    {
+        // When CodeyBox:Concurrency is null (new-style config only), no warning.
+        var capturingLogger = new CapturingLogger();
+        var opts = OrchestratorOptionsFactory.Build(null, new WorkerPoolOptions { MaxConcurrentWorkers = 2 }, capturingLogger);
 
         Assert.Equal(2, opts.MaxConcurrentWorkers);
+        Assert.DoesNotContain(capturingLogger.Entries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task LegacyConcurrencyKey_PoolFunctions()
+    {
+        // End-to-end: options built via the legacy path produce a working pool.
+        var opts = OrchestratorOptionsFactory.Build(
+            legacyConcurrency: 2,
+            workerPool: new WorkerPoolOptions(),
+            log: NullLogger.Instance);
 
         const int itemCount = 4;
         var executed = new ConcurrentBag<WorkItemId>();
@@ -73,15 +109,33 @@ public sealed class WorkerPoolLegacyConcurrencyKeyTests : IDisposable
 
         await svc.StopAsync(CancellationToken.None);
 
-        // All items ran.
         Assert.Equal(itemCount, executed.Count);
 
-        // Concurrency was respected (checked via WorkerPoolConcurrencyTests;
-        // here we just verify the pool ran at all — the alias worked).
         int stillQueued = 0;
         await foreach (var item in _store.ListByStateAsync(WorkItemState.Queued))
             stillQueued++;
         Assert.Equal(0, stillQueued);
+    }
+}
+
+/// <summary>Captures log entries for assertion in tests.</summary>
+internal sealed class CapturingLogger : ILogger
+{
+    public sealed record LogEntry(LogLevel Level, string Message);
+
+    public List<LogEntry> Entries { get; } = new();
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        Entries.Add(new LogEntry(logLevel, formatter(state, exception)));
     }
 }
 

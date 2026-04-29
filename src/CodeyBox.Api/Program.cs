@@ -321,40 +321,8 @@ builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<Pipel
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var wp = cbOpts.WorkerPool;
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.Orchestrator");
-
-    // Legacy fallback: if the operator set CodeyBox:Concurrency but not
-    // CodeyBox:WorkerPool:MaxConcurrentWorkers, honour the old value.
-    if (cbOpts.Concurrency is { } legacyConcurrency)
-    {
-        startupLog.LogWarning(
-            "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
-            "Use CodeyBox:WorkerPool:MaxConcurrentWorkers instead. " +
-            "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.",
-            legacyConcurrency);
-        wp = new WorkerPoolOptions
-        {
-            MaxConcurrentWorkers = legacyConcurrency,
-            MinSpawnInterval = wp.MinSpawnInterval,
-        };
-    }
-
-    if (wp.MaxConcurrentWorkers < 1)
-        throw new InvalidOperationException(
-            "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
-    if (wp.MinSpawnInterval < TimeSpan.Zero)
-        throw new InvalidOperationException(
-            "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
-    if (wp.MinSpawnInterval >= TimeSpan.FromHours(1))
-        throw new InvalidOperationException(
-            "CodeyBox:WorkerPool:MinSpawnInterval must be < 1 hour (values >= 1h are almost certainly a configuration error)");
-
-    return new OrchestratorOptions
-    {
-        MaxConcurrentWorkers = wp.MaxConcurrentWorkers,
-        MinSpawnInterval = wp.MinSpawnInterval,
-    };
+    return OrchestratorOptionsFactory.Build(cbOpts.Concurrency, cbOpts.WorkerPool, startupLog);
 });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
     new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));

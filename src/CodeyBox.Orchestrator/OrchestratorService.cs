@@ -58,11 +58,21 @@ public sealed class OrchestratorService : BackgroundService
     }
 
     /// <summary>Snapshot for the /workers/status endpoint.</summary>
-    public WorkerPoolStatus GetStatus(int queuedCount = 0) => new(
-        _opts.MaxConcurrentWorkers,
-        _currentlyRunning,
-        queuedCount,
-        _lastSpawnAtTicks == 0 ? null : new DateTimeOffset(_lastSpawnAtTicks, TimeSpan.Zero));
+    public WorkerPoolStatus GetStatus(int queuedCount = 0)
+    {
+        var ticks = Interlocked.Read(ref _lastSpawnAtTicks);
+        return new(
+            _opts.MaxConcurrentWorkers,
+            _currentlyRunning,
+            queuedCount,
+            ticks == 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero));
+    }
+
+    public override void Dispose()
+    {
+        _concurrencyGate.Dispose();
+        base.Dispose();
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -112,7 +122,6 @@ public sealed class OrchestratorService : BackgroundService
             var capturedId = id.Value;
             var task = Task.Run(async () =>
             {
-                Interlocked.Increment(ref _currentlyRunning);
                 AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
                 try
                 {
@@ -124,8 +133,9 @@ public sealed class OrchestratorService : BackgroundService
                     AuditLog.WorkerPoolWorkerFinished(workerIndex, capturedId);
                     _concurrencyGate.Release();
                 }
-            }, stoppingToken);
+            });
 
+            Interlocked.Increment(ref _currentlyRunning);
             inFlight.Add(task);
         }
 

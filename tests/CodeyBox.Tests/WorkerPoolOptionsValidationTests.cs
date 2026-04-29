@@ -1,32 +1,23 @@
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Validates that invalid WorkerPoolOptions values are rejected at startup.
-/// The validation runs inside the OrchestratorOptions DI factory in Program.cs;
-/// here we test the equivalent guard logic directly via a helper that mirrors it.
+/// Validates that invalid WorkerPoolOptions values are rejected by
+/// OrchestratorOptionsFactory.Build — the same code path that Program.cs calls
+/// at startup via the DI factory.
 /// </summary>
 public sealed class WorkerPoolOptionsValidationTests
 {
-    private static void Validate(WorkerPoolOptions opts)
-    {
-        if (opts.MaxConcurrentWorkers < 1)
-            throw new InvalidOperationException(
-                "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
-        if (opts.MinSpawnInterval < TimeSpan.Zero)
-            throw new InvalidOperationException(
-                "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
-        if (opts.MinSpawnInterval >= TimeSpan.FromHours(1))
-            throw new InvalidOperationException(
-                "CodeyBox:WorkerPool:MinSpawnInterval must be < 1 hour (values >= 1h are almost certainly a configuration error)");
-    }
+    private static OrchestratorOptions Build(WorkerPoolOptions opts) =>
+        OrchestratorOptionsFactory.Build(null, opts, NullLogger.Instance);
 
     [Fact]
     public void MaxConcurrentWorkers_Zero_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            Validate(new WorkerPoolOptions { MaxConcurrentWorkers = 0 }));
+            Build(new WorkerPoolOptions { MaxConcurrentWorkers = 0 }));
         Assert.Contains("MaxConcurrentWorkers", ex.Message);
     }
 
@@ -34,7 +25,7 @@ public sealed class WorkerPoolOptionsValidationTests
     public void MaxConcurrentWorkers_Negative_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            Validate(new WorkerPoolOptions { MaxConcurrentWorkers = -3 }));
+            Build(new WorkerPoolOptions { MaxConcurrentWorkers = -3 }));
         Assert.Contains("MaxConcurrentWorkers", ex.Message);
     }
 
@@ -42,7 +33,7 @@ public sealed class WorkerPoolOptionsValidationTests
     public void MinSpawnInterval_Negative_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            Validate(new WorkerPoolOptions
+            Build(new WorkerPoolOptions
             {
                 MaxConcurrentWorkers = 1,
                 MinSpawnInterval = TimeSpan.FromSeconds(-1),
@@ -54,7 +45,7 @@ public sealed class WorkerPoolOptionsValidationTests
     public void MinSpawnInterval_OneHour_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            Validate(new WorkerPoolOptions
+            Build(new WorkerPoolOptions
             {
                 MaxConcurrentWorkers = 1,
                 MinSpawnInterval = TimeSpan.FromHours(1),
@@ -66,7 +57,7 @@ public sealed class WorkerPoolOptionsValidationTests
     public void MinSpawnInterval_FiveHours_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            Validate(new WorkerPoolOptions
+            Build(new WorkerPoolOptions
             {
                 MaxConcurrentWorkers = 1,
                 MinSpawnInterval = TimeSpan.FromHours(5),
@@ -81,8 +72,7 @@ public sealed class WorkerPoolOptionsValidationTests
     [InlineData(4, 3599)]
     public void ValidValues_DoNotThrow(int max, int intervalSeconds)
     {
-        // Should not throw.
-        Validate(new WorkerPoolOptions
+        Build(new WorkerPoolOptions
         {
             MaxConcurrentWorkers = max,
             MinSpawnInterval = TimeSpan.FromSeconds(intervalSeconds),
