@@ -36,8 +36,37 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
     public async Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
     {
         // Generic git has no PR concept — push baseBranch and report done.
-        await _gitHost.PushToUpstreamAsync(request.RepositoryId, _opts.UpstreamUrl, request.BaseBranch, _opts.ExtraEnvironment, ct);
-        return new UpstreamCompletionOutcome { BranchPushed = true };
+        try
+        {
+            await _gitHost.PushToUpstreamAsync(request.RepositoryId, _opts.UpstreamUrl, request.BaseBranch, _opts.ExtraEnvironment, ct);
+            return new UpstreamCompletionOutcome { BranchPushed = true };
+        }
+        catch (Exception ex)
+        {
+            // Strip embedded credentials (e.g. https://user:pass@host/repo.git) from
+            // the exception message before it reaches the orchestrator's Warning log.
+            var safeUrl = ScrubUrlCredentials(_opts.UpstreamUrl);
+            var safeMessage = ex.Message.Replace(_opts.UpstreamUrl, safeUrl, StringComparison.Ordinal);
+            throw new InvalidOperationException(
+                $"Failed to push '{request.BaseBranch}' to '{safeUrl}': {safeMessage}", ex);
+        }
+    }
+
+    private static string ScrubUrlCredentials(string url)
+    {
+        try
+        {
+            var builder = new UriBuilder(url);
+            if (string.IsNullOrEmpty(builder.UserName) && string.IsNullOrEmpty(builder.Password))
+                return url;
+            builder.UserName = string.Empty;
+            builder.Password = string.Empty;
+            return builder.Uri.ToString();
+        }
+        catch
+        {
+            return "[url-redacted]";
+        }
     }
 }
 

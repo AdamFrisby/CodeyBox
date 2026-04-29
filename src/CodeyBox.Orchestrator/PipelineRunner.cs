@@ -512,7 +512,7 @@ public sealed class PipelineRunner
         return headSha;
     }
 
-    private static string BuildPrDescription(WorkItemId itemId, string? agentStdout)
+    internal static string BuildPrDescription(WorkItemId itemId, string? agentStdout)
     {
         var summary = $"Automated via CodeyBox — work item {itemId}";
         if (string.IsNullOrWhiteSpace(agentStdout))

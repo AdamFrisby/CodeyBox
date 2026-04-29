@@ -92,14 +92,19 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     /// </summary>
     public async Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
     {
-        // Reject branch names with whitespace/control chars to prevent log injection.
-        if (string.IsNullOrEmpty(request.WorkBranch) || request.WorkBranch.Any(char.IsWhiteSpace))
+        // Reject branch names with whitespace or control characters to prevent log injection.
+        // char.IsWhiteSpace alone misses non-whitespace control chars (\x01–\x08, \x0b–\x0c, \x0e–\x1f),
+        // so we also check char.IsControl (excluding tab, which git allows in branch names).
+        static bool HasInvalidChars(string s) =>
+            s.Any(c => char.IsWhiteSpace(c) || (char.IsControl(c) && c != '\t'));
+
+        if (string.IsNullOrEmpty(request.WorkBranch) || HasInvalidChars(request.WorkBranch))
             throw new ArgumentException(
-                $"WorkBranch contains invalid characters (whitespace not allowed): '{SanitizeForLog(request.WorkBranch)}'",
+                $"WorkBranch contains invalid characters (whitespace/control chars not allowed): '{SanitizeForLog(request.WorkBranch)}'",
                 nameof(request));
-        if (string.IsNullOrEmpty(request.BaseBranch) || request.BaseBranch.Any(char.IsWhiteSpace))
+        if (string.IsNullOrEmpty(request.BaseBranch) || HasInvalidChars(request.BaseBranch))
             throw new ArgumentException(
-                $"BaseBranch contains invalid characters (whitespace not allowed): '{SanitizeForLog(request.BaseBranch)}'",
+                $"BaseBranch contains invalid characters (whitespace/control chars not allowed): '{SanitizeForLog(request.BaseBranch)}'",
                 nameof(request));
 
         // Step 1: push work branch
@@ -111,10 +116,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
         catch (Exception ex)
         {
-            // Log original exception at Debug so the full stack trace is available
-            // in verbose logs without forwarding potential credential noise to Info+.
-            _log.LogDebug(ex, "Work-branch push to upstream threw (details may contain credentials)");
+            // Log only the scrubbed message at Debug; the raw exception object is
+            // withheld because git can echo credential material on auth failures.
             var scrubbed = Scrub(ex.Message);
+            _log.LogDebug("Work-branch push to upstream threw: {Message} (full exception withheld; may contain credentials)", scrubbed);
             throw new InvalidOperationException($"Failed to push work branch '{SanitizeForLog(request.WorkBranch)}': {scrubbed}");
         }
 
@@ -134,15 +139,34 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
 
-        await _webhooks.DispatchAsync("work_item.pull_request_opened", new PullRequestOpenedPayload
+        // Only dispatch the webhook when we have a concrete PR URL; emitting a
+        // pull_request_opened event with an empty URL would confuse consumers.
+        // A misbehaving dispatcher must not abort the auto-merge step — the
+        // interface contract says implementations should not throw, but we guard
+        // defensively so a faulty custom dispatcher cannot silently skip AutoMerge.
+        if (pr.HtmlUrl is not null)
         {
-            WorkItemId = request.WorkItemId.ToString(),
-            ProjectId = request.ProjectId.ToString(),
-            WorkBranch = request.WorkBranch,
-            BaseBranch = request.BaseBranch,
-            PullRequestNumber = pr.Number,
-            PullRequestUrl = pr.HtmlUrl ?? string.Empty,
-        }, ct);
+            try
+            {
+                await _webhooks.DispatchAsync("work_item.pull_request_opened", new PullRequestOpenedPayload
+                {
+                    WorkItemId = request.WorkItemId.ToString(),
+                    ProjectId = request.ProjectId.ToString(),
+                    WorkBranch = request.WorkBranch,
+                    BaseBranch = request.BaseBranch,
+                    PullRequestNumber = pr.Number,
+                    PullRequestUrl = pr.HtmlUrl,
+                }, ct);
+            }
+            catch (Exception dispatchEx)
+            {
+                _log.LogWarning(dispatchEx, "pull_request_opened webhook dispatch failed; auto-merge (if configured) will still proceed");
+            }
+        }
+        else
+        {
+            _log.LogWarning("GitHub PR response did not include html_url; skipping pull_request_opened webhook event");
+        }
 
         if (!_opts.AutoMerge)
         {
@@ -243,9 +267,11 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     {
         if (string.IsNullOrEmpty(_opts.PullRequestTitleTemplate))
             return title;
+        // Replace {branch} from the template first so that a user-supplied title
+        // containing the literal text "{branch}" is not expanded in the second pass.
         return _opts.PullRequestTitleTemplate
-            .Replace("{title}", title, StringComparison.Ordinal)
-            .Replace("{branch}", workBranch, StringComparison.Ordinal);
+            .Replace("{branch}", workBranch, StringComparison.Ordinal)
+            .Replace("{title}", title, StringComparison.Ordinal);
     }
 }
 

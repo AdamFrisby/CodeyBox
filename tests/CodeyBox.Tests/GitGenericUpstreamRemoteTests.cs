@@ -44,6 +44,23 @@ public sealed class GitGenericUpstreamRemoteTests
         await Assert.ThrowsAnyAsync<Exception>(() =>
             remote.CompleteAsync(SampleRequest, CancellationToken.None));
     }
+
+    [Fact]
+    public async Task CompleteAsync_UrlWithEmbeddedCredentials_ScrubbedFromExceptionMessage()
+    {
+        // Verifies that an operator-supplied URL with embedded user:pass does not
+        // surface credentials in the exception message that reaches the orchestrator log.
+        var gitHost = new ThrowingGitHost();
+        var urlWithCreds = "https://user:secret@git.example.com/repo.git";
+        var opts = new GitGenericUpstreamOptions { UpstreamUrl = urlWithCreds };
+        var remote = new GitGenericUpstreamRemote(gitHost, opts);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.DoesNotContain("secret", ex.Message);
+        Assert.Contains("git.example.com", ex.Message); // host still present for diagnostics
+    }
 }
 
 internal sealed class ThrowingGitHost : IGitHost
