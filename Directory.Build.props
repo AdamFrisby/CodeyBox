@@ -7,6 +7,15 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <AnalysisLevel>latest</AnalysisLevel>
+    <!-- Suppress satellite-assembly scanning during ResolveAssemblyReference.
+         This is required solution-wide because the build host is fork-heavy
+         and the directory-enumeration inside RAR hits ENOMEM on multiple
+         projects (not only CodeyBox.Cli). Known trade-off: non-English
+         satellite assemblies from referenced packages will not be copied to
+         output directories; this is acceptable because the solution has no
+         non-English resource consumers. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <ResolveAssemblyReferencesFindRelatedSatellites>false</ResolveAssemblyReferencesFindRelatedSatellites>
   </PropertyGroup>
 
 </Project>
