@@ -58,9 +58,10 @@ public sealed class OrchestratorService : BackgroundService
     }
 
     /// <summary>Snapshot for the /workers/status endpoint.</summary>
-    public WorkerPoolStatus GetStatus() => new(
+    public WorkerPoolStatus GetStatus(int queuedCount = 0) => new(
         _opts.MaxConcurrentWorkers,
         _currentlyRunning,
+        queuedCount,
         _lastSpawnAtTicks == 0 ? null : new DateTimeOffset(_lastSpawnAtTicks, TimeSpan.Zero));
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -297,4 +298,5 @@ public sealed record OrchestratorOptions
 public sealed record WorkerPoolStatus(
     int MaxConcurrent,
     int CurrentlyRunning,
+    int QueuedCount,
     DateTimeOffset? LastSpawnAt);

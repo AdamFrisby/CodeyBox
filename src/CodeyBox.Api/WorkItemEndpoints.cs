@@ -22,13 +22,16 @@ internal static class WorkItemEndpoints
         app.MapGet("/workers/status", GetWorkerStatusAsync);
     }
 
-    private static IResult GetWorkerStatusAsync(OrchestratorService orchestrator, IWorkItemStore store)
+    private static async Task<IResult> GetWorkerStatusAsync(OrchestratorService orchestrator, IWorkItemStore store)
     {
-        var status = orchestrator.GetStatus();
+        var queuedCount = 0;
+        await foreach (var _ in store.ListByStateAsync(WorkItemState.Queued)) queuedCount++;
+        var status = orchestrator.GetStatus(queuedCount);
         return Results.Ok(new
         {
             maxConcurrent = status.MaxConcurrent,
             currentlyRunning = status.CurrentlyRunning,
+            queuedCount = status.QueuedCount,
             lastSpawnAt = status.LastSpawnAt,
         });
     }

@@ -112,6 +112,7 @@ Returns a JSON snapshot of the pool:
 {
   "maxConcurrent": 4,
   "currentlyRunning": 2,
+  "queuedCount": 3,
   "lastSpawnAt": "2026-04-30T12:34:56.789+00:00"
 }
 ```

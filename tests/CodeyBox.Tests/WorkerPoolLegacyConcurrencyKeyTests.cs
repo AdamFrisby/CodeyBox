@@ -34,13 +34,11 @@ public sealed class WorkerPoolLegacyConcurrencyKeyTests : IDisposable
     };
 
     [Fact]
-#pragma warning disable CS0618 // intentionally testing the obsolete alias
     public async Task LegacyConcurrencyProperty_PoolFunctions()
     {
-        // Simulate what the legacy DI factory did: set Concurrency via the
-        // deprecated alias. MaxConcurrentWorkers should honour the value.
-        var opts = new OrchestratorOptions { Concurrency = 2 };
-#pragma warning restore CS0618
+        // Simulate a config built from the legacy CodeyBox:Concurrency path
+        // (Program.cs DI factory maps it to MaxConcurrentWorkers).
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
 
         Assert.Equal(2, opts.MaxConcurrentWorkers);
 
