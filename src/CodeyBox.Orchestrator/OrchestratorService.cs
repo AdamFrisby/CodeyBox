@@ -58,13 +58,13 @@ public sealed class OrchestratorService : BackgroundService
     }
 
     /// <summary>Snapshot for the /workers/status endpoint.</summary>
-    public WorkerPoolStatus GetStatus(int queuedCount = 0)
+    public WorkerPoolStatus GetStatus()
     {
         var ticks = Interlocked.Read(ref _lastSpawnAtTicks);
         return new(
             _opts.MaxConcurrentWorkers,
-            _currentlyRunning,
-            queuedCount,
+            Volatile.Read(ref _currentlyRunning),
+            _queue.Count,
             ticks == 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero));
     }
 
@@ -118,7 +118,13 @@ public sealed class OrchestratorService : BackgroundService
 
             // Record spawn timestamp before launching the task.
             lock (_spawnTimeLock) { _lastSpawnAtTicks = DateTimeOffset.UtcNow.Ticks; }
-            _opts.OnWorkerSpawned?.Invoke();
+            try { _opts.OnWorkerSpawned?.Invoke(); }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "OnWorkerSpawned callback threw; releasing concurrency slot and skipping item {Id}", id);
+                _concurrencyGate.Release();
+                continue;
+            }
             var workerIndex = Interlocked.Increment(ref _nextWorkerId);
 
             var capturedId = id.Value;
@@ -294,7 +300,7 @@ public sealed class OrchestratorService : BackgroundService
 /// </summary>
 public sealed record OrchestratorOptions
 {
-    public int MaxConcurrentWorkers { get; init; } = 2;
+    public int MaxConcurrentWorkers { get; init; } = 1;
     public TimeSpan MinSpawnInterval { get; init; } = TimeSpan.Zero;
 
     /// <summary>

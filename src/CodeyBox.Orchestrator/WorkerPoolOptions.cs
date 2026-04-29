@@ -6,8 +6,8 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class WorkerPoolOptions
 {
-    /// <summary>Maximum number of work items that can run concurrently. Default 2.</summary>
-    public int MaxConcurrentWorkers { get; set; } = 2;
+    /// <summary>Maximum number of work items that can run concurrently. Default 1.</summary>
+    public int MaxConcurrentWorkers { get; set; } = 1;
 
     /// <summary>
     /// Minimum wall-clock interval between two consecutive worker spawns.

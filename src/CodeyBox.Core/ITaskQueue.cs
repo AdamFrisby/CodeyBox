@@ -12,4 +12,7 @@ public interface ITaskQueue
     /// Awaits the next available work item. Returns null when the queue is closed.
     /// </summary>
     ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default);
+
+    /// <summary>Number of items currently waiting in the queue.</summary>
+    int Count { get; }
 }
