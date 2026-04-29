@@ -94,6 +94,7 @@ internal static class WorkItemEndpoints
         if (req.MergeTimeoutMinutes is { } m)
             item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
         await store.CreateAsync(item, ct);
+        AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
         await queue.EnqueueAsync(item.Id, ct);
         return Results.Created($"/workitems/{item.Id}", ToDto(item, project));
     }
@@ -172,6 +173,7 @@ internal static class WorkItemEndpoints
 
         var resumed = item.With(resumeState.Value, error: null);
         await store.UpdateAsync(resumed, ct);
+        AuditLog.WorkItemRetried(workItemId, from);
         await queue.EnqueueAsync(resumed.Id, ct);
         return Results.Accepted($"/workitems/{id}", new { id, from, state = resumeState.Value.ToString() });
     }
@@ -196,6 +198,7 @@ internal static class WorkItemEndpoints
         {
             var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API");
             await store.UpdateAsync(cancelled, ct);
+            AuditLog.WorkItemCancelled(workItemId);
             var project = await projects.GetAsync(item.ProjectId, ct);
             if (project is not null)
                 await webhooks.PublishAsync(new WebhookEvent

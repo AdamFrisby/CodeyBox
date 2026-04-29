@@ -39,6 +39,7 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
         try
         {
             await _gitHost.PushToUpstreamAsync(request.RepositoryId, _opts.UpstreamUrl, request.BaseBranch, _opts.ExtraEnvironment, ct);
+            AuditLog.UpstreamPush(request.BaseBranch, ScrubUrlCredentials(_opts.UpstreamUrl));
             return new UpstreamCompletionOutcome { BranchPushed = true };
         }
         catch (Exception ex)

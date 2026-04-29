@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Audit;
 using CodeyBox.Core;
@@ -73,6 +74,8 @@ public sealed class PipelineRunner
 
     public async Task RunAsync(WorkItem item, CancellationToken ct)
     {
+        using var workItemScope = AuditLog.WorkItemScope(item.Id);
+
         Project project;
         try
         {
@@ -85,6 +88,8 @@ public sealed class PipelineRunner
             await TransitionFailed(item, ex.Message, CancellationToken.None, project: null);
             return;
         }
+
+        using var projectScope = AuditLog.ProjectScope(project.Id);
 
         var agentKind = item.Agent ?? project.DefaultAgent;
         if (!_agents.TryGet(agentKind, out var agentRunner))
@@ -183,6 +188,7 @@ public sealed class PipelineRunner
             {
                 var cancelled = current.With(WorkItemState.Cancelled, "cancelled");
                 await _store.UpdateAsync(cancelled, CancellationToken.None);
+                AuditLog.WorkItemCancelled(item.Id);
                 await _webhooks.PublishAsync(new WebhookEvent
                 {
                     Event = "work_item.cancelled",
@@ -260,7 +266,14 @@ public sealed class PipelineRunner
             throw new InvalidOperationException($"Failed to read HEAD before agent: {beforeHead.Stderr}");
         var shaBefore = beforeHead.Stdout.Trim();
 
+        var agentPhase = isInitial ? "work" : "rework";
+        AuditLog.AgentStarted(runner.Kind, sandbox.Id, agentPhase);
+        var agentSw = Stopwatch.StartNew();
+
         var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, ct);
+
+        agentSw.Stop();
+        AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed);
         // Always log a truncated tail of agent output, regardless of
         // success. This is critical when an agent finishes "successfully"
         // but produces no useful diff — without this log, we have no
@@ -268,11 +281,17 @@ public sealed class PipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
+            // Truncate agent-controlled output to prevent unbounded content from
+            // reaching the audit log via the exception message chain.
+            const int MaxOutputBytes = 4096;
+            static string Truncate(string s) =>
+                s.Length <= MaxOutputBytes ? s : s[..MaxOutputBytes] + $"… [{s.Length - MaxOutputBytes} bytes truncated]";
+
             var detail = string.Join("\n",
                 new[] {
                     $"Agent {runner.Kind} reported failure: {agentResult.Summary}",
-                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{agentResult.Stderr}" : null,
-                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{agentResult.Stdout}" : null,
+                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{Truncate(agentResult.Stderr)}" : null,
+                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{Truncate(agentResult.Stdout)}" : null,
                 }.Where(s => s is not null));
             throw new InvalidOperationException(detail);
         }
@@ -354,6 +373,8 @@ public sealed class PipelineRunner
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
             var nonBlocking = findings.Count - blocking.Count;
 
+            AuditLog.AuditIterationComplete(iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking);
+
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "work_item.audit_iteration",
@@ -366,6 +387,7 @@ public sealed class PipelineRunner
             {
                 _log.LogInformation("Audit iteration {Iter} passed for {Id} ({NonBlocking} non-blocking findings)",
                     iteration, item.Id, nonBlocking);
+                AuditLog.AuditPassed(iteration);
                 return;
             }
 
@@ -374,6 +396,7 @@ public sealed class PipelineRunner
 
             if (iteration == project.Audit.MaxIterations)
             {
+                AuditLog.AuditFailed(iteration, blocking.Count);
                 var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
@@ -425,7 +448,13 @@ public sealed class PipelineRunner
             foreach (var auditor in group)
             {
                 _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
+                var auditorSw = Stopwatch.StartNew();
                 var result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, ctx, ct);
+                auditorSw.Stop();
+                var worstSeverity = result.Findings.Count > 0
+                    ? ((AuditSeverity)result.Findings.Max(f => (int)f.Severity)).ToString()
+                    : "none";
+                AuditLog.AuditorRun(auditor.Name, worstSeverity, auditorSw.Elapsed);
                 findings.AddRange(result.Findings);
                 if (project.Audit.StopOnFirstFailure && result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
                     return findings;
@@ -476,7 +505,13 @@ public sealed class PipelineRunner
         var preMergeSha = preMerge.Stdout.Trim();
 
         var prompt = BuildMergePrompt(baseBranch, workBranch);
+        AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
+        var mergeSw = Stopwatch.StartNew();
+
         var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, ct);
+
+        mergeSw.Stop();
+        AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed);
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
             throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
@@ -751,6 +786,7 @@ public sealed class PipelineRunner
         var next = current.With(state);
         await _store.UpdateAsync(next, ct);
         _log.LogInformation("Work item {Id} → {State}", item.Id, state);
+        AuditLog.WorkItemTransitioned(item.Id, state.ToString());
         if (project is not null)
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -766,6 +802,7 @@ public sealed class PipelineRunner
         var next = current.With(WorkItemState.Failed, error);
         await _store.UpdateAsync(next, ct);
         _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
+        AuditLog.WorkItemFailed(item.Id, error);
         var effectiveProject = project ?? new Project
         {
             Id = item.ProjectId,

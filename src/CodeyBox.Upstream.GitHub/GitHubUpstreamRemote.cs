@@ -135,11 +135,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
 
         _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
+        AuditLog.UpstreamPrOpened(pr.Number, pr.HtmlUrl, request.WorkBranch, request.BaseBranch);
 
         if (pr.HtmlUrl is null)
-        {
             _log.LogWarning("GitHub PR response did not include html_url; pull_request_opened webhook event will not fire");
-        }
 
         if (!_opts.AutoMerge)
         {
@@ -154,7 +153,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         // Step 3: auto-merge
         var (mergedSha, mergeNotes) = await MergePullRequestAsync(pr.Number, ct);
         if (mergedSha is not null)
+        {
             _log.LogInformation("GitHub PR #{N} auto-merged: {Sha}", pr.Number, mergedSha);
+            AuditLog.UpstreamPrMerged(pr.Number, mergedSha);
+        }
 
         return new UpstreamCompletionOutcome
         {
@@ -184,8 +186,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             _log.LogWarning(
                 "GitHub POST /pulls returned 422 for {Owner}/{Repo} head={WorkBranch} base={BaseBranch}; skipping PR creation",
                 _opts.Owner, _opts.Repository, request.WorkBranch, request.BaseBranch);
+            AuditLog.UpstreamApiCallFailed("POST /pulls", 422, _opts.Owner, _opts.Repository);
             return null;
         }
+
+        if (!response.IsSuccessStatusCode)
+            AuditLog.UpstreamApiCallFailed("POST /pulls", (int)response.StatusCode, _opts.Owner, _opts.Repository);
 
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<GitHubPrResponse>(ct)
@@ -209,8 +215,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             _log.LogWarning(
                 "GitHub PUT /pulls/{N}/merge returned 405 (PR not mergeable, e.g. branch protection); leaving PR open",
                 prNumber);
+            AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", 405, _opts.Owner, _opts.Repository);
             return (null, note);
         }
+
+        if (!response.IsSuccessStatusCode)
+            AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", (int)response.StatusCode, _opts.Owner, _opts.Repository);
 
         response.EnsureSuccessStatusCode();
         var result = await response.Content.ReadFromJsonAsync<GitHubMergeResponse>(ct);

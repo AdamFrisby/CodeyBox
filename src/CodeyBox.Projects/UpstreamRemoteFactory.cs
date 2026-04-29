@@ -74,6 +74,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         if (string.IsNullOrEmpty(token))
             throw new InvalidOperationException(
                 $"Project {project.Id}: env var '{u.TokenEnvVar}' is empty (set it to the GitHub PAT)");
+        // Log the env var NAME only — never the token value.
+        AuditLog.TokenRead(u.TokenEnvVar, project.Id);
         return token;
     }
 }

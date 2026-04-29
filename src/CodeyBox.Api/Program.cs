@@ -13,6 +13,14 @@ using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
+using Serilog;
+using Serilog.Events;
+using Serilog.Filters;
+using Serilog.Formatting.Compact;
+// Disambiguate: both Serilog and MEL expose an ILogger interface.
+// Program.cs only uses Serilog.Log (the static class) and MEL's ILogger<T>;
+// declaring the alias keeps local function signatures unambiguous.
+using ILogger = Microsoft.Extensions.Logging.ILogger;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -35,6 +43,76 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
     && builder.Configuration["Kestrel:Endpoints:Default:Url"] is null)
 {
     builder.WebHost.UseUrls("http://127.0.0.1:5000");
+}
+
+// ── Serilog bootstrap ─────────────────────────────────────────────────────
+// Configured from CodeyBox:AuditLog section before the host builds so the
+// logger is available from startup. UseSerilog() replaces the default MEL
+// providers, so all ILogger<T> call sites continue to work unchanged.
+{
+    var cbConf = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
+        ?? new CodeyBoxOptions();
+    var auditOpts = cbConf.AuditLog;
+
+    if (auditOpts.RetainedDays < 1)
+        throw new InvalidOperationException("CodeyBox:AuditLog:RetainedDays must be >= 1");
+    if (string.IsNullOrWhiteSpace(auditOpts.Path))
+        throw new InvalidOperationException("CodeyBox:AuditLog:Path must be non-empty");
+    if (string.IsNullOrWhiteSpace(auditOpts.AuditPath))
+        throw new InvalidOperationException("CodeyBox:AuditLog:AuditPath must be non-empty");
+
+    // Ensure log directories exist and are writable before handing control
+    // to Serilog, so misconfigured paths surface at startup rather than
+    // silently dropping events.
+    foreach (var logPath in new[] { auditOpts.Path, auditOpts.AuditPath })
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(logPath));
+        if (string.IsNullOrEmpty(dir)) continue;
+        try
+        {
+            Directory.CreateDirectory(dir);
+            var probe = Path.Combine(dir, $".write-probe-{Guid.NewGuid():N}");
+            File.WriteAllText(probe, "");
+            File.Delete(probe);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"Audit log directory '{dir}' (from path '{logPath}') is not writable: {ex.Message}", ex);
+        }
+    }
+
+    Log.Logger = new LoggerConfiguration()
+        .MinimumLevel.Information()
+        .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+        .MinimumLevel.Override("Microsoft.Hosting.Lifetime", LogEventLevel.Information)
+        .Enrich.FromLogContext()
+        .Enrich.WithMachineName()
+        .Enrich.WithThreadId()
+        .Enrich.WithProperty("Application", "CodeyBox")
+        .Enrich.With<SensitiveDataRedactionEnricher>()
+        .WriteTo.Console()
+        .WriteTo.File(
+            formatter: new CompactJsonFormatter(),
+            path: auditOpts.Path,
+            rollingInterval: RollingInterval.Day,
+            retainedFileCountLimit: auditOpts.RetainedDays,
+            fileSizeLimitBytes: auditOpts.MaxFileSizeBytes,
+            rollOnFileSizeLimit: true,
+            shared: false)
+        .WriteTo.Logger(lc => lc
+            .Filter.ByIncludingOnly(Matching.WithProperty<bool>("Audit", v => v))
+            .WriteTo.File(
+                formatter: new CompactJsonFormatter(),
+                path: auditOpts.AuditPath,
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: auditOpts.RetainedDays,
+                fileSizeLimitBytes: auditOpts.MaxFileSizeBytes,
+                rollOnFileSizeLimit: true,
+                shared: false))
+        .CreateLogger();
+
+    builder.Host.UseSerilog();
 }
 
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
@@ -253,7 +331,19 @@ WorkItemEndpoints.Map(app);
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
-app.Run();
+try
+{
+    app.Run();
+}
+catch (Exception ex)
+{
+    Log.Fatal(ex, "Host terminated unexpectedly");
+    throw;
+}
+finally
+{
+    Log.CloseAndFlush();
+}
 
 namespace CodeyBox.Api
 {
@@ -340,6 +430,11 @@ namespace CodeyBox.Api
         /// Each entry configures one HTTPS target that receives pipeline events.
         /// </summary>
         public List<WebhookEndpointOptions> Webhooks { get; set; } = [];
+
+        /// <summary>
+        /// Audit log configuration: rolling file paths, retention, and size caps.
+        /// </summary>
+        public AuditLogOptions AuditLog { get; set; } = new();
     }
 
     /// <summary>
@@ -354,5 +449,32 @@ namespace CodeyBox.Api
         public int MaxAttempts { get; set; } = 3;
         public int InitialBackoffSeconds { get; set; } = 1;
         public int TimeoutSeconds { get; set; } = 10;
+    }
+
+    /// <summary>
+    /// Rolling file log configuration. Paths are resolved relative to the
+    /// API process's working directory when they are not absolute.
+    /// See <c>docs/audit-logging.md</c> for details.
+    /// </summary>
+    public sealed class AuditLogOptions
+    {
+        /// <summary>
+        /// Path template for the main rolling log (all severity levels).
+        /// Default: <c>logs/codeybox-.json</c> — the date is inserted before
+        /// the trailing dot by Serilog's file sink.
+        /// </summary>
+        public string Path { get; set; } = "logs/codeybox-.json";
+
+        /// <summary>
+        /// Path template for the audit-only rolling log (<c>Audit=true</c>
+        /// events only). Default: <c>logs/audit-.json</c>.
+        /// </summary>
+        public string AuditPath { get; set; } = "logs/audit-.json";
+
+        /// <summary>Days of rolled files to keep. Must be >= 1. Default: 30.</summary>
+        public int RetainedDays { get; set; } = 30;
+
+        /// <summary>Per-file size cap before rolling. Default: 100 MiB.</summary>
+        public long MaxFileSizeBytes { get; set; } = 100 * 1024 * 1024;
     }
 }

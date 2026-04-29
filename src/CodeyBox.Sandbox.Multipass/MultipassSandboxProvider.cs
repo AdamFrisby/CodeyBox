@@ -174,6 +174,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             await StartAndWaitForRunningAsync(name, ct);
 
             await TransferEnvAsync(name, spec.Environment, sandboxRoot, ct);
+            AuditLog.SandboxCreated(name, spec.Network.ProfileName);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files); on the clone path it's
             // already baked into the source VM's filesystem, so the clone
@@ -943,6 +944,7 @@ internal sealed class MultipassSandbox : ISandbox
     {
         if (_disposed) return;
         _disposed = true;
+        AuditLog.SandboxDisposed(_name);
         try
         {
             using var p = Process.Start(new ProcessStartInfo
