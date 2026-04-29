@@ -41,16 +41,17 @@ public static class WorkItemDependencies
     }
 
     /// <summary>
-    /// Runs DFS cycle detection over the proposed graph (all existing items
-    /// plus the hypothetical new item <paramref name="newId"/> with deps
-    /// <paramref name="newDeps"/>). Returns a human-readable cycle path string
-    /// like "a -> b -> c -> a" if a cycle would be introduced, or null if the
-    /// graph remains acyclic.
+    /// Runs DFS cycle detection starting from the proposed new item
+    /// (<paramref name="newId"/> with edges to <paramref name="newDeps"/>)
+    /// over the combined graph of all existing items. Returns a human-readable
+    /// cycle path string like "a -> b -> c -> a" if a cycle is reachable from
+    /// <paramref name="newId"/>, or null if the graph remains acyclic.
     ///
-    /// By construction, existing items cannot depend on the new item (it
-    /// doesn't exist yet), so a cycle is mathematically impossible. This
-    /// method is a safety net for DB corruption or future code changes that
-    /// might violate that invariant.
+    /// Starting DFS only from <paramref name="newId"/> limits detection to
+    /// cycles reachable through the new item's dependency chain — cycles in
+    /// unrelated parts of the graph do not block this item's creation. The
+    /// check guards against DB corruption or concurrent races that leave a
+    /// dependency subgraph in a cyclic state.
     /// </summary>
     public static string? FindCycle(
         WorkItemId newId,
@@ -99,13 +100,10 @@ public static class WorkItemDependencies
             return false;
         }
 
-        foreach (var node in adj.Keys)
-        {
-            if (!visited.Contains(node) && Visit(node))
-                return cyclePath;
-        }
-
-        return null;
+        // Only traverse the subgraph reachable from newId. This catches cycles
+        // that involve newId's dep chain (e.g., DB corruption where an existing
+        // item already references newId, completing a loop back to it).
+        return Visit(newId.ToString()) ? cyclePath : null;
     }
 
     /// <summary>

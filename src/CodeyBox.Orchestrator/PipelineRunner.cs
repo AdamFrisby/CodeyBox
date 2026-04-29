@@ -29,7 +29,7 @@ namespace CodeyBox.Orchestrator;
 /// The orchestrator verifies the agent's output before pushing — see
 /// <see cref="VerifyMergeStateAsync"/>.
 /// </summary>
-public sealed class PipelineRunner
+public sealed class PipelineRunner : IPipelineRunner
 {
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;

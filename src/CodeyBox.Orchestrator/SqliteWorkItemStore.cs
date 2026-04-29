@@ -188,6 +188,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         var json = r.GetString(ordinal);
         var ids = JsonSerializer.Deserialize<string[]>(json);
         if (ids is null || ids.Length == 0) return [];
-        return ids.Select(WorkItemId.Parse).ToList();
+        // Guard against malformed GUIDs from DB corruption: skip bad entries
+        // rather than crashing all callers (including ReplayPendingAsync at boot).
+        var result = new List<WorkItemId>(ids.Length);
+        foreach (var raw in ids)
+        {
+            if (Guid.TryParse(raw, out var g))
+                result.Add(new WorkItemId(g));
+        }
+        return result;
     }
 }

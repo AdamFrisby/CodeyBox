@@ -317,6 +317,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
     };
 });
 builder.Services.AddSingleton<PipelineRunner>();
+builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
     new OrchestratorOptions { Concurrency = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Concurrency });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>

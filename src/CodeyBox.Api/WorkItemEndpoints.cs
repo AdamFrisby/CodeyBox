@@ -78,7 +78,12 @@ internal static class WorkItemEndpoints
 
         // ── Dependency validation ─────────────────────────────────────────────
 
-        // Parse dependsOn IDs.
+        // Parse dependsOn IDs. Cap at 100 to bound sequential existence checks
+        // and cycle-detection graph size (prevents resource exhaustion via
+        // a single oversized request).
+        if ((req.DependsOn?.Length ?? 0) > 100)
+            return Results.BadRequest(new { error = "dependsOn must contain at most 100 entries" });
+
         var dependsOnIds = new List<WorkItemId>();
         foreach (var rawId in req.DependsOn ?? [])
         {

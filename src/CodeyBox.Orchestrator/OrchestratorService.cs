@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -13,15 +14,20 @@ public sealed class OrchestratorService : BackgroundService
 {
     private readonly ITaskQueue _queue;
     private readonly IWorkItemStore _store;
-    private readonly PipelineRunner _pipeline;
+    private readonly IPipelineRunner _pipeline;
     private readonly CancellationRegistry _cancellations;
     private readonly OrchestratorOptions _opts;
     private readonly ILogger<OrchestratorService> _log;
 
+    // Tracks work item IDs that are currently being processed by a worker.
+    // Guards against double-execution when two workers both enqueue the same
+    // item (e.g., both see it as the last satisfied dependent simultaneously).
+    private readonly ConcurrentDictionary<WorkItemId, byte> _activeItems = new();
+
     public OrchestratorService(
         ITaskQueue queue,
         IWorkItemStore store,
-        PipelineRunner pipeline,
+        IPipelineRunner pipeline,
         CancellationRegistry cancellations,
         OrchestratorOptions opts,
         ILogger<OrchestratorService> log)
@@ -114,38 +120,55 @@ public sealed class OrchestratorService : BackgroundService
                 continue;
             }
 
-            // Dependency gate: skip items whose deps aren't all terminal yet.
-            // This handles races where an item is enqueued before all deps complete.
-            if (item.DependsOn.Count > 0)
+            // Double-enqueue guard: when two workers simultaneously complete
+            // the last dependency of the same downstream item, both may enqueue
+            // it. Only one worker should run the pipeline for a given item at a
+            // time. TryAdd is atomic; the losing worker skips gracefully.
+            if (!_activeItems.TryAdd(id.Value, 0))
             {
-                var allItems = new List<WorkItem>();
-                await foreach (var i in _store.ListAsync(ct)) allItems.Add(i);
-                var statesById = WorkItemDependencies.BuildStateMap(allItems);
-                if (!WorkItemDependencies.AreSatisfied(item.DependsOn, statesById))
-                {
-                    _log.LogInformation(
-                        "Worker {WorkerId} skipping {Id}: dependencies not yet terminal", workerId, id);
-                    continue; // will be re-enqueued when deps reach terminal state
-                }
+                _log.LogInformation(
+                    "Worker {WorkerId} skipping {Id}: already being processed by another worker", workerId, id);
+                continue;
             }
 
-            using var registration = _cancellations.Register(item.Id);
-            AuditLog.WorkItemPickedUp(workerId, item.Id);
             try
             {
-                await _pipeline.RunAsync(item, registration.Token);
+                // Dependency gate: skip items whose deps aren't all terminal yet.
+                if (item.DependsOn.Count > 0)
+                {
+                    var allItems = new List<WorkItem>();
+                    await foreach (var i in _store.ListAsync(ct)) allItems.Add(i);
+                    var statesById = WorkItemDependencies.BuildStateMap(allItems);
+                    if (!WorkItemDependencies.AreSatisfied(item.DependsOn, statesById))
+                    {
+                        _log.LogInformation(
+                            "Worker {WorkerId} skipping {Id}: dependencies not yet terminal", workerId, id);
+                        continue; // finally removes from _activeItems
+                    }
+                }
+
+                using var registration = _cancellations.Register(item.Id);
+                AuditLog.WorkItemPickedUp(workerId, item.Id);
+                try
+                {
+                    await _pipeline.RunAsync(item, registration.Token);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break; // finally removes from _activeItems, then exits loop
+                }
+                catch (OperationCanceledException)
+                {
+                    _log.LogInformation("Worker {WorkerId} item {Id} cancelled", workerId, id);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Worker {WorkerId} unexpected failure on {Id}", workerId, id);
+                }
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            finally
             {
-                break;
-            }
-            catch (OperationCanceledException)
-            {
-                _log.LogInformation("Worker {WorkerId} item {Id} cancelled", workerId, id);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Worker {WorkerId} unexpected failure on {Id}", workerId, id);
+                _activeItems.TryRemove(id.Value, out _);
             }
 
             // After the pipeline finishes (any outcome), check whether any
