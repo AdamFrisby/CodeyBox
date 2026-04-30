@@ -24,6 +24,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.done` | Work item completed successfully |
 | `work_item.failed` | Work item failed (unrecoverable error) |
 | `work_item.cancelled` | Work item was cancelled via the API |
+| `work_item.agent_stuck` | Stuck-agent probe detected a hang and killed the agent (see [Details](#agent_stuck-details)) |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -92,6 +93,33 @@ When `event` is `work_item.pull_request_opened` (only emitted by `Upstream.Kind=
 ```
 
 `mergedSha` is `null` when `AutoMerge=false` or when GitHub refused the auto-merge (e.g. branch protection); the PR is still left open in that case.
+
+### `agent_stuck` details
+
+When `event` is `work_item.agent_stuck`, the `details` field is populated:
+
+```json
+{
+  "details": {
+    "phase": "work",
+    "agentKind": "claude",
+    "stuckSeconds": 602,
+    "killed": true
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `phase` | string | Pipeline phase where the hang was detected: `"work"`, `"rework"`, or `"merge"` |
+| `agentKind` | string | Agent binary that was killed (e.g. `"claude"`, `"codex"`) |
+| `stuckSeconds` | int | Approximate idle duration in seconds when the probe fired |
+| `killed` | bool | Always `true`; reserved for future graceful-shutdown paths |
+
+`work_item.agent_stuck` fires **before** the terminal state event
+(`work_item.failed` or the state preceding auto-retry). Operators should
+subscribe to this event to alert on hung agents even when `AutoRetryOnStuck`
+automatically re-queues the item.
 
 ---
 

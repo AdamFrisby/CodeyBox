@@ -90,6 +90,83 @@ orchestrator logs a deprecation warning and copies the value into
 `MaxConcurrentWorkers`. No config file edits are required to keep an
 existing deployment working, but migrating to `WorkerPool` is encouraged.
 
+## Stuck-agent detection
+
+The orchestrator monitors each running agent for liveness. If an agent stops
+consuming CPU **and** has no open network sockets for a configurable period, it
+is classified as _stuck_ (deadlocked, blocked on a closed socket, blocked on
+stdin, etc.) and killed so the slot can be recovered.
+
+### How it works
+
+While a work, rework, or merge phase is running, a background probe samples
+agent activity every 30 seconds:
+
+| Dimension | What is measured | "Active" if … |
+|---|---|---|
+| CPU | `utime + stime` from `/proc/<pid>/stat` | tick counter increased between two samples |
+| Network | Open socket file-descriptors in `/proc/<pid>/fd` | at least one socket FD exists |
+
+The agent is classified **stuck** when both dimensions show zero activity for
+`StuckThresholdMinutes` consecutive minutes (default 10 min = 20 samples ×
+30 s). Once stuck is detected:
+
+1. Audit event `agent.stuck_detected` is logged.
+2. The phase's `CancellationToken` is cancelled, causing the sandbox to kill
+   the agent process.
+3. Audit event `agent.killed_by_stuck_probe` is logged.
+4. Webhook event `work_item.agent_stuck` is fired (see
+   [webhooks.md](webhooks.md)).
+5. The work item transitions to **Failed** (or is re-queued if
+   `AutoRetryOnStuck` is enabled — see [projects.md](projects.md)).
+
+### Platform support
+
+| Provider | CPU probe | Network probe |
+|---|---|---|
+| **ProcessSandbox** (dev) | ✓ | ✓ (host processes, host netns) |
+| **Bubblewrap** (production) | ✓ | ✓ (host-visible PIDs, per-process netns) |
+| **Multipass** (production KVM) | ✗ — agent runs inside VM | ✗ |
+
+On Multipass the agent process is not visible from the host `/proc` filesystem.
+The probe's `TryRead()` returns `null` every sample, so no stuck classification
+occurs. The existing coarse phase timeout remains the only protection in that
+configuration.
+
+On non-Linux hosts (macOS, Windows) the probe is also silently disabled (null
+source).
+
+### Threshold tuning
+
+**Default: 10 minutes (20 × 30 s samples).**
+
+Choosing a threshold involves two failure modes:
+
+| Too low | Too high |
+|---|---|
+| Kills agents that are just slow (large LLM response streaming, big `git clone`) | Wastes compute and human time on a genuinely deadlocked agent |
+
+Rules of thumb:
+- Set to **at most half** of your phase timeout. If `WorkTimeout = 30 min`, a
+  threshold ≤ 15 min ensures the probe fires before the timeout.
+- For phases that routinely produce large diffs or audit many files, start with
+  the default (10 min) and only reduce if you're confident your slowest
+  legitimate run completes within that window.
+- Set `StuckThresholdMinutes = 0` to **disable** the probe entirely for a
+  project (e.g. when you want to investigate hangs manually via the VM console
+  rather than auto-recovering).
+
+### Observability
+
+| Audit event | Logged when |
+|---|---|
+| `agent.stuck_detected` | Probe classified the agent as stuck (includes phase, agent kind, stuck duration in seconds) |
+| `agent.killed_by_stuck_probe` | Phase CTS was cancelled and the agent was killed |
+
+Both events are at **Warning** level. Per-sample CPU-delta and socket-count
+readings are logged at **Debug** level (30 s × multi-hour runs → very noisy at
+higher levels).
+
 ## Observability
 
 ### Audit log events

@@ -101,6 +101,15 @@ public static class AuditLog
             .Information("Agent {Agent} finished in sandbox {Sandbox}: success={Success} exit={ExitCode} duration={DurationMs}ms",
                 agent.Value, sandboxName, success, exitCode, (long)duration.TotalMilliseconds);
 
+    public static void AgentStuckDetected(AgentKind agent, string phase, TimeSpan stuckDuration) =>
+        Audit("agent.stuck_detected")
+            .Warning("Agent {Agent} stuck in phase {Phase} for {StuckSeconds}s with no CPU or network activity",
+                agent.Value, phase, (int)stuckDuration.TotalSeconds);
+
+    public static void AgentKilledByStuckProbe(AgentKind agent, string phase) =>
+        Audit("agent.killed_by_stuck_probe")
+            .Warning("Agent {Agent} killed by stuck probe in phase {Phase}", agent.Value, phase);
+
     // ── Sandbox lifecycle ────────────────────────────────────────────────────
 
     public static void SandboxCreated(string vmName, string? networkProfile) =>

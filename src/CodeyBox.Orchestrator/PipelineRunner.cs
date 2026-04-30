@@ -45,6 +45,24 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
 
+    /// <summary>
+    /// Overridable in tests to inject a programmable activity source without
+    /// modifying the production constructor. Defaults to the OS-appropriate
+    /// implementation (<see cref="ProcFsAgentActivitySource"/> on Linux,
+    /// <see cref="NullAgentActivitySource"/> elsewhere).
+    /// </summary>
+    internal Func<IAgentActivitySource> ActivitySourceFactory { get; set; }
+        = () => OperatingSystem.IsLinux()
+            ? new ProcFsAgentActivitySource()
+            : NullAgentActivitySource.Instance;
+
+    /// <summary>
+    /// Overridable poll interval for the stuck probe. Default is
+    /// <see cref="StuckProbe.DefaultPollInterval"/> (30 s). Set to a short
+    /// duration in tests to avoid real wall-clock waits.
+    /// </summary>
+    internal TimeSpan StuckProbePollInterval { get; set; } = StuckProbe.DefaultPollInterval;
+
     public PipelineRunner(
         ISandboxProvider sandboxes,
         IGitHost gitHost,
@@ -125,11 +143,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 using (var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
                     workCts.CancelAfter(item.WorkTimeout);
-                    await RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                        BuildInitialWorkPrompt(item.Prompt), isInitial: true,
-                        networkProfile: project.NetworkProfiles.Work,
-                        project: project,
-                        workCts.Token);
+                    await RunWithStuckProbeAsync(item, project, agentKind, "work", workCts, ct, phaseCt =>
+                        RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
+                            BuildInitialWorkPrompt(item.Prompt), isInitial: true,
+                            networkProfile: project.NetworkProfiles.Work,
+                            project: project,
+                            phaseCt));
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
             }
@@ -164,10 +183,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
                     mergeCts.CancelAfter(item.MergeTimeout);
-                    (mergeSha, agentStdout) = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                        networkProfile: project.NetworkProfiles.Merge,
-                        project: project,
-                        mergeCts.Token);
+                    (mergeSha, agentStdout) = await RunWithStuckProbeAsync(item, project, agentKind, "merge", mergeCts, ct, phaseCt =>
+                        RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
+                            networkProfile: project.NetworkProfiles.Merge,
+                            project: project,
+                            phaseCt));
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
                 await Transition(item, WorkItemState.Merged, ct, project);
@@ -213,6 +233,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 WorkItem = failed,
                 Project = project,
             }, CancellationToken.None);
+        }
+        catch (AgentStuckException stuckEx)
+        {
+            await HandleAgentStuckAsync(item, project, stuckEx);
         }
         catch (Exception ex)
         {
@@ -429,11 +453,12 @@ public sealed class PipelineRunner : IPipelineRunner
             var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations);
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
-            await RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
-                reworkPrompt, isInitial: false,
-                networkProfile: project.NetworkProfiles.Rework,
-                project: project,
-                reworkCts.Token);
+            await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct, phaseCt =>
+                RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
+                    reworkPrompt, isInitial: false,
+                    networkProfile: project.NetworkProfiles.Rework,
+                    project: project,
+                    phaseCt));
         }
     }
 
@@ -835,6 +860,131 @@ public sealed class PipelineRunner : IPipelineRunner
         return trimmed;
     }
 
+    // ── Stuck-probe integration ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Wraps a returning agent phase action with a background liveness probe.
+    /// If the probe detects a hang it cancels <paramref name="phaseCts"/> and
+    /// throws <see cref="AgentStuckException"/>, which the caller's
+    /// <c>catch</c> handles. The non-generic overload delegates here.
+    /// </summary>
+    private async Task<T> RunWithStuckProbeAsync<T>(
+        WorkItem item,
+        Project project,
+        AgentKind agentKind,
+        string phase,
+        CancellationTokenSource phaseCts,
+        CancellationToken ct,
+        Func<CancellationToken, Task<T>> work)
+    {
+        var thresholdMinutes = ResolveEffectiveStuckThresholdMinutes(project);
+        if (thresholdMinutes <= 0)
+            return await work(phaseCts.Token);
+
+        ValidateStuckThreshold(thresholdMinutes, phase);
+
+        var thresholdSamples = (int)Math.Ceiling(
+            thresholdMinutes * 60.0 / StuckProbe.DefaultPollInterval.TotalSeconds);
+
+        var ctx = new StuckContext { Phase = phase, AgentKind = agentKind };
+        var source = ActivitySourceFactory();
+        var probe = new StuckProbe(source, thresholdSamples, ctx, phaseCts, _log, StuckProbePollInterval);
+
+        using var probeCts = new CancellationTokenSource();
+        _ = probe.RunAsync(probeCts.Token); // fire-and-forget; self-terminating
+
+        try
+        {
+            return await work(phaseCts.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && ctx.Detected)
+        {
+            throw new AgentStuckException(ctx);
+        }
+        finally
+        {
+            probeCts.Cancel();
+        }
+    }
+
+    private Task RunWithStuckProbeAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agentKind,
+        string phase,
+        CancellationTokenSource phaseCts,
+        CancellationToken ct,
+        Func<CancellationToken, Task> work)
+        => RunWithStuckProbeAsync<bool>(item, project, agentKind, phase, phaseCts, ct,
+            async pct => { await work(pct); return true; });
+
+    private async Task HandleAgentStuckAsync(WorkItem item, Project project, AgentStuckException stuckEx)
+    {
+        var ctx = stuckEx.Context;
+        _log.LogWarning("Work item {Id} agent stuck in phase '{Phase}' for {Seconds}s",
+            item.Id, ctx.Phase, (int)ctx.StuckDuration.TotalSeconds);
+
+        AuditLog.AgentStuckDetected(ctx.AgentKind, ctx.Phase, ctx.StuckDuration);
+        AuditLog.AgentKilledByStuckProbe(ctx.AgentKind, ctx.Phase);
+
+        var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "work_item.agent_stuck",
+            WorkItem = current,
+            Project = project,
+            Details = new AgentStuckDetails
+            {
+                Phase = ctx.Phase,
+                AgentKind = ctx.AgentKind.Value,
+                StuckSeconds = (int)ctx.StuckDuration.TotalSeconds,
+                Killed = true,
+            },
+        }, CancellationToken.None);
+
+        if (project.Audit.AutoRetryOnStuck && current.StuckRetries < project.Audit.MaxStuckRetries)
+        {
+            // Re-queue from the same phase entry point.
+            var retryFromState = ctx.Phase switch
+            {
+                "rework" => WorkItemState.WorkComplete,
+                "merge" => WorkItemState.AuditPassed,
+                _ => WorkItemState.Queued,
+            };
+            var retried = current with
+            {
+                State = retryFromState,
+                StuckRetries = current.StuckRetries + 1,
+                LastError = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+            await _store.UpdateAsync(retried, CancellationToken.None);
+            _log.LogWarning(
+                "Work item {Id} auto-retrying from phase '{Phase}' after stuck detection (retry {N}/{Max})",
+                item.Id, ctx.Phase, retried.StuckRetries, project.Audit.MaxStuckRetries);
+            AuditLog.WorkItemRetried(item.Id, ctx.Phase);
+        }
+        else
+        {
+            await TransitionFailed(item, stuckEx.Message, CancellationToken.None, project);
+        }
+    }
+
+    private int ResolveEffectiveStuckThresholdMinutes(Project project)
+    {
+        // ProjectAudit.StuckThresholdMinutes: -1 = inherit global, 0 = disabled, >0 = use it
+        var projectVal = project.Audit.StuckThresholdMinutes;
+        return projectVal < 0 ? _opts.StuckThresholdMinutes : projectVal;
+    }
+
+    private void ValidateStuckThreshold(int thresholdMinutes, string phase)
+    {
+        if (thresholdMinutes < 1)
+            _log.LogWarning("Stuck probe: threshold {Min}min is below minimum 1 min for phase '{Phase}'",
+                thresholdMinutes, phase);
+    }
+
     private async Task Transition(WorkItem item, WorkItemState state, CancellationToken ct, Project? project = null)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
@@ -908,4 +1058,12 @@ public sealed record PipelineOptions
     public int UpstreamPushMaxAttempts { get; init; } = 5;
     public TimeSpan UpstreamPushBackoff { get; init; } = TimeSpan.FromSeconds(15);
     public HostGitIdentity? HostGitIdentity { get; init; }
+
+    /// <summary>
+    /// Global default for stuck-agent detection threshold, in minutes.
+    /// 0 = globally disabled. Per-project <c>Audit.StuckThresholdMinutes</c>
+    /// overrides this when set to a non-negative value.
+    /// Must be ≥ 1 (or 0 to disable) when non-negative.
+    /// </summary>
+    public int StuckThresholdMinutes { get; init; } = 10;
 }

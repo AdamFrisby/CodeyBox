@@ -114,12 +114,22 @@ public sealed class ProjectRepository : IProjectRepository
         var mergedAuditTypes = project?.AuditTypes ?? defaults?.AuditTypes ?? [];
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
 
+        // Stuck-probe config. null in config = -1 (inherit from PipelineOptions global).
+        // 0 = explicitly disabled for this project. >0 = explicit threshold.
+        var rawStuck = project?.StuckThresholdMinutes ?? defaults?.StuckThresholdMinutes;
+        var mergedStuck = rawStuck.HasValue ? rawStuck.Value : -1;
+        var mergedAutoRetry = project?.AutoRetryOnStuck ?? defaults?.AutoRetryOnStuck ?? false;
+        var mergedMaxRetries = project?.MaxStuckRetries ?? defaults?.MaxStuckRetries ?? 2;
+
         return new ProjectAudit
         {
             MaxIterations = mergedMaxIter,
             FailingSeverity = mergedSeverity,
             PerIterationTimeout = TimeSpan.FromMinutes(mergedTimeoutMin),
             StopOnFirstFailure = mergedStopOnFirst,
+            StuckThresholdMinutes = mergedStuck,
+            AutoRetryOnStuck = mergedAutoRetry,
+            MaxStuckRetries = mergedMaxRetries,
             Languages = mergedLanguages,
             AuditTypes = mergedAuditTypes,
             Custom = mergedCustom,
