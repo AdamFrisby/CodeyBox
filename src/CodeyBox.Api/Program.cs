@@ -446,12 +446,15 @@ builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTa
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.GitIdentity");
+    var hostIdentity = HostGitIdentityReader.Read(startupLog);
     return new PipelineOptions
     {
         SandboxImageReference = opts.SandboxImageReference,
         AgentAllowedHosts = opts.AgentAllowedHosts,
         UpstreamPushMaxAttempts = opts.UpstreamPushMaxAttempts,
         UpstreamPushBackoff = TimeSpan.FromSeconds(opts.UpstreamPushBackoffSeconds),
+        HostGitIdentity = hostIdentity,
     };
 });
 builder.Services.AddSingleton<PipelineRunner>();

@@ -48,6 +48,20 @@ public sealed record Project
     public ProjectAudit Audit { get; init; } = new();
 
     /// <summary>
+    /// Override the git commit author name for this project. When set, takes
+    /// precedence over the host's global git identity. Falls back to the host
+    /// identity, then to "CodeyBox".
+    /// </summary>
+    public string? GitAuthorName { get; init; }
+
+    /// <summary>
+    /// Override the git commit author email for this project. When set, takes
+    /// precedence over the host's global git identity. Falls back to the host
+    /// identity, then to "codeybox@local".
+    /// </summary>
+    public string? GitAuthorEmail { get; init; }
+
+    /// <summary>
     /// Per-phase host-enforced network profile selection. Each profile name
     /// references an entry in the sandbox provider's
     /// <c>NetworkProfiles</c> map (which maps logical names to host bridge

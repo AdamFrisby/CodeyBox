@@ -64,6 +64,31 @@ provider). Everything sits under the `CodeyBox` section:
 }
 ```
 
+### `GitAuthorName` / `GitAuthorEmail`
+
+Set these two fields together to override the git commit author identity for all
+work items in this project. Both must be non-empty for the override to take
+effect; setting only one falls through to the host identity.
+
+```json
+{
+  "Id": "my-app",
+  "GitAuthorName": "CI Bot",
+  "GitAuthorEmail": "ci-bot@example.com",
+  ...
+}
+```
+
+**Resolution order** (first match wins):
+1. Project `GitAuthorName` / `GitAuthorEmail` — if both are set.
+2. Host global git config (`git config --global user.name/email`) — read once
+   at orchestrator startup; requires `git` on PATH and `~/.gitconfig`.
+3. Synthetic fallback: `CodeyBox <codeybox@local>`.
+
+Operators without a project-level override and with a normal `~/.gitconfig`
+will automatically see their real identity on commits from the next work item
+after a restart. No other config change is needed.
+
 ### `DefaultAgentClass`
 
 Set `DefaultAgentClass` to a class ID from `CodeyBox:AgentClasses` to enable

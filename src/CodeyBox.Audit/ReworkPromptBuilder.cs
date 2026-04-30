@@ -20,6 +20,10 @@ public static class ReworkPromptBuilder
         sb.AppendLine();
         sb.AppendLine("Make new commits — do not amend.");
         sb.AppendLine();
+        sb.AppendLine("Every commit message MUST end with the following trailer, separated from the subject by a blank line:");
+        sb.AppendLine();
+        sb.AppendLine("    Co-Authored-By: CodeyBox <noreply@codeybox.invalid>");
+        sb.AppendLine();
 
         var grouped = findings.GroupBy(f => f.AuditorName);
         foreach (var group in grouped)
