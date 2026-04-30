@@ -13,6 +13,12 @@ namespace CodeyBox.Api;
 /// appropriate on a localhost dev box; the orchestrator can spawn sandboxes,
 /// merge to git remotes, and enqueue arbitrary work — anyone who can reach
 /// the API can exfiltrate via a malicious prompt.
+///
+/// <para>The disabled-vs-key check is resolved lazily through DI rather than
+/// at <see cref="WebApplicationBuilder"/>-construction time so that test
+/// hosts (<c>WebApplicationFactory</c>) can layer their in-memory config in
+/// before the check runs. <see cref="ApiKeyAuthValidator"/> still forces
+/// fail-fast at host start by resolving the state in <see cref="IHostedService.StartAsync"/>.</para>
 /// </summary>
 internal static class ApiKeyAuth
 {
@@ -21,23 +27,25 @@ internal static class ApiKeyAuth
 
     public static void Configure(WebApplicationBuilder builder)
     {
-        var disabled = builder.Configuration.GetValue<bool>(DisableConfigKey);
-        var key = Environment.GetEnvironmentVariable(EnvVarName);
-
-        if (disabled)
+        builder.Services.AddSingleton(sp =>
         {
-            builder.Services.AddSingleton(new ApiKeyState(Token: null, Disabled: true));
-            return;
-        }
+            var configuration = sp.GetRequiredService<IConfiguration>();
+            var disabled = configuration.GetValue<bool>(DisableConfigKey);
 
-        if (string.IsNullOrWhiteSpace(key))
-            throw new InvalidOperationException(
-                $"{EnvVarName} must be set, or set {DisableConfigKey}=true to opt out of auth (dev only).");
-        if (key.Length < 32)
-            throw new InvalidOperationException(
-                $"{EnvVarName} must be at least 32 characters of high-entropy random data.");
+            if (disabled)
+                return new ApiKeyState(Token: null, Disabled: true);
 
-        builder.Services.AddSingleton(new ApiKeyState(Token: key, Disabled: false));
+            var key = Environment.GetEnvironmentVariable(EnvVarName);
+            if (string.IsNullOrWhiteSpace(key))
+                throw new InvalidOperationException(
+                    $"{EnvVarName} must be set, or set {DisableConfigKey}=true to opt out of auth (dev only).");
+            if (key.Length < 32)
+                throw new InvalidOperationException(
+                    $"{EnvVarName} must be at least 32 characters of high-entropy random data.");
+
+            return new ApiKeyState(Token: key, Disabled: false);
+        });
+        builder.Services.AddHostedService<ApiKeyAuthValidator>();
     }
 
     public static IApplicationBuilder UseApiKeyAuth(this IApplicationBuilder app, string[] anonymousPrefixes)
@@ -93,3 +101,25 @@ internal static class ApiKeyAuth
 }
 
 internal sealed record ApiKeyState(string? Token, bool Disabled);
+
+/// <summary>
+/// Forces fail-fast at host start by resolving <see cref="ApiKeyState"/> in
+/// <see cref="StartAsync"/>. If the configuration is invalid (no key, no
+/// opt-out), the DI factory throws and <c>WebApplication.RunAsync</c>
+/// surfaces the failure before any request is served.
+/// </summary>
+internal sealed class ApiKeyAuthValidator : IHostedService
+{
+    private readonly IServiceProvider _services;
+    public ApiKeyAuthValidator(IServiceProvider services) => _services = services;
+
+    public Task StartAsync(CancellationToken ct)
+    {
+        // Resolution executes the factory registered in ApiKeyAuth.Configure
+        // and propagates any InvalidOperationException to the host.
+        _ = _services.GetRequiredService<ApiKeyState>();
+        return Task.CompletedTask;
+    }
+
+    public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+}

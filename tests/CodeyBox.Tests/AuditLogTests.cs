@@ -9,10 +9,13 @@ namespace CodeyBox.Tests;
 /// Tests for the <see cref="AuditLog"/> helper and <see cref="SensitiveDataRedactionEnricher"/>.
 ///
 /// Each test class instance gets a fresh Serilog logger wired to an in-memory
-/// <see cref="TestSink"/>. Because xUnit creates a new class instance per test
-/// method and runs all methods within a class sequentially, the global
-/// <see cref="Log.Logger"/> is set and torn down safely.
+/// <see cref="TestSink"/>. The <c>GlobalSerilog</c> xUnit collection serializes
+/// this class with every other test class that mutates the static
+/// <see cref="Log.Logger"/> (notably <c>WebApplicationFactory</c>-based tests
+/// whose Program.cs bootstrap re-creates the global logger), so concurrent
+/// startup can't swap our sink out mid-assertion.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class AuditLogTests : IDisposable
 {
     private readonly TestSink _sink = new();

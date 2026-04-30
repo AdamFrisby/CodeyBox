@@ -152,7 +152,13 @@ public sealed class PatchWorkItemTests : IDisposable
 /// HTTP-level tests for PATCH /workitems/{id}. Verifies status codes returned by
 /// the real endpoint handler — routing, validation, and state-guard paths.
 /// A fresh server + store is created per test method for isolation.
+///
+/// Joined to <c>GlobalSerilog</c> because <c>WebApplicationFactory</c> startup
+/// runs Program.cs's Serilog bootstrap, which mutates the static
+/// <see cref="Serilog.Log.Logger"/>; this serializes us with other tests that
+/// observe or write to that global.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class PatchWorkItemHttpTests : IDisposable
 {
     private readonly WorkItemApiFactory _factory = new();
