@@ -53,6 +53,40 @@
     </div>
 }
 
+@* ── Budget usage bars ───────────────────────────────────────────────────── *@
+@if (_budgetUsage.Count > 0)
+{
+    <div style="margin-bottom:1rem;">
+        <strong style="font-size:0.85rem;display:block;margin-bottom:0.4rem;">Project budget</strong>
+        @foreach (var (pid, u) in _budgetUsage)
+        {
+            var hPct = BudgetPct(u.LastHour, u.Limits.PerHour);
+            var dPct = BudgetPct(u.Last24h, u.Limits.PerDay);
+            var cPct = BudgetPct(u.CurrentlyInFlight, u.Limits.Concurrent);
+            <div style="display:flex;align-items:center;gap:1rem;padding:0.2rem 0;font-size:0.82rem;">
+                <span style="min-width:8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="@pid">@pid</span>
+                <span>
+                    <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(hPct)" style="width:@(Math.Min(100, hPct))%"></span></span>
+                    <span style="margin-left:0.3rem;">@u.LastHour/@(u.Limits.PerHour == 0 ? "∞" : u.Limits.PerHour.ToString())/h</span>
+                </span>
+                <span>
+                    <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(dPct)" style="width:@(Math.Min(100, dPct))%"></span></span>
+                    <span style="margin-left:0.3rem;">@u.Last24h/@(u.Limits.PerDay == 0 ? "∞" : u.Limits.PerDay.ToString())/24h</span>
+                </span>
+                <span>
+                    <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(cPct)" style="width:@(Math.Min(100, cPct))%"></span></span>
+                    <span style="margin-left:0.3rem;">@u.CurrentlyInFlight/@(u.Limits.Concurrent == 0 ? "∞" : u.Limits.Concurrent.ToString()) fly</span>
+                </span>
+            </div>
+        }
+    </div>
+}
+
+@if (_resumeError is not null)
+{
+    <p class="error-banner">Resume failed: @_resumeError</p>
+}
+
 @if (_error is not null)
 {
     <p class="error-banner">Error loading queue: @_error</p>
@@ -124,7 +158,9 @@ else
 @code {
     private List<WorkItemDto>? _items;
     private QueueStatusDto? _queueStatus;
+    private Dictionary<string, BudgetUsageDto> _budgetUsage = [];
     private string? _error;
+    private string? _resumeError;
     private CancellationTokenSource? _cts;
 
     private bool _showPauseModal;
@@ -169,6 +205,24 @@ else
 
         try { _queueStatus = await ApiClient.GetQueueStatusAsync(); }
         catch { /* non-critical; banner just won't show */ }
+
+        // Load budget usage for projects with non-terminal items.
+        var projectIds = _items?
+            .Where(i => !i.IsTerminal)
+            .Select(i => i.ProjectId)
+            .Distinct()
+            .ToList() ?? [];
+        var usage = new Dictionary<string, BudgetUsageDto>();
+        foreach (var pid in projectIds)
+        {
+            try
+            {
+                var u = await ApiClient.GetBudgetUsageAsync(pid);
+                if (u is not null) usage[pid] = u;
+            }
+            catch { /* non-critical */ }
+        }
+        _budgetUsage = usage;
     }
 
     private async Task CancelAsync(string id)
@@ -213,8 +267,9 @@ else
 
     private async Task ResumeQueueAsync()
     {
+        _resumeError = null;
         try { _queueStatus = await ApiClient.ResumeQueueAsync(); }
-        catch { /* ignore; next poll will refresh */ }
+        catch (Exception ex) { _resumeError = ex.Message; }
     }
 
     public void Dispose()
@@ -222,4 +277,10 @@ else
         _cts?.Cancel();
         _cts?.Dispose();
     }
+
+    private static int BudgetPct(int used, int limit) =>
+        limit <= 0 ? 0 : Math.Min(100, (int)(100.0 * used / limit));
+
+    private static string BudgetCss(int pct) =>
+        pct >= 100 ? "budget-full" : pct >= 80 ? "budget-warn" : "";
 }

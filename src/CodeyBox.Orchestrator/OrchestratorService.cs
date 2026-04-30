@@ -49,6 +49,11 @@ public sealed class OrchestratorService : BackgroundService
     private int _pendingDeferrals = 0;
     private const int DeferralWarningThreshold = 100;
 
+    // Per-project semaphores: serialise budget check + StartedAt write to prevent
+    // TOCTOU races where multiple concurrent workers all pass the budget check before
+    // any of them has committed StartedAt to the database.
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _budgetLocks = new();
+
     public OrchestratorService(
         ITaskQueue queue,
         IWorkItemStore store,
@@ -88,6 +93,7 @@ public sealed class OrchestratorService : BackgroundService
     public override void Dispose()
     {
         _concurrencyGate.Dispose();
+        foreach (var sem in _budgetLocks.Values) sem.Dispose();
         base.Dispose();
     }
 
@@ -314,33 +320,54 @@ public sealed class OrchestratorService : BackgroundService
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId };
             }
 
-            // Budget gate: enforce per-project rate limits before starting.
+            // Budget gate + StartedAt write held under a per-project lock to prevent
+            // TOCTOU: without the lock, concurrent workers for the same project can all
+            // pass the budget check before any of them has committed StartedAt, allowing
+            // the per-project caps to be exceeded by up to MaxConcurrentWorkers−1 items.
             if (project is not null)
             {
-                var deferReason = await CheckBudgetAsync(item, project.Budget, ct);
-                if (deferReason is not null)
+                var budgetLock = GetBudgetLock(item.ProjectId);
+                await budgetLock.WaitAsync(ct);
+                try
                 {
-                    AuditLog.BudgetDeferred(item.Id, item.ProjectId, deferReason.Reason);
-                    if (_webhooks is not null)
+                    var deferReason = await CheckBudgetAsync(item, project.Budget, ct);
+                    if (deferReason is not null)
                     {
-                        _ = _webhooks.PublishAsync(new WebhookEvent
+                        AuditLog.BudgetDeferred(item.Id, item.ProjectId, deferReason.Reason);
+                        if (_webhooks is not null)
                         {
-                            Event = "budget.deferred",
-                            WorkItem = item,
-                            Project = project,
-                            Details = new { deferReason.Reason, suggestedRetryAt = DateTimeOffset.UtcNow + deferReason.RecheckIn },
-                        }, CancellationToken.None);
+                            _ = _webhooks.PublishAsync(new WebhookEvent
+                            {
+                                Event = "budget.deferred",
+                                WorkItem = item,
+                                Project = project,
+                                Details = new { deferReason.Reason, suggestedRetryAt = DateTimeOffset.UtcNow + deferReason.RecheckIn },
+                            }, CancellationToken.None);
+                        }
+                        ScheduleDeferredRequeue(item.Id, deferReason.RecheckIn, ct);
+                        return;
                     }
-                    ScheduleDeferredRequeue(item.Id, deferReason.RecheckIn, ct);
-                    return;
+                    // Record first pickup time inside the lock so the count is visible
+                    // to the next worker before it runs its own budget check.
+                    if (item.StartedAt is null)
+                    {
+                        item = item with { StartedAt = DateTimeOffset.UtcNow };
+                        await _store.UpdateAsync(item, ct);
+                    }
+                }
+                finally
+                {
+                    budgetLock.Release();
                 }
             }
-
-            // Record first pickup time for budget window calculations.
-            if (item.StartedAt is null)
+            else
             {
-                item = item with { StartedAt = DateTimeOffset.UtcNow };
-                await _store.UpdateAsync(item, ct);
+                // No project → no budget check; still record first pickup time.
+                if (item.StartedAt is null)
+                {
+                    item = item with { StartedAt = DateTimeOffset.UtcNow };
+                    await _store.UpdateAsync(item, ct);
+                }
             }
 
             using var registration = _cancellations.Register(item.Id);
@@ -412,6 +439,9 @@ public sealed class OrchestratorService : BackgroundService
 
         return null;
     }
+
+    private SemaphoreSlim GetBudgetLock(ProjectId projectId) =>
+        _budgetLocks.GetOrAdd(projectId.Value, _ => new SemaphoreSlim(1, 1));
 
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after

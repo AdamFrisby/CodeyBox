@@ -89,7 +89,7 @@ public sealed class QueueStatusHttpTests : IDisposable
     [Fact]
     public async Task GetBudgetUsage_KnownProject_Returns200()
     {
-        // The test factory seeds one project with id "proj".
+        // The test factory seeds one project with id "proj" (no budget caps configured).
         var resp = await _client.GetAsync("/projects/proj/budget/usage");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
@@ -98,6 +98,10 @@ public sealed class QueueStatusHttpTests : IDisposable
         Assert.Equal(0, body.LastHour);
         Assert.Equal(0, body.Last24h);
         Assert.Equal(0, body.CurrentlyInFlight);
+        Assert.NotNull(body.Limits);
+        Assert.Equal(0, body.Limits.PerHour);
+        Assert.Equal(0, body.Limits.PerDay);
+        Assert.Equal(0, body.Limits.Concurrent);
     }
 
     [Fact]
@@ -114,10 +118,13 @@ public sealed class QueueStatusHttpTests : IDisposable
         DateTimeOffset? PausedAt,
         string? PausedReason);
 
+    private sealed record BudgetLimitsResponse(int PerHour, int PerDay, int Concurrent);
+
     private sealed record BudgetUsageResponse(
         int LastHour,
         int Last24h,
-        int CurrentlyInFlight);
+        int CurrentlyInFlight,
+        BudgetLimitsResponse? Limits);
 }
 
 /// <summary>

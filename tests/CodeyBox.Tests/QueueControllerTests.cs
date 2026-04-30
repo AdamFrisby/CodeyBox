@@ -84,15 +84,16 @@ public sealed class QueueControllerTests : IDisposable
     [Fact]
     public async Task MultipleControllers_SameDb_SeeConsistentState()
     {
-        // Two controllers open on the same file — writes from one are reflected in
-        // the other because SQLite WAL allows concurrent readers.
+        // A controller that pauses the queue writes to SQLite. A NEW controller
+        // opened on the same DB path afterwards reads the persisted state, so
+        // cross-instance consistency is guaranteed via the database row.
         using var ctrl1 = Make();
-        using var ctrl2 = Make();
-
         await ctrl1.PauseAsync("from-ctrl1");
-
-        // ctrl2's in-memory cache is stale; a NEW controller on the same path would
-        // see the updated row. This test just validates pause doesn't throw.
         Assert.Equal(QueueState.Paused, ctrl1.State);
+
+        // New controller on the same path loads from SQLite on construction.
+        using var ctrl2 = Make();
+        Assert.Equal(QueueState.Paused, ctrl2.State);
+        Assert.Equal("from-ctrl1", ctrl2.PausedReason);
     }
 }

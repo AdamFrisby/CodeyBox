@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -5,8 +6,8 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies per-project budget cap enforcement at pickup time.
-/// Tests use the store's budget-query methods directly and exercise the
-/// OrchestratorService pickup path via a counting pipeline.
+/// Store-level tests validate the query logic; the OrchestratorService
+/// integration test validates that CheckBudgetAsync gates real pickups.
 /// </summary>
 public sealed class BudgetEnforcementTests : IDisposable
 {
@@ -180,5 +181,57 @@ public sealed class BudgetEnforcementTests : IDisposable
 
         var read = await _store.GetAsync(item.Id);
         Assert.Equal(ts, read!.StartedAt);
+    }
+
+    // ── OrchestratorService integration ──────────────────────────────────────
+
+    /// <summary>
+    /// End-to-end: with MaxItemsPerHour=2 and 5 queued items in the same
+    /// project, the orchestrator picks up exactly 2 and defers the rest.
+    /// Validates the CheckBudgetAsync gate in the OrchestratorService pickup path.
+    /// </summary>
+    [Fact]
+    public async Task OrchestratorPickup_HourlyBudget_EnforcedAtPickupTime()
+    {
+        var pid = new ProjectId("budget-hourly");
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = pid,
+            DisplayName = "Budget Project",
+            RepositoryUrl = "https://github.com/test/repo",
+            Budget = new ProjectBudget { MaxItemsPerHour = 2 },
+        });
+
+        var pickupCount = 0;
+        var pipeline = new CountingPipelineRunner(
+            _store, onRun: () => Interlocked.Increment(ref pickupCount));
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 5 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo);
+
+        for (var i = 0; i < 5; i++)
+        {
+            var item = MakeQueued("budget-hourly");
+            await _store.CreateAsync(item);
+            await queue.EnqueueAsync(item.Id);
+        }
+
+        await svc.StartAsync(CancellationToken.None);
+
+        // Wait for exactly 2 pickups.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline && Volatile.Read(ref pickupCount) < 2)
+            await Task.Delay(50);
+
+        // Short settling window to confirm no further pickups occur within the hour.
+        await Task.Delay(300);
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Equal(2, Volatile.Read(ref pickupCount));
     }
 }
