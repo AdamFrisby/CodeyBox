@@ -338,11 +338,83 @@ repo; the upstream push is additive. If your branch protection rules
 prevent the PAT from merging, leave `AutoMerge=false` and approve the PR
 manually.
 
+## Budget caps
+
+Per-project rate limits applied at pickup time. All caps default to 0
+(unlimited). Setting any cap > 0 throttles that project without affecting
+others.
+
+```json
+{
+  "CodeyBox": {
+    "Projects": [
+      {
+        "Id": "fast-mover",
+        "RepositoryUrl": "https://github.com/example/fast-mover",
+        "Budget": {
+          "MaxItemsPerHour": 10,
+          "MaxItemsPerDay": 50,
+          "MaxConcurrentForProject": 2
+        }
+      }
+    ]
+  }
+}
+```
+
+### Fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `MaxItemsPerHour` | `int` | `0` (unlimited) | Max work items that can **start** per rolling 60-minute window |
+| `MaxItemsPerDay` | `int` | `0` (unlimited) | Max work items that can **start** per rolling 24-hour window |
+| `MaxConcurrentForProject` | `int` | `0` (unlimited) | Max work items in a non-terminal, non-Queued state simultaneously for this project |
+
+"Start" means the moment the orchestrator commits to running an item (after
+dependency and quota routing gates pass, `started_at` is written). Items
+deferred by a budget cap stay Queued and are re-checked automatically on the
+next pickup cycle — no manual intervention needed.
+
+### Deferral semantics
+
+When an item is deferred:
+
+1. Audit event `budget.deferred` is logged with the reason and project ID.
+2. Webhook event `budget.deferred` fires: `{ workItemId, projectId, reason, suggestedRetryAt }`.
+3. The item is re-enqueued after a short back-off (`MaxItemsPerHour` → 5 min;
+   `MaxItemsPerDay` → 60 min; `MaxConcurrentForProject` → 1 min).
+4. Other projects' items may be picked up in the meantime.
+
+### Budget usage endpoint
+
+```
+GET /projects/{id}/budget/usage
+```
+
+Returns current consumption against the configured limits:
+
+```json
+{
+  "lastHour": 5,
+  "last24h": 23,
+  "currentlyInFlight": 1,
+  "limits": {
+    "perHour": 10,
+    "perDay": 50,
+    "concurrent": 2
+  }
+}
+```
+
+The admin dashboard shows this as colour-coded usage bars per project
+(yellow ≥ 80%, red = 100%).
+
 ## REST API
 
 ```
 GET  /projects             — list all configured projects
 GET  /projects/{id}        — single project
+GET  /projects/{id}/budget/usage  — current budget consumption vs. limits
 POST /workitems            — body now requires "projectId" instead of "repositoryUrl"
 ```
 

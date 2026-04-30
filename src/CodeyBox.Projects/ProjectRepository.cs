@@ -59,6 +59,7 @@ public sealed class ProjectRepository : IProjectRepository
             Upstream = ResolveUpstream(pc.Upstream),
             Audit = ResolveAudit(pc.Audit, defaults.Audit),
             NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),
+            Budget = ResolveBudget(pc.Budget),
         };
     }
 
@@ -135,6 +136,13 @@ public sealed class ProjectRepository : IProjectRepository
             Custom = mergedCustom,
         };
     }
+
+    private static ProjectBudget ResolveBudget(ProjectBudgetConfig? c) => c is null ? new() : new()
+    {
+        MaxItemsPerHour = c.MaxItemsPerHour ?? 0,
+        MaxItemsPerDay = c.MaxItemsPerDay ?? 0,
+        MaxConcurrentForProject = c.MaxConcurrentForProject ?? 0,
+    };
 
     private static AuditSeverity ParseSeverity(string? s) => s?.ToLowerInvariant() switch
     {

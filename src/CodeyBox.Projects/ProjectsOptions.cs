@@ -32,6 +32,21 @@ public sealed class ProjectConfig
     public ProjectUpstreamConfig? Upstream { get; set; }
     public ProjectAuditConfig? Audit { get; set; }
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
+    public ProjectBudgetConfig? Budget { get; set; }
+}
+
+/// <summary>
+/// Config-binding shape for per-project budget caps.
+/// All fields default to null (0 = unlimited when mapped to ProjectBudget).
+/// </summary>
+public sealed class ProjectBudgetConfig
+{
+    /// <summary>Max work items that can START per rolling hour. Null or 0 = unlimited.</summary>
+    public int? MaxItemsPerHour { get; set; }
+    /// <summary>Max work items that can START per rolling 24h. Null or 0 = unlimited.</summary>
+    public int? MaxItemsPerDay { get; set; }
+    /// <summary>Max in-flight (non-terminal, non-Queued) items simultaneously. Null or 0 = unlimited.</summary>
+    public int? MaxConcurrentForProject { get; set; }
 }
 
 public sealed class ProjectNetworkProfilesConfig

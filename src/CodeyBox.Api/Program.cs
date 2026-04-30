@@ -488,6 +488,11 @@ builder.Services.AddSingleton<IWorkItemStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IQueueController>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteQueueController(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteQueueController>>());
+});
 builder.Services.AddSingleton<InMemoryTaskQueue>();
 builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTaskQueue>());
 
@@ -523,7 +528,9 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<OrchestratorOptions>(),
     sp.GetRequiredService<ILogger<OrchestratorService>>(),
     sp.GetRequiredService<AgentClassRouter>(),
-    sp.GetRequiredService<IProjectRepository>()));
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IQueueController>(),
+    sp.GetRequiredService<IWebhookDispatcher>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),

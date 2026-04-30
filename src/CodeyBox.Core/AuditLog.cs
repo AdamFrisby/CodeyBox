@@ -197,6 +197,27 @@ public static class AuditLog
             .Warning("Agent {Agent} credential smoke test failed in {DurationMs}ms: {Reason}",
                 agent.Value, (long)duration.TotalMilliseconds, reason);
 
+    // ── Queue control ────────────────────────────────────────────────────────
+
+    public static void QueuePaused(string reason) =>
+        Audit("queue.paused")
+            .Information("Queue paused: {Reason}", reason);
+
+    public static void QueueResumed() =>
+        Audit("queue.resumed")
+            .Information("Queue resumed");
+
+    public static void QueueStartedWhilePaused() =>
+        Audit("queue.started_while_paused")
+            .Warning("Orchestrator started with queue in Paused state; no new work items will be picked up until the queue is resumed");
+
+    // ── Budget caps ──────────────────────────────────────────────────────────
+
+    public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>
+        Audit("budget.deferred")
+            .Information("Work item {WorkItemId} for project {ProjectId} deferred by budget cap: {Reason}",
+                id.ToString(), projectId.Value, reason);
+
     // ── Quota router ─────────────────────────────────────────────────────────
 
     public static void QuotaProbed(AgentKind agent, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null) =>

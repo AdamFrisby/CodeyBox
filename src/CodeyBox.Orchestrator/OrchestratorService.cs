@@ -23,6 +23,8 @@ public sealed class OrchestratorService : BackgroundService
     private readonly ILogger<OrchestratorService> _log;
     private readonly AgentClassRouter? _router;
     private readonly IProjectRepository? _projects;
+    private readonly IQueueController? _queueController;
+    private readonly IWebhookDispatcher? _webhooks;
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -55,7 +57,9 @@ public sealed class OrchestratorService : BackgroundService
         OrchestratorOptions opts,
         ILogger<OrchestratorService> log,
         AgentClassRouter? router = null,
-        IProjectRepository? projects = null)
+        IProjectRepository? projects = null,
+        IQueueController? queueController = null,
+        IWebhookDispatcher? webhooks = null)
     {
         _queue = queue;
         _store = store;
@@ -65,6 +69,8 @@ public sealed class OrchestratorService : BackgroundService
         _log = log;
         _router = router;
         _projects = projects;
+        _queueController = queueController;
+        _webhooks = webhooks;
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
     }
 
@@ -95,10 +101,22 @@ public sealed class OrchestratorService : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Pause gate: spin-wait while the queue is paused, without consuming
+            // from the channel. In-flight workers continue normally during pause.
+            if (!await WaitIfPausedAsync(stoppingToken)) break;
+
             WorkItemId? id;
             try { id = await _queue.DequeueAsync(stoppingToken); }
             catch (OperationCanceledException) { break; }
             if (id is null) break;
+
+            // Post-dequeue pause check: handles the race where the queue was paused
+            // while we were blocked in DequeueAsync. Put the item back and re-check.
+            if (_queueController is not null && _queueController.State == QueueState.Paused)
+            {
+                await _queue.EnqueueAsync(id.Value, stoppingToken);
+                continue;
+            }
 
             // Block until a concurrency slot is free.
             try { await _concurrencyGate.WaitAsync(stoppingToken); }
@@ -164,6 +182,22 @@ public sealed class OrchestratorService : BackgroundService
 
         // Drain in-flight tasks before the hosted service exits.
         await Task.WhenAll(inFlight).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Waits until the queue is no longer paused, then returns true.
+    /// Returns false if the stopping token fires while waiting.
+    /// </summary>
+    private async Task<bool> WaitIfPausedAsync(CancellationToken stoppingToken)
+    {
+        if (_queueController is null) return true;
+        while (_queueController.State == QueueState.Paused)
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken); }
+            catch (OperationCanceledException) { return false; }
+            if (stoppingToken.IsCancellationRequested) return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -254,20 +288,21 @@ public sealed class OrchestratorService : BackgroundService
                 }
             }
 
+            // Load the project once for quota routing and budget caps.
+            Project? project = null;
+            if (_projects is not null)
+            {
+                try { project = await _projects.GetAsync(item.ProjectId, ct); }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Worker {WorkerId}: could not load project for {Id}; routing/budget skipped", workerIndex, id);
+                }
+            }
+
             // Quota routing: resolve which agent to use, or decide to wait.
             // Skipped entirely (no probe, no wait) when no agent class is configured.
             if (_router is not null)
             {
-                Project? project = null;
-                if (_projects is not null)
-                {
-                    try { project = await _projects.GetAsync(item.ProjectId, ct); }
-                    catch (Exception ex)
-                    {
-                        _log.LogWarning(ex, "Worker {WorkerId}: could not load project for quota routing; routing skipped", workerIndex);
-                    }
-                }
-
                 var decision = await _router.ResolveAsync(item, project, ct);
                 if (decision.ShouldWait)
                 {
@@ -277,6 +312,35 @@ public sealed class OrchestratorService : BackgroundService
                 }
                 if (decision.Chosen is { } chosen)
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId };
+            }
+
+            // Budget gate: enforce per-project rate limits before starting.
+            if (project is not null)
+            {
+                var deferReason = await CheckBudgetAsync(item, project.Budget, ct);
+                if (deferReason is not null)
+                {
+                    AuditLog.BudgetDeferred(item.Id, item.ProjectId, deferReason.Reason);
+                    if (_webhooks is not null)
+                    {
+                        _ = _webhooks.PublishAsync(new WebhookEvent
+                        {
+                            Event = "budget.deferred",
+                            WorkItem = item,
+                            Project = project,
+                            Details = new { deferReason.Reason, suggestedRetryAt = DateTimeOffset.UtcNow + deferReason.RecheckIn },
+                        }, CancellationToken.None);
+                    }
+                    ScheduleDeferredRequeue(item.Id, deferReason.RecheckIn, ct);
+                    return;
+                }
+            }
+
+            // Record first pickup time for budget window calculations.
+            if (item.StartedAt is null)
+            {
+                item = item with { StartedAt = DateTimeOffset.UtcNow };
+                await _store.UpdateAsync(item, ct);
             }
 
             using var registration = _cancellations.Register(item.Id);
@@ -306,6 +370,47 @@ public sealed class OrchestratorService : BackgroundService
         // After the pipeline finishes (any outcome), check whether any
         // Queued items were waiting on this item and are now unblocked.
         await EnqueueSatisfiedDependentsAsync(id, ct);
+    }
+
+    private sealed record BudgetDeferral(string Reason, TimeSpan RecheckIn);
+
+    /// <summary>
+    /// Checks per-project budget caps against the store. Returns a
+    /// <see cref="BudgetDeferral"/> if any cap is exceeded, null otherwise.
+    /// Single SQLite query per cap; each query hits the index on (project_id, started_at).
+    /// </summary>
+    private async Task<BudgetDeferral?> CheckBudgetAsync(WorkItem item, ProjectBudget budget, CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        if (budget.MaxItemsPerHour > 0)
+        {
+            var count = await _store.CountStartedInWindowAsync(item.ProjectId, now.AddHours(-1), ct);
+            if (count >= budget.MaxItemsPerHour)
+                return new BudgetDeferral(
+                    $"hourly limit: {count}/{budget.MaxItemsPerHour} items started in last hour",
+                    TimeSpan.FromMinutes(5));
+        }
+
+        if (budget.MaxItemsPerDay > 0)
+        {
+            var count = await _store.CountStartedInWindowAsync(item.ProjectId, now.AddHours(-24), ct);
+            if (count >= budget.MaxItemsPerDay)
+                return new BudgetDeferral(
+                    $"daily limit: {count}/{budget.MaxItemsPerDay} items started in last 24h",
+                    TimeSpan.FromHours(1));
+        }
+
+        if (budget.MaxConcurrentForProject > 0)
+        {
+            var count = await _store.CountInFlightAsync(item.ProjectId, ct);
+            if (count >= budget.MaxConcurrentForProject)
+                return new BudgetDeferral(
+                    $"concurrent limit: {count}/{budget.MaxConcurrentForProject} items in flight",
+                    TimeSpan.FromMinutes(1));
+        }
+
+        return null;
     }
 
     /// <summary>

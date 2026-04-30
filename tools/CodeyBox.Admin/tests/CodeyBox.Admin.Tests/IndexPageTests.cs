@@ -197,4 +197,16 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default)
         => Task.FromResult(true);
+
+    public Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default)
+        => Task.FromResult<QueueStatusDto?>(null);
+
+    public Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default)
+        => Task.FromResult<QueueStatusDto?>(null);
+
+    public Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default)
+        => Task.FromResult<QueueStatusDto?>(null);
+
+    public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
+        => Task.FromResult<BudgetUsageDto?>(null);
 }

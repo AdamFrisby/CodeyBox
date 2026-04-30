@@ -6,6 +6,53 @@
 
 <h1>Work Queue</h1>
 
+@* ── Queue state banner ──────────────────────────────────────────────────── *@
+@if (_queueStatus is not null)
+{
+    @if (_queueStatus.IsPaused)
+    {
+        <div class="queue-banner queue-banner-paused">
+            <strong>QUEUE PAUSED</strong>
+            — reason: @_queueStatus.PausedReason
+            @if (_queueStatus.PausedAt is { } at)
+            {
+                <span> — paused at @at.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz")</span>
+            }
+            <button class="btn btn-resume" @onclick="ResumeQueueAsync">Resume queue</button>
+        </div>
+    }
+    else
+    {
+        <div class="queue-banner queue-banner-running">
+            <span class="queue-running-dot">●</span> Queue running
+            <button class="btn btn-sm" @onclick="ShowPauseModal">Pause queue</button>
+        </div>
+    }
+}
+
+@* ── Pause modal ─────────────────────────────────────────────────────────── *@
+@if (_showPauseModal)
+{
+    <div class="modal-overlay">
+        <div class="modal-box">
+            <h2>Pause queue</h2>
+            <p>New work-item pickup will stop immediately. In-flight items will finish normally.</p>
+            <label>
+                Reason
+                <input type="text" @bind="_pauseReason" placeholder="e.g. maintenance window" class="modal-input" />
+            </label>
+            @if (_pauseError is not null)
+            {
+                <p class="error-banner">@_pauseError</p>
+            }
+            <div class="modal-actions">
+                <button class="btn btn-danger" @onclick="PauseQueueAsync">Pause</button>
+                <button class="btn" @onclick="HidePauseModal">Cancel</button>
+            </div>
+        </div>
+    </div>
+}
+
 @if (_error is not null)
 {
     <p class="error-banner">Error loading queue: @_error</p>
@@ -76,8 +123,13 @@ else
 
 @code {
     private List<WorkItemDto>? _items;
+    private QueueStatusDto? _queueStatus;
     private string? _error;
     private CancellationTokenSource? _cts;
+
+    private bool _showPauseModal;
+    private string _pauseReason = "";
+    private string? _pauseError;
 
     protected override async Task OnInitializedAsync()
     {
@@ -114,6 +166,9 @@ else
         {
             _error = ex.Message;
         }
+
+        try { _queueStatus = await ApiClient.GetQueueStatusAsync(); }
+        catch { /* non-critical; banner just won't show */ }
     }
 
     private async Task CancelAsync(string id)
@@ -126,6 +181,40 @@ else
     {
         await ApiClient.RetryWorkItemAsync(id);
         await LoadAsync();
+    }
+
+    private void ShowPauseModal()
+    {
+        _pauseReason = "";
+        _pauseError = null;
+        _showPauseModal = true;
+    }
+
+    private void HidePauseModal() => _showPauseModal = false;
+
+    private async Task PauseQueueAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_pauseReason))
+        {
+            _pauseError = "A reason is required.";
+            return;
+        }
+        try
+        {
+            _queueStatus = await ApiClient.PauseQueueAsync(_pauseReason.Trim());
+            _showPauseModal = false;
+            _pauseError = null;
+        }
+        catch (Exception ex)
+        {
+            _pauseError = ex.Message;
+        }
+    }
+
+    private async Task ResumeQueueAsync()
+    {
+        try { _queueStatus = await ApiClient.ResumeQueueAsync(); }
+        catch { /* ignore; next poll will refresh */ }
     }
 
     public void Dispose()

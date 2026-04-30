@@ -60,6 +60,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
         // Additive migration: track automatic re-queues from stuck-agent detection.
         RunMigration("ALTER TABLE work_items ADD COLUMN stuck_retries INTEGER NOT NULL DEFAULT 0;");
+
+        // Additive migration: record when an item was first picked up by a worker.
+        // Used for per-project hourly/daily budget cap queries.
+        RunMigration("ALTER TABLE work_items ADD COLUMN started_at TEXT;");
+
+        // Index for cheap per-project budget window queries.
+        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_started ON work_items(project_id, started_at);");
     }
 
     private void RunMigration(string sql)
@@ -87,9 +94,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
-                    stuck_retries)
+                    stuck_retries, started_at)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
-                    $sretries);
+                    $sretries, $started_at);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -114,7 +121,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
-                    stuck_retries = $sretries
+                    stuck_retries = $sretries, started_at = $started_at
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -140,7 +147,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
-                    stuck_retries = $sretries
+                    stuck_retries = $sretries, started_at = $started_at
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -226,6 +233,36 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    public async Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(*) FROM work_items
+            WHERE project_id = $pid
+              AND started_at IS NOT NULL
+              AND started_at >= $since;
+            """;
+        cmd.Parameters.AddWithValue("$pid", projectId.Value);
+        cmd.Parameters.AddWithValue("$since", since.ToString("O"));
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result is long l ? (int)l : 0;
+    }
+
+    public async Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default)
+    {
+        // Non-terminal, non-Queued states == actively running.
+        // Excluded: Queued=0, Done=6, Failed=100, Cancelled=101, AuditFailed=102
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(*) FROM work_items
+            WHERE project_id = $pid
+              AND state NOT IN (0, 6, 100, 101, 102);
+            """;
+        cmd.Parameters.AddWithValue("$pid", projectId.Value);
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result is long l ? (int)l : 0;
+    }
+
     public void Dispose()
     {
         _conn.Dispose();
@@ -254,6 +291,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$class_id", (object?)item.AgentClassId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$qpos", item.QueuePosition);
         cmd.Parameters.AddWithValue("$sretries", item.StuckRetries);
+        cmd.Parameters.AddWithValue("$started_at", (object?)item.StartedAt?.ToString("O") ?? DBNull.Value);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -277,7 +315,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         AgentClassId = r.IsDBNull(r.GetOrdinal("agent_class_id")) ? null : r.GetString(r.GetOrdinal("agent_class_id")),
         QueuePosition = r.GetInt64(r.GetOrdinal("queue_position")),
         StuckRetries = r.GetInt32(r.GetOrdinal("stuck_retries")),
+        StartedAt = ReadNullableDateTimeOffset(r, "started_at"),
     };
+
+    private static DateTimeOffset? ReadNullableDateTimeOffset(SqliteDataReader r, string column)
+    {
+        var ord = r.GetOrdinal(column);
+        return r.IsDBNull(ord)
+            ? null
+            : DateTimeOffset.Parse(r.GetString(ord), System.Globalization.CultureInfo.InvariantCulture);
+    }
 
     private static IReadOnlyList<WorkItemId> ReadDependsOn(SqliteDataReader r)
     {

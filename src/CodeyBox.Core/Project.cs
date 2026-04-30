@@ -1,6 +1,23 @@
 namespace CodeyBox.Core;
 
 /// <summary>
+/// Per-project rate limits applied at pickup time. All caps default to 0 (unlimited).
+/// Existing projects without a Budget section keep the zero defaults — no behaviour change.
+/// </summary>
+public sealed record ProjectBudget
+{
+    /// <summary>Max work items that can START per rolling hour. 0 = unlimited.</summary>
+    public int MaxItemsPerHour { get; init; }
+    /// <summary>Max work items that can START per rolling 24h. 0 = unlimited.</summary>
+    public int MaxItemsPerDay { get; init; }
+    /// <summary>
+    /// Max work items in non-terminal, non-Queued state simultaneously for this project.
+    /// 0 = unlimited (subject to global MaxConcurrentWorkers).
+    /// </summary>
+    public int MaxConcurrentForProject { get; init; }
+}
+
+/// <summary>
 /// A managed project: an upstream git repo, the auditor configuration
 /// applied to its work items, and per-project defaults. Resolved at work-
 /// item-pickup time from <see cref="IProjectRepository"/>.
@@ -68,6 +85,13 @@ public sealed record Project
     /// the probe would always fail transiently. Default false.
     /// </summary>
     public bool SkipCredentialSmokeTest { get; init; }
+
+    /// <summary>
+    /// Optional rate limits applied at pickup time. All caps default to 0
+    /// (unlimited). Set any cap &gt; 0 to throttle this project without
+    /// affecting others.
+    /// </summary>
+    public ProjectBudget Budget { get; init; } = new();
 
     /// <summary>
     /// Per-phase host-enforced network profile selection. Each profile name

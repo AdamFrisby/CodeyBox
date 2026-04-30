@@ -77,4 +77,32 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         var resp = await _http.PostAsJsonAsync("/workitems/reorder", new ReorderRequest { Ids = ids }, JsonOptions, ct);
         return resp.IsSuccessStatusCode;
     }
+
+    public async Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync("/queue/status", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<QueueStatusDto>(JsonOptions, ct);
+    }
+
+    public async Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync("/queue/pause", new { reason }, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<QueueStatusDto>(JsonOptions, ct);
+    }
+
+    public async Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync("/queue/resume", new { }, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<QueueStatusDto>(JsonOptions, ct);
+    }
+
+    public async Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/projects/{Uri.EscapeDataString(projectId)}/budget/usage", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<BudgetUsageDto>(JsonOptions, ct);
+    }
 }
