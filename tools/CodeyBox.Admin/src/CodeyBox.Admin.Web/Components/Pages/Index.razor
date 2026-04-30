@@ -50,8 +50,12 @@ else
                         @if (item.IsQueued)
                         {
                             <a href="/work-items/@item.Id/edit" class="btn">edit</a>
-                            <button class="btn btn-up" @onclick="() => MoveUpAsync(item.Id)" title="Move up">▲</button>
-                            <button class="btn btn-down" @onclick="() => MoveDownAsync(item.Id)" title="Move down">▼</button>
+                            <form method="post" action="/admin/move/@item.Id/up" style="display:inline">
+                                <button type="submit" class="btn btn-up" title="Move up">▲</button>
+                            </form>
+                            <form method="post" action="/admin/move/@item.Id/down" style="display:inline">
+                                <button type="submit" class="btn btn-down" title="Move down">▼</button>
+                            </form>
                         }
                         @if (!item.IsTerminal)
                         {
@@ -108,26 +112,6 @@ else
         {
             _error = ex.Message;
         }
-    }
-
-    private async Task MoveUpAsync(string id)
-    {
-        var queued = _items!.Where(i => i.IsQueued).ToList();
-        var idx = queued.FindIndex(i => i.Id == id);
-        if (idx <= 0) return;
-        (queued[idx - 1], queued[idx]) = (queued[idx], queued[idx - 1]);
-        await ApiClient.ReorderWorkItemsAsync(queued.Select(i => i.Id).ToList());
-        await LoadAsync();
-    }
-
-    private async Task MoveDownAsync(string id)
-    {
-        var queued = _items!.Where(i => i.IsQueued).ToList();
-        var idx = queued.FindIndex(i => i.Id == id);
-        if (idx < 0 || idx >= queued.Count - 1) return;
-        (queued[idx], queued[idx + 1]) = (queued[idx + 1], queued[idx]);
-        await ApiClient.ReorderWorkItemsAsync(queued.Select(i => i.Id).ToList());
-        await LoadAsync();
     }
 
     private async Task CancelAsync(string id)

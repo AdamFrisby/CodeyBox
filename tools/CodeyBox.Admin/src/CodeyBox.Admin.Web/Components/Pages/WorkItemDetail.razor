@@ -39,8 +39,7 @@ else if (_item is not null)
         <tr><th>State</th><td class="state-@_item.State.ToLowerInvariant()">@_item.State</td></tr>
         <tr><th>Base branch</th><td>@(_item.BaseBranch ?? "(project default)")</td></tr>
         <tr><th>Work branch</th><td>@(_item.WorkBranch ?? "(auto-generated)")</td></tr>
-        <tr><th>Push upstream</th><td>@(_item.IsQueued ? "yes (queued)" : "n/a")</td></tr>
-        <tr><th>Created</th><td>@_item.CreatedAt.ToString("O")</td></tr>
+<tr><th>Created</th><td>@_item.CreatedAt.ToString("O")</td></tr>
         <tr><th>Updated</th><td>@_item.UpdatedAt.ToString("O")</td></tr>
         <tr><th>Age</th><td>@_item.Age</td></tr>
         @if (_item.UpstreamPushAttempts > 0)
