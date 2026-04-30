@@ -12,3 +12,7 @@ obj/
 
 # Per-developer dev/test helpers (see local/README.md after creation).
 /local/
+
+# Serilog rolling-file output (see CodeyBox:AuditLog options).
+/logs/
+**/logs/*.json
