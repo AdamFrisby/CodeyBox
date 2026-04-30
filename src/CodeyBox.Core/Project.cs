@@ -62,6 +62,14 @@ public sealed record Project
     public string? GitAuthorEmail { get; init; }
 
     /// <summary>
+    /// When true, the credential smoke test is skipped for work items in this
+    /// project. Use for agents whose surface is harder to probe directly
+    /// (e.g. Copilot), or for projects that run on air-gapped networks where
+    /// the probe would always fail transiently. Default false.
+    /// </summary>
+    public bool SkipCredentialSmokeTest { get; init; }
+
+    /// <summary>
     /// Per-phase host-enforced network profile selection. Each profile name
     /// references an entry in the sandbox provider's
     /// <c>NetworkProfiles</c> map (which maps logical names to host bridge

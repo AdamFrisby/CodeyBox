@@ -118,3 +118,62 @@ set `GOOGLE_APPLICATION_CREDENTIALS` to the path of your service-account JSON.
 This requires a custom `ICredentialProvider` that materialises the JSON into
 the sandbox via `AgentCredential.Files` — the `Files` map on `AgentCredential`
 is designed for exactly this use case.
+
+## Credential smoke test
+
+Before spending sandbox resources on a work item, CodeyBox performs a
+lightweight credential check (a "smoke test") to verify that the agent's API
+key is valid and can authenticate. This catches stale or misconfigured
+credentials before they waste expensive compute.
+
+### When it runs
+
+1. **At orchestrator startup** — all configured agents are probed in parallel.
+   Failure is non-fatal: the orchestrator starts regardless. Failures emit an
+   `agent.smoke_failed` webhook event and a structured audit log entry, so
+   monitoring catches stale credentials early.
+
+2. **At work-item pickup** — just before the sandbox is allocated.
+   If the credential fails, the work item transitions to `Failed` immediately
+   and the pipeline returns without ever starting the agent.
+
+### Per-agent probe shape
+
+| Agent | Endpoint probed | Auth header |
+|-------|----------------|-------------|
+| `claude` | `https://api.anthropic.com/v1/messages` | `Authorization: Bearer <oauth>` or `x-api-key: <api-key>` |
+| `codex` | `https://api.openai.com/v1/chat/completions` | `Authorization: Bearer <api-key>` |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent` | `x-goog-api-key: <api-key>` |
+| `copilot` | *(no probe)* — always passes | — |
+
+Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
+means the credential is valid. 401/403 is classified as `"auth"` failure.
+5xx and network errors are classified as `"transient: try later"` (cached
+like any result, so a transient server error at startup won't permanently gate
+work items).
+
+### Cache semantics
+
+Probe results are cached per `(AgentKind, credential fingerprint)` for
+`CodeyBox:Smoke:CacheTtlMinutes` (default 15 minutes). The fingerprint is a
+SHA-256 hash of all credential values; the raw token is never stored.
+
+Changing the credential (e.g. rotating a key) produces a new fingerprint and
+forces a fresh probe on the next pickup.
+
+### Disabling smoke tests
+
+**Globally** — set `CodeyBox:Smoke:Enabled=false`. No probes run at startup
+or pickup.
+
+**Per-project** — set `SkipCredentialSmokeTest: true` in the project
+configuration. Useful for agents (like Copilot) that have no testable
+credential, or for internal test projects that always use fake credentials.
+
+### Configuration reference
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `CodeyBox:Smoke:Enabled` | `true` | Enable or disable all smoke testing. |
+| `CodeyBox:Smoke:CacheTtlMinutes` | `15` | How long to cache a probe result before re-probing. |
+| `CodeyBox:Smoke:StartupTimeoutSeconds` | `10` | Per-agent timeout for the startup probe. |

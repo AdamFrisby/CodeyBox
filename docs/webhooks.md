@@ -25,6 +25,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.failed` | Work item failed (unrecoverable error) |
 | `work_item.cancelled` | Work item was cancelled via the API |
 | `work_item.agent_stuck` | Stuck-agent probe detected a hang and killed the agent (see [Details](#agent_stuck-details)) |
+| `agent.smoke_failed` | Credential smoke test failed at startup or work-item pickup (see [Details](#agent_smoke_failed-details)) |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -120,6 +121,32 @@ When `event` is `work_item.agent_stuck`, the `details` field is populated:
 (`work_item.failed` or the state preceding auto-retry). Operators should
 subscribe to this event to alert on hung agents even when `AutoRetryOnStuck`
 automatically re-queues the item.
+
+### `agent_smoke_failed` details
+
+When `event` is `agent.smoke_failed`, both `workItem` and `project` are `null`
+(startup probes have no work-item context). The `details` field is populated:
+
+```json
+{
+  "details": {
+    "agentKind": "claude",
+    "reason": "auth",
+    "occurredAt": "2026-04-29T12:00:00.000+00:00"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `agentKind` | string | Agent whose credential failed (e.g. `"claude"`, `"codex"`) |
+| `reason` | string\|null | `"auth"` for 401/403, `"transient: try later"` for 5xx/network errors, `"timeout"` if the probe timed out, `"no token"` if no credential is configured |
+| `occurredAt` | ISO-8601 | When the failure was recorded |
+
+`agent.smoke_failed` can fire at **startup** (no `workItem`, no `project`) or
+at **work-item pickup** (a subsequent `work_item.failed` event also fires and
+carries the work-item context). Subscribe to `agent.smoke_failed` to alert on
+credential problems independently of whether any work items were affected.
 
 ---
 

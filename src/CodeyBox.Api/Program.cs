@@ -332,6 +332,14 @@ builder.Services.AddHttpClient("agent-quota", client =>
     client.Timeout = TimeSpan.FromSeconds(10);
 });
 
+// Named client for credential smoke probes. Authorization is added per-request
+// from the credential bundle; the header is never logged. Timeout is generous
+// (15 s) since the probe runs at most once per credential fingerprint per TTL.
+builder.Services.AddHttpClient("agent-smoke", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
+
 // --- Quota probes ------------------------------------------------------------
 // Registered as IEnumerable<IAgentQuotaProbe>; the router resolves by Kind.
 // Tokens are read from host env vars here (not in the probes) to keep the
@@ -377,6 +385,46 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetRequiredService<QuotaRouterOptions>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentClassRouter>());
 });
+
+// --- Credential smoke probes -------------------------------------------------
+// Registered as IEnumerable<IAgentSmokeProbe>; the gate resolves by Kind.
+// Copilot has no smoke probe: its auth surface is not directly probeable.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new ClaudeSmokeProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<ClaudeSmokeProbe>()));
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new CodexSmokeProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CodexSmokeProbe>()));
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new GeminiSmokeProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<GeminiSmokeProbe>()));
+
+builder.Services.AddSingleton<SmokeOptions>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var s = cbOpts.Smoke;
+    return new SmokeOptions
+    {
+        Enabled = s.Enabled,
+        CacheTtlMinutes = s.CacheTtlMinutes,
+        StartupTimeoutSeconds = s.StartupTimeoutSeconds,
+    };
+});
+builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
+{
+    var opts = sp.GetRequiredService<SmokeOptions>();
+    return new AgentSmokeCache(TimeSpan.FromMinutes(opts.CacheTtlMinutes));
+});
+builder.Services.AddSingleton<CredentialSmokeGate>(sp =>
+    new CredentialSmokeGate(
+        sp.GetRequiredService<ICredentialProvider>(),
+        sp.GetServices<IAgentSmokeProbe>(),
+        sp.GetRequiredService<IAgentSmokeCache>(),
+        sp.GetRequiredService<SmokeOptions>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CredentialSmokeGate>()));
 
 // --- Projects + per-project upstream + audit composer ------------------------
 builder.Services.AddSingleton<IProjectRepository, ProjectRepository>();
@@ -477,6 +525,12 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<AgentClassRouter>(),
     sp.GetRequiredService<IProjectRepository>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
+builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
+    sp.GetRequiredService<ICredentialProvider>(),
+    sp.GetServices<IAgentSmokeProbe>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<SmokeOptions>(),
+    sp.GetRequiredService<ILogger<StartupSmokeProbeService>>()));
 
 var app = builder.Build();
 
@@ -608,6 +662,24 @@ namespace CodeyBox.Api
 
         /// <summary>Quota router tuning knobs.</summary>
         public QuotaRouterConfig QuotaRouter { get; set; } = new();
+
+        /// <summary>Credential smoke test tuning knobs.</summary>
+        public SmokeConfig Smoke { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Credential smoke test options. Bound from <c>CodeyBox:Smoke</c>.
+    /// </summary>
+    public sealed class SmokeConfig
+    {
+        /// <summary>Enable or disable the smoke gate. Default true.</summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>Result cache TTL in minutes. Default 15.</summary>
+        public int CacheTtlMinutes { get; set; } = 15;
+
+        /// <summary>Per-agent timeout for the startup probe in seconds. Default 10.</summary>
+        public int StartupTimeoutSeconds { get; set; } = 10;
     }
 
     /// <summary>Config binding for a single agent class (see CodeyBox:AgentClasses).</summary>

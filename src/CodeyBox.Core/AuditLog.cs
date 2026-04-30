@@ -185,6 +185,18 @@ public static class AuditLog
             .Warning("Webhook delivery failed: endpoint={Endpoint} event={WebhookEvent} after {Attempts} attempts: {LastFailure}",
                 endpoint, eventName, attempts, lastFailure);
 
+    // ── Credential smoke tests ───────────────────────────────────────────────
+
+    public static void AgentSmokeSucceeded(AgentKind agent, TimeSpan duration) =>
+        Audit("agent.smoke_succeeded")
+            .Information("Agent {Agent} credential smoke test passed in {DurationMs}ms",
+                agent.Value, (long)duration.TotalMilliseconds);
+
+    public static void AgentSmokeFailed(AgentKind agent, string? reason, TimeSpan duration) =>
+        Audit("agent.smoke_failed")
+            .Warning("Agent {Agent} credential smoke test failed in {DurationMs}ms: {Reason}",
+                agent.Value, (long)duration.TotalMilliseconds, reason);
+
     // ── Quota router ─────────────────────────────────────────────────────────
 
     public static void QuotaProbed(AgentKind agent, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null) =>
