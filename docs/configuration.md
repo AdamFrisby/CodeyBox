@@ -13,7 +13,7 @@ All CodeyBox configuration lives under the `CodeyBox` key in any standard
 | `GitRootDirectory` | string | `/var/lib/codeybox/repos` | Root for bare host git repos. |
 | `StateDatabasePath` | string | `/var/lib/codeybox/state.db` | SQLite database path. |
 | `SandboxImageReference` | string | `codeybox/agent:latest` | OCI image reference for agent sandboxes. |
-| `AgentAllowedHosts` | string[] | `["api.anthropic.com","api.openai.com","api.githubcopilot.com"]` | Egress allowlist inside agent sandboxes. |
+| `AgentAllowedHosts` | string[] | `["api.anthropic.com","api.openai.com","api.githubcopilot.com","generativelanguage.googleapis.com"]` | Egress allowlist inside agent sandboxes. |
 | `SandboxProvider` | string | — | One of `multipass`, `bubblewrap`, `process`. Required in non-Development environments. |
 | `DangerouslyAllowProcessSandbox` | bool | `false` | Allow process sandbox outside Development. Do not use in production. |
 | `UpstreamPushMaxAttempts` | int | `5` | Retry count for upstream push (GitHub PR creation). |

@@ -1,5 +1,6 @@
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
@@ -147,17 +148,117 @@ public sealed class GeminiAgentRunnerTests
 
         Assert.False(result.Success);
     }
+
+    // ── ANSI stripping ────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task RunAsync_StripsAnsiFromStdout()
+    {
+        var sandbox = new CapturingSandbox(stdout: "\x1b[32msome output\x1b[0m");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.Equal("some output", result.Stdout);
+    }
+
+    [Fact]
+    public async Task RunAsync_StripsAnsiFromStderr()
+    {
+        var sandbox = new CapturingSandbox(stderr: "\x1b[1mProgress:\x1b[0m done");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.Equal("Progress: done", result.Stderr);
+    }
+
+    [Fact]
+    public async Task RunAsync_PlainOutput_PassesThroughUnchanged()
+    {
+        var sandbox = new CapturingSandbox(stdout: "plain text");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.Equal("plain text", result.Stdout);
+    }
+
+    // ── Credential provider ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task EnvironmentCredentialProvider_Gemini_ReturnsCredentialWhenEnvVarSet()
+    {
+        Environment.SetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY", "test-gemini-key");
+        try
+        {
+            var provider = new EnvironmentCredentialProvider(new[]
+            {
+                new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
+            });
+
+            var cred = await provider.GetAsync(AgentKind.Gemini);
+
+            Assert.NotNull(cred);
+            Assert.Equal("test-gemini-key", cred!.EnvironmentVariables["GEMINI_API_KEY"]);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task EnvironmentCredentialProvider_Gemini_ReturnsNullWhenEnvVarAbsent()
+    {
+        Environment.SetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY", null);
+        var provider = new EnvironmentCredentialProvider(new[]
+        {
+            new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
+        });
+
+        var cred = await provider.GetAsync(AgentKind.Gemini);
+
+        Assert.Null(cred);
+    }
+
+    [Fact]
+    public async Task EnvironmentCredentialProvider_Gemini_ReturnsNullForOtherAgents()
+    {
+        Environment.SetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY", "test-gemini-key");
+        try
+        {
+            var provider = new EnvironmentCredentialProvider(new[]
+            {
+                new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
+            });
+
+            Assert.Null(await provider.GetAsync(AgentKind.Claude));
+            Assert.Null(await provider.GetAsync(AgentKind.Codex));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY", null);
+        }
+    }
 }
 
 /// <summary>
 /// Fake sandbox that records the most recent <see cref="SandboxExec"/> it
-/// received and returns a configurable exit code.
+/// received and returns configurable exit code, stdout, and stderr.
 /// </summary>
 internal sealed class CapturingSandbox : ISandbox
 {
     private readonly int _exitCode;
+    private readonly string _stdout;
+    private readonly string _stderr;
 
-    public CapturingSandbox(int exitCode = 0) { _exitCode = exitCode; }
+    public CapturingSandbox(int exitCode = 0, string stdout = "stdout", string stderr = "stderr")
+    {
+        _exitCode = exitCode;
+        _stdout = stdout;
+        _stderr = stderr;
+    }
 
     public string Id => "fake";
     public SandboxExec? CapturedExec { get; private set; }
@@ -165,7 +266,7 @@ internal sealed class CapturingSandbox : ISandbox
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
         CapturedExec = exec;
-        return Task.FromResult(new SandboxExecResult(_exitCode, "stdout", "stderr"));
+        return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;

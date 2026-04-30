@@ -1,5 +1,7 @@
+using System.Text.RegularExpressions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Agents.Gemini;
 
@@ -10,6 +12,13 @@ namespace CodeyBox.Agents.Gemini;
 /// </summary>
 public sealed class GeminiAgentRunner : CliAgentRunnerBase
 {
+    // @google/gemini-cli emits ANSI colour codes and progress spinners to
+    // stderr (and occasionally stdout) even in non-TTY mode. Strip them so
+    // the audit log stays clean and SIEM tools are not confused.
+    private static readonly Regex AnsiEscape = new(
+        @"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     public override AgentKind Kind => AgentKind.Gemini;
 
     /// <summary>
@@ -33,4 +42,23 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
         argv.Add(prompt);
         return new AgentInvocation(argv);
     }
+
+    public override async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        CancellationToken ct = default)
+    {
+        var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, ct);
+        return result with
+        {
+            Stdout = Strip(result.Stdout),
+            Stderr = Strip(result.Stderr),
+        };
+    }
+
+    private static string? Strip(string? s) =>
+        s is null ? null : AnsiEscape.Replace(s, string.Empty);
 }

@@ -39,7 +39,7 @@ git checkout -B codeybox/<id>          # work branch off baseBranch
 git config user.email codeybox@local
 git config user.name CodeyBox
 
-# (the agent runs here — claude / copilot / codex)
+# (the agent runs here — claude / copilot / codex / gemini)
 # It edits files in /work and may or may not commit.
 
 git add -A

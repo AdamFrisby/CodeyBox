@@ -359,6 +359,8 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CodexQuotaProbe>()));
+// No GeminiQuotaProbe: Gemini uses PayPerApi billing (no subscription quota endpoint).
+// The router treats a missing probe as unlimited — intentional. See docs/agents.md.
 
 // --- Agent class router ------------------------------------------------------
 builder.Services.AddSingleton<AgentClassRouter>(sp =>

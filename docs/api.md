@@ -49,7 +49,7 @@ Queue a new work item.
   [`projects.md`](projects.md)). Unknown ids are rejected.
 * `title` — short label, ≤ 200 chars, no leading dash, no control chars.
 * `prompt` — what to give to the agent. ≤ 64 KB.
-* `agent` — optional override. `"claude"`, `"copilot"`, `"codex"`, or any
+* `agent` — optional override. `"claude"`, `"copilot"`, `"codex"`, `"gemini"`, or any
   kind registered with the `IAgentRegistry`. Defaults to the project's
   configured agent. Unknown agents are rejected with the list of
   available kinds.

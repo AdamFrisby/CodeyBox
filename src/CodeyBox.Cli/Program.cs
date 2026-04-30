@@ -66,7 +66,7 @@ var agent = AnsiConsole.Prompt(
     new SelectionPrompt<string>()
         .Title("[bold yellow]Agent[/]:")
         .HighlightStyle(new Style(Color.Cyan1, decoration: Decoration.Bold))
-        .AddChoices("claude", "copilot", "codex"));
+        .AddChoices("claude", "copilot", "codex", "gemini"));
 
 // ── Upstream kind ─────────────────────────────────────────────────────────────
 var upstreamKind = AnsiConsole.Prompt(
