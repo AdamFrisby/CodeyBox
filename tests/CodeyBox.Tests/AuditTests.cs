@@ -33,6 +33,8 @@ public sealed class AuditTests
         Assert.Contains("hardcoded secret", prompt);
         Assert.Contains("(src/x.cs:42)", prompt);
         Assert.Contains("original task", prompt);
+        // The Co-Authored-By trailer instruction must be present.
+        Assert.Contains("Co-Authored-By: CodeyBox <noreply@codeybox.invalid>", prompt);
         // Errors come before warnings within a group.
         var lintIdx = prompt.IndexOf("### Lint", StringComparison.Ordinal);
         var missingReturnIdx = prompt.IndexOf("missing return", lintIdx, StringComparison.Ordinal);

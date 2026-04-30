@@ -40,7 +40,6 @@ public static class HostGitIdentityReader
             {
                 FileName = "git",
                 RedirectStandardOutput = true,
-                RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
@@ -53,7 +52,11 @@ public static class HostGitIdentityReader
             using var p = Process.Start(psi);
             if (p is null) return null;
             var output = p.StandardOutput.ReadToEnd();
-            p.WaitForExit();
+            if (!p.WaitForExit(5_000))
+            {
+                try { p.Kill(); } catch { }
+                return null;
+            }
             return p.ExitCode == 0 ? output.Trim() : null;
         }
         catch

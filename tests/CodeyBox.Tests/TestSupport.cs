@@ -65,7 +65,9 @@ internal static class TestSupport
         string seedRepoUrl,
         IEnumerable<IAuditor>? auditors = null,
         int maxAuditIterations = 3,
-        IEnumerable<MergeStrategy>? mergeStrategy = null)
+        IEnumerable<MergeStrategy>? mergeStrategy = null,
+        HostGitIdentity? hostGitIdentity = null,
+        (string Name, string Email)? projectGitAuthor = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -90,6 +92,8 @@ internal static class TestSupport
             RepositoryUrl = seedRepoUrl,
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Claude,
+            GitAuthorName = projectGitAuthor?.Name,
+            GitAuthorEmail = projectGitAuthor?.Email,
             Audit = new ProjectAudit
             {
                 MaxIterations = maxAuditIterations,
@@ -106,7 +110,7 @@ internal static class TestSupport
             projects, upstreamFactory, composer,
             store,
             new NullWebhookDispatcher(),
-            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [], HostGitIdentity = hostGitIdentity },
             NullLogger<PipelineRunner>.Instance);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);

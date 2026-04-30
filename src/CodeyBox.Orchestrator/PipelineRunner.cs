@@ -126,7 +126,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     workCts.CancelAfter(item.WorkTimeout);
                     await RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                        item.Prompt, isInitial: true,
+                        BuildInitialWorkPrompt(item.Prompt), isInitial: true,
                         networkProfile: project.NetworkProfiles.Work,
                         project: project,
                         workCts.Token);
@@ -221,7 +221,10 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    internal const string CoAuthoredByTrailer = "\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>";
+    internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
+
+    internal static string BuildInitialWorkPrompt(string userPrompt) =>
+        $"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\n{userPrompt}";
 
     /// <summary>
     /// Resolves the git author identity to use for sandbox commits.
