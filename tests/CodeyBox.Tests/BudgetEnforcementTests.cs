@@ -105,7 +105,7 @@ public sealed class BudgetEnforcementTests : IDisposable
     [Fact]
     public async Task CountInFlight_WorkingItems_Counted()
     {
-        var item = MakeQueued() with { State = WorkItemState.Working };
+        var item = MakeQueued() with { State = WorkItemState.Working, StartedAt = DateTimeOffset.UtcNow };
         await _store.CreateAsync(item);
 
         var count = await _store.CountInFlightAsync(new ProjectId("proj-a"));
@@ -146,7 +146,7 @@ public sealed class BudgetEnforcementTests : IDisposable
             WorkItemState.Merging, WorkItemState.Merged, WorkItemState.UpstreamPushing,
         })
         {
-            await _store.CreateAsync(MakeQueued("proj-multi") with { State = state });
+            await _store.CreateAsync(MakeQueued("proj-multi") with { State = state, StartedAt = DateTimeOffset.UtcNow });
         }
 
         var count = await _store.CountInFlightAsync(pid);

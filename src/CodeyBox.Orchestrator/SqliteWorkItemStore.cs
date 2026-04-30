@@ -250,13 +250,19 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
     public async Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default)
     {
-        // Non-terminal, non-Queued states == actively running.
-        // Excluded: Queued=0, Done=6, Failed=100, Cancelled=101, AuditFailed=102
+        // Use started_at IS NOT NULL as the concurrent proxy instead of state.
+        // State transitions from Queued→Working happen *outside* the per-project
+        // budget lock, so a worker that just wrote StartedAt (inside the lock) still
+        // appears as state=Queued to the next worker's state-based query. Querying
+        // on started_at IS NOT NULL makes the write inside the lock immediately
+        // visible, preventing the concurrent cap from being exceeded.
+        // Terminal states excluded: Done=6, Failed=100, Cancelled=101, AuditFailed=102
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             SELECT COUNT(*) FROM work_items
             WHERE project_id = $pid
-              AND state NOT IN (0, 6, 100, 101, 102);
+              AND started_at IS NOT NULL
+              AND state NOT IN (6, 100, 101, 102);
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);

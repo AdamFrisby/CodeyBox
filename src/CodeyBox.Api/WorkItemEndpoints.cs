@@ -513,6 +513,7 @@ internal static class WorkItemEndpoints
         {
             state = queueController.State.ToString(),
             pausedAt = queueController.PausedAt,
+            pausedReason = queueController.PausedReason,
         });
     }
 

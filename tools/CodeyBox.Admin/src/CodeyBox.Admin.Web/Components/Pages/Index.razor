@@ -258,6 +258,7 @@ else
             _queueStatus = await ApiClient.PauseQueueAsync(_pauseReason.Trim());
             _showPauseModal = false;
             _pauseError = null;
+            await LoadAsync();
         }
         catch (Exception ex)
         {
