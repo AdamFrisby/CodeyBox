@@ -27,7 +27,7 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
     };
 
     private static readonly Regex SecretValuePattern = new(
-        @"(?:gho_[A-Za-z0-9]+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+)",
+        @"(?:gho_[A-Za-z0-9]+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]{35,})",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     public void Enrich(LogEvent logEvent, ILogEventPropertyFactory propertyFactory)

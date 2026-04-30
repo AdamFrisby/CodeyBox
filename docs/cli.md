@@ -20,7 +20,7 @@ No arguments are required. The wizard is fully interactive.
 | 2 | **Display name** | Free-form human-readable label |
 | 3 | **Repository URL** | `https://`, `git@`, `ssh://`, or filesystem path |
 | 4 | **Base branch** | Defaults to `main` |
-| 5 | **Agent** | `claude` · `copilot` · `codex` (default: `claude`) |
+| 5 | **Agent** | `claude` · `copilot` · `codex` · `gemini` (default: `claude`) |
 | 6 | **Upstream kind** | `noop` · `github` · `git-generic` |
 | 6a | *(github)* | GitHub owner, repository name, token env var |
 | 6b | *(git-generic)* | Generic URL, optional token env var |

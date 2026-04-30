@@ -18,7 +18,7 @@ public abstract class CliAgentRunnerBase : IAgentRunner
     /// </summary>
     protected abstract AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null);
 
-    public async Task<AgentResult> RunAsync(
+    public virtual async Task<AgentResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
         string prompt,

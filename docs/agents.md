@@ -11,6 +11,7 @@ amount of code; nothing in the orchestrator changes.
 | `claude`    | `claude`          | `ANTHROPIC_API_KEY`     | `CODEYBOX_CLAUDE_API_KEY` |
 | `copilot`   | `copilot`         | `GH_TOKEN`              | `CODEYBOX_COPILOT_TOKEN`  |
 | `codex`     | `codex`           | `OPENAI_API_KEY`        | `CODEYBOX_CODEX_API_KEY`  |
+| `gemini`    | `gemini`          | `GEMINI_API_KEY`        | `CODEYBOX_GEMINI_API_KEY` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side env
 name is what the orchestrator's `EnvironmentCredentialProvider` looks up
@@ -74,3 +75,46 @@ that cannot push to your real repos. Sandbox network policy must
 ### OpenAI Codex CLI
 Reads `OPENAI_API_KEY`. The `--full-auto` flag skips Codex's per-edit
 confirmations — appropriate inside a sandbox.
+
+### Google Gemini CLI (`@google/gemini-cli`)
+
+**Install in the sandbox image:**
+```sh
+npm install -g @google/gemini-cli
+```
+Node.js is already on the baseline image (installed for the Claude CLI), so
+adding the Gemini CLI costs only one extra `npm install -g` line in
+`MultipassExtraRuncmd`.
+
+**Credential:** set `CODEYBOX_GEMINI_API_KEY` on the orchestrator host to your
+[Google AI Studio API key](https://aistudio.google.com/app/apikey) (format
+`AIza…`). The orchestrator injects it as `GEMINI_API_KEY` inside the sandbox,
+which is the env var the Gemini CLI reads.
+
+**Non-interactive invocation:** `gemini --yolo -p "<prompt>"`
+
+- `--yolo` skips all tool-use confirmation prompts (analogous to Claude's
+  `--dangerously-skip-permissions`; appropriate inside the VM where the host
+  boundary is the real permission boundary).
+- `-p` delivers the prompt in a single non-interactive turn and exits.
+
+**Model selection:** pass `ModelId` in the agent-class config to select a
+specific Gemini model:
+```json
+{ "Agent": "gemini", "Billing": "PayPerApi", "ModelId": "gemini-2.5-pro" }
+```
+When `ModelId` is omitted the CLI uses its own default.
+
+**Quota probe:** no Gemini usage endpoint is currently registered; the router
+treats unknown quota as available (fail-open). Register Gemini as `PayPerApi`
+in agent-class config so the orchestrator never gates on it:
+```json
+{ "Agent": "gemini", "Billing": "PayPerApi", "ModelId": "gemini-2.5-pro" }
+```
+
+**Vertex AI / service-account auth:** the Gemini CLI also accepts Application
+Default Credentials (ADC). If you prefer service-account auth over an API key,
+set `GOOGLE_APPLICATION_CREDENTIALS` to the path of your service-account JSON.
+This requires a custom `ICredentialProvider` that materialises the JSON into
+the sandbox via `AgentCredential.Files` — the `Files` map on `AgentCredential`
+is designed for exactly this use case.
