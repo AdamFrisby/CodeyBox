@@ -528,7 +528,12 @@ internal static class WorkItemEndpoints
             Event = "queue.resumed",
             Details = new { resumedAt = DateTimeOffset.UtcNow },
         }, CancellationToken.None);
-        return Results.Ok(new { state = queueController.State.ToString() });
+        return Results.Ok(new
+        {
+            state = queueController.State.ToString(),
+            pausedAt = queueController.PausedAt,
+            pausedReason = queueController.PausedReason,
+        });
     }
 
     // ── Budget usage ──────────────────────────────────────────────────────────

@@ -269,7 +269,11 @@ else
     private async Task ResumeQueueAsync()
     {
         _resumeError = null;
-        try { _queueStatus = await ApiClient.ResumeQueueAsync(); }
+        try
+        {
+            _queueStatus = await ApiClient.ResumeQueueAsync();
+            await LoadAsync();
+        }
         catch (Exception ex) { _resumeError = ex.Message; }
     }
 

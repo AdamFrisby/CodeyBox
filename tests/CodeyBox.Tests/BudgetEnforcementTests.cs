@@ -125,11 +125,28 @@ public sealed class BudgetEnforcementTests : IDisposable
     [Fact]
     public async Task CountInFlight_TerminalItems_NotCounted()
     {
+        // Items have StartedAt set so the state NOT IN exclusion is actually exercised
+        // (previously StartedAt was null, so started_at IS NOT NULL filtered them first).
         foreach (var state in new[] { WorkItemState.Done, WorkItemState.Failed, WorkItemState.Cancelled, WorkItemState.AuditFailed })
         {
-            var item = MakeQueued() with { State = state };
+            var item = MakeQueued() with { State = state, StartedAt = DateTimeOffset.UtcNow };
             await _store.CreateAsync(item);
         }
+
+        var count = await _store.CountInFlightAsync(new ProjectId("proj-a"));
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public async Task CountInFlight_RetriedItem_NotCounted()
+    {
+        // A retried item goes through With(WorkItemState.Queued) which clears StartedAt.
+        // Verify both that the With() call clears it and that the store returns 0.
+        var working = MakeQueued() with { State = WorkItemState.Working, StartedAt = DateTimeOffset.UtcNow };
+        var retried = working.With(WorkItemState.Queued, error: null);
+        Assert.Null(retried.StartedAt);
+
+        await _store.CreateAsync(retried);
 
         var count = await _store.CountInFlightAsync(new ProjectId("proj-a"));
         Assert.Equal(0, count);

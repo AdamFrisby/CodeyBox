@@ -103,5 +103,8 @@ public sealed record WorkItem
         State = state,
         LastError = error,
         UpdatedAt = DateTimeOffset.UtcNow,
+        // Clear StartedAt when re-queuing: retried items must not appear in-flight
+        // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
+        StartedAt = state == WorkItemState.Queued ? null : StartedAt,
     };
 }

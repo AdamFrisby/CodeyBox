@@ -16,12 +16,22 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly ILogger<SqliteQueueController> _log;
 
-    private QueueState _state;
-    private DateTimeOffset? _pausedAt;
-    private string? _pausedReason;
+    // volatile so reads outside the lock see writes made inside the lock on ARM64.
+    private volatile QueueState _state;
+    // long cannot be volatile in C#; use Interlocked for atomic 64-bit reads/writes.
+    // 0 is the null sentinel (the epoch DateTimeOffset has non-zero UtcTicks, so 0 is safe).
+    private long _pausedAtUtcTicks;
+    private volatile string? _pausedReason;
 
     public QueueState State => _state;
-    public DateTimeOffset? PausedAt => _pausedAt;
+    public DateTimeOffset? PausedAt
+    {
+        get
+        {
+            var t = Interlocked.Read(ref _pausedAtUtcTicks);
+            return t == 0 ? null : new DateTimeOffset(t, TimeSpan.Zero);
+        }
+    }
     public string? PausedReason => _pausedReason;
 
     public SqliteQueueController(string dbPath, ILogger<SqliteQueueController> log)
@@ -32,6 +42,14 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
 
         _conn = new SqliteConnection($"Data Source={dbPath}");
         _conn.Open();
+
+        // WAL mode lets SqliteWorkItemStore and this connection write concurrently
+        // without SQLITE_BUSY. busy_timeout gives the rare collision a retry window.
+        using (var walCmd = _conn.CreateCommand())
+        {
+            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+            walCmd.ExecuteNonQuery();
+        }
 
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
@@ -71,7 +89,7 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             await cmd.ExecuteNonQueryAsync(ct);
 
             _state = QueueState.Paused;
-            _pausedAt = now;
+            Interlocked.Exchange(ref _pausedAtUtcTicks, now.UtcTicks);
             _pausedReason = reason;
             AuditLog.QueuePaused(reason);
         }
@@ -86,6 +104,9 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
         await _lock.WaitAsync(ct);
         try
         {
+            // No-op if already running: prevents spurious audit entries on duplicate calls.
+            if (_state == QueueState.Running) return;
+
             var now = DateTimeOffset.UtcNow;
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
@@ -97,7 +118,7 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             await cmd.ExecuteNonQueryAsync(ct);
 
             _state = QueueState.Running;
-            _pausedAt = null;
+            Interlocked.Exchange(ref _pausedAtUtcTicks, 0);
             _pausedReason = null;
             AuditLog.QueueResumed();
         }
@@ -122,9 +143,9 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
 
         _state = (QueueState)reader.GetInt32(reader.GetOrdinal("state"));
         var pausedAtOrd = reader.GetOrdinal("paused_at");
-        _pausedAt = reader.IsDBNull(pausedAtOrd)
-            ? null
-            : DateTimeOffset.Parse(reader.GetString(pausedAtOrd), System.Globalization.CultureInfo.InvariantCulture);
+        _pausedAtUtcTicks = reader.IsDBNull(pausedAtOrd)
+            ? 0L
+            : DateTimeOffset.Parse(reader.GetString(pausedAtOrd), System.Globalization.CultureInfo.InvariantCulture).UtcTicks;
         var reasonOrd = reader.GetOrdinal("paused_reason");
         _pausedReason = reader.IsDBNull(reasonOrd) ? null : reader.GetString(reasonOrd);
     }

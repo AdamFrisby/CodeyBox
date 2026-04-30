@@ -23,6 +23,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         _conn = new SqliteConnection($"Data Source={path}");
         _conn.Open();
 
+        // WAL mode allows concurrent readers + SqliteQueueController writes without SQLITE_BUSY.
+        // busy_timeout is per-connection and provides a retry window for the rare lock collision.
+        using (var walCmd = _conn.CreateCommand())
+        {
+            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+            walCmd.ExecuteNonQuery();
+        }
+
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS work_items (

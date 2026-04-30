@@ -201,7 +201,6 @@ public sealed class OrchestratorService : BackgroundService
         {
             try { await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken); }
             catch (OperationCanceledException) { return false; }
-            if (stoppingToken.IsCancellationRequested) return false;
         }
         return true;
     }
