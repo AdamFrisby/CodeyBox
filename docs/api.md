@@ -84,6 +84,71 @@ List work items that directly depend on this one. Useful for inspecting
 blast radius before cancelling. Returns the same record shape as
 `GET /workitems/{id}`.
 
+### `GET /workitems/{id}/timeline`
+
+Replay the audit-log events for a work item as a structured timeline.
+
+**Query parameters** (all optional):
+
+| Param | Description |
+|-------|-------------|
+| `kind` | Comma-separated list of event kinds to include (`state_transition`, `agent_started`, `agent_finished`, `auditor_run`, `iteration_complete`, `webhook_delivered`). Omit for all kinds. |
+| `since` | ISO-8601 timestamp. Only events at or after this time are returned. |
+| `iteration` | Integer. Only `auditor_run` and `iteration_complete` events for this audit iteration number are returned. |
+
+**Response** `200 OK`:
+
+```json
+{
+  "workItemId": "aabbccdd00000000000000000000001a",
+  "entries": [
+    {
+      "occurredAt": "2026-05-01T10:00:00+00:00",
+      "kind": "state_transition",
+      "summary": "Created (Queued): Add JSON config support",
+      "details": { "from": null, "to": "Queued", "title": "Add JSON config support" }
+    },
+    {
+      "occurredAt": "2026-05-01T10:00:05+00:00",
+      "kind": "agent_started",
+      "summary": "claude (work) started",
+      "details": { "agent": "claude", "phase": "work", "sandbox": "vm-abc123" }
+    },
+    {
+      "occurredAt": "2026-05-01T10:03:12+00:00",
+      "kind": "agent_finished",
+      "summary": "claude succeeded in 3m 7s",
+      "details": {
+        "agent": "claude", "success": true, "exitCode": null,
+        "durationMs": 187000, "stdoutTail": "All done.", "stderrTail": "", "sandbox": "vm-abc123"
+      }
+    },
+    {
+      "occurredAt": "2026-05-01T10:03:15+00:00",
+      "kind": "auditor_run",
+      "summary": "csharp:format-check (iter 1) — 0 findings",
+      "details": { "name": "csharp:format-check", "iteration": 1, "severity": "None", "durationMs": 4200 }
+    },
+    {
+      "occurredAt": "2026-05-01T10:03:16+00:00",
+      "kind": "iteration_complete",
+      "summary": "Audit iteration 1 of 3: 0 blocking, 0 non-blocking",
+      "details": { "iteration": 1, "totalIterations": 3, "blocking": 0, "nonBlocking": 0 }
+    }
+  ]
+}
+```
+
+Entries are sorted chronologically. The endpoint streams the audit log
+files line-by-line; it never loads a full log file into memory.
+
+**Caching**: timelines for work items in a terminal state (`Done`,
+`Failed`, `Cancelled`, `AuditFailed`) are cached in memory after the
+first request. In-flight items are re-read from disk on every call.
+
+* Returns `400 Bad Request` when `id` is not a valid UUID.
+* Returns `404 Not Found` when the work item does not exist.
+
 ### `DELETE /workitems/{id}`
 
 Cancel a non-terminal work item.

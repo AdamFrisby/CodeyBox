@@ -368,7 +368,8 @@ public sealed class PipelineRunner : IPipelineRunner
         var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
 
         agentSw.Stop();
-        AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed);
+        AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed,
+            stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
         // Always log a truncated tail of agent output, regardless of
         // success. This is critical when an agent finishes "successfully"
         // but produces no useful diff — without this log, we have no
@@ -430,6 +431,13 @@ public sealed class PipelineRunner : IPipelineRunner
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
     }
 
+    // Returns a 2 KB tail of agent output for inclusion in audit log events.
+    private static string? Tail(string? s)
+    {
+        const int max = 2000;
+        return string.IsNullOrEmpty(s) ? null : s.Length <= max ? s : "…" + s[^max..];
+    }
+
     /// <summary>
     /// Logs a truncated tail of agent stdout/stderr at Information level.
     /// Truncated because agent output can be tens of KB; the tail is
@@ -437,13 +445,10 @@ public sealed class PipelineRunner : IPipelineRunner
     /// </summary>
     private static void LogAgentOutput(ILogger log, AgentKind kind, AgentResult result)
     {
-        const int tailBytes = 2000;
-        static string Tail(string? s) =>
-            string.IsNullOrEmpty(s) ? "(empty)" :
-            s.Length <= tailBytes ? s : "…" + s[^tailBytes..];
+        static string Display(string? s) => string.IsNullOrEmpty(s) ? "(empty)" : s;
         log.LogInformation(
             "Agent {Kind} finished: success={Success} exit={Summary}\nstdout-tail:\n{StdoutTail}\nstderr-tail:\n{StderrTail}",
-            kind.Value, result.Success, result.Summary, Tail(result.Stdout), Tail(result.Stderr));
+            kind.Value, result.Success, result.Summary, Display(Tail(result.Stdout)), Display(Tail(result.Stderr)));
     }
 
     private async Task RunAuditLoopAsync(
@@ -610,7 +615,8 @@ public sealed class PipelineRunner : IPipelineRunner
         var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
 
         mergeSw.Stop();
-        AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed);
+        AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
+            stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
             throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");

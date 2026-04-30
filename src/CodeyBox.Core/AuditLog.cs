@@ -96,10 +96,19 @@ public static class AuditLog
             .Information("Agent {Agent} started in sandbox {Sandbox} for phase {Phase}",
                 agent.Value, sandboxName, phase);
 
-    public static void AgentFinished(AgentKind agent, string sandboxName, bool success, int? exitCode, TimeSpan duration) =>
-        Audit("agent.finished")
-            .Information("Agent {Agent} finished in sandbox {Sandbox}: success={Success} exit={ExitCode} duration={DurationMs}ms",
-                agent.Value, sandboxName, success, exitCode, (long)duration.TotalMilliseconds);
+    public static void AgentFinished(
+        AgentKind agent, string sandboxName, bool success, int? exitCode, TimeSpan duration,
+        string? stdoutTail = null, string? stderrTail = null)
+    {
+        var log = Audit("agent.finished");
+        if (stdoutTail is not null) log = log.ForContext("StdoutTail", TruncateAuditTail(stdoutTail));
+        if (stderrTail is not null) log = log.ForContext("StderrTail", TruncateAuditTail(stderrTail));
+        log.Information("Agent {Agent} finished in sandbox {Sandbox}: success={Success} exit={ExitCode} duration={DurationMs}ms",
+            agent.Value, sandboxName, success, exitCode, (long)duration.TotalMilliseconds);
+    }
+
+    private static string TruncateAuditTail(string s) =>
+        s.Length <= 2048 ? s : "…" + s[^2048..];
 
     public static void AgentStuckDetected(AgentKind agent, string phase, TimeSpan stuckDuration) =>
         Audit("agent.stuck_detected")
