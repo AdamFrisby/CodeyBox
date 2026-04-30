@@ -25,3 +25,9 @@ Start here if you're new:
 12. [`webhooks.md`](webhooks.md) — outbound webhook events, payload shape, HMAC signing, and configuration.
 13. [`audit-logging.md`](audit-logging.md) — structured audit log: location, format, all event names and
     properties. Start here when writing SIEM rules or log-query dashboards.
+
+## Admin dashboard
+
+A Blazor Server web UI lives at [`tools/CodeyBox.Admin/`](../tools/CodeyBox.Admin/README.md).
+Run with `dotnet run --project tools/CodeyBox.Admin/src/CodeyBox.Admin.Web`.
+It speaks to the orchestrator over REST only — no shared code with the orchestrator.

@@ -1,0 +1,161 @@
+@page "/work-items/{Id}/edit"
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+@inject ILogger<EditWorkItem> Logger
+
+<PageTitle>Edit Work Item — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found.</p>
+}
+else if (_item is null && _error is null)
+{
+    <p>Loading…</p>
+}
+else if (_item is null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (!_item.IsQueued)
+{
+    <div class="error-banner">
+        <p>This item is in state <strong>@_item.State</strong> and cannot be edited.</p>
+        <p>Only Queued items are editable.</p>
+        <a href="/work-items/@Id" class="btn">Back</a>
+    </div>
+}
+else
+{
+    <h1>Edit: @_item.Title</h1>
+
+    @if (_error is not null)
+    {
+        <p class="error-banner">@_error</p>
+    }
+
+    <EditForm Model="_form" OnValidSubmit="SubmitAsync">
+        <DataAnnotationsValidator />
+
+        <div class="form-group">
+            <label for="title">Title</label>
+            <InputText id="title" @bind-Value="_form.Title" class="form-control" />
+            <ValidationMessage For="() => _form.Title" />
+        </div>
+
+        <div class="form-group">
+            <label for="prompt">Prompt</label>
+            <InputTextArea id="prompt" @bind-Value="_form.Prompt" class="form-control prompt-input" rows="20" />
+            <ValidationMessage For="() => _form.Prompt" />
+        </div>
+
+        <div class="form-group">
+            <label for="agent">Agent</label>
+            <InputSelect id="agent" @bind-Value="_form.Agent" class="form-control">
+                <option value="">(project default)</option>
+                @foreach (var agent in _availableAgents)
+                {
+                    <option value="@agent">@agent</option>
+                }
+            </InputSelect>
+        </div>
+
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary" disabled="@_submitting">
+                @(_submitting ? "Saving…" : "Save")
+            </button>
+            <a href="/work-items/@Id" class="btn">Cancel</a>
+        </div>
+    </EditForm>
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private WorkItemDto? _item;
+    private readonly EditForm _form = new();
+    private string? _error;
+    private bool _submitting;
+    private bool _notFound;
+    private string? _loadedId;
+    private List<string> _availableAgents = [];
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (Id == _loadedId) return;
+        _loadedId = Id;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        try
+        {
+            var itemTask = ApiClient.GetWorkItemAsync(Id);
+            var projectsTask = ApiClient.GetProjectsAsync();
+            await Task.WhenAll(itemTask, projectsTask);
+            var item = await itemTask;
+            var projects = await projectsTask;
+            if (item is null) { _notFound = true; return; }
+            _item = item;
+            _form.Title = _item.Title;
+            _form.Prompt = _item.Prompt;
+            _form.Agent = _item.Agent;
+            _availableAgents = projects
+                .Select(p => p.DefaultAgent)
+                .Where(a => !string.IsNullOrEmpty(a))
+                .Distinct()
+                .OrderBy(a => a)
+                .ToList()!;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load work item {Id}", Id);
+            _error = "Failed to load work item. Check server logs for details.";
+        }
+    }
+
+    private async Task SubmitAsync()
+    {
+        _submitting = true;
+        _error = null;
+        try
+        {
+            var req = new PatchWorkItemRequest
+            {
+                Title = _form.Title,
+                Prompt = _form.Prompt,
+                Agent = string.IsNullOrWhiteSpace(_form.Agent) ? null : _form.Agent,
+            };
+            var result = await ApiClient.PatchWorkItemAsync(Id, req);
+            if (result is not null)
+                Nav.NavigateTo($"/work-items/{Id}");
+            else
+                _error = "Item is no longer in Queued state and cannot be edited.";
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to save work item {Id}", Id);
+            _error = "Save failed. Check server logs for details.";
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    private sealed class EditForm
+    {
+        [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Title is required.")]
+        [System.ComponentModel.DataAnnotations.MaxLength(200, ErrorMessage = "Title must be ≤ 200 chars.")]
+        public string Title { get; set; } = "";
+
+        [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Prompt is required.")]
+        [System.ComponentModel.DataAnnotations.MaxLength(65536, ErrorMessage = "Prompt must be ≤ 64 KB.")]
+        public string Prompt { get; set; } = "";
+
+        public string? Agent { get; set; }
+    }
+}

@@ -76,6 +76,14 @@ public sealed record WorkItem
     /// </summary>
     public string? ModelId { get; init; }
 
+    /// <summary>
+    /// Display and pickup ordering for Queued items. Set to <c>CreatedAt.Ticks</c> on
+    /// first persist so items sort in creation order by default. <see cref="IWorkItemStore.ReorderAsync"/>
+    /// overwrites this with small integers (1, 2, 3 …) so explicitly prioritised items
+    /// sort before timestamp-ordered items. Value 0 is treated as "sort last" by the store.
+    /// </summary>
+    public long QueuePosition { get; init; } = 0;
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,

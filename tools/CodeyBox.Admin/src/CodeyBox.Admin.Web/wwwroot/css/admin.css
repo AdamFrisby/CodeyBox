@@ -1,0 +1,301 @@
+/* CodeyBox Admin — plain CSS, no external frameworks */
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    background: #f5f5f5;
+    color: #222;
+}
+
+/* ── Layout ────────────────────────────────────────────────────────────────── */
+
+.admin-layout {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+.admin-nav {
+    background: #1a1a2e;
+    color: #fff;
+    padding: 0.6rem 1.2rem;
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+}
+
+.admin-nav-brand {
+    font-weight: 700;
+    font-size: 1rem;
+    letter-spacing: 0.02em;
+}
+
+.admin-nav a {
+    color: #c8d6ff;
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+
+.admin-nav a:hover,
+.admin-nav a.active {
+    color: #fff;
+    text-decoration: underline;
+}
+
+.admin-main {
+    padding: 1.5rem;
+    flex: 1;
+}
+
+/* ── Typography ─────────────────────────────────────────────────────────────── */
+
+h1 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────────────── */
+
+.btn {
+    display: inline-block;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.8rem;
+    border: 1px solid #bbb;
+    border-radius: 3px;
+    background: #fff;
+    cursor: pointer;
+    text-decoration: none;
+    color: inherit;
+    line-height: 1.4;
+}
+
+.btn:hover {
+    background: #e8e8e8;
+}
+
+.btn-primary {
+    background: #1a1a2e;
+    color: #fff;
+    border-color: #1a1a2e;
+}
+
+.btn-primary:hover {
+    background: #2a2a4e;
+}
+
+.btn-danger {
+    color: #c0392b;
+    border-color: #c0392b;
+}
+
+.btn-danger:hover {
+    background: #ffeaea;
+}
+
+.btn-up, .btn-down {
+    padding: 0.15rem 0.4rem;
+    font-size: 0.75rem;
+}
+
+/* ── Queue table ────────────────────────────────────────────────────────────── */
+
+.queue-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 4px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+
+.queue-table th,
+.queue-table td {
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    border-bottom: 1px solid #eee;
+}
+
+.queue-table th {
+    background: #f0f0f0;
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.queue-table tr:last-child td {
+    border-bottom: none;
+}
+
+.queue-table tr:hover td {
+    background: #fafafa;
+}
+
+.col-id code, .col-id a {
+    font-family: monospace;
+    font-size: 0.85rem;
+}
+
+.col-actions {
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+/* ── State colours ──────────────────────────────────────────────────────────── */
+
+.col-state,
+.state-queued .col-state      { color: #1a5276; }
+.state-working .col-state     { color: #1e8449; font-weight: 600; }
+.state-auditing .col-state,
+.state-reworking .col-state   { color: #9b59b6; font-weight: 600; }
+.state-merging .col-state     { color: #d35400; }
+.state-done .col-state        { color: #1e8449; }
+.state-failed .col-state,
+.state-auditfailed .col-state { color: #c0392b; font-weight: 600; }
+.state-cancelled .col-state   { color: #7f8c8d; }
+
+/* ── Detail view ────────────────────────────────────────────────────────────── */
+
+.detail-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+
+.detail-table {
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+    margin-bottom: 1.5rem;
+    width: 100%;
+    max-width: 700px;
+}
+
+.detail-table th,
+.detail-table td {
+    padding: 0.45rem 0.75rem;
+    border-bottom: 1px solid #eee;
+    text-align: left;
+    vertical-align: top;
+}
+
+.detail-table th {
+    width: 140px;
+    font-weight: 600;
+    color: #555;
+    background: #f8f8f8;
+}
+
+.last-error {
+    color: #c0392b;
+    font-family: monospace;
+    font-size: 0.85rem;
+}
+
+/* ── Prompt collapsible ──────────────────────────────────────────────────────── */
+
+.prompt-collapsible {
+    max-width: 900px;
+    margin-bottom: 1rem;
+}
+
+.prompt-collapsible summary {
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0.4rem 0;
+    user-select: none;
+}
+
+.prompt-text {
+    background: #1a1a2e;
+    color: #d8e4ff;
+    font-family: monospace;
+    font-size: 0.82rem;
+    padding: 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin-top: 0.5rem;
+}
+
+/* ── Forms ───────────────────────────────────────────────────────────────────── */
+
+.form-group {
+    margin-bottom: 1rem;
+    max-width: 600px;
+}
+
+.form-group label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+    font-size: 0.85rem;
+}
+
+.form-control {
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.form-control:focus {
+    outline: 2px solid #1a1a2e;
+    border-color: #1a1a2e;
+}
+
+.prompt-input {
+    font-family: monospace;
+    font-size: 0.82rem;
+}
+
+.form-check {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.4rem;
+}
+
+.form-check input[type="checkbox"] {
+    width: 1rem;
+    height: 1rem;
+}
+
+.form-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 1.5rem;
+}
+
+/* ── Errors ──────────────────────────────────────────────────────────────────── */
+
+.error-banner {
+    background: #fdecea;
+    border: 1px solid #e57373;
+    border-radius: 4px;
+    padding: 0.75rem 1rem;
+    color: #b71c1c;
+    margin-bottom: 1rem;
+    max-width: 700px;
+}
+
+/* Validation messages from Blazor EditForm */
+.validation-message {
+    color: #c0392b;
+    font-size: 0.8rem;
+    margin-top: 0.2rem;
+}

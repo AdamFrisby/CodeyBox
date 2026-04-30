@@ -13,4 +13,12 @@ public interface IWorkItemStore
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);
+
+    /// <summary>
+    /// Sets <c>queue_position</c> for the listed Queued items in the given order
+    /// (index + 1 becomes the position). Only rows still in <c>Queued</c> state
+    /// are touched; items that raced to a non-Queued state are silently skipped.
+    /// Runs inside a single transaction for atomicity.
+    /// </summary>
+    Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default);
 }

@@ -80,6 +80,15 @@ public static class AuditLog
             .Information("Work item {WorkItemId} cascade-cancelled because parent {ParentWorkItemId} was cancelled",
                 id.ToString(), parentId.ToString());
 
+    public static void WorkItemPatched(WorkItemId id, bool titleChanged, bool promptChanged, bool agentChanged) =>
+        Audit("work_item.patched")
+            .Information("Work item {WorkItemId} patched: title={TitleChanged} prompt={PromptChanged} agent={AgentChanged}",
+                id.ToString(), titleChanged, promptChanged, agentChanged);
+
+    public static void WorkItemReordered(int count) =>
+        Audit("work_item.reordered")
+            .Information("Queue reordered: {Count} items repositioned", count);
+
     // ── Agent lifecycle ──────────────────────────────────────────────────────
 
     public static void AgentStarted(AgentKind agent, string sandboxName, string phase) =>

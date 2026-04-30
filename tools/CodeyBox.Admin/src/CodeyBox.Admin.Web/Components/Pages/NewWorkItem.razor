@@ -1,0 +1,163 @@
+@page "/work-items/new"
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+
+<PageTitle>New Work Item — CodeyBox Admin</PageTitle>
+
+<h1>New Work Item</h1>
+
+@if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+
+<EditForm Model="_form" OnValidSubmit="SubmitAsync">
+    <DataAnnotationsValidator />
+
+    <div class="form-group">
+        <label for="project">Project</label>
+        <InputSelect id="project" @bind-Value="_form.ProjectId" class="form-control">
+            <option value="">— select —</option>
+            @foreach (var p in _projects)
+            {
+                <option value="@p.Id">@p.DisplayName</option>
+            }
+        </InputSelect>
+        <ValidationMessage For="() => _form.ProjectId" />
+    </div>
+
+    <div class="form-group">
+        <label for="title">Title</label>
+        <InputText id="title" @bind-Value="_form.Title" class="form-control" />
+        <ValidationMessage For="() => _form.Title" />
+    </div>
+
+    <div class="form-group">
+        <label for="prompt">Prompt</label>
+        <InputTextArea id="prompt" @bind-Value="_form.Prompt" class="form-control prompt-input" rows="20" />
+        <ValidationMessage For="() => _form.Prompt" />
+    </div>
+
+    <div class="form-group">
+        <label for="agent">Agent</label>
+        <InputSelect id="agent" @bind-Value="_form.Agent" class="form-control">
+            <option value="">(project default)</option>
+            <option value="claude">claude</option>
+            <option value="copilot">copilot</option>
+            <option value="codex">codex</option>
+        </InputSelect>
+    </div>
+
+    <div class="form-group">
+        <label for="workBranch">Work branch</label>
+        <InputText id="workBranch" @bind-Value="_form.WorkBranch" class="form-control"
+                   placeholder="(auto-generated)" />
+    </div>
+
+    <div class="form-group form-check">
+        <InputCheckbox id="pushUpstream" @bind-Value="_form.PushUpstream" />
+        <label for="pushUpstream">Push upstream after merge</label>
+    </div>
+
+    @if (_queuedItems.Count > 0)
+    {
+        <div class="form-group">
+            <label>Depends on (queued items)</label>
+            @foreach (var qi in _queuedItems)
+            {
+                <div class="form-check">
+                    <input type="checkbox"
+                           id="dep-@qi.Id"
+                           checked="@_selectedDeps.Contains(qi.Id)"
+                           @onchange="e => ToggleDep(qi.Id, (bool)(e.Value ?? false))" />
+                    <label for="dep-@qi.Id">@qi.ShortId — @qi.Title</label>
+                </div>
+            }
+        </div>
+    }
+
+    <div class="form-actions">
+        <button type="submit" class="btn btn-primary" disabled="@_submitting">
+            @(_submitting ? "Submitting…" : "Create")
+        </button>
+        <a href="/" class="btn">Cancel</a>
+    </div>
+</EditForm>
+
+@code {
+    private readonly NewItemForm _form = new();
+    private List<ProjectDto> _projects = [];
+    private List<WorkItemDto> _queuedItems = [];
+    private readonly HashSet<string> _selectedDeps = [];
+    private string? _error;
+    private bool _submitting;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _projects = await ApiClient.GetProjectsAsync();
+            var all = await ApiClient.GetWorkItemsAsync();
+            _queuedItems = all.Where(i => i.IsQueued).OrderBy(i => i.QueuePosition).ToList();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    private void ToggleDep(string id, bool selected)
+    {
+        if (selected) _selectedDeps.Add(id);
+        else _selectedDeps.Remove(id);
+    }
+
+    private async Task SubmitAsync()
+    {
+        _submitting = true;
+        _error = null;
+        try
+        {
+            var req = new CreateWorkItemRequest
+            {
+                ProjectId = _form.ProjectId,
+                Title = _form.Title,
+                Prompt = _form.Prompt,
+                Agent = string.IsNullOrWhiteSpace(_form.Agent) ? null : _form.Agent,
+                WorkBranch = string.IsNullOrWhiteSpace(_form.WorkBranch) ? null : _form.WorkBranch,
+                PushUpstream = _form.PushUpstream,
+                DependsOn = [.. _selectedDeps],
+            };
+            var created = await ApiClient.CreateWorkItemAsync(req);
+            if (created is not null)
+                Nav.NavigateTo($"/work-items/{created.Id}");
+            else
+                _error = "Failed to create work item.";
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    private sealed class NewItemForm
+    {
+        [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Project is required.")]
+        public string ProjectId { get; set; } = "";
+
+        [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Title is required.")]
+        [System.ComponentModel.DataAnnotations.MaxLength(200, ErrorMessage = "Title must be ≤ 200 chars.")]
+        public string Title { get; set; } = "";
+
+        [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Prompt is required.")]
+        public string Prompt { get; set; } = "";
+
+        public string? Agent { get; set; }
+        public string? WorkBranch { get; set; }
+        public bool PushUpstream { get; set; } = true;
+    }
+}

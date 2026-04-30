@@ -25,4 +25,8 @@
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
   </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/CodeyBox.Admin/src/CodeyBox.Admin.Web/CodeyBox.Admin.Web.csproj" />
+    <Project Path="tools/CodeyBox.Admin/tests/CodeyBox.Admin.Tests/CodeyBox.Admin.Tests.csproj" />
+  </Folder>
 </Solution>

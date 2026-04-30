@@ -1,0 +1,53 @@
+@page "/login"
+@attribute [AllowAnonymous]
+
+<PageTitle>Login — CodeyBox Admin</PageTitle>
+
+<h1>CodeyBox Admin Login</h1>
+
+@if (_loginError)
+{
+    <p class="error-banner">Invalid username or password.</p>
+}
+
+<form method="post" action="/account/login" class="login-form">
+    <AntiforgeryToken />
+    <input type="hidden" name="returnUrl" value="@_returnUrl" />
+
+    <div class="form-group">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" class="form-control"
+               required autocomplete="username" />
+    </div>
+
+    <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" class="form-control"
+               required autocomplete="current-password" />
+    </div>
+
+    <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Log in</button>
+    </div>
+</form>
+
+<p class="login-hint">
+    Set credentials via environment variables <code>CODEYBOX_ADMIN_USERNAME</code>
+    and <code>CODEYBOX_ADMIN_PASSWORD</code>.
+</p>
+
+@code {
+    [SupplyParameterFromQuery] public string? ReturnUrl { get; set; }
+    [SupplyParameterFromQuery(Name = "error")] public string? ErrorParam { get; set; }
+
+    private bool _loginError;
+    private string _returnUrl = "/";
+
+    protected override void OnInitialized()
+    {
+        _loginError = ErrorParam is not null;
+        _returnUrl = !string.IsNullOrEmpty(ReturnUrl) && ReturnUrl.StartsWith('/')
+            ? ReturnUrl
+            : "/";
+    }
+}

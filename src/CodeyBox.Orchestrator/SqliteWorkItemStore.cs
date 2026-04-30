@@ -49,23 +49,24 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
         // Additive migration: add depends_on_json column if it doesn't exist yet.
         // Existing rows get the default '[]' so behaviour is unchanged.
-        try
-        {
-            using var migrate = _conn.CreateCommand();
-            migrate.CommandText = "ALTER TABLE work_items ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';";
-            migrate.ExecuteNonQuery();
-        }
-        catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
-        {
-            // Column already exists from a previous startup — nothing to do.
-        }
+        RunMigration("ALTER TABLE work_items ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';");
 
         // Additive migration: add agent_class_id column for quota-aware routing.
+        RunMigration("ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;");
+
+        // Additive migration: add queue_position for admin-dashboard reorder support.
+        // Default 0 = "no explicit position" → store treats as sort-last (behind timestamp-based positions).
+        RunMigration("ALTER TABLE work_items ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0;");
+    }
+
+    private void RunMigration(string sql)
+    {
         try
         {
-            using var migrate = _conn.CreateCommand();
-            migrate.CommandText = "ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;";
-            migrate.ExecuteNonQuery();
+            using var m = _conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals; no user-supplied input reaches this method
+            m.CommandText = sql;
+            m.ExecuteNonQuery();
         }
         catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
         {
@@ -82,8 +83,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             cmd.CommandText = """
                 INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
-                    last_error, upstream_push_attempts, depends_on_json, agent_class_id)
-                VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id);
+                    last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position)
+                VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -107,7 +108,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
-                    agent_class_id = $class_id
+                    agent_class_id = $class_id, queue_position = $qpos
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -132,7 +133,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
-                    agent_class_id = $class_id
+                    agent_class_id = $class_id, queue_position = $qpos
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -166,11 +167,56 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
     public async IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, [EnumeratorCancellation] CancellationToken ct = default)
     {
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
+        // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
+        // queue_position = 0 (pre-migration or newly created without explicit pos) sort
+        // last via the CASE sentinel, then by creation time for stable tie-breaking.
+        // Other states: simple creation-time ordering.
+        if (state == WorkItemState.Queued)
+        {
+            cmd.CommandText = """
+                SELECT * FROM work_items WHERE state = $state
+                ORDER BY
+                    CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
+                    created_at ASC;
+                """;
+        }
+        else
+        {
+            cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
+        }
         cmd.Parameters.AddWithValue("$state", (int)state);
         using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             yield return Read(reader);
+    }
+
+    public async Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            for (var i = 0; i < orderedIds.Count; i++)
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.Transaction = tx;
+                // Only update rows still in Queued state. Items that raced to a different
+                // state between the validation and the write are silently skipped.
+                cmd.CommandText = """
+                    UPDATE work_items SET queue_position = $pos
+                    WHERE id = $id AND state = $queued;
+                    """;
+                cmd.Parameters.AddWithValue("$pos", (long)(i + 1));
+                cmd.Parameters.AddWithValue("$id", orderedIds[i].ToString());
+                cmd.Parameters.AddWithValue("$queued", (int)WorkItemState.Queued);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            tx.Commit();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public void Dispose()
@@ -199,6 +245,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$deps",
             JsonSerializer.Serialize(item.DependsOn.Select(id => id.ToString()).ToList()));
         cmd.Parameters.AddWithValue("$class_id", (object?)item.AgentClassId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$qpos", item.QueuePosition);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -220,6 +267,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         UpstreamPushAttempts = r.GetInt32(r.GetOrdinal("upstream_push_attempts")),
         DependsOn = ReadDependsOn(r),
         AgentClassId = r.IsDBNull(r.GetOrdinal("agent_class_id")) ? null : r.GetString(r.GetOrdinal("agent_class_id")),
+        QueuePosition = r.GetInt64(r.GetOrdinal("queue_position")),
     };
 
     private static IReadOnlyList<WorkItemId> ReadDependsOn(SqliteDataReader r)
