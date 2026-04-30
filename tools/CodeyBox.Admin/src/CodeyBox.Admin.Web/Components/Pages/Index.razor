@@ -39,7 +39,7 @@
             <p>New work-item pickup will stop immediately. In-flight items will finish normally.</p>
             <label>
                 Reason
-                <input type="text" @bind="_pauseReason" placeholder="e.g. maintenance window" class="modal-input" />
+                <input type="text" @bind="_pauseReason" placeholder="e.g. maintenance window" class="modal-input" maxlength="500" />
             </label>
             @if (_pauseError is not null)
             {
@@ -204,7 +204,8 @@ else
         }
 
         try { _queueStatus = await ApiClient.GetQueueStatusAsync(); }
-        catch { /* non-critical; banner just won't show */ }
+        catch (HttpRequestException) { /* non-critical; banner just won't show */ }
+        catch (TaskCanceledException) { /* non-critical */ }
 
         // Load budget usage for projects with non-terminal items.
         var projectIds = _items?
@@ -220,7 +221,8 @@ else
                 var u = await ApiClient.GetBudgetUsageAsync(pid);
                 if (u is not null) usage[pid] = u;
             }
-            catch { /* non-critical */ }
+            catch (HttpRequestException) { /* non-critical */ }
+            catch (TaskCanceledException) { /* non-critical */ }
         }
         _budgetUsage = usage;
     }
@@ -255,7 +257,13 @@ else
         }
         try
         {
-            _queueStatus = await ApiClient.PauseQueueAsync(_pauseReason.Trim());
+            var result = await ApiClient.PauseQueueAsync(_pauseReason.Trim());
+            if (result is null)
+            {
+                _pauseError = "Pause request failed: server returned an empty response.";
+                return;
+            }
+            _queueStatus = result;
             _showPauseModal = false;
             _pauseError = null;
             await LoadAsync();

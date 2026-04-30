@@ -105,6 +105,56 @@ public sealed class PausePickupTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
         Assert.Equal(3, pickupCount);
     }
+
+    [Fact]
+    public async Task PausedQueue_DoesNotCancelInFlightItems()
+    {
+        using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
+
+        var itemStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var itemCanProceed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var itemCompleted = 0;
+
+        var pipeline = new BlockingPipelineRunner(
+            _store,
+            onStart: () => itemStarted.TrySetResult(),
+            proceedGate: itemCanProceed.Task,
+            onComplete: () => Interlocked.Increment(ref itemCompleted));
+
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            queueController: controller);
+
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        // Wait until item is in-flight.
+        await itemStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Pause while the item is running — must not cancel it.
+        await controller.PauseAsync("in-flight continuity test");
+        Assert.Equal(QueueState.Paused, controller.State);
+
+        // Allow the in-flight item to finish.
+        itemCanProceed.TrySetResult();
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline && Volatile.Read(ref itemCompleted) == 0)
+            await Task.Delay(50);
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, itemCompleted);
+        var stored = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, stored!.State);
+    }
 }
 
 /// <summary>
@@ -125,6 +175,34 @@ internal sealed class CountingPipelineRunner : IPipelineRunner
     public async Task RunAsync(WorkItem item, CancellationToken ct)
     {
         _onRun();
+        await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+    }
+}
+
+/// <summary>
+/// Pipeline stub that signals when it starts, waits for a gate, then completes.
+/// Used to test that in-flight items finish normally when the queue is paused.
+/// </summary>
+internal sealed class BlockingPipelineRunner : IPipelineRunner
+{
+    private readonly IWorkItemStore _store;
+    private readonly Action _onStart;
+    private readonly Task _proceedGate;
+    private readonly Action _onComplete;
+
+    public BlockingPipelineRunner(IWorkItemStore store, Action onStart, Task proceedGate, Action onComplete)
+    {
+        _store = store;
+        _onStart = onStart;
+        _proceedGate = proceedGate;
+        _onComplete = onComplete;
+    }
+
+    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    {
+        _onStart();
+        await _proceedGate;
+        _onComplete();
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
     }
 }

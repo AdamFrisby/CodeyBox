@@ -200,6 +200,54 @@ public sealed class IndexPageTests : TestContext
         Assert.Contains("modal-overlay", cut.Markup); // modal stays open
     }
 
+    [Fact]
+    public void Index_PauseSuccess_CloseModalAndShowPausedBanner()
+    {
+        var fake = new FakeApiClient([]);
+        fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        // Open pause modal
+        cut.Find(".btn-sm").Click();
+        Assert.Contains("modal-overlay", cut.Markup);
+
+        // Enter a reason and submit
+        cut.Find(".modal-input").Change("incident response");
+        cut.Find(".modal-box .btn-danger").Click();
+
+        // Wait for async update
+        cut.WaitForState(() => !cut.Markup.Contains("modal-overlay"), TimeSpan.FromSeconds(2));
+
+        Assert.DoesNotContain("modal-overlay", cut.Markup);
+        Assert.Contains("QUEUE PAUSED", cut.Markup);
+        Assert.Contains("incident response", cut.Markup);
+    }
+
+    [Fact]
+    public void Index_ResumeSuccess_ShowsRunningBanner()
+    {
+        var fake = new FakeApiClient([]);
+        fake.QueueStatusOverride = new QueueStatusDto
+        {
+            State = "Paused",
+            PausedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PausedReason = "test",
+        };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+        Assert.Contains("QUEUE PAUSED", cut.Markup);
+
+        cut.Find(".btn-resume").Click();
+
+        cut.WaitForState(() => cut.Markup.Contains("queue-banner-running"), TimeSpan.FromSeconds(2));
+
+        Assert.DoesNotContain("QUEUE PAUSED", cut.Markup);
+        Assert.Contains("queue-banner-running", cut.Markup);
+    }
+
     // ── Budget usage bar tests ───────────────────────────────────────────────
 
     [Fact]
@@ -344,10 +392,21 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         => Task.FromResult(QueueStatusOverride);
 
     public Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default)
-        => Task.FromResult(QueueStatusOverride);
+    {
+        QueueStatusOverride = new QueueStatusDto
+        {
+            State = "Paused",
+            PausedAt = DateTimeOffset.UtcNow,
+            PausedReason = reason,
+        };
+        return Task.FromResult<QueueStatusDto?>(QueueStatusOverride);
+    }
 
     public Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default)
-        => Task.FromResult(QueueStatusOverride);
+    {
+        QueueStatusOverride = new QueueStatusDto { State = "Running" };
+        return Task.FromResult<QueueStatusDto?>(QueueStatusOverride);
+    }
 
     public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult(BudgetUsageOverrides.TryGetValue(projectId, out var u) ? (BudgetUsageDto?)u : null);

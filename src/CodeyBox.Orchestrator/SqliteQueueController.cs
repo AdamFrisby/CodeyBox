@@ -141,7 +141,16 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
         using var reader = cmd.ExecuteReader();
         if (!reader.Read()) return;
 
-        _state = (QueueState)reader.GetInt32(reader.GetOrdinal("state"));
+        var rawState = reader.GetInt32(reader.GetOrdinal("state"));
+        if (!Enum.IsDefined(typeof(QueueState), rawState))
+        {
+            _log.LogWarning("Persisted queue state value {RawState} is not a valid QueueState; defaulting to Running", rawState);
+            _state = QueueState.Running;
+        }
+        else
+        {
+            _state = (QueueState)rawState;
+        }
         var pausedAtOrd = reader.GetOrdinal("paused_at");
         _pausedAtUtcTicks = reader.IsDBNull(pausedAtOrd)
             ? 0L

@@ -88,14 +88,22 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
     public async Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync("/queue/pause", new { reason }, JsonOptions, ct);
-        if (!resp.IsSuccessStatusCode) return null;
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException($"Pause failed ({(int)resp.StatusCode}): {body}", null, resp.StatusCode);
+        }
         return await resp.Content.ReadFromJsonAsync<QueueStatusDto>(JsonOptions, ct);
     }
 
     public async Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync("/queue/resume", new { }, JsonOptions, ct);
-        if (!resp.IsSuccessStatusCode) return null;
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException($"Resume failed ({(int)resp.StatusCode}): {body}", null, resp.StatusCode);
+        }
         return await resp.Content.ReadFromJsonAsync<QueueStatusDto>(JsonOptions, ct);
     }
 

@@ -137,12 +137,23 @@ public sealed class ProjectRepository : IProjectRepository
         };
     }
 
-    private static ProjectBudget ResolveBudget(ProjectBudgetConfig? c) => c is null ? new() : new()
+    private static ProjectBudget ResolveBudget(ProjectBudgetConfig? c)
     {
-        MaxItemsPerHour = c.MaxItemsPerHour ?? 0,
-        MaxItemsPerDay = c.MaxItemsPerDay ?? 0,
-        MaxConcurrentForProject = c.MaxConcurrentForProject ?? 0,
-    };
+        if (c is null) return new();
+        static int ValidateCap(int? value, string name)
+        {
+            var v = value ?? 0;
+            if (v < 0) throw new InvalidOperationException(
+                $"Budget cap '{name}' must be >= 0 (got {v}). Use 0 for unlimited.");
+            return v;
+        }
+        return new()
+        {
+            MaxItemsPerHour = ValidateCap(c.MaxItemsPerHour, nameof(c.MaxItemsPerHour)),
+            MaxItemsPerDay = ValidateCap(c.MaxItemsPerDay, nameof(c.MaxItemsPerDay)),
+            MaxConcurrentForProject = ValidateCap(c.MaxConcurrentForProject, nameof(c.MaxConcurrentForProject)),
+        };
+    }
 
     private static AuditSeverity ParseSeverity(string? s) => s?.ToLowerInvariant() switch
     {

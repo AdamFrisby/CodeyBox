@@ -500,6 +500,8 @@ internal static class WorkItemEndpoints
     {
         if (string.IsNullOrWhiteSpace(body.Reason))
             return Results.BadRequest(new { error = "reason is required" });
+        if (body.Reason.Any(char.IsControl))
+            return Results.BadRequest(new { error = "reason must not contain control characters" });
         if (body.Reason.Length > 500)
             return Results.BadRequest(new { error = "reason must be <= 500 chars" });
 
@@ -522,12 +524,16 @@ internal static class WorkItemEndpoints
         IWebhookDispatcher webhooks,
         CancellationToken ct)
     {
+        var wasRunning = queueController.State == QueueState.Running;
         await queueController.ResumeAsync(ct);
-        _ = webhooks.PublishAsync(new WebhookEvent
+        if (!wasRunning)
         {
-            Event = "queue.resumed",
-            Details = new { resumedAt = DateTimeOffset.UtcNow },
-        }, CancellationToken.None);
+            _ = webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "queue.resumed",
+                Details = new { resumedAt = DateTimeOffset.UtcNow },
+            }, CancellationToken.None);
+        }
         return Results.Ok(new
         {
             state = queueController.State.ToString(),

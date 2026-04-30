@@ -264,13 +264,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // appears as state=Queued to the next worker's state-based query. Querying
         // on started_at IS NOT NULL makes the write inside the lock immediately
         // visible, preventing the concurrent cap from being exceeded.
-        // Terminal states excluded: Done=6, Failed=100, Cancelled=101, AuditFailed=102
+        // Terminal states excluded; use cast enum values so renumbering is caught at compile time.
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
+        cmd.CommandText = $"""
             SELECT COUNT(*) FROM work_items
             WHERE project_id = $pid
               AND started_at IS NOT NULL
-              AND state NOT IN (6, 100, 101, 102);
+              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);
