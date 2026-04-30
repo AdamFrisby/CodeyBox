@@ -1,6 +1,7 @@
 @page "/work-items/{Id}/edit"
 @inject ICodeyBoxApiClient ApiClient
 @inject NavigationManager Nav
+@inject ILogger<EditWorkItem> Logger
 
 <PageTitle>Edit Work Item — CodeyBox Admin</PageTitle>
 
@@ -109,8 +110,9 @@ else
                 .OrderBy(a => a)
                 .ToList()!;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Logger.LogError(ex, "Failed to load work item {Id}", Id);
             _error = "Failed to load work item. Check server logs for details.";
         }
     }
@@ -133,8 +135,9 @@ else
             else
                 _error = "Item is no longer in Queued state and cannot be edited.";
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Logger.LogError(ex, "Failed to save work item {Id}", Id);
             _error = "Save failed. Check server logs for details.";
         }
         finally

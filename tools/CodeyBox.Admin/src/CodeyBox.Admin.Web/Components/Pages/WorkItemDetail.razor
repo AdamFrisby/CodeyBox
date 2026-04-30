@@ -1,6 +1,7 @@
 @page "/work-items/{Id}"
 @inject ICodeyBoxApiClient ApiClient
 @inject NavigationManager Nav
+@inject ILogger<WorkItemDetail> Logger
 
 <PageTitle>Work Item — CodeyBox Admin</PageTitle>
 
@@ -99,8 +100,9 @@ else
             _item = await ApiClient.GetWorkItemAsync(Id);
             _notFound = _item is null;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Logger.LogError(ex, "Failed to load work item {Id}", Id);
             _error = "Failed to load work item. Check server logs for details.";
         }
     }

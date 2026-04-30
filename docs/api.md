@@ -132,6 +132,36 @@ Reorder the set of **Queued** work items. The body must list **exactly** the cur
 * The order of `ids` sets the new queue priority: index 0 = highest priority.
 * Items not in `Queued` state are unaffected even if their IDs appear in the body (the store's conditional update skips non-Queued rows).
 
+### `GET /projects`
+
+List all configured projects.
+
+Response: `200 OK` with a JSON array of project records:
+
+```json
+[
+  {
+    "id": "my-app",
+    "displayName": "My App",
+    "repositoryUrl": "/repos/my-app",
+    "defaultBaseBranch": "main",
+    "defaultAgent": "claude",
+    "upstreamKind": "None",
+    "auditLanguages": [],
+    "auditTypes": [],
+    "auditMaxIterations": 3
+  }
+]
+```
+
+### `GET /projects/{id}`
+
+Fetch a single project by its id.
+
+* Returns `200 OK` with the project record.
+* Returns `400 Bad Request` if `id` is not a valid project identifier.
+* Returns `404 Not Found` if the project does not exist.
+
 ### `GET /healthz`
 
 Liveness probe. Returns `{ "status": "ok" }`.
