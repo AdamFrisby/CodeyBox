@@ -642,3 +642,6 @@ namespace CodeyBox.Api
         public long MaxFileSizeBytes { get; set; } = 100 * 1024 * 1024;
     }
 }
+
+// Exposed for WebApplicationFactory<Program> in integration tests.
+public partial class Program { }

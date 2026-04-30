@@ -13,7 +13,7 @@ builder.Services.AddRazorComponents()
 
 var apiBaseUrl = builder.Configuration.GetValue<string>("CodeyBoxAdmin:ApiBaseUrl")
     ?? "http://localhost:5050";
-var requireAuth = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:RequireAuth", true);
+var requireAuth = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:RequireAuth", false);
 
 // Always register auth so AuthorizeRouteView works regardless of RequireAuth setting.
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
@@ -103,7 +103,10 @@ app.MapPost("/account/login", async (HttpContext ctx) =>
     var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
     await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
 
-    var redirect = !string.IsNullOrEmpty(returnUrl) && returnUrl.StartsWith('/')
+    var redirect = !string.IsNullOrEmpty(returnUrl) &&
+        returnUrl.StartsWith('/') &&
+        !returnUrl.StartsWith("//") &&
+        Uri.TryCreate(returnUrl, UriKind.Relative, out _)
         ? returnUrl
         : "/";
     return Results.Redirect(redirect);
@@ -120,6 +123,8 @@ app.MapPost("/account/logout", async (HttpContext ctx) =>
 // The forms include <AntiforgeryToken /> so the UseAntiforgery() middleware validates the token.
 // When RequireAuth=true, RequireAuthorization() is chained to block unauthenticated callers;
 // the SameSite=Strict auth cookie also prevents cross-site request forgery.
+var moveLogger = app.Services.GetRequiredService<ILoggerFactory>()
+    .CreateLogger("CodeyBox.Admin.Move");
 var moveEndpoint = app.MapPost("/admin/move/{id}/{direction}",
     async (string id, string direction, CodeyBoxApiClient apiClient) =>
     {
@@ -138,7 +143,10 @@ var moveEndpoint = app.MapPost("/admin/move/{id}/{direction}",
             if (idx >= 0)
                 await apiClient.ReorderWorkItemsAsync(queued.Select(i => i.Id).ToList());
         }
-        catch { /* best-effort; redirect either way */ }
+        catch (Exception ex)
+        {
+            moveLogger.LogWarning(ex, "No-JS reorder for item {ItemId} direction={Direction} failed", id, direction);
+        }
         return Results.Redirect("/");
     });
 

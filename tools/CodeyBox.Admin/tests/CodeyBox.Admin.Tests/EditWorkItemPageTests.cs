@@ -10,17 +10,17 @@ public sealed class EditWorkItemPageTests : TestContext
 {
     private static WorkItemDto MakeItem(string id, string title, string state = "Queued",
         string prompt = "Original prompt") => new()
-    {
-        Id = id,
-        ProjectId = "proj",
-        Title = title,
-        Prompt = prompt,
-        Agent = "claude",
-        State = state,
-        CreatedAt = DateTimeOffset.UtcNow,
-        UpdatedAt = DateTimeOffset.UtcNow,
-        QueuePosition = 1,
-    };
+        {
+            Id = id,
+            ProjectId = "proj",
+            Title = title,
+            Prompt = prompt,
+            Agent = "claude",
+            State = state,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            QueuePosition = 1,
+        };
 
     [Fact]
     public void EditWorkItem_QueuedItem_ShowsForm()

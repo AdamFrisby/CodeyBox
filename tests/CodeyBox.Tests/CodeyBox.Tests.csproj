@@ -20,10 +20,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.7" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.7" />
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeyBox.Api\CodeyBox.Api.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />

@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Http.Json;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -143,5 +145,135 @@ public sealed class PatchWorkItemTests : IDisposable
         Assert.True(written);
         var read = await _store.GetAsync(item.Id);
         Assert.Equal(42L, read!.QueuePosition);
+    }
+}
+
+/// <summary>
+/// HTTP-level tests for PATCH /workitems/{id}. Verifies status codes returned by
+/// the real endpoint handler — routing, validation, and state-guard paths.
+/// A fresh server + store is created per test method for isolation.
+/// </summary>
+public sealed class PatchWorkItemHttpTests : IDisposable
+{
+    private readonly WorkItemApiFactory _factory = new();
+    private readonly HttpClient _client;
+
+    public PatchWorkItemHttpTests()
+    {
+        _client = _factory.CreateClient();
+    }
+
+    public void Dispose()
+    {
+        _client.Dispose();
+        _factory.Dispose();
+    }
+
+    private static WorkItem QueuedItem() => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("proj"),
+        Title = "Original",
+        Prompt = "Original prompt",
+        Agent = AgentKind.Claude,
+        State = WorkItemState.Queued,
+    };
+
+    [Fact]
+    public async Task Patch_WhenQueued_Returns200Ok()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { title = "Updated Title" });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_WhenNotQueued_Returns409Conflict()
+    {
+        var item = QueuedItem() with { State = WorkItemState.Working };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { title = "Updated" });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_WhenAuditing_Returns409Conflict()
+    {
+        var item = QueuedItem() with { State = WorkItemState.Auditing };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { title = "Updated" });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_UnknownAgent_Returns400BadRequest()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { agent = "unknown-agent-xyz" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_OversizedTitle_Returns400BadRequest()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { title = new string('x', 201) });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_OversizedPrompt_Returns400BadRequest()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { prompt = new string('p', 65 * 1024 + 1) });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_NotFound_Returns404()
+    {
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{Guid.NewGuid()}",
+            new { title = "Anything" });
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_InvalidId_Returns400()
+    {
+        var response = await _client.PatchAsJsonAsync(
+            "/workitems/not-a-guid",
+            new { title = "Anything" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 }
