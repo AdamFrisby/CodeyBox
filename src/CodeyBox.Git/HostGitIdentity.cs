@@ -16,8 +16,8 @@ public static class HostGitIdentityReader
     /// <param name="homeDir">Override for $HOME, used in tests to point at a synthetic .gitconfig.</param>
     public static HostGitIdentity? Read(ILogger? log = null, string? homeDir = null)
     {
-        var name = RunGitConfig("user.name", homeDir);
-        var email = RunGitConfig("user.email", homeDir);
+        var name = RunGitConfig("user.name", homeDir, log);
+        var email = RunGitConfig("user.email", homeDir, log);
 
         if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(email))
         {
@@ -32,7 +32,7 @@ public static class HostGitIdentityReader
         return new HostGitIdentity(name, email);
     }
 
-    private static string? RunGitConfig(string key, string? homeDir)
+    private static string? RunGitConfig(string key, string? homeDir, ILogger? log = null)
     {
         try
         {
@@ -59,8 +59,9 @@ public static class HostGitIdentityReader
             }
             return p.ExitCode == 0 ? output.Trim() : null;
         }
-        catch
+        catch (Exception ex)
         {
+            log?.LogDebug(ex, "Failed to read git config {Key} (git may not be installed or accessible)", key);
             return null;
         }
     }
