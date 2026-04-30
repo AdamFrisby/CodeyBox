@@ -51,9 +51,11 @@ else
                         {
                             <a href="/work-items/@item.Id/edit" class="btn">edit</a>
                             <form method="post" action="/admin/move/@item.Id/up" style="display:inline">
+                                <AntiforgeryToken />
                                 <button type="submit" class="btn btn-up" title="Move up">▲</button>
                             </form>
                             <form method="post" action="/admin/move/@item.Id/down" style="display:inline">
+                                <AntiforgeryToken />
                                 <button type="submit" class="btn btn-down" title="Move down">▼</button>
                             </form>
                         }

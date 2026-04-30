@@ -413,6 +413,12 @@ internal static class WorkItemEndpoints
         if (!written)
             return Results.Conflict(new { error = "item transitioned out of Queued state before the update could be written" });
 
+        AuditLog.WorkItemPatched(
+            updated.Id,
+            titleChanged: body.Title is not null,
+            promptChanged: body.Prompt is not null,
+            agentChanged: body.Agent is not null);
+
         var project = await projects.GetAsync(updated.ProjectId, ct);
         return Results.Ok(ToDto(updated, project, new Dictionary<WorkItemId, WorkItemState>()));
     }
@@ -427,6 +433,9 @@ internal static class WorkItemEndpoints
         CancellationToken ct)
     {
         var rawIds = req.Ids ?? [];
+
+        if (rawIds.Length > 1000)
+            return Results.BadRequest(new { error = "ids array must contain at most 1000 items" });
 
         // Parse IDs
         var parsedIds = new List<WorkItemId>(rawIds.Length);
@@ -463,6 +472,7 @@ internal static class WorkItemEndpoints
         }
 
         await store.ReorderAsync(parsedIds, ct);
+        AuditLog.WorkItemReordered(parsedIds.Count);
         return Results.NoContent();
     }
 

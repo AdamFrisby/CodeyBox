@@ -1,3 +1,7 @@
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using CodeyBox.Admin.Web.Services;
@@ -9,7 +13,7 @@ builder.Services.AddRazorComponents()
 
 var apiBaseUrl = builder.Configuration.GetValue<string>("CodeyBoxAdmin:ApiBaseUrl")
     ?? "http://localhost:5050";
-var requireAuth = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:RequireAuth", false);
+var requireAuth = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:RequireAuth", true);
 
 // Always register auth so AuthorizeRouteView works regardless of RequireAuth setting.
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
@@ -17,6 +21,10 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     {
         opts.LoginPath = "/login";
         opts.AccessDeniedPath = "/login";
+        // Strict prevents the auth cookie from being sent on any cross-site request.
+        opts.Cookie.SameSite = SameSiteMode.Strict;
+        opts.Cookie.HttpOnly = true;
+        opts.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
     });
 
 if (requireAuth)
@@ -56,26 +64,86 @@ app.UseAntiforgery();
 app.UseAuthentication();
 app.UseAuthorization();
 
-// No-JS reorder: form POST from ▲/▼ buttons in Index.razor.
-// DisableAntiforgery because the form submits via a full HTTP round-trip; the internal admin
-// network trust model (same as the rest of the dashboard) is the CSRF boundary here.
-app.MapPost("/admin/move/{id}/{direction}", async (string id, string direction, CodeyBoxApiClient apiClient) =>
+// Defensive response headers on every response.
+app.Use(async (ctx, next) =>
 {
-    try
+    ctx.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    ctx.Response.Headers["X-Frame-Options"] = "DENY";
+    // Blazor Server requires 'unsafe-inline' for its bootstrap script and wss:/ws: for SignalR.
+    ctx.Response.Headers["Content-Security-Policy"] =
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:; frame-ancestors 'none'";
+    ctx.Response.Headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
+    await next();
+});
+
+// Cookie-based login — credentials read exclusively from env vars (CODEYBOX_ADMIN_USERNAME /
+// CODEYBOX_ADMIN_PASSWORD), never from config files or code.
+// Login.razor includes <AntiforgeryToken />, so antiforgery is enforced without DisableAntiforgery().
+app.MapPost("/account/login", async (HttpContext ctx) =>
+{
+    var form = await ctx.Request.ReadFormAsync();
+    var username = form["username"].ToString().Trim();
+    var password = form["password"].ToString();
+    var returnUrl = form["returnUrl"].ToString();
+
+    var expectedUsername = Environment.GetEnvironmentVariable("CODEYBOX_ADMIN_USERNAME") ?? "admin";
+    var expectedPassword = Environment.GetEnvironmentVariable("CODEYBOX_ADMIN_PASSWORD") ?? "";
+
+    // Timing-safe comparison prevents oracle attacks on credential length/prefix.
+    var usernameOk = CryptographicOperations.FixedTimeEquals(
+        Encoding.UTF8.GetBytes(username), Encoding.UTF8.GetBytes(expectedUsername));
+    var passwordOk = !string.IsNullOrEmpty(expectedPassword) &&
+        CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(password), Encoding.UTF8.GetBytes(expectedPassword));
+
+    if (!usernameOk || !passwordOk)
+        return Results.Redirect("/login?error=1");
+
+    var claims = new[] { new Claim(ClaimTypes.Name, username) };
+    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+    await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
+
+    var redirect = !string.IsNullOrEmpty(returnUrl) && returnUrl.StartsWith('/')
+        ? returnUrl
+        : "/";
+    return Results.Redirect(redirect);
+}).AllowAnonymous();
+
+// Logout — clears the session cookie and returns to login page.
+app.MapPost("/account/logout", async (HttpContext ctx) =>
+{
+    await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    return Results.Redirect("/login");
+});
+
+// No-JS reorder: form POST from ▲/▼ buttons in Index.razor.
+// The forms include <AntiforgeryToken /> so the UseAntiforgery() middleware validates the token.
+// When RequireAuth=true, RequireAuthorization() is chained to block unauthenticated callers;
+// the SameSite=Strict auth cookie also prevents cross-site request forgery.
+var moveEndpoint = app.MapPost("/admin/move/{id}/{direction}",
+    async (string id, string direction, CodeyBoxApiClient apiClient) =>
     {
-        var items = await apiClient.GetWorkItemsAsync();
-        var queued = items.Where(i => i.IsQueued).OrderBy(i => i.QueuePosition).ToList();
-        var idx = queued.FindIndex(i => i.Id == id);
-        if (direction == "up" && idx > 0)
-            (queued[idx - 1], queued[idx]) = (queued[idx], queued[idx - 1]);
-        else if (direction == "down" && idx >= 0 && idx < queued.Count - 1)
-            (queued[idx], queued[idx + 1]) = (queued[idx + 1], queued[idx]);
-        if (idx >= 0)
-            await apiClient.ReorderWorkItemsAsync(queued.Select(i => i.Id).ToList());
-    }
-    catch { /* best-effort; redirect either way */ }
-    return Results.Redirect("/");
-}).DisableAntiforgery();
+        if (direction is not "up" and not "down")
+            return Results.BadRequest(new { error = "direction must be 'up' or 'down'" });
+
+        try
+        {
+            var items = await apiClient.GetWorkItemsAsync();
+            var queued = items.Where(i => i.IsQueued).OrderBy(i => i.QueuePosition).ToList();
+            var idx = queued.FindIndex(i => i.Id == id);
+            if (direction == "up" && idx > 0)
+                (queued[idx - 1], queued[idx]) = (queued[idx], queued[idx - 1]);
+            else if (direction == "down" && idx >= 0 && idx < queued.Count - 1)
+                (queued[idx], queued[idx + 1]) = (queued[idx + 1], queued[idx]);
+            if (idx >= 0)
+                await apiClient.ReorderWorkItemsAsync(queued.Select(i => i.Id).ToList());
+        }
+        catch { /* best-effort; redirect either way */ }
+        return Results.Redirect("/");
+    });
+
+if (requireAuth)
+    moveEndpoint.RequireAuthorization();
 
 app.MapRazorComponents<CodeyBox.Admin.Web.Components.App>()
    .AddInteractiveServerRenderMode();

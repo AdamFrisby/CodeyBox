@@ -142,6 +142,8 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     private List<WorkItemDto> _items;
     private List<ProjectDto> _projects;
 
+    public int GetWorkItemCallCount { get; private set; }
+
     public FakeApiClient(List<WorkItemDto> items, List<ProjectDto>? projects = null)
     {
         _items = items;
@@ -152,7 +154,10 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         => Task.FromResult(_items);
 
     public Task<WorkItemDto?> GetWorkItemAsync(string id, CancellationToken ct = default)
-        => Task.FromResult(_items.FirstOrDefault(i => i.Id == id));
+    {
+        GetWorkItemCallCount++;
+        return Task.FromResult(_items.FirstOrDefault(i => i.Id == id));
+    }
 
     public Task<List<ProjectDto>> GetProjectsAsync(CancellationToken ct = default)
         => Task.FromResult(_projects);

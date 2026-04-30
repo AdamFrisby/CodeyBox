@@ -64,7 +64,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         try
         {
             using var m = _conn.CreateCommand();
-            m.CommandText = sql; // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals; no user-supplied input reaches this method
+            m.CommandText = sql;
             m.ExecuteNonQuery();
         }
         catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))

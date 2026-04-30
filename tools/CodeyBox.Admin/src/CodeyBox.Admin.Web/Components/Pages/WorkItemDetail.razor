@@ -4,15 +4,19 @@
 
 <PageTitle>Work Item — CodeyBox Admin</PageTitle>
 
-@if (_item is null && _error is null)
+@if (_notFound)
 {
-    <p>Loading…</p>
+    <p class="error-banner">Work item not found.</p>
 }
 else if (_error is not null)
 {
     <p class="error-banner">@_error</p>
 }
-else if (_item is not null)
+else if (_item is null)
+{
+    <p>Loading…</p>
+}
+else
 {
     <h1>@_item.Title</h1>
 
@@ -69,11 +73,6 @@ else if (_item is not null)
         <summary>Prompt</summary>
         <pre class="prompt-text">@_item.Prompt</pre>
     </details>
-
-    @if (_notFound)
-    {
-        <p class="error-banner">Work item not found.</p>
-    }
 }
 
 @code {
@@ -82,14 +81,12 @@ else if (_item is not null)
     private WorkItemDto? _item;
     private string? _error;
     private bool _notFound;
-
-    protected override async Task OnInitializedAsync()
-    {
-        await LoadAsync();
-    }
+    private string? _loadedId;
 
     protected override async Task OnParametersSetAsync()
     {
+        if (Id == _loadedId) return;
+        _loadedId = Id;
         await LoadAsync();
     }
 
@@ -102,9 +99,9 @@ else if (_item is not null)
             _item = await ApiClient.GetWorkItemAsync(Id);
             _notFound = _item is null;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            _error = ex.Message;
+            _error = "Failed to load work item. Check server logs for details.";
         }
     }
 

@@ -4,15 +4,19 @@
 
 <PageTitle>Edit Work Item — CodeyBox Admin</PageTitle>
 
-@if (_item is null && _error is null)
-{
-    <p>Loading…</p>
-}
-else if (_notFound)
+@if (_notFound)
 {
     <p class="error-banner">Work item not found.</p>
 }
-else if (_item is not null && !_item.IsQueued)
+else if (_item is null && _error is null)
+{
+    <p>Loading…</p>
+}
+else if (_item is null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (!_item.IsQueued)
 {
     <div class="error-banner">
         <p>This item is in state <strong>@_item.State</strong> and cannot be edited.</p>
@@ -20,7 +24,7 @@ else if (_item is not null && !_item.IsQueued)
         <a href="/work-items/@Id" class="btn">Back</a>
     </div>
 }
-else if (_item is not null)
+else
 {
     <h1>Edit: @_item.Title</h1>
 
@@ -48,9 +52,10 @@ else if (_item is not null)
             <label for="agent">Agent</label>
             <InputSelect id="agent" @bind-Value="_form.Agent" class="form-control">
                 <option value="">(project default)</option>
-                <option value="claude">claude</option>
-                <option value="copilot">copilot</option>
-                <option value="codex">codex</option>
+                @foreach (var agent in _availableAgents)
+                {
+                    <option value="@agent">@agent</option>
+                }
             </InputSelect>
         </div>
 
@@ -71,14 +76,13 @@ else if (_item is not null)
     private string? _error;
     private bool _submitting;
     private bool _notFound;
-
-    protected override async Task OnInitializedAsync()
-    {
-        await LoadAsync();
-    }
+    private string? _loadedId;
+    private List<string> _availableAgents = [];
 
     protected override async Task OnParametersSetAsync()
     {
+        if (Id == _loadedId) return;
+        _loadedId = Id;
         await LoadAsync();
     }
 
@@ -88,15 +92,26 @@ else if (_item is not null)
         _notFound = false;
         try
         {
-            _item = await ApiClient.GetWorkItemAsync(Id);
-            if (_item is null) { _notFound = true; return; }
+            var itemTask = ApiClient.GetWorkItemAsync(Id);
+            var projectsTask = ApiClient.GetProjectsAsync();
+            await Task.WhenAll(itemTask, projectsTask);
+            var item = await itemTask;
+            var projects = await projectsTask;
+            if (item is null) { _notFound = true; return; }
+            _item = item;
             _form.Title = _item.Title;
             _form.Prompt = _item.Prompt;
             _form.Agent = _item.Agent;
+            _availableAgents = projects
+                .Select(p => p.DefaultAgent)
+                .Where(a => !string.IsNullOrEmpty(a))
+                .Distinct()
+                .OrderBy(a => a)
+                .ToList()!;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            _error = ex.Message;
+            _error = "Failed to load work item. Check server logs for details.";
         }
     }
 
@@ -118,9 +133,9 @@ else if (_item is not null)
             else
                 _error = "Item is no longer in Queued state and cannot be edited.";
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            _error = ex.Message;
+            _error = "Save failed. Check server logs for details.";
         }
         finally
         {
@@ -135,6 +150,7 @@ else if (_item is not null)
         public string Title { get; set; } = "";
 
         [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Prompt is required.")]
+        [System.ComponentModel.DataAnnotations.MaxLength(65536, ErrorMessage = "Prompt must be ≤ 64 KB.")]
         public string Prompt { get; set; } = "";
 
         public string? Agent { get; set; }
