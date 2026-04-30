@@ -338,7 +338,7 @@ builder.Services.AddHttpClient("agent-quota", client =>
 builder.Services.AddHttpClient("agent-smoke", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(15);
-});
+}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
 
 // --- Quota probes ------------------------------------------------------------
 // Registered as IEnumerable<IAgentQuotaProbe>; the router resolves by Kind.

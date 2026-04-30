@@ -6,8 +6,7 @@ namespace CodeyBox.Core;
 /// fast (≤5 s happy path) and must not log the authorization header or
 /// the credential values.
 ///
-/// Not every runner has a sensible probe. The parallel interface
-/// <see cref="IAgentSmokeProbe"/> is kept separate from
+/// Not every runner has a sensible probe. This interface is kept separate from
 /// <see cref="IAgentRunner"/> so agents without a probe (e.g. Copilot)
 /// simply have no registered implementation, and the smoke gate skips them.
 /// </summary>

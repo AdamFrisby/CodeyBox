@@ -131,6 +131,10 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 smokeResult = await _smokeGate.CheckAsync(agentKind, ct);
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 _log.LogDebug(ex, "Smoke gate check threw for {Agent}; skipping gate", agentKind.Value);
@@ -140,6 +144,17 @@ public sealed class PipelineRunner : IPipelineRunner
             if (smokeResult is { Ok: false })
             {
                 AuditLog.AgentSmokeFailed(agentKind, smokeResult.FailureReason, smokeResult.Duration);
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.smoke_failed",
+                    WorkItem = item,
+                    Project = project,
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = agentKind.Value,
+                        Reason = smokeResult.FailureReason,
+                    },
+                }, CancellationToken.None);
                 await TransitionFailed(item,
                     $"credential smoke test failed: {smokeResult.FailureReason}",
                     CancellationToken.None, project);

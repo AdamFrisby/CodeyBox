@@ -124,8 +124,10 @@ automatically re-queues the item.
 
 ### `agent_smoke_failed` details
 
-When `event` is `agent.smoke_failed`, both `workItem` and `project` are `null`
-(startup probes have no work-item context). The `details` field is populated:
+When `event` is `agent.smoke_failed`, the `details` field is always populated.
+`workItem` and `project` are `null` when the event fires at **startup** (no
+work-item context). At **work-item pickup**, both `workItem` and `project` are
+populated with the affected item and its project.
 
 ```json
 {

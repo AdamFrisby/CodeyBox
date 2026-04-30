@@ -28,10 +28,10 @@ public static class SmokeCredentialFingerprint
     public static string Compute(AgentCredential credential)
     {
         var sb = new StringBuilder();
-        foreach (var (_, v) in credential.EnvironmentVariables.OrderBy(x => x.Key, StringComparer.Ordinal))
-            sb.Append(v).Append('\0');
-        foreach (var (_, v) in credential.Files.OrderBy(x => x.Key, StringComparer.Ordinal))
-            sb.Append(v).Append('\0');
+        foreach (var (k, v) in credential.EnvironmentVariables.OrderBy(x => x.Key, StringComparer.Ordinal))
+            sb.Append(k).Append('\0').Append(v).Append('\0');
+        foreach (var (k, v) in credential.Files.OrderBy(x => x.Key, StringComparer.Ordinal))
+            sb.Append(k).Append('\0').Append(v).Append('\0');
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
     }
 }

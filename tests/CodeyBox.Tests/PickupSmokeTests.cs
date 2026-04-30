@@ -180,6 +180,20 @@ public sealed class PickupSmokeTests : IDisposable
         Assert.Contains(r.Webhooks.Events, e => e.Event == "work_item.failed");
     }
 
+    [Fact]
+    public async Task SmokeGateFail_AgentSmokeFailedWebhookFires()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var (gate, _) = SmokeGateFactory.Build(probePass: false);
+        using var r = BuildResources(seed, gate);
+
+        var item = NewItem();
+        await r.Store.CreateAsync(item);
+        await r.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.Contains(r.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
     // ── Gate bypass (project opts out) ────────────────────────────────────────
 
     [Fact]
