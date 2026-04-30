@@ -266,18 +266,49 @@ builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 // Each agent's API key has a per-agent host env var that maps to the
 // canonical sandbox env var the agent CLI reads. Operators add new agents
 // by appending to this list (or registering a different ICredentialProvider).
-builder.Services.AddSingleton<ICredentialProvider>(_ => new EnvironmentCredentialProvider(new[]
+//
+// The chain reads Claude's OAuth token fresh from a JSON file (default
+// ~/.claude/.credentials.json, the path the local `claude` CLI refreshes
+// in-place) on every pickup, so a host-side token rotation is picked up
+// without an orchestrator restart. If the file is absent or empty, the
+// env-var provider supplies the value the host launcher exported.
+builder.Services.AddSingleton<ICredentialProvider>(sp =>
 {
-    // Claude Code accepts either ANTHROPIC_API_KEY (real API key, format
-    // sk-ant-api03-…) or CLAUDE_CODE_OAUTH_TOKEN (OAuth access token,
-    // format sk-ant-oat01-…). Default mapping is OAuth so subscription
-    // users (Pro/Max/Team/Enterprise) can run without a separate API
-    // key. Operators with a raw API key can change the in-sandbox name
-    // to ANTHROPIC_API_KEY here.
-    new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
-    new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
-    new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
-}));
+    var providers = new List<ICredentialProvider>();
+
+    var oauthFile =
+        Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_OAUTH_FILE")
+        ?? builder.Configuration["CodeyBox:ClaudeOAuthFile"];
+
+    if (!string.IsNullOrWhiteSpace(oauthFile))
+    {
+        // Expand a leading ~ to $HOME for ergonomic config like
+        // "~/.claude/.credentials.json".
+        if (oauthFile.StartsWith("~/", StringComparison.Ordinal))
+            oauthFile = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                oauthFile[2..]);
+        providers.Add(new ClaudeOAuthFileCredentialProvider(
+            oauthFile,
+            sandboxEnvVar: "CLAUDE_CODE_OAUTH_TOKEN",
+            sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
+    }
+
+    providers.Add(new EnvironmentCredentialProvider(new[]
+    {
+        // Claude Code accepts either ANTHROPIC_API_KEY (real API key, format
+        // sk-ant-api03-…) or CLAUDE_CODE_OAUTH_TOKEN (OAuth access token,
+        // format sk-ant-oat01-…). Default mapping is OAuth so subscription
+        // users (Pro/Max/Team/Enterprise) can run without a separate API
+        // key. Operators with a raw API key can change the in-sandbox name
+        // to ANTHROPIC_API_KEY here.
+        new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+        new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
+        new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
+    }));
+
+    return new ChainedCredentialProvider(providers);
+});
 
 // --- HTTP clients ------------------------------------------------------------
 // Named client for GitHub upstream. GitHub requires a User-Agent header.
