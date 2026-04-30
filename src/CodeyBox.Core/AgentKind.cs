@@ -9,6 +9,7 @@ public readonly record struct AgentKind(string Value)
     public static AgentKind Claude { get; } = new("claude");
     public static AgentKind Copilot { get; } = new("copilot");
     public static AgentKind Codex { get; } = new("codex");
+    public static AgentKind Gemini { get; } = new("gemini");
 
     public override string ToString() => Value;
 }

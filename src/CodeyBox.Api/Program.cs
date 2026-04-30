@@ -3,6 +3,7 @@ using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
+using CodeyBox.Agents.Gemini;
 using CodeyBox.Api;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
@@ -260,6 +261,7 @@ builder.Services.AddSingleton<IPullRequestService, InMemoryPullRequestService>()
 builder.Services.AddSingleton<IAgentRunner, ClaudeAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CopilotAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 
 // --- Credentials -------------------------------------------------------------
@@ -305,6 +307,7 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
         new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
     }));
 
     return new ChainedCredentialProvider(providers);
@@ -499,7 +502,7 @@ namespace CodeyBox.Api
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public string SandboxImageReference { get; set; } = "codeybox/agent:latest";
-        public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com"];
+        public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com", "generativelanguage.googleapis.com"];
         /// <summary>
         /// Legacy concurrency knob. If set, treated as
         /// <see cref="WorkerPool"/>.<see cref="WorkerPoolOptions.MaxConcurrentWorkers"/>

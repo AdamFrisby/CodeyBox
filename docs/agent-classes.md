@@ -51,7 +51,7 @@ Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `Agent` | yes | Agent kind value: `claude`, `codex`, `copilot`, or any custom kind. |
+| `Agent` | yes | Agent kind value: `claude`, `codex`, `copilot`, `gemini`, or any custom kind. |
 | `Billing` | yes | `Subscription` or `PayPerApi` (see below). |
 | `ModelId` | no | Optional model override passed to the agent CLI. Reserved for CLIs that accept a `--model` flag; currently advisory. |
 
