@@ -154,7 +154,7 @@ public sealed class StuckRecoveryTests : IDisposable
 
         var stuckEvent = tp.Webhooks.Events.FirstOrDefault(e => e.Event == "work_item.agent_stuck");
         Assert.NotNull(stuckEvent);
-        Assert.Equal(item.Id, stuckEvent!.WorkItem.Id);
+        Assert.Equal(item.Id, stuckEvent!.WorkItem!.Id);
 
         var details = stuckEvent.Details as AgentStuckDetails;
         Assert.NotNull(details);

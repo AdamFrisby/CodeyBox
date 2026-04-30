@@ -44,6 +44,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWebhookDispatcher _webhooks;
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
+    private readonly CredentialSmokeGate? _smokeGate;
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -75,7 +76,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IWorkItemStore store,
         IWebhookDispatcher webhooks,
         PipelineOptions opts,
-        ILogger<PipelineRunner> log)
+        ILogger<PipelineRunner> log,
+        CredentialSmokeGate? smokeGate = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -89,6 +91,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _webhooks = webhooks;
         _opts = opts;
         _log = log;
+        _smokeGate = smokeGate;
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct)
@@ -115,6 +118,51 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             await TransitionFailed(item, $"No runner registered for agent '{agentKind}'", CancellationToken.None, project);
             return;
+        }
+
+        // ── Credential smoke gate ────────────────────────────────────────────────
+        // Run before ANY sandbox is allocated. Skipped when the project opts out
+        // (e.g. Copilot), when the gate is disabled globally, or when no probe is
+        // registered for this agent. Results are cached per-credential-fingerprint.
+        if (_smokeGate is not null && !project.SkipCredentialSmokeTest)
+        {
+            AgentSmokeResult? smokeResult;
+            try
+            {
+                smokeResult = await _smokeGate.CheckAsync(agentKind, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Smoke gate check threw for {Agent}; skipping gate", agentKind.Value);
+                smokeResult = null;
+            }
+
+            if (smokeResult is { Ok: false })
+            {
+                AuditLog.AgentSmokeFailed(agentKind, smokeResult.FailureReason, smokeResult.Duration);
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.smoke_failed",
+                    WorkItem = item,
+                    Project = project,
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = agentKind.Value,
+                        Reason = smokeResult.FailureReason,
+                    },
+                }, CancellationToken.None);
+                await TransitionFailed(item,
+                    $"credential smoke test failed: {smokeResult.FailureReason}",
+                    CancellationToken.None, project);
+                return;
+            }
+
+            if (smokeResult is { Ok: true })
+                AuditLog.AgentSmokeSucceeded(agentKind, smokeResult.Duration);
         }
 
         try

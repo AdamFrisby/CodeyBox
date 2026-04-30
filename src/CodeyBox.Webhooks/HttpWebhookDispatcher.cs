@@ -159,21 +159,22 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
 
     public static string BuildPayload(WebhookEvent evt)
     {
-        var repoUrl = StripUserInfo(evt.Project.RepositoryUrl);
+        var repoUrl = evt.Project?.RepositoryUrl is { } url ? StripUserInfo(url) : null;
         var payload = new WebhookPayload(
             Event: evt.Event,
             OccurredAt: evt.OccurredAt,
-            WorkItem: MapWorkItem(evt.WorkItem, repoUrl, evt.Project.DefaultAgent),
-            Project: new WebhookProjectPayload(
-                evt.Project.Id.Value,
-                evt.Project.DisplayName,
-                repoUrl),
+            WorkItem: evt.WorkItem is { } wi && evt.Project is { } p
+                ? MapWorkItem(wi, repoUrl, p.DefaultAgent)
+                : null,
+            Project: evt.Project is { } proj
+                ? new WebhookProjectPayload(proj.Id.Value, proj.DisplayName, repoUrl ?? "")
+                : null,
             Details: evt.Details);
 
         return JsonSerializer.Serialize(payload, JsonOptions);
     }
 
-    private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string repositoryUrl, AgentKind projectDefaultAgent) => new(
+    private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string? repositoryUrl, AgentKind projectDefaultAgent) => new(
         Id: item.Id.ToString(),
         ProjectId: item.ProjectId.Value,
         Title: item.Title,
@@ -224,8 +225,8 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
 internal sealed record WebhookPayload(
     string Event,
     DateTimeOffset OccurredAt,
-    WebhookWorkItemPayload WorkItem,
-    WebhookProjectPayload Project,
+    WebhookWorkItemPayload? WorkItem,
+    WebhookProjectPayload? Project,
     object? Details);
 
 internal sealed record WebhookWorkItemPayload(
