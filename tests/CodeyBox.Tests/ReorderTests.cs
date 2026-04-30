@@ -189,7 +189,13 @@ public sealed class ReorderTests : IDisposable
 /// HTTP-level tests for POST /workitems/reorder. Verifies the endpoint's status codes
 /// and that the queue order actually changes on success. A fresh server + store is
 /// created per test method for isolation.
+///
+/// Joined to <c>GlobalSerilog</c> because <c>WebApplicationFactory</c> startup
+/// runs Program.cs's Serilog bootstrap, which mutates the static
+/// <see cref="Serilog.Log.Logger"/>; this serializes us with other tests that
+/// observe or write to that global.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class ReorderHttpTests : IDisposable
 {
     private readonly WorkItemApiFactory _factory = new();
