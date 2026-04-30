@@ -57,6 +57,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Additive migration: add queue_position for admin-dashboard reorder support.
         // Default 0 = "no explicit position" → store treats as sort-last (behind timestamp-based positions).
         RunMigration("ALTER TABLE work_items ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0;");
+
+        // Additive migration: track automatic re-queues from stuck-agent detection.
+        RunMigration("ALTER TABLE work_items ADD COLUMN stuck_retries INTEGER NOT NULL DEFAULT 0;");
     }
 
     private void RunMigration(string sql)
@@ -83,8 +86,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             cmd.CommandText = """
                 INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
-                    last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position)
-                VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos);
+                    last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
+                    stuck_retries)
+                VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
+                    $sretries);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -108,7 +113,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
-                    agent_class_id = $class_id, queue_position = $qpos
+                    agent_class_id = $class_id, queue_position = $qpos,
+                    stuck_retries = $sretries
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -133,7 +139,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
-                    agent_class_id = $class_id, queue_position = $qpos
+                    agent_class_id = $class_id, queue_position = $qpos,
+                    stuck_retries = $sretries
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -246,6 +253,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             JsonSerializer.Serialize(item.DependsOn.Select(id => id.ToString()).ToList()));
         cmd.Parameters.AddWithValue("$class_id", (object?)item.AgentClassId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$qpos", item.QueuePosition);
+        cmd.Parameters.AddWithValue("$sretries", item.StuckRetries);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -268,6 +276,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         DependsOn = ReadDependsOn(r),
         AgentClassId = r.IsDBNull(r.GetOrdinal("agent_class_id")) ? null : r.GetString(r.GetOrdinal("agent_class_id")),
         QueuePosition = r.GetInt64(r.GetOrdinal("queue_position")),
+        StuckRetries = r.GetInt32(r.GetOrdinal("stuck_retries")),
     };
 
     private static IReadOnlyList<WorkItemId> ReadDependsOn(SqliteDataReader r)

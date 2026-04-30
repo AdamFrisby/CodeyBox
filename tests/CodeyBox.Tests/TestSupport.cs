@@ -257,3 +257,18 @@ internal sealed partial class ScriptedAgent : IAgentRunner
 }
 
 internal sealed record FileWrite(string FileName, string Contents);
+
+/// <summary>
+/// Webhook dispatcher that captures all published events in memory.
+/// Shared across stuck-probe test files.
+/// </summary>
+internal sealed class CapturingWebhookDispatcher : IWebhookDispatcher
+{
+    public List<WebhookEvent> Events { get; } = [];
+
+    public Task PublishAsync(WebhookEvent evt, CancellationToken ct = default)
+    {
+        Events.Add(evt);
+        return Task.CompletedTask;
+    }
+}

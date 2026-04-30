@@ -179,6 +179,60 @@ failing tests. The deterministic diff-pattern auditor catches the most
 common suppression markers; the LLM reviewer catches subtler shortcuts
 by comparing the diff against the original task.
 
+### Stuck-agent detection
+
+```json
+"Audit": {
+  "StuckThresholdMinutes": 10,
+  "AutoRetryOnStuck": false,
+  "MaxStuckRetries": 2
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `StuckThresholdMinutes` | int | — (inherits global 10 min) | Minutes of zero CPU + zero TCP activity before the agent is killed. `0` = disabled for this project. Omit to use the orchestrator global default. |
+| `AutoRetryOnStuck` | bool | `false` | Re-queue the work item from the same phase after a stuck-kill, rather than transitioning to Failed. |
+| `MaxStuckRetries` | int | `2` | Maximum automatic re-queues per work item before the item is marked Failed regardless of `AutoRetryOnStuck`. |
+
+**Resolution order** for `StuckThresholdMinutes`:
+1. Project `Audit.StuckThresholdMinutes` — if explicitly set (including `0` to disable).
+2. Global `CodeyBox:Pipeline:StuckThresholdMinutes` in appsettings (default `10`).
+
+**Constraints**: the effective threshold must be ≥ 1 minute (or 0 to disable).
+A threshold greater than half the phase timeout is not rejected but is
+ineffective — the coarse phase timeout will fire first.
+
+**`AutoRetryOnStuck` behaviour**:
+- On stuck-detection, the work item is transitioned back to the start of the
+  stuck phase (`Queued` for work, `WorkComplete` for rework, `AuditPassed` for
+  merge) and `StuckRetries` is incremented.
+- Once `StuckRetries ≥ MaxStuckRetries`, further stuck-kills transition the
+  item to Failed.
+- Manual retries via `POST /workitems/{id}/retry` do **not** consume the
+  `StuckRetries` budget.
+- The `work_item.agent_stuck` webhook fires on every stuck-kill regardless of
+  whether auto-retry is enabled.
+
+**Example — fast detection, no auto-retry (investigate manually)**:
+```json
+"Audit": { "StuckThresholdMinutes": 5 }
+```
+
+**Example — aggressive auto-recovery**:
+```json
+"Audit": {
+  "StuckThresholdMinutes": 8,
+  "AutoRetryOnStuck": true,
+  "MaxStuckRetries": 3
+}
+```
+
+**Example — probe disabled (manual VM-console investigation)**:
+```json
+"Audit": { "StuckThresholdMinutes": 0 }
+```
+
 ### Per-phase network profiles
 
 Each project can specify which host-enforced network profile applies to

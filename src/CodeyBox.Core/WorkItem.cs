@@ -54,6 +54,13 @@ public sealed record WorkItem
     public int UpstreamPushAttempts { get; init; }
 
     /// <summary>
+    /// Number of times this work item has been automatically re-queued after
+    /// stuck-agent detection. Counts only auto-retries triggered by the stuck
+    /// probe, not manual retries via the API.
+    /// </summary>
+    public int StuckRetries { get; init; }
+
+    /// <summary>
     /// IDs of work items this item depends on. The orchestrator will not pick
     /// this item up until every dependency has reached a terminal state
     /// (Done, Failed, AuditFailed, or Cancelled). Immutable after creation.

@@ -61,6 +61,15 @@ public sealed class ProjectAuditConfig
     public string? FailingSeverity { get; set; }
     public int? PerIterationTimeoutMinutes { get; set; }
     public bool? StopOnFirstFailure { get; set; }
+
+    /// <summary>
+    /// Minutes of zero activity before stuck detection fires.
+    /// null = inherit global default; 0 = disabled; &gt;0 = explicit threshold.
+    /// </summary>
+    public int? StuckThresholdMinutes { get; set; }
+    public bool? AutoRetryOnStuck { get; set; }
+    public int? MaxStuckRetries { get; set; }
+
     public List<string>? Languages { get; set; }
     public List<string>? AuditTypes { get; set; }
     public List<CustomAuditorConfig>? Custom { get; set; }

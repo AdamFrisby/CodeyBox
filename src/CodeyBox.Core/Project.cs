@@ -143,6 +143,23 @@ public sealed record ProjectAudit
     public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(10);
     public bool StopOnFirstFailure { get; init; }
 
+    /// <summary>
+    /// Minutes of zero CPU + zero TCP-connection activity before an agent is
+    /// classified as stuck and killed. -1 = inherit from
+    /// <c>PipelineOptions.StuckThresholdMinutes</c>; 0 = disabled for this project.
+    /// </summary>
+    public int StuckThresholdMinutes { get; init; } = -1;
+
+    /// <summary>
+    /// When true, a stuck-killed work item is automatically re-queued from the
+    /// same phase rather than transitioning to Failed. Capped by
+    /// <see cref="MaxStuckRetries"/> to prevent infinite kill-respawn loops.
+    /// </summary>
+    public bool AutoRetryOnStuck { get; init; }
+
+    /// <summary>Maximum automatic re-queues per work item due to stuck detection.</summary>
+    public int MaxStuckRetries { get; init; } = 2;
+
     public IReadOnlyList<string> Languages { get; init; } = [];
     public IReadOnlyList<string> AuditTypes { get; init; } = [];
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
