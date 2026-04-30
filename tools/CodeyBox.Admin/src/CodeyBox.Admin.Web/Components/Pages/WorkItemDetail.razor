@@ -1,0 +1,126 @@
+@page "/work-items/{Id}"
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+
+<PageTitle>Work Item — CodeyBox Admin</PageTitle>
+
+@if (_item is null && _error is null)
+{
+    <p>Loading…</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_item is not null)
+{
+    <h1>@_item.Title</h1>
+
+    <div class="detail-actions">
+        @if (_item.IsQueued)
+        {
+            <a href="/work-items/@_item.Id/edit" class="btn">Edit</a>
+        }
+        @if (!_item.IsTerminal)
+        {
+            <button class="btn btn-danger" @onclick="CancelAsync">Cancel</button>
+        }
+        @if (_item.State is "Failed" or "AuditFailed" or "Cancelled")
+        {
+            <button class="btn" @onclick="RetryFromWork">Retry from work</button>
+            <button class="btn" @onclick="RetryFromAudit">Retry from audit</button>
+        }
+    </div>
+
+    <table class="detail-table">
+        <tr><th>ID</th><td><code>@_item.Id</code></td></tr>
+        <tr><th>Project</th><td>@_item.ProjectId</td></tr>
+        <tr><th>Agent</th><td>@_item.Agent</td></tr>
+        <tr><th>State</th><td class="state-@_item.State.ToLowerInvariant()">@_item.State</td></tr>
+        <tr><th>Base branch</th><td>@(_item.BaseBranch ?? "(project default)")</td></tr>
+        <tr><th>Work branch</th><td>@(_item.WorkBranch ?? "(auto-generated)")</td></tr>
+        <tr><th>Push upstream</th><td>@(_item.IsQueued ? "yes (queued)" : "n/a")</td></tr>
+        <tr><th>Created</th><td>@_item.CreatedAt.ToString("O")</td></tr>
+        <tr><th>Updated</th><td>@_item.UpdatedAt.ToString("O")</td></tr>
+        <tr><th>Age</th><td>@_item.Age</td></tr>
+        @if (_item.UpstreamPushAttempts > 0)
+        {
+            <tr><th>Push attempts</th><td>@_item.UpstreamPushAttempts</td></tr>
+        }
+        @if (_item.LastError is not null)
+        {
+            <tr><th>Last error</th><td class="last-error">@_item.LastError</td></tr>
+        }
+        @if (_item.DependsOn.Count > 0)
+        {
+            <tr>
+                <th>Depends on</th>
+                <td>
+                    @foreach (var dep in _item.DependsOn)
+                    {
+                        <a href="/work-items/@dep">@dep[..Math.Min(8, dep.Length)]</a><span> </span>
+                    }
+                    @(_item.DependsOnSatisfied ? "(satisfied)" : "(waiting)")
+                </td>
+            </tr>
+        }
+    </table>
+
+    <details class="prompt-collapsible">
+        <summary>Prompt</summary>
+        <pre class="prompt-text">@_item.Prompt</pre>
+    </details>
+
+    @if (_notFound)
+    {
+        <p class="error-banner">Work item not found.</p>
+    }
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private WorkItemDto? _item;
+    private string? _error;
+    private bool _notFound;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadAsync();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        try
+        {
+            _item = await ApiClient.GetWorkItemAsync(Id);
+            _notFound = _item is null;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    private async Task CancelAsync()
+    {
+        await ApiClient.DeleteWorkItemAsync(Id);
+        await LoadAsync();
+    }
+
+    private Task RetryFromWork() => RetryAsync("work");
+    private Task RetryFromAudit() => RetryAsync("audit");
+
+    private async Task RetryAsync(string from)
+    {
+        await ApiClient.RetryWorkItemAsync(Id, from);
+        await LoadAsync();
+    }
+}

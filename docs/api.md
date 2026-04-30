@@ -100,6 +100,38 @@ Cancel a non-terminal work item.
 
 Returns `202 Accepted`.
 
+### `PATCH /workitems/{id}`
+
+Partially update a **Queued** work item's `title`, `prompt`, and/or `agent`.
+Only fields provided (non-null) in the body are updated.
+
+```json
+{
+  "title": "optional new title",
+  "prompt": "optional new prompt text",
+  "agent": "optional agent override"
+}
+```
+
+* Returns `200 OK` with the updated work item record.
+* Returns `409 Conflict` when the item is not in `Queued` state (in-flight items are read-only).
+* Validation rules for `title`, `prompt`, and `agent` are identical to `POST /workitems`.
+
+### `POST /workitems/reorder`
+
+Reorder the set of **Queued** work items. The body must list **exactly** the current queued item IDs (no more, no fewer). Any mismatch indicates a stale view and is rejected with `400`.
+
+```json
+{
+  "ids": ["<id1>", "<id2>", "<id3>"]
+}
+```
+
+* Returns `204 No Content` on success.
+* Returns `400 Bad Request` with `missingFromRequest` and `unknownInRequest` arrays when the provided ID set does not exactly match the current Queued items.
+* The order of `ids` sets the new queue priority: index 0 = highest priority.
+* Items not in `Queued` state are unaffected even if their IDs appear in the body (the store's conditional update skips non-Queued rows).
+
 ### `GET /healthz`
 
 Liveness probe. Returns `{ "status": "ok" }`.
@@ -111,6 +143,7 @@ Liveness probe. Returns `{ "status": "ok" }`.
   "id": "5b6e...",
   "projectId": "my-app",
   "title": "...",
+  "prompt": "Add a --config flag …",
   "agent": "claude",
   "baseBranch": "main",
   "workBranch": "codeybox/5b6e7c41",
@@ -120,9 +153,14 @@ Liveness probe. Returns `{ "status": "ok" }`.
   "lastError": null,
   "upstreamPushAttempts": 0,
   "dependsOn": [],
-  "dependsOnSatisfied": true
+  "dependsOnSatisfied": true,
+  "queuePosition": 0
 }
 ```
+
+`prompt` is the full task text given to the agent (≤ 64 KB).
+
+`queuePosition` is an ordering hint for Queued items set by `POST /workitems/reorder`. Smaller values sort first. Items not yet explicitly reordered have a position derived from their creation timestamp and sort after explicitly positioned items.
 
 `state` is one of: `Queued`, `Working`, `WorkComplete`, `Auditing`,
 `AuditPassed`, `Reworking`, `AuditFailed`, `Merging`, `Merged`,

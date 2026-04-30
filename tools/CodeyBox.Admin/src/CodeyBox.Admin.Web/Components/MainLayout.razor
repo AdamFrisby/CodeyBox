@@ -1,0 +1,12 @@
+@inherits LayoutComponentBase
+
+<div class="admin-layout">
+    <nav class="admin-nav">
+        <span class="admin-nav-brand">CodeyBox Admin</span>
+        <NavLink href="/" Match="NavLinkMatch.All">Queue</NavLink>
+        <NavLink href="/work-items/new">+ New Item</NavLink>
+    </nav>
+    <main class="admin-main">
+        @Body
+    </main>
+</div>

@@ -1,0 +1,150 @@
+@page "/"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+
+<PageTitle>Queue — CodeyBox Admin</PageTitle>
+
+<h1>Work Queue</h1>
+
+@if (_error is not null)
+{
+    <p class="error-banner">Error loading queue: @_error</p>
+}
+
+@if (_items is null)
+{
+    <p>Loading…</p>
+}
+else if (_items.Count == 0)
+{
+    <p>No work items.</p>
+}
+else
+{
+    <table class="queue-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Project</th>
+                <th>Title</th>
+                <th>Agent</th>
+                <th>State</th>
+                <th>Age</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var item in _items)
+            {
+                <tr class="state-@item.State.ToLowerInvariant()">
+                    <td class="col-id">
+                        <a href="/work-items/@item.Id">@item.ShortId</a>
+                    </td>
+                    <td>@item.ProjectId</td>
+                    <td>@item.Title</td>
+                    <td>@item.Agent</td>
+                    <td class="col-state">@item.State</td>
+                    <td class="col-age">@item.Age</td>
+                    <td class="col-actions">
+                        <a href="/work-items/@item.Id" class="btn">open</a>
+                        @if (item.IsQueued)
+                        {
+                            <a href="/work-items/@item.Id/edit" class="btn">edit</a>
+                            <button class="btn btn-up" @onclick="() => MoveUpAsync(item.Id)" title="Move up">▲</button>
+                            <button class="btn btn-down" @onclick="() => MoveDownAsync(item.Id)" title="Move down">▼</button>
+                        }
+                        @if (!item.IsTerminal)
+                        {
+                            <button class="btn btn-danger" @onclick="() => CancelAsync(item.Id)">cancel</button>
+                        }
+                        @if (item.State is "Failed" or "AuditFailed" or "Cancelled")
+                        {
+                            <button class="btn" @onclick="() => RetryAsync(item.Id)">retry</button>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private List<WorkItemDto>? _items;
+    private string? _error;
+    private CancellationTokenSource? _cts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await LoadAsync();
+        _ = RefreshLoopAsync(_cts.Token);
+    }
+
+    private async Task RefreshLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                await LoadAsync();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            var all = await ApiClient.GetWorkItemsAsync();
+            var queued = all.Where(i => i.IsQueued).OrderBy(i => i.QueuePosition).ToList();
+            var others = all.Where(i => !i.IsQueued).OrderByDescending(i => i.UpdatedAt).ToList();
+            _items = [.. queued, .. others];
+            _error = null;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    private async Task MoveUpAsync(string id)
+    {
+        var queued = _items!.Where(i => i.IsQueued).ToList();
+        var idx = queued.FindIndex(i => i.Id == id);
+        if (idx <= 0) return;
+        (queued[idx - 1], queued[idx]) = (queued[idx], queued[idx - 1]);
+        await ApiClient.ReorderWorkItemsAsync(queued.Select(i => i.Id).ToList());
+        await LoadAsync();
+    }
+
+    private async Task MoveDownAsync(string id)
+    {
+        var queued = _items!.Where(i => i.IsQueued).ToList();
+        var idx = queued.FindIndex(i => i.Id == id);
+        if (idx < 0 || idx >= queued.Count - 1) return;
+        (queued[idx], queued[idx + 1]) = (queued[idx + 1], queued[idx]);
+        await ApiClient.ReorderWorkItemsAsync(queued.Select(i => i.Id).ToList());
+        await LoadAsync();
+    }
+
+    private async Task CancelAsync(string id)
+    {
+        await ApiClient.DeleteWorkItemAsync(id);
+        await LoadAsync();
+    }
+
+    private async Task RetryAsync(string id)
+    {
+        await ApiClient.RetryWorkItemAsync(id);
+        await LoadAsync();
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+}

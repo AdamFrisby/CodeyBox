@@ -9,11 +9,13 @@ internal static class WorkItemEndpoints
     {
         var group = app.MapGroup("/workitems");
         group.MapPost("/", CreateAsync);
+        group.MapPost("/reorder", ReorderWorkItemsAsync);
         group.MapPost("/{id}/retry", RetryAsync);
         group.MapGet("/", ListAsync);
         group.MapGet("/{id}", GetAsync);
         group.MapDelete("/{id}", CancelAsync);
         group.MapGet("/{id}/dependents", GetDependentsAsync);
+        group.MapPatch("/{id}", PatchWorkItemAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -137,6 +139,8 @@ internal static class WorkItemEndpoints
             agentClassId = req.AgentClassId.Trim();
         }
 
+        // Use creation timestamp as default queue position so new items sort after
+        // any explicitly reordered items (which get small integers 1, 2, 3 …).
         var item = new WorkItem
         {
             Id = newId,
@@ -149,6 +153,7 @@ internal static class WorkItemEndpoints
             AgentClassId = agentClassId,
             PushUpstream = req.PushUpstream ?? true,
             DependsOn = dependsOnIds,
+            QueuePosition = DateTimeOffset.UtcNow.Ticks,
         };
         if (req.WorkTimeoutMinutes is { } w)
             item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
@@ -359,6 +364,108 @@ internal static class WorkItemEndpoints
         }
     }
 
+    /// <summary>
+    /// Partially update a Queued work item's title, prompt, and/or agent.
+    /// Returns 409 Conflict when the item is no longer in Queued state.
+    /// </summary>
+    private static async Task<IResult> PatchWorkItemAsync(
+        string id,
+        PatchWorkItemRequest body,
+        IWorkItemStore store,
+        IProjectRepository projects,
+        IAgentRegistry agents,
+        CancellationToken ct)
+    {
+        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
+        var workItemId = new WorkItemId(g);
+        var item = await store.GetAsync(workItemId, ct);
+        if (item is null) return Results.NotFound();
+        if (item.State != WorkItemState.Queued)
+            return Results.Conflict(new { error = $"cannot edit item in state {item.State}; only Queued items are editable" });
+
+        var updated = item;
+
+        if (body.Title is not null)
+        {
+            try { Validation.ValidateNoOptionLikeOrControl(body.Title, nameof(body.Title)); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            if (body.Title.Length > 200) return Results.BadRequest(new { error = "title must be <= 200 chars" });
+            updated = updated with { Title = body.Title, UpdatedAt = DateTimeOffset.UtcNow };
+        }
+
+        if (body.Prompt is not null)
+        {
+            if (body.Prompt.Length > 64 * 1024) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
+            updated = updated with { Prompt = body.Prompt, UpdatedAt = DateTimeOffset.UtcNow };
+        }
+
+        if (body.Agent is not null)
+        {
+            var kind = new AgentKind(body.Agent);
+            if (!agents.TryGet(kind, out _))
+                return Results.BadRequest(new { error = $"unknown agent '{body.Agent}'", available = agents.Available.Select(a => a.Value) });
+            updated = updated with { Agent = kind, UpdatedAt = DateTimeOffset.UtcNow };
+        }
+
+        // TryUpdateIfStateAsync guards against a race where the orchestrator picks
+        // up the item between the GetAsync above and this write.
+        var written = await store.TryUpdateIfStateAsync(updated, WorkItemState.Queued, ct);
+        if (!written)
+            return Results.Conflict(new { error = "item transitioned out of Queued state before the update could be written" });
+
+        var project = await projects.GetAsync(updated.ProjectId, ct);
+        return Results.Ok(ToDto(updated, project, new Dictionary<WorkItemId, WorkItemState>()));
+    }
+
+    /// <summary>
+    /// Reorder the Queued items. The request body must list exactly the current
+    /// set of Queued item IDs; any mismatch (stale view) is rejected with 400.
+    /// </summary>
+    private static async Task<IResult> ReorderWorkItemsAsync(
+        ReorderWorkItemsRequest req,
+        IWorkItemStore store,
+        CancellationToken ct)
+    {
+        var rawIds = req.Ids ?? [];
+
+        // Parse IDs
+        var parsedIds = new List<WorkItemId>(rawIds.Length);
+        foreach (var raw in rawIds)
+        {
+            if (!Guid.TryParse(raw, out var g))
+                return Results.BadRequest(new { error = $"'{raw}' is not a valid work item id" });
+            parsedIds.Add(new WorkItemId(g));
+        }
+
+        // Reject duplicates before set comparison so we don't silently deduplicate.
+        var uniqueCount = new HashSet<WorkItemId>(parsedIds).Count;
+        if (uniqueCount != parsedIds.Count)
+            return Results.BadRequest(new { error = "ids must not contain duplicates" });
+
+        // Fetch current Queued items
+        var queuedItems = new List<WorkItem>();
+        await foreach (var item in store.ListByStateAsync(WorkItemState.Queued, ct))
+            queuedItems.Add(item);
+
+        var queuedSet = new HashSet<WorkItemId>(queuedItems.Select(i => i.Id));
+        var requestedSet = new HashSet<WorkItemId>(parsedIds);
+
+        if (!queuedSet.SetEquals(requestedSet))
+        {
+            var missing = queuedSet.Except(requestedSet).Select(i => i.ToString()).ToList();
+            var extra = requestedSet.Except(queuedSet).Select(i => i.ToString()).ToList();
+            return Results.BadRequest(new
+            {
+                error = "provided ids do not exactly match the current Queued items (view is stale)",
+                missingFromRequest = missing,
+                unknownInRequest = extra,
+            });
+        }
+
+        await store.ReorderAsync(parsedIds, ct);
+        return Results.NoContent();
+    }
+
     private static async Task<IResult> ListProjectsAsync(IProjectRepository projects, CancellationToken ct)
     {
         var list = await projects.ListAsync(ct);
@@ -381,6 +488,7 @@ internal static class WorkItemEndpoints
             item.Id.ToString(),
             item.ProjectId.Value,
             item.Title,
+            item.Prompt,
             (item.Agent ?? project?.DefaultAgent ?? AgentKind.Claude).Value,
             project?.RepositoryUrl,
             item.BaseBranch,
@@ -391,7 +499,8 @@ internal static class WorkItemEndpoints
             item.LastError,
             item.UpstreamPushAttempts,
             item.DependsOn.Select(d => d.ToString()).ToList(),
-            depsSatisfied);
+            depsSatisfied,
+            item.QueuePosition);
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -421,10 +530,18 @@ public sealed record CreateWorkItemRequest(
 
 public sealed record RetryWorkItemRequest(string? From);
 
+public sealed record PatchWorkItemRequest(
+    string? Title = null,
+    string? Prompt = null,
+    string? Agent = null);
+
+public sealed record ReorderWorkItemsRequest(string[]? Ids = null);
+
 public sealed record WorkItemDto(
     string Id,
     string ProjectId,
     string Title,
+    string Prompt,
     string Agent,
     string? RepositoryUrl,
     string? BaseBranch,
@@ -435,7 +552,8 @@ public sealed record WorkItemDto(
     string? LastError,
     int UpstreamPushAttempts,
     IReadOnlyList<string> DependsOn,
-    bool DependsOnSatisfied);
+    bool DependsOnSatisfied,
+    long QueuePosition = 0);
 
 public sealed record ProjectDto(
     string Id,
