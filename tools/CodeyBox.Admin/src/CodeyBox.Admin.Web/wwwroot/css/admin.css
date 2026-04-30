@@ -299,3 +299,116 @@ h1 {
     font-size: 0.8rem;
     margin-top: 0.2rem;
 }
+
+/* ── Queue state banner ──────────────────────────────────────────────────────── */
+
+.queue-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 1rem;
+    border-radius: 4px;
+    margin-bottom: 1rem;
+    font-size: 0.9rem;
+    flex-wrap: wrap;
+}
+
+.queue-banner-paused {
+    background: #fdecea;
+    border: 1px solid #e57373;
+    color: #b71c1c;
+}
+
+.queue-banner-running {
+    background: #eafaf1;
+    border: 1px solid #52be80;
+    color: #1e8449;
+}
+
+.queue-running-dot {
+    font-size: 0.7rem;
+}
+
+.btn-resume {
+    background: #1e8449;
+    color: #fff;
+    border-color: #1e8449;
+}
+
+.btn-resume:hover {
+    background: #145a32;
+}
+
+.btn-sm {
+    font-size: 0.75rem;
+    padding: 0.2rem 0.5rem;
+}
+
+/* ── Modal ──────────────────────────────────────────────────────────────────── */
+
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-box {
+    background: #fff;
+    border-radius: 6px;
+    padding: 1.5rem;
+    width: 100%;
+    max-width: 480px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.15);
+}
+
+.modal-box h2 {
+    margin-bottom: 0.75rem;
+}
+
+.modal-box p {
+    margin-bottom: 1rem;
+    color: #555;
+    font-size: 0.9rem;
+}
+
+.modal-input {
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    font-size: 0.9rem;
+    font-family: inherit;
+    margin-top: 0.25rem;
+    display: block;
+    margin-bottom: 1rem;
+}
+
+.modal-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+}
+
+/* ── Budget usage bars ───────────────────────────────────────────────────────── */
+
+.budget-bar-wrap {
+    background: #eee;
+    border-radius: 3px;
+    height: 8px;
+    width: 120px;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+.budget-bar {
+    height: 100%;
+    border-radius: 3px;
+    background: #52be80;
+}
+
+.budget-bar.budget-warn { background: #f39c12; }
+.budget-bar.budget-full { background: #e74c3c; }

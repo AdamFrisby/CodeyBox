@@ -20,8 +20,12 @@ internal static class WorkItemEndpoints
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
         projects.MapGet("/{id}", GetProjectAsync);
+        projects.MapGet("/{id}/budget/usage", GetBudgetUsageAsync);
 
         app.MapGet("/workers/status", GetWorkerStatusAsync);
+        app.MapGet("/queue/status", GetQueueStatusAsync);
+        app.MapPost("/queue/pause", PauseQueueAsync);
+        app.MapPost("/queue/resume", ResumeQueueAsync);
     }
 
     private static IResult GetWorkerStatusAsync(OrchestratorService orchestrator)
@@ -476,6 +480,101 @@ internal static class WorkItemEndpoints
         return Results.NoContent();
     }
 
+    // ── Queue control ─────────────────────────────────────────────────────────
+
+    private static IResult GetQueueStatusAsync(IQueueController queueController)
+    {
+        return Results.Ok(new
+        {
+            state = queueController.State.ToString(),
+            pausedAt = queueController.PausedAt,
+            pausedReason = queueController.PausedReason,
+        });
+    }
+
+    private static async Task<IResult> PauseQueueAsync(
+        PauseQueueRequest body,
+        IQueueController queueController,
+        IWebhookDispatcher webhooks,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(body.Reason))
+            return Results.BadRequest(new { error = "reason is required" });
+        if (body.Reason.Any(char.IsControl))
+            return Results.BadRequest(new { error = "reason must not contain control characters" });
+        if (body.Reason.Length > 500)
+            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+
+        await queueController.PauseAsync(body.Reason, ct);
+        _ = webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "queue.paused",
+            Details = new { pausedAt = queueController.PausedAt, reason = queueController.PausedReason, pausedBy = "api" },
+        }, CancellationToken.None);
+        return Results.Ok(new
+        {
+            state = queueController.State.ToString(),
+            pausedAt = queueController.PausedAt,
+            pausedReason = queueController.PausedReason,
+        });
+    }
+
+    private static async Task<IResult> ResumeQueueAsync(
+        IQueueController queueController,
+        IWebhookDispatcher webhooks,
+        CancellationToken ct)
+    {
+        var wasRunning = queueController.State == QueueState.Running;
+        await queueController.ResumeAsync(ct);
+        if (!wasRunning)
+        {
+            _ = webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "queue.resumed",
+                Details = new { resumedAt = DateTimeOffset.UtcNow },
+            }, CancellationToken.None);
+        }
+        return Results.Ok(new
+        {
+            state = queueController.State.ToString(),
+            pausedAt = queueController.PausedAt,
+            pausedReason = queueController.PausedReason,
+        });
+    }
+
+    // ── Budget usage ──────────────────────────────────────────────────────────
+
+    private static async Task<IResult> GetBudgetUsageAsync(
+        string id,
+        IProjectRepository projects,
+        IWorkItemStore store,
+        CancellationToken ct)
+    {
+        ProjectId pid;
+        try { pid = new ProjectId(id); }
+        catch (ArgumentException) { return Results.BadRequest(new { error = "invalid project id" }); }
+        var project = await projects.GetAsync(pid, ct);
+        if (project is null) return Results.NotFound();
+
+        var now = DateTimeOffset.UtcNow;
+        var lastHour = await store.CountStartedInWindowAsync(pid, now.AddHours(-1), ct);
+        var last24h = await store.CountStartedInWindowAsync(pid, now.AddHours(-24), ct);
+        var inFlight = await store.CountInFlightAsync(pid, ct);
+
+        return Results.Ok(new
+        {
+            lastHour,
+            last24h,
+            currentlyInFlight = inFlight,
+            limits = new
+            {
+                perHour = project.Budget.MaxItemsPerHour,
+                perDay = project.Budget.MaxItemsPerDay,
+                concurrent = project.Budget.MaxConcurrentForProject,
+            },
+        });
+    }
+
     private static async Task<IResult> ListProjectsAsync(IProjectRepository projects, CancellationToken ct)
     {
         var list = await projects.ListAsync(ct);
@@ -546,6 +645,8 @@ public sealed record PatchWorkItemRequest(
     string? Agent = null);
 
 public sealed record ReorderWorkItemsRequest(string[]? Ids = null);
+
+public sealed record PauseQueueRequest(string Reason = "");
 
 public sealed record WorkItemDto(
     string Id,

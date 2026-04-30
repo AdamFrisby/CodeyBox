@@ -26,6 +26,9 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.cancelled` | Work item was cancelled via the API |
 | `work_item.agent_stuck` | Stuck-agent probe detected a hang and killed the agent (see [Details](#agent_stuck-details)) |
 | `agent.smoke_failed` | Credential smoke test failed at startup or work-item pickup (see [Details](#agent_smoke_failed-details)) |
+| `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
+| `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
+| `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -121,6 +124,57 @@ When `event` is `work_item.agent_stuck`, the `details` field is populated:
 (`work_item.failed` or the state preceding auto-retry). Operators should
 subscribe to this event to alert on hung agents even when `AutoRetryOnStuck`
 automatically re-queues the item.
+
+### `queue_paused` details
+
+When `event` is `queue.paused`:
+
+```json
+{
+  "details": {
+    "pausedAt": "2026-05-01T14:00:00.000+00:00",
+    "reason": "pre-maintenance window",
+    "pausedBy": "api"
+  }
+}
+```
+
+`workItem` and `project` are `null` for queue-level events.
+
+### `queue_resumed` details
+
+When `event` is `queue.resumed`:
+
+```json
+{
+  "details": {
+    "resumedAt": "2026-05-01T15:30:00.000+00:00"
+  }
+}
+```
+
+### `budget_deferred` details
+
+When `event` is `budget.deferred`, `workItem` and `project` carry the affected
+item and its project:
+
+```json
+{
+  "details": {
+    "reason": "hourly limit: 10/10 items started in last hour",
+    "suggestedRetryAt": "2026-05-01T14:05:00.000+00:00"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `reason` | string | Which cap was exceeded and the current/max counts |
+| `suggestedRetryAt` | ISO-8601 | Approximate time when the item may be eligible to start |
+
+Subscribe to `budget.deferred` to alert when a project is consistently
+throttled — it may indicate the budget caps need adjustment or the project's
+work-item generation rate is unexpectedly high.
 
 ### `agent_smoke_failed` details
 

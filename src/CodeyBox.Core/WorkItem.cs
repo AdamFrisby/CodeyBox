@@ -91,10 +91,20 @@ public sealed record WorkItem
     /// </summary>
     public long QueuePosition { get; init; } = 0;
 
+    /// <summary>
+    /// UTC timestamp when this work item was first picked up by a worker
+    /// (transitioned out of Queued state). Null until the worker commits to
+    /// running it. Used for per-project budget window calculations.
+    /// </summary>
+    public DateTimeOffset? StartedAt { get; init; }
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,
         LastError = error,
         UpdatedAt = DateTimeOffset.UtcNow,
+        // Clear StartedAt when re-queuing: retried items must not appear in-flight
+        // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
+        StartedAt = state == WorkItemState.Queued ? null : StartedAt,
     };
 }

@@ -132,6 +132,193 @@ public sealed class IndexPageTests : TestContext
         Assert.Contains("Working", cut.Markup);
         Assert.Contains("Done", cut.Markup);
     }
+
+    // ── Queue state banner tests ─────────────────────────────────────────────
+
+    [Fact]
+    public void Index_PausedQueue_ShowsPausedBanner()
+    {
+        var fake = new FakeApiClient([]);
+        fake.QueueStatusOverride = new QueueStatusDto
+        {
+            State = "Paused",
+            PausedAt = DateTimeOffset.UtcNow.AddMinutes(-15),
+            PausedReason = "maintenance window",
+        };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        Assert.Contains("QUEUE PAUSED", cut.Markup);
+        Assert.Contains("maintenance window", cut.Markup);
+        Assert.Contains("Resume queue", cut.Markup);
+        Assert.Contains("queue-banner-paused", cut.Markup);
+    }
+
+    [Fact]
+    public void Index_RunningQueue_ShowsRunningBannerAndPauseButton()
+    {
+        var fake = new FakeApiClient([]);
+        fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        Assert.Contains("queue-banner-running", cut.Markup);
+        Assert.Contains("Pause queue", cut.Markup);
+        Assert.DoesNotContain("QUEUE PAUSED", cut.Markup);
+    }
+
+    [Fact]
+    public void Index_PauseButton_OpensPauseModal()
+    {
+        var fake = new FakeApiClient([]);
+        fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+        cut.Find(".btn-sm").Click();
+
+        Assert.Contains("modal-overlay", cut.Markup);
+        Assert.Contains("Reason", cut.Markup);
+    }
+
+    [Fact]
+    public void Index_PauseModal_EmptyReason_ShowsValidationError()
+    {
+        var fake = new FakeApiClient([]);
+        fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+        cut.Find(".btn-sm").Click(); // open modal
+
+        // Click Pause without entering a reason.
+        cut.Find(".modal-box .btn-danger").Click();
+
+        Assert.Contains("reason is required", cut.Markup);
+        Assert.Contains("modal-overlay", cut.Markup); // modal stays open
+    }
+
+    [Fact]
+    public void Index_PauseSuccess_CloseModalAndShowPausedBanner()
+    {
+        var fake = new FakeApiClient([]);
+        fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        // Open pause modal
+        cut.Find(".btn-sm").Click();
+        Assert.Contains("modal-overlay", cut.Markup);
+
+        // Enter a reason and submit
+        cut.Find(".modal-input").Change("incident response");
+        cut.Find(".modal-box .btn-danger").Click();
+
+        // Wait for async update
+        cut.WaitForState(() => !cut.Markup.Contains("modal-overlay"), TimeSpan.FromSeconds(2));
+
+        Assert.DoesNotContain("modal-overlay", cut.Markup);
+        Assert.Contains("QUEUE PAUSED", cut.Markup);
+        Assert.Contains("incident response", cut.Markup);
+    }
+
+    [Fact]
+    public void Index_ResumeSuccess_ShowsRunningBanner()
+    {
+        var fake = new FakeApiClient([]);
+        fake.QueueStatusOverride = new QueueStatusDto
+        {
+            State = "Paused",
+            PausedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PausedReason = "test",
+        };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+        Assert.Contains("QUEUE PAUSED", cut.Markup);
+
+        cut.Find(".btn-resume").Click();
+
+        cut.WaitForState(() => cut.Markup.Contains("queue-banner-running"), TimeSpan.FromSeconds(2));
+
+        Assert.DoesNotContain("QUEUE PAUSED", cut.Markup);
+        Assert.Contains("queue-banner-running", cut.Markup);
+    }
+
+    // ── Budget usage bar tests ───────────────────────────────────────────────
+
+    [Fact]
+    public void Index_BudgetBars_RenderedForNonTerminalProjectItems()
+    {
+        var fake = new FakeApiClient(
+            [MakeItem("aabbccdd-0000-0000-0000-000000000001", "Active Task", "Working")]);
+        fake.BudgetUsageOverrides["proj"] = new BudgetUsageDto
+        {
+            LastHour = 3,
+            Last24h = 5,
+            CurrentlyInFlight = 1,
+            Limits = new BudgetLimitsDto { PerHour = 10, PerDay = 50, Concurrent = 2 },
+        };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        Assert.Contains("budget-bar", cut.Markup);
+        Assert.Contains("3/10/h", cut.Markup);
+    }
+
+    [Fact]
+    public void Index_BudgetBars_WarnCss_AtEightyPercent()
+    {
+        var fake = new FakeApiClient(
+            [MakeItem("aabbccdd-0000-0000-0000-000000000001", "Busy Task", "Working")]);
+        fake.BudgetUsageOverrides["proj"] = new BudgetUsageDto
+        {
+            LastHour = 8,
+            Last24h = 0,
+            CurrentlyInFlight = 0,
+            Limits = new BudgetLimitsDto { PerHour = 10, PerDay = 0, Concurrent = 0 },
+        };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        Assert.Contains("budget-warn", cut.Markup);
+    }
+
+    [Fact]
+    public void Index_BudgetBars_FullCss_AtHundredPercent()
+    {
+        var fake = new FakeApiClient(
+            [MakeItem("aabbccdd-0000-0000-0000-000000000001", "Maxed Task", "Working")]);
+        fake.BudgetUsageOverrides["proj"] = new BudgetUsageDto
+        {
+            LastHour = 10,
+            Last24h = 0,
+            CurrentlyInFlight = 0,
+            Limits = new BudgetLimitsDto { PerHour = 10, PerDay = 0, Concurrent = 0 },
+        };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        Assert.Contains("budget-full", cut.Markup);
+    }
+
+    [Fact]
+    public void Index_BudgetBars_NotRendered_WhenNoNonTerminalItems()
+    {
+        var fake = new FakeApiClient(
+            [MakeItem("aabbccdd-0000-0000-0000-000000000001", "Done Task", "Done")]);
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<IndexPage>();
+
+        Assert.DoesNotContain("budget-bar-wrap", cut.Markup);
+    }
 }
 
 /// <summary>
@@ -197,4 +384,30 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default)
         => Task.FromResult(true);
+
+    public QueueStatusDto? QueueStatusOverride { get; set; }
+    public Dictionary<string, BudgetUsageDto> BudgetUsageOverrides { get; set; } = [];
+
+    public Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default)
+        => Task.FromResult(QueueStatusOverride);
+
+    public Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default)
+    {
+        QueueStatusOverride = new QueueStatusDto
+        {
+            State = "Paused",
+            PausedAt = DateTimeOffset.UtcNow,
+            PausedReason = reason,
+        };
+        return Task.FromResult<QueueStatusDto?>(QueueStatusOverride);
+    }
+
+    public Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default)
+    {
+        QueueStatusOverride = new QueueStatusDto { State = "Running" };
+        return Task.FromResult<QueueStatusDto?>(QueueStatusOverride);
+    }
+
+    public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
+        => Task.FromResult(BudgetUsageOverrides.TryGetValue(projectId, out var u) ? (BudgetUsageDto?)u : null);
 }

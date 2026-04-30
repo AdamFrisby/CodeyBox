@@ -167,6 +167,70 @@ Both events are at **Warning** level. Per-sample CPU-delta and socket-count
 readings are logged at **Debug** level (30 s × multi-hour runs → very noisy at
 higher levels).
 
+## Queue control
+
+Operators can pause and resume the global pickup queue without restarting the
+orchestrator. A **paused** queue blocks all new work-item pickup; in-flight
+items continue normally.
+
+### State machine
+
+```
+Running ──(POST /queue/pause)──► Paused
+Paused  ──(POST /queue/resume)──► Running
+```
+
+State is persisted to the same SQLite database as work items (`queue_state`
+table, single row). A restart with the queue in `Paused` state logs a
+**Warning** audit event (`queue.started_while_paused`) so operators don't
+forget they left it paused.
+
+### When to use it
+
+- **Incident response**: a project is generating runaway items. Pause the
+  queue, cancel the offending items via the API, then resume.
+- **Maintenance window**: pause before a dependency upgrade, resume after.
+- **Investigations**: stop the dispatch loop to inspect state before it changes.
+
+### Behaviour during pause
+
+| What | Behaviour |
+|---|---|
+| New item pickup | **Blocked** — items stay in the Queued state |
+| In-flight workers | **Unchanged** — run to completion normally |
+| Webhook delivery | **Unchanged** — audit logging and webhooks continue |
+| State persistence | **Yes** — survives a restart |
+
+Pausing is **not** the same as cancelling. Items blocked by the pause gate
+remain Queued and are picked up automatically on resume.
+
+### API
+
+```
+GET  /queue/status          → { state, pausedAt, pausedReason }
+POST /queue/pause           body: { "reason": "..." }  → { state, pausedAt }
+POST /queue/resume          → { state }
+```
+
+Operators must supply a non-empty reason when pausing. The reason is stored
+in the audit log and shown in the admin dashboard banner.
+
+### Webhook events
+
+| Event | Payload |
+|---|---|
+| `queue.paused` | `{ pausedAt, reason, pausedBy }` |
+| `queue.resumed` | `{ resumedAt }` |
+
+### Admin dashboard
+
+The queue index page shows a coloured banner at the top:
+
+- **Paused (red)**: "QUEUE PAUSED — reason: … — paused at …" + **Resume
+  queue** button.
+- **Running (green)**: subtle dot + **Pause queue** button (opens a modal
+  asking for a reason).
+
 ## Observability
 
 ### Audit log events
@@ -176,6 +240,10 @@ higher levels).
 | `worker_pool.spawn_throttled` | A spawn waited non-zero time due to `MinSpawnInterval` (includes actual wait ms) |
 | `worker_pool.worker_started` | A worker task starts (worker index + work item ID) |
 | `worker_pool.worker_finished` | A worker task completes (worker index + work item ID) |
+| `queue.paused` | Operator paused the queue (includes reason) |
+| `queue.resumed` | Operator resumed the queue |
+| `queue.started_while_paused` | Orchestrator started with queue already paused |
+| `budget.deferred` | Work item deferred by a per-project budget cap |
 
 ### Status endpoint
 

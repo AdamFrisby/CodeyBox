@@ -59,6 +59,7 @@ public sealed class ProjectRepository : IProjectRepository
             Upstream = ResolveUpstream(pc.Upstream),
             Audit = ResolveAudit(pc.Audit, defaults.Audit),
             NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),
+            Budget = ResolveBudget(pc.Budget),
         };
     }
 
@@ -133,6 +134,24 @@ public sealed class ProjectRepository : IProjectRepository
             Languages = mergedLanguages,
             AuditTypes = mergedAuditTypes,
             Custom = mergedCustom,
+        };
+    }
+
+    private static ProjectBudget ResolveBudget(ProjectBudgetConfig? c)
+    {
+        if (c is null) return new();
+        static int ValidateCap(int? value, string name)
+        {
+            var v = value ?? 0;
+            if (v < 0) throw new InvalidOperationException(
+                $"Budget cap '{name}' must be >= 0 (got {v}). Use 0 for unlimited.");
+            return v;
+        }
+        return new()
+        {
+            MaxItemsPerHour = ValidateCap(c.MaxItemsPerHour, nameof(c.MaxItemsPerHour)),
+            MaxItemsPerDay = ValidateCap(c.MaxItemsPerDay, nameof(c.MaxItemsPerDay)),
+            MaxConcurrentForProject = ValidateCap(c.MaxConcurrentForProject, nameof(c.MaxConcurrentForProject)),
         };
     }
 

@@ -16,6 +16,14 @@ public interface ICodeyBoxApiClient
     Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default);
     Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default);
     Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default);
+
+    // ── Queue control ─────────────────────────────────────────────────────────
+    Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default);
+    Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default);
+    Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default);
+
+    // ── Budget usage ──────────────────────────────────────────────────────────
+    Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default);
 }
 
 /// <summary>Request body for PATCH /workitems/{id}.</summary>
