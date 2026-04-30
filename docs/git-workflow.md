@@ -36,17 +36,50 @@ it to upstream. Sandboxes never see the upstream URL or creds.
 git clone /repos/<id>.git /work
 cd /work
 git checkout -B codeybox/<id>          # work branch off baseBranch
-git config user.email codeybox@local
-git config user.name CodeyBox
+
+# Identity resolution (precedence: project > host global git config > fallback)
+git config user.email <resolved-email>
+git config user.name  <resolved-name>
 
 # (the agent runs here — claude / copilot / codex / gemini)
 # It edits files in /work and may or may not commit.
 
 git add -A
 git diff --cached --quiet && exit 1      # fail if no changes
-git commit -m "codeybox: <title>"
+git commit -m "codeybox: <title>
+
+Co-Authored-By: CodeyBox <noreply@codeybox.invalid>"
 git push origin codeybox/<id>:codeybox/<id>
 ```
+
+### Git identity propagation
+
+By default the orchestrator reads the host's global git config at startup
+(`git config --global user.name` / `user.email`) and uses those values for all
+sandbox commits. This lets `git blame` / `git log --author=alice` show the real
+operator who triggered the work item.
+
+Resolution order (first match wins):
+
+1. **`Project.GitAuthorName` / `Project.GitAuthorEmail`** — set both fields on a
+   project to override for that project only.
+2. **Host global git config** — read once at orchestrator startup via
+   `git config --global`. Requires `git` on PATH and `~/.gitconfig` configured.
+3. **Synthetic fallback** — `CodeyBox <codeybox@local>`. Used when no global git
+   config is found (fresh containers, CI runners without a configured identity).
+   A warning is logged at startup.
+
+### Co-Authored-By trailer
+
+Every commit produced by the orchestrator or instructed to the agent includes:
+
+```
+Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+```
+
+The `.invalid` TLD (per RFC 2606) signals "not a real email" while GitHub still
+renders the trailer in the PR conversation view. The operator's email never
+appears in this trailer — only `noreply@codeybox.invalid`.
 
 The orchestrator then opens a PR record via `IPullRequestService`. With the
 default in-memory impl this is just metadata; with a Gitea/Forgejo backend

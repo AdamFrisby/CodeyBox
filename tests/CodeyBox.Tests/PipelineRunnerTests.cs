@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
@@ -156,5 +157,107 @@ public sealed class PipelineRunnerTests
 
         Assert.Contains("Untrusted agent output", result);
         Assert.Contains("```", result);
+    }
+
+    // -------------------------------------------------------------------------
+    // BuildInitialWorkPrompt — unit tests
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void BuildInitialWorkPrompt_IncludesCoAuthoredByInstruction()
+    {
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("implement feature X");
+        Assert.Contains("Co-Authored-By: CodeyBox <noreply@codeybox.invalid>", prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_PreservesUserPrompt()
+    {
+        const string userPrompt = "implement feature X with unit tests";
+        var prompt = PipelineRunner.BuildInitialWorkPrompt(userPrompt);
+        Assert.Contains(userPrompt, prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_TrailerSeparatedByBlankLine()
+    {
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work");
+        Assert.Contains("\n\n    Co-Authored-By:", prompt);
+    }
+}
+
+/// <summary>
+/// Integration tests that verify the resolved git identity is propagated into
+/// sandbox git-config calls and that commits carry the Co-Authored-By trailer.
+/// These tests require git on PATH and use the Process sandbox.
+/// </summary>
+[Collection("Pipeline integration")]
+public sealed class PipelineRunnerSandboxIdentityTests : IDisposable
+{
+    private readonly string _workspace;
+    public PipelineRunnerSandboxIdentityTests()
+        => _workspace = Directory.CreateTempSubdirectory("codeybox-sboxid-").FullName;
+    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+
+    private static WorkItem NewItem(string workBranch) => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("test-project"),
+        Title = "test",
+        Prompt = "do thing",
+        BaseBranch = "main",
+        WorkBranch = workBranch,
+        PushUpstream = false,
+    };
+
+    [Fact]
+    public async Task HostIdentity_PropagatedToSandbox_CommitHasCorrectAuthorAndTrailer()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var hostId = new HostGitIdentity("Pipeline Test Author", "pipelinetest@codeybox.test");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, hostGitIdentity: hostId);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("hello.txt", "hello\n"));
+
+        var item = NewItem("feature/hello-identity");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+
+        // Verify commit author matches the resolved host identity.
+        var (_, authorLog, _) = await TestSupport.RunGit(barePath, "log", "--format=%an|%ae", "--all");
+        Assert.Contains("Pipeline Test Author|pipelinetest@codeybox.test", authorLog);
+
+        // Verify every commit message contains the Co-Authored-By trailer.
+        var (_, bodyLog, _) = await TestSupport.RunGit(barePath, "log", "--format=%B", "--all");
+        Assert.Contains("Co-Authored-By: CodeyBox <noreply@codeybox.invalid>", bodyLog);
+    }
+
+    [Fact]
+    public async Task ProjectOverride_TakesPrecedenceOverHost_InSandboxCommit()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var hostId = new HostGitIdentity("Host Author", "host@codeybox.test");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed,
+            hostGitIdentity: hostId,
+            projectGitAuthor: ("Project Override Author", "projectoverride@codeybox.test"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("hello.txt", "hello\n"));
+
+        var item = NewItem("feature/hello-override");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, authorLog, _) = await TestSupport.RunGit(barePath, "log", "--format=%an|%ae", "--all");
+
+        // Project override must win; host identity must not appear as author.
+        Assert.Contains("Project Override Author|projectoverride@codeybox.test", authorLog);
+        Assert.DoesNotContain("Host Author", authorLog);
     }
 }

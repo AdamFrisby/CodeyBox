@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Audit;
 using CodeyBox.Core;
+using CodeyBox.Git;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 
@@ -125,8 +126,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     workCts.CancelAfter(item.WorkTimeout);
                     await RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                        item.Prompt, isInitial: true,
+                        BuildInitialWorkPrompt(item.Prompt), isInitial: true,
                         networkProfile: project.NetworkProfiles.Work,
+                        project: project,
                         workCts.Token);
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
@@ -164,6 +166,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     mergeCts.CancelAfter(item.MergeTimeout);
                     (mergeSha, agentStdout) = await RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
                         networkProfile: project.NetworkProfiles.Merge,
+                        project: project,
                         mergeCts.Token);
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
@@ -218,6 +221,24 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
+    internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
+
+    internal static string BuildInitialWorkPrompt(string userPrompt) =>
+        $"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\n{userPrompt}";
+
+    /// <summary>
+    /// Resolves the git author identity to use for sandbox commits.
+    /// Precedence: project override → host global git identity → synthetic fallback.
+    /// </summary>
+    internal static (string Name, string Email) ResolveGitIdentity(Project project, HostGitIdentity? host)
+    {
+        if (!string.IsNullOrWhiteSpace(project.GitAuthorName) && !string.IsNullOrWhiteSpace(project.GitAuthorEmail))
+            return (project.GitAuthorName, project.GitAuthorEmail);
+        if (host is not null)
+            return (host.Name, host.Email);
+        return ("CodeyBox", "codeybox@local");
+    }
+
     /// <summary>
     /// Runs the agent in a sandbox against <paramref name="branch"/>. On the
     /// first call (work phase), <paramref name="isInitial"/> is true and the
@@ -234,6 +255,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string prompt,
         bool isInitial,
         string? networkProfile,
+        Project project,
         CancellationToken ct)
     {
         var credential = await _credentials.GetAsync(runner.Kind, ct);
@@ -250,8 +272,9 @@ public sealed class PipelineRunner : IPipelineRunner
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch);
         else
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", branch);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", "codeybox@local");
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", "CodeyBox");
+        var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+        await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
 
         // Capture HEAD before the agent runs. The rework prompt explicitly
         // asks the agent to make new commits, so the agent may move HEAD
@@ -310,8 +333,8 @@ public sealed class PipelineRunner : IPipelineRunner
         if (hasStagedDiff)
         {
             var commitMessage = isInitial
-                ? $"codeybox: {item.Title}"
-                : "codeybox rework: address audit findings";
+                ? $"codeybox: {item.Title}{CoAuthoredByTrailer}"
+                : $"codeybox rework: address audit findings{CoAuthoredByTrailer}";
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
         }
 
@@ -409,6 +432,7 @@ public sealed class PipelineRunner : IPipelineRunner
             await RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
                 reworkPrompt, isInitial: false,
                 networkProfile: project.NetworkProfiles.Rework,
+                project: project,
                 reworkCts.Token);
         }
     }
@@ -483,6 +507,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string baseBranch,
         string workBranch,
         string? networkProfile,
+        Project project,
         CancellationToken ct)
     {
         var credential = await _credentials.GetAsync(runner.Kind, ct);
@@ -493,8 +518,9 @@ public sealed class PipelineRunner : IPipelineRunner
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
         await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", "codeybox@local");
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", "CodeyBox");
+        var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+        await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
 
         var preMerge = await sandbox.ExecAsync(new SandboxExec
@@ -598,11 +624,21 @@ public sealed class PipelineRunner : IPipelineRunner
           - DO NOT delete or comment out code to make conflicts go away.
           - DO NOT take one side blindly when resolving — read both versions
             and preserve the intent of each.
+          - Every commit message MUST include the Co-Authored-By trailer below,
+            separated from the subject by a blank line.
+
+        Co-Authored-By trailer (copy exactly into every commit message):
+
+            {{CodeyBoxTrailers.CoAuthoredBy}}
 
         Steps:
           1. `git fetch origin` (already done by the orchestrator, but safe to repeat)
           2. Confirm you are on `{{baseBranch}}`: `git branch --show-current`
-          3. Merge: `git merge --no-ff origin/{{workBranch}} -m "codeybox: merge {{workBranch}}"`
+          3. Merge using a portable commit message file (works with sh/dash/bash):
+             ```
+             printf 'codeybox: merge {{workBranch}}\n\n{{CodeyBoxTrailers.CoAuthoredBy}}\n' > /tmp/merge-msg.txt
+             git merge --no-ff origin/{{workBranch}} -F /tmp/merge-msg.txt
+             ```
           4. If the merge succeeds without conflicts, you are done. Verify with
              `git log --oneline -3` and exit.
           5. If there are conflicts:
@@ -610,7 +646,11 @@ public sealed class PipelineRunner : IPipelineRunner
              b. For each file, read both sides (look for `<<<<<<<`, `=======`, `>>>>>>>`)
              c. Resolve carefully, preserving both sides' intent
              d. `git add <file>` for each resolved file
-             e. `git commit` (the merge message is already prepared)
+             e. Commit using the same portable approach:
+                ```
+                printf 'codeybox: merge {{workBranch}}\n\n{{CodeyBoxTrailers.CoAuthoredBy}}\n' > /tmp/merge-msg.txt
+                git commit -F /tmp/merge-msg.txt
+                ```
              f. Verify: `git status` should be clean; `git log --oneline -3`
 
         After committing, exit. The orchestrator will:
@@ -770,6 +810,21 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
     }
 
+    // Runs a command but replaces the last argv element with "***" in any exception message,
+    // used when the last element is a sensitive value (e.g. user.email) that must not reach
+    // audit-tier logs.
+    private static async Task RunMasked(ISandbox sandbox, params string[] argv)
+    {
+        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv });
+        if (!r.Success)
+        {
+            var masked = argv.Length > 0
+                ? argv[..^1].Append("***").ToArray()
+                : argv;
+            throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', masked)}\n{r.Stderr}");
+        }
+    }
+
     private static string SanitiseCredentialFileName(string path)
     {
         if (string.IsNullOrEmpty(path)) throw new ArgumentException("Empty credential file name");
@@ -852,4 +907,5 @@ public sealed record PipelineOptions
     public IReadOnlyList<string> AgentAllowedHosts { get; init; } = [];
     public int UpstreamPushMaxAttempts { get; init; } = 5;
     public TimeSpan UpstreamPushBackoff { get; init; } = TimeSpan.FromSeconds(15);
+    public HostGitIdentity? HostGitIdentity { get; init; }
 }
