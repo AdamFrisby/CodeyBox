@@ -121,6 +121,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         private readonly Queue<AuditOutcome> _plan;
         public ScriptedAuditor(IEnumerable<AuditOutcome> plan) { _plan = new Queue<AuditOutcome>(plan); }
         public string Name => "Scripted";
+        public string Kind => "tool";
         public AuditCapabilities Required => AuditCapabilities.None;
         public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
         {

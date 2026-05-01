@@ -34,6 +34,7 @@ public sealed class LlmReviewAuditor : IAuditor
     }
 
     public string Name => _opts.Name;
+    public string Kind => "llm";
     public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
@@ -51,13 +52,16 @@ public sealed class LlmReviewAuditor : IAuditor
         // agent credential (set on the container at boot), so we don't pass
         // it here — the runner will read what it needs from the env.
 
+        var rawOutput = agentResult.Stdout;
+
         if (!agentResult.Success)
         {
             return new AuditResult(false, [new AuditFinding(
                 AuditorName: Name,
                 Severity: AuditSeverity.Error,
                 Title: "review agent failed to run",
-                Description: agentResult.Stderr ?? agentResult.Summary)]);
+                Description: agentResult.Stderr ?? agentResult.Summary)],
+                RawOutput: rawOutput);
         }
 
         // Read the JSON result file from the sandbox.
@@ -71,7 +75,8 @@ public sealed class LlmReviewAuditor : IAuditor
                 AuditorName: Name,
                 Severity: AuditSeverity.Error,
                 Title: $"agent did not write {ResultFile}",
-                Description: agentResult.Stdout ?? "")]);
+                Description: agentResult.Stdout ?? "")],
+                RawOutput: rawOutput);
         }
 
         try
@@ -85,7 +90,7 @@ public sealed class LlmReviewAuditor : IAuditor
                 Title: f.Title ?? "(no title)",
                 Description: f.Description ?? "",
                 Location: f.Location)).ToList();
-            return new AuditResult(parsed.Passed, findings);
+            return new AuditResult(parsed.Passed, findings, RawOutput: rawOutput);
         }
         catch (JsonException ex)
         {
@@ -93,7 +98,8 @@ public sealed class LlmReviewAuditor : IAuditor
                 AuditorName: Name,
                 Severity: AuditSeverity.Error,
                 Title: "review agent produced invalid JSON",
-                Description: $"{ex.Message}\n---\n{Truncate(read.Stdout, 1024)}")]);
+                Description: $"{ex.Message}\n---\n{Truncate(read.Stdout, 1024)}")],
+                RawOutput: rawOutput);
         }
     }
 

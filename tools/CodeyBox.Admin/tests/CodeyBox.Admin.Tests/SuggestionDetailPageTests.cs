@@ -159,6 +159,8 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default) => Task.FromResult<QueueStatusDto?>(null);
     public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default) => Task.FromResult<BudgetUsageDto?>(null);
     public Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(string id, string? kind = null, string? since = null, int? iteration = null, CancellationToken ct = default) => Task.FromResult<WorkItemTimelineDto?>(null);
+    public Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default) => Task.FromResult<AuditReportsDto?>(null);
+    public Task<string?> GetAuditReportRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default) => Task.FromResult<string?>(null);
 }
 
 /// <summary>
@@ -206,4 +208,6 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default) => Task.FromResult<QueueStatusDto?>(null);
     public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default) => Task.FromResult<BudgetUsageDto?>(null);
     public Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(string id, string? kind = null, string? since = null, int? iteration = null, CancellationToken ct = default) => Task.FromResult<WorkItemTimelineDto?>(null);
+    public Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default) => Task.FromResult<AuditReportsDto?>(null);
+    public Task<string?> GetAuditReportRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default) => Task.FromResult<string?>(null);
 }

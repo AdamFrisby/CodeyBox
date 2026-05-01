@@ -85,6 +85,7 @@ public sealed class AuditTests
             _impl = impl;
         }
         public string Name { get; }
+        public string Kind => "tool";
         public AuditCapabilities Required { get; }
         public Task<AuditResult> RunAsync(ISandbox _, string __, AuditContext ctx, CancellationToken ___ = default)
             => Task.FromResult(_impl(ctx));

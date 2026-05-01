@@ -440,4 +440,14 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
         string? agentClassId = null, CancellationToken ct = default)
         => Task.FromResult<string?>("fake-work-item-id");
+
+    public AuditReportsDto? AuditReportsOverride { get; set; }
+    public Dictionary<(int, string), string?> RawOutputOverrides { get; set; } = [];
+
+    public Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult(AuditReportsOverride);
+
+    public Task<string?> GetAuditReportRawOutputAsync(
+        string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+        => Task.FromResult(RawOutputOverrides.TryGetValue((iteration, auditorName), out var r) ? r : null);
 }

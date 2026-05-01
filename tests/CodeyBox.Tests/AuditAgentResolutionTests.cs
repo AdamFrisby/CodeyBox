@@ -267,6 +267,7 @@ public sealed class AuditAgentResolutionTests : IDisposable
 internal sealed class ContextCapturingAuditor : IAuditor
 {
     public string Name { get; }
+    public string Kind => "tool";
     public AuditCapabilities Required { get; }
     public AgentKind? ObservedRunnerKind { get; private set; }
 

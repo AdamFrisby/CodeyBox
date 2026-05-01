@@ -1,0 +1,271 @@
+@page "/work-items/{Id}/audit-reports"
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+@inject ILogger<AuditReports> Logger
+
+<PageTitle>Audit Reports — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found.</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_reports is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <div class="detail-actions">
+        <a href="/work-items/@Id" class="btn">← Detail</a>
+        <a href="/work-items/@Id/timeline" class="btn">Timeline</a>
+    </div>
+
+    <h1>Audit Reports — @Id[..Math.Min(8, Id.Length)]…</h1>
+
+    @if (_reports.Iterations.Count == 0)
+    {
+        <p>No audit reports recorded for this work item yet.</p>
+    }
+    else
+    {
+        @* ── Findings across iterations table ─────────────────────────────── *@
+        @if (_findingMatrix.Count > 0)
+        {
+            <section class="audit-matrix">
+                <h2>Findings across iterations</h2>
+                <p class="audit-matrix-note">
+                    Each row is a stable finding ID. Columns are iteration numbers.
+                    <strong>✓</strong> = present &nbsp; <strong>·</strong> = absent.
+                    Finding IDs are best-effort: LLM phrasing variation may produce different IDs for the same defect.
+                </p>
+                <div class="audit-matrix-scroll">
+                    <table class="audit-matrix-table">
+                        <thead>
+                            <tr>
+                                <th>Finding</th>
+                                @foreach (var iter in _iterations)
+                                {
+                                    <th title="Iteration @iter">@iter</th>
+                                }
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var row in _findingMatrix)
+                            {
+                                <tr>
+                                    <td class="audit-matrix-finding">
+                                        <span class="severity-badge severity-badge--@row.Severity.ToLowerInvariant()">@row.Severity[0]</span>
+                                        <span title="@row.Id">@row.Title</span>
+                                        @if (row.Files.Count > 0)
+                                        {
+                                            <span class="audit-matrix-file">@row.Files[0]@(row.LineHints.Count > 0 ? $":{row.LineHints[0]}" : "")</span>
+                                        }
+                                    </td>
+                                    @foreach (var iter in _iterations)
+                                    {
+                                        var cell = row.Presence.TryGetValue(iter, out var p) ? p : MatrixCell.Absent;
+                                        <td class="audit-matrix-cell audit-matrix-cell--@cell.ToString().ToLowerInvariant()"
+                                            title="@cell">
+                                            @(cell == MatrixCell.Present ? "✓" : "·")
+                                        </td>
+                                    }
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        }
+
+        @* ── Per-iteration auditor details ────────────────────────────────── *@
+        <section class="audit-iterations">
+            <h2>Iterations</h2>
+            @foreach (var iteration in _reports.Iterations)
+            {
+                <details class="audit-iteration" @key="iteration.Iteration">
+                    <summary class="audit-iteration-summary">
+                        Iteration @iteration.Iteration
+                        <span class="audit-iter-counts">
+                            @if (iteration.BlockingCount > 0)
+                            {
+                                <span class="count-blocking">@iteration.BlockingCount blocking</span>
+                            }
+                            @if (iteration.NonBlockingCount > 0)
+                            {
+                                <span class="count-nonblocking">@iteration.NonBlockingCount non-blocking</span>
+                            }
+                            @if (iteration.BlockingCount == 0 && iteration.NonBlockingCount == 0)
+                            {
+                                <span class="count-pass">✓ pass</span>
+                            }
+                        </span>
+                    </summary>
+
+                    @foreach (var auditor in iteration.Auditors)
+                    {
+                        <details class="audit-auditor" @key="auditor.Name">
+                            <summary class="audit-auditor-summary">
+                                <span class="severity-badge severity-badge--@auditor.WorstSeverity.ToLowerInvariant()">@auditor.WorstSeverity</span>
+                                @auditor.Name
+                                <span class="audit-auditor-meta">(@auditor.Kind, @FormatDuration(auditor.DurationMs))</span>
+                                @if (auditor.RawOutputAvailable)
+                                {
+                                    <button class="btn btn-xs audit-raw-btn"
+                                            @onclick:stopPropagation="true"
+                                            @onclick="() => ToggleRawAsync(iteration.Iteration, auditor.Name)">
+                                        raw
+                                    </button>
+                                }
+                            </summary>
+
+                            @if (_rawOutputVisible.TryGetValue((iteration.Iteration, auditor.Name), out var raw) && raw is not null)
+                            {
+                                <pre class="audit-raw-output">@raw</pre>
+                            }
+
+                            @if (auditor.Findings.Count == 0)
+                            {
+                                <p class="audit-no-findings">No findings.</p>
+                            }
+                            else
+                            {
+                                <ul class="audit-findings">
+                                    @foreach (var finding in auditor.Findings)
+                                    {
+                                        <li class="audit-finding audit-finding--@finding.Severity.ToLowerInvariant()">
+                                            <span class="severity-badge severity-badge--@finding.Severity.ToLowerInvariant()">@finding.Severity[0]</span>
+                                            <strong>@finding.Title</strong>
+                                            @if (finding.Files.Count > 0)
+                                            {
+                                                <span class="audit-finding-loc">
+                                                    @finding.Files[0]@(finding.LineHints.Count > 0 ? $":{finding.LineHints[0]}" : "")
+                                                </span>
+                                            }
+                                            <p class="audit-finding-msg">@finding.Message</p>
+                                        </li>
+                                    }
+                                </ul>
+                            }
+                        </details>
+                    }
+                </details>
+            }
+        </section>
+    }
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private AuditReportsDto? _reports;
+    private string? _error;
+    private bool _notFound;
+    private string? _loadedId;
+
+    // Findings-across-iterations matrix
+    private List<int> _iterations = [];
+    private List<MatrixRow> _findingMatrix = [];
+
+    // Raw output cache: (iteration, auditorName) → raw text or null if loading failed
+    private readonly Dictionary<(int, string), string?> _rawOutputVisible = new();
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (Id == _loadedId) return;
+        _loadedId = Id;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        _findingMatrix = [];
+        _iterations = [];
+        try
+        {
+            _reports = await ApiClient.GetAuditReportsAsync(Id);
+            _notFound = _reports is null;
+            if (_reports is not null)
+                BuildMatrix(_reports);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load audit reports for {Id}", Id);
+            _error = "Failed to load audit reports. Check server logs for details.";
+        }
+    }
+
+    private async Task ToggleRawAsync(int iteration, string auditorName)
+    {
+        var key = (iteration, auditorName);
+        if (_rawOutputVisible.ContainsKey(key))
+        {
+            _rawOutputVisible.Remove(key);
+            return;
+        }
+        _rawOutputVisible[key] = null; // show loading state
+        StateHasChanged();
+        try
+        {
+            var raw = await ApiClient.GetAuditReportRawOutputAsync(Id, iteration, auditorName);
+            _rawOutputVisible[key] = raw ?? "(no raw output)";
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to load raw output for {Iter}/{Auditor}", iteration, auditorName);
+            _rawOutputVisible[key] = "(error loading raw output)";
+        }
+        StateHasChanged();
+    }
+
+    private void BuildMatrix(AuditReportsDto reports)
+    {
+        _iterations = reports.Iterations.Select(i => i.Iteration).OrderBy(x => x).ToList();
+
+        // Collect all findings keyed by their stable ID.
+        var byId = new Dictionary<string, MatrixRow>();
+        foreach (var iter in reports.Iterations)
+        {
+            foreach (var aud in iter.Auditors)
+            {
+                foreach (var f in aud.Findings)
+                {
+                    if (!byId.TryGetValue(f.Id, out var row))
+                    {
+                        row = new MatrixRow(f.Id, f.Title, f.Severity, f.Files, f.LineHints);
+                        byId[f.Id] = row;
+                    }
+                    row.Presence[iter.Iteration] = MatrixCell.Present;
+                }
+            }
+        }
+
+        _findingMatrix = byId.Values
+            .OrderByDescending(r => r.Severity)
+            .ThenBy(r => r.Title)
+            .ToList();
+    }
+
+    private static string FormatDuration(long ms) =>
+        ms < 1_000 ? $"{ms}ms" :
+        ms < 60_000 ? $"{ms / 1000}s" :
+        $"{ms / 60_000}m {(ms % 60_000) / 1000}s";
+
+    private enum MatrixCell { Absent, Present }
+
+    private sealed class MatrixRow(string id, string title, string severity,
+        IReadOnlyList<string> files, IReadOnlyList<int> lineHints)
+    {
+        public string Id { get; } = id;
+        public string Title { get; } = title;
+        public string Severity { get; } = severity;
+        public IReadOnlyList<string> Files { get; } = files;
+        public IReadOnlyList<int> LineHints { get; } = lineHints;
+        public Dictionary<int, MatrixCell> Presence { get; } = new();
+    }
+}
