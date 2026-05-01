@@ -1,0 +1,352 @@
+@page "/work-items/{Id}/timeline"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+@inject ILogger<WorkItemTimeline> Logger
+
+<PageTitle>Timeline — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found.</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_timeline is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <div class="detail-actions">
+        <a href="/work-items/@Id" class="btn">← Detail</a>
+        @if (_isInFlight)
+        {
+            <span class="timeline-live-badge">● Live (auto-refresh 5s)</span>
+        }
+    </div>
+
+    <h1>Timeline — @Id[..Math.Min(8, Id.Length)]…</h1>
+
+    @* ── Filter chips ─────────────────────────────────────────────────────────── *@
+    <div class="timeline-filters">
+        <span class="timeline-filter-label">Filter:</span>
+        @foreach (var k in KindOptions)
+        {
+            var isActive = ActiveKinds.Contains(k.Value);
+            <button class="filter-chip @(isActive ? "filter-chip--active" : "")"
+                    @onclick="() => ToggleKind(k.Value)">
+                @k.Label
+            </button>
+        }
+        @if (!string.IsNullOrEmpty(FilterKind) || FilterIteration is not null || FilterSince is not null)
+        {
+            <button class="filter-chip filter-chip--clear" @onclick="ClearFilters">✕ Clear</button>
+        }
+        @if (FilterIteration is { } fi)
+        {
+            <span class="filter-chip filter-chip--active">iter @fi
+                <button class="filter-chip-remove" @onclick="() => FilterIteration = null">✕</button>
+            </span>
+        }
+        @if (FilterSince is { } fsinceChip)
+        {
+            <span class="filter-chip filter-chip--active">since @fsinceChip.ToString("yyyy-MM-dd HH:mm")
+                <button class="filter-chip-remove" @onclick="() => FilterSince = null">✕</button>
+            </span>
+        }
+    </div>
+
+    @* ── Timeline ────────────────────────────────────────────────────────────── *@
+    @if (VisibleEntries.Count == 0)
+    {
+        <p class="timeline-empty">No timeline entries match the current filters.</p>
+    }
+    else
+    {
+        var start = _timeline.Entries.Count > 0 ? _timeline.Entries[0].OccurredAt : DateTimeOffset.UtcNow;
+        var groups = GroupEntries(VisibleEntries);
+
+        <div class="timeline">
+            @foreach (var group in groups)
+            {
+                @if (group.IsAuditorGroup)
+                {
+                    <details class="timeline-group" open="@(FilterIteration == group.Iteration)">
+                        <summary class="timeline-group-summary">
+                            Iteration @group.Iteration auditors
+                            <span class="timeline-group-count">(@group.Entries.Count)</span>
+                            <button class="btn btn-xs timeline-iter-filter"
+                                    @onclick:stopPropagation="true"
+                                    @onclick="() => FilterIteration = group.Iteration">
+                                filter
+                            </button>
+                        </summary>
+                        @foreach (var entry in group.Entries)
+                        {
+                            @RenderEntry(entry, start)
+                        }
+                    </details>
+                }
+                else
+                {
+                    @foreach (var entry in group.Entries)
+                    {
+                        @RenderEntry(entry, start)
+                    }
+                }
+            }
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    // Query-string filter params
+    [SupplyParameterFromQuery] public string? Kind { get; set; }
+    [SupplyParameterFromQuery] public string? Since { get; set; }
+    [SupplyParameterFromQuery] public int? Iteration { get; set; }
+
+    private WorkItemTimelineDto? _timeline;
+    private string? _error;
+    private bool _notFound;
+    private bool _isInFlight;
+    private string? _loadedId;
+    private CancellationTokenSource? _cts;
+
+    // Mutable UI filter state (may differ from query params after user interaction)
+    private string FilterKind { get; set; } = "";
+    private int? FilterIteration { get; set; }
+    private DateTimeOffset? FilterSince { get; set; }
+
+    private HashSet<string> ActiveKinds =>
+        FilterKind.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly (string Label, string Value)[] KindOptions =
+    [
+        ("State", "state_transition"),
+        ("Agent", "agent_started,agent_finished"),
+        ("Auditor", "auditor_run"),
+        ("Iteration", "iteration_complete"),
+        ("Webhook", "webhook_delivered"),
+    ];
+
+    private List<TimelineEntryDto> VisibleEntries
+    {
+        get
+        {
+            if (_timeline is null) return [];
+            IEnumerable<TimelineEntryDto> q = _timeline.Entries;
+
+            if (!string.IsNullOrEmpty(FilterKind))
+            {
+                var kinds = FilterKind.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                q = q.Where(e => kinds.Contains(e.Kind, StringComparer.OrdinalIgnoreCase));
+            }
+            if (FilterIteration is { } fi)
+                q = q.Where(e => e.IterationNumber == fi);
+            if (FilterSince is { } fs)
+                q = q.Where(e => e.OccurredAt >= fs);
+
+            return q.ToList();
+        }
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (Id == _loadedId) return;
+        _loadedId = Id;
+
+        FilterKind = Kind ?? "";
+        FilterIteration = Iteration;
+        FilterSince = DateTimeOffset.TryParse(Since, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsedSince) ? parsedSince : null;
+
+        _cts?.Cancel();
+        _cts = new CancellationTokenSource();
+        await LoadAsync(_cts.Token);
+
+        if (_isInFlight)
+            _ = RefreshLoopAsync(_cts.Token);
+    }
+
+    private async Task LoadAsync(CancellationToken ct)
+    {
+        _error = null;
+        _notFound = false;
+        try
+        {
+            _timeline = await ApiClient.GetWorkItemTimelineAsync(Id,
+                kind: string.IsNullOrEmpty(FilterKind) ? null : FilterKind,
+                since: FilterSince?.ToString("O"),
+                iteration: FilterIteration,
+                ct: ct);
+            _notFound = _timeline is null;
+
+            // Determine if in-flight by checking the last state_transition entry
+            _isInFlight = !IsTerminalTimeline(_timeline);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load timeline for {Id}", Id);
+            _error = "Failed to load timeline. Check server logs for details.";
+        }
+    }
+
+    private async Task RefreshLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                await LoadAsync(ct);
+                await InvokeAsync(StateHasChanged);
+                if (!_isInFlight) break;
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private static bool IsTerminalTimeline(WorkItemTimelineDto? t)
+    {
+        if (t is null) return false;
+        var last = t.Entries.LastOrDefault(e => e.Kind == "state_transition");
+        if (last is null) return false;
+        var to = "";
+        if (last.Details.ValueKind == System.Text.Json.JsonValueKind.Object &&
+            last.Details.TryGetProperty("to", out var p))
+            to = p.GetString() ?? "";
+        return to is "Done" or "Failed" or "Cancelled" or "AuditFailed";
+    }
+
+    private void ToggleKind(string kindValue)
+    {
+        var active = ActiveKinds;
+        var parts = kindValue.Split(',');
+        if (parts.All(p => active.Contains(p)))
+        {
+            // all already active → remove them
+            foreach (var p in parts) active.Remove(p);
+        }
+        else
+        {
+            foreach (var p in parts) active.Add(p);
+        }
+        FilterKind = string.Join(",", active.Order());
+    }
+
+    private void ClearFilters()
+    {
+        FilterKind = "";
+        FilterIteration = null;
+        FilterSince = null;
+    }
+
+    private async Task CopyEntryJsonAsync(TimelineEntryDto entry)
+    {
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                occurredAt = entry.OccurredAt,
+                kind = entry.Kind,
+                summary = entry.Summary,
+                details = entry.Details,
+            }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", json);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Clipboard write failed");
+        }
+    }
+
+    // ── Entry grouping ────────────────────────────────────────────────────────
+
+    private static List<EntryGroup> GroupEntries(List<TimelineEntryDto> entries)
+    {
+        var groups = new List<EntryGroup>();
+        var i = 0;
+        while (i < entries.Count)
+        {
+            var entry = entries[i];
+            if (entry.Kind == "auditor_run" && entry.IterationNumber is { } iter)
+            {
+                // Collect consecutive auditor_run entries for the same iteration
+                var run = new List<TimelineEntryDto>();
+                while (i < entries.Count &&
+                       entries[i].Kind == "auditor_run" &&
+                       entries[i].IterationNumber == iter)
+                {
+                    run.Add(entries[i]);
+                    i++;
+                }
+                groups.Add(new EntryGroup(run, IsAuditorGroup: true, Iteration: iter));
+            }
+            else
+            {
+                groups.Add(new EntryGroup([entry], IsAuditorGroup: false, Iteration: null));
+                i++;
+            }
+        }
+        return groups;
+    }
+
+    private sealed record EntryGroup(
+        List<TimelineEntryDto> Entries,
+        bool IsAuditorGroup,
+        int? Iteration);
+
+    // ── Render helpers ────────────────────────────────────────────────────────
+
+    private RenderFragment RenderEntry(TimelineEntryDto entry, DateTimeOffset start) =>
+        __builder =>
+        {
+            var isAgentFinished = entry.Kind == "agent_finished";
+            <div class="timeline-entry timeline-entry--@entry.Kind timeline-entry--@entry.CssModifier">
+                <div class="timeline-gutter">
+                    <span class="timeline-rel" title="@entry.OccurredAt.ToString("O")">
+                        @entry.RelativeTime(start)
+                    </span>
+                </div>
+                <div class="timeline-icon">@EntryIcon(entry.Kind)</div>
+                <div class="timeline-body">
+                    <div class="timeline-summary">
+                        @entry.Summary
+                        <button class="btn btn-xs timeline-copy"
+                                title="Copy as JSON"
+                                @onclick="() => CopyEntryJsonAsync(entry)">📋</button>
+                    </div>
+                    @if (isAgentFinished || entry.Kind != "auditor_run")
+                    {
+                        <details class="timeline-details" open="@isAgentFinished">
+                            <summary>details</summary>
+                            <pre class="timeline-json">@entry.Details.ToString()</pre>
+                        </details>
+                    }
+                </div>
+            </div>
+        };
+
+    private static string EntryIcon(string kind) => kind switch
+    {
+        "state_transition"  => "→",
+        "agent_started"     => "▶",
+        "agent_finished"    => "■",
+        "auditor_run"       => "🔍",
+        "iteration_complete" => "⚖",
+        "webhook_delivered" => "⇗",
+        _                   => "·",
+    };
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+}

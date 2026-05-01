@@ -107,4 +107,17 @@ public sealed class WorkItemDetailPageTests : TestContext
         // GetWorkItemAsync was called exactly once, not twice.
         Assert.Equal(1, fake.GetWorkItemCallCount);
     }
+
+    [Fact]
+    public void WorkItemDetail_ShowsReplayButton_ForAnyItem()
+    {
+        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Working");
+        var fake = new FakeApiClient([item]);
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+
+        Assert.Contains("Replay", cut.Markup);
+        Assert.Contains("/timeline", cut.Markup);
+    }
 }

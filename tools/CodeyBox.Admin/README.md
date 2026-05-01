@@ -45,6 +45,7 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 | `/work-items/new` | Create a new work item |
 | `/work-items/{id}` | Detail view: full prompt (collapsible), state, error, deps |
 | `/work-items/{id}/edit` | Edit title/prompt/agent — Queued items only |
+| `/work-items/{id}/timeline` | Audit-replay timeline — chronological log of every agent/audit event. Auto-refreshes every 5 s for in-flight items. Supports `?kind=`, `?since=`, `?iteration=` filter params. |
 
 ## In scope (v1)
 
@@ -54,11 +55,11 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 - Cancel non-terminal item
 - Retry terminal-failed item from work/audit
 - Drill-in detail view with collapsible prompt
+- Audit-replay timeline with per-kind filter chips, iteration grouping, copy-as-JSON
 
 ## Out of scope (v1)
 
 - Drag-and-drop reorder (HTML5 DnD is wired but not implemented)
-- Audit iteration history (orchestrator API does not yet expose iterations)
 - Webhook delivery log
 - Multi-user auth (only a single cookie gate placeholder)
 

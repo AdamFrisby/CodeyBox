@@ -1,4 +1,5 @@
 using CodeyBox.Admin.Web.Models;
+using System.Text.Json;
 
 namespace CodeyBox.Admin.Web.Services;
 
@@ -24,6 +25,11 @@ public interface ICodeyBoxApiClient
 
     // ── Budget usage ──────────────────────────────────────────────────────────
     Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default);
+
+    // ── Audit timeline ────────────────────────────────────────────────────────
+    Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
+        string id, string? kind = null, string? since = null, int? iteration = null,
+        CancellationToken ct = default);
 }
 
 /// <summary>Request body for PATCH /workitems/{id}.</summary>

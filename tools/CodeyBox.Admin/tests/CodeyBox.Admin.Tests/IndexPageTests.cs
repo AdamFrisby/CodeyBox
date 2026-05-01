@@ -410,4 +410,11 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult(BudgetUsageOverrides.TryGetValue(projectId, out var u) ? (BudgetUsageDto?)u : null);
+
+    public WorkItemTimelineDto? TimelineOverride { get; set; }
+
+    public Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
+        string id, string? kind = null, string? since = null, int? iteration = null,
+        CancellationToken ct = default)
+        => Task.FromResult(TimelineOverride);
 }

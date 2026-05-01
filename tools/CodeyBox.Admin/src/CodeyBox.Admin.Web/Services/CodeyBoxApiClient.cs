@@ -113,4 +113,28 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadFromJsonAsync<BudgetUsageDto>(JsonOptions, ct);
     }
+
+    public async Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
+        string id, string? kind = null, string? since = null, int? iteration = null,
+        CancellationToken ct = default)
+    {
+        var qs = BuildTimelineQueryString(kind, since, iteration);
+        var url = $"/workitems/{Uri.EscapeDataString(id)}/timeline{qs}";
+        var resp = await _http.GetAsync(url, ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemTimelineDto>(JsonOptions, ct);
+    }
+
+    private static string BuildTimelineQueryString(string? kind, string? since, int? iteration)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(kind))
+            parts.Add($"kind={Uri.EscapeDataString(kind)}");
+        if (!string.IsNullOrWhiteSpace(since))
+            parts.Add($"since={Uri.EscapeDataString(since)}");
+        if (iteration is { } i)
+            parts.Add($"iteration={i}");
+        return parts.Count > 0 ? "?" + string.Join("&", parts) : "";
+    }
 }

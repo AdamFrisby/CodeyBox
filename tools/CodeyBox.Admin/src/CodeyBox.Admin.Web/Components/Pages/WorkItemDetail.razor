@@ -26,6 +26,7 @@ else
         {
             <a href="/work-items/@_item.Id/edit" class="btn">Edit</a>
         }
+        <a href="/work-items/@_item.Id/timeline" class="btn">Replay</a>
         @if (!_item.IsTerminal)
         {
             <button class="btn btn-danger" @onclick="CancelAsync">Cancel</button>

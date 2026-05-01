@@ -237,4 +237,9 @@ public sealed class CapturingApiClient : ICodeyBoxApiClient
 
     public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult<BudgetUsageDto?>(null);
+
+    public Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
+        string id, string? kind = null, string? since = null, int? iteration = null,
+        CancellationToken ct = default)
+        => Task.FromResult<WorkItemTimelineDto?>(null);
 }

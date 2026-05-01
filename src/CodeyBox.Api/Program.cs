@@ -482,6 +482,13 @@ builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
         sp.GetRequiredService<ILogger<HttpWebhookDispatcher>>());
 });
 
+// --- Audit timeline reader ---------------------------------------------------
+builder.Services.AddSingleton(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog;
+    return new AuditLogTimelineReader(opts);
+});
+
 // --- Persistence + queue + pipeline + worker pool ----------------------------
 builder.Services.AddSingleton<IWorkItemStore>(sp =>
 {

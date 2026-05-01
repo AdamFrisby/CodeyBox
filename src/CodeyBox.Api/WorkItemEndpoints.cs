@@ -16,6 +16,7 @@ internal static class WorkItemEndpoints
         group.MapDelete("/{id}", CancelAsync);
         group.MapGet("/{id}/dependents", GetDependentsAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
+        group.MapGet("/{id}/timeline", GetTimelineAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -622,6 +623,69 @@ internal static class WorkItemEndpoints
         p.Audit.Languages,
         p.Audit.AuditTypes,
         p.Audit.MaxIterations);
+
+    private static async Task<IResult> GetTimelineAsync(
+        string id,
+        string? kind,
+        string? since,
+        int? iteration,
+        IWorkItemStore store,
+        AuditLogTimelineReader timeline,
+        CancellationToken ct)
+    {
+        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
+        var workItemId = new WorkItemId(g);
+        var item = await store.GetAsync(workItemId, ct);
+        if (item is null) return Results.NotFound();
+
+        var isTerminal = item.State is
+            WorkItemState.Done or WorkItemState.Failed or
+            WorkItemState.Cancelled or WorkItemState.AuditFailed;
+
+        var entries = await timeline.GetTimelineAsync(workItemId.ToString(), isTerminal, item.CreatedAt, ct);
+
+        IEnumerable<TimelineEntry> filtered = entries;
+
+        if (!string.IsNullOrWhiteSpace(kind))
+        {
+            var kinds = kind.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            filtered = filtered.Where(e => kinds.Contains(e.Kind, StringComparer.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(since) &&
+            DateTimeOffset.TryParse(since, null, System.Globalization.DateTimeStyles.RoundtripKind, out var sinceDate))
+        {
+            filtered = filtered.Where(e => e.OccurredAt >= sinceDate);
+        }
+
+        if (iteration is { } iter)
+        {
+            filtered = filtered.Where(e =>
+                e.Kind is "auditor_run" or "iteration_complete" &&
+                e.Details is not null &&
+                TryGetIterationFromDetails(e.Details, out var entryIter) &&
+                entryIter == iter);
+        }
+
+        return Results.Ok(new WorkItemTimelineResponse(id, filtered.ToList()));
+    }
+
+    private static bool TryGetIterationFromDetails(object details, out int iteration)
+    {
+        iteration = 0;
+        var json = System.Text.Json.JsonSerializer.Serialize(details);
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("iteration", out var p) && p.TryGetInt32(out var i))
+            {
+                iteration = i;
+                return true;
+            }
+        }
+        catch (System.Text.Json.JsonException) { }
+        return false;
+    }
 }
 
 public sealed record CreateWorkItemRequest(
@@ -647,6 +711,8 @@ public sealed record PatchWorkItemRequest(
 public sealed record ReorderWorkItemsRequest(string[]? Ids = null);
 
 public sealed record PauseQueueRequest(string Reason = "");
+
+public sealed record WorkItemTimelineResponse(string WorkItemId, IReadOnlyList<TimelineEntry> Entries);
 
 public sealed record WorkItemDto(
     string Id,
