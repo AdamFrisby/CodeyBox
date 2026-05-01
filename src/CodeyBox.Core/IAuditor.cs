@@ -18,6 +18,12 @@ public interface IAuditor
     /// <summary>Stable name for logs and findings.</summary>
     string Name { get; }
 
+    /// <summary>
+    /// Implementation kind for observability storage.
+    /// One of: <c>diff-pattern</c>, <c>shell</c>, <c>llm</c>, <c>tool</c>.
+    /// </summary>
+    string Kind { get; }
+
     /// <summary>What the auditor needs to do its job.</summary>
     AuditCapabilities Required { get; }
 
@@ -58,7 +64,7 @@ public sealed record AuditContext(
     IAgentRunner? AuditRunner = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
-public sealed record AuditResult(bool Passed, IReadOnlyList<AuditFinding> Findings);
+public sealed record AuditResult(bool Passed, IReadOnlyList<AuditFinding> Findings, string? RawOutput = null);
 
 public sealed record AuditFinding(
     string AuditorName,

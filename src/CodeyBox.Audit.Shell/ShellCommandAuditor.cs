@@ -23,6 +23,7 @@ public sealed class ShellCommandAuditor : IAuditor
     }
 
     public string Name => _opts.Name;
+    public string Kind => "shell";
     public AuditCapabilities Required => AuditCapabilities.None;
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
@@ -34,7 +35,7 @@ public sealed class ShellCommandAuditor : IAuditor
         }, ct);
 
         if (result.Success)
-            return new AuditResult(true, []);
+            return new AuditResult(true, [], RawOutput: result.Stdout);
 
         var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
 
@@ -56,7 +57,10 @@ public sealed class ShellCommandAuditor : IAuditor
             Severity: severity,
             Title: title,
             Description: description.TrimEnd());
-        return new AuditResult(false, [finding]);
+        var rawOutput = string.IsNullOrEmpty(result.Stderr)
+            ? result.Stdout
+            : result.Stderr + (string.IsNullOrEmpty(result.Stdout) ? "" : "\n" + result.Stdout);
+        return new AuditResult(false, [finding], RawOutput: rawOutput);
     }
 }
 

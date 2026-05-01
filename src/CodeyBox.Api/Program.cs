@@ -500,6 +500,11 @@ builder.Services.AddSingleton<ISuggestionStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteSuggestionStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IAuditReportStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteAuditReportStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IQueueController>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -522,7 +527,24 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         HostGitIdentity = hostIdentity,
     };
 });
-builder.Services.AddSingleton<PipelineRunner>();
+builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
+    sp.GetRequiredService<ISandboxProvider>(),
+    sp.GetRequiredService<IGitHost>(),
+    sp.GetRequiredService<IAgentRegistry>(),
+    sp.GetRequiredService<ICredentialProvider>(),
+    sp.GetRequiredService<IPullRequestService>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IUpstreamRemoteFactory>(),
+    sp.GetRequiredService<ProjectAuditorComposer>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<PipelineOptions>(),
+    sp.GetRequiredService<ILogger<PipelineRunner>>(),
+    sp.GetService<CredentialSmokeGate>(),
+    sp.GetService<ISuggestionStore>(),
+    sp.GetServices<IAgentQuotaProbe>(),
+    sp.GetService<QuotaRouterOptions>(),
+    sp.GetRequiredService<IAuditReportStore>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
@@ -554,6 +576,10 @@ builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetRequiredService<ILogger<AuditAgentStartupValidationService>>()));
+builder.Services.AddHostedService(sp => new AuditReportRetentionService(
+    sp.GetRequiredService<IAuditReportStore>(),
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog.RetainedDays,
+    sp.GetRequiredService<ILogger<AuditReportRetentionService>>()));
 
 var app = builder.Build();
 
@@ -561,6 +587,7 @@ app.UseApiKeyAuth(anonymousPrefixes: ["/healthz"]);
 
 WorkItemEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
+AuditReportEndpoints.Map(app);
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 

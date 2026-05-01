@@ -46,6 +46,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly ILogger<PipelineRunner> _log;
     private readonly CredentialSmokeGate? _smokeGate;
     private readonly ISuggestionStore? _suggestions;
+    private readonly IAuditReportStore? _auditReports;
     // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
     // Null when no probes were provided (fail-open: no quota gate on audit agent).
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
@@ -85,7 +86,8 @@ public sealed class PipelineRunner : IPipelineRunner
         CredentialSmokeGate? smokeGate = null,
         ISuggestionStore? suggestions = null,
         IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
-        QuotaRouterOptions? auditQuotaOptions = null)
+        QuotaRouterOptions? auditQuotaOptions = null,
+        IAuditReportStore? auditReports = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -101,6 +103,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
+        _auditReports = auditReports;
         // PayPerApi and Null probes are routing utilities, not real quota sources —
         // exclude them so only genuine subscription probes gate the audit agent.
         _auditQuotaProbesByKind = auditQuotaProbes is null ? null
@@ -621,6 +624,7 @@ public sealed class PipelineRunner : IPipelineRunner
             foreach (var (auditor, runner) in group)
             {
                 _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
+                var auditorStarted = DateTimeOffset.UtcNow;
                 var auditorSw = Stopwatch.StartNew();
                 // Thread the resolved runner into the context so LlmReviewAuditor
                 // can use the cross-review agent instead of its baked-in default.
@@ -635,12 +639,83 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (needsCreds && runner.Kind != workRunner.Kind)
                     activeAuditAgentKind ??= runner.Kind;
                 findings.AddRange(result.Findings);
+                await PersistAuditReportAsync(ctx, auditor, result, auditorStarted, auditorSw.Elapsed, ct);
                 if (project.Audit.StopOnFirstFailure && result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
                     return (findings, activeAuditAgentKind);
             }
         }
 
         return (findings, activeAuditAgentKind);
+    }
+
+    private async Task PersistAuditReportAsync(
+        AuditContext ctx,
+        IAuditor auditor,
+        AuditResult result,
+        DateTimeOffset startedAt,
+        TimeSpan elapsed,
+        CancellationToken ct)
+    {
+        if (_auditReports is null) return;
+        try
+        {
+            const int MaxRawBytes = 256 * 1024;
+            string? rawOutput = null;
+            if (result.RawOutput is not null)
+            {
+                var redacted = RawOutputRedactor.Redact(result.RawOutput);
+                rawOutput = RawOutputRedactor.TruncateToBytes(redacted, MaxRawBytes);
+            }
+
+            var worstSeverity = result.Findings.Count > 0
+                ? ((AuditSeverity)result.Findings.Max(f => (int)f.Severity)).ToString()
+                : "none";
+
+            var reportFindings = result.Findings.Select(f =>
+            {
+                var (files, lineHints) = ParseLocation(f.Location);
+                return new AuditReportFinding(
+                    Id: FindingIdComputer.Compute(auditor.Name, f.Title, files),
+                    Severity: f.Severity.ToString(),
+                    Title: f.Title,
+                    Message: f.Description,
+                    Files: files,
+                    LineHints: lineHints);
+            }).ToList();
+
+            var report = new AuditReport
+            {
+                Id = Guid.NewGuid().ToString(),
+                WorkItemId = ctx.WorkItemId.ToString(),
+                Iteration = ctx.Iteration,
+                AuditorName = auditor.Name,
+                AuditorKind = auditor.Kind,
+                WorstSeverity = worstSeverity,
+                StartedAt = startedAt,
+                EndedAt = startedAt + elapsed,
+                DurationMs = (long)elapsed.TotalMilliseconds,
+                Findings = reportFindings,
+                RawOutput = rawOutput,
+            };
+            await _auditReports.CreateAsync(report, ct);
+        }
+        catch (Exception ex)
+        {
+            // Non-fatal: audit report persistence must never abort the pipeline.
+            _log.LogWarning(ex, "Failed to persist audit report for auditor '{Auditor}' iteration {Iter}",
+                auditor.Name, ctx.Iteration);
+        }
+    }
+
+    private static (IReadOnlyList<string> Files, IReadOnlyList<int> LineHints) ParseLocation(string? location)
+    {
+        if (string.IsNullOrWhiteSpace(location))
+            return ([], []);
+        // location may be "path/to/file:42" or just "path/to/file"
+        var colonIdx = location.LastIndexOf(':');
+        if (colonIdx > 0 && int.TryParse(location.AsSpan(colonIdx + 1), out var line))
+            return ([location[..colonIdx]], [line]);
+        return ([location], []);
     }
 
     /// <summary>

@@ -31,6 +31,10 @@ public interface ICodeyBoxApiClient
         string id, string? kind = null, string? since = null, int? iteration = null,
         CancellationToken ct = default);
 
+    // ── Audit reports ─────────────────────────────────────────────────────────
+    Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default);
+    Task<string?> GetAuditReportRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default);
+
     // ── Suggestions ───────────────────────────────────────────────────────────
     Task<List<SuggestionDto>> GetSuggestionsAsync(
         string? projectId = null, string? category = null, string? severity = null,

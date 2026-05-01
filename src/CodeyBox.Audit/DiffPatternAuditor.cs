@@ -26,6 +26,7 @@ public sealed partial class DiffPatternAuditor : IAuditor
     }
 
     public string Name => _opts.Name;
+    public string Kind => "diff-pattern";
     public AuditCapabilities Required => AuditCapabilities.None;
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
@@ -55,7 +56,8 @@ public sealed partial class DiffPatternAuditor : IAuditor
         if (!diff.Success)
         {
             return new AuditResult(false, [new AuditFinding(
-                Name, AuditSeverity.Error, "git diff failed", diff.Stderr)]);
+                Name, AuditSeverity.Error, "git diff failed", diff.Stderr)],
+                RawOutput: diff.Stderr);
         }
 
         var findings = new List<AuditFinding>();
@@ -97,7 +99,7 @@ public sealed partial class DiffPatternAuditor : IAuditor
             lineNumber++;
         }
 
-        return new AuditResult(findings.Count == 0, findings);
+        return new AuditResult(findings.Count == 0, findings, RawOutput: diff.Stdout);
     }
 
     [GeneratedRegex(@"\+(\d+)(?:,(\d+))? @@", RegexOptions.CultureInvariant)]

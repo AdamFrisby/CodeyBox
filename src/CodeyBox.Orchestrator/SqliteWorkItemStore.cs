@@ -27,7 +27,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // busy_timeout is per-connection and provides a retry window for the rare lock collision.
         using (var walCmd = _conn.CreateCommand())
         {
-            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
             walCmd.ExecuteNonQuery();
         }
 

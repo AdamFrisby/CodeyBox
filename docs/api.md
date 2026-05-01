@@ -149,6 +149,65 @@ first request. In-flight items are re-read from disk on every call.
 * Returns `400 Bad Request` when `id` is not a valid UUID.
 * Returns `404 Not Found` when the work item does not exist.
 
+### `GET /workitems/{id}/audit-reports`
+
+Returns all stored per-auditor reports for a work item, grouped by
+iteration. See [`audit-reports.md`](audit-reports.md) for the full
+schema and semantics.
+
+```json
+{
+  "workItemId": "...",
+  "iterations": [
+    {
+      "iteration": 1,
+      "blockingCount": 2,
+      "nonBlockingCount": 1,
+      "auditors": [
+        {
+          "name": "DiffPatternAuditor",
+          "kind": "diff-pattern",
+          "worstSeverity": "Error",
+          "durationMs": 120,
+          "rawOutputAvailable": true,
+          "findings": [
+            {
+              "id": "f-a1b2c3d4",
+              "severity": "Error",
+              "title": "Missing null check",
+              "message": "The foo method does not validate its input.",
+              "files": ["src/Foo.cs"],
+              "lineHints": [42]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`blockingCount` counts Error-severity findings; `nonBlockingCount`
+counts all others. `rawOutputAvailable` is true when raw auditor output
+is stored; fetch it via the `/raw` endpoint below.
+
+* Returns `400 Bad Request` when `id` is not a valid UUID.
+* Returns `404 Not Found` when the work item does not exist.
+* Returns an empty `iterations` array when no reports have been
+  persisted yet (e.g. the work item has not yet entered the audit phase).
+
+### `GET /workitems/{id}/audit-reports/{iteration}/{auditor}/raw`
+
+Returns the raw stdout/stderr captured from a single auditor invocation
+as `text/plain; charset=utf-8`.
+
+The output is pre-redacted (GitHub PATs, Anthropic API keys, and Google
+API keys replaced with `***`) and capped at 256 KB. A `[...truncated]`
+suffix is appended when the original exceeded the cap.
+
+* Returns `404 Not Found` when the work item, iteration, or auditor row
+  does not exist, or when `raw_output` is `NULL` for that row.
+
 ### `DELETE /workitems/{id}`
 
 Cancel a non-terminal work item.

@@ -23,6 +23,7 @@ else
 {
     <div class="detail-actions">
         <a href="/work-items/@Id" class="btn">← Detail</a>
+        <a href="/work-items/@Id/audit-reports" class="btn">Audit Reports</a>
         @if (_isInFlight)
         {
             <span class="timeline-live-badge">● Live (auto-refresh 5s)</span>
@@ -112,11 +113,14 @@ else
     [SupplyParameterFromQuery] public int? Iteration { get; set; }
 
     private WorkItemTimelineDto? _timeline;
+    private AuditReportsDto? _auditReports;
     private string? _error;
     private bool _notFound;
     private bool _isInFlight;
     private string? _loadedId;
     private CancellationTokenSource? _cts;
+
+    private readonly Dictionary<(int, string), string?> _rawOutputVisible = new();
 
     // Mutable UI filter state (may differ from query params after user interaction)
     private string FilterKind { get; set; } = "";
@@ -194,6 +198,16 @@ else
         {
             Logger.LogError(ex, "Failed to load timeline for {Id}", Id);
             _error = "Failed to load timeline. Check server logs for details.";
+        }
+
+        // Load audit reports non-fatally for inline findings display
+        try
+        {
+            _auditReports = await ApiClient.GetAuditReportsAsync(Id, ct);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to load audit reports for timeline {Id}", Id);
         }
     }
 
@@ -322,7 +336,51 @@ else
                                 title="Copy as JSON"
                                 @onclick="() => CopyEntryJsonAsync(entry)">📋</button>
                     </div>
-                    @if (isAgentFinished || entry.Kind != "auditor_run")
+                    @if (entry.Kind == "auditor_run")
+                    {
+                        var auditorName = entry.Details.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                            entry.Details.TryGetProperty("name", out var nameProp)
+                            ? nameProp.GetString() ?? "" : "";
+                        var iter = entry.IterationNumber ?? 0;
+                        var findings = GetFindings(iter, auditorName);
+                        <details class="timeline-details">
+                            <summary>findings @(findings is { Count: > 0 } ? $"({findings.Count})" : "")</summary>
+                            @if (_auditReports is null)
+                            {
+                                <p class="timeline-findings-empty">Findings not available.</p>
+                            }
+                            else if (findings is null or { Count: 0 })
+                            {
+                                <p class="timeline-findings-empty">No findings.</p>
+                            }
+                            else
+                            {
+                                <ul class="audit-findings">
+                                    @foreach (var f in findings)
+                                    {
+                                        <li class="audit-finding audit-finding--@f.Severity.ToLowerInvariant()">
+                                            <span class="severity-badge severity-badge--@f.Severity.ToLowerInvariant()">@f.Severity[0]</span>
+                                            <strong>@f.Title</strong>
+                                            <p class="audit-finding-msg">@FirstParagraph(f.Message)</p>
+                                        </li>
+                                    }
+                                </ul>
+                            }
+                            @if (!string.IsNullOrEmpty(auditorName) && iter > 0)
+                            {
+                                <button class="btn btn-xs audit-raw-btn"
+                                        @onclick:stopPropagation="true"
+                                        @onclick="() => ToggleRawAsync(iter, auditorName)">
+                                    raw
+                                </button>
+                                @if (_rawOutputVisible.TryGetValue((iter, auditorName), out var raw) && raw is not null)
+                                {
+                                    <pre class="audit-raw-output">@raw</pre>
+                                }
+                            }
+                        </details>
+                    }
+                    else
                     {
                         <details class="timeline-details" open="@isAgentFinished">
                             <summary>details</summary>
@@ -343,6 +401,45 @@ else
         "webhook_delivered" => "⇗",
         _                   => "·",
     };
+
+    private IReadOnlyList<AuditReportFindingDto>? GetFindings(int iteration, string auditorName)
+    {
+        if (_auditReports is null) return null;
+        var iter = _auditReports.Iterations.FirstOrDefault(i => i.Iteration == iteration);
+        if (iter is null) return [];
+        var aud = iter.Auditors.FirstOrDefault(a => a.Name == auditorName);
+        return aud?.Findings ?? [];
+    }
+
+    private static string FirstParagraph(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return message;
+        var idx = message.IndexOf('\n');
+        return idx > 0 ? message[..idx] : message;
+    }
+
+    private async Task ToggleRawAsync(int iteration, string auditorName)
+    {
+        var key = (iteration, auditorName);
+        if (_rawOutputVisible.ContainsKey(key))
+        {
+            _rawOutputVisible.Remove(key);
+            return;
+        }
+        _rawOutputVisible[key] = null; // show loading state
+        StateHasChanged();
+        try
+        {
+            var raw = await ApiClient.GetAuditReportRawOutputAsync(Id, iteration, auditorName);
+            _rawOutputVisible[key] = raw ?? "(no raw output)";
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to load raw output for {Iter}/{Auditor}", iteration, auditorName);
+            _rawOutputVisible[key] = "(error loading raw output)";
+        }
+        StateHasChanged();
+    }
 
     public void Dispose()
     {
