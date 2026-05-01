@@ -101,14 +101,34 @@ public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
         finally { _writeLock.Release(); }
     }
 
-    public async Task<bool> TryAcceptAsync(string id, CancellationToken ct = default)
+    public async Task<bool> TryAcceptAsync(string id, string promotedToWorkItemId, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "UPDATE suggestions SET state = 'accepted' WHERE id = $id AND state = 'open';";
+            cmd.CommandText = """
+                UPDATE suggestions
+                SET state = 'accepted', promoted_to_work_item_id = $pid
+                WHERE id = $id AND state = 'open';
+                """;
             cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$pid", promotedToWorkItemId);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            return rows > 0;
+        }
+        finally { _writeLock.Release(); }
+    }
+
+    public async Task<bool> TryDismissAsync(string id, string? dismissReason, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "UPDATE suggestions SET state = 'dismissed', dismiss_reason = $reason WHERE id = $id AND state = 'open';";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$reason", (object?)dismissReason ?? DBNull.Value);
             var rows = await cmd.ExecuteNonQueryAsync(ct);
             return rows > 0;
         }

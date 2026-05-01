@@ -7,10 +7,16 @@ public interface ISuggestionStore
     Task UpdateAsync(Suggestion suggestion, CancellationToken ct = default);
 
     /// <summary>
-    /// Atomically transitions a suggestion from 'open' to 'accepted'.
-    /// Returns true if the update succeeded (suggestion was open), false if it was already accepted/dismissed.
+    /// Atomically transitions a suggestion from 'open' to 'accepted', recording the linked work item.
+    /// Returns true if the update succeeded (suggestion was open), false if already accepted/dismissed.
     /// </summary>
-    Task<bool> TryAcceptAsync(string id, CancellationToken ct = default);
+    Task<bool> TryAcceptAsync(string id, string promotedToWorkItemId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically transitions a suggestion from 'open' to 'dismissed'.
+    /// Returns true if the update succeeded (suggestion was open), false if already dismissed/accepted.
+    /// </summary>
+    Task<bool> TryDismissAsync(string id, string? dismissReason, CancellationToken ct = default);
 
     IAsyncEnumerable<Suggestion> ListAsync(
         string? projectId = null,

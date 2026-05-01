@@ -1156,9 +1156,10 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (!result.Success) return null;
 
-        if (result.Stdout.Length > MaxBytes)
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(result.Stdout);
+        if (byteCount > MaxBytes)
         {
-            _log.LogWarning("suggestions.json exceeds 256 KB ({Bytes} bytes); skipping", result.Stdout.Length);
+            _log.LogWarning("suggestions.json exceeds 256 KB ({Bytes} bytes); skipping", byteCount);
             return null;
         }
 
@@ -1196,7 +1197,7 @@ public sealed class PipelineRunner : IPipelineRunner
             await _suggestions.CreateAsync(suggestion, ct);
             _log.LogInformation(
                 "Suggestion {SuggestionId} persisted from work item {WorkItemId}: {Title}",
-                suggestion.Id, item.Id, suggestion.Title);
+                suggestion.Id, item.Id, suggestion.Title.ReplaceLineEndings(" "));
 
             await _webhooks.PublishAsync(new WebhookEvent
             {

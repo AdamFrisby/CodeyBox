@@ -133,6 +133,11 @@ public static class SuggestionsFileParser
                     log.LogWarning("suggestions.json[{I}]: filesReferenced entry exceeds {Max} chars; skipping", idx, MaxPathLength);
                     continue;
                 }
+                if (path.StartsWith('/') || path.Contains("..") || path.Contains('\0'))
+                {
+                    log.LogWarning("suggestions.json[{I}]: filesReferenced entry rejected (absolute path, traversal, or NUL); skipping", idx);
+                    continue;
+                }
                 files.Add(path);
             }
         }

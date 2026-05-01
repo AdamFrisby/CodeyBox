@@ -131,7 +131,7 @@ public sealed class SuggestionListPageTests : TestContext
         Assert.Contains("bbbbbbbb", cut.Markup);
     }
 
-[Fact]
+    [Fact]
     public void Suggestions_PageTitle_ContainsSuggestions()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([]));
