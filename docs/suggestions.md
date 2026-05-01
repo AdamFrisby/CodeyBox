@@ -112,6 +112,7 @@ The `POST /suggestions/{id}/promote` API endpoint accepts optional overrides:
 | `workBranch` | Override the work branch name |
 | `pushUpstream` | Override push-upstream behaviour |
 | `agentClassId` | Route via a named agent class |
+| `extraInstructions` | Additional operator instructions appended after the advisory block (≤ 64 KB) |
 
 ### Dismissing a suggestion
 

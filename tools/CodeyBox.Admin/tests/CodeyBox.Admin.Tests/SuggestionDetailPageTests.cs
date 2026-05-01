@@ -131,7 +131,10 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult(_suggestion);
 
-    public Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
+    public Task<string?> PromoteSuggestionAsync(
+        string id, string? extraInstructions = null, string? agent = null,
+        string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
+        string? agentClassId = null, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
 
     public Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null, CancellationToken ct = default)
@@ -172,7 +175,10 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult<SuggestionDto?>(_suggestion);
 
-    public Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
+    public Task<string?> PromoteSuggestionAsync(
+        string id, string? extraInstructions = null, string? agent = null,
+        string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
+        string? agentClassId = null, CancellationToken ct = default)
     {
         PromoteCalled = true;
         return Task.FromResult<string?>("fake-work-item-id");

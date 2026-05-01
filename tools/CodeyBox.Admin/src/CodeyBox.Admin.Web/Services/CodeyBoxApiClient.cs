@@ -178,9 +178,17 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<SuggestionDto>(JsonOptions, ct);
     }
 
-    public async Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
+    public async Task<string?> PromoteSuggestionAsync(
+        string id,
+        string? extraInstructions = null,
+        string? agent = null,
+        string? workBranch = null,
+        string? baseBranch = null,
+        bool? pushUpstream = null,
+        string? agentClassId = null,
+        CancellationToken ct = default)
     {
-        var body = new { extraInstructions };
+        var body = new { extraInstructions, agent, workBranch, baseBranch, pushUpstream, agentClassId };
         var resp = await _http.PostAsJsonAsync(
             $"/suggestions/{Uri.EscapeDataString(id)}/promote",
             body, JsonOptions, ct);

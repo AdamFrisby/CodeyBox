@@ -258,6 +258,9 @@ public sealed class CapturingApiClient : ICodeyBoxApiClient
         CancellationToken ct = default)
         => Task.FromResult<SuggestionDto?>(null);
 
-    public Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
+    public Task<string?> PromoteSuggestionAsync(
+        string id, string? extraInstructions = null, string? agent = null,
+        string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
+        string? agentClassId = null, CancellationToken ct = default)
         => Task.FromResult<string?>("fake-work-item-id");
 }

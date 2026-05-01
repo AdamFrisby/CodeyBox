@@ -1,6 +1,7 @@
 using System.Security;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Serilog;
 
 namespace CodeyBox.Api;
 
@@ -142,6 +143,9 @@ internal static class SuggestionEndpoints
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
         }
 
+        if (body?.ExtraInstructions?.Length > 64 * 1024)
+            return Results.BadRequest(new { error = "extraInstructions must be <= 64 KB" });
+
         var newId = WorkItemId.New();
         // Wrap agent-supplied content in explicit delimiters so the receiving agent
         // can distinguish advisory context from operator instructions (OWASP LLM01).
@@ -149,8 +153,10 @@ internal static class SuggestionEndpoints
         // the advisory block early and allow injected content to appear as instructions.
         // The heading is placed OUTSIDE the advisory fence so it acts as the operator-level
         // task instruction; the rationale is inside advisory-only context.
-        var safeTitle = SecurityElement.Escape(suggestion.Title.ReplaceLineEndings(" ")) ?? suggestion.Title;
-        var safeRationale = SecurityElement.Escape(suggestion.Rationale) ?? suggestion.Rationale;
+        // StripXmlInvalidChars removes codepoints that cause SecurityElement.Escape to return null,
+        // eliminating the injection path where a raw unescaped value would reach the advisory fence.
+        var safeTitle = SecurityElement.Escape(StripXmlInvalidChars(suggestion.Title.ReplaceLineEndings(" ")))!;
+        var safeRationale = SecurityElement.Escape(StripXmlInvalidChars(suggestion.Rationale))!;
         var prompt = $"""
             # From suggestion: {safeTitle}
 
@@ -192,10 +198,18 @@ internal static class SuggestionEndpoints
         catch (Exception)
         {
             // Work-item creation or queuing failed after the suggestion was claimed.
-            // Revert to 'open' so the operator can retry; best-effort (ignore revert failures).
-            try { await store.UpdateAsync(suggestion with { State = "open", PromotedToWorkItemId = null }, CancellationToken.None); }
-            catch { /* ignore */ }
-            AuditLog.SuggestionReverted(id);
+            // Attempt to revert to 'open' so the operator can retry.
+            try
+            {
+                await store.UpdateAsync(suggestion with { State = "open", PromotedToWorkItemId = null }, CancellationToken.None);
+                AuditLog.SuggestionReverted(id);
+            }
+            catch (Exception revertEx)
+            {
+                // Revert also failed: suggestion is permanently stuck in 'accepted' with no work item.
+                // Log the stuck state so operators have visibility; do not swallow silently.
+                AuditLog.SuggestionRevertFailed(id, revertEx);
+            }
             return Results.Problem("Work item creation failed; suggestion reverted to open.");
         }
 
@@ -207,6 +221,30 @@ internal static class SuggestionEndpoints
         return Results.Ok(new PromoteResponse(
             WorkItemId: newId.ToString(),
             Suggestion: ToDto(promoted)));
+    }
+
+    // Strips codepoints that XML 1.0 forbids (0x01-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0xFFFE, 0xFFFF)
+    // so that SecurityElement.Escape never returns null on the sanitised value.
+    private static string StripXmlInvalidChars(string s)
+    {
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if ((c < 0x20 && c != 0x09 && c != 0x0A && c != 0x0D) || c == 0xFFFE || c == 0xFFFF)
+            {
+                // Only allocate a new array when we find a bad character.
+                var buf = new System.Text.StringBuilder(s.Length);
+                buf.Append(s, 0, i);
+                for (int j = i + 1; j < s.Length; j++)
+                {
+                    char d = s[j];
+                    if (!((d < 0x20 && d != 0x09 && d != 0x0A && d != 0x0D) || d == 0xFFFE || d == 0xFFFF))
+                        buf.Append(d);
+                }
+                return buf.ToString();
+            }
+        }
+        return s;
     }
 
     private static SuggestionDto ToDto(Suggestion s) => new(

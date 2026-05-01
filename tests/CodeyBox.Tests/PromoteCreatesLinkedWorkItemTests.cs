@@ -93,6 +93,39 @@ public sealed class PromoteCreatesLinkedWorkItemTests : IDisposable
         Assert.Equal(body.WorkItemId, body.Suggestion.PromotedToWorkItemId);
     }
 
+    [Fact]
+    public async Task Promote_ExtraInstructions_AppendedAfterAdvisoryBlock()
+    {
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        const string extra = "Please also update the changelog.";
+        var resp = await _client.PostAsJsonAsync($"/suggestions/{s.Id}/promote",
+            new { extraInstructions = extra });
+        resp.EnsureSuccessStatusCode();
+        var body = await resp.Content.ReadFromJsonAsync<PromoteBody>();
+
+        var wi = await _factory.WorkItemStore.GetAsync(WorkItemId.Parse(body!.WorkItemId));
+        Assert.NotNull(wi);
+        Assert.Contains(extra, wi.Prompt);
+        // Extra instructions must follow the advisory block, not precede it.
+        var advisoryCloseIdx = wi.Prompt.IndexOf("</agent_advisory>", StringComparison.Ordinal);
+        var extraIdx = wi.Prompt.IndexOf(extra, StringComparison.Ordinal);
+        Assert.True(advisoryCloseIdx < extraIdx, "extraInstructions must appear after </agent_advisory>");
+    }
+
+    [Fact]
+    public async Task Promote_ExtraInstructions_TooLong_ReturnsBadRequest()
+    {
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        var tooLong = new string('x', 64 * 1024 + 1);
+        var resp = await _client.PostAsJsonAsync($"/suggestions/{s.Id}/promote",
+            new { extraInstructions = tooLong });
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     private sealed record SuggestionShape(string State, string? PromotedToWorkItemId);
     private sealed record PromoteBody(string WorkItemId, SuggestionShape Suggestion);
 }

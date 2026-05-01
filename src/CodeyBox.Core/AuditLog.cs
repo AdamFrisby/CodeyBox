@@ -224,7 +224,7 @@ public static class AuditLog
 
     public static void SuggestionDismissed(string suggestionId, string? reason) =>
         Audit("suggestion.dismissed")
-            .Information("Suggestion {SuggestionId} dismissed: {Reason}", suggestionId, reason);
+            .Information("Suggestion {SuggestionId} dismissed: {Reason}", suggestionId, reason?.ReplaceLineEndings(" "));
 
     public static void SuggestionCreated(string suggestionId, string sourceWorkItemId, string projectId) =>
         Audit("suggestion.created")
@@ -239,6 +239,12 @@ public static class AuditLog
     public static void SuggestionReverted(string suggestionId) =>
         Audit("suggestion.reverted")
             .Warning("Suggestion {SuggestionId} reverted to open after failed promotion", suggestionId);
+
+    public static void SuggestionRevertFailed(string suggestionId, Exception exception) =>
+        Audit("suggestion.revert_failed")
+            .Warning(exception,
+                "Suggestion {SuggestionId} could not be reverted to open after promotion failure; stuck in 'accepted' with no linked work item",
+                suggestionId);
 
     // ── Budget caps ──────────────────────────────────────────────────────────
 

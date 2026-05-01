@@ -122,17 +122,32 @@ else
     private async Task DismissOneAsync(string id)
     {
         var ct = _cts?.Token ?? default;
-        await ApiClient.DismissSuggestionAsync(id, ct: ct);
-        await LoadAsync();
+        try
+        {
+            await ApiClient.DismissSuggestionAsync(id, ct: ct);
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
     }
 
     private async Task BulkDismissAsync()
     {
         var ct = _cts?.Token ?? default;
-        foreach (var id in _selected.ToList())
-            await ApiClient.DismissSuggestionAsync(id, ct: ct);
-        _selected.Clear();
-        await LoadAsync();
+        _error = null;
+        try
+        {
+            foreach (var id in _selected.ToList())
+                await ApiClient.DismissSuggestionAsync(id, ct: ct);
+            _selected.Clear();
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
     }
 
     private void ToggleAll(ChangeEventArgs e)

@@ -203,8 +203,12 @@
         _error = null;
         try
         {
-            var extraInstructions = string.IsNullOrWhiteSpace(_form.Prompt) ? null : _form.Prompt;
-            var workItemId = await ApiClient.PromoteSuggestionAsync(_fromSuggestionId!, extraInstructions);
+            var workItemId = await ApiClient.PromoteSuggestionAsync(
+                _fromSuggestionId!,
+                extraInstructions: string.IsNullOrWhiteSpace(_form.Prompt) ? null : _form.Prompt,
+                agent: string.IsNullOrWhiteSpace(_form.Agent) ? null : _form.Agent,
+                workBranch: string.IsNullOrWhiteSpace(_form.WorkBranch) ? null : _form.WorkBranch,
+                pushUpstream: _form.PushUpstream);
             if (workItemId is not null)
                 Nav.NavigateTo($"/work-items/{workItemId}");
             else
