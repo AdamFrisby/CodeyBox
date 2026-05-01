@@ -93,7 +93,6 @@ internal static class SuggestionEndpoints
         ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
-        ILoggerFactory loggerFactory,
         CancellationToken ct)
     {
         var suggestion = await store.GetAsync(id, ct);
@@ -137,7 +136,7 @@ internal static class SuggestionEndpoints
         // can distinguish advisory context from operator instructions (OWASP LLM01).
         // XML-escape both fields: a rationale containing </agent_advisory> would close
         // the advisory block early and allow injected content to appear as instructions.
-        var safeTitle = suggestion.Title.ReplaceLineEndings(" ");
+        var safeTitle = SecurityElement.Escape(suggestion.Title.ReplaceLineEndings(" ")) ?? suggestion.Title;
         var safeRationale = SecurityElement.Escape(suggestion.Rationale) ?? suggestion.Rationale;
         var prompt = $"""
             # From suggestion: {safeTitle}
@@ -162,23 +161,17 @@ internal static class SuggestionEndpoints
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
         };
 
-        // Create the work item and enqueue BEFORE atomically claiming the suggestion.
-        // This way a failure in CreateAsync/EnqueueAsync leaves the suggestion in
-        // state='open' and retryable, rather than stuck in state='accepted' with no
-        // linked work item. TryAcceptAsync also atomically sets promotedToWorkItemId.
+        // Atomically claim the suggestion BEFORE creating the work item.
+        // If two concurrent requests race, only one wins TryAcceptAsync; the loser
+        // returns 409 here without creating any work item, eliminating orphaned items.
+        if (!await store.TryAcceptAsync(id, newId.ToString(), ct))
+            return Results.Conflict(new { error = "suggestion was already promoted by a concurrent request" });
+
+        AuditLog.SuggestionPromoted(id, newId.ToString());
+
         await workItemStore.CreateAsync(item, ct);
         AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
         await queue.EnqueueAsync(item.Id, ct);
-
-        if (!await store.TryAcceptAsync(id, newId.ToString(), ct))
-        {
-            loggerFactory.CreateLogger("SuggestionEndpoints").LogWarning(
-                "Suggestion {SuggestionId} was already promoted concurrently; orphaned work item {OrphanedWorkItemId} remains in DB/queue",
-                id, newId);
-            return Results.Conflict(new { error = "suggestion was already promoted by a concurrent request" });
-        }
-
-        AuditLog.SuggestionPromoted(id, newId.ToString());
 
         var promoted = suggestion with
         {
