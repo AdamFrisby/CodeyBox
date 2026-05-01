@@ -197,7 +197,7 @@ internal sealed partial class ScriptedAgent : IAgentRunner
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
-    public AgentKind Kind => AgentKind.Claude;
+    public AgentKind Kind { get; init; } = AgentKind.Claude;
 
     public ScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
     {

@@ -550,6 +550,10 @@ builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<SmokeOptions>(),
     sp.GetRequiredService<ILogger<StartupSmokeProbeService>>()));
+builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<ICredentialProvider>(),
+    sp.GetRequiredService<ILogger<AuditAgentStartupValidationService>>()));
 
 var app = builder.Build();
 

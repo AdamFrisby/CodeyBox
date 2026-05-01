@@ -163,10 +163,30 @@ public static class AuditLog
 
     // ── Auditor / audit loop ─────────────────────────────────────────────────
 
-    public static void AuditorRun(string auditorName, string worstSeverity, TimeSpan duration) =>
+    public static void AuditorRun(string auditorName, string worstSeverity, TimeSpan duration, AgentKind agentKind) =>
         Audit("auditor.run")
-            .Information("Auditor {AuditorName} completed: worstSeverity={WorstSeverity} duration={DurationMs}ms",
-                auditorName, worstSeverity, (long)duration.TotalMilliseconds);
+            .Information("Auditor {AuditorName} completed: worstSeverity={WorstSeverity} duration={DurationMs}ms agentKind={AgentKind}",
+                auditorName, worstSeverity, (long)duration.TotalMilliseconds, agentKind.Value);
+
+    /// <summary>
+    /// Emitted once per audit iteration when at least one LLM auditor actually
+    /// ran with a different agent than the work agent. Tells operators this
+    /// iteration used diversified (cross-model) signal.
+    /// </summary>
+    public static void CrossReviewActive(AgentKind workAgent, AgentKind auditAgent) =>
+        Audit("audit.cross_review_active")
+            .Information("Cross-review active: workAgent={WorkAgent} auditAgent={AuditAgent}",
+                workAgent.Value, auditAgent.Value);
+
+    /// <summary>
+    /// Emitted when the configured audit agent had insufficient quota and the
+    /// pipeline fell through to the work agent. The correlation-breaking
+    /// benefit of cross-review was lost for this auditor invocation.
+    /// </summary>
+    public static void QuotaAuditFallthrough(AgentKind exhaustedAgent, AgentKind fallbackAgent, string auditorName) =>
+        Audit("quota_router.audit_fallthrough")
+            .Warning("Audit agent '{ExhaustedAgent}' quota exhausted; fell through to '{FallbackAgent}' for auditor '{AuditorName}'",
+                exhaustedAgent.Value, fallbackAgent.Value, auditorName);
 
     public static void AuditIterationComplete(int iteration, int maxIterations, int blockingCount, int nonBlockingCount) =>
         Audit("audit.iteration_complete")

@@ -195,6 +195,30 @@ public sealed record ProjectAudit
     public IReadOnlyList<string> Languages { get; init; } = [];
     public IReadOnlyList<string> AuditTypes { get; init; } = [];
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
+
+    /// <summary>
+    /// Agent runner used for LLM-based auditors (security:llm-review,
+    /// completeness:llm-review, cheating:llm-review, etc.). Defaults to the
+    /// project's primary <see cref="Project.DefaultAgent"/> for backwards
+    /// compatibility. Set to a different agent (e.g. <c>gemini</c> when the
+    /// work agent is <c>claude</c>) to diversify audit signal — different
+    /// models have different blind spots. Requires the agent to be registered
+    /// and its credentials to be available; otherwise the pipeline falls back
+    /// to the work agent with a warning.
+    /// </summary>
+    public AgentKind? AuditAgent { get; init; }
+
+    /// <summary>
+    /// Optional per-auditor agent override. Keys are auditor names (e.g.
+    /// <c>"security:llm-review"</c>); values are the agent kind to use for
+    /// that auditor. Checked before <see cref="AuditAgent"/>, then falls
+    /// through to <see cref="AuditAgent"/>, then to the work agent. Lets
+    /// operators route individual auditors to specific models — e.g. security
+    /// review on Claude (more cautious) and completeness review on Gemini
+    /// (different perspective).
+    /// </summary>
+    public IReadOnlyDictionary<string, AgentKind> PerAuditorAgent { get; init; }
+        = new Dictionary<string, AgentKind>();
 }
 
 /// <summary>

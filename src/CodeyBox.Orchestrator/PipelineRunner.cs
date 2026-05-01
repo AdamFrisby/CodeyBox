@@ -46,6 +46,10 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly ILogger<PipelineRunner> _log;
     private readonly CredentialSmokeGate? _smokeGate;
     private readonly ISuggestionStore? _suggestions;
+    // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
+    // Null when no probes were provided (fail-open: no quota gate on audit agent).
+    private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
+    private readonly QuotaRouterOptions _auditQuotaOptions;
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -79,7 +83,9 @@ public sealed class PipelineRunner : IPipelineRunner
         PipelineOptions opts,
         ILogger<PipelineRunner> log,
         CredentialSmokeGate? smokeGate = null,
-        ISuggestionStore? suggestions = null)
+        ISuggestionStore? suggestions = null,
+        IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
+        QuotaRouterOptions? auditQuotaOptions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -95,6 +101,13 @@ public sealed class PipelineRunner : IPipelineRunner
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
+        // PayPerApi and Null probes are routing utilities, not real quota sources —
+        // exclude them so only genuine subscription probes gate the audit agent.
+        _auditQuotaProbesByKind = auditQuotaProbes is null ? null
+            : auditQuotaProbes
+                .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
+                .ToDictionary(p => p.Kind);
+        _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct)
@@ -493,7 +506,12 @@ public sealed class PipelineRunner : IPipelineRunner
             auditCts.CancelAfter(project.Audit.PerIterationTimeout);
 
             var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt);
-            var findings = await CollectFindingsAsync(project, runner, auditors, repoId, ctx, auditCts.Token);
+            var (findings, activeAuditAgentKind) = await CollectFindingsAsync(project, runner, auditors, repoId, ctx, auditCts.Token);
+
+            // Emit cross-review event once per iteration when at least one LLM
+            // auditor actually ran with a different agent than the work agent.
+            if (activeAuditAgentKind is not null)
+                AuditLog.CrossReviewActive(runner.Kind, activeAuditAgentKind.Value);
 
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
             var nonBlocking = findings.Count - blocking.Count;
@@ -505,7 +523,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 Event = "work_item.audit_iteration",
                 WorkItem = await _store.GetAsync(item.Id, ct) ?? item,
                 Project = project,
-                Details = new AuditIterationDetails(iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking),
+                Details = new AuditIterationDetails(
+                    iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking,
+                    activeAuditAgentKind?.Value),
             }, CancellationToken.None);
 
             if (blocking.Count == 0)
@@ -540,27 +560,53 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    private async Task<IReadOnlyList<AuditFinding>> CollectFindingsAsync(
+    private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(
         Project project,
-        IAgentRunner runner,
+        IAgentRunner workRunner,
         IReadOnlyList<IAuditor> auditors,
         string repoId,
         AuditContext ctx,
         CancellationToken ct)
     {
         var findings = new List<AuditFinding>();
-        var byCaps = auditors.GroupBy(a => a.Required).ToList();
+        AgentKind? activeAuditAgentKind = null;
+
+        // Resolve the audit agent runner per LLM auditor (once, before grouping).
+        // Tool auditors don't carry a runner — they stay with workRunner as a
+        // harmless sentinel that only affects grouping.
+        var resolved = new List<(IAuditor Auditor, IAgentRunner Runner)>(auditors.Count);
+        foreach (var a in auditors)
+        {
+            var runner = a.Required.HasFlag(AuditCapabilities.AgentCredentials)
+                ? await ResolveAuditAgentRunnerAsync(project, a.Name, workRunner, ct)
+                : workRunner;
+            resolved.Add((a, runner));
+        }
+
+        // Group by (capabilities, resolved-runner-kind) so auditors that need
+        // different agent credentials get separate sandboxes — each sandbox is
+        // only ever loaded with the credentials of a single agent kind.
+        // Tool-only auditors all share one group (kind = default).
+        var byCaps = resolved
+            .GroupBy(x => (
+                Caps: x.Auditor.Required,
+                Kind: x.Auditor.Required.HasFlag(AuditCapabilities.AgentCredentials)
+                    ? x.Runner.Kind
+                    : default(AgentKind)))
+            .ToList();
 
         foreach (var group in byCaps)
         {
-            var needsCreds = group.Key.HasFlag(AuditCapabilities.AgentCredentials);
-            var needsNetwork = group.Key.HasFlag(AuditCapabilities.Network);
+            var needsCreds = group.Key.Caps.HasFlag(AuditCapabilities.AgentCredentials);
+            var needsNetwork = group.Key.Caps.HasFlag(AuditCapabilities.Network);
 
-            AgentCredential? credential = needsCreds ? await _credentials.GetAsync(runner.Kind, ct) : null;
-            var access = _gitHost.GetSandboxAccess(repoId);
+            // All auditors in this group share the same runner kind; pick from first.
+            var groupRunner = needsCreds ? group.First().Runner : workRunner;
             // Tool-only auditors get the project's "audit-tool" profile
             // (typically isolated/no-egress); LLM-driven auditors get the
             // "audit-agent" profile (typically same as the work profile).
+            AgentCredential? credential = needsCreds ? await _credentials.GetAsync(groupRunner.Kind, ct) : null;
+            var access = _gitHost.GetSandboxAccess(repoId);
             var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork, hostNetworkProfile: profile);
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
@@ -572,23 +618,92 @@ public sealed class PipelineRunner : IPipelineRunner
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
 
-            foreach (var auditor in group)
+            foreach (var (auditor, runner) in group)
             {
                 _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
                 var auditorSw = Stopwatch.StartNew();
-                var result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, ctx, ct);
+                // Thread the resolved runner into the context so LlmReviewAuditor
+                // can use the cross-review agent instead of its baked-in default.
+                var auditorCtx = ctx with { AuditRunner = runner };
+                var result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
                 auditorSw.Stop();
                 var worstSeverity = result.Findings.Count > 0
                     ? ((AuditSeverity)result.Findings.Max(f => (int)f.Severity)).ToString()
                     : "none";
-                AuditLog.AuditorRun(auditor.Name, worstSeverity, auditorSw.Elapsed);
+                AuditLog.AuditorRun(auditor.Name, worstSeverity, auditorSw.Elapsed, runner.Kind);
+                // Track whether any LLM auditor ran with a different agent (cross-review).
+                if (needsCreds && runner.Kind != workRunner.Kind)
+                    activeAuditAgentKind ??= runner.Kind;
                 findings.AddRange(result.Findings);
                 if (project.Audit.StopOnFirstFailure && result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
-                    return findings;
+                    return (findings, activeAuditAgentKind);
             }
         }
 
-        return findings;
+        return (findings, activeAuditAgentKind);
+    }
+
+    /// <summary>
+    /// Resolves the <see cref="IAgentRunner"/> to use for a given LLM auditor,
+    /// applying the three-level hierarchy:
+    /// <list type="number">
+    ///   <item><see cref="ProjectAudit.PerAuditorAgent"/>[<paramref name="auditorName"/>] if present.</item>
+    ///   <item>Else <see cref="ProjectAudit.AuditAgent"/> if set.</item>
+    ///   <item>Else <paramref name="workRunner"/> (current behaviour, backwards compat).</item>
+    /// </list>
+    /// Falls back to <paramref name="workRunner"/> with a warning if the
+    /// configured audit agent is unregistered, has no credentials, or is below
+    /// its quota threshold (using the injected <see cref="IAgentQuotaProbe"/>s).
+    /// Resolved once per auditor per iteration; the result is reused for that
+    /// auditor's sandbox and prompt invocation.
+    /// </summary>
+    private async Task<IAgentRunner> ResolveAuditAgentRunnerAsync(
+        Project project, string auditorName, IAgentRunner workRunner, CancellationToken ct)
+    {
+        AgentKind? kind = project.Audit.PerAuditorAgent.TryGetValue(auditorName, out var perAuditor)
+            ? perAuditor
+            : project.Audit.AuditAgent;
+
+        if (kind is null)
+            return workRunner;
+
+        if (!_agents.TryGet(kind.Value, out var auditRunner))
+        {
+            _log.LogWarning(
+                "Audit agent '{AuditKind}' is not registered for auditor '{Auditor}'; falling back to work agent '{WorkKind}'",
+                kind.Value.Value, auditorName, workRunner.Kind.Value);
+            return workRunner;
+        }
+
+        // Credential check: if the audit agent has no credentials configured,
+        // fall back gracefully — operators may configure agents incrementally.
+        var cred = await _credentials.GetAsync(kind.Value, ct);
+        if (cred is null)
+        {
+            _log.LogWarning(
+                "No credentials found for audit agent '{AuditKind}' (auditor '{Auditor}'); falling back to work agent '{WorkKind}'",
+                kind.Value.Value, auditorName, workRunner.Kind.Value);
+            return workRunner;
+        }
+
+        // Quota gate: when quota probes are wired up, check the audit agent's
+        // availability; fall through to the work agent if quota is low.
+        if (_auditQuotaProbesByKind is not null
+            && _auditQuotaProbesByKind.TryGetValue(kind.Value, out var probe))
+        {
+            var snapshot = await probe.GetAvailabilityAsync(
+                new AgentMembership { Agent = kind.Value, Billing = AgentBilling.Subscription }, ct);
+            if (snapshot.AvailablePct >= 0 && snapshot.AvailablePct < _auditQuotaOptions.MinQuotaPct)
+            {
+                AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);
+                _log.LogWarning(
+                    "Audit agent '{AuditKind}' quota exhausted ({Pct:F1}%); falling through to work agent for auditor '{Auditor}'",
+                    kind.Value.Value, snapshot.AvailablePct, auditorName);
+                return workRunner;
+            }
+        }
+
+        return auditRunner;
     }
 
     /// <summary>
@@ -1244,7 +1359,14 @@ internal sealed record AuditIterationDetails(
     int Iteration,
     int TotalIterations,
     int BlockingFindings,
-    int NonBlockingFindings);
+    int NonBlockingFindings,
+    /// <summary>
+    /// Set when at least one LLM auditor ran with a different agent than the
+    /// work agent (cross-review active). Null when all auditors used the same
+    /// agent as the work phase (including after quota/credential fallthrough).
+    /// Receivers that do not care about this field ignore it safely.
+    /// </summary>
+    string? AuditAgentKind = null);
 
 internal sealed record SuggestionWebhookDetails(
     string Id,

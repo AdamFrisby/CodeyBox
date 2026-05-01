@@ -303,7 +303,7 @@ public sealed class AuditLogTests : IDisposable
     [Fact]
     public void AuditorRun_emits_auditor_run_event_with_correct_properties()
     {
-        AuditLog.AuditorRun("security:llm-review", "Warning", TimeSpan.FromSeconds(5));
+        AuditLog.AuditorRun("security:llm-review", "Warning", TimeSpan.FromSeconds(5), AgentKind.Gemini);
 
         var evt = Assert.Single(_sink.Events);
         Assert.True(GetScalar<bool>(evt, "Audit"));
@@ -311,6 +311,33 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal("security:llm-review", GetScalar<string>(evt, "AuditorName"));
         Assert.Equal("Warning", GetScalar<string>(evt, "WorstSeverity"));
         Assert.Equal(5_000L, GetScalar<long>(evt, "DurationMs"));
+        Assert.Equal("gemini", GetScalar<string>(evt, "AgentKind"));
+    }
+
+    [Fact]
+    public void CrossReviewActive_emits_audit_cross_review_active_event()
+    {
+        AuditLog.CrossReviewActive(AgentKind.Claude, AgentKind.Gemini);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("audit.cross_review_active", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("claude", GetScalar<string>(evt, "WorkAgent"));
+        Assert.Equal("gemini", GetScalar<string>(evt, "AuditAgent"));
+    }
+
+    [Fact]
+    public void QuotaAuditFallthrough_emits_quota_router_audit_fallthrough_event_at_Warning()
+    {
+        AuditLog.QuotaAuditFallthrough(AgentKind.Gemini, AgentKind.Claude, "security:llm-review");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("quota_router.audit_fallthrough", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(Serilog.Events.LogEventLevel.Warning, evt.Level);
+        Assert.Equal("gemini", GetScalar<string>(evt, "ExhaustedAgent"));
+        Assert.Equal("claude", GetScalar<string>(evt, "FallbackAgent"));
+        Assert.Equal("security:llm-review", GetScalar<string>(evt, "AuditorName"));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
