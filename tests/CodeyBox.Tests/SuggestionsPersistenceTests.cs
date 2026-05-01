@@ -23,18 +23,18 @@ public sealed class SuggestionsPersistenceTests : IDisposable
         string category = "test-coverage",
         string severity = "minor",
         string state = "open") => new()
-    {
-        Id = id ?? Guid.NewGuid().ToString(),
-        SourceWorkItemId = Guid.NewGuid().ToString(),
-        ProjectId = projectId,
-        Title = "Test suggestion",
-        Rationale = "Some rationale",
-        Category = category,
-        Severity = severity,
-        EstimatedEffort = "small",
-        CreatedAt = DateTimeOffset.UtcNow,
-        State = state,
-    };
+        {
+            Id = id ?? Guid.NewGuid().ToString(),
+            SourceWorkItemId = Guid.NewGuid().ToString(),
+            ProjectId = projectId,
+            Title = "Test suggestion",
+            Rationale = "Some rationale",
+            Category = category,
+            Severity = severity,
+            EstimatedEffort = "small",
+            CreatedAt = DateTimeOffset.UtcNow,
+            State = state,
+        };
 
     [Fact]
     public async Task CreateAndGet_RoundTrips_AllFields()

@@ -130,7 +130,6 @@ internal static class SuggestionEndpoints
         await store.UpdateAsync(promoted, ct);
         AuditLog.SuggestionPromoted(id, newId.ToString());
 
-        var statesById = new Dictionary<WorkItemId, WorkItemState>();
         return Results.Ok(new PromoteResponse(
             WorkItemId: newId.ToString(),
             Suggestion: ToDto(promoted)));

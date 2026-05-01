@@ -18,18 +18,18 @@ public sealed class SuggestionListPageTests : TestContext
         string category = "test-coverage",
         string severity = "minor",
         string sourceWorkItemId = "bbbbbbbb-0000-0000-0000-000000000001") => new()
-    {
-        Id = id,
-        Title = title,
-        Category = category,
-        Severity = severity,
-        EstimatedEffort = "small",
-        SourceWorkItemId = sourceWorkItemId,
-        ProjectId = "proj",
-        Rationale = "Some rationale",
-        CreatedAt = DateTimeOffset.UtcNow,
-        State = "open",
-    };
+        {
+            Id = id,
+            Title = title,
+            Category = category,
+            Severity = severity,
+            EstimatedEffort = "small",
+            SourceWorkItemId = sourceWorkItemId,
+            ProjectId = "proj",
+            Rationale = "Some rationale",
+            CreatedAt = DateTimeOffset.UtcNow,
+            State = "open",
+        };
 
     [Fact]
     public void Suggestions_EmptyList_ShowsNoOpenMessage()

@@ -38,18 +38,18 @@ public sealed class SuggestionsApiTests : IDisposable
         string? projectId = null,
         string category = "test-coverage",
         string severity = "minor") => new()
-    {
-        Id = Guid.NewGuid().ToString(),
-        SourceWorkItemId = Guid.NewGuid().ToString(),
-        ProjectId = projectId ?? SuggestionsApiFactory.ProjectId,
-        Title = "Add tests",
-        Rationale = "Missing coverage",
-        Category = category,
-        Severity = severity,
-        EstimatedEffort = "small",
-        CreatedAt = DateTimeOffset.UtcNow,
-        State = "open",
-    };
+        {
+            Id = Guid.NewGuid().ToString(),
+            SourceWorkItemId = Guid.NewGuid().ToString(),
+            ProjectId = projectId ?? SuggestionsApiFactory.ProjectId,
+            Title = "Add tests",
+            Rationale = "Missing coverage",
+            Category = category,
+            Severity = severity,
+            EstimatedEffort = "small",
+            CreatedAt = DateTimeOffset.UtcNow,
+            State = "open",
+        };
 
     // ── GET /suggestions ──────────────────────────────────────────────────────
 
