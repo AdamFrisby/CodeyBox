@@ -1,0 +1,5 @@
+[allowlist]
+  description = "Test fixture files containing synthetic tokens for redaction unit tests"
+  paths = [
+    '''tests/CodeyBox\.Tests/RawOutputRedactionTests\.cs''',
+  ]

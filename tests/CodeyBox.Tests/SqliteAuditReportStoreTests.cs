@@ -24,19 +24,19 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         string auditorKind = "diff-pattern",
         string? rawOutput = null,
         IReadOnlyList<AuditReportFinding>? findings = null) => new()
-    {
-        Id = Guid.NewGuid().ToString(),
-        WorkItemId = workItemId,
-        Iteration = iteration,
-        AuditorName = auditorName,
-        AuditorKind = auditorKind,
-        WorstSeverity = findings?.Count > 0 ? findings[0].Severity : "none",
-        StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
-        EndedAt = DateTimeOffset.UtcNow,
-        DurationMs = 100,
-        Findings = findings ?? [],
-        RawOutput = rawOutput,
-    };
+        {
+            Id = Guid.NewGuid().ToString(),
+            WorkItemId = workItemId,
+            Iteration = iteration,
+            AuditorName = auditorName,
+            AuditorKind = auditorKind,
+            WorstSeverity = findings?.Count > 0 ? findings[0].Severity : "none",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            EndedAt = DateTimeOffset.UtcNow,
+            DurationMs = 100,
+            Findings = findings ?? [],
+            RawOutput = rawOutput,
+        };
 
     private static AuditReportFinding MakeFinding(string title = "Bad thing", string sev = "Error") =>
         new(
@@ -101,7 +101,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
 
         Assert.Equal(4, results.Count);
         Assert.Equal((1, "Alpha"), (results[0].Iteration, results[0].AuditorName));
-        Assert.Equal((1, "Beta"),  (results[1].Iteration, results[1].AuditorName));
+        Assert.Equal((1, "Beta"), (results[1].Iteration, results[1].AuditorName));
         Assert.Equal((2, "Alpha"), (results[2].Iteration, results[2].AuditorName));
         Assert.Equal((2, "Zebra"), (results[3].Iteration, results[3].AuditorName));
     }

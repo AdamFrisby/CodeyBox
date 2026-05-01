@@ -26,7 +26,7 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
 
         using (var pragmaCmd = _conn.CreateCommand())
         {
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = OFF;";
+            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;";
             pragmaCmd.ExecuteNonQuery();
         }
 
@@ -34,7 +34,7 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS audit_reports (
                 id              TEXT PRIMARY KEY,
-                work_item_id    TEXT NOT NULL,
+                work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
                 iteration       INTEGER NOT NULL,
                 auditor_name    TEXT NOT NULL,
                 auditor_kind    TEXT NOT NULL,
