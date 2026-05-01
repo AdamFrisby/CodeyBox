@@ -38,10 +38,16 @@ public static class SuggestionsFileParser
                 return [];
             }
 
+            const int MaxEntries = 50;
             var results = new List<SuggestionEntry>();
             var idx = 0;
             foreach (var el in arr.EnumerateArray())
             {
+                if (idx >= MaxEntries)
+                {
+                    log.LogWarning("suggestions.json: more than {Max} entries; ignoring the rest", MaxEntries);
+                    break;
+                }
                 var entry = TryParseEntry(el, idx, log);
                 if (entry is not null) results.Add(entry);
                 idx++;
@@ -112,13 +118,23 @@ public static class SuggestionsFileParser
             return null;
         }
 
+        const int MaxPathLength = 500;
         var files = new List<string>();
         if (el.TryGetProperty("filesReferenced", out var filesEl)
             && filesEl.ValueKind == JsonValueKind.Array)
         {
             foreach (var f in filesEl.EnumerateArray())
-                if (f.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(f.GetString()))
-                    files.Add(f.GetString()!);
+            {
+                if (f.ValueKind != JsonValueKind.String) continue;
+                var path = f.GetString();
+                if (string.IsNullOrWhiteSpace(path)) continue;
+                if (path.Length > MaxPathLength)
+                {
+                    log.LogWarning("suggestions.json[{I}]: filesReferenced entry exceeds {Max} chars; skipping", idx, MaxPathLength);
+                    continue;
+                }
+                files.Add(path);
+            }
         }
 
         return new SuggestionEntry(title, rationale, category, severity, effort, files);

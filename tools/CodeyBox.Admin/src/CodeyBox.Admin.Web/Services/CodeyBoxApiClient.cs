@@ -147,9 +147,18 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         if (!string.IsNullOrWhiteSpace(category)) parts.Add($"category={Uri.EscapeDataString(category)}");
         if (!string.IsNullOrWhiteSpace(severity)) parts.Add($"severity={Uri.EscapeDataString(severity)}");
         var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
-        var result = await _http.GetFromJsonAsync<List<SuggestionDto>>($"/suggestions{qs}", JsonOptions, ct);
-        return result ?? [];
+        var page = await _http.GetFromJsonAsync<SuggestionsPage>($"/suggestions{qs}", JsonOptions, ct);
+        return page?.Items ?? [];
     }
+
+    public async Task<int> GetSuggestionsCountAsync(CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<SuggestionsCountResult>("/suggestions/count", JsonOptions, ct);
+        return result?.Count ?? 0;
+    }
+
+    private sealed record SuggestionsPage(List<SuggestionDto> Items, int Total, int Offset, int Limit);
+    private sealed record SuggestionsCountResult(int Count);
 
     public async Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
     {

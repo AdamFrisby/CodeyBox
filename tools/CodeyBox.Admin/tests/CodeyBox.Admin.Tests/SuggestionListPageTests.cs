@@ -131,13 +131,124 @@ public sealed class SuggestionListPageTests : TestContext
         Assert.Contains("bbbbbbbb", cut.Markup);
     }
 
-    [Fact]
+[Fact]
     public void Suggestions_PageTitle_ContainsSuggestions()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([]));
         var cut = RenderComponent<SuggestionsPage>();
         Assert.Contains("Suggestions", cut.Markup);
     }
+
+    [Fact]
+    public void Suggestions_ChangeCategoryFilter_CallsApiWithCategoryArgument()
+    {
+        var client = new SuggestionCapturingClient([
+            MakeSuggestion(category: "security"),
+            MakeSuggestion(category: "docs"),
+        ]);
+        Services.AddSingleton<ICodeyBoxApiClient>(client);
+        var cut = RenderComponent<SuggestionsPage>();
+
+        var selects = cut.FindAll("select");
+        selects[0].Change("security");  // first select is Category
+
+        cut.WaitForAssertion(() => Assert.Equal("security", client.LastCategory));
+    }
+
+    [Fact]
+    public async Task Suggestions_BulkDismiss_CallsDismissForEachSelected()
+    {
+        var s1 = MakeSuggestion(id: "id-bb01", title: "Alpha");
+        var s2 = MakeSuggestion(id: "id-bb02", title: "Beta");
+        var client = new SuggestionCapturingClient([s1, s2]);
+        Services.AddSingleton<ICodeyBoxApiClient>(client);
+        var cut = RenderComponent<SuggestionsPage>();
+
+        // Use InvokeAsync to wrap Find+Change atomically on the renderer's sync context,
+        // preventing re-renders from invalidating the event handler ID mid-operation.
+        await cut.InvokeAsync(() => cut.Find("th input[type=checkbox]").Change(true));
+
+        // Bulk-actions bar is now visible; dismiss all selected items.
+        await cut.InvokeAsync(() => cut.Find(".bulk-actions .btn-danger").Click());
+
+        cut.WaitForAssertion(() =>
+        {
+            Assert.Contains("id-bb01", client.DismissedIds);
+            Assert.Contains("id-bb02", client.DismissedIds);
+        });
+    }
+}
+
+/// <summary>
+/// Fake client that records the arguments passed to suggestion API calls.
+/// </summary>
+internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
+{
+    private readonly List<SuggestionDto> _suggestions;
+    public string? LastCategory { get; private set; }
+    public string? LastSeverity { get; private set; }
+    public List<string> DismissedIds { get; } = [];
+
+    public SuggestionCapturingClient(List<SuggestionDto> suggestions) => _suggestions = suggestions;
+
+    public Task<List<SuggestionDto>> GetSuggestionsAsync(
+        string? projectId = null, string? category = null, string? severity = null,
+        CancellationToken ct = default)
+    {
+        LastCategory = category;
+        LastSeverity = severity;
+        return Task.FromResult(_suggestions
+            .Where(s => (category == null || s.Category == category)
+                     && (severity == null || s.Severity == severity))
+            .ToList());
+    }
+
+    public Task<int> GetSuggestionsCountAsync(CancellationToken ct = default)
+        => Task.FromResult(_suggestions.Count);
+
+    public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(_suggestions.FirstOrDefault(s => s.Id == id));
+
+    public Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null,
+        CancellationToken ct = default)
+    {
+        DismissedIds.Add(id);
+        var s = _suggestions.FirstOrDefault(x => x.Id == id);
+        _suggestions.RemoveAll(x => x.Id == id);
+        return Task.FromResult<SuggestionDto?>(s);
+    }
+
+    public Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(true);
+
+    public Task<List<WorkItemDto>> GetWorkItemsAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<WorkItemDto>());
+    public Task<WorkItemDto?> GetWorkItemAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDto?>(null);
+    public Task<List<ProjectDto>> GetProjectsAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<ProjectDto>());
+    public Task<WorkItemDto?> CreateWorkItemAsync(CreateWorkItemRequest req, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDto?>(null);
+    public Task<WorkItemDto?> PatchWorkItemAsync(string id, PatchWorkItemRequest req, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDto?>(null);
+    public Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(false);
+    public Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default)
+        => Task.FromResult(false);
+    public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default)
+        => Task.FromResult(false);
+    public Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default)
+        => Task.FromResult<QueueStatusDto?>(null);
+    public Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default)
+        => Task.FromResult<QueueStatusDto?>(null);
+    public Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default)
+        => Task.FromResult<QueueStatusDto?>(null);
+    public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
+        => Task.FromResult<BudgetUsageDto?>(null);
+    public Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
+        string id, string? kind = null, string? since = null, int? iteration = null,
+        CancellationToken ct = default)
+        => Task.FromResult<WorkItemTimelineDto?>(null);
 }
 
 /// <summary>
@@ -154,6 +265,9 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         string? projectId = null, string? category = null, string? severity = null,
         CancellationToken ct = default)
         => Task.FromResult(_suggestions);
+
+    public Task<int> GetSuggestionsCountAsync(CancellationToken ct = default)
+        => Task.FromResult(_suggestions.Count);
 
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult(_suggestions.FirstOrDefault(s => s.Id == id));

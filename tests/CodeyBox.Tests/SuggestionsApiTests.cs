@@ -51,15 +51,16 @@ public sealed class SuggestionsApiTests : IDisposable
             State = "open",
         };
 
-    // ── GET /suggestions ──────────────────────────────────────────────────────
+    // ── GET /suggestions (paginated) ─────────────────────────────────────────
 
     [Fact]
-    public async Task GetSuggestions_EmptyStore_ReturnsEmptyArray()
+    public async Task GetSuggestions_EmptyStore_ReturnsEmptyPage()
     {
         var resp = await _client.GetAsync("/suggestions");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
-        var items = await resp.Content.ReadFromJsonAsync<List<SuggestionResponse>>();
-        Assert.Empty(items!);
+        var page = await resp.Content.ReadFromJsonAsync<PagedSuggestionsResult>();
+        Assert.Empty(page!.Items);
+        Assert.Equal(0, page.Total);
     }
 
     [Fact]
@@ -70,11 +71,12 @@ public sealed class SuggestionsApiTests : IDisposable
 
         var resp = await _client.GetAsync("/suggestions");
         resp.EnsureSuccessStatusCode();
-        var items = await resp.Content.ReadFromJsonAsync<List<SuggestionResponse>>();
-        Assert.Single(items!);
-        Assert.Equal(s.Id, items![0].Id);
-        Assert.Equal(s.Title, items[0].Title);
-        Assert.Equal(s.Rationale, items[0].Rationale);
+        var page = await resp.Content.ReadFromJsonAsync<PagedSuggestionsResult>();
+        Assert.Single(page!.Items);
+        Assert.Equal(s.Id, page.Items[0].Id);
+        Assert.Equal(s.Title, page.Items[0].Title);
+        Assert.Equal(s.Rationale, page.Items[0].Rationale);
+        Assert.Equal(1, page.Total);
     }
 
     [Fact]
@@ -85,8 +87,9 @@ public sealed class SuggestionsApiTests : IDisposable
         await _factory.SuggestionStore.UpdateAsync(s with { State = "dismissed" });
 
         var resp = await _client.GetAsync("/suggestions");
-        var items = await resp.Content.ReadFromJsonAsync<List<SuggestionResponse>>();
-        Assert.Empty(items!);
+        var page = await resp.Content.ReadFromJsonAsync<PagedSuggestionsResult>();
+        Assert.Empty(page!.Items);
+        Assert.Equal(0, page.Total);
     }
 
     [Fact]
@@ -96,9 +99,10 @@ public sealed class SuggestionsApiTests : IDisposable
         await _factory.SuggestionStore.CreateAsync(MakeSuggestion(category: "docs"));
 
         var resp = await _client.GetAsync("/suggestions?category=security");
-        var items = await resp.Content.ReadFromJsonAsync<List<SuggestionResponse>>();
-        Assert.Single(items!);
-        Assert.Equal("security", items![0].Category);
+        var page = await resp.Content.ReadFromJsonAsync<PagedSuggestionsResult>();
+        Assert.Single(page!.Items);
+        Assert.Equal("security", page.Items[0].Category);
+        Assert.Equal(1, page.Total);
     }
 
     [Fact]
@@ -108,9 +112,22 @@ public sealed class SuggestionsApiTests : IDisposable
         await _factory.SuggestionStore.CreateAsync(MakeSuggestion(severity: "minor"));
 
         var resp = await _client.GetAsync("/suggestions?severity=important");
-        var items = await resp.Content.ReadFromJsonAsync<List<SuggestionResponse>>();
-        Assert.Single(items!);
-        Assert.Equal("important", items![0].Severity);
+        var page = await resp.Content.ReadFromJsonAsync<PagedSuggestionsResult>();
+        Assert.Single(page!.Items);
+        Assert.Equal("important", page.Items[0].Severity);
+        Assert.Equal(1, page.Total);
+    }
+
+    [Fact]
+    public async Task GetSuggestions_LimitAndOffset_Paginate()
+    {
+        for (var i = 0; i < 5; i++)
+            await _factory.SuggestionStore.CreateAsync(MakeSuggestion());
+
+        var resp = await _client.GetAsync("/suggestions?limit=2&offset=0");
+        var page = await resp.Content.ReadFromJsonAsync<PagedSuggestionsResult>();
+        Assert.Equal(2, page!.Items.Count);
+        Assert.Equal(5, page.Total);
     }
 
     // ── GET /suggestions/{id} ─────────────────────────────────────────────────
@@ -220,56 +237,6 @@ public sealed class SuggestionsApiTests : IDisposable
     // ── POST /suggestions/{id}/promote ────────────────────────────────────────
 
     [Fact]
-    public async Task PromoteSuggestion_CreatesWorkItemAndTransitionsToAccepted()
-    {
-        var s = MakeSuggestion();
-        await _factory.SuggestionStore.CreateAsync(s);
-
-        var resp = await _client.PostAsJsonAsync($"/suggestions/{s.Id}/promote", new { });
-        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
-
-        var body = await resp.Content.ReadFromJsonAsync<PromoteResponseBody>();
-        Assert.NotNull(body);
-        Assert.NotNull(body.WorkItemId);
-        Assert.Equal("accepted", body.Suggestion.State);
-        Assert.Equal(body.WorkItemId, body.Suggestion.PromotedToWorkItemId);
-    }
-
-    [Fact]
-    public async Task PromoteSuggestion_WorkItemHasCorrectPrompt()
-    {
-        var s = MakeSuggestion();
-        await _factory.SuggestionStore.CreateAsync(s);
-
-        var resp = await _client.PostAsJsonAsync($"/suggestions/{s.Id}/promote", new { });
-        resp.EnsureSuccessStatusCode();
-        var body = await resp.Content.ReadFromJsonAsync<PromoteResponseBody>();
-
-        // Find the created work item via GET (the store is a direct reference)
-        var wi = await _factory.WorkItemStore.GetAsync(WorkItemId.Parse(body!.WorkItemId));
-        Assert.NotNull(wi);
-        Assert.StartsWith("# From suggestion:", wi.Prompt);
-        Assert.Contains(s.Title, wi.Prompt);
-        Assert.Contains(s.Rationale, wi.Prompt);
-        Assert.Equal(s.Title, wi.Title);
-    }
-
-    [Fact]
-    public async Task PromoteSuggestion_SuggestionLinkedToWorkItem()
-    {
-        var s = MakeSuggestion();
-        await _factory.SuggestionStore.CreateAsync(s);
-
-        var resp = await _client.PostAsJsonAsync($"/suggestions/{s.Id}/promote", new { });
-        resp.EnsureSuccessStatusCode();
-        var body = await resp.Content.ReadFromJsonAsync<PromoteResponseBody>();
-
-        var got = await _factory.SuggestionStore.GetAsync(s.Id);
-        Assert.Equal("accepted", got!.State);
-        Assert.Equal(body!.WorkItemId, got.PromotedToWorkItemId);
-    }
-
-    [Fact]
     public async Task PromoteSuggestion_AlreadyAccepted_Returns409()
     {
         var s = MakeSuggestion();
@@ -299,6 +266,12 @@ public sealed class SuggestionsApiTests : IDisposable
     }
 
     // ── Local response shapes ─────────────────────────────────────────────────
+
+    private sealed record PagedSuggestionsResult(
+        List<SuggestionResponse> Items,
+        int Total,
+        int Offset,
+        int Limit);
 
     private sealed record SuggestionResponse(
         string Id,

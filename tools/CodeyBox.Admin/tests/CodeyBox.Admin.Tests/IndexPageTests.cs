@@ -425,6 +425,9 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         CancellationToken ct = default)
         => Task.FromResult(SuggestionsOverride);
 
+    public Task<int> GetSuggestionsCountAsync(CancellationToken ct = default)
+        => Task.FromResult(SuggestionsOverride.Count);
+
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult(SuggestionsOverride.FirstOrDefault(s => s.Id == id));
 

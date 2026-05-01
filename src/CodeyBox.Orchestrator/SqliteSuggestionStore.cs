@@ -101,12 +101,52 @@ public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
         finally { _writeLock.Release(); }
     }
 
+    public async Task<bool> TryAcceptAsync(string id, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "UPDATE suggestions SET state = 'accepted' WHERE id = $id AND state = 'open';";
+            cmd.Parameters.AddWithValue("$id", id);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            return rows > 0;
+        }
+        finally { _writeLock.Release(); }
+    }
+
     public async IAsyncEnumerable<Suggestion> ListAsync(
         string? projectId = null,
         string? category = null,
         string? severity = null,
         string? state = "open",
+        int limit = 200,
+        int offset = 0,
         [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        var where = new List<string>();
+        if (state is not null) { where.Add("state = $state"); cmd.Parameters.AddWithValue("$state", state); }
+        if (projectId is not null) { where.Add("project_id = $pid"); cmd.Parameters.AddWithValue("$pid", projectId); }
+        if (category is not null) { where.Add("category = $cat"); cmd.Parameters.AddWithValue("$cat", category); }
+        if (severity is not null) { where.Add("severity = $sev"); cmd.Parameters.AddWithValue("$sev", severity); }
+
+        cmd.Parameters.AddWithValue("$limit", limit);
+        cmd.Parameters.AddWithValue("$offset", offset);
+        var whereClause = where.Count > 0 ? "WHERE " + string.Join(" AND ", where) : "";
+        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all conditions use named parameterized placeholders; no user input reaches the SQL string
+        cmd.CommandText = $"SELECT * FROM suggestions {whereClause} ORDER BY created_at DESC LIMIT $limit OFFSET $offset;";
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return Read(reader);
+    }
+
+    public async Task<int> CountAsync(
+        string? projectId = null,
+        string? category = null,
+        string? severity = null,
+        string? state = "open",
+        CancellationToken ct = default)
     {
         using var cmd = _conn.CreateCommand();
         var where = new List<string>();
@@ -117,10 +157,9 @@ public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
 
         var whereClause = where.Count > 0 ? "WHERE " + string.Join(" AND ", where) : "";
         // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all conditions use named parameterized placeholders; no user input reaches the SQL string
-        cmd.CommandText = $"SELECT * FROM suggestions {whereClause} ORDER BY created_at DESC;";
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-            yield return Read(reader);
+        cmd.CommandText = $"SELECT COUNT(*) FROM suggestions {whereClause};";
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result is long l ? (int)l : 0;
     }
 
     public async Task<int> CountOpenAsync(CancellationToken ct = default)

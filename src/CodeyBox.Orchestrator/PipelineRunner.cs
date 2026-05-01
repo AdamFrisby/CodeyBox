@@ -648,8 +648,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
         // Read suggestions.json before cleaning the working tree, then remove it
         // so VerifyMergeStateAsync's `git status --porcelain` check sees a clean tree.
-        // Use separate argv so ProcessSandbox translates the path correctly.
+        // Mirror the work-phase pattern: strip from the git index first so a staged
+        // suggestions.json doesn't leave a deletion entry that confuses git status.
         var mergeSuggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
+        await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--force", "--",
+                ".codeybox/suggestions.json"],
+        }, ct);
         await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["rm", "-f", $"{SandboxConventions.WorkDir}/.codeybox/suggestions.json"],

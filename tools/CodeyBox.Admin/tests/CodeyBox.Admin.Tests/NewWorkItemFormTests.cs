@@ -248,6 +248,9 @@ public sealed class CapturingApiClient : ICodeyBoxApiClient
         CancellationToken ct = default)
         => Task.FromResult(new List<SuggestionDto>());
 
+    public Task<int> GetSuggestionsCountAsync(CancellationToken ct = default)
+        => Task.FromResult(0);
+
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult<SuggestionDto?>(null);
 

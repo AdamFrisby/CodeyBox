@@ -9,6 +9,7 @@ internal static class SuggestionEndpoints
     {
         var group = app.MapGroup("/suggestions");
         group.MapGet("/", ListAsync);
+        group.MapGet("/count", CountEndpointAsync);
         group.MapGet("/{id}", GetAsync);
         group.MapPatch("/{id}", PatchAsync);
         group.MapPost("/{id}/promote", PromoteAsync);
@@ -19,17 +20,36 @@ internal static class SuggestionEndpoints
         string? category,
         string? severity,
         ISuggestionStore store,
-        CancellationToken ct)
+        CancellationToken ct,
+        int limit = 200,
+        int offset = 0)
     {
+        if (limit is < 1 or > 500)
+            return Results.BadRequest(new { error = "limit must be 1-500" });
+        if (offset < 0)
+            return Results.BadRequest(new { error = "offset must be >= 0" });
+
+        var total = await store.CountAsync(project, category, severity, "open", ct);
         var results = new List<Suggestion>();
         await foreach (var s in store.ListAsync(
             projectId: project,
             category: category,
             severity: severity,
             state: "open",
+            limit: limit,
+            offset: offset,
             ct: ct))
             results.Add(s);
-        return Results.Ok(results.Select(ToDto));
+        return Results.Ok(new PagedSuggestionsResponse(results.Select(ToDto).ToList(), total, offset, limit));
+    }
+
+    private static async Task<IResult> CountEndpointAsync(
+        string? project,
+        ISuggestionStore store,
+        CancellationToken ct)
+    {
+        var count = await store.CountAsync(project, null, null, "open", ct);
+        return Results.Ok(new { count });
     }
 
     private static async Task<IResult> GetAsync(
@@ -102,6 +122,18 @@ internal static class SuggestionEndpoints
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
         }
 
+        var baseBranch = body?.BaseBranch;
+        if (baseBranch is not null)
+        {
+            try { Validation.ValidateBranchName(baseBranch, nameof(baseBranch)); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        }
+
+        // Atomically claim the suggestion before creating resources — prevents duplicate
+        // work items when two concurrent requests both observe state='open'.
+        if (!await store.TryAcceptAsync(id, ct))
+            return Results.Conflict(new { error = "suggestion was already promoted by a concurrent request" });
+
         var newId = WorkItemId.New();
         var prompt = $"# From suggestion: {suggestion.Title}\n\n{suggestion.Rationale}";
         var item = new WorkItem
@@ -111,7 +143,7 @@ internal static class SuggestionEndpoints
             Title = suggestion.Title,
             Prompt = prompt,
             Agent = agentOverride,
-            BaseBranch = body?.BaseBranch,
+            BaseBranch = baseBranch,
             WorkBranch = workBranch,
             PushUpstream = body?.PushUpstream ?? true,
             AgentClassId = body?.AgentClassId,
@@ -178,3 +210,9 @@ public sealed record SuggestionDto(
     string? PromotedToWorkItemId);
 
 internal sealed record PromoteResponse(string WorkItemId, SuggestionDto Suggestion);
+
+internal sealed record PagedSuggestionsResponse(
+    IReadOnlyList<SuggestionDto> Items,
+    int Total,
+    int Offset,
+    int Limit);
