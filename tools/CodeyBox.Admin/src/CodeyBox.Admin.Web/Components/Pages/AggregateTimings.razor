@@ -1,0 +1,90 @@
+@page "/timings/aggregate"
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<AggregateTimings> Logger
+
+<PageTitle>Aggregate Timings — CodeyBox Admin</PageTitle>
+
+<h1>Aggregate Timings</h1>
+
+<div class="timings-controls">
+    <label>
+        Work items (N):
+        <input type="number" min="1" max="500" @bind="_n" @bind:event="oninput" />
+    </label>
+    <button class="btn" @onclick="LoadAsync">Refresh</button>
+</div>
+
+@if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_data is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <p>Across <strong>@_data.WorkItemCount</strong> completed work items.</p>
+
+    @if (_data.StepStats.Count == 0)
+    {
+        <p>No completed timing data yet.</p>
+    }
+    else
+    {
+        <table class="detail-table aggregate-timings-table">
+            <thead>
+                <tr>
+                    <th>Phase</th>
+                    <th>Step</th>
+                    <th>Count</th>
+                    <th>Median</th>
+                    <th>p95</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var stat in _data.StepStats)
+                {
+                    <tr>
+                        <td>@stat.Phase</td>
+                        <td><code>@stat.Step</code></td>
+                        <td>@stat.Count</td>
+                        <td>@FormatDuration(stat.MedianMs)</td>
+                        <td>@FormatDuration(stat.P95Ms)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+
+@code {
+    private int _n = 50;
+    private AggregateTimingsDto? _data;
+    private string? _error;
+
+    protected override async Task OnInitializedAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        try
+        {
+            _data = await ApiClient.GetAggregateTimingsAsync(_n);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load aggregate timings");
+            _error = "Failed to load aggregate timings. Check server logs for details.";
+        }
+    }
+
+    private static string FormatDuration(long ms)
+    {
+        if (ms < 1000) return $"{ms}ms";
+        if (ms < 60_000) return $"{ms / 1000.0:F1}s";
+        var min = ms / 60_000;
+        var sec = (ms % 60_000) / 1000;
+        return $"{min}m {sec}s";
+    }
+}

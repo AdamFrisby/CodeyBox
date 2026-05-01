@@ -208,6 +208,31 @@ suffix is appended when the original exceeded the cap.
 * Returns `404 Not Found` when the work item, iteration, or auditor row
   does not exist, or when `raw_output` is `NULL` for that row.
 
+### `GET /workitems/{id}/timings`
+
+Returns per-step wall-clock timing data for a single work item as a structured
+tree grouped by phase and step.  See [`timings.md`](timings.md) for the full
+response shape and field descriptions.
+
+* Returns `200 OK` with the timing tree.
+* Returns `404 Not Found` when the work item does not exist.
+* Returns `400 Bad Request` when `{id}` is not a valid GUID.
+
+### `GET /workitems/timings/aggregate`
+
+Returns aggregate statistics (median and p95) per step across the last *n*
+completed work items.  Default `n` = 50; max `n` = 500.  The query streams the
+SQLite cursor rather than loading all rows into memory.
+
+**Query parameters:**
+
+| Param | Description |
+|-------|-------------|
+| `n` | Number of completed work items to include (default 50, max 500). |
+
+**Response (200 OK):** step-stat array.  See [`timings.md`](timings.md) for
+the full schema.
+
 ### `DELETE /workitems/{id}`
 
 Cancel a non-terminal work item.

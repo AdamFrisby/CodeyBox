@@ -25,6 +25,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
         // WAL mode allows concurrent readers + SqliteQueueController writes without SQLITE_BUSY.
         // busy_timeout is per-connection and provides a retry window for the rare lock collision.
+        // foreign_keys enables ON DELETE CASCADE from work_items → work_item_timings.
         using (var walCmd = _conn.CreateCommand())
         {
             walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";

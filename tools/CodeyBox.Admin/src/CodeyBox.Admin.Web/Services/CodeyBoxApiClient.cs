@@ -218,4 +218,20 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
     }
 
     private sealed record PromoteResponse(string WorkItemId);
+
+    public async Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/timings", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemTimingsDto>(JsonOptions, ct);
+    }
+
+    public async Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default)
+    {
+        var url = n.HasValue ? $"/workitems/timings/aggregate?n={n}" : "/workitems/timings/aggregate";
+        var resp = await _http.GetAsync(url, ct);
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<AggregateTimingsDto>(JsonOptions, ct);
+    }
 }

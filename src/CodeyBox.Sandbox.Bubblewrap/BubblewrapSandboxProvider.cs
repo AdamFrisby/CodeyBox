@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 
@@ -37,17 +38,27 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
 {
     private readonly BubblewrapSandboxOptions _opts;
     private readonly ILogger<BubblewrapSandboxProvider> _log;
+    private readonly ITimingStore? _timings;
 
-    public BubblewrapSandboxProvider(BubblewrapSandboxOptions opts, ILogger<BubblewrapSandboxProvider> log)
+    public BubblewrapSandboxProvider(BubblewrapSandboxOptions opts, ILogger<BubblewrapSandboxProvider> log,
+        ITimingStore? timings = null)
     {
         _opts = opts;
         _log = log;
+        _timings = timings;
     }
 
     public string Name => "bubblewrap";
 
-    public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
+        var timingStore = _timings is not null && spec.TimingWorkItemId.HasValue ? _timings : null;
+        var timingItemId = spec.TimingWorkItemId.GetValueOrDefault();
+        var timingPhase = spec.TimingPhase ?? "work";
+
+        await using var setupScope = await TimingScope.BeginAsync(
+            timingStore, timingItemId, timingPhase, "bwrap.exec_setup", log: _log);
+
         var id = Guid.NewGuid().ToString("N");
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-bwrap-{id}");
         Directory.CreateDirectory(root);
@@ -75,14 +86,14 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
             }
         }
 
-        var sandbox = new BubblewrapSandbox(id, root, spec, binds, _opts, _log);
+        var sandbox = new BubblewrapSandbox(id, root, spec, binds, _opts, _log, timingStore, timingItemId, timingPhase);
         var hasNet = spec.Network.AllowedHosts.Count > 0 || spec.Network.HostGitEndpoint is not null;
         if (hasNet)
             _log.LogWarning(
                 "Bubblewrap sandbox {Id}: agent network policy is NOT enforced by this provider. " +
                 "The agent has full host network access. For hostname allowlisting use Multipass " +
                 "with scripts/setup-host-networks.sh.", id);
-        return Task.FromResult<ISandbox>(sandbox);
+        return sandbox;
     }
 }
 
@@ -108,10 +119,15 @@ internal sealed class BubblewrapSandbox : ISandbox
     private readonly IReadOnlyList<BindEntry> _binds;
     private readonly BubblewrapSandboxOptions _opts;
     private readonly ILogger _log;
+    private readonly ITimingStore? _timings;
+    private readonly WorkItemId _timingItemId;
+    private readonly string _timingPhase;
+    private int _firstExecEmitted;
     private bool _disposed;
 
     public BubblewrapSandbox(string id, string root, SandboxSpec spec, IReadOnlyList<BindEntry> binds,
-        BubblewrapSandboxOptions opts, ILogger log)
+        BubblewrapSandboxOptions opts, ILogger log,
+        ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work")
     {
         Id = id;
         _root = root;
@@ -119,6 +135,9 @@ internal sealed class BubblewrapSandbox : ISandbox
         _binds = binds;
         _opts = opts;
         _log = log;
+        _timings = timings;
+        _timingItemId = timingItemId;
+        _timingPhase = timingPhase;
     }
 
     public string Id { get; }
@@ -151,28 +170,40 @@ internal sealed class BubblewrapSandbox : ISandbox
         if (exec.ExtraEnvironment is not null)
             foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = v;
 
-        using var proc = new Process { StartInfo = psi };
-        var stdout = new StringBuilder();
-        var stderr = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderr.AppendLine(e.Data); };
-        proc.Start();
-        proc.BeginOutputReadLine();
-        proc.BeginErrorReadLine();
-        if (exec.Stdin is not null)
+        var isFirstExec = Interlocked.CompareExchange(ref _firstExecEmitted, 1, 0) == 0;
+        TimingScope? firstExecScope = isFirstExec
+            ? await TimingScope.BeginAsync(_timings, _timingItemId, _timingPhase, "bwrap.exec_first", log: _log)
+            : null;
+        try
         {
-            await proc.StandardInput.WriteAsync(exec.Stdin);
-            proc.StandardInput.Close();
-        }
+            using var proc = new Process { StartInfo = psi };
+            var stdout = new StringBuilder();
+            var stderr = new StringBuilder();
+            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
+            proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderr.AppendLine(e.Data); };
+            proc.Start();
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+            if (exec.Stdin is not null)
+            {
+                await proc.StandardInput.WriteAsync(exec.Stdin);
+                proc.StandardInput.Close();
+            }
 
-        try { await proc.WaitForExitAsync(ct); }
-        catch (OperationCanceledException)
+            try { await proc.WaitForExitAsync(ct); }
+            catch (OperationCanceledException)
+            {
+                try { proc.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+                throw;
+            }
+
+            return new SandboxExecResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
+        }
+        finally
         {
-            try { proc.Kill(entireProcessTree: true); } catch { /* best-effort */ }
-            throw;
+            if (firstExecScope is not null)
+                await firstExecScope.DisposeAsync();
         }
-
-        return new SandboxExecResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
     }
 
     private List<string> BuildArgv(SandboxExec exec)
@@ -255,10 +286,12 @@ internal sealed class BubblewrapSandbox : ISandbox
         catch { return null; }
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        if (_disposed) return ValueTask.CompletedTask;
+        if (_disposed) return;
         _disposed = true;
+        await using var teardownScope = await TimingScope.BeginAsync(
+            _timings, _timingItemId, _timingPhase, "bwrap.teardown", log: _log);
         try
         {
             if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
@@ -267,6 +300,5 @@ internal sealed class BubblewrapSandbox : ISandbox
         {
             _log.LogWarning(ex, "Failed to clean up bwrap sandbox root {Root}", _root);
         }
-        return ValueTask.CompletedTask;
     }
 }

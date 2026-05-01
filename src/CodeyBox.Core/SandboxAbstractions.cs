@@ -46,6 +46,13 @@ public sealed record SandboxSpec
     public SandboxResourceLimits Limits { get; init; } = SandboxResourceLimits.Default;
     public SandboxNetworkPolicy Network { get; init; } = SandboxNetworkPolicy.Denied;
     public string WorkingDirectory { get; init; } = "/work";
+
+    /// <summary>
+    /// Optional timing context. When set, sandbox providers emit vm.* / bwrap.*
+    /// lifecycle timing rows for this work item using ITimingStore.
+    /// </summary>
+    public WorkItemId? TimingWorkItemId { get; init; }
+    public string? TimingPhase { get; init; }
 }
 
 /// <summary>

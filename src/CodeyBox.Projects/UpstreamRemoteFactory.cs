@@ -20,15 +20,18 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly IGitHost _gitHost;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GitHubUpstreamRemote> _githubLog;
+    private readonly ITimingStore? _timings;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
         IHttpClientFactory httpClientFactory,
-        ILogger<GitHubUpstreamRemote> githubLog)
+        ILogger<GitHubUpstreamRemote> githubLog,
+        ITimingStore? timings = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
         _githubLog = githubLog;
+        _timings = timings;
     }
 
     public IUpstreamRemote Create(Project project)
@@ -46,7 +49,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
                 MergeMethod = ValidateMergeMethod(project.Id, u.MergeMethod),
                 AutoMerge = u.AutoMerge,
                 PullRequestTitleTemplate = u.PullRequestTitleTemplate,
-            }),
+            }, _timings),
             "git-generic" => new GitGenericUpstreamRemote(_gitHost, new GitGenericUpstreamOptions
             {
                 UpstreamUrl = u.GenericUrl ?? throw new InvalidOperationException(

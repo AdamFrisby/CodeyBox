@@ -314,6 +314,7 @@ internal static class WorkItemEndpoints
         CancellationRegistry cancellations,
         IWebhookDispatcher webhooks,
         IProjectRepository projects,
+        ITimingStore? timings,
         CancellationToken ct)
     {
         if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
@@ -338,6 +339,12 @@ internal static class WorkItemEndpoints
                     WorkItem = cancelled,
                     Project = project,
                 }, ct);
+
+            // Only delete timing rows when the pipeline was not active. If the
+            // pipeline was running (wasActive=true) it races to Done; deleting
+            // here could erase timing records for a successfully-completed item.
+            if (timings is not null)
+                await timings.DeleteByWorkItemAsync(workItemId, ct);
         }
 
         // Cascade: cancel all Queued items that (transitively) depend on this
