@@ -1194,24 +1194,33 @@ public sealed class PipelineRunner : IPipelineRunner
                 CreatedAt = DateTimeOffset.UtcNow,
             };
 
-            await _suggestions.CreateAsync(suggestion, ct);
-            _log.LogInformation(
-                "Suggestion {SuggestionId} persisted from work item {WorkItemId}: {Title}",
-                suggestion.Id, item.Id, suggestion.Title.ReplaceLineEndings(" "));
-
-            await _webhooks.PublishAsync(new WebhookEvent
+            try
             {
-                Event = "work_item.suggestion",
-                WorkItem = item,
-                Project = project,
-                Details = new SuggestionWebhookDetails(
-                    suggestion.Id,
-                    suggestion.Title,
-                    suggestion.Category,
-                    suggestion.Severity,
-                    suggestion.EstimatedEffort,
-                    suggestion.FilesReferenced),
-            }, CancellationToken.None);
+                await _suggestions.CreateAsync(suggestion, ct);
+                _log.LogInformation(
+                    "Suggestion {SuggestionId} persisted from work item {WorkItemId}: {Title}",
+                    suggestion.Id, item.Id, suggestion.Title.ReplaceLineEndings(" "));
+
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.suggestion",
+                    WorkItem = item,
+                    Project = project,
+                    Details = new SuggestionWebhookDetails(
+                        suggestion.Id,
+                        suggestion.Title,
+                        suggestion.Category,
+                        suggestion.Severity,
+                        suggestion.EstimatedEffort,
+                        suggestion.FilesReferenced),
+                }, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "Failed to persist or dispatch suggestion '{Title}' from work item {WorkItemId}; skipping",
+                    suggestion.Title.ReplaceLineEndings(" "), item.Id);
+            }
         }
     }
 }
