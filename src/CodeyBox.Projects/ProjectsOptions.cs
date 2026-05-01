@@ -88,6 +88,16 @@ public sealed class ProjectAuditConfig
     public List<string>? Languages { get; set; }
     public List<string>? AuditTypes { get; set; }
     public List<CustomAuditorConfig>? Custom { get; set; }
+
+    /// <summary>
+    /// Agent used for LLM-based auditors. Null = use the project's primary agent.
+    /// </summary>
+    public string? AuditAgent { get; set; }
+
+    /// <summary>
+    /// Per-auditor agent overrides. Keys are auditor names; values are agent kind strings.
+    /// </summary>
+    public Dictionary<string, string>? PerAuditorAgent { get; set; }
 }
 
 public sealed class CustomAuditorConfig

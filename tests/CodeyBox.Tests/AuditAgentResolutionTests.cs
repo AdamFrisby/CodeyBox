@@ -202,7 +202,7 @@ public sealed class AuditAgentResolutionTests : IDisposable
         var claudeAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = workAgent };
         var runners = new List<IAgentRunner> { claudeAgent };
         if (registerGemini) runners.Add(new PassthroughRunner(AgentKind.Gemini));
-        if (registerCodex)  runners.Add(new PassthroughRunner(AgentKind.Codex));
+        if (registerCodex) runners.Add(new PassthroughRunner(AgentKind.Codex));
         var registry = new AgentRegistry(runners);
 
         var auditTypes = auditors.Count > 0 ? new[] { "scripted" } : Array.Empty<string>();

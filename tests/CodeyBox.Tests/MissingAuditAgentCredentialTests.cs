@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Audit;
@@ -18,9 +19,9 @@ namespace CodeyBox.Tests;
 /// null for Gemini (simulating an unset <c>CODEYBOX_GEMINI_API_KEY</c>), the
 /// pipeline must fall back to the work agent without crashing.
 ///
-/// The spec says this should also warn at startup. Here we test both paths:
-///   1. Per-pickup fallback: the audit iteration runs with the work agent.
-///   2. No crash: the work item transitions to Done (not Failed).
+/// Tests both paths per spec:
+///   1. Startup path: <see cref="AuditAgentStartupValidationService"/> warns at startup.
+///   2. Per-pickup fallback: the audit iteration runs with the work agent.
 /// </summary>
 public sealed class MissingAuditAgentCredentialTests : IDisposable
 {
@@ -30,6 +31,68 @@ public sealed class MissingAuditAgentCredentialTests : IDisposable
         _workspace = Directory.CreateTempSubdirectory("codeybox-cred-").FullName;
 
     public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+
+    // ── Startup path: AuditAgentStartupValidationService warns ───────────────
+
+    [Fact]
+    public async Task StartupValidation_MissingAuditAgentCredential_LogsWarning()
+    {
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = "file:///unused",
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit
+            {
+                MaxIterations = 3,
+                AuditTypes = [],
+                AuditAgent = AgentKind.Gemini,
+                PerAuditorAgent = new Dictionary<string, AgentKind>(),
+            },
+        };
+
+        var projects = new InMemoryProjectRepository(project);
+        var credentials = new SelectiveCredentialProvider(null);   // no credentials for any agent
+        var logger = new CapturingLogger<AuditAgentStartupValidationService>();
+
+        var svc = new AuditAgentStartupValidationService(projects, credentials, logger);
+        await svc.StartAsync(CancellationToken.None);
+        await svc.StartupTask;
+
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task StartupValidation_CredentialPresent_NoWarningLogged()
+    {
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = "file:///unused",
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit
+            {
+                MaxIterations = 3,
+                AuditTypes = [],
+                AuditAgent = AgentKind.Gemini,
+                PerAuditorAgent = new Dictionary<string, AgentKind>(),
+            },
+        };
+
+        var projects = new InMemoryProjectRepository(project);
+        var credentials = new SelectiveCredentialProvider(AgentKind.Gemini);   // credential present
+        var logger = new CapturingLogger<AuditAgentStartupValidationService>();
+
+        var svc = new AuditAgentStartupValidationService(projects, credentials, logger);
+        await svc.StartAsync(CancellationToken.None);
+        await svc.StartupTask;
+
+        Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning);
+    }
 
     // ── Per-pickup: fallback with no credentials ──────────────────────────────
 
@@ -211,4 +274,25 @@ internal sealed class CredTestPipeline : IDisposable
     }
 
     public void Dispose() => Store.Dispose();
+}
+
+/// <summary>Typed logger that captures entries for assertion in tests.</summary>
+internal sealed class CapturingLogger<T> : ILogger<T>
+{
+    public sealed record LogEntry(LogLevel Level, string Message);
+
+    public List<LogEntry> Entries { get; } = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        Entries.Add(new LogEntry(logLevel, formatter(state, exception)));
+    }
 }

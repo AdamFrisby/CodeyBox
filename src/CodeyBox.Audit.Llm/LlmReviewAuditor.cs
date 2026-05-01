@@ -99,14 +99,18 @@ public sealed class LlmReviewAuditor : IAuditor
 
     private string BuildPrompt(AuditContext context)
     {
+        // Escape any closing tag sequence in user content to prevent delimiter breakout.
+        var safePrompt = context.OriginalPrompt
+            .Replace("</task_description>", "< /task_description>", StringComparison.OrdinalIgnoreCase);
+
         return $$"""
             You are a strict code reviewer. Review the working tree at {{SandboxConventions.WorkDir}}, focusing on:
             {{_opts.ReviewFocus}}
 
             Original task being reviewed:
-            ---
-            {{context.OriginalPrompt}}
-            ---
+            <task_description>
+            {{safePrompt}}
+            </task_description>
 
             Examine the diff between {{context.BaseBranch}} and {{context.WorkBranch}}, plus the surrounding code.
             Then write your verdict to {{ResultFile}} as a single JSON object with this exact shape:

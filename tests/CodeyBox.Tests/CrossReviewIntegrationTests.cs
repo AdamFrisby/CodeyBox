@@ -113,7 +113,7 @@ public sealed class CrossReviewIntegrationTests : IDisposable
     public async Task PerAuditorAgent_RoutesSpecificAuditorToOverrideAgent()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var secAuditor  = new ContextCapturingAuditor("security:llm-review",     AuditCapabilities.AgentCredentials | AuditCapabilities.Network);
+        var secAuditor = new ContextCapturingAuditor("security:llm-review", AuditCapabilities.AgentCredentials | AuditCapabilities.Network);
         var compAuditor = new ContextCapturingAuditor("completeness:llm-review", AuditCapabilities.AgentCredentials | AuditCapabilities.Network);
 
         using var tp = BuildCrossReviewPipeline(seed, [secAuditor, compAuditor],

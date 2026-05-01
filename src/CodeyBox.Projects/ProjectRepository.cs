@@ -122,6 +122,17 @@ public sealed class ProjectRepository : IProjectRepository
         var mergedAutoRetry = project?.AutoRetryOnStuck ?? defaults?.AutoRetryOnStuck ?? false;
         var mergedMaxRetries = project?.MaxStuckRetries ?? defaults?.MaxStuckRetries ?? 2;
 
+        var rawAuditAgent = project?.AuditAgent ?? defaults?.AuditAgent;
+        var mergedAuditAgent = string.IsNullOrWhiteSpace(rawAuditAgent)
+            ? (AgentKind?)null
+            : new AgentKind(rawAuditAgent);
+
+        var rawPerAuditor = project?.PerAuditorAgent ?? defaults?.PerAuditorAgent;
+        var mergedPerAuditorAgent = rawPerAuditor is null
+            ? (IReadOnlyDictionary<string, AgentKind>)new Dictionary<string, AgentKind>()
+            : rawPerAuditor.Where(kvp => !string.IsNullOrWhiteSpace(kvp.Value))
+                           .ToDictionary(kvp => kvp.Key, kvp => new AgentKind(kvp.Value));
+
         return new ProjectAudit
         {
             MaxIterations = mergedMaxIter,
@@ -134,6 +145,8 @@ public sealed class ProjectRepository : IProjectRepository
             Languages = mergedLanguages,
             AuditTypes = mergedAuditTypes,
             Custom = mergedCustom,
+            AuditAgent = mergedAuditAgent,
+            PerAuditorAgent = mergedPerAuditorAgent,
         };
     }
 
