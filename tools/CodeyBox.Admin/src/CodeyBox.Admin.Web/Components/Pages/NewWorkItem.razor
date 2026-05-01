@@ -4,7 +4,20 @@
 
 <PageTitle>New Work Item — CodeyBox Admin</PageTitle>
 
-<h1>New Work Item</h1>
+<h1>@(_fromSuggestionId is not null ? "Promote Suggestion to Work Item" : "New Work Item")</h1>
+
+@if (_fromSuggestionData is not null)
+{
+    <div class="suggestion-context">
+        <p>
+            Promoting suggestion:
+            <strong>@_fromSuggestionData.Title</strong>
+            (<span class="category-badge">@_fromSuggestionData.Category</span>
+            / <span class="@_fromSuggestionData.SeverityCss">@_fromSuggestionData.Severity</span>).
+            The suggestion title and rationale are automatically prepended to the prompt.
+        </p>
+    </div>
+}
 
 @if (_error is not null)
 {
@@ -33,9 +46,12 @@
     </div>
 
     <div class="form-group">
-        <label for="prompt">Prompt</label>
+        <label for="prompt">@(_fromSuggestionId is not null ? "Additional instructions (optional)" : "Prompt")</label>
         <InputTextArea id="prompt" @bind-Value="_form.Prompt" class="form-control prompt-input" rows="20" />
-        <ValidationMessage For="() => _form.Prompt" />
+        @if (_fromSuggestionId is null)
+        {
+            <ValidationMessage For="() => _form.Prompt" />
+        }
     </div>
 
     <div class="form-group">
@@ -59,7 +75,7 @@
         <label for="pushUpstream">Push upstream after merge</label>
     </div>
 
-    @if (_queuedItems.Count > 0)
+    @if (_queuedItems.Count > 0 && _fromSuggestionId is null)
     {
         <div class="form-group">
             <label>Depends on (queued items)</label>
@@ -77,20 +93,35 @@
     }
 
     <div class="form-actions">
-        <button type="submit" class="btn btn-primary" disabled="@_submitting">
-            @(_submitting ? "Submitting…" : "Create")
-        </button>
-        <a href="/" class="btn">Cancel</a>
+        @if (_fromSuggestionId is not null)
+        {
+            <button type="button" class="btn btn-primary" disabled="@_submitting" @onclick="PromoteSuggestionAsync">
+                @(_submitting ? "Promoting…" : "Promote to work item")
+            </button>
+            <a href="/suggestions/@_fromSuggestionId" class="btn">Cancel</a>
+        }
+        else
+        {
+            <button type="submit" class="btn btn-primary" disabled="@_submitting">
+                @(_submitting ? "Submitting…" : "Create")
+            </button>
+            <a href="/" class="btn">Cancel</a>
+        }
     </div>
 </EditForm>
 
 @code {
+    [SupplyParameterFromQuery]
+    public string? FromSuggestion { get; set; }
+
     private readonly NewItemForm _form = new();
     private List<ProjectDto> _projects = [];
     private List<WorkItemDto> _queuedItems = [];
     private readonly HashSet<string> _selectedDeps = [];
     private string? _error;
     private bool _submitting;
+    private string? _fromSuggestionId;
+    private SuggestionDto? _fromSuggestionData;
 
     protected override async Task OnInitializedAsync()
     {
@@ -99,6 +130,23 @@
             _projects = await ApiClient.GetProjectsAsync();
             var all = await ApiClient.GetWorkItemsAsync();
             _queuedItems = all.Where(i => i.IsQueued).OrderBy(i => i.QueuePosition).ToList();
+
+            if (!string.IsNullOrEmpty(FromSuggestion))
+            {
+                _fromSuggestionId = FromSuggestion;
+                var suggestion = await ApiClient.GetSuggestionAsync(FromSuggestion);
+                if (suggestion is not null)
+                {
+                    _fromSuggestionData = suggestion;
+                    _form.Title = suggestion.Title;
+                    _form.ProjectId = suggestion.ProjectId;
+                }
+                else
+                {
+                    _error = $"Suggestion '{FromSuggestion}' not found.";
+                    _fromSuggestionId = null;
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -118,6 +166,11 @@
         _error = null;
         try
         {
+            if (string.IsNullOrWhiteSpace(_form.Prompt))
+            {
+                _error = "Prompt is required.";
+                return;
+            }
             var req = new CreateWorkItemRequest
             {
                 ProjectId = _form.ProjectId,
@@ -133,6 +186,29 @@
                 Nav.NavigateTo($"/work-items/{created.Id}");
             else
                 _error = "Failed to create work item.";
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    private async Task PromoteSuggestionAsync()
+    {
+        _submitting = true;
+        _error = null;
+        try
+        {
+            var extraInstructions = string.IsNullOrWhiteSpace(_form.Prompt) ? null : _form.Prompt;
+            var workItemId = await ApiClient.PromoteSuggestionAsync(_fromSuggestionId!, extraInstructions);
+            if (workItemId is not null)
+                Nav.NavigateTo($"/work-items/{workItemId}");
+            else
+                _error = "Failed to promote suggestion.";
         }
         catch (Exception ex)
         {

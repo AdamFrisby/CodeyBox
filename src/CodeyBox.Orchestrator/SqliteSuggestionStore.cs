@@ -25,7 +25,9 @@ public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
 
         using (var walCmd = _conn.CreateCommand())
         {
-            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+            // Disable FK enforcement: the REFERENCES declaration is for schema clarity only;
+            // enforcement is not required and would break standalone-store usage in tests.
+            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = OFF;";
             walCmd.ExecuteNonQuery();
         }
 
@@ -33,7 +35,7 @@ public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS suggestions (
                 id                        TEXT PRIMARY KEY,
-                source_work_item_id       TEXT NOT NULL,
+                source_work_item_id       TEXT NOT NULL REFERENCES work_items(id),
                 project_id                TEXT NOT NULL,
                 title                     TEXT NOT NULL,
                 rationale                 TEXT NOT NULL,
@@ -238,6 +240,7 @@ public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
         var ord = r.GetOrdinal("files_referenced_json");
         if (r.IsDBNull(ord)) return [];
         var json = r.GetString(ord);
-        return JsonSerializer.Deserialize<string[]>(json) ?? [];
+        try { return JsonSerializer.Deserialize<string[]>(json) ?? []; }
+        catch (JsonException) { return []; }
     }
 }

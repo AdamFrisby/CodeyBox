@@ -1155,9 +1155,12 @@ public sealed class PipelineRunner : IPipelineRunner
         const int MaxBytes = 256 * 1024;
         const string SuggestionsPath = SandboxConventions.WorkDir + "/.codeybox/suggestions.json";
 
+        // Read at most MaxBytes+1 bytes at the source so the sandbox provider's
+        // stdout buffer is bounded before the size check fires (prevents OOM on
+        // a multi-gigabyte file written by a compromised agent).
         var result = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["cat", SuggestionsPath],
+            Argv = ["head", "-c", (MaxBytes + 1).ToString(), SuggestionsPath],
         }, ct);
 
         if (!result.Success) return null;

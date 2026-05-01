@@ -156,6 +156,22 @@ public sealed class SuggestionListPageTests : TestContext
     }
 
     [Fact]
+    public void Suggestions_ChangeSeverityFilter_CallsApiWithSeverityArgument()
+    {
+        var client = new SuggestionCapturingClient([
+            MakeSuggestion(severity: "important"),
+            MakeSuggestion(severity: "minor"),
+        ]);
+        Services.AddSingleton<ICodeyBoxApiClient>(client);
+        var cut = RenderComponent<SuggestionsPage>();
+
+        var selects = cut.FindAll("select");
+        selects[1].Change("important");  // second select is Severity
+
+        cut.WaitForAssertion(() => Assert.Equal("important", client.LastSeverity));
+    }
+
+    [Fact]
     public async Task Suggestions_BulkDismiss_CallsDismissForEachSelected()
     {
         var s1 = MakeSuggestion(id: "id-bb01", title: "Alpha");
@@ -218,8 +234,8 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         return Task.FromResult<SuggestionDto?>(s);
     }
 
-    public Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default)
-        => Task.FromResult(true);
+    public Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
+        => Task.FromResult<string?>("fake-work-item-id");
 
     public Task<List<WorkItemDto>> GetWorkItemsAsync(CancellationToken ct = default)
         => Task.FromResult(new List<WorkItemDto>());
@@ -281,8 +297,8 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         return Task.FromResult<SuggestionDto?>(s);
     }
 
-    public Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default)
-        => Task.FromResult(true);
+    public Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
+        => Task.FromResult<string?>("fake-work-item-id");
 
     // ── Stubs for remaining interface members ─────────────────────────────────
     public Task<List<WorkItemDto>> GetWorkItemsAsync(CancellationToken ct = default)

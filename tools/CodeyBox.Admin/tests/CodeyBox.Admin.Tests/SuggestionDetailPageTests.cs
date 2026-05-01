@@ -71,18 +71,18 @@ public sealed class SuggestionDetailPageTests : TestContext
     }
 
     [Fact]
-    public async Task SuggestionDetail_PromoteButton_CallsPromoteAndNavigates()
+    public async Task SuggestionDetail_PromoteButton_NavigatesToNewWorkItemForm()
     {
         var s = MakeSuggestion();
-        var client = new DetailCapturingClient(s);
-        Services.AddSingleton<ICodeyBoxApiClient>(client);
+        Services.AddSingleton<ICodeyBoxApiClient>(new DetailFakeClient(s));
         var nav = Services.GetRequiredService<NavigationManager>();
         var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
 
         await cut.InvokeAsync(() => cut.Find("button.btn-primary").Click());
 
-        cut.WaitForAssertion(() => Assert.True(client.PromoteCalled));
-        Assert.Equal("http://localhost/", nav.Uri);
+        Assert.Contains("/work-items/new", nav.Uri);
+        Assert.Contains("fromSuggestion", nav.Uri);
+        Assert.Contains(s.Id, nav.Uri);
     }
 
     [Fact]
@@ -131,8 +131,8 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult(_suggestion);
 
-    public Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default)
-        => Task.FromResult(true);
+    public Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 
     public Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null, CancellationToken ct = default)
     {
@@ -172,10 +172,10 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult<SuggestionDto?>(_suggestion);
 
-    public Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default)
+    public Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
     {
         PromoteCalled = true;
-        return Task.FromResult(true);
+        return Task.FromResult<string?>("fake-work-item-id");
     }
 
     public Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null, CancellationToken ct = default)

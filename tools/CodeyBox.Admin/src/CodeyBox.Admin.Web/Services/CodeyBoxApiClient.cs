@@ -178,11 +178,16 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<SuggestionDto>(JsonOptions, ct);
     }
 
-    public async Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default)
+    public async Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default)
     {
+        var body = new { extraInstructions };
         var resp = await _http.PostAsJsonAsync(
             $"/suggestions/{Uri.EscapeDataString(id)}/promote",
-            new { }, JsonOptions, ct);
-        return resp.IsSuccessStatusCode;
+            body, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        var result = await resp.Content.ReadFromJsonAsync<PromoteResponse>(JsonOptions, ct);
+        return result?.WorkItemId;
     }
+
+    private sealed record PromoteResponse(string WorkItemId);
 }

@@ -57,6 +57,11 @@ public sealed class PromoteCreatesLinkedWorkItemTests : IDisposable
         Assert.Contains(s.Title, wi.Prompt);
         Assert.Contains(s.Rationale, wi.Prompt);
         Assert.Equal(s.Title, wi.Title);
+        // Structural order: heading must appear BEFORE the advisory block so it acts
+        // as the operator-level task instruction (not buried inside the advisory fence).
+        var headingIdx = wi.Prompt.IndexOf("# From suggestion:", StringComparison.Ordinal);
+        var advisoryIdx = wi.Prompt.IndexOf("<agent_advisory>", StringComparison.Ordinal);
+        Assert.True(headingIdx < advisoryIdx, "'# From suggestion:' must precede '<agent_advisory>'");
     }
 
     [Fact]

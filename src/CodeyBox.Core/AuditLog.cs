@@ -236,6 +236,10 @@ public static class AuditLog
             .Information("Suggestion {SuggestionId} promoted to work item {WorkItemId}",
                 suggestionId, newWorkItemId);
 
+    public static void SuggestionReverted(string suggestionId) =>
+        Audit("suggestion.reverted")
+            .Warning("Suggestion {SuggestionId} reverted to open after failed promotion", suggestionId);
+
     // ── Budget caps ──────────────────────────────────────────────────────────
 
     public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>

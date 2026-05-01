@@ -38,7 +38,7 @@ public interface ICodeyBoxApiClient
     Task<int> GetSuggestionsCountAsync(CancellationToken ct = default);
     Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default);
     Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null, CancellationToken ct = default);
-    Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default);
+    Task<string?> PromoteSuggestionAsync(string id, string? extraInstructions = null, CancellationToken ct = default);
 }
 
 /// <summary>Request body for PATCH /workitems/{id}.</summary>

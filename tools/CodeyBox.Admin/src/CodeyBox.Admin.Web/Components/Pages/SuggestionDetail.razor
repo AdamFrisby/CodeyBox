@@ -96,18 +96,9 @@ else if (_suggestion is not null)
         catch (Exception ex) { _error = ex.Message; }
     }
 
-    private async Task PromoteAsync()
+    private void PromoteAsync()
     {
-        _actionError = null;
-        try
-        {
-            var ok = await ApiClient.PromoteSuggestionAsync(Id);
-            if (ok)
-                Nav.NavigateTo("/");
-            else
-                _actionError = "Promote failed.";
-        }
-        catch (Exception ex) { _actionError = ex.Message; }
+        Nav.NavigateTo($"/work-items/new?fromSuggestion={Uri.EscapeDataString(Id)}");
     }
 
     private async Task DoDismissAsync()
