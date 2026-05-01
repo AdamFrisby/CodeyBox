@@ -224,10 +224,10 @@ public sealed class WorkItemTimelineEndpointTests : IDisposable
         using var extraDoc = JsonDocument.Parse(extraJson);
         var result = new Dictionary<string, JsonElement>
         {
-            ["@t"]          = JsonSerializer.SerializeToElement(time.ToString("O")),
-            ["EventName"]   = JsonSerializer.SerializeToElement(eventName),
-            ["WorkItemId"]  = JsonSerializer.SerializeToElement(id.ToString()),
-            ["Audit"]       = JsonSerializer.SerializeToElement(true),
+            ["@t"] = JsonSerializer.SerializeToElement(time.ToString("O")),
+            ["EventName"] = JsonSerializer.SerializeToElement(eventName),
+            ["WorkItemId"] = JsonSerializer.SerializeToElement(id.ToString()),
+            ["Audit"] = JsonSerializer.SerializeToElement(true),
         };
         foreach (var prop in extraDoc.RootElement.EnumerateObject())
             result[prop.Name] = prop.Value.Clone();

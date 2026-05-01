@@ -58,7 +58,7 @@ internal sealed class AuditLogTimelineReader
 
         // e.g. AuditPath="logs/audit-.json" → stem="audit-", ext=".json"
         var stem = Path.GetFileNameWithoutExtension(auditPath);
-        var ext  = Path.GetExtension(auditPath);
+        var ext = Path.GetExtension(auditPath);
         var pattern = stem + "*" + ext;
 
         var startDate = DateOnly.FromDateTime(createdAt.UtcDateTime);
@@ -169,157 +169,157 @@ internal sealed class AuditLogTimelineReader
         switch (eventName)
         {
             case "work_item.created":
-            {
-                var title = GetStr(root, "Title");
-                var summary = title is not null ? $"Created (Queued): {Truncate(title, 80)}" : "Created (Queued)";
-                var details = new { from = prevState, to = "Queued", title };
-                prevState = "Queued";
-                return new TimelineEntry(time, "state_transition", summary, details);
-            }
+                {
+                    var title = GetStr(root, "Title");
+                    var summary = title is not null ? $"Created (Queued): {Truncate(title, 80)}" : "Created (Queued)";
+                    var details = new { from = prevState, to = "Queued", title };
+                    prevState = "Queued";
+                    return new TimelineEntry(time, "state_transition", summary, details);
+                }
             case "work_item.transitioned":
-            {
-                var to = GetStr(root, "State") ?? "Unknown";
-                var summary = prevState is not null ? $"{prevState} → {to}" : $"→ {to}";
-                var details = new { from = prevState, to };
-                prevState = to;
-                return new TimelineEntry(time, "state_transition", summary, details);
-            }
+                {
+                    var to = GetStr(root, "State") ?? "Unknown";
+                    var summary = prevState is not null ? $"{prevState} → {to}" : $"→ {to}";
+                    var details = new { from = prevState, to };
+                    prevState = to;
+                    return new TimelineEntry(time, "state_transition", summary, details);
+                }
             case "work_item.picked_up":
-            {
-                var worker = GetInt(root, "WorkerId");
-                var to = "Working";
-                var summary = prevState is not null
-                    ? $"{prevState} → {to} (worker {worker})"
-                    : $"→ {to} (worker {worker})";
-                var details = new { from = prevState, to, workerId = worker };
-                prevState = to;
-                return new TimelineEntry(time, "state_transition", summary, details);
-            }
+                {
+                    var worker = GetInt(root, "WorkerId");
+                    var to = "Working";
+                    var summary = prevState is not null
+                        ? $"{prevState} → {to} (worker {worker})"
+                        : $"→ {to} (worker {worker})";
+                    var details = new { from = prevState, to, workerId = worker };
+                    prevState = to;
+                    return new TimelineEntry(time, "state_transition", summary, details);
+                }
             case "work_item.cancelled":
-            {
-                var summary = prevState is not null ? $"{prevState} → Cancelled" : "→ Cancelled";
-                var details = new { from = prevState, to = "Cancelled" };
-                prevState = "Cancelled";
-                return new TimelineEntry(time, "state_transition", summary, details);
-            }
+                {
+                    var summary = prevState is not null ? $"{prevState} → Cancelled" : "→ Cancelled";
+                    var details = new { from = prevState, to = "Cancelled" };
+                    prevState = "Cancelled";
+                    return new TimelineEntry(time, "state_transition", summary, details);
+                }
             case "work_item.failed":
-            {
-                var error = GetStr(root, "Error");
-                var summary = $"Failed: {Truncate(error ?? "(no details)", 120)}";
-                var details = new { from = prevState, to = "Failed", error };
-                prevState = "Failed";
-                return new TimelineEntry(time, "state_transition", summary, details);
-            }
+                {
+                    var error = GetStr(root, "Error");
+                    var summary = $"Failed: {Truncate(error ?? "(no details)", 120)}";
+                    var details = new { from = prevState, to = "Failed", error };
+                    prevState = "Failed";
+                    return new TimelineEntry(time, "state_transition", summary, details);
+                }
             case "work_item.retried":
-            {
-                var from = GetStr(root, "From") ?? "work";
-                var details = new { phase = from };
-                return new TimelineEntry(time, "state_transition", $"Retried from {from}", details);
-            }
+                {
+                    var from = GetStr(root, "From") ?? "work";
+                    var details = new { phase = from };
+                    return new TimelineEntry(time, "state_transition", $"Retried from {from}", details);
+                }
             case "work_item.dependent_cancelled":
-            {
-                var parentId = GetStr(root, "ParentWorkItemId") ?? "?";
-                var shortParent = parentId.Length >= 8 ? parentId[..8] : parentId;
-                var summary = $"Cascade-cancelled (parent: {shortParent}…)";
-                var details = new { from = prevState, to = "Cancelled", parentWorkItemId = parentId };
-                prevState = "Cancelled";
-                return new TimelineEntry(time, "state_transition", summary, details);
-            }
+                {
+                    var parentId = GetStr(root, "ParentWorkItemId") ?? "?";
+                    var shortParent = parentId.Length >= 8 ? parentId[..8] : parentId;
+                    var summary = $"Cascade-cancelled (parent: {shortParent}…)";
+                    var details = new { from = prevState, to = "Cancelled", parentWorkItemId = parentId };
+                    prevState = "Cancelled";
+                    return new TimelineEntry(time, "state_transition", summary, details);
+                }
             case "agent.started":
-            {
-                var agent = GetStr(root, "Agent") ?? "?";
-                var phase = GetStr(root, "Phase") ?? "?";
-                var sandbox = GetStr(root, "Sandbox");
-                var details = new { agent, phase, sandbox };
-                return new TimelineEntry(time, "agent_started", $"{agent} ({phase}) started", details);
-            }
+                {
+                    var agent = GetStr(root, "Agent") ?? "?";
+                    var phase = GetStr(root, "Phase") ?? "?";
+                    var sandbox = GetStr(root, "Sandbox");
+                    var details = new { agent, phase, sandbox };
+                    return new TimelineEntry(time, "agent_started", $"{agent} ({phase}) started", details);
+                }
             case "agent.finished":
-            {
-                var agent = GetStr(root, "Agent") ?? "?";
-                var success = GetBool(root, "Success");
-                var durationMs = GetLong(root, "DurationMs");
-                var exitCode = GetIntNullable(root, "ExitCode");
-                var stdoutTail = GetStr(root, "StdoutTail");
-                var stderrTail = GetStr(root, "StderrTail");
-                var sandbox = GetStr(root, "Sandbox");
-                var outcome = success ? "succeeded" : "failed";
-                var summary = $"{agent} {outcome} in {FormatDuration(durationMs)}";
-                var details = new { agent, success, exitCode, durationMs, stdoutTail, stderrTail, sandbox };
-                return new TimelineEntry(time, "agent_finished", summary, details);
-            }
+                {
+                    var agent = GetStr(root, "Agent") ?? "?";
+                    var success = GetBool(root, "Success");
+                    var durationMs = GetLong(root, "DurationMs");
+                    var exitCode = GetIntNullable(root, "ExitCode");
+                    var stdoutTail = GetStr(root, "StdoutTail");
+                    var stderrTail = GetStr(root, "StderrTail");
+                    var sandbox = GetStr(root, "Sandbox");
+                    var outcome = success ? "succeeded" : "failed";
+                    var summary = $"{agent} {outcome} in {FormatDuration(durationMs)}";
+                    var details = new { agent, success, exitCode, durationMs, stdoutTail, stderrTail, sandbox };
+                    return new TimelineEntry(time, "agent_finished", summary, details);
+                }
             case "agent.stuck_detected":
-            {
-                var agent = GetStr(root, "Agent") ?? "?";
-                var phase = GetStr(root, "Phase") ?? "?";
-                var stuck = GetInt(root, "StuckSeconds");
-                var details = new { agent, phase, stuckSeconds = stuck };
-                return new TimelineEntry(time, "agent_started",
-                    $"{agent} ({phase}) stuck — no activity for {stuck}s", details);
-            }
+                {
+                    var agent = GetStr(root, "Agent") ?? "?";
+                    var phase = GetStr(root, "Phase") ?? "?";
+                    var stuck = GetInt(root, "StuckSeconds");
+                    var details = new { agent, phase, stuckSeconds = stuck };
+                    return new TimelineEntry(time, "agent_stuck",
+                        $"{agent} ({phase}) stuck — no activity for {stuck}s", details);
+                }
             case "agent.killed_by_stuck_probe":
-            {
-                var agent = GetStr(root, "Agent") ?? "?";
-                var phase = GetStr(root, "Phase") ?? "?";
-                var details = new { agent, phase, killedByStuckProbe = true };
-                return new TimelineEntry(time, "agent_finished",
-                    $"{agent} ({phase}) killed by stuck probe", details);
-            }
+                {
+                    var agent = GetStr(root, "Agent") ?? "?";
+                    var phase = GetStr(root, "Phase") ?? "?";
+                    var details = new { agent, phase, killedByStuckProbe = true };
+                    return new TimelineEntry(time, "agent_finished",
+                        $"{agent} ({phase}) killed by stuck probe", details);
+                }
             case "auditor.run":
-            {
-                var name = GetStr(root, "AuditorName") ?? "?";
-                var severity = GetStr(root, "WorstSeverity") ?? "None";
-                var durationMs = GetLong(root, "DurationMs");
-                var findings = string.Equals(severity, "None", StringComparison.OrdinalIgnoreCase)
-                    ? "0 findings" : $"{severity} findings";
-                var summary = $"{name} (iter {pendingIteration}) — {findings}";
-                var details = new { name, iteration = pendingIteration, severity, durationMs };
-                return new TimelineEntry(time, "auditor_run", summary, details);
-            }
+                {
+                    var name = GetStr(root, "AuditorName") ?? "?";
+                    var severity = GetStr(root, "WorstSeverity") ?? "None";
+                    var durationMs = GetLong(root, "DurationMs");
+                    var findings = string.Equals(severity, "None", StringComparison.OrdinalIgnoreCase)
+                        ? "0 findings" : $"{severity} findings";
+                    var summary = $"{name} (iter {pendingIteration}) — {findings}";
+                    var details = new { name, iteration = pendingIteration, severity, durationMs };
+                    return new TimelineEntry(time, "auditor_run", summary, details);
+                }
             case "audit.iteration_complete":
-            {
-                var iter = GetInt(root, "Iteration");
-                var maxIter = GetInt(root, "MaxIterations");
-                var blocking = GetInt(root, "BlockingCount");
-                var nonBlocking = GetInt(root, "NonBlockingCount");
-                var summary = $"Audit iteration {iter} of {maxIter}: {blocking} blocking, {nonBlocking} non-blocking";
-                var details = new { iteration = iter, totalIterations = maxIter, blocking, nonBlocking };
-                return new TimelineEntry(time, "iteration_complete", summary, details);
-            }
+                {
+                    var iter = GetInt(root, "Iteration");
+                    var maxIter = GetInt(root, "MaxIterations");
+                    var blocking = GetInt(root, "BlockingCount");
+                    var nonBlocking = GetInt(root, "NonBlockingCount");
+                    var summary = $"Audit iteration {iter} of {maxIter}: {blocking} blocking, {nonBlocking} non-blocking";
+                    var details = new { iteration = iter, totalIterations = maxIter, blocking, nonBlocking };
+                    return new TimelineEntry(time, "iteration_complete", summary, details);
+                }
             case "audit.passed":
-            {
-                var iter = GetInt(root, "Iteration");
-                var details = new { iteration = iter, passed = true };
-                return new TimelineEntry(time, "iteration_complete",
-                    $"Audit passed on iteration {iter}", details);
-            }
+                {
+                    var iter = GetInt(root, "Iteration");
+                    var details = new { iteration = iter, passed = true };
+                    return new TimelineEntry(time, "iteration_complete",
+                        $"Audit passed on iteration {iter}", details);
+                }
             case "audit.failed":
-            {
-                var iter = GetInt(root, "Iteration");
-                var blocking = GetInt(root, "BlockingCount");
-                var details = new { iteration = iter, blocking, passed = false };
-                return new TimelineEntry(time, "iteration_complete",
-                    $"Audit failed after {iter} iterations: {blocking} blocking findings", details);
-            }
+                {
+                    var iter = GetInt(root, "Iteration");
+                    var blocking = GetInt(root, "BlockingCount");
+                    var details = new { iteration = iter, blocking, passed = false };
+                    return new TimelineEntry(time, "iteration_complete",
+                        $"Audit failed after {iter} iterations: {blocking} blocking findings", details);
+                }
             case "webhook.delivered":
-            {
-                var endpoint = GetStr(root, "Endpoint") ?? "?";
-                var ev = GetStr(root, "WebhookEvent") ?? "?";
-                var status = GetInt(root, "StatusCode");
-                var attempt = GetInt(root, "Attempt");
-                var details = new { endpoint, @event = ev, success = true, statusCode = status, attempt };
-                return new TimelineEntry(time, "webhook_delivered",
-                    $"Webhook {ev} → {endpoint}: HTTP {status}", details);
-            }
+                {
+                    var endpoint = GetStr(root, "Endpoint") ?? "?";
+                    var ev = GetStr(root, "WebhookEvent") ?? "?";
+                    var status = GetInt(root, "StatusCode");
+                    var attempt = GetInt(root, "Attempt");
+                    var details = new { endpoint, @event = ev, success = true, statusCode = status, attempt };
+                    return new TimelineEntry(time, "webhook_delivered",
+                        $"Webhook {ev} → {endpoint}: HTTP {status}", details);
+                }
             case "webhook.delivery_failed":
-            {
-                var endpoint = GetStr(root, "Endpoint") ?? "?";
-                var ev = GetStr(root, "WebhookEvent") ?? "?";
-                var attempts = GetInt(root, "Attempts");
-                var failure = GetStr(root, "LastFailure") ?? "";
-                var details = new { endpoint, @event = ev, success = false, attempts, lastFailure = failure };
-                return new TimelineEntry(time, "webhook_delivered",
-                    $"Webhook {ev} → {endpoint}: failed after {attempts} attempts", details);
-            }
+                {
+                    var endpoint = GetStr(root, "Endpoint") ?? "?";
+                    var ev = GetStr(root, "WebhookEvent") ?? "?";
+                    var attempts = GetInt(root, "Attempts");
+                    var failure = GetStr(root, "LastFailure") ?? "";
+                    var details = new { endpoint, @event = ev, success = false, attempts, lastFailure = failure };
+                    return new TimelineEntry(time, "webhook_delivered",
+                        $"Webhook {ev} → {endpoint}: failed after {attempts} attempts", details);
+                }
             default:
                 return null;
         }

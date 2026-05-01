@@ -42,7 +42,7 @@ else
                 @k.Label
             </button>
         }
-        @if (!string.IsNullOrEmpty(FilterKind))
+        @if (!string.IsNullOrEmpty(FilterKind) || FilterIteration is not null || FilterSince is not null)
         {
             <button class="filter-chip filter-chip--clear" @onclick="ClearFilters">✕ Clear</button>
         }
@@ -50,6 +50,12 @@ else
         {
             <span class="filter-chip filter-chip--active">iter @fi
                 <button class="filter-chip-remove" @onclick="() => FilterIteration = null">✕</button>
+            </span>
+        }
+        @if (FilterSince is { } fsinceChip)
+        {
+            <span class="filter-chip filter-chip--active">since @fsinceChip.ToString("yyyy-MM-dd HH:mm")
+                <button class="filter-chip-remove" @onclick="() => FilterSince = null">✕</button>
             </span>
         }
     </div>
@@ -115,6 +121,7 @@ else
     // Mutable UI filter state (may differ from query params after user interaction)
     private string FilterKind { get; set; } = "";
     private int? FilterIteration { get; set; }
+    private DateTimeOffset? FilterSince { get; set; }
 
     private HashSet<string> ActiveKinds =>
         FilterKind.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -143,6 +150,8 @@ else
             }
             if (FilterIteration is { } fi)
                 q = q.Where(e => e.IterationNumber == fi);
+            if (FilterSince is { } fs)
+                q = q.Where(e => e.OccurredAt >= fs);
 
             return q.ToList();
         }
@@ -155,6 +164,7 @@ else
 
         FilterKind = Kind ?? "";
         FilterIteration = Iteration;
+        FilterSince = DateTimeOffset.TryParse(Since, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsedSince) ? parsedSince : null;
 
         _cts?.Cancel();
         _cts = new CancellationTokenSource();
@@ -170,7 +180,11 @@ else
         _notFound = false;
         try
         {
-            _timeline = await ApiClient.GetWorkItemTimelineAsync(Id, ct: ct);
+            _timeline = await ApiClient.GetWorkItemTimelineAsync(Id,
+                kind: string.IsNullOrEmpty(FilterKind) ? null : FilterKind,
+                since: FilterSince?.ToString("O"),
+                iteration: FilterIteration,
+                ct: ct);
             _notFound = _timeline is null;
 
             // Determine if in-flight by checking the last state_transition entry
@@ -230,6 +244,7 @@ else
     {
         FilterKind = "";
         FilterIteration = null;
+        FilterSince = null;
     }
 
     private async Task CopyEntryJsonAsync(TimelineEntryDto entry)
