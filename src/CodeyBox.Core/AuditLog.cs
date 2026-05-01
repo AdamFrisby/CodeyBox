@@ -226,6 +226,11 @@ public static class AuditLog
         Audit("suggestion.dismissed")
             .Information("Suggestion {SuggestionId} dismissed: {Reason}", suggestionId, reason);
 
+    public static void SuggestionCreated(string suggestionId, string sourceWorkItemId, string projectId) =>
+        Audit("suggestion.created")
+            .Information("Suggestion {SuggestionId} created from work item {SourceWorkItemId} in project {ProjectId}",
+                suggestionId, sourceWorkItemId, projectId);
+
     public static void SuggestionPromoted(string suggestionId, string newWorkItemId) =>
         Audit("suggestion.promoted")
             .Information("Suggestion {SuggestionId} promoted to work item {WorkItemId}",

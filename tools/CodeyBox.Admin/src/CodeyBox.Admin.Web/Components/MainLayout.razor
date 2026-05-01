@@ -1,5 +1,6 @@
 @inherits LayoutComponentBase
 @inject ICodeyBoxApiClient ApiClient
+@inject ILogger<MainLayout> Logger
 
 <div class="admin-layout">
     <nav class="admin-nav">
@@ -27,6 +28,6 @@
         {
             _openCount = await ApiClient.GetSuggestionsCountAsync();
         }
-        catch { /* non-critical; badge just won't show */ }
+        catch (Exception ex) { Logger.LogWarning(ex, "Failed to fetch open suggestion count for nav badge"); }
     }
 }

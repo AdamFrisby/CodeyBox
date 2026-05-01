@@ -219,6 +219,101 @@ public sealed class SuggestionsPersistenceTests : IDisposable
         Assert.Equal(2, all.Count);
     }
 
+    // ── TryAcceptAsync ────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task TryAcceptAsync_OpenSuggestion_ReturnsTrueAndSetsAccepted()
+    {
+        var s = Make();
+        await _store.CreateAsync(s);
+        var workItemId = Guid.NewGuid().ToString();
+
+        var result = await _store.TryAcceptAsync(s.Id, workItemId);
+
+        Assert.True(result);
+        var got = await _store.GetAsync(s.Id);
+        Assert.Equal("accepted", got!.State);
+        Assert.Equal(workItemId, got.PromotedToWorkItemId);
+    }
+
+    [Fact]
+    public async Task TryAcceptAsync_AlreadyAccepted_ReturnsFalse()
+    {
+        var s = Make();
+        await _store.CreateAsync(s);
+        await _store.TryAcceptAsync(s.Id, Guid.NewGuid().ToString());
+
+        var result = await _store.TryAcceptAsync(s.Id, Guid.NewGuid().ToString());
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task TryAcceptAsync_AlreadyDismissed_ReturnsFalse()
+    {
+        var s = Make();
+        await _store.CreateAsync(s);
+        await _store.TryDismissAsync(s.Id, null);
+
+        var result = await _store.TryAcceptAsync(s.Id, Guid.NewGuid().ToString());
+
+        Assert.False(result);
+    }
+
+    // ── TryDismissAsync ───────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task TryDismissAsync_OpenSuggestion_ReturnsTrueAndSetsDismissed()
+    {
+        var s = Make();
+        await _store.CreateAsync(s);
+
+        var result = await _store.TryDismissAsync(s.Id, "not on roadmap");
+
+        Assert.True(result);
+        var got = await _store.GetAsync(s.Id);
+        Assert.Equal("dismissed", got!.State);
+        Assert.Equal("not on roadmap", got.DismissReason);
+    }
+
+    [Fact]
+    public async Task TryDismissAsync_NoReason_ReturnsTrueAndSetsDismissed()
+    {
+        var s = Make();
+        await _store.CreateAsync(s);
+
+        var result = await _store.TryDismissAsync(s.Id, null);
+
+        Assert.True(result);
+        var got = await _store.GetAsync(s.Id);
+        Assert.Equal("dismissed", got!.State);
+        Assert.Null(got.DismissReason);
+    }
+
+    [Fact]
+    public async Task TryDismissAsync_AlreadyDismissed_ReturnsFalse()
+    {
+        var s = Make();
+        await _store.CreateAsync(s);
+        await _store.TryDismissAsync(s.Id, null);
+
+        var result = await _store.TryDismissAsync(s.Id, "second attempt");
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task TryDismissAsync_AlreadyAccepted_ReturnsFalse()
+    {
+        var s = Make();
+        await _store.CreateAsync(s);
+        await _store.TryAcceptAsync(s.Id, Guid.NewGuid().ToString());
+
+        var result = await _store.TryDismissAsync(s.Id, "reason");
+
+        Assert.False(result);
+    }
+
     private static async Task<List<T>> ToList<T>(IAsyncEnumerable<T> source)
     {
         var list = new List<T>();

@@ -52,7 +52,8 @@ public sealed class PromoteCreatesLinkedWorkItemTests : IDisposable
 
         var wi = await _factory.WorkItemStore.GetAsync(WorkItemId.Parse(body!.WorkItemId));
         Assert.NotNull(wi);
-        Assert.StartsWith("# From suggestion:", wi.Prompt);
+        Assert.Contains("<agent_advisory>", wi.Prompt);
+        Assert.Contains("# From suggestion:", wi.Prompt);
         Assert.Contains(s.Title, wi.Prompt);
         Assert.Contains(s.Rationale, wi.Prompt);
         Assert.Equal(s.Title, wi.Title);

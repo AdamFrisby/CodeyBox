@@ -149,7 +149,8 @@ public static class SuggestionsFileParser
     {
         if (!el.TryGetProperty(prop, out var v) || v.ValueKind != JsonValueKind.String) return null;
         var s = v.GetString();
-        return string.IsNullOrWhiteSpace(s) ? null : s;
+        if (string.IsNullOrWhiteSpace(s)) return null;
+        return s.ReplaceLineEndings(" ");
     }
 }
 

@@ -130,6 +130,78 @@ public sealed class SuggestionsApiTests : IDisposable
         Assert.Equal(5, page.Total);
     }
 
+    // ── GET /suggestions/count ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetSuggestionsCount_EmptyStore_ReturnsZero()
+    {
+        var resp = await _client.GetAsync("/suggestions/count");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<CountResponse>();
+        Assert.Equal(0, body!.Count);
+    }
+
+    [Fact]
+    public async Task GetSuggestionsCount_WithOpenSuggestions_ReturnsCount()
+    {
+        await _factory.SuggestionStore.CreateAsync(MakeSuggestion());
+        await _factory.SuggestionStore.CreateAsync(MakeSuggestion());
+
+        var resp = await _client.GetAsync("/suggestions/count");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<CountResponse>();
+        Assert.Equal(2, body!.Count);
+    }
+
+    [Fact]
+    public async Task GetSuggestionsCount_ProjectFilter_CountsOnlyMatchingProject()
+    {
+        await _factory.SuggestionStore.CreateAsync(MakeSuggestion(projectId: SuggestionsApiFactory.ProjectId));
+        await _factory.SuggestionStore.CreateAsync(MakeSuggestion(projectId: "other-project"));
+
+        var resp = await _client.GetAsync($"/suggestions/count?project={SuggestionsApiFactory.ProjectId}");
+        var body = await resp.Content.ReadFromJsonAsync<CountResponse>();
+        Assert.Equal(1, body!.Count);
+    }
+
+    // ── GET /suggestions?project= ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetSuggestions_ProjectFilter_OnlyMatchingProject()
+    {
+        await _factory.SuggestionStore.CreateAsync(MakeSuggestion(projectId: SuggestionsApiFactory.ProjectId));
+        await _factory.SuggestionStore.CreateAsync(MakeSuggestion(projectId: "other-project"));
+
+        var resp = await _client.GetAsync($"/suggestions?project={SuggestionsApiFactory.ProjectId}");
+        var page = await resp.Content.ReadFromJsonAsync<PagedSuggestionsResult>();
+        Assert.Single(page!.Items);
+        Assert.Equal(SuggestionsApiFactory.ProjectId, page.Items[0].ProjectId);
+        Assert.Equal(1, page.Total);
+    }
+
+    // ── limit/offset validation ───────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetSuggestions_LimitZero_Returns400()
+    {
+        var resp = await _client.GetAsync("/suggestions?limit=0");
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetSuggestions_LimitAbove500_Returns400()
+    {
+        var resp = await _client.GetAsync("/suggestions?limit=501");
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetSuggestions_NegativeOffset_Returns400()
+    {
+        var resp = await _client.GetAsync("/suggestions?offset=-1");
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     // ── GET /suggestions/{id} ─────────────────────────────────────────────────
 
     [Fact]
@@ -266,6 +338,8 @@ public sealed class SuggestionsApiTests : IDisposable
     }
 
     // ── Local response shapes ─────────────────────────────────────────────────
+
+    private sealed record CountResponse(int Count);
 
     private sealed record PagedSuggestionsResult(
         List<SuggestionResponse> Items,

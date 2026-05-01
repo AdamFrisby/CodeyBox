@@ -299,7 +299,7 @@ public sealed class PipelineRunner : IPipelineRunner
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
 
     internal static string BuildInitialWorkPrompt(string userPrompt) =>
-        $"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\n{userPrompt}";
+        $"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.\n\n{userPrompt}";
 
     /// <summary>
     /// Resolves the git author identity to use for sandbox commits.
@@ -776,6 +776,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 ```
              f. Verify: `git status` should be clean; `git log --oneline -3`
 
+        If during your merge you notice adjacent issues that are out of scope — bugs
+        you saw, gaps in tests, missing validation, dead code — write them to
+        `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`).
+        Do **not** fix them here; the operator will triage. If you have nothing to
+        suggest, do not create the file.
+
         After committing, exit. The orchestrator will:
           - run `git status --porcelain` (must be empty)
           - confirm HEAD is on `{{baseBranch}}`
@@ -1197,6 +1203,7 @@ public sealed class PipelineRunner : IPipelineRunner
             try
             {
                 await _suggestions.CreateAsync(suggestion, ct);
+                AuditLog.SuggestionCreated(suggestion.Id, suggestion.SourceWorkItemId, suggestion.ProjectId);
                 _log.LogInformation(
                     "Suggestion {SuggestionId} persisted from work item {WorkItemId}: {Title}",
                     suggestion.Id, item.Id, suggestion.Title.ReplaceLineEndings(" "));
