@@ -27,17 +27,20 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GitHubUpstreamRemote> _log;
     private readonly GitHubUpstreamOptions _opts;
+    private readonly ITimingStore? _timings;
 
     public GitHubUpstreamRemote(
         IGitHost gitHost,
         IHttpClientFactory httpClientFactory,
         ILogger<GitHubUpstreamRemote> log,
-        GitHubUpstreamOptions opts)
+        GitHubUpstreamOptions opts,
+        ITimingStore? timings = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
         _log = log;
         _opts = opts;
+        _timings = timings;
         if (string.IsNullOrEmpty(_opts.Token))
             throw new ArgumentException("GitHub PAT must be provided", nameof(opts));
         if (!IsValidRemoteName(_opts.Owner))
@@ -107,22 +110,34 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         // Step 1: push work branch
         var repoUrl = RepoUrl();
         using var askpass = GitCredentialHelper.CreateAskPassFor(_opts.Token, "x-access-token");
-        try
+        await using (var pushScope = await TimingScope.BeginAsync(
+            _timings, request.WorkItemId, "upstream_push", "upstream.push_branch",
+            log: _log))
         {
-            await _gitHost.PushToUpstreamAsync(request.RepositoryId, repoUrl, request.WorkBranch, askpass.Environment, ct);
-        }
-        catch (Exception ex)
-        {
-            // Log only the scrubbed message at Debug; the raw exception object is
-            // withheld because git can echo credential material on auth failures.
-            var scrubbed = Scrub(ex.Message);
-            _log.LogDebug("Work-branch push to upstream threw: {Message} (full exception withheld; may contain credentials)", scrubbed);
-            throw new InvalidOperationException($"Failed to push work branch '{SanitizeForLog(request.WorkBranch)}': {scrubbed}");
+            try
+            {
+                await _gitHost.PushToUpstreamAsync(request.RepositoryId, repoUrl, request.WorkBranch, askpass.Environment, ct);
+            }
+            catch (Exception ex)
+            {
+                // Log only the scrubbed message at Debug; the raw exception object is
+                // withheld because git can echo credential material on auth failures.
+                var scrubbed = Scrub(ex.Message);
+                _log.LogDebug("Work-branch push to upstream threw: {Message} (full exception withheld; may contain credentials)", scrubbed);
+                throw new InvalidOperationException($"Failed to push work branch '{SanitizeForLog(request.WorkBranch)}': {scrubbed}");
+            }
         }
 
         // Step 2: open PR
         var prTitle = BuildPrTitle(request.Title, request.WorkBranch);
-        var pr = await CreatePullRequestAsync(request, prTitle, ct);
+        GitHubPrResponse? pr;
+        await using (var createPrScope = await TimingScope.BeginAsync(
+            _timings, request.WorkItemId, "upstream_push", "upstream.api_create_pr",
+            log: _log))
+        {
+            pr = await CreatePullRequestAsync(request, prTitle, ct);
+        }
+
         if (pr is null)
         {
             // 422 — branch already has an open PR or the request was otherwise
@@ -151,7 +166,15 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
 
         // Step 3: auto-merge
-        var (mergedSha, mergeNotes) = await MergePullRequestAsync(pr.Number, ct);
+        string? mergedSha;
+        string? mergeNotes;
+        await using (var mergeScope = await TimingScope.BeginAsync(
+            _timings, request.WorkItemId, "upstream_push", "upstream.api_merge_pr",
+            log: _log))
+        {
+            (mergedSha, mergeNotes) = await MergePullRequestAsync(pr.Number, ct);
+        }
+
         if (mergedSha is not null)
         {
             _log.LogInformation("GitHub PR #{N} auto-merged: {Sha}", pr.Number, mergedSha);

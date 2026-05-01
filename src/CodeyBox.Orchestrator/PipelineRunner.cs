@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Audit;
 using CodeyBox.Core;
@@ -47,6 +49,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly CredentialSmokeGate? _smokeGate;
     private readonly ISuggestionStore? _suggestions;
     private readonly IAuditReportStore? _auditReports;
+    private readonly ITimingStore? _timings;
     // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
     // Null when no probes were provided (fail-open: no quota gate on audit agent).
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
@@ -87,7 +90,8 @@ public sealed class PipelineRunner : IPipelineRunner
         ISuggestionStore? suggestions = null,
         IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
         QuotaRouterOptions? auditQuotaOptions = null,
-        IAuditReportStore? auditReports = null)
+        IAuditReportStore? auditReports = null,
+        ITimingStore? timingStore = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -100,6 +104,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _store = store;
         _webhooks = webhooks;
         _opts = opts;
+        _timings = timingStore;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -351,14 +356,19 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var credential = await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
-        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true, hostNetworkProfile: networkProfile);
+        var agentPhase = isInitial ? "work" : "rework";
+        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
+            hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase);
 
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
 
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+        await using (var cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox", log: _log))
+        {
+            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+        }
         if (isInitial)
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch);
         else
@@ -380,12 +390,20 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException($"Failed to read HEAD before agent: {beforeHead.Stderr}");
         var shaBefore = beforeHead.Stdout.Trim();
 
-        var agentPhase = isInitial ? "work" : "rework";
         AuditLog.AgentStarted(runner.Kind, sandbox.Id, agentPhase);
         var agentSw = Stopwatch.StartNew();
 
-        var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+        var agentExecScope = await TimingScope.BeginAsync(
+            _timings, item.Id, agentPhase, "agent.exec",
+            metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+            log: _log);
+        AgentResult agentResult;
+        await using (agentExecScope)
+        {
+            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+        }
 
+        await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
         agentSw.Stop();
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed,
             stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
@@ -445,7 +463,10 @@ public sealed class PipelineRunner : IPipelineRunner
             var commitMessage = isInitial
                 ? $"codeybox: {item.Title}{CoAuthoredByTrailer}"
                 : $"codeybox rework: address audit findings{CoAuthoredByTrailer}";
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+            await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit", log: _log))
+            {
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+            }
         }
 
         // Did HEAD advance — either via the agent committing itself or
@@ -465,7 +486,10 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException(msg);
         }
 
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
+        await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo", log: _log))
+        {
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
+        }
 
         // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
         if (isInitial && suggestionsJson is not null)
@@ -611,7 +635,8 @@ public sealed class PipelineRunner : IPipelineRunner
             AgentCredential? credential = needsCreds ? await _credentials.GetAsync(groupRunner.Kind, ct) : null;
             var access = _gitHost.GetSandboxAccess(repoId);
             var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
-            var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork, hostNetworkProfile: profile);
+            var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
+                hostNetworkProfile: profile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit");
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
@@ -626,11 +651,25 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
                 var auditorStarted = DateTimeOffset.UtcNow;
                 var auditorSw = Stopwatch.StartNew();
+                var auditorStartedAt = DateTimeOffset.UtcNow;
                 // Thread the resolved runner into the context so LlmReviewAuditor
                 // can use the cross-review agent instead of its baked-in default.
                 var auditorCtx = ctx with { AuditRunner = runner };
-                var result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+                AuditResult result;
+                var auditorScope = await TimingScope.BeginAsync(
+                    _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
+                    iteration: ctx.Iteration,
+                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+                    log: _log);
+                await using (auditorScope)
+                {
+                    result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+                }
                 auditorSw.Stop();
+                await EmitAuditorSubStepsAsync(auditor.Name, result.RawOutput,
+                    ctx.WorkItemId, ctx.Iteration, auditorStartedAt);
+                await EmitToolCallCountsAsync(result.RawOutput, ctx.WorkItemId, "audit",
+                    auditorScope.ElapsedMs, ct, iteration: ctx.Iteration);
                 var worstSeverity = result.Findings.Count > 0
                     ? ((AuditSeverity)result.Findings.Max(f => (int)f.Severity)).ToString()
                     : "none";
@@ -805,12 +844,16 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var credential = await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
-        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true, hostNetworkProfile: networkProfile);
+        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
+            hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge");
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+        await using (var mergeCloneScope = await TimingScope.BeginAsync(_timings, item.Id, "merge", "git.clone_into_sandbox", log: _log))
+        {
+            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+        }
         var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
         await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
@@ -827,8 +870,17 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
         var mergeSw = Stopwatch.StartNew();
 
-        var agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+        var mergeExecScope = await TimingScope.BeginAsync(
+            _timings, item.Id, "merge", "agent.exec",
+            metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+            log: _log);
+        AgentResult agentResult;
+        await using (mergeExecScope)
+        {
+            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+        }
 
+        await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecScope.ElapsedMs, ct);
         mergeSw.Stop();
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
             stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
@@ -1017,7 +1069,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
             try
             {
-                var outcome = await upstream.CompleteAsync(request, ct);
+                UpstreamCompletionOutcome outcome;
+                await using (var upstreamScope = await TimingScope.BeginAsync(
+                    _timings, item.Id, "upstream_push", "upstream.complete",
+                    metadata: new Dictionary<string, object> { ["attempt"] = attempt },
+                    log: _log))
+                {
+                    outcome = await upstream.CompleteAsync(request, ct);
+                }
                 if (outcome.PullRequestUrl is not null)
                     _log.LogInformation("Upstream PR: {Url}", outcome.PullRequestUrl);
                 if (outcome.MergedSha is not null)
@@ -1061,11 +1120,221 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
+    /// <summary>
+    /// Parses well-known output patterns from shell auditors and emits sub-step timing rows.
+    /// Best-effort: unknown auditors or unparsable output are silently skipped.
+    /// </summary>
+    private async Task EmitAuditorSubStepsAsync(
+        string auditorName, string? stdout, WorkItemId itemId, int iteration, DateTimeOffset phaseStart)
+    {
+        if (_timings is null || stdout is null) return;
+
+        var subSteps = ParseAuditorSubSteps(auditorName, stdout);
+        foreach (var (step, durMs, metaJson) in subSteps)
+        {
+            var id = Guid.NewGuid().ToString("N");
+            try
+            {
+                await _timings.BeginAsync(new TimingRecord
+                {
+                    Id = id,
+                    WorkItemId = itemId,
+                    Phase = "audit",
+                    Iteration = iteration,
+                    Step = step,
+                    StartedAt = phaseStart,
+                    MetadataJson = metaJson,
+                }, CancellationToken.None);
+                await _timings.EndAsync(id, phaseStart.AddMilliseconds(durMs), durMs, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Timing: failed to emit auditor sub-step {Step}", step);
+            }
+        }
+    }
+
+    private static List<(string Step, long DurationMs, string MetadataJson)> ParseAuditorSubSteps(string auditorName, string stdout)
+    {
+        var result = new List<(string, long, string)>();
+
+        // dotnet build: "Time Elapsed 00:00:01.234"
+        if (auditorName.Contains("build", StringComparison.OrdinalIgnoreCase))
+        {
+            var m = Regex.Match(stdout, @"Time Elapsed (\d+):(\d+):(\d+)\.(\d+)");
+            if (m.Success &&
+                int.TryParse(m.Groups[1].Value, out var h) &&
+                int.TryParse(m.Groups[2].Value, out var min) &&
+                int.TryParse(m.Groups[3].Value, out var sec) &&
+                int.TryParse(m.Groups[4].Value.PadRight(3, '0')[..3], out var ms))
+            {
+                result.Add(("dotnet.build", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
+            }
+        }
+
+        // dotnet format: "Time Elapsed" line (same marker as dotnet build but from dotnet format)
+        else if (auditorName.Contains("format", StringComparison.OrdinalIgnoreCase))
+        {
+            var m = Regex.Match(stdout, @"Time Elapsed (\d+):(\d+):(\d+)\.(\d+)");
+            if (m.Success &&
+                int.TryParse(m.Groups[1].Value, out var h) &&
+                int.TryParse(m.Groups[2].Value, out var min) &&
+                int.TryParse(m.Groups[3].Value, out var sec) &&
+                int.TryParse(m.Groups[4].Value.PadRight(3, '0')[..3], out var ms))
+            {
+                result.Add(("dotnet.format", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
+            }
+        }
+
+        // dotnet test: "Time Elapsed" for total run; "A total of N test files matched" for discovery count;
+        // "Duration: X s" in Passed!/Failed! line for execution time.
+        else if (auditorName.Contains("test", StringComparison.OrdinalIgnoreCase))
+        {
+            // Test discovery: count of matched test files (no distinct duration available)
+            var discoveryMatch = Regex.Match(stdout, @"A total of (\d+) test files? matched");
+            if (discoveryMatch.Success && int.TryParse(discoveryMatch.Groups[1].Value, out var fileCount))
+            {
+                // duration not separately measurable; count stored in metadata
+                result.Add(("dotnet.test_discovery", 0, $"{{\"count\":{fileCount}}}"));
+            }
+
+            // Test run duration from "Duration: X s" in Passed!/Failed! line
+            var durationMatch = Regex.Match(stdout, @"Duration:\s*([\d.]+)\s*s", RegexOptions.IgnoreCase);
+            if (durationMatch.Success && double.TryParse(durationMatch.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var runSecs))
+            {
+                result.Add(("dotnet.test_run", (long)(runSecs * 1000), "{}"));
+            }
+            else
+            {
+                // Fallback: "Time Elapsed" covers the full test invocation
+                var m = Regex.Match(stdout, @"Time Elapsed (\d+):(\d+):(\d+)\.(\d+)");
+                if (m.Success &&
+                    int.TryParse(m.Groups[1].Value, out var h) &&
+                    int.TryParse(m.Groups[2].Value, out var min) &&
+                    int.TryParse(m.Groups[3].Value, out var sec) &&
+                    int.TryParse(m.Groups[4].Value.PadRight(3, '0')[..3], out var ms))
+                {
+                    result.Add(("dotnet.test_run", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
+                }
+            }
+        }
+
+        // gitleaks: "scan completed in 1.234s"
+        if (auditorName.Contains("gitleaks", StringComparison.OrdinalIgnoreCase))
+        {
+            var m = Regex.Match(stdout, @"scan completed in ([\d.]+)s", RegexOptions.IgnoreCase);
+            if (m.Success && double.TryParse(m.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var secs))
+            {
+                result.Add(("gitleaks.scan", (long)(secs * 1000), "{}"));
+            }
+        }
+
+        // semgrep: JSON output with "duration" field in seconds
+        if (auditorName.Contains("semgrep", StringComparison.OrdinalIgnoreCase))
+        {
+            var m = Regex.Match(stdout, @"""duration""\s*:\s*([\d.]+)");
+            if (m.Success && double.TryParse(m.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var secs))
+            {
+                result.Add(("semgrep.scan", (long)(secs * 1000), "{}"));
+            }
+        }
+
+        return result;
+    }
+
+    private async Task EmitToolCallCountsAsync(
+        string? stdout, WorkItemId itemId, string phase, long agentExecDurationMs, CancellationToken ct,
+        int? iteration = null)
+    {
+        if (_timings is null) return;
+
+        var parsed = AgentStreamJsonParser.TryParse(stdout);
+        if (parsed is null) return; // Not stream-json output; skip silently.
+
+        // Compute the approximate window the agent exec occupied.
+        // now ≈ agent exec end; startedAt ≈ agent exec start.
+        // This ensures EndedAt - StartedAt == agentExecDurationMs for thinking_aggregate.
+        var endedAt = DateTimeOffset.UtcNow;
+        var startedAt = endedAt.AddMilliseconds(-agentExecDurationMs);
+
+        // Emit one agent.tool_call.<name> row per distinct tool.
+        // Per-event timestamps are unavailable in buffered stream-json output, so
+        // duration_ms = 0. The invocation count is stored in metadata_json.
+        foreach (var (toolName, count) in parsed.ToolCallCounts)
+        {
+            // Sanitize agent-controlled name: cap length, allow only safe chars.
+            var safeToolName = SanitizeToolName(toolName);
+            var rowId = Guid.NewGuid().ToString("N");
+            var metaJson = JsonSerializer.Serialize(new Dictionary<string, object> { ["count"] = count });
+            try
+            {
+                await _timings.BeginAsync(new TimingRecord
+                {
+                    Id = rowId,
+                    WorkItemId = itemId,
+                    Phase = phase,
+                    Iteration = iteration,
+                    Step = $"agent.tool_call.{safeToolName}",
+                    StartedAt = startedAt,
+                    MetadataJson = metaJson,
+                }, CancellationToken.None);
+                await _timings.EndAsync(rowId, startedAt, 0, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Timing: failed to emit agent.tool_call.{Tool}",
+                    safeToolName.Replace("\n", "\\n", StringComparison.Ordinal)
+                               .Replace("\r", "\\r", StringComparison.Ordinal));
+            }
+        }
+
+        // Emit agent.thinking_aggregate as exec duration minus sum of tool call durations.
+        // Without per-event timestamps all tool call durations are 0, so thinking_aggregate
+        // equals the full agent.exec duration. IsSubStep excludes it from phase totals.
+        // StartedAt/EndedAt span the actual execution window so SQL duration math is consistent.
+        var thinkId = Guid.NewGuid().ToString("N");
+        try
+        {
+            await _timings.BeginAsync(new TimingRecord
+            {
+                Id = thinkId,
+                WorkItemId = itemId,
+                Phase = phase,
+                Iteration = iteration,
+                Step = "agent.thinking_aggregate",
+                StartedAt = startedAt,
+                MetadataJson = "{}",
+            }, CancellationToken.None);
+            await _timings.EndAsync(thinkId, endedAt, agentExecDurationMs, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Timing: failed to emit agent.thinking_aggregate");
+        }
+    }
+
+    private static string SanitizeToolName(string name)
+    {
+        const int maxLen = 256;
+        var s = name.Length > maxLen ? name[..maxLen] : name;
+        return string.IsNullOrEmpty(s)
+            ? "unknown"
+            : new string(s.Select(c => char.IsLetterOrDigit(c) || c == '.' || c == '_' || c == '-' ? c : '_').ToArray());
+    }
+
     private SandboxSpec BuildSandboxSpec(
         SandboxRepositoryAccess access,
         AgentCredential? includeAgentCredential,
         bool allowAgentNetwork,
-        string? hostNetworkProfile = null)
+        string? hostNetworkProfile = null,
+        WorkItemId? timingWorkItemId = null,
+        string? timingPhase = null)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
@@ -1100,6 +1369,8 @@ public sealed class PipelineRunner : IPipelineRunner
             Environment = env,
             Network = net,
             WorkingDirectory = SandboxConventions.WorkDir,
+            TimingWorkItemId = timingWorkItemId,
+            TimingPhase = timingPhase,
         };
     }
 

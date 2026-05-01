@@ -166,7 +166,8 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         "process" => BuildProcess(opts, environment, startupLog, loggerFactory),
         "bubblewrap" => new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions(),
-            loggerFactory.CreateLogger<BubblewrapSandboxProvider>()),
+            loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
+            sp.GetService<ITimingStore>()),
         "multipass" => new MultipassSandboxProvider(
             new MultipassSandboxOptions
             {
@@ -175,7 +176,8 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
                 NetworkProfiles = opts.SandboxNetworkProfiles,
                 UseBaselineImages = opts.MultipassUseBaselineImages,
             },
-            loggerFactory.CreateLogger<MultipassSandboxProvider>()),
+            loggerFactory.CreateLogger<MultipassSandboxProvider>(),
+            sp.GetService<ITimingStore>()),
         _ => throw new InvalidOperationException(
             $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, bubblewrap, process"),
     };
@@ -505,6 +507,11 @@ builder.Services.AddSingleton<IAuditReportStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteAuditReportStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<ITimingStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteTimingStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IQueueController>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -586,6 +593,7 @@ var app = builder.Build();
 app.UseApiKeyAuth(anonymousPrefixes: ["/healthz"]);
 
 WorkItemEndpoints.Map(app);
+WorkItemTimingsEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 

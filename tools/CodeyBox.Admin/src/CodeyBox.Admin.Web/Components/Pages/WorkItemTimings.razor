@@ -1,0 +1,192 @@
+@page "/work-items/{Id}/timings"
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<WorkItemTimings> Logger
+
+<PageTitle>Timings — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found.</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_timings is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <h1>Timings — <a href="/work-items/@Id">@Id[..Math.Min(8, Id.Length)]</a></h1>
+
+    <p>Total: <strong>@FormatDuration(_timings.TotalDurationMs)</strong></p>
+
+    @if (_timings.TotalDurationMs > 0)
+    {
+        @* Stacked horizontal bar: work / rework / audit / merge / upstream_push *@
+        var phases = new[] { "work", "rework", "audit", "merge", "upstream_push" };
+        var colors = new[] { "#4CAF50", "#8BC34A", "#FF9800", "#2196F3", "#9C27B0" };
+        var labels = new[] { "Work", "Rework", "Audit", "Merge", "Upstream Push" };
+        <section class="timings-bar-section">
+            <h2>Phase breakdown</h2>
+            <div class="duration-bar" style="display:flex;height:28px;width:100%;border:1px solid #ccc;border-radius:3px;overflow:hidden;">
+                @for (var i = 0; i < phases.Length; i++)
+                {
+                    var phaseDur = _timings.ByPhase.TryGetValue(phases[i], out var phaseEl)
+                        ? GetLong(phaseEl, "durationMs") ?? 0L
+                        : 0L;
+                    if (phaseDur <= 0) continue;
+                    var pct = (double)phaseDur / _timings.TotalDurationMs * 100.0;
+                    var idx = i;
+                    <div style="width:@(pct.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))%;background:@colors[idx];height:100%;"
+                         title="@labels[idx]: @FormatDuration(phaseDur)">
+                    </div>
+                }
+            </div>
+            <div class="duration-bar-legend" style="display:flex;gap:12px;margin-top:4px;font-size:0.85em;flex-wrap:wrap;">
+                @for (var i = 0; i < phases.Length; i++)
+                {
+                    var phaseDur = _timings.ByPhase.TryGetValue(phases[i], out var phaseEl2)
+                        ? GetLong(phaseEl2, "durationMs") ?? 0L
+                        : 0L;
+                    if (phaseDur <= 0) continue;
+                    var idx = i;
+                    <span><span style="display:inline-block;width:12px;height:12px;background:@colors[idx];border-radius:2px;margin-right:4px;vertical-align:middle;"></span>@labels[idx]: @FormatDuration(phaseDur)</span>
+                }
+            </div>
+        </section>
+    }
+
+    @if (_timings.TopSteps.Count > 0)
+    {
+        <section class="timings-top">
+            <h2>Top slowest steps</h2>
+            <table class="detail-table">
+                <thead>
+                    <tr><th>Step</th><th>Total</th><th>Count</th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var s in _timings.TopSteps)
+                    {
+                        <tr>
+                            <td><code>@s.Step</code></td>
+                            <td>@FormatDuration(s.TotalMs)</td>
+                            <td>@s.Count</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </section>
+    }
+
+    @foreach (var phase in _timings.ByPhase)
+    {
+        <section class="timings-phase">
+            <h2>@phase.Key</h2>
+            @{
+                var phaseJson = phase.Value;
+                var durationMs = GetLong(phaseJson, "durationMs");
+                if (durationMs.HasValue)
+                {
+                    <p>Duration: <strong>@FormatDuration(durationMs.Value)</strong></p>
+                }
+            }
+            @if (TryGetSteps(phase.Value) is { } steps)
+            {
+                <table class="detail-table timings-steps">
+                    <thead>
+                        <tr><th>Step</th><th>Duration</th><th>Status</th></tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var step in steps)
+                        {
+                            var dur = GetLong(step, "durationMs");
+                            var stepName = GetString(step, "step") ?? "";
+                            var isInflight = !dur.HasValue;
+                            <tr class="@(isInflight ? "timing-inflight" : "")">
+                                <td><code>@stepName</code></td>
+                                <td>@(dur.HasValue ? FormatDuration(dur.Value) : "in-flight")</td>
+                                <td>@(isInflight ? "running" : "done")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        </section>
+    }
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private WorkItemTimingsDto? _timings;
+    private string? _error;
+    private bool _notFound;
+
+    protected override async Task OnParametersSetAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        try
+        {
+            _timings = await ApiClient.GetWorkItemTimingsAsync(Id);
+            _notFound = _timings is null;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load timings for {Id}", Id);
+            _error = "Failed to load timings. Check server logs for details.";
+        }
+    }
+
+    private static string FormatDuration(long ms)
+    {
+        if (ms < 1000) return $"{ms}ms";
+        if (ms < 60_000) return $"{ms / 1000.0:F1}s";
+        var min = ms / 60_000;
+        var sec = (ms % 60_000) / 1000;
+        return $"{min}m {sec}s";
+    }
+
+    private static long? GetLong(System.Text.Json.JsonElement el, string key)
+    {
+        if (el.ValueKind == System.Text.Json.JsonValueKind.Object &&
+            el.TryGetProperty(key, out var v) &&
+            v.TryGetInt64(out var n)) return n;
+        return null;
+    }
+
+    private static string? GetString(System.Text.Json.JsonElement el, string key)
+    {
+        if (el.ValueKind == System.Text.Json.JsonValueKind.Object &&
+            el.TryGetProperty(key, out var v)) return v.GetString();
+        return null;
+    }
+
+    private static List<System.Text.Json.JsonElement>? TryGetSteps(System.Text.Json.JsonElement phaseEl)
+    {
+        if (phaseEl.ValueKind != System.Text.Json.JsonValueKind.Object) return null;
+
+        // Non-iteration phase: direct "steps" array.
+        if (phaseEl.TryGetProperty("steps", out var steps) &&
+            steps.ValueKind == System.Text.Json.JsonValueKind.Array)
+            return steps.EnumerateArray().ToList();
+
+        // Iteration-based phase (audit/rework): collect steps from all iterations.
+        if (phaseEl.TryGetProperty("iterations", out var iterations) &&
+            iterations.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            var all = new List<System.Text.Json.JsonElement>();
+            foreach (var iter in iterations.EnumerateArray())
+                if (iter.TryGetProperty("steps", out var iterSteps) &&
+                    iterSteps.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    all.AddRange(iterSteps.EnumerateArray());
+            return all.Count > 0 ? all : null;
+        }
+
+        return null;
+    }
+}

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 
@@ -45,16 +46,19 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private readonly MultipassSandboxOptions _opts;
     private readonly ILogger<MultipassSandboxProvider> _log;
     private readonly string _stagingRoot;
+    private readonly ITimingStore? _timings;
     // Per-baseline-name semaphore: serialises bake operations so two
     // concurrent CreateAsync calls for the same profile don't both try to
     // launch the same baseline VM. Lazily populated.
     private readonly Dictionary<string, SemaphoreSlim> _baselineLocks = new();
     private readonly object _baselineLocksGuard = new();
 
-    public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log)
+    public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
+        ITimingStore? timings = null)
     {
         _opts = opts;
         _log = log;
+        _timings = timings;
         _stagingRoot = ResolveStagingRoot(opts);
         Directory.CreateDirectory(_stagingRoot);
         // 0700 on the staging root: only the orchestrator user can read or
@@ -134,6 +138,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
         }
 
+        // Resolve timing context from the spec (null → no timing emitted).
+        var timingStore = _timings is not null && spec.TimingWorkItemId.HasValue ? _timings : null;
+        var timingItemId = spec.TimingWorkItemId.GetValueOrDefault();
+        var timingPhase = spec.TimingPhase ?? "work";
+
         try
         {
             // Choose between two boot paths:
@@ -152,6 +161,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             if (useBaseline)
             {
                 var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, ct);
+                await using var cloneScope = await TimingScope.BeginAsync(
+                    timingStore, timingItemId, timingPhase, "vm.clone", log: _log);
                 await CloneFromBaselineAsync(name, baselineName, ct);
                 // Clone is Stopped after `multipass clone`; no start yet.
             }
@@ -160,9 +171,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                 var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit);
                 var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
                 await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
-                await LaunchAsync(name, spec, cloudInitPath, ct);
-                await WaitForRunningAsync(name, ct);
-                // Stop the freshly-launched VM so we can mount.
+                await using (var launchScope = await TimingScope.BeginAsync(
+                    timingStore, timingItemId, timingPhase, "vm.launch", log: _log))
+                {
+                    await LaunchAsync(name, spec, cloudInitPath, ct);
+                    await WaitForRunningAsync(name, ct);
+                }
+                // Stop the freshly-launched VM so we can mount (outside vm.launch scope).
                 var stop = await RunAsync([_opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
                 if (stop.ExitCode != 0)
                     throw new InvalidOperationException($"multipass stop (for mount) failed: {stop.Stderr}");
@@ -170,8 +185,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
 
             // Apply native mounts while VM is Stopped, then start.
-            await ApplyMountsAsync(name, bindMounts, ct);
-            await StartAndWaitForRunningAsync(name, ct);
+            await using (var mountScope = await TimingScope.BeginAsync(
+                timingStore, timingItemId, timingPhase, "vm.mount", log: _log))
+            {
+                await ApplyMountsAsync(name, bindMounts, ct);
+            }
+
+            await using (var startScope = await TimingScope.BeginAsync(
+                timingStore, timingItemId, timingPhase, "vm.start", log: _log))
+            {
+                await StartAndWaitForRunningAsync(name, ct);
+            }
 
             await TransferEnvAsync(name, spec.Environment, sandboxRoot, ct);
             AuditLog.SandboxCreated(name, spec.Network.ProfileName);
@@ -180,7 +204,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // already baked into the source VM's filesystem, so the clone
             // inherits it. The codeybox-route systemd service runs on every
             // boot in both paths.
-            return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log);
+            return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log, timingStore, timingItemId, timingPhase);
         }
         catch
         {
@@ -861,15 +885,23 @@ internal sealed class MultipassSandbox : ISandbox
     private readonly SandboxSpec _spec;
     private readonly MultipassSandboxOptions _opts;
     private readonly ILogger _log;
+    private readonly ITimingStore? _timings;
+    private readonly WorkItemId _timingItemId;
+    private readonly string _timingPhase;
+    private int _firstExecEmitted;
     private bool _disposed;
 
-    public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log)
+    public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
+        ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work")
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
         _spec = spec;
         _opts = opts;
         _log = log;
+        _timings = timings;
+        _timingItemId = timingItemId;
+        _timingPhase = timingPhase;
         Id = name;
     }
 
@@ -922,22 +954,34 @@ internal sealed class MultipassSandbox : ISandbox
         };
         for (var i = 1; i < argv.Count; i++) psi.ArgumentList.Add(argv[i]);
 
-        using var p = new Process { StartInfo = psi };
-        p.Start();
-        var stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = p.StandardError.ReadToEndAsync(ct);
-        if (exec.Stdin is not null)
+        var isFirstExec = Interlocked.CompareExchange(ref _firstExecEmitted, 1, 0) == 0;
+        TimingScope? firstExecScope = isFirstExec
+            ? await TimingScope.BeginAsync(_timings, _timingItemId, _timingPhase, "vm.exec_first", log: _log)
+            : null;
+        try
         {
-            await p.StandardInput.WriteAsync(exec.Stdin);
-            p.StandardInput.Close();
+            using var p = new Process { StartInfo = psi };
+            p.Start();
+            var stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
+            var stderrTask = p.StandardError.ReadToEndAsync(ct);
+            if (exec.Stdin is not null)
+            {
+                await p.StandardInput.WriteAsync(exec.Stdin);
+                p.StandardInput.Close();
+            }
+            try { await p.WaitForExitAsync(ct); }
+            catch (OperationCanceledException)
+            {
+                try { p.Kill(entireProcessTree: true); } catch { }
+                throw;
+            }
+            return new SandboxExecResult(p.ExitCode, await stdoutTask, await stderrTask);
         }
-        try { await p.WaitForExitAsync(ct); }
-        catch (OperationCanceledException)
+        finally
         {
-            try { p.Kill(entireProcessTree: true); } catch { }
-            throw;
+            if (firstExecScope is not null)
+                await firstExecScope.DisposeAsync();
         }
-        return new SandboxExecResult(p.ExitCode, await stdoutTask, await stderrTask);
     }
 
     public async ValueTask DisposeAsync()
@@ -945,6 +989,8 @@ internal sealed class MultipassSandbox : ISandbox
         if (_disposed) return;
         _disposed = true;
         AuditLog.SandboxDisposed(_name);
+        await using var disposeScope = await TimingScope.BeginAsync(
+            _timings, _timingItemId, _timingPhase, "vm.dispose", log: _log);
         try
         {
             using var p = Process.Start(new ProcessStartInfo

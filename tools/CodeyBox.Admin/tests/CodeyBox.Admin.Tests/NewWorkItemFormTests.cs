@@ -270,4 +270,10 @@ public sealed class CapturingApiClient : ICodeyBoxApiClient
     public Task<string?> GetAuditReportRawOutputAsync(
         string workItemId, int iteration, string auditorName, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
+
+    public Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemTimingsDto?>(null);
+
+    public Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default)
+        => Task.FromResult<AggregateTimingsDto?>(null);
 }

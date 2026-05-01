@@ -46,6 +46,8 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 | `/work-items/{id}` | Detail view: full prompt (collapsible), state, error, deps |
 | `/work-items/{id}/edit` | Edit title/prompt/agent — Queued items only |
 | `/work-items/{id}/timeline` | Audit-replay timeline — chronological log of every agent/audit event. Auto-refreshes every 5 s for in-flight items. Supports `?kind=`, `?since=`, `?iteration=` filter params. |
+| `/work-items/{id}/timings` | Per-item timing breakdown — stacked bar of phases, drill-down step table, top-10 slowest steps |
+| `/timings/aggregate` | System-wide aggregate — median and p95 per step across the last N completed work items, configurable N picker |
 
 ## In scope (v1)
 

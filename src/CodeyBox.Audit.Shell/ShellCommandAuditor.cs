@@ -34,8 +34,12 @@ public sealed class ShellCommandAuditor : IAuditor
             WorkingDirectory = workingDirectory,
         }, ct);
 
+        var combinedOutput = string.IsNullOrWhiteSpace(result.Stderr)
+            ? result.Stdout
+            : result.Stdout + "\n" + result.Stderr;
+
         if (result.Success)
-            return new AuditResult(true, [], RawOutput: result.Stdout);
+            return new AuditResult(true, [], RawOutput: combinedOutput);
 
         var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
 
@@ -57,10 +61,7 @@ public sealed class ShellCommandAuditor : IAuditor
             Severity: severity,
             Title: title,
             Description: description.TrimEnd());
-        var rawOutput = string.IsNullOrEmpty(result.Stderr)
-            ? result.Stdout
-            : result.Stderr + (string.IsNullOrEmpty(result.Stdout) ? "" : "\n" + result.Stdout);
-        return new AuditResult(false, [finding], RawOutput: rawOutput);
+        return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
 }
 
