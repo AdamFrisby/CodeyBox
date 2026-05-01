@@ -1,0 +1,122 @@
+@page "/suggestions/{Id}"
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+
+<PageTitle>Suggestion — CodeyBox Admin</PageTitle>
+
+@if (_suggestion is null && _error is null)
+{
+    <p>Loading…</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_suggestion is not null)
+{
+    <h1>@_suggestion.Title</h1>
+
+    <div class="suggestion-meta">
+        <span class="category-badge">@_suggestion.Category</span>
+        <span class="@_suggestion.SeverityCss">@_suggestion.Severity</span>
+        <span>effort: @_suggestion.EstimatedEffort</span>
+        <span>project: @_suggestion.ProjectId</span>
+        <span>from: <a href="/work-items/@_suggestion.SourceWorkItemId">@_suggestion.ShortWorkItemId</a></span>
+        <span>@_suggestion.Age ago</span>
+        <span class="state-@_suggestion.State.ToLowerInvariant()">@_suggestion.State</span>
+    </div>
+
+    <h2>Rationale</h2>
+    <pre class="suggestion-rationale">@_suggestion.Rationale</pre>
+
+    @if (_suggestion.FilesReferenced.Count > 0)
+    {
+        <h2>Files referenced</h2>
+        <ul>
+            @foreach (var f in _suggestion.FilesReferenced)
+            {
+                <li><code>@f</code></li>
+            }
+        </ul>
+    }
+
+    @if (_suggestion.PromotedToWorkItemId is not null)
+    {
+        <p>Promoted to work item <a href="/work-items/@_suggestion.PromotedToWorkItemId">@_suggestion.PromotedToWorkItemId[..8]</a></p>
+    }
+
+    @if (_suggestion.State == "open")
+    {
+        <div class="suggestion-actions">
+            <button class="btn btn-primary" @onclick="PromoteAsync">Promote to work item</button>
+            <button class="btn btn-danger" @onclick="() => _showDismissModal = true">Dismiss</button>
+        </div>
+    }
+
+    @if (_actionError is not null)
+    {
+        <p class="error-banner">@_actionError</p>
+    }
+}
+
+@* ── Dismiss modal ──────────────────────────────────────────────────────── *@
+@if (_showDismissModal)
+{
+    <div class="modal-overlay">
+        <div class="modal-box">
+            <h2>Dismiss suggestion</h2>
+            <label>
+                Reason (optional)
+                <input type="text" @bind="_dismissReason" placeholder="e.g. not on roadmap" class="modal-input" maxlength="500" />
+            </label>
+            <div class="modal-actions">
+                <button class="btn btn-danger" @onclick="DoDismissAsync">Dismiss</button>
+                <button class="btn" @onclick="() => _showDismissModal = false">Cancel</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private SuggestionDto? _suggestion;
+    private string? _error;
+    private string? _actionError;
+    private bool _showDismissModal;
+    private string _dismissReason = "";
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _suggestion = await ApiClient.GetSuggestionAsync(Id);
+            if (_suggestion is null) _error = "Suggestion not found.";
+        }
+        catch (Exception ex) { _error = ex.Message; }
+    }
+
+    private void PromoteAsync()
+    {
+        Nav.NavigateTo($"/work-items/new?fromSuggestion={Uri.EscapeDataString(Id)}");
+    }
+
+    private async Task DoDismissAsync()
+    {
+        _actionError = null;
+        try
+        {
+            var updated = await ApiClient.DismissSuggestionAsync(Id, string.IsNullOrWhiteSpace(_dismissReason) ? null : _dismissReason.Trim());
+            if (updated is not null)
+            {
+                _suggestion = updated;
+                _showDismissModal = false;
+            }
+            else
+            {
+                _actionError = "Dismiss failed.";
+            }
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+}

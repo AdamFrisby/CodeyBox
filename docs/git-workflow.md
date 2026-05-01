@@ -45,6 +45,9 @@ git config user.name  <resolved-name>
 # It edits files in /work and may or may not commit.
 
 git add -A
+# Strip suggestions file before committing — it is advisory metadata,
+# not part of the work branch history. Exit code ignored if not staged.
+git rm --cached -- .codeybox/suggestions.json
 git diff --cached --quiet && exit 1      # fail if no changes
 git commit -m "codeybox: <title>
 

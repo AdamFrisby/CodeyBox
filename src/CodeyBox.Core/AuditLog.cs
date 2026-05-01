@@ -220,6 +220,32 @@ public static class AuditLog
         Audit("queue.started_while_paused")
             .Warning("Orchestrator started with queue in Paused state; no new work items will be picked up until the queue is resumed");
 
+    // ── Suggestions ─────────────────────────────────────────────────────────
+
+    public static void SuggestionDismissed(string suggestionId, string? reason) =>
+        Audit("suggestion.dismissed")
+            .Information("Suggestion {SuggestionId} dismissed: {Reason}", suggestionId, reason?.ReplaceLineEndings(" "));
+
+    public static void SuggestionCreated(string suggestionId, string sourceWorkItemId, string projectId) =>
+        Audit("suggestion.created")
+            .Information("Suggestion {SuggestionId} created from work item {SourceWorkItemId} in project {ProjectId}",
+                suggestionId, sourceWorkItemId, projectId);
+
+    public static void SuggestionPromoted(string suggestionId, string newWorkItemId) =>
+        Audit("suggestion.promoted")
+            .Information("Suggestion {SuggestionId} promoted to work item {WorkItemId}",
+                suggestionId, newWorkItemId);
+
+    public static void SuggestionReverted(string suggestionId) =>
+        Audit("suggestion.reverted")
+            .Warning("Suggestion {SuggestionId} reverted to open after failed promotion", suggestionId);
+
+    public static void SuggestionRevertFailed(string suggestionId, Exception exception) =>
+        Audit("suggestion.revert_failed")
+            .Warning(exception,
+                "Suggestion {SuggestionId} could not be reverted to open after promotion failure; stuck in 'accepted' with no linked work item",
+                suggestionId);
+
     // ── Budget caps ──────────────────────────────────────────────────────────
 
     public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>

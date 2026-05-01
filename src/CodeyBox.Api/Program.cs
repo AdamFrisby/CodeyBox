@@ -495,6 +495,11 @@ builder.Services.AddSingleton<IWorkItemStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<ISuggestionStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteSuggestionStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IQueueController>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -551,6 +556,7 @@ var app = builder.Build();
 app.UseApiKeyAuth(anonymousPrefixes: ["/healthz"]);
 
 WorkItemEndpoints.Map(app);
+SuggestionEndpoints.Map(app);
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 

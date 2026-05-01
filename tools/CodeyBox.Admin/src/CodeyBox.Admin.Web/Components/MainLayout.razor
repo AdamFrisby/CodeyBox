@@ -1,12 +1,33 @@
 @inherits LayoutComponentBase
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<MainLayout> Logger
 
 <div class="admin-layout">
     <nav class="admin-nav">
         <span class="admin-nav-brand">CodeyBox Admin</span>
         <NavLink href="/" Match="NavLinkMatch.All">Queue</NavLink>
         <NavLink href="/work-items/new">+ New Item</NavLink>
+        <NavLink href="/suggestions">
+            Suggestions@if (_openCount > 0)
+            {
+                <span class="nav-badge">@_openCount</span>
+            }
+        </NavLink>
     </nav>
     <main class="admin-main">
         @Body
     </main>
 </div>
+
+@code {
+    private int _openCount;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _openCount = await ApiClient.GetSuggestionsCountAsync();
+        }
+        catch (Exception ex) { Logger.LogWarning(ex, "Failed to fetch open suggestion count for nav badge"); }
+    }
+}
