@@ -42,7 +42,10 @@ public sealed class LlmReviewAuditor : IAuditor
         await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", "/audit"] }, ct);
 
         var prompt = BuildPrompt(context);
-        var agentResult = await _opts.Agent.RunAsync(sandbox, workingDirectory, prompt, credential: null, modelId: null, ct);
+        // Use the per-invocation override supplied by the pipeline for cross-review,
+        // falling back to the baked-in runner from options (backwards compat).
+        var agent = context.AuditRunner ?? _opts.Agent;
+        var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, credential: null, modelId: null, ct);
 
         // The pipeline already populates SandboxSpec.Environment with the
         // agent credential (set on the container at boot), so we don't pass

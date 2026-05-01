@@ -207,6 +207,27 @@ A per-item `AgentClassId` overrides the project default.
 
 ---
 
+## Audit agent vs. agent class
+
+The agent-class router described above applies to the **work phase** (and
+rework) of a work item. The **audit phase** uses a separate resolution path
+via `Project.Audit.AuditAgent` / `Project.Audit.PerAuditorAgent` — see
+`docs/audit.md` for the full cross-review documentation.
+
+Key differences:
+
+| | Agent class (work phase) | AuditAgent (audit phase) |
+|---|---|---|
+| Configured on | `AgentClasses` catalog + `WorkItem.AgentClassId` | `Project.Audit.AuditAgent` |
+| Resolution | Quota-probe across members in preference order | Three-level: PerAuditorAgent → AuditAgent → work agent |
+| Quota events | `quota_router.probed`, `.waiting`, `.deferred` | `quota_router.audit_fallthrough` |
+| Applies to | Every phase (work, rework, merge) | LLM auditors only |
+
+Auditors are **not** class-routed — they pin to a specific agent kind, not a
+class. This is intentional: cross-review requires a known model identity (so
+operators can correlate which model reviewed which diff), whereas class-routing
+deliberately hides which member runs.
+
 ## Audit events
 
 All routing decisions are emitted as `Audit=true` events:
@@ -216,6 +237,7 @@ All routing decisions are emitted as `Audit=true` events:
 | `quota_router.probed` | After each probe call (agent, class, available %). |
 | `quota_router.waiting` | When all Subscription members are exhausted. |
 | `quota_router.deferred` | When the orchestrator schedules a deferred re-enqueue. |
+| `quota_router.audit_fallthrough` | When the audit agent's quota was low and the pipeline fell through to the work agent. |
 
 ---
 

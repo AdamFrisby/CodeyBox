@@ -179,6 +179,46 @@ failing tests. The deterministic diff-pattern auditor catches the most
 common suppression markers; the LLM reviewer catches subtler shortcuts
 by comparing the diff against the original task.
 
+### Cross-agent review (`AuditAgent` / `PerAuditorAgent`)
+
+By default, LLM auditors run with the same agent as the work phase. To
+diversify signal, configure a different model for the audit phase:
+
+```json
+"Audit": {
+  "AuditAgent": "gemini",
+  "AuditTypes": ["security", "architecture", "completeness"]
+}
+```
+
+For per-auditor control (e.g. security on Claude, completeness on Gemini):
+
+```json
+"Audit": {
+  "AuditAgent": "gemini",
+  "PerAuditorAgent": {
+    "security:llm-review": "claude"
+  }
+}
+```
+
+**Resolution order** (per LLM auditor):
+1. `PerAuditorAgent[<auditor name>]` if present.
+2. Else `AuditAgent` if set.
+3. Else the work agent (backwards-compatible default).
+
+**Requirements:**
+- The audit agent must be registered (`IAgentRegistry`).
+- Its credentials must be available (e.g. `CODEYBOX_GEMINI_API_KEY` set).
+  If either is missing, the pipeline logs a warning and falls back to the
+  work agent — no crash, no failed work items.
+
+Tool auditors (`security:gitleaks`, `csharp:build-WaE`, etc.) are never
+affected by these settings — they do not invoke an LLM.
+
+See [`docs/audit.md`](audit.md) for the full cross-review documentation
+including trade-offs, observability events, and quota fallthrough behaviour.
+
 ### Stuck-agent detection
 
 ```json

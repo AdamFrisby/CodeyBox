@@ -242,6 +242,92 @@ re-queue the work item with a clearer prompt or merge by hand.
 4. The `AuditorRegistry` picks it up automatically; no orchestrator
    changes needed.
 
+## Cross-agent review
+
+By default, LLM auditors run with the same agent as the work phase (e.g.
+Claude reviews Claude's own output). Same training → same blind spots → the
+audit finds what the same model would have found while writing. To break this
+correlation, configure a different agent for the audit phase.
+
+### Configuration
+
+```json
+{
+  "CodeyBox": {
+    "Projects": [
+      {
+        "Id": "my-app",
+        "Agent": "claude",
+        "Audit": {
+          "AuditAgent": "gemini",
+          "AuditTypes": ["security", "architecture", "completeness"]
+        }
+      }
+    ]
+  }
+}
+```
+
+`AuditAgent` applies to all LLM-based auditors (`security:llm-review`,
+`architecture`, `completeness:llm-review`, `cheating:llm-review`, etc.).
+Tool auditors (`csharp:build-WaE`, `security:gitleaks`, `security:semgrep`,
+`cheating:suppression-patterns`) do not invoke an LLM and are unaffected.
+
+For finer control, use `PerAuditorAgent` to route individual auditors to
+specific agents:
+
+```json
+"Audit": {
+  "AuditAgent": "gemini",
+  "PerAuditorAgent": {
+    "security:llm-review": "claude"
+  },
+  "AuditTypes": ["security", "completeness"]
+}
+```
+
+Resolution precedence (per LLM auditor):
+1. `PerAuditorAgent[<auditor name>]` if present.
+2. Else `AuditAgent` if set.
+3. Else the work agent (current behaviour; backwards compat).
+
+### Trade-offs
+
+| Benefit | Cost |
+|---------|------|
+| Uncorrelated signal — two models with different priors reviewing the same diff | Second set of API credentials to manage |
+| Security review on a more conservative model; architecture on a broader-context model | 2× (or more) quota draw for audit iterations |
+| Different LLM prompt styles surface different classes of issues | More work-item latency if the audit agent is slow |
+
+### Fallback behaviour
+
+The pipeline falls back to the work agent (with a warning log) when:
+- The configured audit agent is not registered in `IAgentRegistry`.
+- The credential provider returns `null` for the audit agent (e.g. the
+  `CODEYBOX_GEMINI_API_KEY` env var is unset).
+- The audit agent's quota probe reports available% below the configured
+  minimum threshold — see `docs/agent-classes.md`.
+
+Fallback never crashes the pipeline: work items complete normally using the
+work agent for both phases. The `audit.cross_review_active` audit-tier event
+is NOT emitted when fallback occurs; `quota_router.audit_fallthrough` IS
+emitted so operators can observe when the correlation-breaking benefit was
+lost for an iteration.
+
+### Observability
+
+| Event | When emitted |
+|-------|--------------|
+| `auditor.run` | After each auditor. Now includes `agentKind` property. |
+| `audit.cross_review_active` | Once per iteration when at least one LLM auditor actually ran with a different agent (post-fallback). |
+| `quota_router.audit_fallthrough` | Once per auditor when quota triggered fallthrough. |
+
+The `work_item.audit_iteration` webhook event (see `docs/webhooks.md`)
+gains an optional `auditAgentKind` field in its `details` object:
+- Set to the audit agent kind string (e.g. `"gemini"`) when cross-review
+  is active for that iteration.
+- `null` when all auditors used the work agent.
+
 ## Security notes
 
 The audit phase widens the attack surface in two ways:

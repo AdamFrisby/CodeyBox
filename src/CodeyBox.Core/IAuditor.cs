@@ -47,7 +47,15 @@ public sealed record AuditContext(
     string WorkBranch,
     string BaseBranch,
     int Iteration,
-    string OriginalPrompt);
+    string OriginalPrompt,
+    /// <summary>
+    /// The resolved agent runner for this auditor invocation. Set by the
+    /// pipeline when a cross-review agent override is in effect; null when
+    /// the auditor should use its own configured default. <see
+    /// cref="LlmReviewAuditor"/> reads this to use the override instead of
+    /// its baked-in runner. Tool auditors ignore it.
+    /// </summary>
+    IAgentRunner? AuditRunner = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(bool Passed, IReadOnlyList<AuditFinding> Findings);
