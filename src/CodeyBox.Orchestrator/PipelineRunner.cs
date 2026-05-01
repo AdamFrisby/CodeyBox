@@ -45,6 +45,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly PipelineOptions _opts;
     private readonly ILogger<PipelineRunner> _log;
     private readonly CredentialSmokeGate? _smokeGate;
+    private readonly ISuggestionStore? _suggestions;
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -77,7 +78,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IWebhookDispatcher webhooks,
         PipelineOptions opts,
         ILogger<PipelineRunner> log,
-        CredentialSmokeGate? smokeGate = null)
+        CredentialSmokeGate? smokeGate = null,
+        ISuggestionStore? suggestions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -92,6 +94,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _opts = opts;
         _log = log;
         _smokeGate = smokeGate;
+        _suggestions = suggestions;
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct)
@@ -396,6 +399,24 @@ public sealed class PipelineRunner : IPipelineRunner
         // agent already committed (per the rework prompt's instruction
         // to make new commits), `git add -A` is a no-op.
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+
+        // Read the suggestions file BEFORE stripping it from the staged tree
+        // so we capture it even when the agent staged it alongside real changes.
+        // Only the work phase (isInitial) emits suggestions; rework does not.
+        string? suggestionsJson = null;
+        if (isInitial)
+            suggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
+
+        // Strip suggestions.json from the staged tree so it is never committed
+        // to the work branch, regardless of whether the agent staged it.
+        // Use separate argv so ProcessSandbox translates the -C path correctly.
+        // Ignore the exit code: git rm --cached exits 128 when the file is not tracked.
+        await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
+                ".codeybox/suggestions.json"],
+        }, ct);
+
         var staged = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
@@ -429,6 +450,10 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
+
+        // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
+        if (isInitial && suggestionsJson is not null)
+            await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
     }
 
     // Returns a 2 KB tail of agent output for inclusion in audit log events.
@@ -621,9 +646,22 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!agentResult.Success)
             throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
 
+        // Read suggestions.json before cleaning the working tree, then remove it
+        // so VerifyMergeStateAsync's `git status --porcelain` check sees a clean tree.
+        // Use separate argv so ProcessSandbox translates the path correctly.
+        var mergeSuggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
+        await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["rm", "-f", $"{SandboxConventions.WorkDir}/.codeybox/suggestions.json"],
+        }, ct);
+
         var mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
 
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{baseBranch}:{baseBranch}");
+
+        if (mergeSuggestionsJson is not null)
+            await PickUpSuggestionsAsync(item, project, mergeSuggestionsJson, ct);
+
         return (mergeSha, agentResult.Stdout);
     }
 
@@ -1092,6 +1130,83 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItemState.Cancelled => "work_item.cancelled",
         _ => $"work_item.{state.ToString().ToLowerInvariant()}",
     };
+
+    // ── Suggestion pickup ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Tries to read <c>.codeybox/suggestions.json</c> from the sandbox working
+    /// directory. Returns the raw content string when the file exists and is
+    /// within the 256 KB size limit; null otherwise.
+    /// </summary>
+    private async Task<string?> TryReadSuggestionsFileAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        const int MaxBytes = 256 * 1024;
+        const string SuggestionsPath = SandboxConventions.WorkDir + "/.codeybox/suggestions.json";
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["cat", SuggestionsPath],
+        }, ct);
+
+        if (!result.Success) return null;
+
+        if (result.Stdout.Length > MaxBytes)
+        {
+            _log.LogWarning("suggestions.json exceeds 256 KB ({Bytes} bytes); skipping", result.Stdout.Length);
+            return null;
+        }
+
+        return result.Stdout;
+    }
+
+    /// <summary>
+    /// Parses raw suggestions JSON, persists valid entries, and fires one
+    /// <c>work_item.suggestion</c> webhook per suggestion.
+    /// </summary>
+    private async Task PickUpSuggestionsAsync(
+        WorkItem item, Project project, string rawJson, CancellationToken ct)
+    {
+        if (_suggestions is null) return;
+
+        var entries = SuggestionsFileParser.Parse(rawJson, _log);
+        if (entries.Count == 0) return;
+
+        foreach (var entry in entries)
+        {
+            var suggestion = new Suggestion
+            {
+                Id = Guid.NewGuid().ToString(),
+                SourceWorkItemId = item.Id.ToString(),
+                ProjectId = item.ProjectId.Value,
+                Title = entry.Title,
+                Rationale = entry.Rationale,
+                Category = entry.Category,
+                Severity = entry.Severity,
+                EstimatedEffort = entry.EstimatedEffort,
+                FilesReferenced = entry.FilesReferenced,
+                CreatedAt = DateTimeOffset.UtcNow,
+            };
+
+            await _suggestions.CreateAsync(suggestion, ct);
+            _log.LogInformation(
+                "Suggestion {SuggestionId} persisted from work item {WorkItemId}: {Title}",
+                suggestion.Id, item.Id, suggestion.Title);
+
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.suggestion",
+                WorkItem = item,
+                Project = project,
+                Details = new SuggestionWebhookDetails(
+                    suggestion.Id,
+                    suggestion.Title,
+                    suggestion.Category,
+                    suggestion.Severity,
+                    suggestion.EstimatedEffort,
+                    suggestion.FilesReferenced),
+            }, CancellationToken.None);
+        }
+    }
 }
 
 internal sealed class AuditFailedException : Exception
@@ -1104,6 +1219,14 @@ internal sealed record AuditIterationDetails(
     int TotalIterations,
     int BlockingFindings,
     int NonBlockingFindings);
+
+internal sealed record SuggestionWebhookDetails(
+    string Id,
+    string Title,
+    string Category,
+    string Severity,
+    string EstimatedEffort,
+    IReadOnlyList<string> FilesReferenced);
 
 public sealed record PipelineOptions
 {

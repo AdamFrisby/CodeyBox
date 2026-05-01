@@ -417,4 +417,21 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         string id, string? kind = null, string? since = null, int? iteration = null,
         CancellationToken ct = default)
         => Task.FromResult(TimelineOverride);
+
+    public List<SuggestionDto> SuggestionsOverride { get; set; } = [];
+
+    public Task<List<SuggestionDto>> GetSuggestionsAsync(
+        string? projectId = null, string? category = null, string? severity = null,
+        CancellationToken ct = default)
+        => Task.FromResult(SuggestionsOverride);
+
+    public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(SuggestionsOverride.FirstOrDefault(s => s.Id == id));
+
+    public Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null,
+        CancellationToken ct = default)
+        => Task.FromResult<SuggestionDto?>(null);
+
+    public Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(true);
 }

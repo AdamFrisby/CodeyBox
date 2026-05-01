@@ -29,6 +29,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
+| `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -175,6 +176,41 @@ item and its project:
 Subscribe to `budget.deferred` to alert when a project is consistently
 throttled — it may indicate the budget caps need adjustment or the project's
 work-item generation rate is unexpectedly high.
+
+### `suggestion` details
+
+When `event` is `work_item.suggestion`, the `details` field carries the
+suggestion metadata. **`rationale` is excluded from the payload** to keep
+webhook bodies small; retrieve it via `GET /suggestions/{id}` if needed.
+
+```json
+{
+  "details": {
+    "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "title": "Add unit tests for the parser",
+    "category": "test-coverage",
+    "severity": "notable",
+    "estimatedEffort": "medium",
+    "filesReferenced": ["src/parser.ts"]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Suggestion ID — use with `GET /suggestions/{id}` to fetch full details |
+| `title` | string | Short human-readable label (≤ 120 chars) |
+| `category` | string | One of `test-coverage`, `refactor`, `dead-code`, `security`, `dependency`, `docs`, `other` |
+| `severity` | string | One of `minor`, `notable`, `important` |
+| `estimatedEffort` | string | One of `tiny`, `small`, `medium`, `large` |
+| `filesReferenced` | string[] | File paths the agent considered relevant (may be empty) |
+
+One event fires **per suggestion entry**, not per file. A suggestions.json with
+three entries produces three separate `work_item.suggestion` events. All three
+carry the same `workItem` and `project` context.
+
+See [`suggestions.md`](suggestions.md) for the full agent contract and operator
+workflow.
 
 ### `agent_smoke_failed` details
 

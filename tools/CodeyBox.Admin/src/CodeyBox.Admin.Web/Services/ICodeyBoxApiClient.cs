@@ -30,6 +30,14 @@ public interface ICodeyBoxApiClient
     Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
         string id, string? kind = null, string? since = null, int? iteration = null,
         CancellationToken ct = default);
+
+    // ── Suggestions ───────────────────────────────────────────────────────────
+    Task<List<SuggestionDto>> GetSuggestionsAsync(
+        string? projectId = null, string? category = null, string? severity = null,
+        CancellationToken ct = default);
+    Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default);
+    Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null, CancellationToken ct = default);
+    Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default);
 }
 
 /// <summary>Request body for PATCH /workitems/{id}.</summary>

@@ -137,4 +137,43 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
             parts.Add($"iteration={i}");
         return parts.Count > 0 ? "?" + string.Join("&", parts) : "";
     }
+
+    public async Task<List<SuggestionDto>> GetSuggestionsAsync(
+        string? projectId = null, string? category = null, string? severity = null,
+        CancellationToken ct = default)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(projectId)) parts.Add($"project={Uri.EscapeDataString(projectId)}");
+        if (!string.IsNullOrWhiteSpace(category)) parts.Add($"category={Uri.EscapeDataString(category)}");
+        if (!string.IsNullOrWhiteSpace(severity)) parts.Add($"severity={Uri.EscapeDataString(severity)}");
+        var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
+        var result = await _http.GetFromJsonAsync<List<SuggestionDto>>($"/suggestions{qs}", JsonOptions, ct);
+        return result ?? [];
+    }
+
+    public async Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/suggestions/{Uri.EscapeDataString(id)}", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<SuggestionDto>(JsonOptions, ct);
+    }
+
+    public async Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null,
+        CancellationToken ct = default)
+    {
+        var body = new { state = "dismissed", dismissReason = reason };
+        using var content = JsonContent.Create(body, options: JsonOptions);
+        var resp = await _http.PatchAsync($"/suggestions/{Uri.EscapeDataString(id)}", content, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<SuggestionDto>(JsonOptions, ct);
+    }
+
+    public async Task<bool> PromoteSuggestionAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/suggestions/{Uri.EscapeDataString(id)}/promote",
+            new { }, JsonOptions, ct);
+        return resp.IsSuccessStatusCode;
+    }
 }

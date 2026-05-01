@@ -1,0 +1,148 @@
+@page "/suggestions"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+
+<PageTitle>Suggestions — CodeyBox Admin</PageTitle>
+
+<h1>Suggestions</h1>
+
+@* ── Filters ─────────────────────────────────────────────────────────────── *@
+<div class="suggestion-filters">
+    <label>
+        Category
+        <select @bind="_filterCategory" @bind:after="LoadAsync">
+            <option value="">All</option>
+            <option value="test-coverage">test-coverage</option>
+            <option value="refactor">refactor</option>
+            <option value="dead-code">dead-code</option>
+            <option value="security">security</option>
+            <option value="dependency">dependency</option>
+            <option value="docs">docs</option>
+            <option value="other">other</option>
+        </select>
+    </label>
+    <label>
+        Severity
+        <select @bind="_filterSeverity" @bind:after="LoadAsync">
+            <option value="">All</option>
+            <option value="important">important</option>
+            <option value="notable">notable</option>
+            <option value="minor">minor</option>
+        </select>
+    </label>
+</div>
+
+@if (_error is not null)
+{
+    <p class="error-banner">Error loading suggestions: @_error</p>
+}
+
+@if (_suggestions is null)
+{
+    <p>Loading…</p>
+}
+else if (_suggestions.Count == 0)
+{
+    <p>No open suggestions.</p>
+}
+else
+{
+    @if (_selected.Count > 0)
+    {
+        <div class="bulk-actions">
+            <span>@_selected.Count selected</span>
+            <button class="btn btn-danger" @onclick="BulkDismissAsync">Dismiss selected</button>
+            <button class="btn" @onclick="() => _selected.Clear()">Clear selection</button>
+        </div>
+    }
+
+    <table class="queue-table">
+        <thead>
+            <tr>
+                <th><input type="checkbox" @onchange="ToggleAll" /></th>
+                <th>Title</th>
+                <th>Category</th>
+                <th>Severity</th>
+                <th>Source item</th>
+                <th>Age</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var s in _suggestions)
+            {
+                <tr>
+                    <td><input type="checkbox" checked="@_selected.Contains(s.Id)"
+                               @onchange="e => ToggleItem(s.Id, (bool)e.Value!)" /></td>
+                    <td><a href="/suggestions/@s.Id">@s.Title</a></td>
+                    <td><span class="category-badge">@s.Category</span></td>
+                    <td><span class="@s.SeverityCss">@s.Severity</span></td>
+                    <td><a href="/work-items/@s.SourceWorkItemId">@s.ShortWorkItemId</a></td>
+                    <td class="col-age">@s.Age</td>
+                    <td class="col-actions">
+                        <a href="/suggestions/@s.Id" class="btn">view</a>
+                        <button class="btn btn-danger" @onclick="() => DismissOneAsync(s.Id)">dismiss</button>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private List<SuggestionDto>? _suggestions;
+    private string? _error;
+    private string? _filterCategory;
+    private string? _filterSeverity;
+    private HashSet<string> _selected = [];
+    private CancellationTokenSource? _cts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            _suggestions = await ApiClient.GetSuggestionsAsync(
+                category: string.IsNullOrEmpty(_filterCategory) ? null : _filterCategory,
+                severity: string.IsNullOrEmpty(_filterSeverity) ? null : _filterSeverity);
+            _error = null;
+        }
+        catch (Exception ex) { _error = ex.Message; }
+    }
+
+    private async Task DismissOneAsync(string id)
+    {
+        await ApiClient.DismissSuggestionAsync(id);
+        await LoadAsync();
+    }
+
+    private async Task BulkDismissAsync()
+    {
+        foreach (var id in _selected.ToList())
+            await ApiClient.DismissSuggestionAsync(id);
+        _selected.Clear();
+        await LoadAsync();
+    }
+
+    private void ToggleAll(ChangeEventArgs e)
+    {
+        if ((bool)e.Value!)
+            _selected = [.. _suggestions?.Select(s => s.Id) ?? []];
+        else
+            _selected.Clear();
+    }
+
+    private void ToggleItem(string id, bool selected)
+    {
+        if (selected) _selected.Add(id);
+        else _selected.Remove(id);
+    }
+
+    public void Dispose() => _cts?.Cancel();
+}

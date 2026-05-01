@@ -220,6 +220,17 @@ public static class AuditLog
         Audit("queue.started_while_paused")
             .Warning("Orchestrator started with queue in Paused state; no new work items will be picked up until the queue is resumed");
 
+    // ── Suggestions ─────────────────────────────────────────────────────────
+
+    public static void SuggestionDismissed(string suggestionId, string? reason) =>
+        Audit("suggestion.dismissed")
+            .Information("Suggestion {SuggestionId} dismissed: {Reason}", suggestionId, reason);
+
+    public static void SuggestionPromoted(string suggestionId, string newWorkItemId) =>
+        Audit("suggestion.promoted")
+            .Information("Suggestion {SuggestionId} promoted to work item {WorkItemId}",
+                suggestionId, newWorkItemId);
+
     // ── Budget caps ──────────────────────────────────────────────────────────
 
     public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>
