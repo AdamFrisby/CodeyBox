@@ -126,7 +126,7 @@ when `--output-format stream-json` is not used:
 Input: 1,234 tokens, Output: 567 tokens
 ```
 
-The fallback does not capture cached token counts.
+The fallback captures cached token counts when the output includes the "N cached tokens" pattern.
 
 ### Codex (`CodexCostExtractor`)
 

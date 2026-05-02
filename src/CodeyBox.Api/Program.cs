@@ -587,7 +587,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetServices<IAgentQuotaProbe>(),
     sp.GetService<QuotaRouterOptions>(),
     sp.GetRequiredService<IAuditReportStore>(),
-    sp.GetRequiredService<ITimingStore>(),
+    null,
     sp.GetRequiredService<IWorkItemCostStore>(),
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(),
     sp.GetRequiredService<AgentCostCalculator>()));

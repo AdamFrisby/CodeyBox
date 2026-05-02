@@ -88,7 +88,9 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var costStore = new RecordingCostStore();
-        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore);
+        // Configure a tool-only auditor (no AgentCredentials) that always passes.
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore,
+            auditors: [new PassingToolAuditor()], maxAuditIterations: 1);
 
         tp.Agent.WorkPlan.Enqueue(new FileWrite("audit-tool.txt", "a\n"));
 
@@ -96,10 +98,30 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        // Only work and merge phases produce cost rows from the fake extractor.
-        // Tool auditors (no agent invocation) must not produce cost rows.
+        // Tool auditors (AuditCapabilities.None, no LLM) must not produce cost rows.
         var auditRows = costStore.Recorded.Where(r => r.Phase == "audit").ToList();
         Assert.Empty(auditRows);
+    }
+
+    [Fact]
+    public async Task ReworkPhase_WritesReworkCostRow()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        // Auditor that fails on iteration 1, passes on iteration 2 → triggers one rework.
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore,
+            auditors: [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("cost-rework-work.txt", "work\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("cost-rework-rework.txt", "rework\n"));
+
+        var item = NewItem("feature/cost-rework");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var reworkRows = costStore.Recorded.Where(r => r.Phase == "rework").ToList();
+        Assert.Single(reworkRows);
+        Assert.Equal(1, reworkRows[0].Iteration);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -122,7 +144,9 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         string workspace,
         string seedRepoUrl,
         RecordingCostStore costStore,
-        bool registerExtractor = true)
+        bool registerExtractor = true,
+        IReadOnlyList<IAuditor>? auditors = null,
+        int maxAuditIterations = 1)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -136,6 +160,9 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
         var registry = new AgentRegistry([agent]);
 
+        var auditorList = auditors ?? [];
+        var auditTypes = auditorList.Count > 0 ? new[] { "scripted" } : Array.Empty<string>();
+
         var projects = new InMemoryProjectRepository(new Project
         {
             Id = new ProjectId("test-project"),
@@ -143,10 +170,10 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             RepositoryUrl = seedRepoUrl,
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Claude,
-            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+            Audit = new ProjectAudit { MaxIterations = maxAuditIterations, AuditTypes = auditTypes },
         });
 
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var upstreamFactory = new TestUpstreamFactory();
         var calculator = new AgentCostCalculator(new AgentPricingOptions());
 
@@ -170,6 +197,36 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             costCalculator: calculator);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
+    }
+
+    // ── Scripted auditors ─────────────────────────────────────────────────────
+
+    private sealed class PassingToolAuditor : IAuditor
+    {
+        public string Name => "passing-tool";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
+            => Task.FromResult(new AuditResult(true, []));
+    }
+
+    private sealed class OnceFailingAuditor : IAuditor
+    {
+        private int _callCount;
+        public string Name => "once-failing";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
+        {
+            _callCount++;
+            if (_callCount == 1)
+                return Task.FromResult(new AuditResult(false, [
+                    new AuditFinding("once-failing", AuditSeverity.Error, "Test failure", "First audit always fails"),
+                ]));
+            return Task.FromResult(new AuditResult(true, []));
+        }
     }
 
     // ── Fake extractor ────────────────────────────────────────────────────────

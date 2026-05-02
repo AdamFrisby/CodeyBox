@@ -130,7 +130,7 @@ public sealed class AgentCostCalculator
             var hasRates = opts.Rates.ContainsKey(key) || opts.DefaultRates.ContainsKey(key);
             if (!hasRates && BuiltInFallbacks.ContainsKey(key))
             {
-                log.LogInformation(
+                log.LogWarning(
                     "AgentPricing: no config for agent '{Agent}'; using built-in fallback rates", key);
             }
             else if (!hasRates)

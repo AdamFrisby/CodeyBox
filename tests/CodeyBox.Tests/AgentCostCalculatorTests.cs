@@ -94,9 +94,24 @@ public sealed class AgentCostCalculatorTests
     }
 
     [Fact]
+    public void NegativeDefaultRatesInConfig_ValidateAtStartupThrows()
+    {
+        var opts = new AgentPricingOptions
+        {
+            DefaultRates = new()
+            {
+                ["gemini"] = new() { InputPerMillion = 0, CachedInputPerMillion = 0, OutputPerMillion = -1.0 }
+            }
+        };
+
+        Assert.Throws<InvalidOperationException>(() =>
+            AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Gemini], NullLogger.Instance));
+    }
+
+    [Fact]
     public void MissingPricing_ValidateAtStartupDoesNotThrow()
     {
-        // Gemini has no registered pricing; built-in fallback exists so only LogInformation is emitted.
+        // Gemini has no registered pricing; built-in fallback exists so only a Warning is emitted.
         // Should not throw.
         var opts = new AgentPricingOptions();
 

@@ -188,7 +188,13 @@ public sealed class CostsApiFactory : WebApplicationFactory<Program>
             services.RemoveAll<IWorkItemCostStore>();
             services.AddSingleton<IWorkItemCostStore>(CostStore);
             services.RemoveAll<IProjectRepository>();
-            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository());
+            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
+                new Project
+                {
+                    Id = new ProjectId("proj-costs-test"),
+                    DisplayName = "Cost Test Project",
+                    RepositoryUrl = "https://example.com/test",
+                }));
         });
     }
 

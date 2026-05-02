@@ -110,7 +110,8 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
                     && root.TryGetProperty("message", out var msg)
                     && msg.TryGetProperty("model", out var m))
                 {
-                    modelId = m.GetString();
+                    var raw = m.GetString();
+                    modelId = raw is { Length: > 128 } ? raw[..128] : raw;
                 }
             }
             catch (JsonException) { }
@@ -200,14 +201,8 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
     {
         if (string.IsNullOrWhiteSpace(text)) return null;
 
-        // Try to find a JSON object with a usage field anywhere in the output.
-        var start = text.IndexOf("{\"usage\"", StringComparison.Ordinal);
-        if (start < 0) start = text.IndexOf("\"usage\"", StringComparison.Ordinal);
-        if (start < 0) return null;
-
-        // Walk back to find the opening brace of the containing object.
-        var objStart = start > 0 && text[start] != '{' ? text.LastIndexOf('{', start) : start;
-        if (objStart < 0) objStart = start;
+        // Quick check: skip the expensive line scan if there's no "usage" token at all.
+        if (text.IndexOf("usage", StringComparison.OrdinalIgnoreCase) < 0) return null;
 
         foreach (var line in text.Split('\n',
             StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -248,7 +243,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         if (usage.TryGetProperty("completion_tokens", out var ct) && ct.TryGetInt32(out var ctv)) output = ctv;
         else if (usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv)) output = otv;
 
-        if (root.TryGetProperty("model", out var m)) modelId = m.GetString();
+        if (root.TryGetProperty("model", out var m)) { var raw = m.GetString(); modelId = raw is { Length: > 128 } ? raw[..128] : raw; }
 
         if (input == 0 && output == 0) return null;
         return new AgentCostSnapshot(input, 0, output, modelId);
@@ -341,7 +336,8 @@ public sealed class GeminiCostExtractor : IAgentCostExtractor
                 {
                     var output = root.TryGetProperty("candidatesTokenCount", out var ctc) && ctc.TryGetInt32(out var ov)
                         ? ov : 0;
-                    string? model = root.TryGetProperty("model", out var m) ? m.GetString() : null;
+                    string? raw = root.TryGetProperty("model", out var m) ? m.GetString() : null;
+                    string? model = raw is { Length: > 128 } ? raw[..128] : raw;
                     return new AgentCostSnapshot(input, 0, output, model);
                 }
             }

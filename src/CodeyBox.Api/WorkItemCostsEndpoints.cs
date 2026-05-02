@@ -53,9 +53,9 @@ internal static class WorkItemCostsEndpoints
 
     private static object BuildCostsDto(string workItemId, IReadOnlyList<WorkItemCost> rows)
     {
-        var totalInput = rows.Sum(r => r.InputTokens);
-        var totalCached = rows.Sum(r => r.CachedInputTokens);
-        var totalOutput = rows.Sum(r => r.OutputTokens);
+        var totalInput = rows.Sum(r => (long)r.InputTokens);
+        var totalCached = rows.Sum(r => (long)r.CachedInputTokens);
+        var totalOutput = rows.Sum(r => (long)r.OutputTokens);
         var totalUsd = rows.Sum(r => r.EstimatedUsd);
 
         // byPhase breakdown
@@ -71,17 +71,17 @@ internal static class WorkItemCostsEndpoints
                         .Select(ig => new
                         {
                             iteration = ig.Key,
-                            inputTokens = ig.Sum(r => r.InputTokens),
-                            cachedInputTokens = ig.Sum(r => r.CachedInputTokens),
-                            outputTokens = ig.Sum(r => r.OutputTokens),
+                            inputTokens = ig.Sum(r => (long)r.InputTokens),
+                            cachedInputTokens = ig.Sum(r => (long)r.CachedInputTokens),
+                            outputTokens = ig.Sum(r => (long)r.OutputTokens),
                             estimatedUsd = ig.Sum(r => r.EstimatedUsd),
                         })
                         .ToList();
                     return (object)new
                     {
-                        inputTokens = g.Sum(r => r.InputTokens),
-                        cachedInputTokens = g.Sum(r => r.CachedInputTokens),
-                        outputTokens = g.Sum(r => r.OutputTokens),
+                        inputTokens = g.Sum(r => (long)r.InputTokens),
+                        cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
+                        outputTokens = g.Sum(r => (long)r.OutputTokens),
                         estimatedUsd = g.Sum(r => r.EstimatedUsd),
                         byIteration = byIter,
                     };
@@ -94,9 +94,9 @@ internal static class WorkItemCostsEndpoints
             {
                 agent = g.Key.AgentKind,
                 modelId = g.Key.ModelId,
-                inputTokens = g.Sum(r => r.InputTokens),
-                cachedInputTokens = g.Sum(r => r.CachedInputTokens),
-                outputTokens = g.Sum(r => r.OutputTokens),
+                inputTokens = g.Sum(r => (long)r.InputTokens),
+                cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
+                outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
             })
             .OrderByDescending(x => x.estimatedUsd)
@@ -123,9 +123,9 @@ internal static class WorkItemCostsEndpoints
         DateTimeOffset to,
         IReadOnlyList<WorkItemCost> rows)
     {
-        var totalInput = rows.Sum(r => r.InputTokens);
-        var totalCached = rows.Sum(r => r.CachedInputTokens);
-        var totalOutput = rows.Sum(r => r.OutputTokens);
+        var totalInput = rows.Sum(r => (long)r.InputTokens);
+        var totalCached = rows.Sum(r => (long)r.CachedInputTokens);
+        var totalOutput = rows.Sum(r => (long)r.OutputTokens);
         var totalUsd = rows.Sum(r => r.EstimatedUsd);
 
         var byAgent = rows
@@ -134,9 +134,9 @@ internal static class WorkItemCostsEndpoints
             {
                 agent = g.Key.AgentKind,
                 modelId = g.Key.ModelId,
-                inputTokens = g.Sum(r => r.InputTokens),
-                cachedInputTokens = g.Sum(r => r.CachedInputTokens),
-                outputTokens = g.Sum(r => r.OutputTokens),
+                inputTokens = g.Sum(r => (long)r.InputTokens),
+                cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
+                outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
             })
             .OrderByDescending(x => x.estimatedUsd)
@@ -148,9 +148,9 @@ internal static class WorkItemCostsEndpoints
             .Select(g => new
             {
                 workItemId = g.Key,
-                inputTokens = g.Sum(r => r.InputTokens),
-                cachedInputTokens = g.Sum(r => r.CachedInputTokens),
-                outputTokens = g.Sum(r => r.OutputTokens),
+                inputTokens = g.Sum(r => (long)r.InputTokens),
+                cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
+                outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
             })
             .ToList();

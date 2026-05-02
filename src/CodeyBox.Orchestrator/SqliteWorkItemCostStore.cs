@@ -112,30 +112,27 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
 
     public async Task<IReadOnlyList<WorkItemCost>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
-        try
-        {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                SELECT id, work_item_id, phase, iteration, agent_kind, model_id,
-                       input_tokens, cached_input_tokens, output_tokens,
-                       estimated_usd, started_at, ended_at, raw_metadata_json
-                FROM work_item_costs
-                WHERE work_item_id = $wi
-                ORDER BY started_at
-                """;
-            cmd.Parameters.AddWithValue("$wi", workItemId);
+        // Read-only query: open a separate read connection to avoid holding the write lock
+        // during what could be a multi-row scan.
+        using var readConn = new SqliteConnection($"Data Source={_path};Mode=ReadOnly");
+        readConn.Open();
 
-            var results = new List<WorkItemCost>();
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-                results.Add(ReadRow(reader));
-            return results;
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+        using var cmd = readConn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, work_item_id, phase, iteration, agent_kind, model_id,
+                   input_tokens, cached_input_tokens, output_tokens,
+                   estimated_usd, started_at, ended_at, raw_metadata_json
+            FROM work_item_costs
+            WHERE work_item_id = $wi
+            ORDER BY started_at
+            """;
+        cmd.Parameters.AddWithValue("$wi", workItemId);
+
+        var results = new List<WorkItemCost>();
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            results.Add(ReadRow(reader));
+        return results;
     }
 
     public async Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
