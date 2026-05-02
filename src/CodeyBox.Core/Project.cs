@@ -180,7 +180,50 @@ public sealed record ProjectUpstream
     /// </summary>
     public string? PullRequestTitleTemplate { get; init; }
 
+    /// <summary>
+    /// LLM-generated PR description settings. When <see cref="ProjectPrDescription.SandboxImageReference"/>
+    /// is empty the generator is skipped and the static template is used.
+    /// </summary>
+    public ProjectPrDescription PrDescription { get; init; } = new();
+
     public static ProjectUpstream Noop { get; } = new();
+}
+
+/// <summary>
+/// Per-project LLM-generated PR description configuration.
+/// See <c>docs/upstream.md</c> for configuration guidance.
+/// </summary>
+public sealed record ProjectPrDescription
+{
+    /// <summary>When false the generator is skipped entirely. Default: true.</summary>
+    public bool Enabled { get; init; } = true;
+
+    /// <summary>Agent kind for generation, e.g. "claude". Default: "claude".</summary>
+    public string GeneratorAgent { get; init; } = "claude";
+
+    /// <summary>Optional model override forwarded to the agent runner.</summary>
+    public string? GeneratorModelId { get; init; }
+
+    /// <summary>
+    /// Max UTF-8 byte size of the diff sent to the LLM. Diffs larger than this are
+    /// truncated from the middle. Default: 32 768 bytes (32 KB).
+    /// </summary>
+    public int MaxDiffBytes { get; init; } = 32_768;
+
+    /// <summary>
+    /// Hard deadline for the generation round-trip. On expiry the static template
+    /// is used. Default: 30 seconds.
+    /// </summary>
+    public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Container / VM image reference for the generator sandbox. Must have the
+    /// configured agent CLI installed. When empty the generator is disabled.
+    /// </summary>
+    public string SandboxImageReference { get; init; } = string.Empty;
+
+    /// <summary>Hosts reachable from the generator sandbox. Default: Anthropic API.</summary>
+    public IReadOnlyList<string> AgentAllowedHosts { get; init; } = ["api.anthropic.com"];
 }
 
 /// <summary>

@@ -21,16 +21,28 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GitHubUpstreamRemote> _githubLog;
     private readonly ITimingStore? _timings;
+    private readonly ISandboxProvider _sandboxes;
+    private readonly IAgentRegistry _agents;
+    private readonly ICredentialProvider _credentials;
+    private readonly ILogger<LlmPullRequestDescriptionGenerator> _generatorLog;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
         IHttpClientFactory httpClientFactory,
         ILogger<GitHubUpstreamRemote> githubLog,
+        ISandboxProvider sandboxes,
+        IAgentRegistry agents,
+        ICredentialProvider credentials,
+        ILogger<LlmPullRequestDescriptionGenerator> generatorLog,
         ITimingStore? timings = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
         _githubLog = githubLog;
+        _sandboxes = sandboxes;
+        _agents = agents;
+        _credentials = credentials;
+        _generatorLog = generatorLog;
         _timings = timings;
     }
 
@@ -49,7 +61,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
                 MergeMethod = ValidateMergeMethod(project.Id, u.MergeMethod),
                 AutoMerge = u.AutoMerge,
                 PullRequestTitleTemplate = u.PullRequestTitleTemplate,
-            }, _timings),
+                PrDescription = MapPrDescriptionOptions(u.PrDescription),
+            }, _timings, BuildDescriptionGenerator(u.PrDescription)),
             "git-generic" => new GitGenericUpstreamRemote(_gitHost, new GitGenericUpstreamOptions
             {
                 UpstreamUrl = u.GenericUrl ?? throw new InvalidOperationException(
@@ -80,5 +93,25 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         // Log the env var NAME only — never the token value.
         AuditLog.TokenRead(u.TokenEnvVar, project.Id);
         return token;
+    }
+
+    private static PrDescriptionOptions MapPrDescriptionOptions(ProjectPrDescription pd) =>
+        new()
+        {
+            Enabled = pd.Enabled,
+            GeneratorAgent = pd.GeneratorAgent,
+            GeneratorModelId = pd.GeneratorModelId,
+            MaxDiffBytes = pd.MaxDiffBytes,
+            Timeout = pd.Timeout,
+            SandboxImageReference = pd.SandboxImageReference,
+            AgentAllowedHosts = pd.AgentAllowedHosts,
+        };
+
+    private LlmPullRequestDescriptionGenerator? BuildDescriptionGenerator(ProjectPrDescription pd)
+    {
+        if (!pd.Enabled || string.IsNullOrEmpty(pd.SandboxImageReference))
+            return null;
+        return new LlmPullRequestDescriptionGenerator(
+            _sandboxes, _agents, _credentials, MapPrDescriptionOptions(pd), _generatorLog);
     }
 }
