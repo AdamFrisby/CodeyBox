@@ -50,6 +50,9 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly ISuggestionStore? _suggestions;
     private readonly IAuditReportStore? _auditReports;
     private readonly ITimingStore? _timings;
+    private readonly IWorkItemCostStore? _costStore;
+    private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? _costExtractors;
+    private readonly AgentCostCalculator? _costCalculator;
     // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
     // Null when no probes were provided (fail-open: no quota gate on audit agent).
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
@@ -91,7 +94,10 @@ public sealed class PipelineRunner : IPipelineRunner
         IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
         QuotaRouterOptions? auditQuotaOptions = null,
         IAuditReportStore? auditReports = null,
-        ITimingStore? timingStore = null)
+        ITimingStore? timingStore = null,
+        IWorkItemCostStore? costStore = null,
+        IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? costExtractors = null,
+        AgentCostCalculator? costCalculator = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -105,6 +111,9 @@ public sealed class PipelineRunner : IPipelineRunner
         _webhooks = webhooks;
         _opts = opts;
         _timings = timingStore;
+        _costStore = costStore;
+        _costExtractors = costExtractors;
+        _costCalculator = costCalculator;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -352,7 +361,8 @@ public sealed class PipelineRunner : IPipelineRunner
         bool isInitial,
         string? networkProfile,
         Project project,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? iteration = null)
     {
         var credential = await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
@@ -403,7 +413,11 @@ public sealed class PipelineRunner : IPipelineRunner
             agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
         }
 
+        var agentEndedAt = DateTimeOffset.UtcNow;
+        var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
         await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
+        await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
+            runner.Kind, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt);
         agentSw.Stop();
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed,
             stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
@@ -583,7 +597,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     reworkPrompt, isInitial: false,
                     networkProfile: project.NetworkProfiles.Rework,
                     project: project,
-                    phaseCt));
+                    phaseCt,
+                    iteration: iteration));
         }
     }
 
@@ -666,6 +681,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
                 }
                 auditorSw.Stop();
+                if (needsCreds)
+                {
+                    await TryRecordCostAsync(result.RawOutput, null,
+                        runner.Kind, ctx.WorkItemId, "audit", ctx.Iteration,
+                        auditorStartedAt, auditorStartedAt + auditorSw.Elapsed);
+                }
                 await EmitAuditorSubStepsAsync(auditor.Name, result.RawOutput,
                     ctx.WorkItemId, ctx.Iteration, auditorStartedAt);
                 await EmitToolCallCountsAsync(result.RawOutput, ctx.WorkItemId, "audit",
@@ -880,7 +901,11 @@ public sealed class PipelineRunner : IPipelineRunner
             agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
         }
 
+        var mergeEndedAt = DateTimeOffset.UtcNow;
+        var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecScope.ElapsedMs);
         await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecScope.ElapsedMs, ct);
+        await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
+            runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt);
         mergeSw.Stop();
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
             stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
@@ -1603,6 +1628,70 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItemState.Cancelled => "work_item.cancelled",
         _ => $"work_item.{state.ToString().ToLowerInvariant()}",
     };
+
+    // ── Cost capture ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Best-effort cost capture: extracts token counts from agent output, calculates
+    /// estimated USD, and persists a cost row. Any failure is swallowed with a warning
+    /// so cost capture never aborts a pipeline phase.
+    /// </summary>
+    private async Task TryRecordCostAsync(
+        string? stdout,
+        string? stderr,
+        AgentKind agentKind,
+        WorkItemId workItemId,
+        string phase,
+        int? iteration,
+        DateTimeOffset startedAt,
+        DateTimeOffset endedAt)
+    {
+        if (_costStore is null || _costExtractors is null || _costCalculator is null) return;
+        if (!_costExtractors.TryGetValue(agentKind, out var extractor)) return;
+
+        AgentCostSnapshot? snapshot;
+        try { snapshot = extractor.TryExtract(stdout, stderr); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Cost: extractor threw for agent '{Agent}' phase '{Phase}'",
+                agentKind.Value, phase);
+            return;
+        }
+        if (snapshot is null) return;
+
+        decimal usd;
+        try { usd = _costCalculator.Calculate(snapshot, agentKind); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Cost: calculator threw for agent '{Agent}' phase '{Phase}'",
+                agentKind.Value, phase);
+            return;
+        }
+
+        try
+        {
+            await _costStore.RecordAsync(new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString(),
+                WorkItemId = workItemId.ToString(),
+                Phase = phase,
+                Iteration = iteration,
+                AgentKind = agentKind.Value,
+                ModelId = snapshot.ModelId,
+                InputTokens = snapshot.InputTokens,
+                CachedInputTokens = snapshot.CachedInputTokens,
+                OutputTokens = snapshot.OutputTokens,
+                EstimatedUsd = (double)usd,
+                StartedAt = startedAt,
+                EndedAt = endedAt,
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Cost: failed to persist row for work item {Id} phase '{Phase}'",
+                workItemId, phase);
+        }
+    }
 
     // ── Suggestion pickup ────────────────────────────────────────────────────
 

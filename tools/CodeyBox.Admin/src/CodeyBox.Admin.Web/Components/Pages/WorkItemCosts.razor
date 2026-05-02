@@ -1,0 +1,226 @@
+@page "/work-items/{Id}/costs"
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<WorkItemCosts> Logger
+@using System.Text.Json
+@using CodeyBox.Admin.Web.Models
+
+<PageTitle>Costs — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found.</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_costs is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <h1>Costs — <a href="/work-items/@Id">@Id[..Math.Min(8, Id.Length)]</a></h1>
+
+    <p class="costs-summary">
+        <strong>@FormatUsd(_costs.Totals.EstimatedUsd)</strong> —
+        @FormatTokens(_costs.Totals.InputTokens) input, @FormatTokens(_costs.Totals.OutputTokens) output tokens
+        @if (_costs.Totals.CachedInputTokens > 0)
+        {
+            var cacheHitPct = _costs.Totals.InputTokens > 0 ? (double)_costs.Totals.CachedInputTokens / _costs.Totals.InputTokens * 100.0 : 0.0;
+            <span>, @cacheHitPct.ToString("F0")% cache hit</span>
+        }
+    </p>
+
+    @if (_costs.ByPhase.Count > 0 && _costs.Totals.EstimatedUsd > 0)
+    {
+        @* Stacked horizontal bar: work / rework / audit / merge *@
+        var phases = new[] { "work", "rework", "audit", "merge" };
+        var colors = new[] { "#4CAF50", "#8BC34A", "#FF9800", "#2196F3" };
+        var labels = new[] { "Work", "Rework", "Audit", "Merge" };
+        <section class="costs-bar-section">
+            <h2>Cost by phase</h2>
+            <div class="duration-bar" style="display:flex;height:28px;width:100%;border:1px solid #ccc;border-radius:3px;overflow:hidden;">
+                @for (var i = 0; i < phases.Length; i++)
+                {
+                    var phaseUsd = GetPhaseUsd(phases[i]);
+                    if (phaseUsd <= 0) continue;
+                    var pct = phaseUsd / _costs.Totals.EstimatedUsd * 100.0;
+                    var idx = i;
+                    <div style="width:@(pct.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))%;background:@colors[idx];height:100%;"
+                         title="@labels[idx]: @FormatUsd(phaseUsd)">
+                    </div>
+                }
+            </div>
+            <div class="duration-bar-legend" style="display:flex;gap:12px;margin-top:4px;font-size:0.85em;flex-wrap:wrap;">
+                @for (var i = 0; i < phases.Length; i++)
+                {
+                    var phaseUsd = GetPhaseUsd(phases[i]);
+                    if (phaseUsd <= 0) continue;
+                    var idx = i;
+                    <span>
+                        <span style="display:inline-block;width:12px;height:12px;background:@colors[idx];border-radius:2px;margin-right:4px;vertical-align:middle;"></span>
+                        @labels[idx]: @FormatUsd(phaseUsd)
+                    </span>
+                }
+            </div>
+        </section>
+    }
+
+    @* Token breakdown table by phase *@
+    @if (_costs.ByPhase.Count > 0)
+    {
+        <section class="costs-phase-table">
+            <h2>Token breakdown by phase</h2>
+            <table class="detail-table">
+                <thead>
+                    <tr>
+                        <th>Phase</th>
+                        <th>Input</th>
+                        <th>Cached Input</th>
+                        <th>Output</th>
+                        <th>Est. Cost</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var kv in _costs.ByPhase)
+                    {
+                        var pEl = kv.Value;
+                        var pInput = GetInt(pEl, "inputTokens");
+                        var pCached = GetInt(pEl, "cachedInputTokens");
+                        var pOutput = GetInt(pEl, "outputTokens");
+                        var pUsd = GetDouble(pEl, "estimatedUsd");
+                        <tr>
+                            <td>@kv.Key</td>
+                            <td>@FormatTokens(pInput ?? 0)</td>
+                            <td>@FormatTokens(pCached ?? 0)</td>
+                            <td>@FormatTokens(pOutput ?? 0)</td>
+                            <td>@FormatUsd(pUsd ?? 0)</td>
+                        </tr>
+                        @* Iteration sub-rows *@
+                        @if (pEl.ValueKind == JsonValueKind.Object
+                            && pEl.TryGetProperty("byIteration", out var byIter)
+                            && byIter.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var iter in byIter.EnumerateArray())
+                            {
+                                var iIter = GetInt(iter, "iteration");
+                                var iInput = GetInt(iter, "inputTokens");
+                                var iCached = GetInt(iter, "cachedInputTokens");
+                                var iOutput = GetInt(iter, "outputTokens");
+                                var iUsd = GetDouble(iter, "estimatedUsd");
+                                <tr class="costs-iter-row" style="color:#666;font-size:0.9em;">
+                                    <td style="padding-left:1.5em;">↳ iter @iIter</td>
+                                    <td>@FormatTokens(iInput ?? 0)</td>
+                                    <td>@FormatTokens(iCached ?? 0)</td>
+                                    <td>@FormatTokens(iOutput ?? 0)</td>
+                                    <td>@FormatUsd(iUsd ?? 0)</td>
+                                </tr>
+                            }
+                        }
+                    }
+                </tbody>
+                <tfoot>
+                    <tr style="font-weight:bold;">
+                        <td>Total</td>
+                        <td>@FormatTokens(_costs.Totals.InputTokens)</td>
+                        <td>@FormatTokens(_costs.Totals.CachedInputTokens)</td>
+                        <td>@FormatTokens(_costs.Totals.OutputTokens)</td>
+                        <td>@FormatUsd(_costs.Totals.EstimatedUsd)</td>
+                    </tr>
+                </tfoot>
+            </table>
+        </section>
+    }
+
+    @* By-agent breakdown *@
+    @if (_costs.ByAgent.Count > 0)
+    {
+        <section class="costs-agent-table">
+            <h2>By agent</h2>
+            <table class="detail-table">
+                <thead>
+                    <tr><th>Agent</th><th>Model</th><th>Input</th><th>Cached Input</th><th>Output</th><th>Est. Cost</th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var ag in _costs.ByAgent)
+                    {
+                        <tr>
+                            <td>@ag.Agent</td>
+                            <td>@(ag.ModelId ?? "—")</td>
+                            <td>@FormatTokens(ag.InputTokens)</td>
+                            <td>@FormatTokens(ag.CachedInputTokens)</td>
+                            <td>@FormatTokens(ag.OutputTokens)</td>
+                            <td>@FormatUsd(ag.EstimatedUsd)</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </section>
+    }
+
+    @if (_costs.Totals.InputTokens == 0 && _costs.Totals.OutputTokens == 0)
+    {
+        <p class="costs-empty">No cost data recorded yet. Cost capture requires the agent CLI to emit token counts in its output.</p>
+    }
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private WorkItemCostsDto? _costs;
+    private string? _error;
+    private bool _notFound;
+
+    protected override async Task OnParametersSetAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        try
+        {
+            _costs = await ApiClient.GetWorkItemCostsAsync(Id);
+            _notFound = _costs is null;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load costs for {Id}", Id);
+            _error = "Failed to load costs. Check server logs for details.";
+        }
+    }
+
+    private double GetPhaseUsd(string phase)
+    {
+        if (_costs is null || !_costs.ByPhase.TryGetValue(phase, out var el)) return 0;
+        return GetDouble(el, "estimatedUsd") ?? 0;
+    }
+
+    private static string FormatUsd(double usd)
+    {
+        if (usd == 0) return "$0.00";
+        if (usd < 0.01) return $"${usd:F4}";
+        return $"${usd:F2}";
+    }
+
+    private static string FormatTokens(int n)
+    {
+        if (n >= 1_000_000) return $"{n / 1_000_000.0:F1}M";
+        if (n >= 1_000) return $"{n / 1_000.0:F1}K";
+        return n.ToString();
+    }
+
+    private static int? GetInt(JsonElement el, string key)
+    {
+        if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty(key, out var v) && v.TryGetInt32(out var n))
+            return n;
+        return null;
+    }
+
+    private static double? GetDouble(JsonElement el, string key)
+    {
+        if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty(key, out var v) && v.TryGetDouble(out var d))
+            return d;
+        return null;
+    }
+}
