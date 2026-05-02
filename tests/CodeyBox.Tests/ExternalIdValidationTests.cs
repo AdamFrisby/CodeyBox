@@ -16,6 +16,9 @@ public sealed class ExternalIdValidationTests
     [InlineData("some-id-with-many-parts")]
     [InlineData("!bang")]
     [InlineData("0123456789")]
+    [InlineData("sprint-7:ticket-99")]   // colon is valid; composite-path splits on first colon
+    [InlineData("foo:bar")]
+    [InlineData("a:b:c")]               // multiple colons: all part of externalId after first split
     public void ValidExternalIds(string value) => Validation.ValidateExternalId(value, "externalId");
 
     // ── Empty / null ──────────────────────────────────────────────────────────
@@ -51,7 +54,6 @@ public sealed class ExternalIdValidationTests
     [InlineData("ctrl\x01char")]
     [InlineData("del\x7Fchar")]
     [InlineData("non-ascii-\x80")]
-    [InlineData("foo:bar")]       // colon is the composite-path delimiter
     [InlineData("foo;bar")]       // semicolon excluded
     [InlineData("a<b")]           // less-than excluded
     [InlineData("a=b")]           // equals excluded

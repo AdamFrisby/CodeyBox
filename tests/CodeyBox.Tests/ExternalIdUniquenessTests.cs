@@ -45,7 +45,7 @@ public sealed class ExternalIdUniquenessTests : IDisposable
         var err = await r2.Content.ReadFromJsonAsync<ErrorResponse>();
         Assert.NotNull(err);
         Assert.Contains("JIRA-99", err.Error);
-        Assert.Contains("already exists", err.Error);
+        Assert.Contains("already in use", err.Error);
     }
 
     [Fact]

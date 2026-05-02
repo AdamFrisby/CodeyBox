@@ -101,7 +101,7 @@ internal static class WorkItemEndpoints
             if (conflict is not null)
                 return Results.BadRequest(new
                 {
-                    error = $"externalId '{externalId}' already exists in project '{pid}' for work item {conflict.Id} (state: {conflict.State})"
+                    error = $"externalId '{externalId}' is already in use in project '{pid}'"
                 });
         }
 
@@ -122,13 +122,20 @@ internal static class WorkItemEndpoints
         if ((req.DependsOn?.Length ?? 0) > 100)
             return Results.BadRequest(new { error = "dependsOn must contain at most 100 entries" });
 
-        // Load all existing items once — used for both existence and cycle checks,
-        // and for resolving externalId references in dependsOn.
+        // Load all existing items — used for existence/cycle checks and externalId resolution.
+        // Skip the scan entirely when dependsOn is empty to avoid an O(N) read for the common case.
         var allItems = new List<WorkItem>();
-        await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
-        var allItemsByExternalId = allItems
-            .Where(i => i.ExternalId != null && i.ProjectId == pid)
-            .ToDictionary(i => i.ExternalId!, i => i);
+        var allItemsByExternalId = new Dictionary<string, WorkItem>(StringComparer.Ordinal);
+        if (req.DependsOn?.Length > 0)
+        {
+            await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
+            // GroupBy guards against data-inconsistency duplicates (index corruption, missed migration):
+            // last-wins ensures a deterministic result rather than an unhandled InvalidOperationException.
+            allItemsByExternalId = allItems
+                .Where(i => i.ExternalId != null && i.ProjectId == pid)
+                .GroupBy(i => i.ExternalId!)
+                .ToDictionary(g => g.Key, g => g.Last());
+        }
 
         var newId = WorkItemId.New();
         var dependsOnIds = new List<WorkItemId>();
@@ -680,6 +687,8 @@ internal static class WorkItemEndpoints
                 return (null, Results.BadRequest(new { error = "composite id format requires non-empty projectId and externalId: '<projectId>:<externalId>'" }));
             ProjectId pid;
             try { pid = new ProjectId(projectPart); }
+            catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
+            try { Validation.ValidateExternalId(externalPart, "externalId"); }
             catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
             var byExtId = await store.GetByExternalIdAsync(pid, externalPart, ct);
             return byExtId is null ? (null, Results.NotFound()) : (byExtId, null);

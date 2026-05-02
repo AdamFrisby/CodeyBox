@@ -41,7 +41,7 @@ Attempting to create a second work item in the same project with a duplicate `ex
 
 ```json
 {
-  "error": "externalId 'JIRA-1234' already exists in project 'my-app' for work item <uuid> (state: Done)"
+  "error": "externalId 'JIRA-1234' is already in use in project 'my-app'"
 }
 ```
 
