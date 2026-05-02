@@ -31,10 +31,24 @@ public static class SuggestionsFileParser
 
         using (doc)
         {
-            if (!doc.RootElement.TryGetProperty("suggestions", out var arr)
-                || arr.ValueKind != JsonValueKind.Array)
+            JsonElement arr;
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
             {
-                log.LogWarning("suggestions.json root must be an object with a 'suggestions' array");
+                // Tolerate the bare-array shape: agents sometimes write
+                // [{...}, {...}] directly instead of the documented
+                // {"suggestions":[...]}. Treat root array as the array.
+                arr = doc.RootElement;
+            }
+            else if (doc.RootElement.ValueKind == JsonValueKind.Object
+                     && doc.RootElement.TryGetProperty("suggestions", out arr)
+                     && arr.ValueKind == JsonValueKind.Array)
+            {
+                // Documented shape: {"suggestions":[...]}
+            }
+            else
+            {
+                log.LogWarning("suggestions.json must be either an array or an object with a 'suggestions' array; got root kind {Kind}",
+                    doc.RootElement.ValueKind);
                 return [];
             }
 
