@@ -165,6 +165,28 @@ public sealed class LlmPullRequestDescriptionGeneratorTests
     }
 
     [Fact]
+    public async Task GenerateAsync_DiffContainsSecret_SecretStrippedFromAgentPrompt()
+    {
+        // Defence-in-depth: secrets in FullDiff must not reach the agent prompt
+        // even when the caller has not pre-redacted the input.
+        const string secret = "ghp_SECRETTOKEN123456789012345678";
+        var runner = new CapturingAgentRunner("ok");
+        var registry = new FakeSingleAgentRegistry(runner);
+        var generator = new LlmPullRequestDescriptionGenerator(
+            new InProcessFakeSandboxProvider(), registry, new NullCredentialProvider(),
+            DefaultOpts, NullLogger<LlmPullRequestDescriptionGenerator>.Instance);
+
+        var request = SampleRequest with
+        {
+            FullDiff = $"diff --git a/src/Config.cs b/src/Config.cs\n+var token = \"{secret}\";",
+        };
+        await generator.GenerateAsync(request, CancellationToken.None);
+
+        Assert.NotNull(runner.LastPrompt);
+        Assert.DoesNotContain(secret, runner.LastPrompt);
+    }
+
+    [Fact]
     public async Task GenerateAsync_AgentReturnsEmpty_Throws()
     {
         var generator = BuildGenerator(string.Empty);

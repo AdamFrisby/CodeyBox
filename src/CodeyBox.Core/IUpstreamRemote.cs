@@ -51,6 +51,8 @@ public sealed record UpstreamCompletionRequest
     public IReadOnlyList<string> AddressedFindings { get; init; } = [];
     /// <summary>Original work item prompt, truncated to 2 KB. Null for legacy callers.</summary>
     public string? WorkItemPrompt { get; init; }
+    /// <summary>Raw agent stdout. Used for AgentReasoningTail in LLM-generated descriptions. Null for legacy callers.</summary>
+    public string? AgentStdout { get; init; }
 }
 
 /// <summary>Result of <see cref="IUpstreamRemote.CompleteAsync"/>.</summary>

@@ -227,16 +227,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             using var genCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             genCts.CancelAfter(_opts.PrDescription.Timeout);
 
-            var agentTailRaw = ExtractAgentReasoningTail(request.Description);
+            // Prefer raw agent stdout over the formatted static body for the reasoning tail.
+            var agentTailRaw = ExtractAgentReasoningTail(request.AgentStdout ?? request.Description);
             var agentTail = agentTailRaw is null ? null : RawOutputRedactor.Redact(agentTailRaw);
             // Redact before sending to LLM — diff may contain accidentally-committed tokens.
             // Truncation to MaxDiffBytes is applied inside GenerateAsync.
             var redactedDiff = RawOutputRedactor.Redact(request.FullDiff);
-            var redactedStat = RawOutputRedactor.Redact(request.DiffStat);
+            // Cap DiffStat at 4 KB; large changesets can produce hundreds of KB of stat output.
+            var redactedStat = RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(request.DiffStat), 4096);
+            // Truncate prompt using UTF-8 byte count to honour the documented 2 KB cap.
             var redactedPrompt = RawOutputRedactor.Redact(
-                request.WorkItemPrompt is { Length: > 2048 }
-                    ? request.WorkItemPrompt[..2048] + "\n[… prompt truncated …]"
-                    : request.WorkItemPrompt ?? string.Empty);
+                RawOutputRedactor.TruncateToBytes(request.WorkItemPrompt ?? string.Empty, 2048));
 
             var genRequest = new PullRequestDescriptionRequest
             {
@@ -271,14 +272,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return staticBody + PrFooter;
     }
 
-    /// <summary>Extracts the last 2 KB of agent stdout from the static description body.</summary>
-    private static string? ExtractAgentReasoningTail(string? staticDescription)
+    /// <summary>Returns the last 2 KB of <paramref name="text"/> (raw agent stdout or fallback).</summary>
+    private static string? ExtractAgentReasoningTail(string? text)
     {
-        if (string.IsNullOrWhiteSpace(staticDescription)) return null;
+        if (string.IsNullOrWhiteSpace(text)) return null;
         const int maxTailChars = 2048;
-        return staticDescription.Length <= maxTailChars
-            ? staticDescription
-            : staticDescription[^maxTailChars..];
+        return text.Length <= maxTailChars ? text : text[^maxTailChars..];
     }
 
     // Standard footer appended to every PR body (LLM-generated or static).

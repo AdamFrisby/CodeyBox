@@ -191,7 +191,7 @@ public sealed record ProjectUpstream
 
 /// <summary>
 /// Per-project LLM-generated PR description configuration.
-/// See <c>docs/upstream.md</c> for configuration guidance.
+/// See <c>docs/git-workflow.md</c> for configuration guidance.
 /// </summary>
 public sealed record ProjectPrDescription
 {
