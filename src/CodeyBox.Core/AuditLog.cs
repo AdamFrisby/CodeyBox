@@ -315,6 +315,27 @@ public static class AuditLog
             .Information("Quota router: work item {WorkItemId} deferred — re-enqueue scheduled in {RecheckMs}ms",
                 id.ToString(), (long)recheckIn.TotalMilliseconds);
 
+    // ── Plugin loading ───────────────────────────────────────────────────────
+
+    public static void PluginLoaded(string pluginId, string displayName, string assemblyPath) =>
+        Audit("plugin.loaded")
+            .Information("Plugin loaded: {PluginId} ({DisplayName}) from {AssemblyPath}",
+                pluginId, displayName, assemblyPath);
+
+    public static void PluginSkippedNotAllowlisted(string pluginId, string assemblyPath) =>
+        Audit("plugin.skipped_not_allowlisted")
+            .Information("Plugin {PluginId} skipped: not in Plugins.Allowlist (path: {AssemblyPath})",
+                pluginId, assemblyPath);
+
+    public static void PluginSkippedApiVersion(string pluginId, string required, string current) =>
+        Audit("plugin.skipped_api_version")
+            .Error("Plugin {PluginId} requires host API version {Required} but this host provides {Current}; plugin not loaded",
+                pluginId, required, current);
+
+    public static void PluginInitializationFailed(string pluginId, Exception exception) =>
+        Audit("plugin.initialization_failed")
+            .Error(exception, "Plugin {PluginId} initialization failed; plugin not available", pluginId);
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>
