@@ -61,10 +61,10 @@ public sealed class AgentCostCalculator
     /// </summary>
     private static readonly Dictionary<string, ModelRateConfig> BuiltInFallbacks = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["claude"]  = new() { InputPerMillion = 15.0, CachedInputPerMillion = 1.50, OutputPerMillion = 75.0 },
-        ["codex"]   = new() { InputPerMillion = 5.0,  CachedInputPerMillion = 0.50, OutputPerMillion = 25.0 },
-        ["gemini"]  = new() { InputPerMillion = 7.0,  CachedInputPerMillion = 0.70, OutputPerMillion = 21.0 },
-        ["copilot"] = new() { InputPerMillion = 0.0,  CachedInputPerMillion = 0.0,  OutputPerMillion = 0.0  },
+        ["claude"] = new() { InputPerMillion = 15.0, CachedInputPerMillion = 1.50, OutputPerMillion = 75.0 },
+        ["codex"] = new() { InputPerMillion = 5.0, CachedInputPerMillion = 0.50, OutputPerMillion = 25.0 },
+        ["gemini"] = new() { InputPerMillion = 7.0, CachedInputPerMillion = 0.70, OutputPerMillion = 21.0 },
+        ["copilot"] = new() { InputPerMillion = 0.0, CachedInputPerMillion = 0.0, OutputPerMillion = 0.0 },
     };
 
     public AgentCostCalculator(AgentPricingOptions opts)
@@ -117,8 +117,7 @@ public sealed class AgentCostCalculator
 
     /// <summary>
     /// Validates the pricing config at startup. Emits a warning for each agent kind
-    /// that has a registered runner but no pricing entry. Returns true if all known
-    /// agents have at least some pricing configured.
+    /// that has a registered runner but no pricing entry.
     /// </summary>
     public static void ValidateAtStartup(
         AgentPricingOptions opts,

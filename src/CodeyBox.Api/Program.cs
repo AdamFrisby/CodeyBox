@@ -542,7 +542,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
     var extractors = new Dictionary<AgentKind, IAgentCostExtractor>
     {
         [AgentKind.Claude] = new ClaudeCostExtractor(),
-        [AgentKind.Codex]  = new CodexCostExtractor(),
+        [AgentKind.Codex] = new CodexCostExtractor(),
         [AgentKind.Gemini] = new GeminiCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.

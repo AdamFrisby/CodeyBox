@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS work_item_costs (
     raw_metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_costs_work_item
-    ON work_item_costs (work_item_id);
+    ON work_item_costs(work_item_id, phase, iteration);
 CREATE INDEX IF NOT EXISTS idx_costs_project_time
     ON work_item_costs (work_item_id, started_at);
 ```
@@ -79,33 +79,18 @@ Rates live in `appsettings.json` under `CodeyBox.AgentPricing`:
 "AgentPricing": {
   "Rates": {
     "claude": {
-      "DefaultRate": {
-        "InputPerMTokens": 15.0,
-        "CachedInputPerMTokens": 1.50,
-        "OutputPerMTokens": 75.0
-      },
-      "Models": {
-        "claude-sonnet-4-5": {
-          "InputPerMTokens": 3.0,
-          "CachedInputPerMTokens": 0.30,
-          "OutputPerMTokens": 15.0
-        }
-      }
+      "claude-opus-4-7":  { "inputPerMillion": 15.0, "cachedInputPerMillion": 1.50, "outputPerMillion": 75.0 },
+      "claude-sonnet-4-6": { "inputPerMillion": 3.0,  "cachedInputPerMillion": 0.30, "outputPerMillion": 15.0 }
     },
     "codex": {
-      "DefaultRate": {
-        "InputPerMTokens": 5.0,
-        "CachedInputPerMTokens": 2.50,
-        "OutputPerMTokens": 15.0
-      }
+      "codex-5.5": { "inputPerMillion": 5.0, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.0 }
     },
     "gemini": {
-      "DefaultRate": {
-        "InputPerMTokens": 1.25,
-        "CachedInputPerMTokens": 0.3125,
-        "OutputPerMTokens": 5.0
-      }
+      "gemini-3.0-pro": { "inputPerMillion": 7.0, "cachedInputPerMillion": 0.70, "outputPerMillion": 21.0 }
     }
+  },
+  "DefaultRates": {
+    "claude": { "inputPerMillion": 3.0, "cachedInputPerMillion": 0.30, "outputPerMillion": 15.0 }
   }
 }
 ```
