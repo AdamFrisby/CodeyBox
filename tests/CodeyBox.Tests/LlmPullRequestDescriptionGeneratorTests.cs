@@ -161,8 +161,7 @@ public sealed class LlmPullRequestDescriptionGeneratorTests
         var result = LlmPullRequestDescriptionGenerator.TruncateMiddle(input, maxBytes);
 
         var resultBytes = Encoding.UTF8.GetByteCount(result);
-        // Result may be slightly over due to the marker, but the text portions must fit.
-        Assert.True(resultBytes <= maxBytes + 50, $"Result ({resultBytes} bytes) far exceeds cap ({maxBytes} bytes)");
+        Assert.True(resultBytes <= maxBytes, $"Result ({resultBytes} bytes) exceeds cap ({maxBytes} bytes)");
     }
 
     [Fact]

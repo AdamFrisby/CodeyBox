@@ -259,6 +259,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             _log.LogWarning("PR description generation timed out after {Timeout}; using static template",
                 _opts.PrDescription.Timeout);
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _log.LogWarning("PR description generation failed ({Message}); using static template", ex.Message);
