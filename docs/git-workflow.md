@@ -136,9 +136,11 @@ Pushes the merged base branch. No PR concept.
 
 ```
 1. git push origin <workBranch>:<workBranch>   # token via GIT_ASKPASS
-2. POST https://api.github.com/repos/{owner}/{repo}/pulls
-       { "title": "<pr title>", "head": "<workBranch>", "base": "<baseBranch>" }
-3. [if AutoMerge=true]
+2. Generate PR description (LLM or static fallback — see below)
+3. POST https://api.github.com/repos/{owner}/{repo}/pulls
+       { "title": "<pr title>", "head": "<workBranch>", "base": "<baseBranch>",
+         "body": "<generated description>" }
+4. [if AutoMerge=true]
    PUT  https://api.github.com/repos/{owner}/{repo}/pulls/{n}/merge
        { "merge_method": "<merge|squash|rebase>" }
 ```
@@ -147,6 +149,62 @@ The PAT is set as a per-request `Authorization: token <PAT>` header; it
 never appears on argv, in config files, or in log output (scrubbed from
 any error message). The named `HttpClient "github-upstream"` carries the
 `User-Agent: codeybox` header required by the GitHub API.
+
+#### LLM-generated PR descriptions
+
+When an `IPullRequestDescriptionGenerator` is wired up (default in production)
+and `Upstream.PrDescription.Enabled = true`, step 2 generates a narrative PR
+body from:
+
+- `git diff --stat` (compact change summary)
+- Full `git diff` between base and work branches, capped at `MaxDiffBytes`
+  (default 32 KB) and **truncated from the middle** — equal portions from
+  the start and end are preserved and a `[… N bytes truncated …]` marker
+  is inserted — so the LLM sees both the first and last diff hunks of a
+  large changeset.
+- The original work-item prompt (truncated to 2 KB).
+- Titles of audit findings addressed during rework iterations.
+- Last 2 KB of agent stdout (the agent's concluding reasoning).
+
+The generator runs the configured agent (`GeneratorAgent`, default `"claude"`)
+inside a minimal sandbox. Its output is sanitised through
+`RawOutputRedactor` before use, so accidentally-committed tokens in the
+diff or echoed back by the LLM are replaced with `***`.
+
+**Fallback semantics** — the generator is non-blocking:
+
+| Condition | Behaviour |
+|---|---|
+| `Enabled = false` | Static template used immediately; no LLM call |
+| Generator succeeds | LLM body used as PR description prefix |
+| Generator times out (`Timeout`, default 30 s) | Warning logged; static template used |
+| Generator throws | Warning logged; static template used |
+
+The standard footer (`Co-Authored-By: CodeyBox <noreply@codeybox.invalid>`
+plus a generated-with link) is appended to the PR body in all cases.
+
+**Configuration** (`appsettings.json`, under `Upstream` for a GitHub project):
+
+```json
+"Upstream": {
+  "Kind": "github",
+  ...
+  "PrDescription": {
+    "Enabled": true,
+    "GeneratorAgent": "claude",
+    "GeneratorModelId": null,
+    "MaxDiffBytes": 32768,
+    "Timeout": "00:00:30",
+    "SandboxImageReference": "ghcr.io/myorg/codeybox-agent:latest",
+    "AgentAllowedHosts": ["api.anthropic.com"]
+  }
+}
+```
+
+**Cost** — each PR description adds approximately 5 K input tokens and
+500 output tokens. This appears in the per-work-item cost report as a
+separate `phase=upstream` row. Operators on tight quotas can set
+`Enabled: false`.
 
 **Soft failures** are handled gracefully without retrying:
 

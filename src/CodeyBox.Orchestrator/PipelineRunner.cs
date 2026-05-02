@@ -1069,6 +1069,19 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         await Transition(item, WorkItemState.UpstreamPushing, ct, project);
 
+        // Best-effort: compute the diff for LLM-generated PR descriptions.
+        // Failures here are non-fatal — the fields default to empty strings
+        // and the generator falls back to the static template.
+        var (diffStat, fullDiff) = (string.Empty, string.Empty);
+        try
+        {
+            (diffStat, fullDiff) = await _gitHost.GetDiffAsync(repoId, baseBranch, workBranch, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug("Could not compute diff for PR description: {Message}", ex.Message);
+        }
+
         var request = new UpstreamCompletionRequest
         {
             RepositoryId = repoId,
@@ -1079,6 +1092,13 @@ public sealed class PipelineRunner : IPipelineRunner
             MergeSha = mergeSha,
             Title = item.Title,
             Description = BuildPrDescription(item.Id, agentStdout),
+            DiffStat = diffStat,
+            FullDiff = fullDiff,
+            WorkItemPrompt = item.Prompt,
+            // AddressedFindings: titles of audit findings fixed during rework.
+            // Currently empty; a future enhancement can populate these from
+            // the IAuditReportStore by querying failed iterations for this item.
+            AddressedFindings = [],
         };
 
         // Capture the outcome from a successful CompleteAsync so the local
