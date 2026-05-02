@@ -82,14 +82,32 @@ public sealed class PluginLoaderTests
     [Fact]
     public void DiscoverPlugins_MinHostApiVersionTooHigh_SkipsPlugin()
     {
-        // We cannot easily produce a real assembly that requires v99.0, so we
-        // verify the Satisfies contract indirectly: if CodeyBoxApiVersion.Satisfies
-        // returns false, the plugin is skipped. The unit test for Satisfies covers
-        // the version-comparison logic; here we just confirm the loader honours it.
-        // Use the sample assembly and fake the check via a custom-version subtest.
-        // The sample declares minHostApiVersion = "1.0" which current host satisfies;
-        // the host version test covers the rejection path. This test validates that
-        // VALID plugins ARE NOT skipped (positive path for version check).
+        // SampleFutureAuditor declares minHostApiVersion = "99.0". Even with a
+        // wildcard allowlist it must be skipped by the loader's version check.
+        // The other two plugins (v1.0) must still load, proving the rejection is
+        // selective and not caused by an allowlist or path error.
+        var samplePath = PluginTestHelpers.GetSamplePluginAssemblyPath();
+        var loader = MakeLoader(new PluginOptions
+        {
+            AssemblyPaths = [samplePath],
+            Allowlist = ["*"],   // allow all IDs so rejection is purely from version mismatch
+        });
+
+        var plugins = loader.DiscoverPlugins();
+
+        var ids = plugins.Select(p => p.PluginId).ToHashSet();
+        Assert.DoesNotContain("sample.future-auditor", ids);
+        Assert.Equal(2, plugins.Count);   // sample.auditor + sample.blocked-auditor only
+    }
+
+    // ── DI Registration ───────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task RegisterPlugins_LoadedPlugin_RunAsyncExecutesEndToEnd()
+    {
+        // Integration test: load the sample plugin through the full stack
+        // (ALC isolation → DI registration → method invocation) and verify
+        // that RunAsync executes correctly on the resolved instance.
         var samplePath = PluginTestHelpers.GetSamplePluginAssemblyPath();
         var loader = MakeLoader(new PluginOptions
         {
@@ -99,11 +117,27 @@ public sealed class PluginLoaderTests
 
         var plugins = loader.DiscoverPlugins();
 
-        // sample.auditor requires "1.0" and the current host is "1.0" → loaded
-        Assert.Single(plugins);
-    }
+        var services = new ServiceCollection();
+        loader.RegisterPlugins(services, plugins);
 
-    // ── DI Registration ───────────────────────────────────────────────────────
+        await using var provider = services.BuildServiceProvider();
+        var auditor = provider.GetRequiredService<IAuditor>();
+
+        var context = new AuditContext(
+            WorkItemId: WorkItemId.New(),
+            WorkBranch: "feat/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "test prompt");
+
+        var result = await auditor.RunAsync(
+            sandbox: null!,
+            workingDirectory: "/tmp",
+            context: context);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+    }
 
     [Fact]
     public async Task RegisterPlugins_RegistersTypeUnderIAuditor()

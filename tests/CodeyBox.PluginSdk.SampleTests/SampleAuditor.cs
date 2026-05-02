@@ -105,3 +105,26 @@ public sealed class SampleBlockedAuditor : IAuditor
         CancellationToken ct = default)
         => Task.FromResult(new AuditResult(Passed: true, Findings: []));
 }
+
+/// <summary>
+/// A plugin type that declares a far-future minimum host API version. Used by
+/// loader tests to verify that the version-rejection path is exercised: the
+/// loader must skip this plugin even when the allowlist permits it.
+/// </summary>
+[CodeyBoxPlugin(
+    id: "sample.future-auditor",
+    displayName: "Sample Future Auditor",
+    minHostApiVersion: "99.0")]
+public sealed class SampleFutureAuditor : IAuditor
+{
+    public string Name => "sample-future-auditor";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+        => Task.FromResult(new AuditResult(Passed: true, Findings: []));
+}

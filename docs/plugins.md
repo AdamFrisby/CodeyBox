@@ -121,8 +121,10 @@ public sealed class MyAuditor : IAuditor, IPluginInitializer
 }
 ```
 
-If `InitializeAsync` throws, the host logs the error and re-throws — the host
-process does not abort, but the plugin is unusable.
+If `InitializeAsync` throws, the host logs the error and re-throws from
+`IHostedService.StartAsync`, causing the .NET Generic Host to **abort the
+process**. Catch exceptions inside `InitializeAsync` if you want the host to
+remain running despite a plugin failure.
 
 ### 5. Disposal (optional)
 

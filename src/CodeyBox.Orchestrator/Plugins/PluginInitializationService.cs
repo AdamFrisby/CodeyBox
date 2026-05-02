@@ -57,24 +57,30 @@ internal sealed class PluginInitializationService : IHostedService
         if (!typeof(IPluginInitializer).IsAssignableFrom(type))
             return;
 
-        // Resolve via the first Core interface the type implements.
-        // The instance is a DI singleton so it's the same object everywhere.
         var coreAssembly = typeof(IAuditor).Assembly;
         var coreInterface = type.GetInterfaces()
             .FirstOrDefault(i => i.Assembly == coreAssembly);
 
-        if (coreInterface is null)
-        {
-            _logger.LogWarning(
-                "Plugin {PluginId}: {TypeName} implements IPluginInitializer but no Core interface — cannot resolve from DI, skipping init",
-                plugin.PluginId, type.Name);
-            return;
-        }
-
-        object instance;
+        object? instance;
         try
         {
-            instance = _serviceProvider.GetRequiredService(coreInterface);
+            // Prefer resolving via the concrete plugin type (registered by RegisterPlugins
+            // as AddSingleton(type)). This guarantees the same singleton is returned for
+            // all interfaces, which matters for multi-interface plugins: without it, only
+            // the instance keyed by the first interface receives InitializeAsync.
+            instance = _serviceProvider.GetService(type);
+
+            if (instance is null)
+            {
+                if (coreInterface is null)
+                {
+                    _logger.LogWarning(
+                        "Plugin {PluginId}: {TypeName} implements IPluginInitializer but no Core interface — cannot resolve from DI, skipping init",
+                        plugin.PluginId, type.Name);
+                    return;
+                }
+                instance = _serviceProvider.GetRequiredService(coreInterface);
+            }
         }
         catch (Exception ex)
         {

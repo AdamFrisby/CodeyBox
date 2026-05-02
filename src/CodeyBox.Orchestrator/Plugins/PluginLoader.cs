@@ -68,9 +68,23 @@ public sealed class PluginLoader : IPluginLoader
         return result;
     }
 
+    // Plugins must not shadow these host-managed interfaces. Doing so would allow
+    // an allowlisted plugin to intercept credentials or agent execution for the
+    // entire host process, contradicting the threat model in docs/plugins.md.
+    private static readonly HashSet<Type> _blockedInterfaces =
+    [
+        typeof(ICredentialProvider),
+        typeof(IAgentRunner),
+    ];
+
     /// <summary>
     /// Registers each loaded plugin's types into <paramref name="services"/>
     /// under the <c>CodeyBox.Core</c> interfaces they implement.
+    ///
+    /// <para>Each plugin type is registered once as a concrete singleton, with
+    /// forwarding factories for each allowed interface. This ensures multi-interface
+    /// plugins share a single instance regardless of which interface is resolved.
+    /// </para>
     /// </summary>
     internal void RegisterPlugins(IServiceCollection services, IReadOnlyList<LoadedPlugin> plugins)
     {
@@ -80,21 +94,40 @@ public sealed class PluginLoader : IPluginLoader
         {
             foreach (var type in plugin.RegisteredTypes)
             {
-                var coreInterfaces = type.GetInterfaces()
+                var allCoreInterfaces = type.GetInterfaces()
                     .Where(i => i.Assembly == coreAssembly)
+                    .ToList();
+
+                foreach (var blocked in allCoreInterfaces.Where(i => _blockedInterfaces.Contains(i)))
+                {
+                    _logger.LogWarning(
+                        "Plugin {PluginId}: type {TypeName} implements restricted interface {InterfaceName}; " +
+                        "registration blocked to protect host security boundaries",
+                        plugin.PluginId, type.Name, blocked.Name);
+                }
+
+                var coreInterfaces = allCoreInterfaces
+                    .Where(i => !_blockedInterfaces.Contains(i))
                     .ToList();
 
                 if (coreInterfaces.Count == 0)
                 {
                     _logger.LogWarning(
-                        "Plugin {PluginId}: type {TypeName} has no CodeyBox.Core interfaces; nothing registered",
+                        "Plugin {PluginId}: type {TypeName} has no registerable CodeyBox.Core interfaces; nothing registered",
                         plugin.PluginId, type.Name);
                     continue;
                 }
 
+                // Register the concrete type once as the canonical singleton so that all
+                // interface resolutions share the same instance. Without this, each
+                // AddSingleton(iface, type) call produces a separate instance, and
+                // IPluginInitializer.InitializeAsync would only run on the first one.
+                services.AddSingleton(type);
+
                 foreach (var iface in coreInterfaces)
                 {
-                    services.AddSingleton(iface, type);
+                    var capturedType = type;
+                    services.AddSingleton(iface, sp => sp.GetRequiredService(capturedType));
                     _logger.LogDebug(
                         "Plugin {PluginId}: registered {TypeName} as {InterfaceName}",
                         plugin.PluginId, type.Name, iface.Name);
