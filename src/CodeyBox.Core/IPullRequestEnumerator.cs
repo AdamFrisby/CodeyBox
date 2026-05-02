@@ -9,6 +9,13 @@ public interface IPullRequestEnumerator
         string fromTag,
         string toTag,
         CancellationToken ct);
+
+    Task<string?> ResolvePreviousTagAsync(
+        string owner,
+        string repo,
+        string token,
+        string currentTag,
+        CancellationToken ct);
 }
 
 public sealed record PullRequestEnumeratorResult(

@@ -189,6 +189,11 @@ internal sealed class StubPullRequestEnumerator : IPullRequestEnumerator
                 new(42, "Test PR", "body", "2026-05-01T00:00:00Z", [], []),
             },
             WasCapped: false));
+
+    public Task<string?> ResolvePreviousTagAsync(
+        string owner, string repo, string token,
+        string currentTag, CancellationToken ct)
+        => Task.FromResult<string?>("v1.0.0");
 }
 
 internal sealed class StubChangelogGenerator : IChangelogGenerator

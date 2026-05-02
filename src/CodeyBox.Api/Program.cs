@@ -507,6 +507,32 @@ builder.Services.AddSingleton<IChangelogGenerator>(sp =>
         opts);
 });
 
+// Changelog webhook HMAC secret — mirrors the SandboxProvider enforcement pattern.
+// In non-Development environments the secret env-var MUST be configured so that
+// the POST /webhooks/github/release endpoint always validates HMAC signatures.
+{
+    var changelogCfg = builder.Configuration.GetSection("CodeyBox:Changelog");
+    var changelogEnabled = changelogCfg.GetValue<bool>("Enabled", true);
+    var webhookSecretEnvVar = changelogCfg["GitHubWebhookSecretEnvVar"];
+    if (changelogEnabled && string.IsNullOrEmpty(webhookSecretEnvVar))
+    {
+        if (builder.Environment.IsDevelopment())
+        {
+            Log.Warning(
+                "CodeyBox:Changelog:GitHubWebhookSecretEnvVar is not configured. " +
+                "GitHub release webhooks will be rejected with 401 until a secret is set. " +
+                "This is a configuration error in non-Development environments.");
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:Changelog:GitHubWebhookSecretEnvVar must be configured in non-Development environments. " +
+                "Set it to the name of the environment variable holding the HMAC-SHA256 webhook secret " +
+                "(see docs/changelog-automation.md).");
+        }
+    }
+}
+
 // --- Audit timeline reader ---------------------------------------------------
 builder.Services.AddSingleton(sp =>
 {
@@ -830,8 +856,8 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Name of the environment variable holding the HMAC-SHA256 secret for
-        /// validating incoming GitHub release webhooks. If null, incoming webhooks
-        /// are accepted without signature validation (not recommended for production).
+        /// validating incoming GitHub release webhooks. Must be set in non-Development
+        /// environments; the webhook endpoint rejects all requests with 401 if not configured.
         /// </summary>
         public string? GitHubWebhookSecretEnvVar { get; set; }
     }

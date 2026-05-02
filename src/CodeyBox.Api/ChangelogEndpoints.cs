@@ -187,15 +187,8 @@ internal static class ChangelogEndpoints
             return Results.Accepted();
 
         // Determine the fromTag (previous release tag).
-        var fromTag = payload.Release?.PreviousTagName;
-        if (string.IsNullOrEmpty(fromTag))
-        {
-            // GitHub webhooks don't include the previous tag; we need to infer it.
-            // Use a sentinel — the enumerator will treat it as "beginning of history" if it
-            // can't resolve it, so the changelog entry may be incomplete for a first release.
-            // Operators can regenerate via POST /projects/{id}/release with explicit tags.
-            fromTag = await ResolvePreviousTagAsync(ghOwner, ghRepo, token, tagName, ct);
-        }
+        // GitHub webhooks don't include the previous tag; we always infer it.
+        var fromTag = await enumerator.ResolvePreviousTagAsync(ghOwner, ghRepo, token, tagName, ct);
         if (string.IsNullOrEmpty(fromTag))
         {
             // No prior release found — create a changelog from all PRs up to this tag.
@@ -210,9 +203,9 @@ internal static class ChangelogEndpoints
             enumResult = await enumerator.ListMergedBetweenAsync(
                 ghOwner, ghRepo, token, fromTag, tagName, ct);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            AuditLog.ChangelogWebhookRejected($"PR enumeration failed: {ex.Message}");
+            AuditLog.ChangelogWebhookRejected("PR enumeration failed");
             return Results.Accepted();
         }
 
@@ -227,9 +220,9 @@ internal static class ChangelogEndpoints
                 PullRequests = enumResult.PullRequests,
             }, ct);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            AuditLog.ChangelogWebhookRejected($"changelog generation failed: {ex.Message}");
+            AuditLog.ChangelogWebhookRejected("changelog generation failed");
             return Results.Accepted();
         }
 
@@ -269,9 +262,10 @@ internal static class ChangelogEndpoints
     {
         if (string.IsNullOrEmpty(secretEnvVar))
         {
-            // Secret not configured — accept unsigned webhooks only when no secret is set.
-            // Operators should always configure a secret in production.
-            return true;
+            // No secret env-var name configured — fail closed. HMAC validation is
+            // mandatory; the startup check in Program.cs enforces configuration in
+            // non-Development environments.
+            return false;
         }
 
         var secret = Environment.GetEnvironmentVariable(secretEnvVar);
@@ -331,47 +325,6 @@ internal static class ChangelogEndpoints
         var token = Environment.GetEnvironmentVariable(envVar);
         if (string.IsNullOrEmpty(token)) return (null, null, null);
         return (owner, repo, token);
-    }
-
-    private static async Task<string?> ResolvePreviousTagAsync(
-        string owner, string repo, string token, string currentTag, CancellationToken ct)
-    {
-        // List releases to find the one before currentTag.
-        // Returns null if no prior release is found.
-        try
-        {
-            // Re-use the same HttpClient the PR enumerator uses. We can't inject
-            // IHttpClientFactory here (static method), so we use a plain HttpClient.
-            // This is only called from the webhook path, so it's fire-once per release.
-            using var client = new HttpClient();
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("codeybox");
-            client.DefaultRequestHeaders.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("token", token);
-            client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
-
-            var url = $"https://api.github.com/repos/{owner}/{repo}/releases?per_page=10";
-            var json = await client.GetStringAsync(url, ct);
-            using var doc = JsonDocument.Parse(json);
-
-            string? previousTag = null;
-            bool found = false;
-            foreach (var r in doc.RootElement.EnumerateArray())
-            {
-                var t = r.TryGetProperty("tag_name", out var el) ? el.GetString() : null;
-                if (found)
-                {
-                    previousTag = t;
-                    break;
-                }
-                if (string.Equals(t, currentTag, StringComparison.Ordinal))
-                    found = true;
-            }
-            return previousTag;
-        }
-        catch
-        {
-            return null;
-        }
     }
 
     private static string BuildChangelogApplyPrompt(string changelogPath, string changelogMarkdown)

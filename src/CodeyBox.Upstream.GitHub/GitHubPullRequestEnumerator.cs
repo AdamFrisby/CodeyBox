@@ -168,6 +168,47 @@ public sealed class GitHubPullRequestEnumerator : IPullRequestEnumerator
         }
     }
 
+    public async Task<string?> ResolvePreviousTagAsync(
+        string owner, string repo, string token, string currentTag, CancellationToken ct)
+    {
+        var url = $"https://api.github.com/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(repo)}/releases?per_page=10";
+        using var req = BuildRequest(HttpMethod.Get, url, token);
+        using var response = await SendAsync(req, ct);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _log.LogWarning(
+                "GitHub GET /releases returned {Status} for {Owner}/{Repo}",
+                (int)response.StatusCode, owner, repo);
+            return null;
+        }
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            string? previousTag = null;
+            bool found = false;
+            foreach (var r in doc.RootElement.EnumerateArray())
+            {
+                var t = r.TryGetProperty("tag_name", out var el) ? el.GetString() : null;
+                if (found)
+                {
+                    previousTag = t;
+                    break;
+                }
+                if (string.Equals(t, currentTag, StringComparison.Ordinal))
+                    found = true;
+            }
+            return previousTag;
+        }
+        catch (JsonException ex)
+        {
+            _log.LogWarning(ex, "Failed to parse GitHub releases response for {Owner}/{Repo}", owner, repo);
+            return null;
+        }
+    }
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,
