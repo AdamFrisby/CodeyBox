@@ -11,6 +11,8 @@ public sealed record ChangelogRequest
     public required string FromTag { get; init; }
     public required string ToTag { get; init; }
     public required IReadOnlyList<MergedPullRequest> PullRequests { get; init; }
+    /// <summary>Per-project section header format override. Null falls back to global ChangelogOptions.</summary>
+    public string? SectionHeaderFormat { get; init; }
 }
 
 public sealed record MergedPullRequest(

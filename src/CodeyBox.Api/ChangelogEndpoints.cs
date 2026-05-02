@@ -82,6 +82,7 @@ internal static class ChangelogEndpoints
             FromTag = req.FromTag,
             ToTag = req.ToTag,
             PullRequests = enumResult.PullRequests,
+            SectionHeaderFormat = project.Changelog?.SectionHeaderFormat,
         }, ct);
 
         AuditLog.ChangelogGenerated(
@@ -191,9 +192,9 @@ internal static class ChangelogEndpoints
         var fromTag = await enumerator.ResolvePreviousTagAsync(ghOwner, ghRepo, token, tagName, ct);
         if (string.IsNullOrEmpty(fromTag))
         {
-            // No prior release found — create a changelog from all PRs up to this tag.
-            // Use the empty-tree SHA as the base so the compare includes everything.
-            fromTag = "HEAD~1";
+            // No prior release found — use the empty-tree SHA so the compare includes
+            // every commit reachable from the tag.
+            fromTag = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
         }
 
         // Generate the changelog.
@@ -218,6 +219,7 @@ internal static class ChangelogEndpoints
                 FromTag = fromTag,
                 ToTag = tagName,
                 PullRequests = enumResult.PullRequests,
+                SectionHeaderFormat = project.Changelog?.SectionHeaderFormat,
             }, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

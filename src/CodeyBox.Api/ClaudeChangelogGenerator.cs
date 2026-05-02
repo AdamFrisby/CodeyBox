@@ -48,16 +48,17 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
     public async Task<ChangelogEntry> GenerateAsync(ChangelogRequest request, CancellationToken ct)
     {
         var redacted = request.PullRequests.Select(RedactPr).ToList();
+        var formatOverride = request.SectionHeaderFormat;
 
         string markdown;
         if (redacted.Count == 0)
         {
-            var header = FormatSectionHeader(request.ToTag, DateOnly.FromDateTime(DateTime.UtcNow));
+            var header = FormatSectionHeader(request.ToTag, DateOnly.FromDateTime(DateTime.UtcNow), formatOverride);
             markdown = $"{header}\n\n*(no pull requests found between {request.FromTag} and {request.ToTag})*\n";
         }
         else if (EstimateBytes(redacted) <= MaxPayloadBytes)
         {
-            markdown = await GenerateSinglePassAsync(request.ToTag, redacted, ct);
+            markdown = await GenerateSinglePassAsync(request.ToTag, redacted, formatOverride, ct);
         }
         else
         {
@@ -74,9 +75,9 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
     }
 
     private async Task<string> GenerateSinglePassAsync(
-        string toTag, IReadOnlyList<MergedPullRequest> prs, CancellationToken ct)
+        string toTag, IReadOnlyList<MergedPullRequest> prs, string? formatOverride, CancellationToken ct)
     {
-        var header = FormatSectionHeader(toTag, DateOnly.FromDateTime(DateTime.UtcNow));
+        var header = FormatSectionHeader(toTag, DateOnly.FromDateTime(DateTime.UtcNow), formatOverride);
         var prompt = BuildPrompt(toTag, header, prs);
         return await CallLlmAsync(prompt, ct);
     }
@@ -172,9 +173,10 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
         return "*(changelog generation failed: unexpected response shape)*";
     }
 
-    private string FormatSectionHeader(string tag, DateOnly date)
+    private string FormatSectionHeader(string tag, DateOnly date, string? formatOverride = null)
     {
-        return _opts.SectionHeaderFormat
+        var format = formatOverride ?? _opts.SectionHeaderFormat;
+        return format
             .Replace("{tag}", tag, StringComparison.Ordinal)
             .Replace("{date:yyyy-MM-dd}", date.ToString("yyyy-MM-dd"), StringComparison.Ordinal);
     }
@@ -278,7 +280,7 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
     }
 
     private static MergedPullRequest RedactPr(MergedPullRequest pr) =>
-        pr with { Body = RawOutputRedactor.Redact(pr.Body) };
+        pr with { Title = RawOutputRedactor.Redact(pr.Title), Body = RawOutputRedactor.Redact(pr.Body) };
 
     // Parses category sections from the generated markdown and maps them to PR numbers.
     private static IReadOnlyDictionary<string, IReadOnlyList<int>> ParseCategories(string markdown)
