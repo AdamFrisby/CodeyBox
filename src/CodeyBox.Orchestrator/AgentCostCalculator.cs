@@ -46,7 +46,10 @@ public sealed class AgentPricingOptions
 /// Lookup order:
 ///   1. <c>Rates[agentKind][modelId]</c>
 ///   2. <c>DefaultRates[agentKind]</c>
-///   3. Zero (unknown agent / missing pricing; no warning emitted here — callers decide)
+///   3. Built-in conservative fallback constants (e.g. claude $15/$75 per million,
+///      codex $5/$25, gemini $7/$21) — applies to known agent kinds with no config;
+///      callers decide whether to warn the operator about missing pricing.
+///      Returns null (→ zero cost) only for completely unknown agent kinds.
 ///
 /// For subscription plans, <c>estimatedUsd</c> is the equivalent pay-per-API value, not a
 /// real charge. See docs/cost-reporting.md §"Subscription equivalent USD".
@@ -117,7 +120,8 @@ public sealed class AgentCostCalculator
 
     /// <summary>
     /// Validates the pricing config at startup. Emits a warning for each agent kind
-    /// that has a registered runner but no pricing entry.
+    /// that has a registered runner but no pricing entry. Throws
+    /// <see cref="InvalidOperationException"/> if any configured rate value is negative.
     /// </summary>
     public static void ValidateAtStartup(
         AgentPricingOptions opts,

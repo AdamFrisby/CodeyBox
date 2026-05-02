@@ -124,8 +124,6 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(1, reworkRows[0].Iteration);
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
     private static WorkItem NewItem(string branch) => new()
     {
         Id = new WorkItemId(Guid.NewGuid()),
@@ -140,10 +138,50 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         MergeTimeout = TimeSpan.FromMinutes(5),
     };
 
+    [Fact]
+    public async Task LlmAuditor_ProducesAuditPhaseCostRow()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore,
+            auditors: [new FakeLlmAuditor()], maxAuditIterations: 1);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("llm-audit.txt", "a\n"));
+
+        var item = NewItem("feature/llm-audit");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var auditRows = costStore.Recorded.Where(r => r.Phase == "audit").ToList();
+        Assert.Single(auditRows);
+    }
+
+    [Fact]
+    public async Task CostStoreFailure_DoesNotAbortPipeline()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var throwingStore = new ThrowingCostStore();
+        using var tp = BuildPipelineWithCosts(_workspace, seed, throwingStore);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fail-soft.txt", "x\n"));
+
+        var item = NewItem("feature/fail-soft");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
     private static TestPipeline BuildPipelineWithCosts(
         string workspace,
         string seedRepoUrl,
-        RecordingCostStore costStore,
+        IWorkItemCostStore costStore,
         bool registerExtractor = true,
         IReadOnlyList<IAuditor>? auditors = null,
         int maxAuditIterations = 1)
@@ -259,6 +297,36 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         public Task<IReadOnlyList<WorkItemCost>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<WorkItemCost>>(
                 Recorded.Where(r => r.WorkItemId == workItemId).ToList());
+
+        public Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
+            string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
+
+        public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)
+            => Task.CompletedTask;
+    }
+
+    // ── Fake LLM auditor (needsCreds=true path) ───────────────────────────────
+
+    private sealed class FakeLlmAuditor : IAuditor
+    {
+        public string Name => "fake-llm";
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
+
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
+            => Task.FromResult(new AuditResult(true, [], RawOutput: "fake llm output"));
+    }
+
+    // ── Throwing cost store (fail-soft test) ──────────────────────────────────
+
+    private sealed class ThrowingCostStore : IWorkItemCostStore
+    {
+        public Task RecordAsync(WorkItemCost cost, CancellationToken ct = default)
+            => throw new InvalidOperationException("injected cost store failure");
+
+        public Task<IReadOnlyList<WorkItemCost>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
 
         public Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
             string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
