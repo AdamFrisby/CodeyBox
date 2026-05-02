@@ -76,7 +76,7 @@ public sealed class LlmPullRequestDescriptionGenerator : IPullRequestDescription
                     await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", dir] }, ct);
                 await sandbox.ExecAsync(new SandboxExec
                 {
-                    Argv = ["sh", "-c", $"cat > \"{path}\""],
+                    Argv = ["tee", path],
                     Stdin = contents,
                 }, ct);
             }
@@ -111,9 +111,9 @@ public sealed class LlmPullRequestDescriptionGenerator : IPullRequestDescription
         var halfBudget = budget / 2;
 
         // Find char count fitting in halfBudget bytes from the start.
-        var startChars = FindCharCount(text, 0, text.Length, halfBudget, fromStart: true);
+        var startChars = FindCharCount(text, halfBudget, fromStart: true);
         // Find char count fitting in halfBudget bytes from the end.
-        var endChars = FindCharCount(text, 0, text.Length, budget - Encoding.UTF8.GetByteCount(text.AsSpan(0, startChars)), fromStart: false);
+        var endChars = FindCharCount(text, budget - Encoding.UTF8.GetByteCount(text.AsSpan(0, startChars)), fromStart: false);
 
         var removedBytes = totalBytes - Encoding.UTF8.GetByteCount(text.AsSpan(0, startChars))
                                       - Encoding.UTF8.GetByteCount(text.AsSpan(text.Length - endChars, endChars));
@@ -123,11 +123,11 @@ public sealed class LlmPullRequestDescriptionGenerator : IPullRequestDescription
              + text[^endChars..];
     }
 
-    private static int FindCharCount(string text, int lo, int hi, int maxBytes, bool fromStart)
+    private static int FindCharCount(string text, int maxBytes, bool fromStart)
     {
         // Binary search for the largest char count whose UTF-8 byte count ≤ maxBytes.
-        lo = 0;
-        hi = text.Length;
+        var lo = 0;
+        var hi = text.Length;
         while (lo < hi)
         {
             var mid = (lo + hi + 1) / 2;

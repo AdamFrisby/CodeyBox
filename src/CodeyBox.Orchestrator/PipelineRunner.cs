@@ -1082,6 +1082,19 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogDebug("Could not compute diff for PR description: {Message}", ex.Message);
         }
 
+        IReadOnlyList<string> addressedFindings = [];
+        if (_auditReports is not null)
+        {
+            var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
+            var titles = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var report in reports)
+                foreach (var finding in report.Findings)
+                    if (seen.Add(finding.Title))
+                        titles.Add(finding.Title);
+            addressedFindings = titles;
+        }
+
         var request = new UpstreamCompletionRequest
         {
             RepositoryId = repoId,
@@ -1095,10 +1108,7 @@ public sealed class PipelineRunner : IPipelineRunner
             DiffStat = diffStat,
             FullDiff = fullDiff,
             WorkItemPrompt = item.Prompt,
-            // AddressedFindings: titles of audit findings fixed during rework.
-            // Currently empty; a future enhancement can populate these from
-            // the IAuditReportStore by querying failed iterations for this item.
-            AddressedFindings = [],
+            AddressedFindings = addressedFindings,
         };
 
         // Capture the outcome from a successful CompleteAsync so the local

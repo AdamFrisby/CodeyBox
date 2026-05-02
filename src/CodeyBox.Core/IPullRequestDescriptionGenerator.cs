@@ -3,9 +3,8 @@ namespace CodeyBox.Core;
 /// <summary>
 /// Produces a human-readable PR body from the diff and agent context.
 /// Called by the upstream remote after pushing the work branch and before
-/// opening the pull request. Implementations must be non-throwing on their
-/// own failures — the caller is responsible for enforcing a timeout and
-/// falling back to the static template when the generator fails.
+/// opening the pull request. Implementations may throw; callers must enforce
+/// a timeout and fall back to the static template on failure.
 /// </summary>
 public interface IPullRequestDescriptionGenerator
 {
@@ -19,9 +18,9 @@ public sealed record PullRequestDescriptionRequest
     public required string DiffSummary { get; init; }
 
     /// <summary>
-    /// Full git diff output between base and work branches, capped at
-    /// <see cref="PrDescriptionOptions.MaxDiffBytes"/> and truncated from the
-    /// middle so both the first and last diff hunks are preserved.
+    /// Full git diff output between base and work branches.
+    /// Callers need not pre-truncate; <see cref="IPullRequestDescriptionGenerator.GenerateAsync"/>
+    /// applies <see cref="PrDescriptionOptions.MaxDiffBytes"/> truncation internally.
     /// </summary>
     public required string FullDiff { get; init; }
 

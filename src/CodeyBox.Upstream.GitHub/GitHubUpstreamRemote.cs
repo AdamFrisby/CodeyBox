@@ -227,11 +227,11 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             using var genCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             genCts.CancelAfter(_opts.PrDescription.Timeout);
 
-            var agentTail = ExtractAgentReasoningTail(request.Description);
-            var fullDiff = LlmPullRequestDescriptionGenerator.TruncateMiddle(
-                request.FullDiff, _opts.PrDescription.MaxDiffBytes);
+            var agentTailRaw = ExtractAgentReasoningTail(request.Description);
+            var agentTail = agentTailRaw is null ? null : RawOutputRedactor.Redact(agentTailRaw);
             // Redact before sending to LLM — diff may contain accidentally-committed tokens.
-            var redactedDiff = RawOutputRedactor.Redact(fullDiff);
+            // Truncation to MaxDiffBytes is applied inside GenerateAsync.
+            var redactedDiff = RawOutputRedactor.Redact(request.FullDiff);
             var redactedStat = RawOutputRedactor.Redact(request.DiffStat);
             var redactedPrompt = RawOutputRedactor.Redact(
                 request.WorkItemPrompt is { Length: > 2048 }
