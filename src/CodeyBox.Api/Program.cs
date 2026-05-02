@@ -484,6 +484,55 @@ builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
         sp.GetRequiredService<ILogger<HttpWebhookDispatcher>>());
 });
 
+// --- Changelog automation ----------------------------------------------------
+// Named HTTP client for direct Anthropic Messages API calls (changelog generation).
+// Reuses api.anthropic.com which is already in AgentAllowedHosts; this client is
+// used only from the API process, not from sandbox agents.
+builder.Services.AddHttpClient("changelog-claude", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(60);
+});
+
+builder.Services.AddSingleton<IPullRequestEnumerator>(sp =>
+    new CodeyBox.Upstream.GitHub.GitHubPullRequestEnumerator(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILogger<CodeyBox.Upstream.GitHub.GitHubPullRequestEnumerator>>()));
+
+builder.Services.AddSingleton<IChangelogGenerator>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Changelog;
+    return new ClaudeChangelogGenerator(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILogger<ClaudeChangelogGenerator>>(),
+        opts);
+});
+
+// Changelog webhook HMAC secret — mirrors the SandboxProvider enforcement pattern.
+// In non-Development environments the secret env-var MUST be configured so that
+// the POST /webhooks/github/release endpoint always validates HMAC signatures.
+{
+    var changelogCfg = builder.Configuration.GetSection("CodeyBox:Changelog");
+    var changelogEnabled = changelogCfg.GetValue<bool>("Enabled", true);
+    var webhookSecretEnvVar = changelogCfg["GitHubWebhookSecretEnvVar"];
+    if (changelogEnabled && string.IsNullOrEmpty(webhookSecretEnvVar))
+    {
+        if (builder.Environment.IsDevelopment())
+        {
+            Log.Warning(
+                "CodeyBox:Changelog:GitHubWebhookSecretEnvVar is not configured. " +
+                "GitHub release webhooks will be rejected with 401 until a secret is set. " +
+                "This is a configuration error in non-Development environments.");
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:Changelog:GitHubWebhookSecretEnvVar must be configured in non-Development environments. " +
+                "Set it to the name of the environment variable holding the HMAC-SHA256 webhook secret " +
+                "(see docs/changelog-automation.md).");
+        }
+    }
+}
+
 // --- Audit timeline reader ---------------------------------------------------
 builder.Services.AddSingleton(sp =>
 {
@@ -629,13 +678,14 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
 
 var app = builder.Build();
 
-app.UseApiKeyAuth(anonymousPrefixes: ["/healthz"]);
+app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
 
 WorkItemEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
+ChangelogEndpoints.Map(app);
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
@@ -767,6 +817,49 @@ namespace CodeyBox.Api
 
         /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
         public AgentPricingOptions AgentPricing { get; set; } = new();
+
+        /// <summary>Changelog automation configuration. See docs/changelog-automation.md.</summary>
+        public ChangelogOptions Changelog { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Global changelog automation options. Bound from <c>CodeyBox:Changelog</c>.
+    /// Per-project overrides are applied via <c>Project.Changelog</c>.
+    /// </summary>
+    public sealed class ChangelogOptions
+    {
+        /// <summary>Enable or disable changelog automation globally. Default true.</summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// LLM agent to use for generation. Currently only "claude" is supported.
+        /// Default "claude".
+        /// </summary>
+        public string GeneratorAgent { get; set; } = "claude";
+
+        /// <summary>
+        /// Optional model override for the generator LLM call, e.g. "claude-opus-4-7".
+        /// Defaults to "claude-opus-4-7".
+        /// </summary>
+        public string? GeneratorModelId { get; set; }
+
+        /// <summary>
+        /// Path to CHANGELOG.md within the project repo. Default "CHANGELOG.md".
+        /// </summary>
+        public string ChangelogPath { get; set; } = "CHANGELOG.md";
+
+        /// <summary>
+        /// Section header format. Supports {tag} and {date:yyyy-MM-dd} placeholders.
+        /// Default: "## [{tag}] - {date:yyyy-MM-dd}".
+        /// </summary>
+        public string SectionHeaderFormat { get; set; } = "## [{tag}] - {date:yyyy-MM-dd}";
+
+        /// <summary>
+        /// Name of the environment variable holding the HMAC-SHA256 secret for
+        /// validating incoming GitHub release webhooks. Must be set in non-Development
+        /// environments; the webhook endpoint rejects all requests with 401 if not configured.
+        /// </summary>
+        public string? GitHubWebhookSecretEnvVar { get; set; }
     }
 
     /// <summary>
