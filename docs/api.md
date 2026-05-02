@@ -443,6 +443,63 @@ Fetch a single project by its id.
 
 Liveness probe. Returns `{ "status": "ok" }`.
 
+### `POST /projects/{id}/release`
+
+Generate a CHANGELOG.md entry for a release. Enumerates merged PRs between
+`fromTag` and `toTag`, calls the configured LLM to categorise and summarise
+them, and returns the generated markdown immediately.
+
+Requires the project to have a GitHub upstream configured with a valid PAT.
+
+```json
+{
+  "fromTag": "v1.2.0",
+  "toTag":   "v1.3.0"
+}
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "markdown": "## [v1.3.0] - 2026-05-15\n\n### Added\n- ...\n",
+  "categoryToPrNumbers": {
+    "Added": [16, 18],
+    "Fixed": [17]
+  },
+  "wasCapped": false
+}
+```
+
+`wasCapped: true` means the release contained more than 200 PRs and the
+oldest were omitted.
+
+* Returns `400 Bad Request` when `fromTag` or `toTag` is missing, the
+  project has no GitHub upstream configured, or changelog automation is
+  disabled for the project.
+* Returns `404 Not Found` when the project does not exist.
+
+See [`changelog-automation.md`](changelog-automation.md) for configuration
+and the webhook flow.
+
+### `POST /webhooks/github/release`
+
+Receive a GitHub `release` webhook event. Validates the
+`X-Hub-Signature-256` HMAC, resolves the project by repository URL,
+generates a changelog entry, and creates a work item to apply it to
+`CHANGELOG.md`. Returns `202 Accepted` immediately; the work item runs
+through the normal pipeline.
+
+This endpoint is **exempt from API-key authentication**. It validates the
+GitHub HMAC instead.
+
+* A missing or invalid `X-Hub-Signature-256` returns `401` with no body.
+* Non-`release` event types (e.g. `ping`) return `202 Accepted` silently.
+* Non-`published`/`released` actions (e.g. `deleted`) return `202 Accepted` silently.
+* Repositories not matching any configured project return `202 Accepted` silently.
+
+See [`changelog-automation.md`](changelog-automation.md) for setup instructions.
+
 ## Work item record
 
 ```json

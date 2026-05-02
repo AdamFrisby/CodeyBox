@@ -103,6 +103,26 @@ public sealed record Project
     /// time can grant it; another project's merge phase can stay isolated.
     /// </summary>
     public ProjectNetworkProfiles NetworkProfiles { get; init; } = new();
+
+    /// <summary>
+    /// Per-project changelog automation overrides. When set, these take precedence
+    /// over the global <c>CodeyBox:Changelog</c> options.
+    /// </summary>
+    public ProjectChangelog? Changelog { get; init; }
+}
+
+/// <summary>
+/// Per-project changelog automation overrides. Unset fields fall back to the
+/// global <c>ChangelogOptions</c>. See <c>docs/changelog-automation.md</c>.
+/// </summary>
+public sealed record ProjectChangelog
+{
+    /// <summary>Override the global Enabled flag for this project.</summary>
+    public bool? Enabled { get; init; }
+    /// <summary>Path to CHANGELOG.md within the project repo. Overrides global ChangelogPath.</summary>
+    public string? ChangelogPath { get; init; }
+    /// <summary>Section header format. Overrides global SectionHeaderFormat.</summary>
+    public string? SectionHeaderFormat { get; init; }
 }
 
 /// <summary>

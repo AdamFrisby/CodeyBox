@@ -266,6 +266,31 @@ public static class AuditLog
                 "Suggestion {SuggestionId} could not be reverted to open after promotion failure; stuck in 'accepted' with no linked work item",
                 suggestionId);
 
+    // ── Changelog automation ─────────────────────────────────────────────────
+
+    public static void ChangelogReleaseRequested(string projectId, string fromTag, string toTag, int prCount) =>
+        Audit("changelog.release_requested")
+            .Information("Changelog generation requested for project {ProjectId}: {FromTag}→{ToTag} ({PrCount} PRs)",
+                projectId, fromTag, toTag, prCount);
+
+    public static void ChangelogGenerated(string projectId, string toTag, string category, int prCount) =>
+        Audit("changelog.generated")
+            .Information("Changelog generated for project {ProjectId} tag {ToTag}: {Category} ({PrCount} PRs)",
+                projectId, toTag, category, prCount);
+
+    public static void ChangelogWebhookReceived(string owner, string repo, string tagName) =>
+        Audit("changelog.webhook_received")
+            .Information("GitHub release webhook received for {Owner}/{Repo} tag {TagName}", owner, repo, tagName);
+
+    public static void ChangelogWebhookRejected(string reason) =>
+        Audit("changelog.webhook_rejected")
+            .Warning("GitHub release webhook rejected: {Reason}", reason);
+
+    public static void ChangelogWorkItemCreated(string workItemId, string projectId, string toTag) =>
+        Audit("changelog.work_item_created")
+            .Information("Changelog work item {WorkItemId} created for project {ProjectId} tag {ToTag}",
+                workItemId, projectId, toTag);
+
     // ── Budget caps ──────────────────────────────────────────────────────────
 
     public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>
