@@ -146,6 +146,35 @@ public static partial class Validation
     }
 
     /// <summary>
+    /// External ID character set: ASCII printable (0x21–0x7E) excluding '/' (0x2F) and '?' (0x3F)
+    /// to avoid URL-path collisions.
+    /// </summary>
+    [GeneratedRegex(@"^[!-\x2E\x30-\x3E@-~]+$", RegexOptions.CultureInvariant)]
+    private static partial Regex ExternalIdCharSetRegex();
+
+    /// <summary>
+    /// Validates an externalId value. Rules:
+    /// - 1–256 ASCII printable characters (no whitespace).
+    /// - No '/' or '?' (avoid URL-path segment ambiguity).
+    /// - Must not start with "wi-" (reserved internal prefix).
+    /// - Must not be parseable as a UUID (would be ambiguous with internal IDs).
+    /// </summary>
+    public static void ValidateExternalId(string value, string fieldName)
+    {
+        if (string.IsNullOrEmpty(value))
+            throw new ArgumentException($"{fieldName} must not be empty", fieldName);
+        if (value.Length > 256)
+            throw new ArgumentException($"{fieldName} must be <= 256 characters", fieldName);
+        if (!ExternalIdCharSetRegex().IsMatch(value))
+            throw new ArgumentException(
+                $"{fieldName} must contain only ASCII printable characters (no whitespace, '/', or '?')", fieldName);
+        if (value.StartsWith("wi-", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException($"{fieldName} must not start with 'wi-' (reserved prefix)", fieldName);
+        if (Guid.TryParse(value, out _))
+            throw new ArgumentException($"{fieldName} must not be a UUID (ambiguous with internal IDs)", fieldName);
+    }
+
+    /// <summary>
     /// Validates a string used as a positional argument for a tool that may
     /// otherwise interpret leading '-' as an option, and forbids control
     /// characters that could affect log/audit fidelity.

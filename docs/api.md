@@ -35,6 +35,7 @@ Queue a new work item.
 ```json
 {
   "projectId": "my-app",
+  "externalId": "JIRA-1234",
   "title": "Add JSON config support",
   "prompt": "Add a --config flag that reads settings from a JSON file. Update README.",
   "agent": null,
@@ -47,6 +48,11 @@ Queue a new work item.
 
 * `projectId` — required. Must match a configured project (see
   [`projects.md`](projects.md)). Unknown ids are rejected.
+* `externalId` — optional caller-supplied identifier (e.g. `"JIRA-1234"`,
+  `"GH-456"`, `"sprint-7:ticket-99"`). Must be 1–256 ASCII printable
+  characters (no whitespace, no `/`, no `?`), must not start with `wi-`,
+  must not be a UUID. Unique per project. Rejected with `400` on
+  duplicate. See [`external-ids.md`](external-ids.md) for the full contract.
 * `title` — short label, ≤ 200 chars, no leading dash, no control chars.
 * `prompt` — what to give to the agent. ≤ 64 KB.
 * `agent` — optional override. `"claude"`, `"copilot"`, `"codex"`, `"gemini"`, or any
@@ -62,10 +68,12 @@ Queue a new work item.
   caller cannot bypass it by aliasing the two).
 * `pushUpstream` — if `true` *and* the project has an upstream configured,
   push to it after merge.
-* `dependsOn` — optional array of work item IDs. The item will not be
-  picked up until every listed dependency has reached a terminal state
-  (`Done`, `Failed`, `AuditFailed`, or `Cancelled`). Unknown IDs, self
-  references, and cycles are rejected with `400`. See
+* `dependsOn` — optional array of work item IDs **or externalIds**. Each
+  entry is resolved: if it parses as a UUID it is looked up by internal ID;
+  otherwise it is looked up by `externalId` within the same project. This
+  allows batching dependent items without waiting for UUID responses — see
+  [`external-ids.md`](external-ids.md#dependency-batching-without-round-trips).
+  Unknown IDs, self references, and cycles are rejected with `400`. See
   [`work-items.md`](work-items.md) for details.
 
 Response: `201 Created` with the work item record.
@@ -76,7 +84,17 @@ List all work items, newest first.
 
 ### `GET /workitems/{id}`
 
-Fetch a single work item by id (UUID).
+Fetch a single work item. The `{id}` path segment accepts either:
+
+- A UUID: `GET /workitems/abcd-1234-...`
+- A composite `<projectId>:<externalId>`: `GET /workitems/my-app:JIRA-1234`
+
+The composite form is unambiguous and works with all endpoints that accept `{id}`
+(`GET`, `DELETE`, `PATCH /workitems/{id}`, `POST /workitems/{id}/retry`,
+`GET /workitems/{id}/dependents`, `GET /workitems/{id}/timeline`, etc.).
+
+Returns `400 Bad Request` when the colon form has an empty project or externalId part.
+Returns `404 Not Found` when the project exists but has no item with that externalId.
 
 ### `GET /workitems/{id}/dependents`
 
@@ -430,6 +448,7 @@ Liveness probe. Returns `{ "status": "ok" }`.
 ```json
 {
   "id": "5b6e...",
+  "externalId": "JIRA-1234",
   "projectId": "my-app",
   "title": "...",
   "prompt": "Add a --config flag …",
@@ -443,11 +462,19 @@ Liveness probe. Returns `{ "status": "ok" }`.
   "upstreamPushAttempts": 0,
   "dependsOn": [],
   "dependsOnSatisfied": true,
+  "dependsOnExternalIds": {},
   "queuePosition": 0
 }
 ```
 
+`externalId` is the caller-supplied identifier, or `null` when not provided. See
+[`external-ids.md`](external-ids.md) for the validation rules and usage patterns.
+
 `prompt` is the full task text given to the agent (≤ 64 KB).
+
+`dependsOnExternalIds` is a map of dependency UUID → externalId for each item in
+`dependsOn`. Values are `null` for dependencies that have no externalId. Useful
+for displaying human-readable dependency labels.
 
 `queuePosition` is an ordering hint for Queued items set by `POST /workitems/reorder`. Smaller values sort first. Items not yet explicitly reordered have a position derived from their creation timestamp and sort after explicitly positioned items.
 

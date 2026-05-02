@@ -176,6 +176,7 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
 
     private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string? repositoryUrl, AgentKind projectDefaultAgent) => new(
         Id: item.Id.ToString(),
+        ExternalId: item.ExternalId,
         ProjectId: item.ProjectId.Value,
         Title: item.Title,
         Agent: (item.Agent ?? projectDefaultAgent).Value,
@@ -231,6 +232,7 @@ internal sealed record WebhookPayload(
 
 internal sealed record WebhookWorkItemPayload(
     string Id,
+    string? ExternalId,
     string ProjectId,
     string Title,
     string Agent,

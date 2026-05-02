@@ -43,6 +43,10 @@ else
 
     <table class="detail-table">
         <tr><th>ID</th><td><code>@_item.Id</code></td></tr>
+        @if (_item.ExternalId is not null)
+        {
+            <tr><th>External ID</th><td><code>@_item.ExternalId</code></td></tr>
+        }
         <tr><th>Project</th><td>@_item.ProjectId</td></tr>
         <tr><th>Agent</th><td>@_item.Agent</td></tr>
         <tr><th>State</th><td class="state-@_item.State.ToLowerInvariant()">@_item.State</td></tr>
@@ -66,7 +70,9 @@ else
                 <td>
                     @foreach (var dep in _item.DependsOn)
                     {
-                        <a href="/work-items/@dep">@dep[..Math.Min(8, dep.Length)]</a><span> </span>
+                        var extId = _item.DependsOnExternalIds.TryGetValue(dep, out var eid) ? eid : null;
+                        var label = extId ?? dep[..Math.Min(8, dep.Length)];
+                        <a href="/work-items/@dep" title="@dep">@label</a><span> </span>
                     }
                     @(_item.DependsOnSatisfied ? "(satisfied)" : "(waiting)")
                 </td>

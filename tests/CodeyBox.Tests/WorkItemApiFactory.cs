@@ -54,8 +54,15 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
             services.AddSingleton<IWorkItemStore>(Store);
 
             // Replace the file-backed project repository with an in-memory stub.
+            // Seed "test-project" so HTTP-level tests that POST /workitems can resolve it.
             services.RemoveAll<IProjectRepository>();
-            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository());
+            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
+                new Project
+                {
+                    Id = new ProjectId("test-project"),
+                    DisplayName = "Test Project",
+                    RepositoryUrl = "https://github.com/test/repo",
+                }));
         });
     }
 

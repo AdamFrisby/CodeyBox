@@ -45,6 +45,7 @@ Every event is a JSON object POSTed as the request body.
   "occurredAt": "2026-04-29T12:34:56.789+00:00",
   "workItem": {
     "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "externalId": "JIRA-1234",
     "projectId": "my-project",
     "title": "Add dark-mode support",
     "agent": "claude",
@@ -139,6 +140,8 @@ When `event` is `queue.paused`:
   }
 }
 ```
+
+`externalId` is the caller-supplied identifier set at creation, or `null` when not provided. Receivers that don't need it can ignore the field.
 
 `workItem` and `project` are `null` for queue-level events.
 

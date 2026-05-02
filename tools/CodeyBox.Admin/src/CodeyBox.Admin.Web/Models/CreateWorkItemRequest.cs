@@ -7,6 +7,7 @@ namespace CodeyBox.Admin.Web.Models;
 public sealed class CreateWorkItemRequest
 {
     public string ProjectId { get; set; } = "";
+    public string? ExternalId { get; set; }
     public string Title { get; set; } = "";
     public string Prompt { get; set; } = "";
     public string? Agent { get; set; }
