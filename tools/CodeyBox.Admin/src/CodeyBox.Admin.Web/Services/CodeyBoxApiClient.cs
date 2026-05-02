@@ -234,4 +234,25 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadFromJsonAsync<AggregateTimingsDto>(JsonOptions, ct);
     }
+
+    public async Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/costs", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemCostsDto>(JsonOptions, ct);
+    }
+
+    public async Task<ProjectCostsDto?> GetProjectCostsAsync(
+        string projectId, string? from = null, string? to = null, CancellationToken ct = default)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(from)) parts.Add($"from={Uri.EscapeDataString(from)}");
+        if (!string.IsNullOrEmpty(to)) parts.Add($"to={Uri.EscapeDataString(to)}");
+        var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
+        var resp = await _http.GetAsync($"/projects/{Uri.EscapeDataString(projectId)}/costs{qs}", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<ProjectCostsDto>(JsonOptions, ct);
+    }
 }

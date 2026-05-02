@@ -208,6 +208,116 @@ suffix is appended when the original exceeded the cap.
 * Returns `404 Not Found` when the work item, iteration, or auditor row
   does not exist, or when `raw_output` is `NULL` for that row.
 
+### `GET /workitems/{id}/costs`
+
+Returns token usage and estimated cost data for a single work item, aggregated
+by phase and by agent.  See [`cost-reporting.md`](cost-reporting.md) for the
+cost model and pricing configuration.
+
+**Response (200 OK):**
+
+```json
+{
+  "workItemId": "aabbccdd00000000000000000000001a",
+  "totals": {
+    "inputTokens": 12345,
+    "cachedInputTokens": 3000,
+    "outputTokens": 678,
+    "estimatedUsd": 0.0234
+  },
+  "byPhase": {
+    "work": {
+      "inputTokens": 8000,
+      "cachedInputTokens": 2000,
+      "outputTokens": 400,
+      "estimatedUsd": 0.015,
+      "byIteration": []
+    },
+    "audit": {
+      "inputTokens": 4345,
+      "cachedInputTokens": 1000,
+      "outputTokens": 278,
+      "estimatedUsd": 0.0084,
+      "byIteration": [
+        { "iteration": 1, "inputTokens": 4345, "cachedInputTokens": 1000, "outputTokens": 278, "estimatedUsd": 0.0084 }
+      ]
+    }
+  },
+  "byAgent": [
+    {
+      "agent": "claude",
+      "modelId": "claude-sonnet-4-6",
+      "inputTokens": 12345,
+      "cachedInputTokens": 3000,
+      "outputTokens": 678,
+      "estimatedUsd": 0.0234
+    }
+  ]
+}
+```
+
+`byPhase` contains only phases for which at least one cost row exists.
+`byIteration` within a phase lists per-iteration subtotals (used for `rework`
+and `audit` phases; empty for `work` and `merge`).
+
+* Returns `200 OK` with zero-valued totals and empty breakdowns when the work
+  item exists but no cost rows have been recorded yet.
+* Returns `404 Not Found` when the work item does not exist.
+* Returns `400 Bad Request` when `{id}` is not a valid UUID.
+
+### `GET /projects/{id}/costs`
+
+Returns aggregated token usage and estimated cost for all work items in a
+project, optionally restricted to a time window.
+
+**Query parameters:**
+
+| Param | Description |
+|-------|-------------|
+| `from` | ISO-8601 timestamp (inclusive). Defaults to 30 days ago. |
+| `to`   | ISO-8601 timestamp (inclusive). Defaults to now. |
+
+**Response (200 OK):**
+
+```json
+{
+  "projectId": "my-app",
+  "from": "2026-04-01T00:00:00+00:00",
+  "to": "2026-05-01T00:00:00+00:00",
+  "totals": {
+    "inputTokens": 500000,
+    "cachedInputTokens": 120000,
+    "outputTokens": 30000,
+    "estimatedUsd": 4.56
+  },
+  "byAgent": [
+    {
+      "agent": "claude",
+      "modelId": null,
+      "inputTokens": 500000,
+      "cachedInputTokens": 120000,
+      "outputTokens": 30000,
+      "estimatedUsd": 4.56
+    }
+  ],
+  "byWorkItem": [
+    {
+      "workItemId": "aabbccdd00000000000000000000001a",
+      "inputTokens": 12345,
+      "cachedInputTokens": 3000,
+      "outputTokens": 678,
+      "estimatedUsd": 0.0234
+    }
+  ]
+}
+```
+
+`byAgent` rows have `modelId: null` because the project-level rollup may
+span multiple models.  `byWorkItem` is sorted by `started_at` descending.
+
+* Returns `404 Not Found` when the project does not exist.
+* Returns `400 Bad Request` when `from` or `to` cannot be parsed as ISO-8601.
+
 ### `GET /workitems/{id}/timings`
 
 Returns per-step wall-clock timing data for a single work item as a structured

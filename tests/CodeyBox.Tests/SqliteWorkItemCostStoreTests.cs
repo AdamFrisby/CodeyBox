@@ -1,0 +1,165 @@
+using CodeyBox.Core;
+using CodeyBox.Orchestrator;
+using Microsoft.Data.Sqlite;
+
+namespace CodeyBox.Tests;
+
+public sealed class SqliteWorkItemCostStoreTests : IDisposable
+{
+    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-cost-test-{Guid.NewGuid():N}.db");
+    private readonly SqliteConnection _rawConn;
+    private readonly SqliteWorkItemCostStore _store;
+
+    public SqliteWorkItemCostStoreTests()
+    {
+        _rawConn = new SqliteConnection($"Data Source={_dbPath}");
+        _rawConn.Open();
+        using var setupCmd = _rawConn.CreateCommand();
+        setupCmd.CommandText = """
+            CREATE TABLE IF NOT EXISTS work_items (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL DEFAULT '',
+                state INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+            """;
+        setupCmd.ExecuteNonQuery();
+        _store = new SqliteWorkItemCostStore(_dbPath);
+    }
+
+    public void Dispose()
+    {
+        _store.Dispose();
+        _rawConn.Dispose();
+        try { File.Delete(_dbPath); } catch { /* best-effort */ }
+    }
+
+    private void SeedWorkItem(string id, string projectId = "test-project")
+    {
+        using var cmd = _rawConn.CreateCommand();
+        cmd.CommandText = "INSERT INTO work_items (id, project_id, state, updated_at) VALUES ($id, $proj, 0, $now)";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$proj", projectId);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    private static WorkItemCost MakeCost(string workItemId, string phase = "work") => new()
+    {
+        Id = Guid.NewGuid().ToString("N"),
+        WorkItemId = workItemId,
+        Phase = phase,
+        AgentKind = "claude",
+        ModelId = "claude-opus-4-7",
+        InputTokens = 12345,
+        CachedInputTokens = 500,
+        OutputTokens = 678,
+        EstimatedUsd = 0.168525,
+        StartedAt = DateTimeOffset.UtcNow.AddSeconds(-5),
+        EndedAt = DateTimeOffset.UtcNow,
+    };
+
+    [Fact]
+    public async Task RoundTrip_RecordAndGetByWorkItem_AllFieldsCorrect()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId);
+        var cost = MakeCost(itemId);
+
+        await _store.RecordAsync(cost);
+        var rows = await _store.GetByWorkItemAsync(itemId);
+
+        Assert.Single(rows);
+        var row = rows[0];
+        Assert.Equal(cost.Id, row.Id);
+        Assert.Equal(itemId, row.WorkItemId);
+        Assert.Equal("work", row.Phase);
+        Assert.Equal("claude", row.AgentKind);
+        Assert.Equal("claude-opus-4-7", row.ModelId);
+        Assert.Equal(12345, row.InputTokens);
+        Assert.Equal(500, row.CachedInputTokens);
+        Assert.Equal(678, row.OutputTokens);
+        Assert.Equal(0.168525, row.EstimatedUsd, precision: 5);
+    }
+
+    [Fact]
+    public async Task GetByProjectAsync_ReturnsCostForProjectWorkItem()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, "proj-alpha");
+        var cost = MakeCost(itemId);
+        await _store.RecordAsync(cost);
+
+        var from = DateTimeOffset.UtcNow.AddHours(-1);
+        var to = DateTimeOffset.UtcNow.AddHours(1);
+        var rows = await _store.GetByProjectAsync("proj-alpha", from, to);
+
+        Assert.Single(rows);
+        Assert.Equal(itemId, rows[0].WorkItemId);
+    }
+
+    [Fact]
+    public async Task DeleteByWorkItemAsync_RemovesRows()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId);
+        await _store.RecordAsync(MakeCost(itemId));
+
+        await _store.DeleteByWorkItemAsync(itemId);
+        var rows = await _store.GetByWorkItemAsync(itemId);
+
+        Assert.Empty(rows);
+    }
+
+    [Fact]
+    public async Task FkCascadeDelete_WorkItemDelete_RemovesCostRows()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId);
+        await _store.RecordAsync(MakeCost(itemId));
+
+        using var deleteCmd = _rawConn.CreateCommand();
+        deleteCmd.CommandText = "PRAGMA foreign_keys=ON; DELETE FROM work_items WHERE id = $id";
+        deleteCmd.Parameters.AddWithValue("$id", itemId);
+        deleteCmd.ExecuteNonQuery();
+
+        var rows = await _store.GetByWorkItemAsync(itemId);
+        Assert.Empty(rows);
+    }
+
+    [Fact]
+    public async Task MultipleRowsForSameWorkItem_AllReturned()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId);
+        await _store.RecordAsync(MakeCost(itemId, "work"));
+        await _store.RecordAsync(MakeCost(itemId, "merge"));
+
+        var rows = await _store.GetByWorkItemAsync(itemId);
+
+        Assert.Equal(2, rows.Count);
+    }
+
+    [Fact]
+    public async Task GetByProjectAsync_DateRangeFilter_ExcludesOutsideRange()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, "proj-beta");
+
+        // Record a cost with StartedAt well in the past
+        var pastCost = MakeCost(itemId) with
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            StartedAt = DateTimeOffset.UtcNow.AddDays(-10),
+            EndedAt = DateTimeOffset.UtcNow.AddDays(-10).AddSeconds(5),
+        };
+        await _store.RecordAsync(pastCost);
+
+        // Query a range that excludes the past cost
+        var from = DateTimeOffset.UtcNow.AddDays(-2);
+        var to = DateTimeOffset.UtcNow.AddDays(1);
+        var rows = await _store.GetByProjectAsync("proj-beta", from, to);
+
+        Assert.Empty(rows);
+    }
+}

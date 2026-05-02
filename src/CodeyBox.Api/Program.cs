@@ -512,6 +512,11 @@ builder.Services.AddSingleton<ITimingStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteTimingStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IWorkItemCostStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteWorkItemCostStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IQueueController>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -519,6 +524,36 @@ builder.Services.AddSingleton<IQueueController>(sp =>
 });
 builder.Services.AddSingleton<InMemoryTaskQueue>();
 builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTaskQueue>());
+
+// --- Agent cost extractors + calculator ------------------------------------
+builder.Services.AddSingleton<AgentCostCalculator>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
+    var pricing = opts.AgentPricing;
+    AgentCostCalculator.ValidateAtStartup(pricing,
+        sp.GetRequiredService<IAgentRegistry>().Available, startupLog);
+    return new AgentCostCalculator(pricing);
+});
+builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(sp =>
+{
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentCosts");
+    var registry = sp.GetRequiredService<IAgentRegistry>();
+    var extractors = new Dictionary<AgentKind, IAgentCostExtractor>
+    {
+        [AgentKind.Claude] = new ClaudeCostExtractor(),
+        [AgentKind.Codex] = new CodexCostExtractor(),
+        [AgentKind.Gemini] = new GeminiCostExtractor(),
+    };
+    // Warn once at startup for registered agents with no extractor.
+    foreach (var kind in registry.Available)
+    {
+        if (!extractors.ContainsKey(kind))
+            startupLog.LogWarning(
+                "No cost extractor registered for agent '{Agent}'; cost data will not be captured for this agent", kind.Value);
+    }
+    return extractors;
+});
 
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
@@ -551,7 +586,11 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<ISuggestionStore>(),
     sp.GetServices<IAgentQuotaProbe>(),
     sp.GetService<QuotaRouterOptions>(),
-    sp.GetRequiredService<IAuditReportStore>()));
+    sp.GetRequiredService<IAuditReportStore>(),
+    null,
+    sp.GetRequiredService<IWorkItemCostStore>(),
+    sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(),
+    sp.GetRequiredService<AgentCostCalculator>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
@@ -594,6 +633,7 @@ app.UseApiKeyAuth(anonymousPrefixes: ["/healthz"]);
 
 WorkItemEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
+WorkItemCostsEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 
@@ -724,6 +764,9 @@ namespace CodeyBox.Api
 
         /// <summary>Credential smoke test tuning knobs.</summary>
         public SmokeConfig Smoke { get; set; } = new();
+
+        /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
+        public AgentPricingOptions AgentPricing { get; set; } = new();
     }
 
     /// <summary>
