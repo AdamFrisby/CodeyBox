@@ -7,6 +7,7 @@ namespace CodeyBox.Admin.Web.Models;
 public sealed class WorkItemDto
 {
     public string Id { get; set; } = "";
+    public string? ExternalId { get; set; }
     public string ProjectId { get; set; } = "";
     public string Title { get; set; } = "";
     public string Prompt { get; set; } = "";
@@ -21,6 +22,7 @@ public sealed class WorkItemDto
     public int UpstreamPushAttempts { get; set; }
     public List<string> DependsOn { get; set; } = [];
     public bool DependsOnSatisfied { get; set; }
+    public Dictionary<string, string?> DependsOnExternalIds { get; set; } = [];
     public long QueuePosition { get; set; }
 
     public bool IsTerminal => State is "Done" or "Failed" or "Cancelled" or "AuditFailed";

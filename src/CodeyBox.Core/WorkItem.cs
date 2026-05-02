@@ -98,6 +98,13 @@ public sealed record WorkItem
     /// </summary>
     public DateTimeOffset? StartedAt { get; init; }
 
+    /// <summary>
+    /// Caller-supplied identifier unique within the project (e.g. "JIRA-1234", "GH-#456").
+    /// Null when not provided. Allows API callers to reference work items by a familiar
+    /// external ID and to batch-queue dependent work items without a round-trip for UUIDs.
+    /// </summary>
+    public string? ExternalId { get; init; }
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,

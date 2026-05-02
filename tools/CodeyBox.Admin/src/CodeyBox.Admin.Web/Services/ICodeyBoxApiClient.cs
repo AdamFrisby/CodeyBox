@@ -58,6 +58,7 @@ public interface ICodeyBoxApiClient
         string? baseBranch = null,
         bool? pushUpstream = null,
         string? agentClassId = null,
+        string? externalId = null,
         CancellationToken ct = default);
 }
 
