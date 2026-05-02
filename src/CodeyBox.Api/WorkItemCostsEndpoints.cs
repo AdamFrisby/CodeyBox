@@ -29,10 +29,18 @@ internal static class WorkItemCostsEndpoints
     private static async Task<IResult> GetProjectCostsAsync(
         string id,
         IWorkItemCostStore costs,
+        IProjectRepository projects,
         string? from,
         string? to,
         CancellationToken ct)
     {
+        ProjectId pid;
+        try { pid = new ProjectId(id); }
+        catch (ArgumentException) { return Results.BadRequest(new { error = "invalid project id" }); }
+
+        var project = await projects.GetAsync(pid, ct);
+        if (project is null) return Results.NotFound();
+
         var fromDate = TryParseIso(from) ?? DateTimeOffset.UtcNow.AddDays(-30);
         var toDate = TryParseIso(to) ?? DateTimeOffset.UtcNow;
 
@@ -57,36 +65,25 @@ internal static class WorkItemCostsEndpoints
                 g => g.Key,
                 g =>
                 {
-                    var byIter = g.Where(r => r.Iteration.HasValue).ToList();
-                    if (byIter.Count > 0)
-                    {
-                        var iters = byIter
-                            .GroupBy(r => r.Iteration)
-                            .OrderBy(ig => ig.Key)
-                            .Select(ig => new
-                            {
-                                iteration = ig.Key,
-                                inputTokens = ig.Sum(r => r.InputTokens),
-                                cachedInputTokens = ig.Sum(r => r.CachedInputTokens),
-                                outputTokens = ig.Sum(r => r.OutputTokens),
-                                estimatedUsd = ig.Sum(r => r.EstimatedUsd),
-                            })
-                            .ToList();
-                        return (object)new
+                    var byIter = g.Where(r => r.Iteration.HasValue)
+                        .GroupBy(r => r.Iteration)
+                        .OrderBy(ig => ig.Key)
+                        .Select(ig => new
                         {
-                            inputTokens = g.Sum(r => r.InputTokens),
-                            cachedInputTokens = g.Sum(r => r.CachedInputTokens),
-                            outputTokens = g.Sum(r => r.OutputTokens),
-                            estimatedUsd = g.Sum(r => r.EstimatedUsd),
-                            byIteration = iters,
-                        };
-                    }
+                            iteration = ig.Key,
+                            inputTokens = ig.Sum(r => r.InputTokens),
+                            cachedInputTokens = ig.Sum(r => r.CachedInputTokens),
+                            outputTokens = ig.Sum(r => r.OutputTokens),
+                            estimatedUsd = ig.Sum(r => r.EstimatedUsd),
+                        })
+                        .ToList();
                     return (object)new
                     {
                         inputTokens = g.Sum(r => r.InputTokens),
                         cachedInputTokens = g.Sum(r => r.CachedInputTokens),
                         outputTokens = g.Sum(r => r.OutputTokens),
                         estimatedUsd = g.Sum(r => r.EstimatedUsd),
+                        byIteration = byIter,
                     };
                 });
 
@@ -147,6 +144,7 @@ internal static class WorkItemCostsEndpoints
 
         var byWorkItem = rows
             .GroupBy(r => r.WorkItemId)
+            .OrderByDescending(g => g.Max(r => r.StartedAt))
             .Select(g => new
             {
                 workItemId = g.Key,
@@ -155,7 +153,6 @@ internal static class WorkItemCostsEndpoints
                 outputTokens = g.Sum(r => r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
             })
-            .OrderByDescending(x => x.estimatedUsd)
             .ToList();
 
         return new
