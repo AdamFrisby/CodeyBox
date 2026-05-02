@@ -676,6 +676,13 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog.RetainedDays,
     sp.GetRequiredService<ILogger<AuditReportRetentionService>>()));
 
+// --- Plugin foundation -------------------------------------------------------
+// Discovers assemblies from CodeyBox:Plugins, registers plugin types under
+// their Core interfaces before the container is frozen, then runs
+// IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
+// See docs/plugins.md for author guidance, allowlist config, and threat model.
+builder.Services.AddCodeyBoxPlugins(builder.Configuration);
+
 var app = builder.Build();
 
 app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);

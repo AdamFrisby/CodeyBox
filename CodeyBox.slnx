@@ -14,6 +14,7 @@
     <Project Path="src/CodeyBox.Core/CodeyBox.Core.csproj" />
     <Project Path="src/CodeyBox.Git/CodeyBox.Git.csproj" />
     <Project Path="src/CodeyBox.Orchestrator/CodeyBox.Orchestrator.csproj" />
+    <Project Path="src/CodeyBox.PluginSdk/CodeyBox.PluginSdk.csproj" />
     <Project Path="src/CodeyBox.Projects/CodeyBox.Projects.csproj" />
     <Project Path="src/CodeyBox.Sandbox.Bubblewrap/CodeyBox.Sandbox.Bubblewrap.csproj" />
     <Project Path="src/CodeyBox.Sandbox.Multipass/CodeyBox.Sandbox.Multipass.csproj" />
@@ -25,6 +26,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
+    <Project Path="tests/CodeyBox.PluginSdk.SampleTests/CodeyBox.PluginSdk.SampleTests.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/CodeyBox.Admin/src/CodeyBox.Admin.Web/CodeyBox.Admin.Web.csproj" />
