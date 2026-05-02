@@ -78,4 +78,7 @@ internal sealed class ThrowingGitHost : IGitHost
         => Task.CompletedTask;
     public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
         => Task.FromResult(false);
+    public Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+        => Task.FromResult(("", ""));
 }

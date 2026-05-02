@@ -1069,6 +1069,39 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         await Transition(item, WorkItemState.UpstreamPushing, ct, project);
 
+        // Best-effort: compute the diff for LLM-generated PR descriptions.
+        // Failures here are non-fatal — the fields default to empty strings
+        // and the generator falls back to the static template.
+        var (diffStat, fullDiff) = (string.Empty, string.Empty);
+        try
+        {
+            (diffStat, fullDiff) = await _gitHost.GetDiffAsync(repoId, baseBranch, workBranch, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _log.LogDebug("Could not compute diff for PR description: {Message}", ex.Message);
+        }
+
+        IReadOnlyList<string> addressedFindings = [];
+        if (_auditReports is not null)
+        {
+            try
+            {
+                var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
+                var titles = new List<string>();
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var report in reports)
+                    foreach (var finding in report.Findings)
+                        if (seen.Add(finding.Title))
+                            titles.Add(finding.Title);
+                addressedFindings = titles;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogDebug("Could not load audit findings for PR description: {Message}", ex.Message);
+            }
+        }
+
         var request = new UpstreamCompletionRequest
         {
             RepositoryId = repoId,
@@ -1079,6 +1112,11 @@ public sealed class PipelineRunner : IPipelineRunner
             MergeSha = mergeSha,
             Title = item.Title,
             Description = BuildPrDescription(item.Id, agentStdout),
+            DiffStat = diffStat,
+            FullDiff = fullDiff,
+            WorkItemPrompt = item.Prompt,
+            AddressedFindings = addressedFindings,
+            AgentStdout = agentStdout,
         };
 
         // Capture the outcome from a successful CompleteAsync so the local

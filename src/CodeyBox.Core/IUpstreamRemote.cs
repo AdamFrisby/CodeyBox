@@ -41,7 +41,18 @@ public sealed record UpstreamCompletionRequest
     /// <summary>SHA produced by the local merge. Null when resuming past the merge phase.</summary>
     public string? MergeSha { get; init; }
     public required string Title { get; init; }
+    /// <summary>Static fallback PR description. Used when LLM generation is disabled or fails.</summary>
     public string? Description { get; init; }
+    /// <summary>git diff --stat output between base and work branches. Empty when unavailable.</summary>
+    public string DiffStat { get; init; } = string.Empty;
+    /// <summary>Full git diff between base and work branches. Empty when unavailable.</summary>
+    public string FullDiff { get; init; } = string.Empty;
+    /// <summary>Titles of audit findings the agent addressed across rework iterations.</summary>
+    public IReadOnlyList<string> AddressedFindings { get; init; } = [];
+    /// <summary>Original work item prompt, truncated to 2 KB. Null for legacy callers.</summary>
+    public string? WorkItemPrompt { get; init; }
+    /// <summary>Raw agent stdout. Used for AgentReasoningTail in LLM-generated descriptions. Null for legacy callers.</summary>
+    public string? AgentStdout { get; init; }
 }
 
 /// <summary>Result of <see cref="IUpstreamRemote.CompleteAsync"/>.</summary>

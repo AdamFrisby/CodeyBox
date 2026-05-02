@@ -132,6 +132,36 @@ public sealed class LocalGitHost : IGitHost
         return Task.FromResult(Directory.Exists(path));
     }
 
+    public async Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+        string repositoryId, string baseBranch, string workBranch,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+            Validation.ValidateBranchName(workBranch, nameof(workBranch));
+        }
+        catch
+        {
+            return (string.Empty, string.Empty);
+        }
+
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            return (string.Empty, string.Empty);
+
+        // Use three-dot range so we diff the work branch tip against the
+        // merge-base with base, not the current base tip — the same semantics
+        // a GitHub PR diff uses.
+        var range = $"{baseBranch}...{workBranch}";
+        var stat = await RunGitAsync(path, ct, "diff", "--stat", range);
+        var diff = await RunGitAsync(path, ct, "diff", range);
+        return (
+            stat.ExitCode == 0 ? stat.Stdout : string.Empty,
+            diff.ExitCode == 0 ? diff.Stdout : string.Empty
+        );
+    }
+
     internal string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
 
     private static void ApplyReceivePolicy(string barePath)
