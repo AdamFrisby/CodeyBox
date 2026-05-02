@@ -146,10 +146,11 @@ public static partial class Validation
     }
 
     /// <summary>
-    /// External ID character set: ASCII printable (0x21–0x7E) excluding '/' (0x2F) and '?' (0x3F)
-    /// to avoid URL-path collisions.
+    /// External ID character set: ASCII printable (0x21–0x7E) excluding '/' (0x2F), '?' (0x3F),
+    /// and ':' (0x3A) plus adjacent punctuation 0x3B–0x3E. Colon is excluded because it is the
+    /// composite-path delimiter in route segments (projectId:externalId).
     /// </summary>
-    [GeneratedRegex(@"^[!-\x2E\x30-\x3E@-~]+$", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"^[!-\x2E\x30-\x39@-~]+$", RegexOptions.CultureInvariant)]
     private static partial Regex ExternalIdCharSetRegex();
 
     /// <summary>

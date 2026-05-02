@@ -126,7 +126,6 @@ internal static class WorkItemEndpoints
         // and for resolving externalId references in dependsOn.
         var allItems = new List<WorkItem>();
         await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
-        var allItemsById = allItems.ToDictionary(i => i.Id);
         var allItemsByExternalId = allItems
             .Where(i => i.ExternalId != null && i.ProjectId == pid)
             .ToDictionary(i => i.ExternalId!, i => i);
@@ -195,7 +194,14 @@ internal static class WorkItemEndpoints
         if (req.MergeTimeoutMinutes is { } m)
             item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
 
-        await store.CreateAsync(item, ct);
+        try { await store.CreateAsync(item, ct); }
+        catch (WorkItemExternalIdConflictException)
+        {
+            return Results.BadRequest(new
+            {
+                error = $"externalId '{externalId}' already exists in project '{pid}' (concurrent duplicate)"
+            });
+        }
         AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
 
         // Re-read dep states after persisting to avoid TOCTOU: a dep may have
@@ -474,8 +480,20 @@ internal static class WorkItemEndpoints
             promptChanged: body.Prompt is not null,
             agentChanged: body.Agent is not null);
 
+        var statesById = new Dictionary<WorkItemId, WorkItemState>();
+        var depExternalIds = new Dictionary<WorkItemId, string?>();
+        foreach (var depId in updated.DependsOn)
+        {
+            var dep = await store.GetAsync(depId, ct);
+            if (dep is not null)
+            {
+                statesById[depId] = dep.State;
+                depExternalIds[depId] = dep.ExternalId;
+            }
+        }
+
         var project = await projects.GetAsync(updated.ProjectId, ct);
-        return Results.Ok(ToDto(updated, project, new Dictionary<WorkItemId, WorkItemState>(), new Dictionary<WorkItemId, string?>()));
+        return Results.Ok(ToDto(updated, project, statesById, depExternalIds));
     }
 
     /// <summary>

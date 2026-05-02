@@ -12,7 +12,6 @@ public sealed class ExternalIdValidationTests
     [InlineData("internal-tracker-ID")]
     [InlineData("a")]
     [InlineData("abc_123")]
-    [InlineData("foo:bar")]
     [InlineData("A.B.C")]
     [InlineData("some-id-with-many-parts")]
     [InlineData("!bang")]
@@ -52,6 +51,11 @@ public sealed class ExternalIdValidationTests
     [InlineData("ctrl\x01char")]
     [InlineData("del\x7Fchar")]
     [InlineData("non-ascii-\x80")]
+    [InlineData("foo:bar")]       // colon is the composite-path delimiter
+    [InlineData("foo;bar")]       // semicolon excluded
+    [InlineData("a<b")]           // less-than excluded
+    [InlineData("a=b")]           // equals excluded
+    [InlineData("a>b")]           // greater-than excluded
     public void DisallowedCharacters_Rejected(string value)
         => Assert.Throws<ArgumentException>(() => Validation.ValidateExternalId(value, "externalId"));
 

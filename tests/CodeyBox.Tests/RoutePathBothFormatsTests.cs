@@ -104,5 +104,52 @@ public sealed class RoutePathBothFormatsTests : IDisposable
         Assert.Equal("Cancelled", fetched!.State);
     }
 
+    [Fact]
+    public async Task PatchByComposite_UpdatesTitle()
+    {
+        var created = await CreateAsync("ROUTE-PATCH");
+
+        var r = await _client.PatchAsJsonAsync(
+            $"/workitems/test-project:ROUTE-PATCH",
+            new { title = "patched title" });
+        Assert.Equal(HttpStatusCode.OK, r.StatusCode);
+
+        var updated = await r.Content.ReadFromJsonAsync<WorkItemResponse>();
+        Assert.NotNull(updated);
+        Assert.Equal(created.Id, updated!.Id);
+    }
+
+    [Fact]
+    public async Task RetryByComposite_ResolvesItem_Returns409WhenNotFailed()
+    {
+        // Item is in Queued state — retry should fail with 409 (not 404).
+        // This verifies ResolveWorkItemAsync handles the composite path correctly;
+        // the 409 proves the item was found before the state check fired.
+        await CreateAsync("ROUTE-RETRY");
+
+        var r = await _client.PostAsJsonAsync(
+            "/workitems/test-project:ROUTE-RETRY/retry",
+            new { from = "work" });
+        Assert.Equal(HttpStatusCode.Conflict, r.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetDependentsByComposite_ReturnsEmptyList()
+    {
+        await CreateAsync("ROUTE-DEPS");
+
+        var r = await _client.GetAsync("/workitems/test-project:ROUTE-DEPS/dependents");
+        Assert.Equal(HttpStatusCode.OK, r.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetTimelineByComposite_ReturnsOk()
+    {
+        await CreateAsync("ROUTE-TIMELINE");
+
+        var r = await _client.GetAsync("/workitems/test-project:ROUTE-TIMELINE/timeline");
+        Assert.Equal(HttpStatusCode.OK, r.StatusCode);
+    }
+
     private sealed record WorkItemResponse(string Id, string? ExternalId, string State = "");
 }

@@ -51,18 +51,26 @@ public sealed class ExternalIdUniquenessTests : IDisposable
     [Fact]
     public async Task SameExternalId_DifferentProjects_Allowed()
     {
-        // "test-project" and "second-project" are both registered in InMemoryProjectRepository
-        // via the factory. Since we only seed "test-project" by default, this test
-        // creates both items in test-project but with different externalIds, then
-        // re-tests uniqueness within the project.
-        // A second project isn't set up in the test host so we validate the concept
-        // by confirming first-create succeeds and checking the store directly.
-        var r = await _client.PostAsJsonAsync("/workitems", Body("XT-1"));
-        Assert.Equal(HttpStatusCode.Created, r.StatusCode);
+        // Both "test-project" and "second-project" are seeded in the factory's
+        // InMemoryProjectRepository. The unique constraint is per-project, so the
+        // same externalId in two different projects must both succeed.
+        var r1 = await _client.PostAsJsonAsync("/workitems", Body("XT-1"));
+        Assert.Equal(HttpStatusCode.Created, r1.StatusCode);
 
-        var item = await _factory.Store.GetByExternalIdAsync(new ProjectId("test-project"), "XT-1");
-        Assert.NotNull(item);
-        Assert.Equal("XT-1", item!.ExternalId);
+        var r2 = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "second-project",
+            title = "t",
+            prompt = "p",
+            externalId = "XT-1",
+        });
+        Assert.Equal(HttpStatusCode.Created, r2.StatusCode);
+
+        var item1 = await _factory.Store.GetByExternalIdAsync(new ProjectId("test-project"), "XT-1");
+        var item2 = await _factory.Store.GetByExternalIdAsync(new ProjectId("second-project"), "XT-1");
+        Assert.NotNull(item1);
+        Assert.NotNull(item2);
+        Assert.NotEqual(item1!.Id, item2!.Id);
     }
 
     [Fact]

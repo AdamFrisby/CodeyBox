@@ -116,6 +116,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
         }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == 19) // SQLITE_CONSTRAINT
+        {
+            // A concurrent request snuck past the application-level pre-check and
+            // hit the UNIQUE index on (project_id, external_id).
+            throw new WorkItemExternalIdConflictException();
+        }
         finally
         {
             _writeLock.Release();
