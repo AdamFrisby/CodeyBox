@@ -237,7 +237,7 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
     public Task<string?> PromoteSuggestionAsync(
         string id, string? extraInstructions = null, string? agent = null,
         string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
-        string? agentClassId = null, CancellationToken ct = default)
+        string? agentClassId = null, string? externalId = null, CancellationToken ct = default)
         => Task.FromResult<string?>("fake-work-item-id");
 
     public Task<List<WorkItemDto>> GetWorkItemsAsync(CancellationToken ct = default)
@@ -315,7 +315,7 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
     public Task<string?> PromoteSuggestionAsync(
         string id, string? extraInstructions = null, string? agent = null,
         string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
-        string? agentClassId = null, CancellationToken ct = default)
+        string? agentClassId = null, string? externalId = null, CancellationToken ct = default)
         => Task.FromResult<string?>("fake-work-item-id");
 
     // ── Stubs for remaining interface members ─────────────────────────────────

@@ -50,7 +50,7 @@ Queue a new work item.
   [`projects.md`](projects.md)). Unknown ids are rejected.
 * `externalId` — optional caller-supplied identifier (e.g. `"JIRA-1234"`,
   `"GH-456"`, `"sprint-7:ticket-99"`). Must be 1–256 ASCII printable
-  characters (no whitespace, no `/`, no `?`), must not start with `wi-`,
+  characters (no whitespace, no `/`, no `?`, no `;` `<` `=` `>`), must not start with `wi-`,
   must not be a UUID. Unique per project. Rejected with `400` on
   duplicate. See [`external-ids.md`](external-ids.md) for the full contract.
 * `title` — short label, ≤ 200 chars, no leading dash, no control chars.

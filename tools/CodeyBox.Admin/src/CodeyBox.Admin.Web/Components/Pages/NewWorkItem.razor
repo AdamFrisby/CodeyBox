@@ -215,7 +215,8 @@
                 extraInstructions: string.IsNullOrWhiteSpace(_form.Prompt) ? null : _form.Prompt,
                 agent: string.IsNullOrWhiteSpace(_form.Agent) ? null : _form.Agent,
                 workBranch: string.IsNullOrWhiteSpace(_form.WorkBranch) ? null : _form.WorkBranch,
-                pushUpstream: _form.PushUpstream);
+                pushUpstream: _form.PushUpstream,
+                externalId: string.IsNullOrWhiteSpace(_form.ExternalId) ? null : _form.ExternalId.Trim());
             if (workItemId is not null)
                 Nav.NavigateTo($"/work-items/{workItemId}");
             else

@@ -170,7 +170,7 @@ public static partial class Validation
             throw new ArgumentException($"{fieldName} must be <= 256 characters", fieldName);
         if (!ExternalIdCharSetRegex().IsMatch(value))
             throw new ArgumentException(
-                $"{fieldName} must contain only ASCII printable characters (no whitespace, '/', or '?')", fieldName);
+                $"{fieldName} must contain only ASCII printable characters (no whitespace, '/', '?', ';', '<', '=', or '>')", fieldName);
         if (value.StartsWith("wi-", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException($"{fieldName} must not start with 'wi-' (reserved prefix)", fieldName);
         if (Guid.TryParse(value, out _))

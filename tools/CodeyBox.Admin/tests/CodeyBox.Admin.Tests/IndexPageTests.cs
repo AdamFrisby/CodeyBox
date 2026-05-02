@@ -438,7 +438,7 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<string?> PromoteSuggestionAsync(
         string id, string? extraInstructions = null, string? agent = null,
         string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
-        string? agentClassId = null, CancellationToken ct = default)
+        string? agentClassId = null, string? externalId = null, CancellationToken ct = default)
         => Task.FromResult<string?>("fake-work-item-id");
 
     public AuditReportsDto? AuditReportsOverride { get; set; }

@@ -101,7 +101,7 @@ internal static class WorkItemEndpoints
             if (conflict is not null)
                 return Results.BadRequest(new
                 {
-                    error = $"externalId '{externalId}' is already in use in project '{pid}'"
+                    error = $"externalId '{externalId}' already exists in project '{pid}' for work item {conflict.Id} (state: {conflict.State})"
                 });
         }
 
@@ -141,6 +141,8 @@ internal static class WorkItemEndpoints
         var dependsOnIds = new List<WorkItemId>();
         foreach (var rawId in req.DependsOn ?? [])
         {
+            if (rawId is null)
+                return Results.BadRequest(new { error = $"dependency could not be resolved: null entry in dependsOn array" });
             if (Guid.TryParse(rawId, out var g))
             {
                 dependsOnIds.Add(new WorkItemId(g));
@@ -204,9 +206,13 @@ internal static class WorkItemEndpoints
         try { await store.CreateAsync(item, ct); }
         catch (WorkItemExternalIdConflictException)
         {
+            var concurrentConflict = await store.GetByExternalIdAsync(pid, externalId!, ct);
+            var conflictDetail = concurrentConflict is not null
+                ? $"for work item {concurrentConflict.Id} (state: {concurrentConflict.State})"
+                : "(concurrent duplicate)";
             return Results.BadRequest(new
             {
-                error = $"externalId '{externalId}' already exists in project '{pid}' (concurrent duplicate)"
+                error = $"externalId '{externalId}' already exists in project '{pid}' {conflictDetail}"
             });
         }
         AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);

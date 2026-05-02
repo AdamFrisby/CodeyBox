@@ -38,6 +38,8 @@ public sealed class ExternalIdUniquenessTests : IDisposable
     {
         var r1 = await _client.PostAsJsonAsync("/workitems", Body("JIRA-99"));
         Assert.Equal(HttpStatusCode.Created, r1.StatusCode);
+        var created = await r1.Content.ReadFromJsonAsync<WorkItemResponse>();
+        Assert.NotNull(created);
 
         var r2 = await _client.PostAsJsonAsync("/workitems", Body("JIRA-99"));
         Assert.Equal(HttpStatusCode.BadRequest, r2.StatusCode);
@@ -45,7 +47,9 @@ public sealed class ExternalIdUniquenessTests : IDisposable
         var err = await r2.Content.ReadFromJsonAsync<ErrorResponse>();
         Assert.NotNull(err);
         Assert.Contains("JIRA-99", err.Error);
-        Assert.Contains("already in use", err.Error);
+        Assert.Contains("already exists", err.Error);
+        Assert.Contains(created!.Id, err.Error);
+        Assert.Contains("state:", err.Error);
     }
 
     [Fact]

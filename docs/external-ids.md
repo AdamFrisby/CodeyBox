@@ -21,7 +21,7 @@ Two problems external IDs solve:
 | Rule | Detail |
 |------|--------|
 | **Length** | 1–256 characters |
-| **Characters** | ASCII printable, no whitespace, no `/`, no `?` |
+| **Characters** | ASCII printable, no whitespace, no `/`, no `?`, no `;` `<` `=` `>` |
 | **Reserved prefix** | Must not start with `wi-` |
 | **UUID collision** | Must not be parseable as a UUID (would be ambiguous with internal IDs) |
 
@@ -41,7 +41,7 @@ Attempting to create a second work item in the same project with a duplicate `ex
 
 ```json
 {
-  "error": "externalId 'JIRA-1234' is already in use in project 'my-app'"
+  "error": "externalId 'JIRA-1234' already exists in project 'my-app' for work item <uuid> (state: Queued)"
 }
 ```
 
