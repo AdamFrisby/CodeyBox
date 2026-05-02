@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Api;
@@ -138,22 +139,20 @@ public sealed class ChangelogGeneratorTests
     }
 
     [Fact]
-    public async Task GenerateAsync_NoApiKey_ReturnsPlaceholder()
+    public async Task GenerateAsync_NoApiKey_Throws()
     {
         var prev = Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY");
         Environment.SetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY", null);
         try
         {
             var gen = Build();
-            var result = await gen.GenerateAsync(new ChangelogRequest
+            await Assert.ThrowsAsync<InvalidOperationException>(() => gen.GenerateAsync(new ChangelogRequest
             {
                 ProjectId = new ProjectId("test"),
                 FromTag = "v1.2.0",
                 ToTag = "v1.3.0",
                 PullRequests = [new(1, "title", "body", "2026-05-01", [], [])],
-            }, CancellationToken.None);
-
-            Assert.Contains("unavailable", result.Markdown);
+            }, CancellationToken.None));
         }
         finally
         {
@@ -163,21 +162,19 @@ public sealed class ChangelogGeneratorTests
     }
 
     [Fact]
-    public async Task GenerateAsync_ApiError_ReturnsPlaceholder()
+    public async Task GenerateAsync_ApiError_Throws()
     {
         Environment.SetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY", "sk-ant-test-key");
         try
         {
             var gen = Build(statusCode: 500);
-            var result = await gen.GenerateAsync(new ChangelogRequest
+            await Assert.ThrowsAsync<HttpRequestException>(() => gen.GenerateAsync(new ChangelogRequest
             {
                 ProjectId = new ProjectId("test"),
                 FromTag = "v1.2.0",
                 ToTag = "v1.3.0",
                 PullRequests = [new(1, "title", "body", "2026-05-01", [], [])],
-            }, CancellationToken.None);
-
-            Assert.Contains("failed", result.Markdown);
+            }, CancellationToken.None));
         }
         finally
         {

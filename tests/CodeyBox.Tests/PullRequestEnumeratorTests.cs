@@ -32,16 +32,16 @@ public sealed class PullRequestEnumeratorTests
         var pr10 = BuildPrResponse(10, "Feature Foo", "body foo", "2026-04-01T00:00:00Z");
         var pr11 = BuildPrResponse(11, "Bugfix Bar", "body bar", "2026-04-02T00:00:00Z");
 
-        var enumerator = Build(req =>
+        var enumerator = Build(WithFilesAndCommits(req =>
         {
             if (req.RequestUri!.AbsolutePath.Contains("/compare/"))
                 return Ok(compareResponse);
-            if (req.RequestUri.AbsolutePath.Contains("/pulls/10"))
+            if (req.RequestUri.AbsolutePath.EndsWith("/pulls/10", StringComparison.Ordinal))
                 return Ok(pr10);
-            if (req.RequestUri.AbsolutePath.Contains("/pulls/11"))
+            if (req.RequestUri.AbsolutePath.EndsWith("/pulls/11", StringComparison.Ordinal))
                 return Ok(pr11);
             return NotFound();
-        });
+        }));
 
         var result = await enumerator.ListMergedBetweenAsync(
             "owner", "repo", "token", "v1.0.0", "v1.1.0", CancellationToken.None);
@@ -64,13 +64,13 @@ public sealed class PullRequestEnumeratorTests
         var pr16 = BuildPrResponse(16, "Timeline UI", "body", "2026-04-01T00:00:00Z");
         var pr17 = BuildPrResponse(17, "Queue Fix", "body", "2026-04-02T00:00:00Z");
 
-        var enumerator = Build(req =>
+        var enumerator = Build(WithFilesAndCommits(req =>
         {
             if (req.RequestUri!.AbsolutePath.Contains("/compare/")) return Ok(compareResponse);
-            if (req.RequestUri.AbsolutePath.Contains("/pulls/16")) return Ok(pr16);
-            if (req.RequestUri.AbsolutePath.Contains("/pulls/17")) return Ok(pr17);
+            if (req.RequestUri.AbsolutePath.EndsWith("/pulls/16", StringComparison.Ordinal)) return Ok(pr16);
+            if (req.RequestUri.AbsolutePath.EndsWith("/pulls/17", StringComparison.Ordinal)) return Ok(pr17);
             return NotFound();
-        });
+        }));
 
         var result = await enumerator.ListMergedBetweenAsync(
             "owner", "repo", "token", "v1.0.0", "v1.1.0", CancellationToken.None);
@@ -90,12 +90,16 @@ public sealed class PullRequestEnumeratorTests
         var pr5 = BuildPrResponse(5, "Feature X", "body", "2026-04-01T00:00:00Z");
         int fetchCount = 0;
 
-        var enumerator = Build(req =>
+        var enumerator = Build(WithFilesAndCommits(req =>
         {
             if (req.RequestUri!.AbsolutePath.Contains("/compare/")) return Ok(compareResponse);
-            if (req.RequestUri.AbsolutePath.Contains("/pulls/5")) { fetchCount++; return Ok(pr5); }
+            if (req.RequestUri.AbsolutePath.EndsWith("/pulls/5", StringComparison.Ordinal))
+            {
+                fetchCount++;
+                return Ok(pr5);
+            }
             return NotFound();
-        });
+        }));
 
         var result = await enumerator.ListMergedBetweenAsync(
             "owner", "repo", "token", "v1.0.0", "v1.1.0", CancellationToken.None);
@@ -133,7 +137,7 @@ public sealed class PullRequestEnumeratorTests
             .ToList();
         var compareResponse = BuildCompareResponse(messages);
 
-        var enumerator = Build(req =>
+        var enumerator = Build(WithFilesAndCommits(req =>
         {
             if (req.RequestUri!.AbsolutePath.Contains("/compare/")) return Ok(compareResponse);
             // Extract PR number from path like /repos/owner/repo/pulls/42
@@ -141,7 +145,7 @@ public sealed class PullRequestEnumeratorTests
             if (segs[^2] == "pulls" && int.TryParse(segs[^1], out var n))
                 return Ok(BuildPrResponse(n, $"PR {n}", "body", "2026-04-01T00:00:00Z"));
             return NotFound();
-        });
+        }));
 
         var result = await enumerator.ListMergedBetweenAsync(
             "owner", "repo", "token", "v1.0.0", "v1.1.0", CancellationToken.None);
@@ -173,17 +177,17 @@ public sealed class PullRequestEnumeratorTests
         var pr8 = BuildPrResponse(8, "PR 8", "body", "2026-04-02T00:00:00Z");
         string? capturedUrl = null;
 
-        var enumerator = Build(req =>
+        var enumerator = Build(WithFilesAndCommits(req =>
         {
             if (req.RequestUri!.AbsolutePath.Contains("/compare/"))
             {
                 capturedUrl = req.RequestUri.ToString();
                 return Ok(compareResponse);
             }
-            if (req.RequestUri.AbsolutePath.Contains("/pulls/7")) return Ok(pr7);
-            if (req.RequestUri.AbsolutePath.Contains("/pulls/8")) return Ok(pr8);
+            if (req.RequestUri.AbsolutePath.EndsWith("/pulls/7", StringComparison.Ordinal)) return Ok(pr7);
+            if (req.RequestUri.AbsolutePath.EndsWith("/pulls/8", StringComparison.Ordinal)) return Ok(pr8);
             return NotFound();
-        });
+        }));
 
         var result = await enumerator.ListMergedBetweenAsync(
             "owner", "repo", "token", "v1.0.0", "v1.1.0", CancellationToken.None);
@@ -191,6 +195,145 @@ public sealed class PullRequestEnumeratorTests
         Assert.Equal(2, result.PullRequests.Count);
         // Verify the compare request included per_page parameter.
         Assert.Contains("per_page=250", capturedUrl);
+    }
+
+    [Fact]
+    public async Task ListMergedBetweenAsync_PopulatesChangedFiles()
+    {
+        var compareResponse = BuildCompareResponse(["Merge pull request #20 from feature/z"]);
+        var pr20 = BuildPrResponse(20, "Feature Z", "body", "2026-04-01T00:00:00Z");
+        var files20 = JsonSerializer.Serialize(new[] { new { filename = "src/Foo.cs" }, new { filename = "src/Bar.cs" } });
+        var commits20 = JsonSerializer.Serialize(Array.Empty<object>());
+
+        var enumerator = Build(req =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            if (path.Contains("/compare/")) return Ok(compareResponse);
+            if (path.EndsWith("/pulls/20/files", StringComparison.Ordinal)) return Ok(files20);
+            if (path.EndsWith("/pulls/20/commits", StringComparison.Ordinal)) return Ok(commits20);
+            if (path.EndsWith("/pulls/20", StringComparison.Ordinal)) return Ok(pr20);
+            return NotFound();
+        });
+
+        var result = await enumerator.ListMergedBetweenAsync(
+            "owner", "repo", "token", "v1.0.0", "v1.1.0", CancellationToken.None);
+
+        Assert.Single(result.PullRequests);
+        Assert.Equal(2, result.PullRequests[0].ChangedFiles.Count);
+        Assert.Contains("src/Foo.cs", result.PullRequests[0].ChangedFiles);
+        Assert.Contains("src/Bar.cs", result.PullRequests[0].ChangedFiles);
+    }
+
+    [Fact]
+    public async Task ListMergedBetweenAsync_PopulatesAuthorTrailers()
+    {
+        var compareResponse = BuildCompareResponse(["Merge pull request #21 from feature/w"]);
+        var pr21 = BuildPrResponse(21, "Feature W", "body", "2026-04-01T00:00:00Z");
+        var files21 = JsonSerializer.Serialize(Array.Empty<object>());
+        var commits21 = JsonSerializer.Serialize(new[]
+        {
+            new { commit = new { message = "Initial commit\n\nCo-authored-by: Alice <alice@example.com>" } },
+            new { commit = new { message = "Follow-up\n\nCo-authored-by: Bob <bob@example.com>" } },
+        });
+
+        var enumerator = Build(req =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            if (path.Contains("/compare/")) return Ok(compareResponse);
+            if (path.EndsWith("/pulls/21/files", StringComparison.Ordinal)) return Ok(files21);
+            if (path.EndsWith("/pulls/21/commits", StringComparison.Ordinal)) return Ok(commits21);
+            if (path.EndsWith("/pulls/21", StringComparison.Ordinal)) return Ok(pr21);
+            return NotFound();
+        });
+
+        var result = await enumerator.ListMergedBetweenAsync(
+            "owner", "repo", "token", "v1.0.0", "v1.1.0", CancellationToken.None);
+
+        Assert.Single(result.PullRequests);
+        Assert.Equal(2, result.PullRequests[0].AuthorTrailers.Count);
+        Assert.Contains("Co-authored-by: Alice <alice@example.com>", result.PullRequests[0].AuthorTrailers);
+        Assert.Contains("Co-authored-by: Bob <bob@example.com>", result.PullRequests[0].AuthorTrailers);
+    }
+
+    // ── ResolvePreviousTagAsync tests ─────────────────────────────────────────
+
+    [Fact]
+    public async Task ResolvePreviousTagAsync_ReturnsPreviousTag_WhenFound()
+    {
+        var releases = BuildReleasesResponse(["v3.0.0", "v2.0.0", "v1.0.0"]);
+
+        var enumerator = Build(req =>
+        {
+            if (req.RequestUri!.AbsolutePath.Contains("/releases")) return Ok(releases);
+            return NotFound();
+        });
+
+        var result = await enumerator.ResolvePreviousTagAsync(
+            "owner", "repo", "token", "v2.0.0", CancellationToken.None);
+
+        Assert.Equal("v1.0.0", result);
+    }
+
+    [Fact]
+    public async Task ResolvePreviousTagAsync_ReturnsPreviousTag_ForMostRecentRelease()
+    {
+        var releases = BuildReleasesResponse(["v3.0.0", "v2.0.0", "v1.0.0"]);
+
+        var enumerator = Build(req =>
+        {
+            if (req.RequestUri!.AbsolutePath.Contains("/releases")) return Ok(releases);
+            return NotFound();
+        });
+
+        var result = await enumerator.ResolvePreviousTagAsync(
+            "owner", "repo", "token", "v3.0.0", CancellationToken.None);
+
+        Assert.Equal("v2.0.0", result);
+    }
+
+    [Fact]
+    public async Task ResolvePreviousTagAsync_ReturnsNull_WhenCurrentTagIsFirst()
+    {
+        var releases = BuildReleasesResponse(["v3.0.0", "v2.0.0", "v1.0.0"]);
+
+        var enumerator = Build(req =>
+        {
+            if (req.RequestUri!.AbsolutePath.Contains("/releases")) return Ok(releases);
+            return NotFound();
+        });
+
+        var result = await enumerator.ResolvePreviousTagAsync(
+            "owner", "repo", "token", "v1.0.0", CancellationToken.None);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task ResolvePreviousTagAsync_ReturnsNull_WhenTagNotInList()
+    {
+        var releases = BuildReleasesResponse(["v3.0.0", "v1.0.0"]);
+
+        var enumerator = Build(req =>
+        {
+            if (req.RequestUri!.AbsolutePath.Contains("/releases")) return Ok(releases);
+            return NotFound();
+        });
+
+        var result = await enumerator.ResolvePreviousTagAsync(
+            "owner", "repo", "token", "v2.0.0", CancellationToken.None);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task ResolvePreviousTagAsync_ReturnsNull_WhenApiFails()
+    {
+        var enumerator = Build(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        var result = await enumerator.ResolvePreviousTagAsync(
+            "owner", "repo", "token", "v1.0.0", CancellationToken.None);
+
+        Assert.Null(result);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -209,6 +352,26 @@ public sealed class PullRequestEnumeratorTests
             body,
             merged_at = mergedAt,
         });
+
+    private static string BuildReleasesResponse(IEnumerable<string> tagNames)
+    {
+        var releases = tagNames.Select(t => new { tag_name = t }).ToArray();
+        return JsonSerializer.Serialize(releases);
+    }
+
+    // Wraps a routing function to automatically return empty arrays for /files and /commits sub-paths,
+    // preventing test routing from accidentally matching PR detail routes for the new sub-resource calls.
+    private static Func<HttpRequestMessage, HttpResponseMessage> WithFilesAndCommits(
+        Func<HttpRequestMessage, HttpResponseMessage> inner)
+    {
+        return req =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            if (path.EndsWith("/files", StringComparison.Ordinal)) return Ok("[]");
+            if (path.EndsWith("/commits", StringComparison.Ordinal)) return Ok("[]");
+            return inner(req);
+        };
+    }
 
     private static HttpResponseMessage Ok(string body) => new(HttpStatusCode.OK)
     {

@@ -153,18 +153,93 @@ public sealed class GitHubPullRequestEnumerator : IPullRequestEnumerator
             var pr = JsonSerializer.Deserialize<GitHubPrDetail>(body, JsonOpts);
             if (pr is null) return null;
 
+            var changedFiles = await FetchPullRequestFilesAsync(owner, repo, token, number, ct);
+            var authorTrailers = await FetchPullRequestTrailersAsync(owner, repo, token, number, ct);
+
             return new MergedPullRequest(
                 Number: pr.Number,
                 Title: pr.Title ?? "",
                 Body: pr.Body ?? "",
                 MergedAt: pr.MergedAt ?? "",
-                AuthorTrailers: [],
-                ChangedFiles: []);
+                AuthorTrailers: authorTrailers,
+                ChangedFiles: changedFiles);
         }
         catch (JsonException ex)
         {
             _log.LogDebug(ex, "Failed to parse PR #{Number} detail for {Owner}/{Repo}; skipping", number, owner, repo);
             return null;
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(
+        string owner, string repo, string token, int number, CancellationToken ct)
+    {
+        var url = $"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files?per_page=100";
+        using var req = BuildRequest(HttpMethod.Get, url, token);
+        using var response = await SendAsync(req, ct);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _log.LogDebug(
+                "GitHub GET /pulls/{Number}/files returned {Status} for {Owner}/{Repo}; skipping files",
+                number, (int)response.StatusCode, owner, repo);
+            return [];
+        }
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        try
+        {
+            var files = JsonSerializer.Deserialize<GitHubPrFile[]>(body, JsonOpts);
+            return files?
+                .Select(f => f.Filename ?? "")
+                .Where(f => !string.IsNullOrEmpty(f))
+                .ToList() ?? [];
+        }
+        catch (JsonException ex)
+        {
+            _log.LogDebug(ex, "Failed to parse PR #{Number} files for {Owner}/{Repo}; skipping", number, owner, repo);
+            return [];
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> FetchPullRequestTrailersAsync(
+        string owner, string repo, string token, int number, CancellationToken ct)
+    {
+        var url = $"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits?per_page=100";
+        using var req = BuildRequest(HttpMethod.Get, url, token);
+        using var response = await SendAsync(req, ct);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _log.LogDebug(
+                "GitHub GET /pulls/{Number}/commits returned {Status} for {Owner}/{Repo}; skipping trailers",
+                number, (int)response.StatusCode, owner, repo);
+            return [];
+        }
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        try
+        {
+            var commits = JsonSerializer.Deserialize<GitHubPrCommit[]>(body, JsonOpts);
+            if (commits is null) return [];
+
+            var trailers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var commit in commits)
+            {
+                var message = commit.Commit?.Message ?? "";
+                foreach (var line in message.Split('\n'))
+                {
+                    var trimmed = line.Trim();
+                    if (trimmed.StartsWith("Co-authored-by:", StringComparison.OrdinalIgnoreCase))
+                        trailers.Add(trimmed);
+                }
+            }
+            return trailers.ToList();
+        }
+        catch (JsonException ex)
+        {
+            _log.LogDebug(ex, "Failed to parse PR #{Number} commits for {Owner}/{Repo}; skipping trailers", number, owner, repo);
+            return [];
         }
     }
 
@@ -237,4 +312,19 @@ internal sealed class GitHubPrDetail
     [JsonPropertyName("title")] public string? Title { get; set; }
     [JsonPropertyName("body")] public string? Body { get; set; }
     [JsonPropertyName("merged_at")] public string? MergedAt { get; set; }
+}
+
+internal sealed class GitHubPrFile
+{
+    [JsonPropertyName("filename")] public string? Filename { get; set; }
+}
+
+internal sealed class GitHubPrCommit
+{
+    [JsonPropertyName("commit")] public GitHubPrCommitDetail? Commit { get; set; }
+}
+
+internal sealed class GitHubPrCommitDetail
+{
+    [JsonPropertyName("message")] public string? Message { get; set; }
 }

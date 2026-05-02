@@ -109,8 +109,8 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
         var token = Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY");
         if (string.IsNullOrEmpty(token))
         {
-            _log.LogWarning("CODEYBOX_CLAUDE_API_KEY is not set; returning placeholder changelog");
-            return "*(changelog generation unavailable: no API key configured)*";
+            _log.LogWarning("CODEYBOX_CLAUDE_API_KEY is not set; cannot generate changelog");
+            throw new InvalidOperationException("CODEYBOX_CLAUDE_API_KEY is not set");
         }
 
         var model = _opts.GeneratorModelId ?? "claude-opus-4-7";
@@ -139,7 +139,8 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
             _log.LogWarning(
                 "Anthropic API returned {Status} for changelog generation: {Error}",
                 (int)response.StatusCode, err.Length > 200 ? err[..200] : err);
-            return "*(changelog generation failed: API error)*";
+            throw new HttpRequestException(
+                $"Anthropic API returned {(int)response.StatusCode} for changelog generation");
         }
 
         var body = await response.Content.ReadAsStringAsync(ct);
