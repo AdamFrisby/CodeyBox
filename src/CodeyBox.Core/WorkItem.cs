@@ -84,6 +84,22 @@ public sealed record WorkItem
     public string? ModelId { get; init; }
 
     /// <summary>
+    /// Runtime-only reasoning-mode hint set by the quota router from the chosen
+    /// <see cref="AgentMembership.ReasoningMode"/>. Not persisted; resolved at
+    /// each pickup. The agent runner translates this into the appropriate CLI flag.
+    /// </summary>
+    public string? ReasoningMode { get; init; }
+
+    /// <summary>
+    /// Minimum acceptable <see cref="AgentMembership.QualityScore"/> for this work item.
+    /// The router picks any member whose base score is at or above this floor.
+    /// Default 95: Gemini-3-Flash-high-reasoning is allowed as a frontier-adjacent fallback.
+    /// Set lower (e.g. 70) for low-stakes work that can tolerate a weaker model.
+    /// Persisted; existing records without the column default to 95 on read.
+    /// </summary>
+    public int MinModelScore { get; init; } = 95;
+
+    /// <summary>
     /// Display and pickup ordering for Queued items. Set to <c>CreatedAt.Ticks</c> on
     /// first persist so items sort in creation order by default. <see cref="IWorkItemStore.ReorderAsync"/>
     /// overwrites this with small integers (1, 2, 3 …) so explicitly prioritised items

@@ -36,8 +36,8 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             DisplayName = "Frontier",
             Members =
             [
-                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription },
-                new AgentMembership { Agent = AgentKind.Codex,  Billing = AgentBilling.Subscription },
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = AgentKind.Codex,  Billing = AgentBilling.Subscription, QualityScore = 100 },
             ],
         };
 
@@ -138,7 +138,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             DisplayName = "Frontier",
             Members =
             [
-                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription },
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
             ],
         };
 

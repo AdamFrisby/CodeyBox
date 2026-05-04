@@ -316,7 +316,13 @@ public sealed class OrchestratorService : BackgroundService
                     return;
                 }
                 if (decision.Chosen is { } chosen)
-                    item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId };
+                    item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId, ReasoningMode = chosen.ReasoningMode };
+                if (decision.NoEligibleMembers)
+                {
+                    _log.LogError("Work item {Id}: {Reason}", item.Id, decision.Reason);
+                    await _store.UpdateAsync(item.With(WorkItemState.Failed, decision.Reason), ct);
+                    return;
+                }
             }
 
             // Budget gate + StartedAt write held under a per-project lock to prevent

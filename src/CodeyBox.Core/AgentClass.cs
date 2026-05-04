@@ -31,6 +31,28 @@ public sealed record AgentMembership
     /// (its CLI does not expose a --model flag).
     /// </summary>
     public string? ModelId { get; init; }
+
+    /// <summary>
+    /// Operator-curated capability score on a roughly 0–100 scale. Higher = more
+    /// capable. Equality means "interchangeable for this work" — the router will
+    /// swap freely between them. Recommended seed values:
+    ///   Opus 4.7 = 100, GPT-5.5 = 100      (frontier, tied)
+    ///   Gemini 3 Flash (high reasoning) = 95  (frontier-adjacent)
+    ///   Sonnet 4.6 = 80, GPT-5 base = 80
+    ///   Gemini 3 Flash (standard) = 70
+    ///   Haiku = 50, mini variants = 50
+    /// These are operator-tunable in config; the framework ships sensible
+    /// defaults but does not pin them in code.
+    /// </summary>
+    public required int QualityScore { get; init; }
+
+    /// <summary>
+    /// Agent-CLI-specific reasoning-effort knob. The runner translates this into
+    /// the right CLI flag (e.g. <c>--thinking</c> on gemini). For Gemini
+    /// specifically: a score of 95+ REQUIRES <c>ReasoningMode="high"</c> —
+    /// config validation rejects Gemini-95-without-high-reasoning at startup.
+    /// </summary>
+    public string? ReasoningMode { get; init; }
 }
 
 /// <summary>How the agent is billed, which determines quota-wait behaviour.</summary>

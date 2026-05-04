@@ -206,7 +206,7 @@ internal sealed partial class ScriptedAgent : IAgentRunner
         _mergeStrategies = new Queue<MergeStrategy>(mergeStrategies);
     }
 
-    public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential, string? modelId = null, CancellationToken ct = default)
+    public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default)
     {
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
         {

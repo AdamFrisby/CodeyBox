@@ -202,6 +202,8 @@ internal static class WorkItemEndpoints
             item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
         if (req.MergeTimeoutMinutes is { } m)
             item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
+        if (req.MinModelScore is { } minScore)
+            item = item with { MinModelScore = Math.Clamp(minScore, 0, 200) };
 
         try { await store.CreateAsync(item, ct); }
         catch (WorkItemExternalIdConflictException)
@@ -734,7 +736,8 @@ internal static class WorkItemEndpoints
             item.DependsOn.Select(d => d.ToString()).ToList(),
             depsSatisfied,
             depExtIds,
-            item.QueuePosition);
+            item.QueuePosition,
+            item.MinModelScore);
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -823,7 +826,8 @@ public sealed record CreateWorkItemRequest(
     int? WorkTimeoutMinutes,
     int? MergeTimeoutMinutes,
     string? ExternalId = null,
-    string[]? DependsOn = null);
+    string[]? DependsOn = null,
+    int? MinModelScore = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -856,7 +860,8 @@ public sealed record WorkItemDto(
     IReadOnlyList<string> DependsOn,
     bool DependsOnSatisfied,
     IReadOnlyDictionary<string, string?> DependsOnExternalIds,
-    long QueuePosition = 0);
+    long QueuePosition = 0,
+    int MinModelScore = 95);
 
 public sealed record ProjectDto(
     string Id,

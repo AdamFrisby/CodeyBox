@@ -41,7 +41,7 @@ public sealed class PickupSmokeTests : IDisposable
 
         public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory,
             string prompt, AgentCredential? credential, string? modelId = null,
-            CancellationToken ct = default)
+            string? reasoningMode = null, CancellationToken ct = default)
         {
             CallCount++;
             await Task.Delay(Timeout.Infinite, ct);
