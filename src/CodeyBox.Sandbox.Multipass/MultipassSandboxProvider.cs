@@ -256,6 +256,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// <inheritdoc/>
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
+        // Explicit allowlist before any filesystem or shell operation: VM names must
+        // be alphanumeric-and-hyphen only. This blocks path-traversal strings such as
+        // "codeybox-a/../../../sensitive" that start with the required prefix but
+        // would escape _stagingRoot once Path.Combine resolves them.
+        if (!IsValidSandboxName(name))
+            throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
+
         _log.LogInformation("SandboxLeakReaper: purging leaked VM {Name}", name);
         var run = await RunAsync([_opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: ct);
         if (run.ExitCode != 0)
@@ -302,6 +309,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             return [];
         }
 
+        if (vmNames.Count == 0) return [];
+
+        // Fetch disk usage for all discovered codeybox VMs in a single multipass info call.
+        var diskByName = await FetchDiskInfoAsync(vmNames, ct);
+
         var infos = new List<ManagedSandboxInfo>(vmNames.Count);
         foreach (var name in vmNames)
         {
@@ -314,9 +326,67 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                     createdAt = new DateTimeOffset(created, TimeSpan.Zero);
             }
             var isActive = _activeSandboxNames.ContainsKey(name);
-            infos.Add(new ManagedSandboxInfo(name, createdAt, DiskBytes: null, isActive));
+            diskByName.TryGetValue(name, out var diskBytes);
+            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive));
         }
         return infos;
+    }
+
+    /// <summary>
+    /// Runs <c>multipass info --format json</c> for the given VM names and returns
+    /// a map of VM name → disk-used bytes. Returns an empty dictionary on any failure
+    /// so that missing disk info degrades gracefully to null in the caller.
+    /// </summary>
+    private async Task<Dictionary<string, long>> FetchDiskInfoAsync(List<string> names, CancellationToken ct)
+    {
+        var argv = new List<string> { _opts.MultipassBinary, "info", "--format", "json" };
+        argv.AddRange(names);
+
+        var run = await RunAsync(argv, stdin: null, ct: ct);
+        if (run.ExitCode != 0)
+        {
+            _log.LogWarning("multipass info failed (exit {ExitCode}): {Stderr}", run.ExitCode, run.Stderr);
+            return [];
+        }
+
+        var result = new Dictionary<string, long>(StringComparer.Ordinal);
+        try
+        {
+            using var doc = JsonDocument.Parse(run.Stdout);
+            if (!doc.RootElement.TryGetProperty("info", out var infoEl))
+                return result;
+
+            foreach (var vmEntry in infoEl.EnumerateObject())
+            {
+                if (!vmEntry.Value.TryGetProperty("disks", out var disksEl)) continue;
+                long total = 0;
+                foreach (var diskEntry in disksEl.EnumerateObject())
+                {
+                    if (diskEntry.Value.TryGetProperty("used", out var usedEl) &&
+                        long.TryParse(usedEl.GetString(), out var used))
+                        total += used;
+                }
+                if (total > 0)
+                    result[vmEntry.Name] = total;
+            }
+        }
+        catch (JsonException ex)
+        {
+            _log.LogWarning(ex, "Failed to parse multipass info output; disk sizes will be omitted");
+        }
+        return result;
+    }
+
+    private static bool IsValidSandboxName(string name)
+    {
+        // VM names must be alphanumeric-and-hyphen only (DNS-label style).
+        // This blocks path-traversal characters (/, ., \) before any filesystem use.
+        foreach (var c in name)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-')
+                return false;
+        }
+        return name.Length > 0;
     }
 
     /// <summary>

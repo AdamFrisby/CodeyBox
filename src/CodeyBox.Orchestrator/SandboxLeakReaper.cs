@@ -58,7 +58,15 @@ public sealed class SandboxLeakReaper : BackgroundService
             return;
         }
 
-        using var timer = new PeriodicTimer(_opts.CheckInterval);
+        // Guard against misconfigured intervals that would cause ArgumentOutOfRangeException
+        // (TimeSpan.Zero) or a tight multipass-hammering loop (very small values).
+        var interval = _opts.CheckInterval < TimeSpan.FromMinutes(1)
+            ? TimeSpan.FromMinutes(1)
+            : _opts.CheckInterval;
+        if (_opts.CheckInterval < TimeSpan.FromMinutes(1))
+            _log.LogWarning("SandboxLeakReaper: CheckInterval {Configured} is below the 1-minute minimum; clamped to 1 minute", _opts.CheckInterval);
+
+        using var timer = new PeriodicTimer(interval);
         // Run immediately at startup, then on the configured interval.
         do
         {
@@ -117,22 +125,33 @@ public sealed class SandboxLeakReaper : BackgroundService
         }
     }
 
-    private async Task DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken ct)
+    private async Task DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
     {
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromMinutes(5));
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
 
         try
         {
-            await _provider.DisposeLeakedAsync(leak.Name, cts.Token);
+            await _provider.DisposeLeakedAsync(leak.Name, linkedCts.Token);
             AuditLog.SandboxLeakDisposed(leak.Name, leak.Age.TotalMinutes,
                 leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : null);
             _log.LogInformation("SandboxLeakReaper: disposed leaked sandbox {Name}", leak.Name);
         }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Service is shutting down — rethrow so WhenAll propagates the cancellation
+            // cleanly. Do not emit a spurious "timeout" audit event for a planned restart.
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            // Per-disposal 5-minute timeout fired.
+            AuditLog.SandboxLeakDisposeFailed(leak.Name, "timeout");
+            _log.LogWarning("SandboxLeakReaper: timed out disposing leaked sandbox {Name}", leak.Name);
+        }
         catch (Exception ex)
         {
-            var msg = ex is OperationCanceledException ? "timeout" : ex.Message;
-            AuditLog.SandboxLeakDisposeFailed(leak.Name, msg);
+            AuditLog.SandboxLeakDisposeFailed(leak.Name, ex.Message);
             _log.LogWarning(ex, "SandboxLeakReaper: failed to dispose leaked sandbox {Name}", leak.Name);
         }
     }

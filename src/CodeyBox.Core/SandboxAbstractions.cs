@@ -41,8 +41,8 @@ public interface ISandboxProvider
     /// <c>POST /sandboxes/leaked/{name}/dispose</c> operator endpoint.
     ///
     /// <para>Implementations that have no persistent lifecycle (bubblewrap,
-    /// process) are no-ops. Failures are non-throwing — the caller logs the
-    /// exception.</para>
+    /// process) are no-ops. Implementations may throw on failure; all callers
+    /// must wrap invocations in try/catch and log the exception.</para>
     /// </summary>
     Task DisposeLeakedAsync(string name, CancellationToken ct);
 }

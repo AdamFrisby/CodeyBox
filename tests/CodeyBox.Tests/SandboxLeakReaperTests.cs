@@ -184,6 +184,27 @@ public sealed class SandboxLeakReaperTests
         Assert.Contains("codeybox-willsucceed00", provider.DisposedNames);
     }
 
+    // ── Sweep resilience ─────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task RunSweepAsync_WhenListAllThrows_SwallowsExceptionAndLeavesLeaksUnchanged()
+    {
+        var provider = new FakeSandboxProvider();
+        provider.SetListThrows();
+        var reaper = BuildReaper(provider);
+
+        // Capture the initial (empty) leak list reference.
+        var initialLeaks = reaper.GetLatestLeaks();
+
+        // Must not propagate the exception — sweep failures must be swallowed
+        // so the BackgroundService host does not terminate.
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        // _latestLeaks must remain the same object — the failed sweep must not
+        // have overwritten it with partial or empty results.
+        Assert.Same(initialLeaks, reaper.GetLatestLeaks());
+    }
+
     // ── Age threshold boundary ───────────────────────────────────────────────
 
     [Theory]
@@ -213,19 +234,25 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
 {
     private readonly List<ManagedSandboxInfo> _sandboxes = [];
     private readonly HashSet<string> _throwOnDispose = new(StringComparer.Ordinal);
+    private bool _throwOnList;
 
     public List<string> DisposedNames { get; } = [];
 
     public void AddSandbox(ManagedSandboxInfo info) => _sandboxes.Add(info);
     public void SetDisposeThrows(string name) => _throwOnDispose.Add(name);
+    public void SetListThrows() => _throwOnList = true;
 
     public string Name => "fake";
 
     public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
         throw new NotSupportedException("Fake provider does not create sandboxes");
 
-    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
-        Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(_sandboxes.ToList());
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+    {
+        if (_throwOnList)
+            throw new InvalidOperationException("Simulated ListAllManagedAsync failure");
+        return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(_sandboxes.ToList());
+    }
 
     public Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
