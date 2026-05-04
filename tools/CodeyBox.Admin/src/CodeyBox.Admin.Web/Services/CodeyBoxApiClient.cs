@@ -114,6 +114,22 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<BudgetUsageDto>(JsonOptions, ct);
     }
 
+    public async Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/workitems/{Uri.EscapeDataString(id)}/replay", req, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<WorkItemDto>(JsonOptions, ct);
+    }
+
+    public async Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/replays", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemReplaysDto>(JsonOptions, ct);
+    }
+
     public async Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default)
     {
         var resp = await _http.GetAsync(

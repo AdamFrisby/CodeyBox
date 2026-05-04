@@ -43,6 +43,10 @@ public interface ICodeyBoxApiClient
     Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default);
     Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default);
 
+    // ── Replay ────────────────────────────────────────────────────────────────
+    Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default);
+    Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default);
+
     // ── Suggestions ───────────────────────────────────────────────────────────
     Task<List<SuggestionDto>> GetSuggestionsAsync(
         string? projectId = null, string? category = null, string? severity = null,

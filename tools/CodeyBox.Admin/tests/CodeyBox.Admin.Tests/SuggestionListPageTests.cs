@@ -280,6 +280,10 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDto?>(null);
+    public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemReplaysDto?>(null);
 }
 
 /// <summary>
@@ -359,4 +363,8 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDto?>(null);
+    public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemReplaysDto?>(null);
 }

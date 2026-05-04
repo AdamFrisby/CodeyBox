@@ -105,6 +105,14 @@ public sealed record WorkItem
     /// </summary>
     public string? ExternalId { get; init; }
 
+    /// <summary>
+    /// When set, identifies the source work item this item was created as a replay of.
+    /// Immutable after creation. Null for items not created via the replay API.
+    /// When the source is cancelled the link is cleared (orphaned) but the replay
+    /// continues running.
+    /// </summary>
+    public WorkItemId? ReplayOfWorkItemId { get; init; }
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,

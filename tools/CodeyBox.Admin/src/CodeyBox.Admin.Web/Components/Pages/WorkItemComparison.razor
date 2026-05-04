@@ -1,0 +1,149 @@
+@page "/work-items/{Id}/comparison"
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<WorkItemComparison> Logger
+
+<PageTitle>Comparison — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found.</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_data is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <h1>Comparison: @_data.Source.Title</h1>
+    <p><a href="/work-items/@_data.Source.Id">← Back to source</a></p>
+
+    <div class="comparison-grid" style="grid-template-columns: 120px repeat(@_columns.Count, 1fr);">
+        <div class="comparison-header"></div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-header">
+                <a href="/work-items/@col.Id">@col.Id[..Math.Min(8, col.Id.Length)]</a>
+                @if (col.Id == _data.Source.Id)
+                {
+                    <span class="badge badge-source">source</span>
+                }
+                else
+                {
+                    <span class="badge badge-replay">replay</span>
+                }
+            </div>
+        }
+
+        <div class="comparison-row-label">Agent</div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-cell">@col.Agent</div>
+        }
+
+        <div class="comparison-row-label">Status</div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-cell state-@col.State.ToLowerInvariant()">@col.State</div>
+        }
+
+        <div class="comparison-row-label">Work branch</div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-cell">@(col.WorkBranch ?? "(auto)")</div>
+        }
+
+        <div class="comparison-row-label">Created</div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-cell">@col.CreatedAt.ToString("O")</div>
+        }
+
+        <div class="comparison-row-label">Age</div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-cell">@col.Age</div>
+        }
+
+        @if (_costs.Count > 0 || _timings.Count > 0)
+        {
+            <div class="comparison-row-label">Wall-clock</div>
+            @foreach (var col in _columns)
+            {
+                <div class="comparison-cell">
+                    @(_timings.TryGetValue(col.Id, out var ms) ? FormatDuration(ms) : "—")
+                </div>
+            }
+
+            <div class="comparison-row-label">Token cost</div>
+            @foreach (var col in _columns)
+            {
+                <div class="comparison-cell">
+                    @(_costs.TryGetValue(col.Id, out var usd) ? $"${usd:F4}" : "—")
+                </div>
+            }
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private WorkItemReplaysDto? _data;
+    private List<WorkItemDto> _columns = [];
+    private string? _error;
+    private bool _notFound;
+
+    private Dictionary<string, long> _timings = [];
+    private Dictionary<string, double> _costs = [];
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        _columns = [];
+        _timings = [];
+        _costs = [];
+
+        try
+        {
+            _data = await ApiClient.GetReplaysAsync(Id);
+            _notFound = _data is null;
+            if (_data is null) return;
+
+            _columns = [_data.Source, .._data.Replays];
+            var allItems = _columns;
+
+            foreach (var item in allItems)
+            {
+                var timings = await ApiClient.GetWorkItemTimingsAsync(item.Id);
+                if (timings is not null)
+                    _timings[item.Id] = timings.TotalDurationMs;
+
+                var costs = await ApiClient.GetWorkItemCostsAsync(item.Id);
+                if (costs is not null)
+                    _costs[item.Id] = costs.Totals.EstimatedUsd;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load comparison for work item {Id}", Id);
+            _error = "Failed to load comparison data. Check server logs for details.";
+        }
+    }
+
+    private static string FormatDuration(long ms)
+    {
+        if (ms < 1000) return $"{ms}ms";
+        if (ms < 60_000) return $"{ms / 1000.0:F1}s";
+        return $"{ms / 60_000.0:F1}m";
+    }
+}

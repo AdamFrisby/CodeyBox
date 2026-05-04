@@ -109,7 +109,7 @@ public sealed class WorkItemDetailPageTests : TestContext
     }
 
     [Fact]
-    public void WorkItemDetail_ShowsReplayButton_ForAnyItem()
+    public void WorkItemDetail_ShowsTimelineButton_ForAnyItem()
     {
         var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Working");
         var fake = new FakeApiClient([item]);
@@ -117,7 +117,7 @@ public sealed class WorkItemDetailPageTests : TestContext
 
         var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
-        Assert.Contains("Replay", cut.Markup);
+        Assert.Contains("Timeline", cut.Markup);
         Assert.Contains("/timeline", cut.Markup);
     }
 }
