@@ -2,7 +2,7 @@
 //
 // How it works:
 // 1. The factory matches Upstream.Kind = "gitea" and returns this singleton.
-// 2. CompleteAsync reads per-project config from IPluginHost.GetProjectUpstreamConfig.
+// 2. CompleteAsync reads per-project config from IUpstreamPluginHost.GetProjectUpstreamConfig.
 // 3. It pushes the work branch via the host git module, opens a pull request
 //    using Gitea's REST API, and optionally auto-merges it.
 //
@@ -21,6 +21,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Net.Sockets;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
@@ -33,7 +34,7 @@ namespace CodeyBox.SampleGiteaUpstreamPlugin;
 /// request via Gitea's <c>/api/v1/repos/{owner}/{repo}/pulls</c> endpoint,
 /// and optionally auto-merges it.
 /// Per-project settings (BaseUrl, Owner, Repository) are read from
-/// <c>Upstream.PluginConfig</c> via <c>IPluginHost.GetProjectUpstreamConfig</c>.
+/// <c>Upstream.PluginConfig</c> via <c>IUpstreamPluginHost.GetProjectUpstreamConfig</c>.
 /// The auth token is read from the environment variable named in
 /// <c>UpstreamCompletionRequest.TokenEnvVar</c>.
 /// </summary>
@@ -49,6 +50,7 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
     private readonly IHttpClientFactory _httpClientFactory;
 
     private IPluginHost _host = null!;
+    private IUpstreamPluginHost _upstreamHost = null!;
 
     public SampleGiteaUpstreamRemote(IGitHost gitHost, IHttpClientFactory httpClientFactory)
     {
@@ -59,28 +61,24 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)
     {
         _host = context.Host;
+        _upstreamHost = (IUpstreamPluginHost)_host;
         context.Logger.LogInformation("SampleGiteaUpstreamRemote initialized");
         return Task.CompletedTask;
     }
 
-    // PushAsync is called independently by the orchestrator for push-only scenarios.
-    // This sample plugin reads per-project config only from UpstreamCompletionRequest,
-    // which is unavailable here. A production plugin that needs standalone push support
-    // should cache config (BaseUrl, Owner, Repository, token) at InitializeAsync time
-    // and use the cached values here.
+    // PushAsync is called for push-only orchestrator flows. Per-project config
+    // (BaseUrl, Owner, Repository) is not available without a project ID, so
+    // standalone push is not supported by this sample. Production plugins that
+    // need standalone push support should cache config at InitializeAsync time.
     public Task<UpstreamPushResult> PushAsync(
         string repositoryId, string branch, CancellationToken ct = default)
-    {
-        _host.Logger.LogWarning(
-            "SampleGiteaUpstreamRemote.PushAsync called without project context; " +
-            "push will occur in CompleteAsync");
-        return Task.FromResult(new UpstreamPushResult(true, null));
-    }
+        => Task.FromResult(new UpstreamPushResult(
+            false, "push-only not supported by this plugin; use CompleteAsync"));
 
     public async Task<UpstreamCompletionOutcome> CompleteAsync(
         UpstreamCompletionRequest request, CancellationToken ct = default)
     {
-        var cfg = _host.GetProjectUpstreamConfig(request.ProjectId);
+        var cfg = _upstreamHost.GetProjectUpstreamConfig(request.ProjectId);
 
         if (!cfg.TryGetValue("BaseUrl", out var baseUrl) || string.IsNullOrWhiteSpace(baseUrl))
             throw new InvalidOperationException(
@@ -113,10 +111,15 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
         // Open a pull request.
         var prNumber = await OpenPullRequestAsync(
             baseUrl, encodedOwner, encodedRepo, token, request, ct);
-        var prUrl = $"{NormalizeBaseToWebUrl(baseUrl)}/{owner}/{repo}/pulls/{prNumber}";
 
-        _host.Logger.LogInformation(
-            "Gitea PR #{Number} opened: {Url}", prNumber, prUrl);
+        // prNumber == 0 means the PR already existed (Gitea 422 soft-failure).
+        string? prUrl = prNumber > 0
+            ? $"{NormalizeBaseToWebUrl(baseUrl)}/{owner}/{repo}/pulls/{prNumber}"
+            : null;
+
+        if (prNumber > 0)
+            _host.Logger.LogInformation(
+                "Gitea PR #{Number} opened: {Url}", prNumber, prUrl);
 
         if (!request.AutoMerge || prNumber == 0)
         {
@@ -124,7 +127,7 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
             {
                 BranchPushed = true,
                 PullRequestUrl = prUrl,
-                PullRequestNumber = prNumber,
+                PullRequestNumber = prNumber > 0 ? prNumber : null,
             };
         }
 
@@ -146,8 +149,12 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
         };
     }
 
-    // Reject non-https schemes and malformed URIs so operators cannot use PluginConfig
-    // to point the orchestrator at internal network addresses via BaseUrl.
+    private static readonly HashSet<string> _ssrfBlockedHosts =
+        new(StringComparer.OrdinalIgnoreCase) { "localhost", "metadata.google.internal" };
+
+    // Validates scheme, syntax, and blocks loopback/private/link-local addresses
+    // so operators cannot use PluginConfig to point the orchestrator at internal
+    // network addresses via BaseUrl.
     private static void ValidateBaseUrl(string baseUrl, ProjectId projectId)
     {
         if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
@@ -156,6 +163,41 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
         if (!string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException(
                 $"Project {projectId}: Gitea plugin BaseUrl must use https:// (got '{uri.Scheme}://')");
+
+        // Block known loopback/internal hostnames.
+        if (_ssrfBlockedHosts.Contains(uri.Host))
+            throw new InvalidOperationException(
+                $"Project {projectId}: Gitea plugin BaseUrl must not point to a loopback or internal address");
+
+        // Block IP addresses in loopback, private RFC-1918, or link-local ranges.
+        if (IPAddress.TryParse(uri.Host, out var ip) && IsNonRoutableAddress(ip))
+            throw new InvalidOperationException(
+                $"Project {projectId}: Gitea plugin BaseUrl must not point to a private or loopback address");
+    }
+
+    private static bool IsNonRoutableAddress(IPAddress ip)
+    {
+        if (IPAddress.IsLoopback(ip))
+            return true;
+
+        var bytes = ip.GetAddressBytes();
+        if (ip.AddressFamily == AddressFamily.InterNetwork)
+        {
+            // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 (link-local / cloud metadata)
+            return bytes[0] == 10
+                || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)
+                || (bytes[0] == 192 && bytes[1] == 168)
+                || (bytes[0] == 169 && bytes[1] == 254);
+        }
+
+        if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            // fc00::/7 (ULA — covers fd00:ec2::/32 and similar), fe80::/10 (link-local)
+            return (bytes[0] & 0xfe) == 0xfc
+                || (bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80);
+        }
+
+        return false;
     }
 
     private static string? ResolveToken(UpstreamCompletionRequest request)
@@ -243,10 +285,10 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
         string? sha = null;
         try
         {
-            await using var content = await response.Content.ReadAsStreamAsync(ct);
-            if (content.Length > 0)
+            var body = await response.Content.ReadAsStringAsync(ct);
+            if (!string.IsNullOrEmpty(body))
             {
-                using var doc = await JsonDocument.ParseAsync(content, cancellationToken: ct);
+                using var doc = JsonDocument.Parse(body);
                 if (doc.RootElement.TryGetProperty("sha", out var shaProp))
                     sha = shaProp.GetString();
             }

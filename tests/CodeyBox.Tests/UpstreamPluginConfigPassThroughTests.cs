@@ -8,7 +8,7 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies that <c>Upstream.PluginConfig</c> is accessible to plugins at runtime
-/// via <see cref="IPluginHost.GetProjectUpstreamConfig"/>.
+/// via <see cref="IUpstreamPluginHost.GetProjectUpstreamConfig"/>.
 /// </summary>
 public sealed class UpstreamPluginConfigPassThroughTests
 {
@@ -104,9 +104,11 @@ public sealed class UpstreamPluginConfigPassThroughTests
 
 internal sealed class ConfigReadingFakeRemote
 {
-    private readonly IPluginHost _host;
-    public ConfigReadingFakeRemote(IPluginHost host) => _host = host;
+    private readonly IUpstreamPluginHost _upstreamHost;
+
+    public ConfigReadingFakeRemote(IPluginHost host)
+        => _upstreamHost = (IUpstreamPluginHost)host;
 
     public IReadOnlyDictionary<string, string> ReadConfig(ProjectId projectId)
-        => _host.GetProjectUpstreamConfig(projectId);
+        => _upstreamHost.GetProjectUpstreamConfig(projectId);
 }

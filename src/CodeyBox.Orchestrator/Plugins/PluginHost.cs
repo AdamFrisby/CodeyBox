@@ -9,7 +9,7 @@ namespace CodeyBox.Orchestrator;
 /// Orchestrator-side implementation of <see cref="IPluginHost"/>. Created per
 /// plugin during initialization; plugins may hold a reference for their lifetime.
 /// </summary>
-internal sealed class PluginHost : IPluginHost
+internal sealed class PluginHost : IPluginHost, IUpstreamPluginHost
 {
     private readonly Func<ProjectId, IReadOnlyDictionary<string, string>> _projectConfigResolver;
 

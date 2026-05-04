@@ -72,6 +72,29 @@ public sealed class UpstreamPluginNameCollisionTests
     }
 
     [Fact]
+    public void Create_GitGenericKind_BuiltInWinsOverPlugin()
+    {
+        var plugin = new FakePluginUpstreamRemote("git-generic");
+        var (factory, _) = BuildFactoryWithCapture([plugin]);
+
+        var project = new Project
+        {
+            Id = new ProjectId("gg-project"),
+            DisplayName = "GG",
+            RepositoryUrl = "https://example.com/org/repo.git",
+            Upstream = new ProjectUpstream
+            {
+                Kind = "git-generic",
+                GenericUrl = "https://example.com/org/repo.git",
+            },
+        };
+
+        var remote = factory.Create(project);
+
+        Assert.IsNotType<FakePluginUpstreamRemote>(remote);
+    }
+
+    [Fact]
     public void Factory_PluginWithBuiltInName_LogsWarning()
     {
         var plugin = new FakePluginUpstreamRemote("github");

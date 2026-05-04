@@ -1,4 +1,3 @@
-using CodeyBox.Core;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -28,13 +27,4 @@ public interface IPluginHost
     /// them here without knowing its own ID.
     /// </summary>
     IConfigurationSection ScopedConfig { get; }
-
-    /// <summary>
-    /// Returns the <c>Upstream.PluginConfig</c> key/value map for the specified
-    /// project. This is the ONE sanctioned way for an upstream remote plugin to
-    /// read its per-project settings (base URL, owner, repository, …) at runtime.
-    /// Returns an empty dictionary when the project is unknown or has no
-    /// <c>Upstream.PluginConfig</c> entries.
-    /// </summary>
-    IReadOnlyDictionary<string, string> GetProjectUpstreamConfig(ProjectId projectId);
 }

@@ -33,6 +33,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly ICredentialProvider _credentials;
     private readonly ILogger<LlmPullRequestDescriptionGenerator> _generatorLog;
     private readonly IReadOnlyList<IUpstreamRemote> _pluginRemotes;
+    private readonly ILogger<UpstreamRemoteFactory>? _factoryLog;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
@@ -54,6 +55,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         _credentials = credentials;
         _generatorLog = generatorLog;
         _timings = timings;
+        _factoryLog = factoryLog;
 
         var remotes = new List<IUpstreamRemote>();
         foreach (var remote in pluginRemotes ?? [])

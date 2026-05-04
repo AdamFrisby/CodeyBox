@@ -190,7 +190,7 @@ public sealed record ProjectUpstream
     /// Plugin-specific key/value settings passed to the upstream remote plugin
     /// named by <see cref="Kind"/>. Plugin authors document which keys they read.
     /// Accessible at runtime via
-    /// <c>IPluginHost.GetProjectUpstreamConfig(projectId)</c>.
+    /// <c>IUpstreamPluginHost.GetProjectUpstreamConfig(projectId)</c>.
     /// </summary>
     public IReadOnlyDictionary<string, string> PluginConfig { get; init; }
         = new Dictionary<string, string>();

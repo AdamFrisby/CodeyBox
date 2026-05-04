@@ -34,13 +34,15 @@ public sealed class MyGiteaUpstreamRemote : IUpstreamRemote, IPluginInitializer
     public string Name => "gitea";
 
     private IPluginHost _host = null!;
+    private IUpstreamPluginHost _upstreamHost = null!;
 
     // Inject IGitHost to push branches, and IHttpClientFactory for REST calls.
     public MyGiteaUpstreamRemote(IGitHost gitHost, IHttpClientFactory httpClientFactory) { ... }
 
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)
     {
-        _host = context.Host;   // store for use in CompleteAsync
+        _host = context.Host;
+        _upstreamHost = (IUpstreamPluginHost)_host;   // always succeeds against the orchestrator host
         return Task.CompletedTask;
     }
 
@@ -48,7 +50,7 @@ public sealed class MyGiteaUpstreamRemote : IUpstreamRemote, IPluginInitializer
         UpstreamCompletionRequest request, CancellationToken ct = default)
     {
         // Read per-project config — see PluginConfig convention below.
-        var cfg = _host.GetProjectUpstreamConfig(request.ProjectId);
+        var cfg = _upstreamHost.GetProjectUpstreamConfig(request.ProjectId);
         var baseUrl = cfg["BaseUrl"];
 
         // Read the auth token from the env var named by the operator.
@@ -65,7 +67,7 @@ public sealed class MyGiteaUpstreamRemote : IUpstreamRemote, IPluginInitializer
 
     public Task<UpstreamPushResult> PushAsync(
         string repositoryId, string branch, CancellationToken ct = default)
-        => Task.FromResult(new UpstreamPushResult(true, null));
+        => Task.FromResult(new UpstreamPushResult(false, "push-only not supported; use CompleteAsync"));
 }
 ```
 
@@ -89,12 +91,12 @@ Operators supply these via `Upstream.PluginConfig` in the project config:
 Inside `CompleteAsync`, retrieve the config with:
 
 ```csharp
-var cfg = _host.GetProjectUpstreamConfig(request.ProjectId);
+var cfg = _upstreamHost.GetProjectUpstreamConfig(request.ProjectId);
 ```
 
-`GetProjectUpstreamConfig` is the **only** place the plugin host exposes
-per-project state to a plugin. It returns an empty dictionary when the project
-has no `PluginConfig` entries or is unknown; never throws.
+`IUpstreamPluginHost.GetProjectUpstreamConfig` is the **only** place the plugin
+host exposes per-project state to a plugin. It returns an empty dictionary when
+the project has no `PluginConfig` entries or is unknown; never throws.
 
 Document which keys your plugin reads in your plugin's README.
 
@@ -118,7 +120,7 @@ This keeps credentials out of config files and plugin binaries entirely.
 ## Built-in precedence
 
 Built-in remotes (`noop`, `github`, `git-generic`) always win over plugins with
-the same `Name`. A plugin registering `Name = "github"` is silently unreachable —
+the same `Name`. A plugin registering `Name = "github"` is unreachable —
 the orchestrator logs a warning and ignores it. Operators cannot shadow built-ins
 via plugins.
 
