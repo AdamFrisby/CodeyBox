@@ -654,59 +654,144 @@ public sealed class PipelineRunner : IPipelineRunner
                 hostNetworkProfile: profile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit");
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
 
-            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-            if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+            // Within each capability group, split by Kind so tool auditors stay
+            // sequential in a shared sandbox while LLM auditors each get their
+            // own isolated clone and run concurrently (wall-clock ≈ max individual,
+            // not sum). Tool auditors that share filesystem state must stay sequential.
+            var toolPairs = group.Where(x => x.Auditor.Kind != "llm").ToList();
+            var llmPairs  = group.Where(x => x.Auditor.Kind == "llm").ToList();
 
-            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
-
-            foreach (var (auditor, runner) in group)
+            // Tool auditors: one shared sandbox, sequential.
+            if (toolPairs.Count > 0)
             {
-                _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
-                var auditorStarted = DateTimeOffset.UtcNow;
-                var auditorSw = Stopwatch.StartNew();
-                var auditorStartedAt = DateTimeOffset.UtcNow;
-                // Thread the resolved runner into the context so LlmReviewAuditor
-                // can use the cross-review agent instead of its baked-in default.
-                var auditorCtx = ctx with { AuditRunner = runner };
-                AuditResult result;
-                var auditorScope = await TimingScope.BeginAsync(
-                    _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
-                    iteration: ctx.Iteration,
-                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-                    log: _log);
-                await using (auditorScope)
+                await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+                if (credential is not null && credential.Files.Count > 0)
+                    await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
+
+                foreach (var (auditor, runner) in toolPairs)
                 {
-                    result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+                    var run = await ExecAuditorAsync(sandbox, auditor, runner, ctx, ct);
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
+                    if (needsCreds && runner.Kind != workRunner.Kind)
+                        activeAuditAgentKind ??= runner.Kind;
+                    findings.AddRange(run.Result.Findings);
+                    if (project.Audit.StopOnFirstFailure && run.Result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+                        return (findings, activeAuditAgentKind);
                 }
-                auditorSw.Stop();
-                if (needsCreds)
+            }
+
+            // LLM auditors: one sandbox per auditor, run concurrently capped by
+            // MaxLlmAuditorParallelism. Independent sandboxes prevent races on
+            // /audit/result.json. Post-processing is sequential and stable-ordered.
+            if (llmPairs.Count > 0)
+            {
+                var maxPar = project.Audit.MaxLlmAuditorParallelism;
+                using var sem = new SemaphoreSlim(maxPar, maxPar);
+
+                var llmTasks = llmPairs.Select(async pair =>
                 {
-                    await TryRecordCostAsync(result.RawOutput, null,
-                        runner.Kind, ctx.WorkItemId, "audit", ctx.Iteration,
-                        auditorStartedAt, auditorStartedAt + auditorSw.Elapsed);
+                    await sem.WaitAsync(ct);
+                    try
+                    {
+                        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+                        if (credential is not null && credential.Files.Count > 0)
+                            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
+                        return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, ctx, ct);
+                    }
+                    finally { sem.Release(); }
+                }).ToList();
+
+                var llmRuns = await Task.WhenAll(llmTasks);
+
+                // Post-process in stable auditor order (same as llmPairs).
+                foreach (var run in llmRuns)
+                {
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
+                    if (needsCreds && run.Runner.Kind != workRunner.Kind)
+                        activeAuditAgentKind ??= run.Runner.Kind;
+                    findings.AddRange(run.Result.Findings);
                 }
-                await EmitAuditorSubStepsAsync(auditor.Name, result.RawOutput,
-                    ctx.WorkItemId, ctx.Iteration, auditorStartedAt);
-                await EmitToolCallCountsAsync(result.RawOutput, ctx.WorkItemId, "audit",
-                    auditorScope.ElapsedMs, ct, iteration: ctx.Iteration);
-                var worstSeverity = result.Findings.Count > 0
-                    ? ((AuditSeverity)result.Findings.Max(f => (int)f.Severity)).ToString()
-                    : "none";
-                AuditLog.AuditorRun(auditor.Name, worstSeverity, auditorSw.Elapsed, runner.Kind);
-                // Track whether any LLM auditor ran with a different agent (cross-review).
-                if (needsCreds && runner.Kind != workRunner.Kind)
-                    activeAuditAgentKind ??= runner.Kind;
-                findings.AddRange(result.Findings);
-                await PersistAuditReportAsync(ctx, auditor, result, auditorStarted, auditorSw.Elapsed, ct);
-                if (project.Audit.StopOnFirstFailure && result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+                if (project.Audit.StopOnFirstFailure && findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
                     return (findings, activeAuditAgentKind);
             }
         }
 
         return (findings, activeAuditAgentKind);
     }
+
+    /// <summary>
+    /// Runs a single auditor inside <paramref name="sandbox"/>, wrapping it
+    /// in a timing scope. Safe to call concurrently from parallel tasks — all
+    /// state is local to this invocation.
+    /// </summary>
+    private async Task<AuditorRunRecord> ExecAuditorAsync(
+        ISandbox sandbox,
+        IAuditor auditor,
+        IAgentRunner runner,
+        AuditContext ctx,
+        CancellationToken ct)
+    {
+        _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
+        var startedAt = DateTimeOffset.UtcNow;
+        var sw = Stopwatch.StartNew();
+        // Thread the resolved runner into the context so LlmReviewAuditor
+        // can use the cross-review agent instead of its baked-in default.
+        var auditorCtx = ctx with { AuditRunner = runner };
+        var timingScope = await TimingScope.BeginAsync(
+            _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
+            iteration: ctx.Iteration,
+            metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+            log: _log);
+        AuditResult result;
+        await using (timingScope)
+        {
+            result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+        }
+        sw.Stop();
+        return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs);
+    }
+
+    /// <summary>
+    /// Handles all post-run bookkeeping for a completed auditor: cost capture,
+    /// sub-step emission, structured logging, and audit-report persistence.
+    /// Always called sequentially (never from parallel tasks) to keep writes
+    /// to external stores ordered and safe.
+    /// </summary>
+    private async Task PostProcessAuditorRunAsync(
+        AuditorRunRecord run,
+        IAgentRunner workRunner,
+        bool needsCreds,
+        AuditContext ctx,
+        CancellationToken ct)
+    {
+        if (needsCreds)
+        {
+            await TryRecordCostAsync(run.Result.RawOutput, null,
+                run.Runner.Kind, ctx.WorkItemId, "audit", ctx.Iteration,
+                run.StartedAt, run.StartedAt + run.Elapsed);
+        }
+        await EmitAuditorSubStepsAsync(run.Auditor.Name, run.Result.RawOutput,
+            ctx.WorkItemId, ctx.Iteration, run.StartedAt);
+        await EmitToolCallCountsAsync(run.Result.RawOutput, ctx.WorkItemId, "audit",
+            run.ScopeElapsedMs, ct, iteration: ctx.Iteration);
+        var worstSeverity = run.Result.Findings.Count > 0
+            ? ((AuditSeverity)run.Result.Findings.Max(f => (int)f.Severity)).ToString()
+            : "none";
+        AuditLog.AuditorRun(run.Auditor.Name, worstSeverity, run.Elapsed, run.Runner.Kind);
+        await PersistAuditReportAsync(ctx, run.Auditor, run.Result, run.StartedAt, run.Elapsed, ct);
+    }
+
+    private sealed record AuditorRunRecord(
+        IAuditor Auditor,
+        IAgentRunner Runner,
+        AuditResult Result,
+        DateTimeOffset StartedAt,
+        TimeSpan Elapsed,
+        long ScopeElapsedMs);
 
     private async Task PersistAuditReportAsync(
         AuditContext ctx,

@@ -125,6 +125,7 @@ defaults expecting them to be replaced wholesale by per-project overrides.
   "FailingSeverity": "Error",
   "PerIterationTimeoutMinutes": 10,
   "StopOnFirstFailure": false,
+  "MaxLlmAuditorParallelism": 3,
   "Languages": ["python", "typescript"],
   "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"],
   "Custom": [
@@ -143,6 +144,14 @@ The orchestrator's effective auditor list for each project is:
 ```
 Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 ```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `MaxIterations` | int | `3` | How many audit + rework cycles to attempt before giving up with `AuditFailed` |
+| `FailingSeverity` | string | `"Error"` | Findings at or above this severity block the merge. `"Warning"` or `"Info"` can be used to widen the gate. |
+| `PerIterationTimeoutMinutes` | int | `10` | Wall-clock cap on a single audit iteration's sandbox |
+| `StopOnFirstFailure` | bool | `false` | Stop running auditors as soon as one returns a blocking finding — useful when cheap linters precede expensive LLM auditors |
+| `MaxLlmAuditorParallelism` | int | `3` | Max LLM auditors running concurrently. Default `3` means `security:llm-review`, `completeness:llm-review`, and `cheating:llm-review` all run at the same time. Set to `1` to serialize them if you hit API 429 rate-limit errors. Tool auditors are unaffected and always run sequentially. |
 
 ### Languages (built-in presets)
 

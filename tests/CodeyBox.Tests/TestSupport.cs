@@ -68,7 +68,8 @@ internal static class TestSupport
         IEnumerable<MergeStrategy>? mergeStrategy = null,
         HostGitIdentity? hostGitIdentity = null,
         (string Name, string Email)? projectGitAuthor = null,
-        IAuditReportStore? auditReportStore = null)
+        IAuditReportStore? auditReportStore = null,
+        int maxLlmAuditorParallelism = 3)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -99,6 +100,7 @@ internal static class TestSupport
             {
                 MaxIterations = maxAuditIterations,
                 AuditTypes = auditTypes,
+                MaxLlmAuditorParallelism = maxLlmAuditorParallelism,
             },
         });
 

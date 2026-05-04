@@ -328,6 +328,46 @@ gains an optional `auditAgentKind` field in its `details` object:
   is active for that iteration.
 - `null` when all auditors used the work agent.
 
+## LLM auditor parallelism
+
+By default, LLM-driven auditors within an audit iteration run **concurrently**.
+`security:llm-review`, `completeness:llm-review`, and `cheating:llm-review`
+all start at the same time, so wall-clock latency is approximately
+`max(individual)` (~5–13 min) rather than the sum (~15–35 min).
+
+Each parallel LLM auditor receives its own sandbox clone. Isolation ensures
+a crash or file write in one auditor's sandbox cannot corrupt another's
+`/audit/result.json` output.
+
+Tool auditors (`security:gitleaks`, `security:semgrep`, language presets,
+shell commands, diff-pattern matchers) are unaffected: they always run
+sequentially in a single shared sandbox, regardless of this setting.
+
+### Configuration
+
+```json
+"Audit": {
+  "MaxLlmAuditorParallelism": 3
+}
+```
+
+| Value | Behaviour |
+|---|---|
+| `3` (default) | All three standard LLM auditors run concurrently — fastest audit wall-clock |
+| `2` | Two run concurrently; the third waits for a free slot |
+| `1` | Fully sequential — useful for debugging or avoiding API 429 errors |
+
+**If you hit 429 rate-limit errors during audit**, set `MaxLlmAuditorParallelism: 1`.
+The three LLM auditors queue up and their individual latencies are unchanged —
+you trade total wall-clock time for reduced concurrent token draw.
+
+### Observability
+
+The existing `auditor.run` event is emitted once per auditor after its sandbox
+completes. Because parallel auditors finish in non-deterministic order, event
+emission order may not match registration order — use the auditor `name`
+property to correlate events, not their relative position in the stream.
+
 ## Security notes
 
 The audit phase widens the attack surface in two ways:
