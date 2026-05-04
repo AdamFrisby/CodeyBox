@@ -82,6 +82,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
         // Partial unique index: enforces per-project uniqueness while allowing NULL coexistence.
         RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_external_id_per_project ON work_items(project_id, external_id) WHERE external_id IS NOT NULL;");
+
+        // Additive migration: track how many times the dead-worker reaper has recovered this item.
+        RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;");
     }
 
     private void RunMigration(string sql)
@@ -109,9 +112,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
-                    stuck_retries, started_at, external_id)
+                    stuck_retries, started_at, external_id, recovery_attempts)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
-                    $sretries, $started_at, $external_id);
+                    $sretries, $started_at, $external_id, $recovery_attempts);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -142,7 +145,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
-                    stuck_retries = $sretries, started_at = $started_at, external_id = $external_id
+                    stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
+                    recovery_attempts = $recovery_attempts
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -168,7 +172,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
-                    stuck_retries = $sretries, started_at = $started_at, external_id = $external_id
+                    stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
+                    recovery_attempts = $recovery_attempts
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -330,6 +335,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$sretries", item.StuckRetries);
         cmd.Parameters.AddWithValue("$started_at", (object?)item.StartedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$external_id", (object?)item.ExternalId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$recovery_attempts", item.RecoveryAttempts);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -355,6 +361,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         StuckRetries = r.GetInt32(r.GetOrdinal("stuck_retries")),
         StartedAt = ReadNullableDateTimeOffset(r, "started_at"),
         ExternalId = r.IsDBNull(r.GetOrdinal("external_id")) ? null : r.GetString(r.GetOrdinal("external_id")),
+        RecoveryAttempts = r.IsDBNull(r.GetOrdinal("recovery_attempts")) ? 0 : r.GetInt32(r.GetOrdinal("recovery_attempts")),
     };
 
     private static DateTimeOffset? ReadNullableDateTimeOffset(SqliteDataReader r, string column)
