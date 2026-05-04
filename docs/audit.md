@@ -361,12 +361,34 @@ sequentially in a single shared sandbox, regardless of this setting.
 The three LLM auditors queue up and their individual latencies are unchanged —
 you trade total wall-clock time for reduced concurrent token draw.
 
+**Choosing an intermediate value**: the audit is subscription-friendly when
+`MaxLlmAuditorParallelism × peak-tokens-per-call < per-account-rate-limit`.
+If your rate limit sits between 1× and 3× your per-auditor peak token draw,
+set `MaxLlmAuditorParallelism: 2` rather than dropping all the way to `1`.
+
+### Known limitations
+
+**`StopOnFirstFailure` within the LLM group**: once parallel execution begins,
+all LLM auditors run to completion before findings are checked against
+`StopOnFirstFailure`. Short-circuiting still works between the tool-auditor
+phase and the LLM-auditor phase (a failing tool auditor still prevents LLM
+auditors from starting), but within the LLM group there is no early exit.
+A project that relies on `StopOnFirstFailure` to cap LLM token spend should
+set `MaxLlmAuditorParallelism: 1` so the sequential short-circuit applies.
+
+**Baseline-image baking**: if sandbox baseline images have not been pre-baked,
+parallel LLM auditor clones serialise on the bake step during the first audit
+iteration. Subsequent iterations reuse the baked image and run concurrently as
+expected. This is not a regression versus sequential execution — it only
+affects the first iteration when images are cold.
+
 ### Observability
 
 The existing `auditor.run` event is emitted once per auditor after its sandbox
-completes. Because parallel auditors finish in non-deterministic order, event
-emission order may not match registration order — use the auditor `name`
-property to correlate events, not their relative position in the stream.
+completes. Events are emitted in **registration order** (the order auditors
+appear in the config), not completion order — `Task.WhenAll` returns results
+in input-task order and the post-processing loop iterates that stable array.
+Use the auditor `name` property to correlate events with findings.
 
 ## Security notes
 

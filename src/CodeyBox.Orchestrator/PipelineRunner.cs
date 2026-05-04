@@ -659,7 +659,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // own isolated clone and run concurrently (wall-clock ≈ max individual,
             // not sum). Tool auditors that share filesystem state must stay sequential.
             var toolPairs = group.Where(x => x.Auditor.Kind != "llm").ToList();
-            var llmPairs  = group.Where(x => x.Auditor.Kind == "llm").ToList();
+            var llmPairs = group.Where(x => x.Auditor.Kind == "llm").ToList();
 
             // Tool auditors: one shared sandbox, sequential.
             if (toolPairs.Count > 0)

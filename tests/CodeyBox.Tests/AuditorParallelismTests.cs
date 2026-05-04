@@ -43,6 +43,26 @@ file static class AuditorTestHelpers
     };
 }
 
+file sealed class CapturingAuditReportStore : IAuditReportStore
+{
+    public List<AuditReport> Reports { get; } = [];
+
+    public Task CreateAsync(AuditReport report, CancellationToken ct = default)
+    {
+        Reports.Add(report);
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<AuditReport>>(Reports.Where(r => r.WorkItemId == workItemId).ToList());
+
+    public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
+
+    public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
+        => Task.FromResult(0);
+}
+
 // ── Test: parallel wall-clock ─────────────────────────────────────────────────
 
 /// <summary>
@@ -108,6 +128,7 @@ public sealed class AuditorParallelismOrderingTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
 
         // A=1 500 ms, B=750 ms, C=0 ms → completion order is C, B, A.
+        // Reports must be persisted in registration order (A, B, C).
         var auditorA = new FakeLlmAuditor("A", async (_, _, ct) =>
         {
             await Task.Delay(1_500, ct);
@@ -124,8 +145,13 @@ public sealed class AuditorParallelismOrderingTests : IDisposable
             return new AuditResult(false, [new AuditFinding("C", AuditSeverity.Warning, "finding-C", "from C")]);
         });
 
+        var captureStore = new CapturingAuditReportStore();
+
         // Findings are Warnings; FailingSeverity defaults to Error so audit passes.
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditorA, auditorB, auditorC], maxLlmAuditorParallelism: 3);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed,
+            auditors: [auditorA, auditorB, auditorC],
+            maxLlmAuditorParallelism: 3,
+            auditReportStore: captureStore);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem();
@@ -134,14 +160,16 @@ public sealed class AuditorParallelismOrderingTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-
-        // We can't read findings directly; verify via pipeline completion (all
-        // warning-level findings don't block merge) and absence of errors.
-        // The ordering contract is validated below by inspecting that the pipeline
-        // ran each auditor at least once.  A richer assertion requires exposing
-        // CollectFindingsAsync, which is intentionally private; we rely on the
-        // StopOnFirstFailure ordering test for that invariant.
         Assert.Null(final.LastError);
+
+        // Reports are persisted by PostProcessAuditorRunAsync in the post-WhenAll
+        // loop, which iterates llmRuns in input-task order (registration order).
+        // Verify A comes before B comes before C despite C completing first.
+        var reports = captureStore.Reports
+            .Where(r => r.WorkItemId == item.Id.ToString())
+            .Select(r => r.AuditorName)
+            .ToList();
+        Assert.Equal(["A", "B", "C"], reports);
     }
 
     [Fact]
