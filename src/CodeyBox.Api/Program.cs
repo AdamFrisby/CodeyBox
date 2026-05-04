@@ -285,9 +285,17 @@ builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 //
 // Operators with no credential plugins see zero behaviour change: the chain
 // is identical to the pre-plugin OAuth-file → env-var behaviour.
-builder.Services.AddSingleton<ICredentialProvider>(sp =>
+//
+// ChainedCredentialProvider is registered under three service types so that:
+//   - ICredentialProvider resolves the global chain (smoke gates, startup validation).
+//   - IProjectAwareCredentialProvider lets PipelineRunner apply per-project
+//     CredentialProviderPriority at agent pickup time.
+//   - ChainedCredentialProvider is directly resolvable for callers that need both.
+builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
 {
-    var providers = new List<ICredentialProvider>();
+    var builtInFirst = new List<ICredentialProvider>();
+    var namedPlugins = new List<(string Id, ICredentialProvider Provider)>();
+    var builtInLast = new List<ICredentialProvider>();
 
     var oauthFile =
         Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_OAUTH_FILE")
@@ -301,7 +309,7 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
             oauthFile = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 oauthFile[2..]);
-        providers.Add(new ClaudeOAuthFileCredentialProvider(
+        builtInFirst.Add(new ClaudeOAuthFileCredentialProvider(
             oauthFile,
             sandboxEnvVar: "CLAUDE_CODE_OAUTH_TOKEN",
             sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
@@ -311,6 +319,8 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
     // is registered in DI under its concrete type by PluginLoader.RegisterPlugins;
     // we resolve by concrete type (not by ICredentialProvider) to avoid
     // resolving the ChainedCredentialProvider itself and causing infinite recursion.
+    // Plugin IDs are stored alongside providers so per-project
+    // CredentialProviderPriority can filter and reorder them at pickup time.
     var pluginLoader = sp.GetRequiredService<IPluginLoader>();
     var loadedPlugins = pluginLoader.DiscoverAndLoadAsync(CancellationToken.None).GetAwaiter().GetResult();
     var credentialProviderType = typeof(ICredentialProvider);
@@ -319,11 +329,11 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
         foreach (var type in plugin.RegisteredTypes)
         {
             if (credentialProviderType.IsAssignableFrom(type))
-                providers.Add((ICredentialProvider)sp.GetRequiredService(type));
+                namedPlugins.Add((plugin.PluginId, (ICredentialProvider)sp.GetRequiredService(type)));
         }
     }
 
-    providers.Add(new EnvironmentCredentialProvider(new[]
+    builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         // Claude Code accepts either ANTHROPIC_API_KEY (real API key, format
         // sk-ant-api03-…) or CLAUDE_CODE_OAUTH_TOKEN (OAuth access token,
@@ -337,8 +347,14 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
     }));
 
-    return new ChainedCredentialProvider(providers);
+    return new ChainedCredentialProvider(
+        builtInFirst,
+        namedPlugins,
+        builtInLast,
+        log: sp.GetService<ILogger<ChainedCredentialProvider>>());
 });
+builder.Services.AddSingleton<ICredentialProvider>(sp => sp.GetRequiredService<ChainedCredentialProvider>());
+builder.Services.AddSingleton<IProjectAwareCredentialProvider>(sp => sp.GetRequiredService<ChainedCredentialProvider>());
 
 // --- HTTP clients ------------------------------------------------------------
 // Named client for GitHub upstream. GitHub requires a User-Agent header.

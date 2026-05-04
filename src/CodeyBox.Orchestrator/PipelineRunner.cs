@@ -364,7 +364,13 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         int? iteration = null)
     {
-        var credential = await _credentials.GetAsync(runner.Kind, ct);
+        // Apply per-project credential plugin ordering when configured.
+        // IProjectAwareCredentialProvider is implemented by ChainedCredentialProvider
+        // in production; test stubs that inject a plain ICredentialProvider fall back
+        // to the global chain automatically.
+        var credential = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
         var agentPhase = isInitial ? "work" : "rework";
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
@@ -863,7 +869,9 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         CancellationToken ct)
     {
-        var credential = await _credentials.GetAsync(runner.Kind, ct);
+        var credential = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge");

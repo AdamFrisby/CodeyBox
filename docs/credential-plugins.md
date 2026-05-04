@@ -268,8 +268,8 @@ server. It demonstrates:
 
 To adapt for a real vault:
 
-1. Replace the JSON-file read in `JsonFileVaultClient.GetSecretAsync` with an
-   HTTP call to your Vault's secret engine API.
+1. Replace the JSON-file read in `SampleVaultCredentialProvider.ReadVaultFileAsync`
+   with an HTTP call to your Vault's secret engine API.
 2. Parse the vault's lease duration into `ExpiresAt`.
 3. Add authentication (AppRole, Kubernetes SA, etc.) via `IPluginHost.ScopedConfig`.
 

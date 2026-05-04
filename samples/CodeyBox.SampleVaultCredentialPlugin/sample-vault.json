@@ -3,21 +3,21 @@
     "claude": {
       "ttlSeconds": 900,
       "environmentVariables": {
-        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-REPLACE_WITH_REAL_TOKEN"
+        "CLAUDE_CODE_OAUTH_TOKEN": "PLACEHOLDER-CLAUDE-TOKEN-REPLACE_WITH_REAL_TOKEN"
       },
       "files": {}
     },
     "codex": {
       "ttlSeconds": 3600,
       "environmentVariables": {
-        "OPENAI_API_KEY": "sk-REPLACE_WITH_REAL_KEY"
+        "OPENAI_API_KEY": "PLACEHOLDER-OPENAI-KEY-REPLACE_WITH_REAL_KEY"
       },
       "files": {}
     },
     "gemini": {
       "ttlSeconds": 3600,
       "environmentVariables": {
-        "GEMINI_API_KEY": "AIza-REPLACE_WITH_REAL_KEY"
+        "GEMINI_API_KEY": "PLACEHOLDER-GEMINI-KEY-REPLACE_WITH_REAL_KEY"
       },
       "files": {}
     }

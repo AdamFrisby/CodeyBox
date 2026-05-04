@@ -87,6 +87,17 @@ public sealed class SampleVaultCredentialProvider : ICredentialProvider, IPlugin
             return null;
         }
 
+        // A zero or negative TtlSeconds would produce an ExpiresAt already in the
+        // past, causing a cache miss on every call. Treat it as a misconfiguration
+        // and fall through so the chain tries the next provider.
+        if (entry.TtlSeconds <= 0)
+        {
+            _host.Logger.LogWarning(
+                "SampleVaultCredentialProvider: vault entry for '{Agent}' has TtlSeconds={Ttl} (must be > 0); skipping",
+                agentKey, entry.TtlSeconds);
+            return null;
+        }
+
         var expiry = DateTimeOffset.UtcNow.Add(entry.Ttl);
 
         return new AgentCredential(
