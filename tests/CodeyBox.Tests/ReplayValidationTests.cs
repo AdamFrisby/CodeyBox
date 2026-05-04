@@ -130,6 +130,20 @@ public sealed class ReplayValidationTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
     }
 
+    // ── 400 when modelId is set ───────────────────────────────────────────────
+
+    [Fact]
+    public async Task Replay_ModelIdProvided_Returns400()
+    {
+        var source = Item(WorkItemState.Done);
+        await _factory.Store.CreateAsync(source);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{source.Id}/replay",
+            new { modelId = "gemini-3.0-pro" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     // ── Valid replay succeeds ─────────────────────────────────────────────────
 
     [Fact]

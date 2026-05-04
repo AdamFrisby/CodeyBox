@@ -929,7 +929,8 @@ internal static class WorkItemEndpoints
             depExtIds,
             item.QueuePosition,
             item.ReplayOfWorkItemId?.ToString(),
-            item.AgentClassId);
+            item.AgentClassId,
+            MergeSha: item.MergeSha);
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -1055,7 +1056,8 @@ public sealed record WorkItemDto(
     string? ReplayOfWorkItemId = null,
     string? AgentClassId = null,
     int? AuditIterations = null,
-    int? FinalAuditBlockingFindings = null);
+    int? FinalAuditBlockingFindings = null,
+    string? MergeSha = null);
 
 public sealed record ProjectDto(
     string Id,

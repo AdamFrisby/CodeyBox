@@ -113,6 +113,12 @@ public sealed record WorkItem
     /// </summary>
     public WorkItemId? ReplayOfWorkItemId { get; init; }
 
+    /// <summary>
+    /// SHA of the merge commit produced during the merge phase. Populated by the
+    /// pipeline runner when the merge completes; null until then.
+    /// </summary>
+    public string? MergeSha { get; init; }
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,

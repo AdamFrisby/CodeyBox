@@ -28,6 +28,7 @@ public sealed class WorkItemDto
     public string? AgentClassId { get; set; }
     public int? AuditIterations { get; set; }
     public int? FinalAuditBlockingFindings { get; set; }
+    public string? MergeSha { get; set; }
 
     public bool IsTerminal => State is "Done" or "Failed" or "Cancelled" or "AuditFailed";
     public bool IsQueued => State == "Queued";

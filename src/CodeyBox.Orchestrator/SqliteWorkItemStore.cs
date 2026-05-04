@@ -89,6 +89,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
         // Index for cheap replay-listing queries.
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_replay_of ON work_items(replay_of_work_item_id) WHERE replay_of_work_item_id IS NOT NULL;");
+
+        // Additive migration: store the SHA of the merge commit produced during the merge phase.
+        RunMigration("ALTER TABLE work_items ADD COLUMN merge_sha TEXT;");
     }
 
     private void RunMigration(string sql)
@@ -116,9 +119,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
-                    stuck_retries, started_at, external_id, replay_of_work_item_id)
+                    stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
-                    $sretries, $started_at, $external_id, $replay_of);
+                    $sretries, $started_at, $external_id, $replay_of, $merge_sha);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -150,7 +153,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
-                    replay_of_work_item_id = $replay_of
+                    replay_of_work_item_id = $replay_of, merge_sha = $merge_sha
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -177,7 +180,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
-                    replay_of_work_item_id = $replay_of
+                    replay_of_work_item_id = $replay_of, merge_sha = $merge_sha
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -375,6 +378,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$started_at", (object?)item.StartedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$external_id", (object?)item.ExternalId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$replay_of", (object?)item.ReplayOfWorkItemId?.ToString() ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$merge_sha", (object?)item.MergeSha ?? DBNull.Value);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -401,6 +405,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         StartedAt = ReadNullableDateTimeOffset(r, "started_at"),
         ExternalId = r.IsDBNull(r.GetOrdinal("external_id")) ? null : r.GetString(r.GetOrdinal("external_id")),
         ReplayOfWorkItemId = ReadNullableWorkItemId(r, "replay_of_work_item_id"),
+        MergeSha = r.IsDBNull(r.GetOrdinal("merge_sha")) ? null : r.GetString(r.GetOrdinal("merge_sha")),
     };
 
     private static DateTimeOffset? ReadNullableDateTimeOffset(SqliteDataReader r, string column)

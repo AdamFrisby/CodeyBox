@@ -79,7 +79,6 @@ Creates a replay of work item `{id}`.
 ```json
 {
   "agent": "gemini",
-  "modelId": "gemini-3.0-pro",
   "agentClassId": "frontier-coding",
   "workBranch": "feat/foo-replay-gemini"
 }
@@ -88,14 +87,14 @@ Creates a replay of work item `{id}`.
 | Field | Default | Description |
 |---|---|---|
 | `agent` | source's agent | Override the agent. Must be a known agent kind. Clears `agentClassId` if set. |
-| `modelId` | (none) | Runtime model hint passed to the agent CLI as `--model`. Not persisted. |
+| `modelId` | — | **Not accepted.** Always returns `400 Bad Request`. Model is resolved at pickup from `AgentMembership`. Use `agentClassId` to route via a class that specifies the target model. |
 | `agentClassId` | source's agentClassId | Route via a named agent class instead of a direct agent. Clears `agent` if set. |
 | `workBranch` | `<source-branch>-replay-<short-id>` | Override the auto-generated work branch. Standard branch-name rules apply. Must differ from baseBranch. |
 
 **Responses:**
 
 - `201 Created` — the new work item record (same shape as `GET /workitems/{id}`).
-- `400 Bad Request` — source is not in a terminal state; unknown agent; invalid work branch.
+- `400 Bad Request` — source is not in a terminal state; unknown agent; invalid work branch; or `modelId` is set.
 - `404 Not Found` — source item does not exist.
 
 The new item starts in `Queued` state and enters the normal pipeline.

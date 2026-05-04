@@ -106,19 +106,18 @@ Clone a terminal work item and run it with a different agent or model. See
 ```json
 {
   "agent": "gemini",
-  "modelId": "gemini-3.0-pro",
   "agentClassId": "frontier-coding",
   "workBranch": "feat/foo-replay-gemini"
 }
 ```
 
 - `agent` — override agent kind. Clears `agentClassId` when set.
-- `modelId` — runtime model hint (not persisted).
+- `modelId` — **not accepted**; always returns `400 Bad Request`. Model is resolved at pickup from `AgentMembership`. Use `agentClassId` to route via a class that specifies the target model.
 - `agentClassId` — route via a named agent class. Clears `agent` when set.
 - `workBranch` — defaults to `<source-branch>-replay-<short-id>`.
 
 Returns `201 Created` with the new work item record.  
-Returns `400 Bad Request` if source is not terminal, agent is unknown, or branch is invalid.  
+Returns `400 Bad Request` if source is not terminal, agent is unknown, branch is invalid, or `modelId` is set.  
 Returns `404 Not Found` if source does not exist.
 
 ### `GET /workitems/{id}/replays`

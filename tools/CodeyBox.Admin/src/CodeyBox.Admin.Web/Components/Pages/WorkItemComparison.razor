@@ -66,9 +66,13 @@ else
         @foreach (var col in _columns)
         {
             <div class="comparison-cell">
-                @if (col.ExternalId is not null)
+                @if (col.ExternalId is not null && col.ExternalId.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 {
-                    <a href="@col.ExternalId" target="_blank">@col.ExternalId</a>
+                    <a href="@col.ExternalId" target="_blank" rel="noopener noreferrer">@col.ExternalId</a>
+                }
+                else if (col.ExternalId is not null)
+                {
+                    <code>@col.ExternalId</code>
                 }
                 else
                 {
@@ -80,7 +84,44 @@ else
         <div class="comparison-row-label">Merge SHA</div>
         @foreach (var col in _columns)
         {
-            <div class="comparison-cell">—</div>
+            <div class="comparison-cell">
+                @if (col.MergeSha is not null && col.RepositoryUrl is not null)
+                {
+                    <a href="@col.RepositoryUrl/commit/@col.MergeSha" target="_blank" rel="noopener noreferrer">
+                        <code>@col.MergeSha[..Math.Min(8, col.MergeSha.Length)]</code>
+                    </a>
+                }
+                else if (col.MergeSha is not null)
+                {
+                    <code>@col.MergeSha[..Math.Min(8, col.MergeSha.Length)]</code>
+                }
+                else
+                {
+                    <span>—</span>
+                }
+            </div>
+        }
+
+        @if (_sourceMergeSha is not null && _columns.Any(c => c.Id != _data.Source.Id && c.MergeSha is not null) && _repoUrl is not null)
+        {
+            <div class="comparison-row-label">Diff vs source</div>
+            @foreach (var col in _columns)
+            {
+                <div class="comparison-cell">
+                    @if (col.Id == _data.Source.Id)
+                    {
+                        <span>—</span>
+                    }
+                    else if (col.MergeSha is not null)
+                    {
+                        <a href="@_repoUrl/compare/@_sourceMergeSha...@col.MergeSha" target="_blank" rel="noopener noreferrer">view diff</a>
+                    }
+                    else
+                    {
+                        <span>—</span>
+                    }
+                </div>
+            }
         }
 
         <div class="comparison-row-label">Created</div>
@@ -144,6 +185,8 @@ else
 
     private Dictionary<string, long> _timings = [];
     private Dictionary<string, double> _costs = [];
+    private string? _sourceMergeSha;
+    private string? _repoUrl;
 
     protected override async Task OnParametersSetAsync()
     {
@@ -157,6 +200,8 @@ else
         _columns = [];
         _timings = [];
         _costs = [];
+        _sourceMergeSha = null;
+        _repoUrl = null;
 
         try
         {
@@ -165,6 +210,8 @@ else
             if (_data is null) return;
 
             _columns = [_data.Source, .._data.Replays];
+            _sourceMergeSha = _data.Source.MergeSha;
+            _repoUrl = _columns.FirstOrDefault(c => c.RepositoryUrl is not null)?.RepositoryUrl;
             var allItems = _columns;
 
             foreach (var item in allItems)
