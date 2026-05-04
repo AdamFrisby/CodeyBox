@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -13,9 +14,11 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 {
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly ILogger<SqliteWorkerRegistry>? _logger;
 
-    public SqliteWorkerRegistry(string path)
+    public SqliteWorkerRegistry(string path, ILogger<SqliteWorkerRegistry>? logger = null)
     {
+        _logger = logger;
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
@@ -68,25 +71,39 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Fail-soft: any storage exception is caught and logged as a warning;
+    /// the caller retries on the next heartbeat interval. Only intentional
+    /// cancellation (<see cref="OperationCanceledException"/>) propagates.
+    /// </remarks>
     public async Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                UPDATE worker_registry
-                SET last_heartbeat_at = $hb, current_work_item_id = $item
-                WHERE worker_id = $id;
-                """;
-            cmd.Parameters.AddWithValue("$hb", DateTimeOffset.UtcNow.ToString("O"));
-            cmd.Parameters.AddWithValue("$item", (object?)currentWorkItemId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$id", workerId);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    UPDATE worker_registry
+                    SET last_heartbeat_at = $hb, current_work_item_id = $item
+                    WHERE worker_id = $id;
+                    """;
+                cmd.Parameters.AddWithValue("$hb", DateTimeOffset.UtcNow.ToString("O"));
+                cmd.Parameters.AddWithValue("$item", (object?)currentWorkItemId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$id", workerId);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
-        finally
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
         {
-            _writeLock.Release();
+            _logger?.LogWarning(ex, "Heartbeat failed for worker {WorkerId}; will retry on next interval", workerId);
         }
     }
 

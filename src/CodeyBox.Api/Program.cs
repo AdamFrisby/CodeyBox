@@ -578,7 +578,7 @@ builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTa
 builder.Services.AddSingleton<IWorkerRegistry>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkerRegistry(opts.StateDatabasePath);
+    return new SqliteWorkerRegistry(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteWorkerRegistry>>());
 });
 builder.Services.AddSingleton<DeadWorkerOptions>(sp =>
 {
