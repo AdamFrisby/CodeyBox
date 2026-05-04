@@ -114,6 +114,52 @@ Returns the array of work item records (same shape as `GET /workitems/{id}`) tha
 
 ---
 
+## Model quality routing
+
+Work items carry two fields that control which agent member is selected by the
+quota router. See [docs/agent-classes.md](agent-classes.md) for the full
+routing algorithm.
+
+### `agentClassId`
+
+Binds the work item to a named agent class instead of a specific agent. When
+set, the router picks the highest-scoring available member of that class.
+
+```jsonc
+{
+  "projectId": "my-app",
+  "title": "Refactor auth module",
+  "prompt": "…",
+  "agentClassId": "frontier-coding"
+}
+```
+
+When null, falls back to `Project.DefaultAgentClass`, then to the legacy
+direct `Agent` field. Per-item `agentClassId` always overrides the project
+default.
+
+### `minModelScore`
+
+The minimum `QualityScore` the router will accept for this item. Default `95`
+allows Gemini-3-Flash with high reasoning (score 95) as a frontier-adjacent
+fallback. Lower it for low-stakes work:
+
+```jsonc
+{
+  "projectId": "my-app",
+  "title": "Fix typo in README",
+  "prompt": "…",
+  "minModelScore": 70
+}
+```
+
+Valid range: `0`–`200`. Values outside the range are clamped at the API layer.
+If no class member meets the floor the item **fails immediately** with error
+`ROUTING_NO_ELIGIBLE: no member of class '...' meets MinModelScore=N` — it is
+not retried. Lower `minModelScore` or add a capable member to the class.
+
+---
+
 ## Immutability
 
 `dependsOn` is immutable after creation. There is no endpoint to add, remove, or reorder dependencies. Mutating the dependency graph of an in-flight DAG is a footgun (a running worker could be blocked by a newly-added dependency it never knew about); out of scope for this release.

@@ -315,6 +315,47 @@ public static class AuditLog
             .Information("Quota router: work item {WorkItemId} deferred — re-enqueue scheduled in {RecheckMs}ms",
                 id.ToString(), (long)recheckIn.TotalMilliseconds);
 
+    /// <summary>
+    /// Emitted when all class members fail the MinModelScore floor check. Records
+    /// the rejected members and their below-floor reasons so the audit log captures
+    /// the failure detail even though no member was chosen.
+    /// </summary>
+    public static void QuotaRouterNoEligible(
+        WorkItemId id,
+        string classId,
+        int minModelScore,
+        IEnumerable<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)> rejected) =>
+        Audit("quota_router.scored")
+            .Warning(
+                "Quota router no-eligible: workItem={WorkItemId} class={ClassId} minModelScore={MinModelScore} " +
+                "rejected=[{Rejected}]",
+                id.ToString(), classId, minModelScore,
+                string.Join("; ", rejected.Select(r => $"{r.Agent.Value}/{r.ModelId ?? "(default)"}:eff={r.EffectiveScore}:{r.RejectReason}")));
+
+    /// <summary>
+    /// Emitted once per pickup after a score-based routing decision. Records the
+    /// chosen member's scores and all rejected members with their reject reasons,
+    /// enabling post-hoc inspection of routing decisions without re-running.
+    /// </summary>
+    public static void QuotaRouterScored(
+        WorkItemId id,
+        string classId,
+        AgentKind chosenAgent,
+        string? chosenModelId,
+        int chosenBaseScore,
+        int chosenEffectiveScore,
+        string appliedModifiers,
+        IEnumerable<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)> rejected) =>
+        Audit("quota_router.scored")
+            .Information(
+                "Quota router scored: workItem={WorkItemId} class={ClassId} " +
+                "chosen={Agent}/{ModelId} baseScore={BaseScore} effectiveScore={EffectiveScore} modifiers={Modifiers} " +
+                "rejected=[{Rejected}]",
+                id.ToString(), classId,
+                chosenAgent.Value, chosenModelId ?? "(default)", chosenBaseScore, chosenEffectiveScore,
+                appliedModifiers,
+                string.Join("; ", rejected.Select(r => $"{r.Agent.Value}/{r.ModelId ?? "(default)"}:eff={r.EffectiveScore}:{r.RejectReason}")));
+
     // ── Plugin loading ───────────────────────────────────────────────────────
 
     public static void PluginLoaded(string pluginId, string displayName, string assemblyPath) =>

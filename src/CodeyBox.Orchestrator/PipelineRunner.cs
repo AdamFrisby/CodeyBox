@@ -410,7 +410,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentResult agentResult;
         await using (agentExecScope)
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct);
         }
 
         var agentEndedAt = DateTimeOffset.UtcNow;
@@ -827,7 +827,7 @@ public sealed class PipelineRunner : IPipelineRunner
             && _auditQuotaProbesByKind.TryGetValue(kind.Value, out var probe))
         {
             var snapshot = await probe.GetAvailabilityAsync(
-                new AgentMembership { Agent = kind.Value, Billing = AgentBilling.Subscription }, ct);
+                new AgentMembership { Agent = kind.Value, Billing = AgentBilling.Subscription, QualityScore = 100 }, ct);
             if (snapshot.AvailablePct >= 0 && snapshot.AvailablePct < _auditQuotaOptions.MinQuotaPct)
             {
                 AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);
@@ -898,7 +898,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentResult agentResult;
         await using (mergeExecScope)
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct);
         }
 
         var mergeEndedAt = DateTimeOffset.UtcNow;

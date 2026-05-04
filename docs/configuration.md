@@ -42,7 +42,8 @@ Controls worker concurrency and spawn pacing.
 ## `AgentClasses`
 
 Defines named groups of interchangeable agents for quota-aware routing.
-See [docs/agent-classes.md](agent-classes.md) for the full model.
+See [docs/agent-classes.md](agent-classes.md) for the full model including
+`QualityScore` semantics, the floor filter, and TOD modifiers.
 
 ```json
 "AgentClasses": [
@@ -50,16 +51,65 @@ See [docs/agent-classes.md](agent-classes.md) for the full model.
     "Id": "frontier-coding",
     "DisplayName": "Frontier coding agents",
     "Members": [
-      { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7" },
-      { "Agent": "codex",  "Billing": "Subscription", "ModelId": "codex-5.5" },
-      { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-7" }
+      { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7", "QualityScore": 100 },
+      { "Agent": "codex",  "Billing": "Subscription", "ModelId": "gpt-5.5",         "QualityScore": 100 },
+      { "Agent": "gemini", "Billing": "Subscription", "ModelId": "gemini-3-flash",  "QualityScore": 95, "ReasoningMode": "high" },
+      { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-7", "QualityScore": 100 }
     ]
   }
 ]
 ```
 
 Validation at startup: unique `Id`s, non-empty `Members`, valid `Billing`
-values. A class with only `Subscription` members emits a warning.
+values, `QualityScore` present and in 0–200, Gemini members with
+`QualityScore ≥ 90` must have `ReasoningMode="high"`. A class with only
+`Subscription` members emits a warning.
+
+---
+
+## `AgentScoreModifiers`
+
+Small time-of-day score deltas that act as tiebreakers between near-equivalent
+members. All times are UTC. See [docs/agent-classes.md](agent-classes.md#time-of-day-score-modifiers)
+for the design rationale.
+
+```json
+"AgentScoreModifiers": {
+  "ByTimeOfDay": [
+    {
+      "Agent": "claude",
+      "Modifier": -1,
+      "Windows": [
+        {
+          "Days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+          "StartUtc": "14:00",
+          "EndUtc": "22:00"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `ByTimeOfDay` entry fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `Agent` | yes | Agent kind to adjust: `claude`, `codex`, `gemini`, `copilot`, or a custom kind. |
+| `Modifier` | yes | Signed integer added to the agent's base `QualityScore`. Bounded to ±5 at startup. |
+| `Windows` | yes | One or more UTC time windows during which the modifier is active. |
+
+### Time window fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `Days` | yes | Array of UTC day names: `Mon`, `Tue`, `Wed`, `Thu`, `Fri`, `Sat`, `Sun`. |
+| `StartUtc` | yes | Window start in `HH:mm` format (UTC, 24-hour clock). |
+| `EndUtc` | yes | Window end in `HH:mm` format (UTC). If `EndUtc < StartUtc` the window wraps midnight. |
+
+Modifiers are bounded to ±5 at startup; values outside that range are rejected
+with a startup error. See [agent-classes.md](agent-classes.md) for how effective
+scores interact with the `MinModelScore` floor.
 
 ---
 
