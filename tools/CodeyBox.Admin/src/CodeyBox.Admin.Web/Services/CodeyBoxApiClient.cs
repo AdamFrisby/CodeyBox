@@ -220,6 +220,17 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
 
     private sealed record PromoteResponse(string WorkItemId);
 
+    public async Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+    {
+        var req = new HttpRequestMessage(HttpMethod.Get, $"/workitems/{Uri.EscapeDataString(id)}/diff");
+        req.Headers.Accept.ParseAdd("application/json");
+        var resp = await _http.SendAsync(req, ct);
+        if (resp.StatusCode is System.Net.HttpStatusCode.NotFound
+            or System.Net.HttpStatusCode.NoContent) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemDiffDto>(JsonOptions, ct);
+    }
+
     public async Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default)
     {
         var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/timings", ct);

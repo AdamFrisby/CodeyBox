@@ -634,6 +634,7 @@ app.UseApiKeyAuth(anonymousPrefixes: ["/healthz"]);
 WorkItemEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
+WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 

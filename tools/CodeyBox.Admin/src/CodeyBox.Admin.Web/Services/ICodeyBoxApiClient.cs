@@ -43,6 +43,13 @@ public interface ICodeyBoxApiClient
     Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default);
     Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default);
 
+    // ── Diff ──────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Fetches the pending diff for a work item as JSON. Returns null when the
+    /// work item has no diff yet (204 No Content) or does not exist (404).
+    /// </summary>
+    Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default);
+
     // ── Suggestions ───────────────────────────────────────────────────────────
     Task<List<SuggestionDto>> GetSuggestionsAsync(
         string? projectId = null, string? category = null, string? severity = null,

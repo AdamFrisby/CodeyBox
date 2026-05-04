@@ -30,6 +30,7 @@ else
         <a href="/work-items/@_item.Id/audit-reports" class="btn">Audit Reports</a>
         <a href="/work-items/@_item.Id/timings" class="btn">Timings</a>
         <a href="/work-items/@_item.Id/costs" class="btn">Costs</a>
+        <a href="/work-items/@_item.Id/diff" class="btn">Diff</a>
         @if (!_item.IsTerminal)
         {
             <button class="btn btn-danger" @onclick="CancelAsync">Cancel</button>

@@ -165,6 +165,7 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default) => Task.FromResult<AggregateTimingsDto?>(null);
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default) => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemDiffDto?>(null);
 }
 
 /// <summary>
@@ -218,4 +219,5 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default) => Task.FromResult<AggregateTimingsDto?>(null);
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default) => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemDiffDto?>(null);
 }
