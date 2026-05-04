@@ -10,7 +10,7 @@ namespace CodeyBox.Core;
 public static class CodeyBoxActivities
 {
     public static readonly ActivitySource Pipeline = new("CodeyBox.Pipeline");
-    public static readonly ActivitySource Sandbox  = new("CodeyBox.Sandbox");
+    public static readonly ActivitySource Sandbox = new("CodeyBox.Sandbox");
     public static readonly ActivitySource Upstream = new("CodeyBox.Upstream");
-    public static readonly ActivitySource Audit    = new("CodeyBox.Audit");
+    public static readonly ActivitySource Audit = new("CodeyBox.Audit");
 }

@@ -11,8 +11,9 @@ namespace CodeyBox.Core;
 public static class CodeyBoxMeters
 {
     private static readonly Meter PipelineMeter = new("CodeyBox.Pipeline");
-    private static readonly Meter SandboxMeter  = new("CodeyBox.Sandbox");
-    private static readonly Meter AuditMeter    = new("CodeyBox.Audit");
+    private static readonly Meter SandboxMeter = new("CodeyBox.Sandbox");
+    private static readonly Meter AuditMeter = new("CodeyBox.Audit");
+    private static readonly Meter UpstreamMeter = new("CodeyBox.Upstream");
 
     /// <summary>Incremented on every work-item state transition. Tag: <c>to_state</c>.</summary>
     public static readonly Counter<long> PipelineTransitions =
@@ -37,4 +38,8 @@ public static class CodeyBoxMeters
     /// <summary>Sandbox lifecycle step duration. Tag: <c>step</c> (start | clone).</summary>
     public static readonly Histogram<long> SandboxLifecycle =
         SandboxMeter.CreateHistogram<long>("codeybox.sandbox.lifecycle.duration_ms");
+
+    /// <summary>Upstream API call duration. Tags: <c>endpoint</c>, <c>status_code</c>.</summary>
+    public static readonly Histogram<long> UpstreamApiCallDuration =
+        UpstreamMeter.CreateHistogram<long>("codeybox.upstream.api_call.duration_ms");
 }

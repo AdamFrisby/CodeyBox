@@ -889,14 +889,22 @@ public sealed class PipelineRunner : IPipelineRunner
         var access = _gitHost.GetSandboxAccess(repoId);
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge");
+        var mergeSandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        mergeSandboxStartSw.Stop();
+        CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        await using (var mergeCloneScope = await TimingScope.BeginAsync(_timings, item.Id, "merge", "git.clone_into_sandbox", log: _log))
+        var mergeCloneScope = await TimingScope.BeginAsync(
+            _timings, item.Id, "merge", "git.clone_into_sandbox",
+            activitySource: CodeyBoxActivities.Sandbox, log: _log);
+        await using (mergeCloneScope)
         {
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
         }
+        CodeyBoxMeters.SandboxLifecycle.Record(mergeCloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
         var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
         await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
@@ -916,12 +924,16 @@ public sealed class PipelineRunner : IPipelineRunner
         var mergeExecScope = await TimingScope.BeginAsync(
             _timings, item.Id, "merge", "agent.exec",
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-            log: _log);
+            log: _log,
+            activitySource: CodeyBoxActivities.Pipeline);
         AgentResult agentResult;
         await using (mergeExecScope)
         {
             agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
         }
+        CodeyBoxMeters.AgentDuration.Record(mergeExecScope.ElapsedMs,
+            new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+            new KeyValuePair<string, object?>("phase", "merge"));
 
         var mergeEndedAt = DateTimeOffset.UtcNow;
         var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecScope.ElapsedMs);

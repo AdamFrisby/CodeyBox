@@ -32,7 +32,7 @@ public sealed class OtelDisabledNoOpTests
             itemId: TestId,
             phase: "work",
             step: "agent.exec"
-            // activitySource not passed — defaults to null
+        // activitySource not passed — defaults to null
         );
 
         Assert.Empty(started);

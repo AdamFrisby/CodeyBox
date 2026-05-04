@@ -148,6 +148,8 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
             .WithMetrics(m => m
                 .AddMeter("CodeyBox.Pipeline")
                 .AddMeter("CodeyBox.Sandbox")
+                .AddMeter("CodeyBox.Audit")
+                .AddMeter("CodeyBox.Upstream")
                 .AddRuntimeInstrumentation()
                 .AddOtlpExporter(o => ConfigureOtlp(o, otelOpts)));
     }
