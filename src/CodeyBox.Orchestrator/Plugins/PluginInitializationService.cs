@@ -96,7 +96,10 @@ internal sealed class PluginInitializationService : IHostedService
         Func<ProjectId, IReadOnlyDictionary<string, string>> resolver = projectId =>
         {
             if (repo is null) return new Dictionary<string, string>();
-            var project = repo.GetAsync(projectId, CancellationToken.None).GetAwaiter().GetResult();
+            // Run on a ThreadPool thread so there is no SynchronizationContext, preventing
+            // the sync-over-async deadlock that would occur if called on an ASP.NET context thread.
+            var project = Task.Run(() => repo.GetAsync(projectId, CancellationToken.None))
+                .GetAwaiter().GetResult();
             return project?.Upstream.PluginConfig ?? new Dictionary<string, string>();
         };
         var host = new PluginHost(plugin.PluginId, _loggerFactory, _configuration, resolver);

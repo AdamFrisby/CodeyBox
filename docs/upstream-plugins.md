@@ -35,7 +35,8 @@ public sealed class MyGiteaUpstreamRemote : IUpstreamRemote, IPluginInitializer
 
     private IPluginHost _host = null!;
 
-    public MyGiteaUpstreamRemote(IHttpClientFactory httpClientFactory) { ... }
+    // Inject IGitHost to push branches, and IHttpClientFactory for REST calls.
+    public MyGiteaUpstreamRemote(IGitHost gitHost, IHttpClientFactory httpClientFactory) { ... }
 
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)
     {
@@ -49,6 +50,15 @@ public sealed class MyGiteaUpstreamRemote : IUpstreamRemote, IPluginInitializer
         // Read per-project config — see PluginConfig convention below.
         var cfg = _host.GetProjectUpstreamConfig(request.ProjectId);
         var baseUrl = cfg["BaseUrl"];
+
+        // Read the auth token from the env var named by the operator.
+        // The orchestrator copies Upstream.TokenEnvVar into request.TokenEnvVar.
+        var token = string.IsNullOrWhiteSpace(request.TokenEnvVar)
+            ? null
+            : Environment.GetEnvironmentVariable(request.TokenEnvVar);
+
+        // Optional auto-merge: the orchestrator copies Upstream.AutoMerge into
+        // request.AutoMerge, and the merge strategy into request.MergeMethod.
         ...
         return new UpstreamCompletionOutcome { BranchPushed = true, PullRequestUrl = "..." };
     }
@@ -91,8 +101,19 @@ Document which keys your plugin reads in your plugin's README.
 ### Token security
 
 Tokens must **never** appear in `PluginConfig`. Always read tokens from environment
-variables — the operator names the env var in `Upstream.TokenEnvVar`, and you read
-it with `Environment.GetEnvironmentVariable(tokenVarName)`.
+variables:
+
+1. The operator sets `Upstream.TokenEnvVar` to the name of the env var holding the token.
+2. The orchestrator copies this name into `UpstreamCompletionRequest.TokenEnvVar`.
+3. Inside `CompleteAsync`, read the token with:
+
+```csharp
+var token = string.IsNullOrWhiteSpace(request.TokenEnvVar)
+    ? null
+    : Environment.GetEnvironmentVariable(request.TokenEnvVar);
+```
+
+This keeps credentials out of config files and plugin binaries entirely.
 
 ## Built-in precedence
 
@@ -123,8 +144,10 @@ in use.
 `samples/CodeyBox.SampleGiteaUpstreamPlugin/` provides a complete working example:
 
 - Reads `BaseUrl`, `Owner`, and `Repository` from `PluginConfig`.
-- Pushes the work branch via the host git module.
+- Pushes the work branch via the host git module (`IGitHost.PushToUpstreamAsync`).
 - Opens a PR via Gitea's `/api/v1/repos/{owner}/{repo}/pulls` API.
+- Optionally auto-merges via `POST /pulls/{index}/merge` when `Upstream.AutoMerge = true`.
+- Authenticates using the token from the env var named in `Upstream.TokenEnvVar`.
 - Uses `IPluginHost.GetProjectUpstreamConfig` as documented above.
 
 Build it standalone:
