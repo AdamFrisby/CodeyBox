@@ -298,6 +298,16 @@ public sealed record ProjectAudit
     /// </summary>
     public IReadOnlyDictionary<string, AgentKind> PerAuditorAgent { get; init; }
         = new Dictionary<string, AgentKind>();
+
+    /// <summary>
+    /// Maximum number of LLM auditors to run concurrently within an audit
+    /// iteration. Default 3 matches the typical security/completeness/cheating
+    /// set. Set to 1 to disable parallelism and fall back to sequential
+    /// execution — useful for debugging or subscription accounts hitting 429s.
+    /// Each parallel LLM auditor runs in its own sandbox clone to avoid result
+    /// file races. Tool auditors are unaffected and always run sequentially.
+    /// </summary>
+    public int MaxLlmAuditorParallelism { get; init; } = 3;
 }
 
 /// <summary>
