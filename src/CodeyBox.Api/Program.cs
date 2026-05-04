@@ -271,11 +271,20 @@ builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 // canonical sandbox env var the agent CLI reads. Operators add new agents
 // by appending to this list (or registering a different ICredentialProvider).
 //
-// The chain reads Claude's OAuth token fresh from a JSON file (default
-// ~/.claude/.credentials.json, the path the local `claude` CLI refreshes
-// in-place) on every pickup, so a host-side token rotation is picked up
-// without an orchestrator restart. If the file is absent or empty, the
-// env-var provider supplies the value the host launcher exported.
+// Chain order: BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV.
+//
+// 1. ClaudeOAuthFileCredentialProvider — reads Claude's token fresh from a
+//    JSON file (default ~/.claude/.credentials.json, the path the local
+//    `claude` CLI refreshes in-place) on every pickup, so a host-side token
+//    rotation is picked up without an orchestrator restart.
+// 2. Plugin ICredentialProvider implementations — inserted in discovery order
+//    (between OAuth-file and env-var). Vault-issued short-lived credentials
+//    are preferred over env-var fallbacks. Per-project ordering is expressed
+//    via Project.CredentialProviderPriority; see docs/credential-plugins.md.
+// 3. EnvironmentCredentialProvider — catch-all fallback reading host env vars.
+//
+// Operators with no credential plugins see zero behaviour change: the chain
+// is identical to the pre-plugin OAuth-file → env-var behaviour.
 builder.Services.AddSingleton<ICredentialProvider>(sp =>
 {
     var providers = new List<ICredentialProvider>();
@@ -296,6 +305,22 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
             oauthFile,
             sandboxEnvVar: "CLAUDE_CODE_OAUTH_TOKEN",
             sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
+    }
+
+    // Enumerate plugin-registered ICredentialProvider types. Each plugin type
+    // is registered in DI under its concrete type by PluginLoader.RegisterPlugins;
+    // we resolve by concrete type (not by ICredentialProvider) to avoid
+    // resolving the ChainedCredentialProvider itself and causing infinite recursion.
+    var pluginLoader = sp.GetRequiredService<IPluginLoader>();
+    var loadedPlugins = pluginLoader.DiscoverAndLoadAsync(CancellationToken.None).GetAwaiter().GetResult();
+    var credentialProviderType = typeof(ICredentialProvider);
+    foreach (var plugin in loadedPlugins)
+    {
+        foreach (var type in plugin.RegisteredTypes)
+        {
+            if (credentialProviderType.IsAssignableFrom(type))
+                providers.Add((ICredentialProvider)sp.GetRequiredService(type));
+        }
     }
 
     providers.Add(new EnvironmentCredentialProvider(new[]
