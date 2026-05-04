@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -52,6 +54,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     // launch the same baseline VM. Lazily populated.
     private readonly Dictionary<string, SemaphoreSlim> _baselineLocks = new();
     private readonly object _baselineLocksGuard = new();
+
+    // Tracks sandboxes created by the current process that haven't been disposed.
+    // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
+    private readonly ConcurrentDictionary<string, bool> _activeSandboxNames = new(StringComparer.Ordinal);
+
+    // Cache for ListAllManagedAsync results to avoid hammering multipassd.
+    private IReadOnlyList<ManagedSandboxInfo>? _listCache;
+    private DateTimeOffset _listCacheExpiry = DateTimeOffset.MinValue;
+    private readonly TimeSpan _listCacheTtl = TimeSpan.FromMinutes(2);
+    private readonly SemaphoreSlim _listLock = new(1, 1);
 
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings = null)
@@ -204,7 +216,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // already baked into the source VM's filesystem, so the clone
             // inherits it. The codeybox-route systemd service runs on every
             // boot in both paths.
-            return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log, timingStore, timingItemId, timingPhase);
+            _activeSandboxNames[name] = true;
+            // Invalidate the list cache so the next ListAllManagedAsync call reflects
+            // the newly created sandbox immediately rather than serving stale data.
+            _listCacheExpiry = DateTimeOffset.MinValue;
+            return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log, timingStore, timingItemId, timingPhase,
+                onDisposed: n => { _activeSandboxNames.TryRemove(n, out _); _listCacheExpiry = DateTimeOffset.MinValue; });
         }
         catch
         {
@@ -213,6 +230,93 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             try { Directory.Delete(sandboxRoot, recursive: true); } catch { }
             throw;
         }
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+    {
+        await _listLock.WaitAsync(ct);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (_listCache is not null && now < _listCacheExpiry)
+                return _listCache;
+
+            var result = await FetchManagedSandboxesAsync(ct);
+            _listCache = result;
+            _listCacheExpiry = now + _listCacheTtl;
+            return result;
+        }
+        finally
+        {
+            _listLock.Release();
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task DisposeLeakedAsync(string name, CancellationToken ct)
+    {
+        _log.LogInformation("SandboxLeakReaper: purging leaked VM {Name}", name);
+        var run = await RunAsync([_opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: ct);
+        if (run.ExitCode != 0)
+            throw new InvalidOperationException($"multipass delete --purge {name} failed (exit {run.ExitCode}): {run.Stderr}");
+        // Clean up staging dir if it still exists.
+        var stagingDir = Path.Combine(_stagingRoot, name);
+        try { if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, recursive: true); }
+        catch { /* best-effort */ }
+        // Remove from active set and invalidate cache.
+        _activeSandboxNames.TryRemove(name, out _);
+        _listCacheExpiry = DateTimeOffset.MinValue;
+    }
+
+    private async Task<IReadOnlyList<ManagedSandboxInfo>> FetchManagedSandboxesAsync(CancellationToken ct)
+    {
+        var listRun = await RunAsync([_opts.MultipassBinary, "list", "--format", "json"], stdin: null, ct: ct);
+        if (listRun.ExitCode != 0)
+        {
+            _log.LogWarning("multipass list failed (exit {ExitCode}): {Stderr}", listRun.ExitCode, listRun.Stderr);
+            return [];
+        }
+
+        List<string> vmNames;
+        try
+        {
+            using var doc = JsonDocument.Parse(listRun.Stdout);
+            if (!doc.RootElement.TryGetProperty("list", out var listEl))
+                return [];
+
+            vmNames = [];
+            foreach (var item in listEl.EnumerateArray())
+            {
+                if (!item.TryGetProperty("name", out var nameEl)) continue;
+                var name = nameEl.GetString();
+                if (string.IsNullOrEmpty(name)) continue;
+                // Only sandboxes with the codeybox-* prefix (not cb-baseline-*).
+                if (!name.StartsWith("codeybox-", StringComparison.Ordinal)) continue;
+                vmNames.Add(name);
+            }
+        }
+        catch (JsonException ex)
+        {
+            _log.LogWarning(ex, "Failed to parse multipass list output");
+            return [];
+        }
+
+        var infos = new List<ManagedSandboxInfo>(vmNames.Count);
+        foreach (var name in vmNames)
+        {
+            DateTimeOffset? createdAt = null;
+            var stagingDir = Path.Combine(_stagingRoot, name);
+            if (Directory.Exists(stagingDir))
+            {
+                var created = Directory.GetCreationTimeUtc(stagingDir);
+                if (created != DateTime.MinValue)
+                    createdAt = new DateTimeOffset(created, TimeSpan.Zero);
+            }
+            var isActive = _activeSandboxNames.ContainsKey(name);
+            infos.Add(new ManagedSandboxInfo(name, createdAt, DiskBytes: null, isActive));
+        }
+        return infos;
     }
 
     /// <summary>
@@ -888,11 +992,13 @@ internal sealed class MultipassSandbox : ISandbox
     private readonly ITimingStore? _timings;
     private readonly WorkItemId _timingItemId;
     private readonly string _timingPhase;
+    private readonly Action<string>? _onDisposed;
     private int _firstExecEmitted;
     private bool _disposed;
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
-        ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work")
+        ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
+        Action<string>? onDisposed = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -902,6 +1008,7 @@ internal sealed class MultipassSandbox : ISandbox
         _timings = timings;
         _timingItemId = timingItemId;
         _timingPhase = timingPhase;
+        _onDisposed = onDisposed;
         Id = name;
     }
 
@@ -988,6 +1095,9 @@ internal sealed class MultipassSandbox : ISandbox
     {
         if (_disposed) return;
         _disposed = true;
+        // Notify provider immediately so it removes the name from the active set and
+        // invalidates the list cache before any subsequent leak scan runs.
+        _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name);
         await using var disposeScope = await TimingScope.BeginAsync(
             _timings, _timingItemId, _timingPhase, "vm.dispose", log: _log);

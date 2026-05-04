@@ -270,6 +270,9 @@ internal sealed class InProcessFakeSandboxProvider : ISandboxProvider
     public string Name => "fake";
     public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         => Task.FromResult<ISandbox>(new NoOpFakeSandbox());
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+    public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
 }
 
 internal sealed class NoOpFakeSandbox : ISandbox
