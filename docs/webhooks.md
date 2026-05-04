@@ -265,14 +265,13 @@ sandboxes are not associated with a specific work item.
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `name` | string | VM name matching the `codeybox-*` prefix |
-| `ageMinutes` | number | Age of the sandbox in minutes at detection time |
-| `diskMb` | number\|null | Disk usage in MiB, if available; null otherwise |
-
-For `sandbox.leak_dispose_failed`, an additional `error` field contains the
-failure reason.
+| Field | Type | Present on | Description |
+|---|---|---|---|
+| `name` | string | all | VM name matching the `codeybox-*` prefix |
+| `ageMinutes` | number | all | Age of the sandbox in minutes at detection time |
+| `diskMb` | number\|null | all | Disk usage in MiB, if available; null otherwise |
+| `disposedAt` | ISO-8601 | `sandbox.leak_disposed` | Timestamp when the sandbox was successfully disposed |
+| `error` | string | `sandbox.leak_dispose_failed` | Human-readable failure reason (e.g. `"timeout"` or multipass error) |
 
 ---
 

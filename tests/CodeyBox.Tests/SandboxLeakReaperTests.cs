@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -25,7 +26,7 @@ public sealed class SandboxLeakReaperTests
             LeakAgeThreshold = leakAgeThreshold ?? TimeSpan.FromMinutes(30),
             AutoDispose = autoDispose,
         };
-        return new SandboxLeakReaper(provider, opts, NullLogger<SandboxLeakReaper>.Instance);
+        return new SandboxLeakReaper(provider, new NullWebhookDispatcher(), opts, NullLogger<SandboxLeakReaper>.Instance);
     }
 
     private static DateTimeOffset OldEnough(TimeSpan threshold) =>

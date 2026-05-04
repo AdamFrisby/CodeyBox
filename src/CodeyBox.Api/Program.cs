@@ -681,6 +681,7 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.SandboxLeak;
     return new SandboxLeakReaper(
         sp.GetRequiredService<ISandboxProvider>(),
+        sp.GetRequiredService<IWebhookDispatcher>(),
         opts,
         sp.GetRequiredService<ILogger<SandboxLeakReaper>>());
 });

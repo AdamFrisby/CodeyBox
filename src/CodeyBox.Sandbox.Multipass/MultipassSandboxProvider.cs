@@ -317,6 +317,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         var infos = new List<ManagedSandboxInfo>(vmNames.Count);
         foreach (var name in vmNames)
         {
+            // Validate before using the name in Path.Combine, mirroring the check in
+            // DisposeLeakedAsync. Multipass enforces DNS-label naming so this should
+            // never fire, but we must not rely on an external tool's input validation
+            // for a filesystem path operation.
+            if (!IsValidSandboxName(name)) continue;
+
             DateTimeOffset? createdAt = null;
             var stagingDir = Path.Combine(_stagingRoot, name);
             if (Directory.Exists(stagingDir))
@@ -783,6 +789,26 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         """;
 
     /// <summary>
+    /// Standalone shell script run by codeybox-route.service on every boot
+    /// to point the default route at the profile bridge. Idempotent — if
+    /// the default route is already correct, the del+add is a no-op
+    /// modulo a brief flap.
+    /// </summary>
+    private const string RouteSwapScript = """
+        #!/bin/sh
+        set -e
+        iface=$(ip -4 -o addr show | awk '/inet 10\.99\./{print $2; exit}')
+        if [ -z "$iface" ]; then
+            echo "codeybox-route: no 10.99.x.x interface present; nothing to do"
+            exit 0
+        fi
+        gw=$(ip -4 -o addr show "$iface" | awk '{print $4}' | awk -F. '{print $1"."$2"."$3".1"}')
+        ip route del default 2>/dev/null || true
+        ip route add default via "$gw" dev "$iface"
+        echo "codeybox-route: default via $gw dev $iface"
+        """;
+
+    /// <summary>
     /// Builds a cloud-init document that:
     ///   - Installs the exec wrapper at /usr/local/bin/codeybox-exec (root-
     ///     owned, mode 0755) so the agent can execute but not modify it.
@@ -808,26 +834,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// host bridge enforcement is in the host kernel, where the agent has
     /// no view, and is the only egress boundary we treat as load-bearing.
     /// </summary>
-    /// <summary>
-    /// Standalone shell script run by codeybox-route.service on every boot
-    /// to point the default route at the profile bridge. Idempotent — if
-    /// the default route is already correct, the del+add is a no-op
-    /// modulo a brief flap.
-    /// </summary>
-    private const string RouteSwapScript = """
-        #!/bin/sh
-        set -e
-        iface=$(ip -4 -o addr show | awk '/inet 10\.99\./{print $2; exit}')
-        if [ -z "$iface" ]; then
-            echo "codeybox-route: no 10.99.x.x interface present; nothing to do"
-            exit 0
-        fi
-        gw=$(ip -4 -o addr show "$iface" | awk '{print $4}' | awk -F. '{print $1"."$2"."$3".1"}')
-        ip route del default 2>/dev/null || true
-        ip route add default via "$gw" dev "$iface"
-        echo "codeybox-route: default via $gw dev $iface"
-        """;
-
     internal static string BuildCloudInit(IReadOnlyList<string>? extraRuncmd, string? extraCloudInit)
     {
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));

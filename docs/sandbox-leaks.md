@@ -114,6 +114,7 @@ Operator-triggered dispose of a specific leaked sandbox. Works regardless of the
 accidental deletion of non-CodeyBox VMs on the host.
 
 On success: `200 { "disposed": "<name>" }`  
+On unknown name (not in latest leaked list): `404`  
 On timeout (5 min): `504`  
 On error: `500` with the error message
 

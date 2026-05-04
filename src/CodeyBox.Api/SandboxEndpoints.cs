@@ -8,7 +8,7 @@ internal static class SandboxEndpoints
     public static void Map(WebApplication app)
     {
         var group = app.MapGroup("/sandboxes");
-        group.MapGet("/leaked", GetLeakedAsync);
+        group.MapGet("/leaked", GetLeaked);
         group.MapPost("/leaked/{name}/dispose", DisposeLeakedAsync);
     }
 
@@ -18,7 +18,7 @@ internal static class SandboxEndpoints
     /// sweep (default every 15 minutes). An empty array means no leaks were
     /// detected on the last sweep, not that no leaks exist.
     /// </summary>
-    private static IResult GetLeakedAsync(SandboxLeakReaper reaper)
+    private static IResult GetLeaked(SandboxLeakReaper reaper)
     {
         var leaks = reaper.GetLatestLeaks();
         var dto = leaks.Select(l => new
@@ -41,6 +41,7 @@ internal static class SandboxEndpoints
         string name,
         ISandboxProvider provider,
         SandboxLeakReaper reaper,
+        IWebhookDispatcher webhooks,
         ILogger<Program> log,
         CancellationToken ct)
     {
@@ -60,12 +61,29 @@ internal static class SandboxEndpoints
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromMinutes(5));
 
+        var diskMb = leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : (long?)null;
         try
         {
             await provider.DisposeLeakedAsync(name, cts.Token);
+            // Remove from the in-memory list immediately so a repeated call returns 404
+            // instead of attempting a redundant multipass delete and returning 500.
+            reaper.RemoveFromLatestLeaks(name);
+            var disposedAt = DateTimeOffset.UtcNow;
             AuditLog.SandboxLeakDisposed(name,
                 ageMinutes: leak.Age.TotalMinutes,
-                diskMb: leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : null);
+                diskMb: diskMb,
+                disposedAt: disposedAt);
+            _ = webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "sandbox.leak_disposed",
+                Details = new SandboxLeakDetails
+                {
+                    Name = name,
+                    AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
+                    DiskMb = diskMb,
+                    DisposedAt = disposedAt,
+                },
+            }, ct);
             log.LogInformation("SandboxEndpoints: operator-triggered dispose of leaked sandbox {Name}", name);
             return Results.Ok(new { disposed = name });
         }
@@ -78,11 +96,34 @@ internal static class SandboxEndpoints
         catch (OperationCanceledException)
         {
             // The 5-minute per-disposal timeout fired.
+            AuditLog.SandboxLeakDisposeFailed(name, leak.Age.TotalMinutes, diskMb, "timeout");
+            _ = webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "sandbox.leak_dispose_failed",
+                Details = new SandboxLeakDetails
+                {
+                    Name = name,
+                    AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
+                    DiskMb = diskMb,
+                    Error = "timeout",
+                },
+            }, ct);
             return Results.Problem("Dispose timed out after 5 minutes", statusCode: 504);
         }
         catch (Exception ex)
         {
-            AuditLog.SandboxLeakDisposeFailed(name, ex.Message);
+            AuditLog.SandboxLeakDisposeFailed(name, leak.Age.TotalMinutes, diskMb, ex.Message);
+            _ = webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "sandbox.leak_dispose_failed",
+                Details = new SandboxLeakDetails
+                {
+                    Name = name,
+                    AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
+                    DiskMb = diskMb,
+                    Error = ex.Message,
+                },
+            }, ct);
             log.LogWarning(ex, "SandboxEndpoints: failed to dispose leaked sandbox {Name}", name);
             // Return a generic message; full details (including multipass stderr) are in the server log.
             return Results.Problem("Dispose failed; see server logs for details", statusCode: 500);

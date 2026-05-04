@@ -30,6 +30,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SandboxLeakReaper : BackgroundService
 {
     private readonly ISandboxProvider _provider;
+    private readonly IWebhookDispatcher _webhooks;
     private readonly SandboxLeakOptions _opts;
     private readonly ILogger<SandboxLeakReaper> _log;
 
@@ -39,16 +40,28 @@ public sealed class SandboxLeakReaper : BackgroundService
 
     public SandboxLeakReaper(
         ISandboxProvider provider,
+        IWebhookDispatcher webhooks,
         SandboxLeakOptions opts,
         ILogger<SandboxLeakReaper> log)
     {
         _provider = provider;
+        _webhooks = webhooks;
         _opts = opts;
         _log = log;
     }
 
     /// <summary>Returns the most recently detected leaked sandboxes.</summary>
     public IReadOnlyList<LeakedSandboxInfo> GetLatestLeaks() => _latestLeaks;
+
+    /// <summary>
+    /// Removes a single entry from the latest leak list. Called by the operator-dispose
+    /// endpoint immediately after a successful disposal so that a second POST call for
+    /// the same name returns 404 rather than attempting a redundant multipass delete.
+    /// </summary>
+    public void RemoveFromLatestLeaks(string name)
+    {
+        _latestLeaks = _latestLeaks.Where(l => l.Name != name).ToList();
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -65,6 +78,14 @@ public sealed class SandboxLeakReaper : BackgroundService
             : _opts.CheckInterval;
         if (_opts.CheckInterval < TimeSpan.FromMinutes(1))
             _log.LogWarning("SandboxLeakReaper: CheckInterval {Configured} is below the 1-minute minimum; clamped to 1 minute", _opts.CheckInterval);
+
+        // Guard against a threshold so small that every untracked sandbox is disposed
+        // on the first sweep after a restart (when _activeSandboxNames is empty). Mirrors
+        // the floor applied to CheckInterval.
+        if (_opts.LeakAgeThreshold < TimeSpan.FromMinutes(5))
+            _log.LogWarning(
+                "SandboxLeakReaper: LeakAgeThreshold {Configured} is below the recommended 5-minute minimum; sandboxes from a prior orchestrator instance that crashed recently may be disposed prematurely",
+                _opts.LeakAgeThreshold);
 
         using var timer = new PeriodicTimer(interval);
         // Run immediately at startup, then on the configured interval.
@@ -96,8 +117,19 @@ public sealed class SandboxLeakReaper : BackgroundService
                 if (age < _opts.LeakAgeThreshold)
                     continue;
 
+                var diskMb = info.DiskBytes.HasValue ? info.DiskBytes.Value / (1024 * 1024) : (long?)null;
                 leaks.Add(new LeakedSandboxInfo(info.Name, info.CreatedAt.Value, age, info.DiskBytes));
-                AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, info.DiskBytes.HasValue ? info.DiskBytes.Value / (1024 * 1024) : null);
+                AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb);
+                _ = _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "sandbox.leak_detected",
+                    Details = new SandboxLeakDetails
+                    {
+                        Name = info.Name,
+                        AgeMinutes = Math.Round(age.TotalMinutes, 1),
+                        DiskMb = diskMb,
+                    },
+                }, ct);
             }
 
             _latestLeaks = leaks;
@@ -130,28 +162,63 @@ public sealed class SandboxLeakReaper : BackgroundService
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
 
+        var diskMb = leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : (long?)null;
         try
         {
             await _provider.DisposeLeakedAsync(leak.Name, linkedCts.Token);
-            AuditLog.SandboxLeakDisposed(leak.Name, leak.Age.TotalMinutes,
-                leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : null);
+            var disposedAt = DateTimeOffset.UtcNow;
+            AuditLog.SandboxLeakDisposed(leak.Name, leak.Age.TotalMinutes, diskMb, disposedAt);
+            _ = _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "sandbox.leak_disposed",
+                Details = new SandboxLeakDetails
+                {
+                    Name = leak.Name,
+                    AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
+                    DiskMb = diskMb,
+                    DisposedAt = disposedAt,
+                },
+            }, stoppingToken);
             _log.LogInformation("SandboxLeakReaper: disposed leaked sandbox {Name}", leak.Name);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
-            // Service is shutting down — rethrow so WhenAll propagates the cancellation
-            // cleanly. Do not emit a spurious "timeout" audit event for a planned restart.
+            // Service is shutting down — do not emit a spurious "timeout" audit event for
+            // a planned restart. Rethrow so Task.WhenAll in RunSweepAsync surfaces the
+            // cancellation, which is swallowed by RunSweepAsync's OperationCanceledException handler.
             throw;
         }
         catch (OperationCanceledException)
         {
             // Per-disposal 5-minute timeout fired.
-            AuditLog.SandboxLeakDisposeFailed(leak.Name, "timeout");
+            AuditLog.SandboxLeakDisposeFailed(leak.Name, leak.Age.TotalMinutes, diskMb, "timeout");
+            _ = _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "sandbox.leak_dispose_failed",
+                Details = new SandboxLeakDetails
+                {
+                    Name = leak.Name,
+                    AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
+                    DiskMb = diskMb,
+                    Error = "timeout",
+                },
+            }, stoppingToken);
             _log.LogWarning("SandboxLeakReaper: timed out disposing leaked sandbox {Name}", leak.Name);
         }
         catch (Exception ex)
         {
-            AuditLog.SandboxLeakDisposeFailed(leak.Name, ex.Message);
+            AuditLog.SandboxLeakDisposeFailed(leak.Name, leak.Age.TotalMinutes, diskMb, ex.Message);
+            _ = _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "sandbox.leak_dispose_failed",
+                Details = new SandboxLeakDetails
+                {
+                    Name = leak.Name,
+                    AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
+                    DiskMb = diskMb,
+                    Error = ex.Message,
+                },
+            }, stoppingToken);
             _log.LogWarning(ex, "SandboxLeakReaper: failed to dispose leaked sandbox {Name}", leak.Name);
         }
     }

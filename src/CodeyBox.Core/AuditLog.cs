@@ -135,14 +135,15 @@ public static class AuditLog
             .Warning("Leaked sandbox detected: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB",
                 name, ageMinutes, diskMb);
 
-    public static void SandboxLeakDisposed(string name, double ageMinutes, long? diskMb) =>
+    public static void SandboxLeakDisposed(string name, double ageMinutes, long? diskMb, DateTimeOffset disposedAt) =>
         Audit("sandbox.leak_disposed")
-            .Information("Leaked sandbox disposed: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB",
-                name, ageMinutes, diskMb);
+            .Information("Leaked sandbox disposed: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB disposedAt={DisposedAt}",
+                name, ageMinutes, diskMb, disposedAt);
 
-    public static void SandboxLeakDisposeFailed(string name, string error) =>
+    public static void SandboxLeakDisposeFailed(string name, double ageMinutes, long? diskMb, string error) =>
         Audit("sandbox.leak_dispose_failed")
-            .Warning("Failed to dispose leaked sandbox {SandboxName}: {Error}", name, error);
+            .Warning("Failed to dispose leaked sandbox {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB: {Error}",
+                name, ageMinutes, diskMb, error);
 
     // ── Upstream remote ──────────────────────────────────────────────────────
 

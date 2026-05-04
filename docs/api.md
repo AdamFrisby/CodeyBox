@@ -464,6 +464,7 @@ Operator-triggered dispose of a leaked sandbox by name. The name must start with
 `codeybox-`. Returns `{ "disposed": "<name>" }` on success.
 
 * Returns `400` if the name does not start with `codeybox-`.
+* Returns `404` if the sandbox is not present in the latest leaked list (use `GET /sandboxes/leaked` to verify it is detected as a leak before calling).
 * Returns `504` if the dispose times out (5-minute per-sandbox cap).
 * Returns `500` on other errors.
 
