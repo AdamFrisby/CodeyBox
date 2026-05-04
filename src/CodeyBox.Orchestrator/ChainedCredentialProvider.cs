@@ -97,40 +97,42 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
     /// </summary>
     public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
     {
-        // Fast path: still-valid cached credential.
+        // Fast path + expired-entry detection in a single lock acquisition.
+        bool hasExpiredEntry;
         lock (_cacheLock)
         {
-            if (_cache.TryGetValue(agent, out var cached) && cached.ExpiresAt > _utcNow())
-                return cached.Credential;
+            if (_cache.TryGetValue(agent, out var cached))
+            {
+                if (cached.ExpiresAt > _utcNow())
+                    return cached.Credential;
+                // Entry exists but is expired — need stampede protection on refetch.
+                hasExpiredEntry = true;
+            }
+            else
+            {
+                hasExpiredEntry = false;
+            }
         }
 
-        // Serialise concurrent refetches for this agent kind to prevent stampede
-        // when a cached time-bound credential expires simultaneously.
+        if (!hasExpiredEntry)
+        {
+            // No cached entry: non-expiring credential path. Sources are
+            // parallelism-safe (env-var lookup, OAuth file read), so concurrent
+            // callers do not need to be serialised.
+            return await WalkChainAsync(_providers, agent, _cache, ct);
+        }
+
+        // Expired cached entry: serialise concurrent refetches to prevent stampede.
         var fetchLock = GetOrCreateFetchLock(agent);
         await fetchLock.WaitAsync(ct);
         try
         {
-            // Double-check after acquiring the per-agent lock.
             lock (_cacheLock)
             {
                 if (_cache.TryGetValue(agent, out var cached) && cached.ExpiresAt > _utcNow())
                     return cached.Credential;
             }
-
-            foreach (var p in _providers)
-            {
-                var cred = await p.GetAsync(agent, ct);
-                if (cred is not null)
-                {
-                    if (cred.ExpiresAt.HasValue)
-                    {
-                        lock (_cacheLock)
-                            _cache[agent] = (cred, cred.ExpiresAt.Value);
-                    }
-                    return cred;
-                }
-            }
-            return null;
+            return await WalkChainAsync(_providers, agent, _cache, ct);
         }
         finally
         {
@@ -144,11 +146,25 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
     /// providers are always included unchanged. Falls back to global discovery
     /// order when <paramref name="credentialProviderPriority"/> is empty.
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// Thrown if any entry in <paramref name="credentialProviderPriority"/> contains
+    /// a null character, which would corrupt the internal cache-key fingerprint.
+    /// </exception>
     public async Task<AgentCredential?> GetAsync(
         AgentKind agent,
         IReadOnlyList<string> credentialProviderPriority,
         CancellationToken ct = default)
     {
+        // Reject null bytes early: they are the intra-key separator and would
+        // allow two distinct priority lists to produce identical fingerprints.
+        foreach (var id in credentialProviderPriority)
+        {
+            if (id.Contains('\0'))
+                throw new ArgumentException(
+                    $"Credential provider priority entry '{id}' contains an invalid null character.",
+                    nameof(credentialProviderPriority));
+        }
+
         // No named plugins or empty priority — global chain is correct.
         if (_namedPlugins.Count == 0 || credentialProviderPriority.Count == 0)
             return await GetAsync(agent, ct);
@@ -156,50 +172,52 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
         var priorityKey = string.Join("\0", credentialProviderPriority);
         var cacheKey = (agent, priorityKey);
 
-        // Fast path: still-valid priority-keyed cached credential.
+        // Fast path + expired-entry detection in a single lock acquisition.
+        bool hasExpiredEntry;
         lock (_cacheLock)
         {
-            if (_priorityCache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAt > _utcNow())
-                return cached.Credential;
+            if (_priorityCache.TryGetValue(cacheKey, out var cached))
+            {
+                if (cached.ExpiresAt > _utcNow())
+                    return cached.Credential;
+                hasExpiredEntry = true;
+            }
+            else
+            {
+                hasExpiredEntry = false;
+            }
         }
 
-        // Serialise concurrent refetches for this (agent, priority) combination.
+        // Build the per-project chain: built-in-first + filtered/ordered plugins + built-in-last.
+        var orderedPlugins = OrderByPriority(
+            _namedPlugins,
+            credentialProviderPriority,
+            onMissing: id => _log?.LogWarning(
+                "Project credential priority lists unknown plugin ID '{PluginId}'; skipping", id));
+
+        var chain = _builtInFirst
+            .Concat(orderedPlugins.Select(p => p.Provider))
+            .Concat(_builtInLast)
+            .ToList();
+
+        if (!hasExpiredEntry)
+        {
+            // No cached entry: non-expiring credential path. Sources are
+            // parallelism-safe, so concurrent callers do not need to be serialised.
+            return await WalkPriorityChainAsync(chain, agent, cacheKey, ct);
+        }
+
+        // Expired cached entry: serialise concurrent refetches to prevent stampede.
         var fetchLock = GetOrCreatePriorityFetchLock(cacheKey);
         await fetchLock.WaitAsync(ct);
         try
         {
-            // Double-check after acquiring the lock.
             lock (_cacheLock)
             {
                 if (_priorityCache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAt > _utcNow())
                     return cached.Credential;
             }
-
-            // Build the per-project chain: built-in-first + filtered/ordered plugins + built-in-last.
-            var orderedPlugins = OrderByPriority(
-                _namedPlugins,
-                credentialProviderPriority,
-                onMissing: id => _log?.LogWarning(
-                    "Project credential priority lists unknown plugin ID '{PluginId}'; skipping", id));
-
-            var chain = _builtInFirst
-                .Concat(orderedPlugins.Select(p => p.Provider))
-                .Concat(_builtInLast);
-
-            foreach (var p in chain)
-            {
-                var cred = await p.GetAsync(agent, ct);
-                if (cred is not null)
-                {
-                    if (cred.ExpiresAt.HasValue)
-                    {
-                        lock (_cacheLock)
-                            _priorityCache[cacheKey] = (cred, cred.ExpiresAt.Value);
-                    }
-                    return cred;
-                }
-            }
-            return null;
+            return await WalkPriorityChainAsync(chain, agent, cacheKey, ct);
         }
         finally
         {
@@ -245,6 +263,50 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
         }
 
         return ordered;
+    }
+
+    private async Task<AgentCredential?> WalkChainAsync(
+        IReadOnlyList<ICredentialProvider> chain,
+        AgentKind agent,
+        Dictionary<AgentKind, (AgentCredential Credential, DateTimeOffset ExpiresAt)> cache,
+        CancellationToken ct)
+    {
+        foreach (var p in chain)
+        {
+            var cred = await p.GetAsync(agent, ct);
+            if (cred is not null)
+            {
+                if (cred.ExpiresAt.HasValue)
+                {
+                    lock (_cacheLock)
+                        cache[agent] = (cred, cred.ExpiresAt.Value);
+                }
+                return cred;
+            }
+        }
+        return null;
+    }
+
+    private async Task<AgentCredential?> WalkPriorityChainAsync(
+        IReadOnlyList<ICredentialProvider> chain,
+        AgentKind agent,
+        (AgentKind, string) cacheKey,
+        CancellationToken ct)
+    {
+        foreach (var p in chain)
+        {
+            var cred = await p.GetAsync(agent, ct);
+            if (cred is not null)
+            {
+                if (cred.ExpiresAt.HasValue)
+                {
+                    lock (_cacheLock)
+                        _priorityCache[cacheKey] = (cred, cred.ExpiresAt.Value);
+                }
+                return cred;
+            }
+        }
+        return null;
     }
 
     private SemaphoreSlim GetOrCreateFetchLock(AgentKind kind)

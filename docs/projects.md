@@ -527,7 +527,7 @@ The chain for `payments-service` is:
 `myorg.1password`, even if installed and allowlisted globally, is never tried for
 this project.
 
-### Example — use only env vars (no plugins)
+### Example — default behavior (all plugins in discovery order)
 
 ```json
 {
@@ -536,9 +536,14 @@ this project.
 }
 ```
 
-An empty list is the default. All discovered plugins are included (in discovery
-order). To explicitly exclude all plugins, omit `CredentialProviderPriority`; the
-chain naturally falls back to env vars if no plugin returns a credential.
+An empty list is the default. All discovered plugins are included in global
+discovery order. If no plugin returns a credential, the chain falls through to
+the built-in env-var provider.
+
+> **Tip:** Operators who want env-var-only behaviour should not install credential
+> plugins or should leave the global plugin allowlist empty. There is no
+> configuration option that excludes all installed plugins while keeping the
+> built-in providers.
 
 See [`docs/credential-plugins.md`](credential-plugins.md) for the full plugin
 author guide, chain-order rationale, and sample implementation.

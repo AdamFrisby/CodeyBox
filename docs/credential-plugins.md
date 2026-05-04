@@ -216,8 +216,9 @@ it wants and in what order:
 The built-in OAuth-file and env-var providers are always present regardless of
 the priority list.
 
-Use `ChainedCredentialProvider.OrderByPriority(plugins, project.CredentialProviderPriority)`
-to apply priority filtering when building a project-specific chain.
+Priority filtering is applied automatically by the orchestrator when it calls
+`IProjectAwareCredentialProvider.GetAsync(agent, priority, ct)`. Plugin authors
+implementing `ICredentialProvider` do not need to perform any ordering themselves.
 
 ---
 
@@ -242,8 +243,10 @@ key prefix.
 
 ## Credential redaction
 
-All credential values returned by plugins flow through Serilog's
-`SensitiveDataRedactionEnricher` before any logging. This enricher:
+The `SensitiveDataRedactionEnricher` intercepts structured Serilog log-event
+properties and redacts recognized secret patterns before they reach the log sink.
+It does **not** actively process `AgentCredential` objects — it only acts on values
+that are accidentally emitted as log properties. This enricher:
 
 - Replaces the value of any log property whose name contains "Token", "Secret",
   "Password", "Authorization", or "ApiKey" with `***`.
