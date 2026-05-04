@@ -118,8 +118,8 @@ else
                 </select>
             </div>
             <div class="form-group">
-                <label>Model ID <span class="hint">(optional)</span></label>
-                <input class="modal-input" type="text" placeholder="e.g. gemini-3.0-pro" @bind="_replayModelId" />
+                <label>Agent class ID <span class="hint">(optional — routes to a class that specifies the model)</span></label>
+                <input class="modal-input" type="text" placeholder="e.g. frontier-coding" @bind="_replayAgentClassId" />
             </div>
             <div class="form-group">
                 <label>Work branch <span class="hint">(optional, auto-generated if blank)</span></label>
@@ -143,7 +143,7 @@ else
 
     private bool _showReplayModal;
     private string? _replayAgent;
-    private string? _replayModelId;
+    private string? _replayAgentClassId;
     private string? _replayWorkBranch;
     private string? _replayError;
 
@@ -188,7 +188,7 @@ else
     private void OpenReplayModal()
     {
         _replayAgent = null;
-        _replayModelId = null;
+        _replayAgentClassId = null;
         _replayWorkBranch = null;
         _replayError = null;
         _showReplayModal = true;
@@ -206,7 +206,7 @@ else
         var req = new ReplayWorkItemRequest
         {
             Agent = string.IsNullOrWhiteSpace(_replayAgent) ? null : _replayAgent,
-            ModelId = string.IsNullOrWhiteSpace(_replayModelId) ? null : _replayModelId,
+            AgentClassId = string.IsNullOrWhiteSpace(_replayAgentClassId) ? null : _replayAgentClassId,
             WorkBranch = string.IsNullOrWhiteSpace(_replayWorkBranch) ? null : _replayWorkBranch,
         };
 
