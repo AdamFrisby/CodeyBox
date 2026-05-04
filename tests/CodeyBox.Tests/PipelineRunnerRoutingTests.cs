@@ -129,6 +129,71 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task AllMembersBelowFloor_ItemMarkedFailed_PipelineNotCalled()
+    {
+        // All members have QualityScore=80 but item requires MinModelScore=95 → NoEligibleMembers.
+        var frontierClass = new AgentClass
+        {
+            Id = "frontier-coding",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 80 },
+            ],
+        };
+
+        var router = new AgentClassRouter(
+            [frontierClass],
+            [new FakeProbe(AgentKind.Claude, 80.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var tracking = new AgentTrackingPipeline(_store);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            AgentClassId = "frontier-coding",
+            MinModelScore = 95,
+        };
+        await _store.CreateAsync(item);
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 1 };
+        var svc = new OrchestratorService(
+            queue, _store, tracking, registry, opts,
+            NullLogger<OrchestratorService>.Instance,
+            router, projects: null);
+
+        await queue.EnqueueAsync(item.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        // Wait for the item to be marked Failed.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var stored = await _store.GetAsync(item.Id);
+            if (stored?.State == WorkItemState.Failed) break;
+            await Task.Delay(20);
+        }
+
+        await svc.StopAsync(CancellationToken.None);
+
+        // Pipeline must NOT have been called.
+        Assert.Null(tracking.LastAgent);
+        Assert.False(tracking.ReceivedNullAgent);
+
+        // Item must be marked Failed in the store with the ROUTING_NO_ELIGIBLE reason.
+        var finalItem = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, finalItem?.State);
+        Assert.Contains("ROUTING_NO_ELIGIBLE", finalItem?.LastError ?? "");
+    }
+
+    [Fact]
     public async Task AllSubscriptionExhausted_ItemIsDeferred_NotRunImmediately()
     {
         // All members below threshold → item deferred. Pipeline should NOT be called.

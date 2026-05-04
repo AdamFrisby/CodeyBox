@@ -2,9 +2,9 @@ namespace CodeyBox.Core;
 
 /// <summary>
 /// A named group of interchangeable agents. When a work item requests a class,
-/// the orchestrator probes each member in preference order and picks the first
-/// one above the quota threshold, falling back to the next member or waiting
-/// if all subscription-billed members are exhausted.
+/// the router picks the member with the highest effective quality score that meets
+/// the work item's MinModelScore floor, then probes quota; it waits if all
+/// subscription-billed eligible members are exhausted.
 /// </summary>
 public sealed record AgentClass
 {
@@ -14,7 +14,11 @@ public sealed record AgentClass
     /// <summary>Human label, e.g. "Frontier coding (≈Claude 4.7 / Codex 5.5)".</summary>
     public required string DisplayName { get; init; }
 
-    /// <summary>Members in PREFERENCE order — first is tried first when this class is requested.</summary>
+    /// <summary>
+    /// Members of this class. List order is only a last-resort tiebreaker when
+    /// two members have identical effective scores after TOD modifiers; selection
+    /// is driven by <see cref="AgentMembership.QualityScore"/>, not position.
+    /// </summary>
     public required IReadOnlyList<AgentMembership> Members { get; init; }
 }
 
@@ -49,8 +53,8 @@ public sealed record AgentMembership
     /// <summary>
     /// Agent-CLI-specific reasoning-effort knob. The runner translates this into
     /// the right CLI flag (e.g. <c>--thinking</c> on gemini). For Gemini
-    /// specifically: a score of 95+ REQUIRES <c>ReasoningMode="high"</c> —
-    /// config validation rejects Gemini-95-without-high-reasoning at startup.
+    /// specifically: a score of >= 90 REQUIRES <c>ReasoningMode="high"</c> —
+    /// config validation rejects Gemini-90+-without-high-reasoning at startup.
     /// </summary>
     public string? ReasoningMode { get; init; }
 }

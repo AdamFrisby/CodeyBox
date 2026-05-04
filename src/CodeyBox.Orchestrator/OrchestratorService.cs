@@ -317,9 +317,10 @@ public sealed class OrchestratorService : BackgroundService
                 }
                 if (decision.Chosen is { } chosen)
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId, ReasoningMode = chosen.ReasoningMode };
-                if (decision.NoEligibleMembers)
+                else if (decision.NoEligibleMembers)
                 {
                     _log.LogError("Work item {Id}: {Reason}", item.Id, decision.Reason);
+                    AuditLog.WorkItemFailed(item.Id, decision.Reason);
                     await _store.UpdateAsync(item.With(WorkItemState.Failed, decision.Reason), ct);
                     return;
                 }

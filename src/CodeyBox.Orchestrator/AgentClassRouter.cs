@@ -97,6 +97,16 @@ public sealed class AgentClassRouter
             var reason = $"ROUTING_NO_ELIGIBLE: no member of class '{classId}' meets " +
                          $"MinModelScore={item.MinModelScore} (best available={best})";
             _log.LogError("Work item {Id}: {Reason}", item.Id, reason);
+            // Emit scored audit event so below-floor rejects appear in the audit log.
+            var nowUtcFloor = _time.GetUtcNow();
+            var belowFloor = agentClass.Members
+                .Select(m => (
+                    Agent: m.Agent,
+                    ModelId: m.ModelId,
+                    EffectiveScore: m.QualityScore + ComputeTodModifier(m.Agent, nowUtcFloor),
+                    RejectReason: $"below floor ({m.QualityScore} < {item.MinModelScore})"))
+                .ToList();
+            AuditLog.QuotaRouterNoEligible(item.Id, classId, item.MinModelScore, belowFloor);
             return new AgentRoutingDecision { Reason = reason, NoEligibleMembers = true };
         }
 
