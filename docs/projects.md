@@ -472,6 +472,84 @@ POST /workitems            — body now requires "projectId" instead of "reposit
 }
 ```
 
+## Credential provider priority
+
+When multiple [credential plugins](credential-plugins.md) are installed, a project
+can declare which plugins it prefers and in what order:
+
+```json
+{
+  "CodeyBox": {
+    "Projects": [
+      {
+        "Id": "my-app",
+        "CredentialProviderPriority": ["myorg.vault-creds", "myorg.aws-ssm"]
+      }
+    ]
+  }
+}
+```
+
+### How it works
+
+The `CredentialProviderPriority` list replaces the plugin slot for this project:
+
+- Listed plugins are tried **in order**, between the built-in OAuth-file provider
+  and the env-var fallback (BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV).
+- Plugins installed but **not listed** are excluded for this project.
+- An ID in the list that does not match any installed plugin is **skipped with a
+  warning** (not an error) so a misconfigured ID doesn't break the whole chain.
+- An **empty** `CredentialProviderPriority` (the default) includes all discovered
+  plugins in global discovery order — identical to having no credential plugins at
+  all from the operator's perspective.
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `CredentialProviderPriority` | `string[]` | `[]` | Ordered list of credential plugin IDs to include in the credential chain for this project. |
+
+### Example — vault first, AWS SSM fallback, no 1Password
+
+```json
+{
+  "Id": "payments-service",
+  "CredentialProviderPriority": ["myorg.vault-creds", "myorg.aws-ssm"]
+}
+```
+
+The chain for `payments-service` is:
+1. Built-in OAuth-file (Claude only)
+2. `myorg.vault-creds` plugin
+3. `myorg.aws-ssm` plugin
+4. Built-in env-var (catch-all)
+
+`myorg.1password`, even if installed and allowlisted globally, is never tried for
+this project.
+
+### Example — default behavior (all plugins in discovery order)
+
+```json
+{
+  "Id": "simple-project",
+  "CredentialProviderPriority": []
+}
+```
+
+An empty list is the default. All discovered plugins are included in global
+discovery order. If no plugin returns a credential, the chain falls through to
+the built-in env-var provider.
+
+> **Tip:** Operators who want env-var-only behaviour should not install credential
+> plugins or should leave the global plugin allowlist empty. There is no
+> configuration option that excludes all installed plugins while keeping the
+> built-in providers.
+
+See [`docs/credential-plugins.md`](credential-plugins.md) for the full plugin
+author guide, chain-order rationale, and sample implementation.
+
+---
+
 ## Plugging in a different project source
 
 `IProjectRepository` is the single read surface. The default impl is

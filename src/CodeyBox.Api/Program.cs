@@ -357,19 +357,42 @@ builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 
+// Plugin discovery result captured before builder.Build() so the credential
+// provider factory below can reference the list directly without any async
+// blocking. Populated by AddCodeyBoxPlugins (called in the plugin-foundation
+// section near the end of service registration).
+IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
+
 // --- Credentials -------------------------------------------------------------
 // Each agent's API key has a per-agent host env var that maps to the
 // canonical sandbox env var the agent CLI reads. Operators add new agents
 // by appending to this list (or registering a different ICredentialProvider).
 //
-// The chain reads Claude's OAuth token fresh from a JSON file (default
-// ~/.claude/.credentials.json, the path the local `claude` CLI refreshes
-// in-place) on every pickup, so a host-side token rotation is picked up
-// without an orchestrator restart. If the file is absent or empty, the
-// env-var provider supplies the value the host launcher exported.
-builder.Services.AddSingleton<ICredentialProvider>(sp =>
+// Chain order: BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV.
+//
+// 1. ClaudeOAuthFileCredentialProvider — reads Claude's token fresh from a
+//    JSON file (default ~/.claude/.credentials.json, the path the local
+//    `claude` CLI refreshes in-place) on every pickup, so a host-side token
+//    rotation is picked up without an orchestrator restart.
+// 2. Plugin ICredentialProvider implementations — inserted in discovery order
+//    (between OAuth-file and env-var). Vault-issued short-lived credentials
+//    are preferred over env-var fallbacks. Per-project ordering is expressed
+//    via Project.CredentialProviderPriority; see docs/credential-plugins.md.
+// 3. EnvironmentCredentialProvider — catch-all fallback reading host env vars.
+//
+// Operators with no credential plugins see zero behaviour change: the chain
+// is identical to the pre-plugin OAuth-file → env-var behaviour.
+//
+// ChainedCredentialProvider is registered under three service types so that:
+//   - ICredentialProvider resolves the global chain (smoke gates, startup validation).
+//   - IProjectAwareCredentialProvider lets PipelineRunner apply per-project
+//     CredentialProviderPriority at agent pickup time.
+//   - ChainedCredentialProvider is directly resolvable for callers that need both.
+builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
 {
-    var providers = new List<ICredentialProvider>();
+    var builtInFirst = new List<ICredentialProvider>();
+    var namedPlugins = new List<(string Id, ICredentialProvider Provider)>();
+    var builtInLast = new List<ICredentialProvider>();
 
     var oauthFile =
         Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_OAUTH_FILE")
@@ -383,13 +406,30 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
             oauthFile = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 oauthFile[2..]);
-        providers.Add(new ClaudeOAuthFileCredentialProvider(
+        builtInFirst.Add(new ClaudeOAuthFileCredentialProvider(
             oauthFile,
             sandboxEnvVar: "CLAUDE_CODE_OAUTH_TOKEN",
             sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
     }
 
-    providers.Add(new EnvironmentCredentialProvider(new[]
+    // Enumerate plugin-registered ICredentialProvider types using the list captured
+    // from AddCodeyBoxPlugins (called before builder.Build()). Each plugin type is
+    // registered in DI under its concrete type by PluginLoader.RegisterPlugins;
+    // we resolve by concrete type (not by ICredentialProvider) to avoid resolving
+    // the ChainedCredentialProvider itself and causing infinite recursion.
+    // Plugin IDs are stored alongside providers so per-project
+    // CredentialProviderPriority can filter and reorder them at pickup time.
+    var credentialProviderType = typeof(ICredentialProvider);
+    foreach (var plugin in preDiscoveredPlugins ?? [])
+    {
+        foreach (var type in plugin.RegisteredTypes)
+        {
+            if (credentialProviderType.IsAssignableFrom(type))
+                namedPlugins.Add((plugin.PluginId, (ICredentialProvider)sp.GetRequiredService(type)));
+        }
+    }
+
+    builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         // Claude Code accepts either ANTHROPIC_API_KEY (real API key, format
         // sk-ant-api03-…) or CLAUDE_CODE_OAUTH_TOKEN (OAuth access token,
@@ -403,8 +443,14 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
     }));
 
-    return new ChainedCredentialProvider(providers);
+    return new ChainedCredentialProvider(
+        builtInFirst,
+        namedPlugins,
+        builtInLast,
+        log: sp.GetService<ILogger<ChainedCredentialProvider>>());
 });
+builder.Services.AddSingleton<ICredentialProvider>(sp => sp.GetRequiredService<ChainedCredentialProvider>());
+builder.Services.AddSingleton<IProjectAwareCredentialProvider>(sp => sp.GetRequiredService<ChainedCredentialProvider>());
 
 // --- HTTP clients ------------------------------------------------------------
 // Named client for GitHub upstream. GitHub requires a User-Agent header.
@@ -777,7 +823,7 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
 // their Core interfaces before the container is frozen, then runs
 // IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
 // See docs/plugins.md for author guidance, allowlist config, and threat model.
-builder.Services.AddCodeyBoxPlugins(builder.Configuration);
+preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
 
 var app = builder.Build();
 
