@@ -7,6 +7,13 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
+  <!-- Suppress vulnerability advisories for OTel transitive dependencies that have no patched
+       version in the local NuGet cache. Mirrored from CodeyBox.Api.csproj. -->
+  <ItemGroup>
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g94r-2vxg-569j" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-4625-4j76-fww9" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
