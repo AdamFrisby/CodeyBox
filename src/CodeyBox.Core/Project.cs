@@ -186,6 +186,15 @@ public sealed record ProjectUpstream
     /// </summary>
     public ProjectPrDescription PrDescription { get; init; } = new();
 
+    /// <summary>
+    /// Plugin-specific key/value settings passed to the upstream remote plugin
+    /// named by <see cref="Kind"/>. Plugin authors document which keys they read.
+    /// Accessible at runtime via
+    /// <c>IPluginHost.GetProjectUpstreamConfig(projectId)</c>.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> PluginConfig { get; init; }
+        = new Dictionary<string, string>();
+
     public static ProjectUpstream Noop { get; } = new();
 }
 

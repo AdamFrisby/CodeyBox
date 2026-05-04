@@ -342,6 +342,36 @@ For `git-generic`, set `GenericUrl` and rely on the host git config
 (askpass, SSH agent) for auth. For `noop`, no upstream push happens and
 the host bare repo is the source of truth.
 
+### Plugin upstreams and PluginConfig
+
+When `Kind` is not a built-in (`noop`, `github`, `git-generic`), the orchestrator
+looks for a plugin-registered `IUpstreamRemote` whose `Name` matches. Plugins read
+their per-project settings from `Upstream.PluginConfig`:
+
+```json
+"Upstream": {
+  "Kind": "gitea",
+  "TokenEnvVar": "MY_GITEA_TOKEN",
+  "PluginConfig": {
+    "BaseUrl": "https://git.mycompany.example/api/v1",
+    "Owner": "myteam",
+    "Repository": "myproject"
+  }
+}
+```
+
+The keys inside `PluginConfig` are plugin-defined. Check the plugin's documentation
+for which keys it reads. The orchestrator passes this dictionary to the plugin via
+`IPluginHost.GetProjectUpstreamConfig(projectId)` — plugins must not rely on any
+other per-project state injection mechanism.
+
+**Token security**: tokens must **never** go into `PluginConfig`. Always use
+`TokenEnvVar` to name the environment variable holding the token; the plugin reads it
+with `Environment.GetEnvironmentVariable(...)`.
+
+See [`docs/upstream-plugins.md`](upstream-plugins.md) for how to author an upstream
+remote plugin.
+
 ### GitHub upstream: pull request flow
 
 When `Kind=github`, phase 4 now pushes the **work branch** to GitHub
