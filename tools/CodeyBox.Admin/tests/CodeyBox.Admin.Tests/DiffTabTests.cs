@@ -1,4 +1,5 @@
 using Bunit;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using CodeyBox.Admin.Web.Models;
 using CodeyBox.Admin.Web.Services;
@@ -9,6 +10,11 @@ namespace CodeyBox.Admin.Tests;
 public sealed class DiffTabTests : TestContext
 {
     private const string ItemId = "aabbccdd-0000-0000-0000-000000000001";
+
+    public DiffTabTests()
+    {
+        Services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+    }
 
     private static WorkItemDiffDto MakeDiff(
         int filesChanged = 2,

@@ -125,6 +125,13 @@ internal static class WorkItemDiffEndpoints
         // Get line-change counts from numstat (handles binary files gracefully
         // because numstat emits "-" for binary rows, which parseInt ignores).
         var numstatResult = await RunGitAsync(repoPath, ct, "diff", "--numstat", $"{baseSha}..{workSha}");
+        if (numstatResult.ExitCode != 0)
+        {
+            ctx.Response.StatusCode = 500;
+            await ctx.Response.WriteAsJsonAsync(new { error = "git numstat failed" }, ct);
+            return;
+        }
+
         var (linesAdded, linesRemoved) = ParseNumstat(numstatResult.Stdout);
 
         var wantsJson = ctx.Request.Headers.Accept
@@ -277,10 +284,10 @@ internal static class WorkItemDiffEndpoints
         };
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
-        var stdout = await p.StandardOutput.ReadToEndAsync(ct);
-        var stderr = await p.StandardError.ReadToEndAsync(ct);
+        var readStdout = p.StandardOutput.ReadToEndAsync(ct);
+        var readStderr = p.StandardError.ReadToEndAsync(ct);
         await p.WaitForExitAsync(ct);
-        return (p.ExitCode, stdout, stderr);
+        return (p.ExitCode, await readStdout, await readStderr);
     }
 
     private static (int Added, int Removed) ParseNumstat(string numstat)

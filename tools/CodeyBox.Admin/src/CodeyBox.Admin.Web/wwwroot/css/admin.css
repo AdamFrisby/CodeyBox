@@ -650,6 +650,11 @@ h1 {
     gap: 0.3rem;
 }
 
+.diff-ws-visible .diff-ws-char {
+    color: #6a6aff;
+    font-weight: bold;
+}
+
 .diff-patch-link {
     font-size: 0.8rem;
 }
