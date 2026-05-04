@@ -439,6 +439,35 @@ Fetch a single project by its id.
 * Returns `400 Bad Request` if `id` is not a valid project identifier.
 * Returns `404 Not Found` if the project does not exist.
 
+### `GET /sandboxes/leaked`
+
+Returns the list of `codeybox-*` Multipass VMs that were detected as leaked on
+the most recent reaper sweep (default every 15 minutes). An empty array means
+no leaks were found on the last sweep.
+
+```json
+[
+  {
+    "name": "codeybox-a1b2c3d4e5f6",
+    "createdAt": "2026-05-04T02:00:00+00:00",
+    "ageMinutes": 127.3,
+    "diskMb": null
+  }
+]
+```
+
+See [`sandbox-leaks.md`](sandbox-leaks.md) for full leak detection semantics.
+
+### `POST /sandboxes/leaked/{name}/dispose`
+
+Operator-triggered dispose of a leaked sandbox by name. The name must start with
+`codeybox-`. Returns `{ "disposed": "<name>" }` on success.
+
+* Returns `400` if the name does not start with `codeybox-`.
+* Returns `404` if the sandbox is not present in the latest leaked list (use `GET /sandboxes/leaked` to verify it is detected as a leak before calling).
+* Returns `504` if the dispose times out (5-minute per-sandbox cap).
+* Returns `500` on other errors.
+
 ### `GET /healthz`
 
 Liveness probe. Returns `{ "status": "ok" }`.

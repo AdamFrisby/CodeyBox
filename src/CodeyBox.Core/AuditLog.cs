@@ -130,6 +130,21 @@ public static class AuditLog
         Audit("sandbox.disposed")
             .Information("Sandbox {VmName} disposed", vmName);
 
+    public static void SandboxLeakDetected(string name, double ageMinutes, long? diskMb) =>
+        Audit("sandbox.leak_detected")
+            .Warning("Leaked sandbox detected: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB",
+                name, ageMinutes, diskMb);
+
+    public static void SandboxLeakDisposed(string name, double ageMinutes, long? diskMb, DateTimeOffset disposedAt) =>
+        Audit("sandbox.leak_disposed")
+            .Information("Leaked sandbox disposed: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB disposedAt={DisposedAt}",
+                name, ageMinutes, diskMb, disposedAt);
+
+    public static void SandboxLeakDisposeFailed(string name, double ageMinutes, long? diskMb, string error) =>
+        Audit("sandbox.leak_dispose_failed")
+            .Warning("Failed to dispose leaked sandbox {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB: {Error}",
+                name, ageMinutes, diskMb, error);
+
     // ── Upstream remote ──────────────────────────────────────────────────────
 
     public static void UpstreamPrOpened(int prNumber, string? prUrl, string workBranch, string baseBranch) =>

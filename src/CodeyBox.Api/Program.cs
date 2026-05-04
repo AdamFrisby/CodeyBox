@@ -818,6 +818,17 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog.RetainedDays,
     sp.GetRequiredService<ILogger<AuditReportRetentionService>>()));
 
+builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.SandboxLeak;
+    return new SandboxLeakReaper(
+        sp.GetRequiredService<ISandboxProvider>(),
+        sp.GetRequiredService<IWebhookDispatcher>(),
+        opts,
+        sp.GetRequiredService<ILogger<SandboxLeakReaper>>());
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
+
 // --- Plugin foundation -------------------------------------------------------
 // Discovers assemblies from CodeyBox:Plugins, registers plugin types under
 // their Core interfaces before the container is frozen, then runs
@@ -835,6 +846,7 @@ WorkItemCostsEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
+SandboxEndpoints.Map(app);
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
@@ -976,6 +988,13 @@ namespace CodeyBox.Api
 
         /// <summary>Changelog automation configuration. See docs/changelog-automation.md.</summary>
         public ChangelogOptions Changelog { get; set; } = new();
+
+        /// <summary>
+        /// Sandbox leak reaper configuration. The reaper periodically scans for
+        /// <c>codeybox-*</c> Multipass VMs that outlived their work item and logs
+        /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
+        /// </summary>
+        public SandboxLeakOptions SandboxLeak { get; set; } = new();
     }
 
     /// <summary>

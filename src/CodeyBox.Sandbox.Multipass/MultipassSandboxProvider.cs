@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -52,6 +54,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     // launch the same baseline VM. Lazily populated.
     private readonly Dictionary<string, SemaphoreSlim> _baselineLocks = new();
     private readonly object _baselineLocksGuard = new();
+
+    // Tracks sandboxes created by the current process that haven't been disposed.
+    // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
+    private readonly ConcurrentDictionary<string, bool> _activeSandboxNames = new(StringComparer.Ordinal);
+
+    // Cache for ListAllManagedAsync results to avoid hammering multipassd.
+    private IReadOnlyList<ManagedSandboxInfo>? _listCache;
+    private DateTimeOffset _listCacheExpiry = DateTimeOffset.MinValue;
+    private readonly TimeSpan _listCacheTtl = TimeSpan.FromMinutes(2);
+    private readonly SemaphoreSlim _listLock = new(1, 1);
 
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings = null)
@@ -204,7 +216,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // already baked into the source VM's filesystem, so the clone
             // inherits it. The codeybox-route systemd service runs on every
             // boot in both paths.
-            return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log, timingStore, timingItemId, timingPhase);
+            _activeSandboxNames[name] = true;
+            // Invalidate the list cache so the next ListAllManagedAsync call reflects
+            // the newly created sandbox immediately rather than serving stale data.
+            _listCacheExpiry = DateTimeOffset.MinValue;
+            return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log, timingStore, timingItemId, timingPhase,
+                onDisposed: n => { _activeSandboxNames.TryRemove(n, out _); _listCacheExpiry = DateTimeOffset.MinValue; });
         }
         catch
         {
@@ -213,6 +230,169 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             try { Directory.Delete(sandboxRoot, recursive: true); } catch { }
             throw;
         }
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+    {
+        await _listLock.WaitAsync(ct);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (_listCache is not null && now < _listCacheExpiry)
+                return _listCache;
+
+            var result = await FetchManagedSandboxesAsync(ct);
+            _listCache = result;
+            _listCacheExpiry = now + _listCacheTtl;
+            return result;
+        }
+        finally
+        {
+            _listLock.Release();
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task DisposeLeakedAsync(string name, CancellationToken ct)
+    {
+        // Explicit allowlist before any filesystem or shell operation: VM names must
+        // be alphanumeric-and-hyphen only. This blocks path-traversal strings such as
+        // "codeybox-a/../../../sensitive" that start with the required prefix but
+        // would escape _stagingRoot once Path.Combine resolves them.
+        if (!IsValidSandboxName(name))
+            throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
+
+        _log.LogInformation("SandboxLeakReaper: purging leaked VM {Name}", name);
+        var run = await RunAsync([_opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: ct);
+        if (run.ExitCode != 0)
+            throw new InvalidOperationException($"multipass delete --purge {name} failed (exit {run.ExitCode}): {run.Stderr}");
+        // Clean up staging dir if it still exists.
+        var stagingDir = Path.Combine(_stagingRoot, name);
+        try { if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, recursive: true); }
+        catch { /* best-effort */ }
+        // Remove from active set and invalidate cache.
+        _activeSandboxNames.TryRemove(name, out _);
+        _listCacheExpiry = DateTimeOffset.MinValue;
+    }
+
+    private async Task<IReadOnlyList<ManagedSandboxInfo>> FetchManagedSandboxesAsync(CancellationToken ct)
+    {
+        var listRun = await RunAsync([_opts.MultipassBinary, "list", "--format", "json"], stdin: null, ct: ct);
+        if (listRun.ExitCode != 0)
+        {
+            _log.LogWarning("multipass list failed (exit {ExitCode}): {Stderr}", listRun.ExitCode, listRun.Stderr);
+            return [];
+        }
+
+        List<string> vmNames;
+        try
+        {
+            using var doc = JsonDocument.Parse(listRun.Stdout);
+            if (!doc.RootElement.TryGetProperty("list", out var listEl))
+                return [];
+
+            vmNames = [];
+            foreach (var item in listEl.EnumerateArray())
+            {
+                if (!item.TryGetProperty("name", out var nameEl)) continue;
+                var name = nameEl.GetString();
+                if (string.IsNullOrEmpty(name)) continue;
+                // Only sandboxes with the codeybox-* prefix (not cb-baseline-*).
+                if (!name.StartsWith("codeybox-", StringComparison.Ordinal)) continue;
+                vmNames.Add(name);
+            }
+        }
+        catch (JsonException ex)
+        {
+            _log.LogWarning(ex, "Failed to parse multipass list output");
+            return [];
+        }
+
+        if (vmNames.Count == 0) return [];
+
+        // Fetch disk usage for all discovered codeybox VMs in a single multipass info call.
+        var diskByName = await FetchDiskInfoAsync(vmNames, ct);
+
+        var infos = new List<ManagedSandboxInfo>(vmNames.Count);
+        foreach (var name in vmNames)
+        {
+            // Validate before using the name in Path.Combine, mirroring the check in
+            // DisposeLeakedAsync. Multipass enforces DNS-label naming so this should
+            // never fire, but we must not rely on an external tool's input validation
+            // for a filesystem path operation.
+            if (!IsValidSandboxName(name)) continue;
+
+            DateTimeOffset? createdAt = null;
+            var stagingDir = Path.Combine(_stagingRoot, name);
+            if (Directory.Exists(stagingDir))
+            {
+                var created = Directory.GetCreationTimeUtc(stagingDir);
+                if (created != DateTime.MinValue)
+                    createdAt = new DateTimeOffset(created, TimeSpan.Zero);
+            }
+            var isActive = _activeSandboxNames.ContainsKey(name);
+            diskByName.TryGetValue(name, out var diskBytes);
+            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive));
+        }
+        return infos;
+    }
+
+    /// <summary>
+    /// Runs <c>multipass info --format json</c> for the given VM names and returns
+    /// a map of VM name → disk-used bytes. Returns an empty dictionary on any failure
+    /// so that missing disk info degrades gracefully to null in the caller.
+    /// </summary>
+    private async Task<Dictionary<string, long>> FetchDiskInfoAsync(List<string> names, CancellationToken ct)
+    {
+        var argv = new List<string> { _opts.MultipassBinary, "info", "--format", "json" };
+        argv.AddRange(names);
+
+        var run = await RunAsync(argv, stdin: null, ct: ct);
+        if (run.ExitCode != 0)
+        {
+            _log.LogWarning("multipass info failed (exit {ExitCode}): {Stderr}", run.ExitCode, run.Stderr);
+            return [];
+        }
+
+        var result = new Dictionary<string, long>(StringComparer.Ordinal);
+        try
+        {
+            using var doc = JsonDocument.Parse(run.Stdout);
+            if (!doc.RootElement.TryGetProperty("info", out var infoEl))
+                return result;
+
+            foreach (var vmEntry in infoEl.EnumerateObject())
+            {
+                if (!vmEntry.Value.TryGetProperty("disks", out var disksEl)) continue;
+                long total = 0;
+                foreach (var diskEntry in disksEl.EnumerateObject())
+                {
+                    if (diskEntry.Value.TryGetProperty("used", out var usedEl) &&
+                        long.TryParse(usedEl.GetString(), out var used))
+                        total += used;
+                }
+                if (total > 0)
+                    result[vmEntry.Name] = total;
+            }
+        }
+        catch (JsonException ex)
+        {
+            _log.LogWarning(ex, "Failed to parse multipass info output; disk sizes will be omitted");
+        }
+        return result;
+    }
+
+    private static bool IsValidSandboxName(string name)
+    {
+        // VM names must be alphanumeric-and-hyphen only (DNS-label style).
+        // This blocks path-traversal characters (/, ., \) before any filesystem use.
+        foreach (var c in name)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-')
+                return false;
+        }
+        return name.Length > 0;
     }
 
     /// <summary>
@@ -609,6 +789,26 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         """;
 
     /// <summary>
+    /// Standalone shell script run by codeybox-route.service on every boot
+    /// to point the default route at the profile bridge. Idempotent — if
+    /// the default route is already correct, the del+add is a no-op
+    /// modulo a brief flap.
+    /// </summary>
+    private const string RouteSwapScript = """
+        #!/bin/sh
+        set -e
+        iface=$(ip -4 -o addr show | awk '/inet 10\.99\./{print $2; exit}')
+        if [ -z "$iface" ]; then
+            echo "codeybox-route: no 10.99.x.x interface present; nothing to do"
+            exit 0
+        fi
+        gw=$(ip -4 -o addr show "$iface" | awk '{print $4}' | awk -F. '{print $1"."$2"."$3".1"}')
+        ip route del default 2>/dev/null || true
+        ip route add default via "$gw" dev "$iface"
+        echo "codeybox-route: default via $gw dev $iface"
+        """;
+
+    /// <summary>
     /// Builds a cloud-init document that:
     ///   - Installs the exec wrapper at /usr/local/bin/codeybox-exec (root-
     ///     owned, mode 0755) so the agent can execute but not modify it.
@@ -634,26 +834,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// host bridge enforcement is in the host kernel, where the agent has
     /// no view, and is the only egress boundary we treat as load-bearing.
     /// </summary>
-    /// <summary>
-    /// Standalone shell script run by codeybox-route.service on every boot
-    /// to point the default route at the profile bridge. Idempotent — if
-    /// the default route is already correct, the del+add is a no-op
-    /// modulo a brief flap.
-    /// </summary>
-    private const string RouteSwapScript = """
-        #!/bin/sh
-        set -e
-        iface=$(ip -4 -o addr show | awk '/inet 10\.99\./{print $2; exit}')
-        if [ -z "$iface" ]; then
-            echo "codeybox-route: no 10.99.x.x interface present; nothing to do"
-            exit 0
-        fi
-        gw=$(ip -4 -o addr show "$iface" | awk '{print $4}' | awk -F. '{print $1"."$2"."$3".1"}')
-        ip route del default 2>/dev/null || true
-        ip route add default via "$gw" dev "$iface"
-        echo "codeybox-route: default via $gw dev $iface"
-        """;
-
     internal static string BuildCloudInit(IReadOnlyList<string>? extraRuncmd, string? extraCloudInit)
     {
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
@@ -888,11 +1068,13 @@ internal sealed class MultipassSandbox : ISandbox
     private readonly ITimingStore? _timings;
     private readonly WorkItemId _timingItemId;
     private readonly string _timingPhase;
+    private readonly Action<string>? _onDisposed;
     private int _firstExecEmitted;
     private bool _disposed;
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
-        ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work")
+        ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
+        Action<string>? onDisposed = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -902,6 +1084,7 @@ internal sealed class MultipassSandbox : ISandbox
         _timings = timings;
         _timingItemId = timingItemId;
         _timingPhase = timingPhase;
+        _onDisposed = onDisposed;
         Id = name;
     }
 
@@ -988,6 +1171,9 @@ internal sealed class MultipassSandbox : ISandbox
     {
         if (_disposed) return;
         _disposed = true;
+        // Notify provider immediately so it removes the name from the active set and
+        // invalidates the list cache before any subsequent leak scan runs.
+        _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name);
         await using var disposeScope = await TimingScope.BeginAsync(
             _timings, _timingItemId, _timingPhase, "vm.dispose", log: _log);
