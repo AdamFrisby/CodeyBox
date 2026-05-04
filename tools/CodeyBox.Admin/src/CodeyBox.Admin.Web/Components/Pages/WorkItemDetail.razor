@@ -1,7 +1,11 @@
 @page "/work-items/{Id}"
+@using Microsoft.AspNetCore.SignalR.Client
 @inject ICodeyBoxApiClient ApiClient
 @inject NavigationManager Nav
 @inject ILogger<WorkItemDetail> Logger
+@inject OrchestratorHubSettings HubSettings
+@inject IJSRuntime JS
+@implements IAsyncDisposable
 
 <PageTitle>Work Item — CodeyBox Admin</PageTitle>
 
@@ -84,6 +88,18 @@ else
         <summary>Prompt</summary>
         <pre class="prompt-text">@_item.Prompt</pre>
     </details>
+
+    @if (!_item.IsTerminal || !string.IsNullOrEmpty(_liveStdout))
+    {
+        <div class="live-stdout">
+            <h2>@(_item.IsTerminal ? "Output Tail" : "Live Output")</h2>
+            <pre class="stdout-stream" @ref="_streamRef">@_liveStdout</pre>
+            @if (_streamDone)
+            {
+                <p class="stdout-done">Stream complete.</p>
+            }
+        </div>
+    }
 }
 
 @code {
@@ -94,11 +110,22 @@ else
     private bool _notFound;
     private string? _loadedId;
 
+    private Microsoft.AspNetCore.SignalR.Client.HubConnection? _hub;
+    private string _liveStdout = "";
+    private bool _streamDone;
+    private ElementReference _streamRef;
+
     protected override async Task OnParametersSetAsync()
     {
         if (Id == _loadedId) return;
         _loadedId = Id;
         await LoadAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && _item is { IsTerminal: false })
+            await ConnectToHubAsync();
     }
 
     private async Task LoadAsync()
@@ -117,6 +144,67 @@ else
         }
     }
 
+    private async Task ConnectToHubAsync()
+    {
+        // Fetch the initial ring-buffer tail for late-join context.
+        try
+        {
+            var tail = await ApiClient.GetStdoutTailAsync(_item!.Id);
+            if (!string.IsNullOrEmpty(tail))
+            {
+                _liveStdout = tail;
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not fetch stdout tail for {Id}", _item!.Id);
+        }
+
+        if (string.IsNullOrEmpty(HubSettings.HubUrl)) return;
+
+        var builder = new Microsoft.AspNetCore.SignalR.Client.HubConnectionBuilder()
+            .WithUrl(HubSettings.HubUrl, opts =>
+            {
+                if (!string.IsNullOrEmpty(HubSettings.ApiKey))
+                    opts.Headers.Add("Authorization", $"Bearer {HubSettings.ApiKey}");
+            });
+
+        _hub = builder.Build();
+
+        _hub.On<StdoutChunkPayload>("stdoutChunk", async payload =>
+        {
+            _liveStdout += payload.Chunk;
+            await InvokeAsync(async () =>
+            {
+                StateHasChanged();
+                await ScrollToBottomAsync();
+            });
+        });
+
+        _hub.On<object?>("streamComplete", async _ =>
+        {
+            _streamDone = true;
+            await InvokeAsync(StateHasChanged);
+        });
+
+        try
+        {
+            await _hub.StartAsync();
+            await _hub.InvokeAsync("SubscribeAsync", _item!.Id);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Could not connect to live stdout hub for {Id}", _item!.Id);
+        }
+    }
+
+    private async Task ScrollToBottomAsync()
+    {
+        try { await JS.InvokeVoidAsync("codeyboxScrollToBottom", _streamRef); }
+        catch { /* no-op if JS is unavailable (e.g. prerender) */ }
+    }
+
     private async Task CancelAsync()
     {
         await ApiClient.DeleteWorkItemAsync(Id);
@@ -131,4 +219,16 @@ else
         await ApiClient.RetryWorkItemAsync(Id, from);
         await LoadAsync();
     }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_hub is { } hub)
+        {
+            try { await hub.InvokeAsync("UnsubscribeAsync", _item?.Id ?? ""); }
+            catch { /* best-effort */ }
+            await hub.DisposeAsync();
+        }
+    }
+
+    private sealed record StdoutChunkPayload(string WorkItemId, string Phase, string Chunk);
 }

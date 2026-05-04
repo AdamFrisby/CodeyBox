@@ -467,4 +467,9 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+
+    public Dictionary<string, string> StdoutTailOverride { get; } = [];
+
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(StdoutTailOverride.TryGetValue(workItemId, out var t) ? t : null);
 }

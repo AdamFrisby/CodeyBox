@@ -24,7 +24,8 @@ public abstract class CliAgentRunnerBase : IAgentRunner
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
     {
         // The credential env is set on the container at boot via SandboxSpec.Environment
         // so secrets don't land on per-exec argv. We deliberately do NOT merge
@@ -36,6 +37,7 @@ public abstract class CliAgentRunnerBase : IAgentRunner
             WorkingDirectory = workingDirectory,
             ExtraEnvironment = invocation.ExtraEnvironment,
             Stdin = invocation.Stdin,
+            StdoutChunkCallback = stdoutChunkCallback,
         };
 
         var result = await sandbox.ExecAsync(exec, ct);

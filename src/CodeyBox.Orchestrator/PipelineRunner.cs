@@ -53,6 +53,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWorkItemCostStore? _costStore;
     private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? _costExtractors;
     private readonly AgentCostCalculator? _costCalculator;
+    private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
     // Null when no probes were provided (fail-open: no quota gate on audit agent).
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
@@ -97,7 +98,8 @@ public sealed class PipelineRunner : IPipelineRunner
         ITimingStore? timingStore = null,
         IWorkItemCostStore? costStore = null,
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? costExtractors = null,
-        AgentCostCalculator? costCalculator = null)
+        AgentCostCalculator? costCalculator = null,
+        IStdoutBroadcaster? stdoutBroadcaster = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -114,6 +116,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _costStore = costStore;
         _costExtractors = costExtractors;
         _costCalculator = costCalculator;
+        _stdoutBroadcaster = stdoutBroadcaster;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -324,6 +327,14 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogError(ex, "Work item {Id} failed", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project);
         }
+        finally
+        {
+            if (_stdoutBroadcaster is not null)
+            {
+                try { await _stdoutBroadcaster.CompleteAsync(item.Id); }
+                catch { /* best-effort: SignalR clients may have disconnected */ }
+            }
+        }
     }
 
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
@@ -407,10 +418,15 @@ public sealed class PipelineRunner : IPipelineRunner
             _timings, item.Id, agentPhase, "agent.exec",
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
             log: _log);
+        Action<string>? stdoutCallback = _stdoutBroadcaster is { } broadcaster
+            ? chunk => broadcaster.BroadcastChunk(item.Id, agentPhase, chunk)
+            : null;
+
         AgentResult agentResult;
         await using (agentExecScope)
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct,
+                stdoutChunkCallback: stdoutCallback);
         }
 
         var agentEndedAt = DateTimeOffset.UtcNow;
@@ -895,10 +911,14 @@ public sealed class PipelineRunner : IPipelineRunner
             _timings, item.Id, "merge", "agent.exec",
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
             log: _log);
+        Action<string>? mergeStdoutCallback = _stdoutBroadcaster is { } mergeBroadcaster
+            ? chunk => mergeBroadcaster.BroadcastChunk(item.Id, "merge", chunk)
+            : null;
         AgentResult agentResult;
         await using (mergeExecScope)
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct,
+                stdoutChunkCallback: mergeStdoutCallback);
         }
 
         var mergeEndedAt = DateTimeOffset.UtcNow;

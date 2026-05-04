@@ -49,9 +49,10 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
     {
-        var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, ct);
+        var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, ct, stdoutChunkCallback);
         return result with
         {
             Stdout = Strip(result.Stdout),

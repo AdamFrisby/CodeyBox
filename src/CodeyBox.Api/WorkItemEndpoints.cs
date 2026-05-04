@@ -17,6 +17,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/dependents", GetDependentsAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
+        group.MapGet("/{id}/stdout-tail", GetStdoutTailAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -747,6 +748,22 @@ internal static class WorkItemEndpoints
         p.Audit.Languages,
         p.Audit.AuditTypes,
         p.Audit.MaxIterations);
+
+    private static async Task<IResult> GetStdoutTailAsync(
+        string id,
+        IWorkItemStore store,
+        IStdoutBroadcaster broadcaster,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var tail = broadcaster.GetTail(item!.Id);
+        if (tail is null)
+            return Results.Ok("");  // Work item exists but no live stream data yet.
+
+        return Results.Text(tail, "text/plain");
+    }
 
     private static async Task<IResult> GetTimelineAsync(
         string id,

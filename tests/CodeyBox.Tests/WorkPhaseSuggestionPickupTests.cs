@@ -278,7 +278,7 @@ internal sealed partial class SuggestionEmittingAgent : IAgentRunner
 
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox, string workingDirectory, string prompt,
-        AgentCredential? credential, string? modelId = null, CancellationToken ct = default)
+        AgentCredential? credential, string? modelId = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
     {
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
             return await HandleMergeAsync(sandbox, workingDirectory, prompt, ct);
@@ -343,7 +343,7 @@ internal sealed partial class MergeOnlySuggestionEmittingAgent : IAgentRunner
 
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox, string workingDirectory, string prompt,
-        AgentCredential? credential, string? modelId = null, CancellationToken ct = default)
+        AgentCredential? credential, string? modelId = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
     {
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
             return await HandleMergeAsync(sandbox, workingDirectory, prompt, ct);

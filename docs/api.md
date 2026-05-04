@@ -336,6 +336,24 @@ span multiple models.  `byWorkItem` is sorted by `started_at` descending.
 * Returns `404 Not Found` when the project does not exist.
 * Returns `400 Bad Request` when `from` or `to` cannot be parsed as ISO-8601.
 
+### `GET /workitems/{id}/stdout-tail`
+
+Returns the recent tail of the agent's live stdout, buffered in the orchestrator's
+in-memory ring buffer (capped at 16 KB). Useful for late-joining dashboard clients
+that missed the beginning of a stream. Returns `text/plain; charset=utf-8`.
+
+The content is pre-redacted: GitHub PATs, Anthropic API keys, and Google API keys
+are replaced with `***` before the output ever reaches the buffer.
+
+* Returns `200 OK` with the buffered tail as `text/plain`. Response body is empty
+  when the ring buffer has no entry for this work item (item hasn't started, or
+  orchestrator was restarted since the run).
+* Returns `400 Bad Request` when `{id}` is not a valid GUID.
+* Returns `404 Not Found` when the work item does not exist.
+
+**Note:** This endpoint returns a static snapshot. For a live stream use the
+SignalR hub below.
+
 ### `GET /workitems/{id}/timings`
 
 Returns per-step wall-clock timing data for a single work item as a structured
@@ -499,6 +517,49 @@ GitHub HMAC instead.
 * Repositories not matching any configured project return `202 Accepted` silently.
 
 See [`changelog-automation.md`](changelog-automation.md) for setup instructions.
+
+## SignalR hub — live agent stdout
+
+The orchestrator exposes a SignalR hub at `/hubs/agent-stdout` for streaming
+agent output in real time to connected clients.
+
+### Authentication
+
+The hub endpoint is protected by the same bearer-token middleware as the REST
+API. Pass the token as a request header on the WebSocket upgrade:
+
+```
+Authorization: Bearer <CODEYBOX_API_KEY>
+```
+
+### Hub methods (client → server)
+
+| Method | Arguments | Description |
+|--------|-----------|-------------|
+| `SubscribeAsync` | `workItemId: string` | Join the group for a work item. |
+| `UnsubscribeAsync` | `workItemId: string` | Leave the group for a work item. |
+
+### Hub events (server → client)
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `stdoutChunk` | `{ workItemId, phase, chunk }` | A batch of stdout. `phase` is `"work"`, `"merge"`, or the audit phase name. `chunk` is a pre-redacted UTF-8 string. Chunks are debounced: at most one push per 100 ms or 4 KB, whichever comes first. |
+| `streamComplete` | `{ workItemId }` | Fired when the pipeline exits (success or failure). No more chunks will follow for this work item. |
+
+### Late-joining clients
+
+Clients that connect after an agent has already started can fetch the recent tail
+from `GET /workitems/{id}/stdout-tail` and then subscribe to the hub to receive
+subsequent chunks.
+
+### Security
+
+Secret patterns are redacted **before** they reach the ring buffer or the hub:
+GitHub PATs (`gho_*`, `ghp_*`, `github_pat_*`), Anthropic keys (`sk-ant-*`),
+and Google API keys (`AIza…`) are replaced with `***`. Unknown secret formats
+are **not** redacted — treat agent stdout as potentially sensitive.
+
+The orchestrator never broadcasts the work item prompt over the hub.
 
 ## Work item record
 
