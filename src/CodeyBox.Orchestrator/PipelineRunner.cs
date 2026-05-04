@@ -683,9 +683,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 var auditorStarted = DateTimeOffset.UtcNow;
                 var auditorSw = Stopwatch.StartNew();
                 var auditorStartedAt = DateTimeOffset.UtcNow;
-                // Thread the resolved runner into the context so LlmReviewAuditor
-                // can use the cross-review agent instead of its baked-in default.
-                var auditorCtx = ctx with { AuditRunner = runner };
+                // Thread the resolved runner and live-stdout callback into the context so
+                // LlmReviewAuditor can use the cross-review agent and stream live output.
+                Action<string>? auditStdoutCallback = needsCreds && _stdoutBroadcaster is { } auditBroadcaster
+                    ? chunk => auditBroadcaster.BroadcastChunk(ctx.WorkItemId, "audit", chunk)
+                    : null;
+                var auditorCtx = ctx with { AuditRunner = runner, StdoutChunkCallback = auditStdoutCallback };
                 AuditResult result;
                 var auditorScope = await TimingScope.BeginAsync(
                     _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",

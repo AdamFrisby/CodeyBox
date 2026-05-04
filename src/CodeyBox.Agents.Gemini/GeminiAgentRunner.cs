@@ -52,7 +52,12 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null)
     {
-        var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, ct, stdoutChunkCallback);
+        // Strip ANSI from each chunk before forwarding so live stream clients
+        // receive clean text, not raw escape sequences.
+        Action<string>? strippingCallback = stdoutChunkCallback is null
+            ? null
+            : chunk => stdoutChunkCallback(Strip(chunk) ?? string.Empty);
+        var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, ct, strippingCallback);
         return result with
         {
             Stdout = Strip(result.Stdout),
