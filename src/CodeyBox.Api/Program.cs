@@ -258,9 +258,12 @@ static IReadOnlyList<ParsedTodModifier> BuildAndValidateTodModifiers(
     // Allowed day-code → DayOfWeek mapping (three-letter abbreviations).
     var dayMap = new Dictionary<string, DayOfWeek>(StringComparer.OrdinalIgnoreCase)
     {
-        ["Mon"] = DayOfWeek.Monday, ["Tue"] = DayOfWeek.Tuesday,
-        ["Wed"] = DayOfWeek.Wednesday, ["Thu"] = DayOfWeek.Thursday,
-        ["Fri"] = DayOfWeek.Friday, ["Sat"] = DayOfWeek.Saturday,
+        ["Mon"] = DayOfWeek.Monday,
+        ["Tue"] = DayOfWeek.Tuesday,
+        ["Wed"] = DayOfWeek.Wednesday,
+        ["Thu"] = DayOfWeek.Thursday,
+        ["Fri"] = DayOfWeek.Friday,
+        ["Sat"] = DayOfWeek.Saturday,
         ["Sun"] = DayOfWeek.Sunday,
     };
 
