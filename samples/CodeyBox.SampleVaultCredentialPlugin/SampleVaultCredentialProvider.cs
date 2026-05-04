@@ -49,8 +49,24 @@ public sealed class SampleVaultCredentialProvider : ICredentialProvider, IPlugin
     {
         // Read the vault file path from scoped config:
         //   CodeyBox:Plugins:sample.vault-creds:VaultFilePath
-        _vaultFilePath = context.ScopedConfig["VaultFilePath"]
+        var rawPath = context.ScopedConfig["VaultFilePath"]
             ?? Path.Combine(AppContext.BaseDirectory, "sample-vault.json");
+
+        // Canonicalize the path and confirm it stays within the base directory.
+        // Operators adapting this sample should keep this guard: if VaultFilePath is
+        // ever surfaced through a higher-level API, path-traversal prevention is
+        // required. Path.GetFullPath resolves ".." segments and symlinks.
+        var basePath = Path.GetFullPath(AppContext.BaseDirectory);
+        var fullPath = Path.GetFullPath(rawPath, AppContext.BaseDirectory);
+        if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            && !fullPath.Equals(basePath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"VaultFilePath '{rawPath}' resolves outside the plugin base directory '{basePath}'. " +
+                "Set VaultFilePath to a path within the plugin's base directory.");
+        }
+
+        _vaultFilePath = fullPath;
 
         context.Logger.LogInformation(
             "SampleVaultCredentialProvider initialized: vaultFilePath={Path}",
@@ -68,10 +84,21 @@ public sealed class SampleVaultCredentialProvider : ICredentialProvider, IPlugin
         {
             vault = await ReadVaultFileAsync(ct);
         }
-        catch (Exception ex)
+        catch (IOException ex)
         {
-            _host.Logger.LogWarning(ex,
-                "SampleVaultCredentialProvider: failed to read vault file at {Path}; falling through",
+            // Log only safe fields (path, error type) — never the exception message,
+            // which may contain file content.
+            _host.Logger.LogWarning(
+                "SampleVaultCredentialProvider: failed to read vault file {Path} ({Kind}); falling through",
+                _vaultFilePath, ex.GetType().Name);
+            return null;
+        }
+        catch (JsonException)
+        {
+            // JsonException.Message can contain a snippet of the offending JSON text,
+            // which may include a credential value. Log only the path and kind.
+            _host.Logger.LogWarning(
+                "SampleVaultCredentialProvider: vault file {Path} contains invalid JSON; falling through",
                 _vaultFilePath);
             return null;
         }

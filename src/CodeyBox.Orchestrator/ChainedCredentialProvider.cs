@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// The built-in-first and built-in-last providers are always included; only
 /// the plugin segment is filtered and reordered.</para>
 /// </summary>
-public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
+public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider, IDisposable
 {
     // Full chain: built-in-first + plugins (global order) + built-in-last.
     // Used by the global GetAsync(AgentKind, ct) path.
@@ -97,32 +97,18 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
     /// </summary>
     public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
     {
-        // Fast path + expired-entry detection in a single lock acquisition.
-        bool hasExpiredEntry;
+        // Fast path: serve from cache if present and not expired.
         lock (_cacheLock)
         {
-            if (_cache.TryGetValue(agent, out var cached))
-            {
-                if (cached.ExpiresAt > _utcNow())
-                    return cached.Credential;
-                // Entry exists but is expired — need stampede protection on refetch.
-                hasExpiredEntry = true;
-            }
-            else
-            {
-                hasExpiredEntry = false;
-            }
+            if (_cache.TryGetValue(agent, out var cached) && cached.ExpiresAt > _utcNow())
+                return cached.Credential;
         }
 
-        if (!hasExpiredEntry)
-        {
-            // No cached entry: non-expiring credential path. Sources are
-            // parallelism-safe (env-var lookup, OAuth file read), so concurrent
-            // callers do not need to be serialised.
-            return await WalkChainAsync(_providers, agent, _cache, ct);
-        }
-
-        // Expired cached entry: serialise concurrent refetches to prevent stampede.
+        // Serialise via fetch lock whether this is a cold-cache miss or an expired-entry
+        // refetch. Both paths risk stampede when vault plugins are installed: on cold start
+        // with N concurrent workers, N simultaneous vault calls would be issued before any
+        // credential is cached. Non-expiring sources (env-var, OAuth file) complete in
+        // microseconds and are unharmed by brief serialization.
         var fetchLock = GetOrCreateFetchLock(agent);
         await fetchLock.WaitAsync(ct);
         try
@@ -155,10 +141,16 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
         IReadOnlyList<string> credentialProviderPriority,
         CancellationToken ct = default)
     {
-        // Reject null bytes early: they are the intra-key separator and would
-        // allow two distinct priority lists to produce identical fingerprints.
+        // Reject null entries and null bytes early: null entries can arise when
+        // System.Text.Json deserializes ["CredentialProviderPriority": [null]]; null
+        // bytes are the intra-key separator and would allow two distinct priority
+        // lists to produce identical cache-key fingerprints.
         foreach (var id in credentialProviderPriority)
         {
+            if (id is null)
+                throw new ArgumentException(
+                    "Credential provider priority entry must not be null.",
+                    nameof(credentialProviderPriority));
             if (id.Contains('\0'))
                 throw new ArgumentException(
                     $"Credential provider priority entry '{id}' contains an invalid null character.",
@@ -172,20 +164,11 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
         var priorityKey = string.Join("\0", credentialProviderPriority);
         var cacheKey = (agent, priorityKey);
 
-        // Fast path + expired-entry detection in a single lock acquisition.
-        bool hasExpiredEntry;
+        // Fast path: serve from cache if present and not expired.
         lock (_cacheLock)
         {
-            if (_priorityCache.TryGetValue(cacheKey, out var cached))
-            {
-                if (cached.ExpiresAt > _utcNow())
-                    return cached.Credential;
-                hasExpiredEntry = true;
-            }
-            else
-            {
-                hasExpiredEntry = false;
-            }
+            if (_priorityCache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAt > _utcNow())
+                return cached.Credential;
         }
 
         // Build the per-project chain: built-in-first + filtered/ordered plugins + built-in-last.
@@ -200,14 +183,8 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
             .Concat(_builtInLast)
             .ToList();
 
-        if (!hasExpiredEntry)
-        {
-            // No cached entry: non-expiring credential path. Sources are
-            // parallelism-safe, so concurrent callers do not need to be serialised.
-            return await WalkPriorityChainAsync(chain, agent, cacheKey, ct);
-        }
-
-        // Expired cached entry: serialise concurrent refetches to prevent stampede.
+        // Serialise via fetch lock on both cold-cache and expired-entry paths (same
+        // rationale as the global chain: vault cold-start stampede prevention).
         var fetchLock = GetOrCreatePriorityFetchLock(cacheKey);
         await fetchLock.WaitAsync(ct);
         try
@@ -319,5 +296,16 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider
     {
         lock (_cacheLock)
             return _priorityFetchLocks.TryGetValue(key, out var s) ? s : (_priorityFetchLocks[key] = new SemaphoreSlim(1, 1));
+    }
+
+    public void Dispose()
+    {
+        lock (_cacheLock)
+        {
+            foreach (var s in _fetchLocks.Values) s.Dispose();
+            foreach (var s in _priorityFetchLocks.Values) s.Dispose();
+            _fetchLocks.Clear();
+            _priorityFetchLocks.Clear();
+        }
     }
 }

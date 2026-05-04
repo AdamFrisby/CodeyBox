@@ -653,7 +653,11 @@ public sealed class PipelineRunner : IPipelineRunner
             // Tool-only auditors get the project's "audit-tool" profile
             // (typically isolated/no-egress); LLM-driven auditors get the
             // "audit-agent" profile (typically same as the work profile).
-            AgentCredential? credential = needsCreds ? await _credentials.GetAsync(groupRunner.Kind, ct) : null;
+            AgentCredential? credential = needsCreds
+                ? (_credentials is IProjectAwareCredentialProvider pac1
+                    ? await pac1.GetAsync(groupRunner.Kind, project.CredentialProviderPriority, ct)
+                    : await _credentials.GetAsync(groupRunner.Kind, ct))
+                : null;
             var access = _gitHost.GetSandboxAccess(repoId);
             var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
@@ -818,7 +822,9 @@ public sealed class PipelineRunner : IPipelineRunner
 
         // Credential check: if the audit agent has no credentials configured,
         // fall back gracefully — operators may configure agents incrementally.
-        var cred = await _credentials.GetAsync(kind.Value, ct);
+        var cred = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(kind.Value, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(kind.Value, ct);
         if (cred is null)
         {
             _log.LogWarning(

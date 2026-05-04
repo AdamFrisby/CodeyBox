@@ -266,6 +266,12 @@ builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 
+// Plugin discovery result captured before builder.Build() so the credential
+// provider factory below can reference the list directly without any async
+// blocking. Populated by AddCodeyBoxPlugins (called in the plugin-foundation
+// section near the end of service registration).
+IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
+
 // --- Credentials -------------------------------------------------------------
 // Each agent's API key has a per-agent host env var that maps to the
 // canonical sandbox env var the agent CLI reads. Operators add new agents
@@ -315,16 +321,15 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
             sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
     }
 
-    // Enumerate plugin-registered ICredentialProvider types. Each plugin type
-    // is registered in DI under its concrete type by PluginLoader.RegisterPlugins;
-    // we resolve by concrete type (not by ICredentialProvider) to avoid
-    // resolving the ChainedCredentialProvider itself and causing infinite recursion.
+    // Enumerate plugin-registered ICredentialProvider types using the list captured
+    // from AddCodeyBoxPlugins (called before builder.Build()). Each plugin type is
+    // registered in DI under its concrete type by PluginLoader.RegisterPlugins;
+    // we resolve by concrete type (not by ICredentialProvider) to avoid resolving
+    // the ChainedCredentialProvider itself and causing infinite recursion.
     // Plugin IDs are stored alongside providers so per-project
     // CredentialProviderPriority can filter and reorder them at pickup time.
-    var pluginLoader = sp.GetRequiredService<IPluginLoader>();
-    var loadedPlugins = pluginLoader.DiscoverAndLoadAsync(CancellationToken.None).GetAwaiter().GetResult();
     var credentialProviderType = typeof(ICredentialProvider);
-    foreach (var plugin in loadedPlugins)
+    foreach (var plugin in preDiscoveredPlugins ?? [])
     {
         foreach (var type in plugin.RegisteredTypes)
         {
@@ -722,7 +727,7 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
 // their Core interfaces before the container is frozen, then runs
 // IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
 // See docs/plugins.md for author guidance, allowlist config, and threat model.
-builder.Services.AddCodeyBoxPlugins(builder.Configuration);
+preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
 
 var app = builder.Build();
 

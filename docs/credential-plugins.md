@@ -241,6 +241,32 @@ key prefix.
 
 ---
 
+## Security hardening: allowlist for credential plugins
+
+Because `ICredentialProvider` plugins can supply credentials to every agent
+sandbox, the impact of a compromised or malicious plugin is higher than for
+other plugin types.
+
+> **Do not use a wildcard allowlist (`Allowlist: ["*"]`) in production when
+> credential plugins are installed.** A wildcard allowlist permits any DLL
+> placed in a configured `AssemblyPaths` or `PackageDirectories` directory to
+> supply arbitrary credentials to agents. Instead, enumerate specific plugin IDs:
+
+```json
+{
+  "CodeyBox": {
+    "Plugins": {
+      "Allowlist": ["myorg.vault-creds", "myorg.aws-ssm"]
+    }
+  }
+}
+```
+
+Use the wildcard only in isolated local development environments where you
+control the plugin directory exclusively.
+
+---
+
 ## Credential redaction
 
 The `SensitiveDataRedactionEnricher` intercepts structured Serilog log-event
@@ -255,6 +281,11 @@ that are accidentally emitted as log properties. This enricher:
 
 Plugin authors must still follow the rule: **do not log raw secrets**. The
 enricher is a defence-in-depth backstop, not the primary control.
+
+When catching exceptions from deserialization (e.g. `JsonException`), log only
+safe fields — the error type and the file path — never the `Exception.Message`,
+which may contain a snippet of the offending text and inadvertently expose a
+credential value.
 
 ---
 
