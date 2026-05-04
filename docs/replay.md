@@ -53,8 +53,8 @@ replay-of link.
 ### Replays of replays
 
 Allowed. The chain `source → replayA → replayB` is valid. The comparison
-endpoint treats the *requested* item as the source and returns all items that
-directly replay it.
+endpoint treats the *requested* item as the source and follows `replay_of`
+recursively — `GET /workitems/source/replays` returns both replayA and replayB.
 
 ### Orphan-on-cancel
 
@@ -102,7 +102,8 @@ The new item starts in `Queued` state and enters the normal pipeline.
 
 ### `GET /workitems/{id}/replays`
 
-Returns the source work item and all items that directly replay it.
+Returns the source work item and all its replay descendants, recursively. For
+a chain `source → replayA → replayB`, this returns both replayA and replayB.
 
 **Response:**
 

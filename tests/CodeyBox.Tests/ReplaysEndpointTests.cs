@@ -92,10 +92,52 @@ public sealed class ReplaysEndpointTests : IDisposable
         Assert.Equal(2, body!.Replays.Count);
         // Both replays link back to the source
         Assert.All(body.Replays, r => Assert.Equal(source.Id.ToString(), r.ReplayOfWorkItemId));
-        // IDs are the two created replays
+        // Verify chronological order: replay1 (created first) must appear before replay2
+        Assert.Equal(replay1!.Id, body.Replays[0].Id);
+        Assert.Equal(replay2!.Id, body.Replays[1].Id);
+    }
+
+    [Fact]
+    public async Task GetReplays_ReplayOfReplay_ReturnsBothLevelsRecursively()
+    {
+        // source → replayA → replayB: GET /source/replays must surface both.
+        var source = DoneItem();
+        await _factory.Store.CreateAsync(source);
+
+        var replayA = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = source.ProjectId,
+            Title = "replay-a",
+            Prompt = source.Prompt,
+            Agent = AgentKind.Codex,
+            State = WorkItemState.Done,
+            ReplayOfWorkItemId = source.Id,
+        };
+        await _factory.Store.CreateAsync(replayA);
+
+        var replayB = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = source.ProjectId,
+            Title = "replay-b",
+            Prompt = source.Prompt,
+            Agent = AgentKind.Gemini,
+            State = WorkItemState.Queued,
+            ReplayOfWorkItemId = replayA.Id,
+        };
+        await _factory.Store.CreateAsync(replayB);
+
+        var resp = await _client.GetAsync($"/workitems/{source.Id}/replays");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var body = await resp.Content.ReadFromJsonAsync<ReplaysResponse>();
+        Assert.Equal(source.Id.ToString(), body!.Source.Id);
+        Assert.Equal(2, body.Replays.Count);
+
         var replayIds = body.Replays.Select(r => r.Id).ToHashSet();
-        Assert.Contains(replay1!.Id, replayIds);
-        Assert.Contains(replay2!.Id, replayIds);
+        Assert.Contains(replayA.Id.ToString(), replayIds);
+        Assert.Contains(replayB.Id.ToString(), replayIds);
     }
 
     [Fact]

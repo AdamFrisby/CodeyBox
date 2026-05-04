@@ -421,6 +421,12 @@ internal static class WorkItemEndpoints
             agentOverride = null; // class routing takes precedence
         }
 
+        if (!string.IsNullOrWhiteSpace(body?.ModelId))
+            return Results.BadRequest(new
+            {
+                error = "modelId is resolved at pickup from AgentMembership and cannot be set directly on a replay; use agentClassId to route via a class that specifies the target model"
+            });
+
         // Resolve work branch: explicit > auto-generated.
         var newId = WorkItemId.New();
         string workBranch;
@@ -485,40 +491,72 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
-    /// Returns the source work item and all its replays in chronological order.
-    /// When the given ID is itself a replay, that item becomes the "source" in the
-    /// response (its own replays are the "replays" list).
+    /// Returns the source work item and all its replays (recursively, depth-first BFS)
+    /// in chronological order at each level. When the given ID is itself a replay, that
+    /// item becomes the "source" in the response and its own descendants are "replays".
     /// </summary>
     private static async Task<IResult> GetReplaysAsync(
         string id,
         IWorkItemStore store,
         IProjectRepository projects,
+        IAuditReportStore reportStore,
         CancellationToken ct)
     {
         var (source, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        // Collect dep state snapshots for the source.
+        // Load all items once for dep-state map, externalId lookup, and recursive traversal.
         var allItems = new List<WorkItem>();
         await foreach (var i in store.ListAsync(ct)) allItems.Add(i);
         var statesById = WorkItemDependencies.BuildStateMap(allItems);
         var externalIdsById = allItems.ToDictionary(i => i.Id, i => i.ExternalId);
         var allProjects = (await projects.ListAsync(ct)).ToDictionary(p => p.Id.Value);
 
-        WorkItemDto BuildDto(WorkItem item)
+        // Group all replay children by their source ID for O(1) lookup during BFS.
+        var replaysBySource = allItems
+            .Where(i => i.ReplayOfWorkItemId.HasValue)
+            .GroupBy(i => i.ReplayOfWorkItemId!.Value)
+            .ToDictionary(g => g.Key, g => g.OrderBy(x => x.CreatedAt).ToList());
+
+        async Task<WorkItemDto> BuildDtoWithAuditAsync(WorkItem item)
         {
             allProjects.TryGetValue(item.ProjectId.Value, out var proj);
             var depExtIds = item.DependsOn
                 .Where(d => externalIdsById.ContainsKey(d))
                 .ToDictionary(d => d, d => externalIdsById[d]);
-            return ToDto(item, proj, statesById, depExtIds);
+            var dto = ToDto(item, proj, statesById, depExtIds);
+
+            var reports = await reportStore.GetByWorkItemAsync(item.Id.ToString(), ct);
+            if (reports.Count > 0)
+            {
+                var maxIter = reports.Max(r => r.Iteration);
+                var iterCount = reports.Select(r => r.Iteration).Distinct().Count();
+                var lastBlockingCount = reports
+                    .Where(r => r.Iteration == maxIter)
+                    .SelectMany(r => r.Findings)
+                    .Count(f => string.Equals(f.Severity, "Error", StringComparison.OrdinalIgnoreCase));
+                dto = dto with { AuditIterations = iterCount, FinalAuditBlockingFindings = lastBlockingCount };
+            }
+            return dto;
         }
 
+        // BFS to collect all descendants of source in chronological order.
         var replays = new List<WorkItemDto>();
-        await foreach (var r in store.ListByReplaySourceAsync(source!.Id, ct))
-            replays.Add(BuildDto(r));
+        var toVisit = new Queue<WorkItemId>();
+        toVisit.Enqueue(source!.Id);
 
-        return Results.Ok(new WorkItemReplaysResponse(BuildDto(source), replays));
+        while (toVisit.Count > 0)
+        {
+            var current = toVisit.Dequeue();
+            if (!replaysBySource.TryGetValue(current, out var children)) continue;
+            foreach (var child in children)
+            {
+                replays.Add(await BuildDtoWithAuditAsync(child));
+                toVisit.Enqueue(child.Id);
+            }
+        }
+
+        return Results.Ok(new WorkItemReplaysResponse(await BuildDtoWithAuditAsync(source), replays));
     }
 
     private static async Task<IResult> CancelAsync(
@@ -890,7 +928,8 @@ internal static class WorkItemEndpoints
             depsSatisfied,
             depExtIds,
             item.QueuePosition,
-            item.ReplayOfWorkItemId?.ToString());
+            item.ReplayOfWorkItemId?.ToString(),
+            item.AgentClassId);
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -1013,7 +1052,10 @@ public sealed record WorkItemDto(
     bool DependsOnSatisfied,
     IReadOnlyDictionary<string, string?> DependsOnExternalIds,
     long QueuePosition = 0,
-    string? ReplayOfWorkItemId = null);
+    string? ReplayOfWorkItemId = null,
+    string? AgentClassId = null,
+    int? AuditIterations = null,
+    int? FinalAuditBlockingFindings = null);
 
 public sealed record ProjectDto(
     string Id,

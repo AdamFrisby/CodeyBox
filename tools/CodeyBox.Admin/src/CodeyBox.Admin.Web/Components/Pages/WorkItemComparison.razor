@@ -21,7 +21,7 @@ else
     <h1>Comparison: @_data.Source.Title</h1>
     <p><a href="/work-items/@_data.Source.Id">← Back to source</a></p>
 
-    <div class="comparison-grid" style="grid-template-columns: 120px repeat(@_columns.Count, 1fr);">
+    <div class="comparison-grid" style="grid-template-columns: 160px repeat(@_columns.Count, 1fr);">
         <div class="comparison-header"></div>
         @foreach (var col in _columns)
         {
@@ -44,6 +44,12 @@ else
             <div class="comparison-cell">@col.Agent</div>
         }
 
+        <div class="comparison-row-label">Model / class</div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-cell">@(col.AgentClassId ?? "—")</div>
+        }
+
         <div class="comparison-row-label">Status</div>
         @foreach (var col in _columns)
         {
@@ -54,6 +60,27 @@ else
         @foreach (var col in _columns)
         {
             <div class="comparison-cell">@(col.WorkBranch ?? "(auto)")</div>
+        }
+
+        <div class="comparison-row-label">PR URL</div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-cell">
+                @if (col.ExternalId is not null)
+                {
+                    <a href="@col.ExternalId" target="_blank">@col.ExternalId</a>
+                }
+                else
+                {
+                    <span>—</span>
+                }
+            </div>
+        }
+
+        <div class="comparison-row-label">Merge SHA</div>
+        @foreach (var col in _columns)
+        {
+            <div class="comparison-cell">—</div>
         }
 
         <div class="comparison-row-label">Created</div>
@@ -68,7 +95,7 @@ else
             <div class="comparison-cell">@col.Age</div>
         }
 
-        @if (_costs.Count > 0 || _timings.Count > 0)
+        @if (_timings.Count > 0)
         {
             <div class="comparison-row-label">Wall-clock</div>
             @foreach (var col in _columns)
@@ -77,13 +104,31 @@ else
                     @(_timings.TryGetValue(col.Id, out var ms) ? FormatDuration(ms) : "—")
                 </div>
             }
+        }
 
+        @if (_costs.Count > 0)
+        {
             <div class="comparison-row-label">Token cost</div>
             @foreach (var col in _columns)
             {
                 <div class="comparison-cell">
                     @(_costs.TryGetValue(col.Id, out var usd) ? $"${usd:F4}" : "—")
                 </div>
+            }
+        }
+
+        @if (_columns.Any(c => c.AuditIterations.HasValue))
+        {
+            <div class="comparison-row-label">Audit iterations</div>
+            @foreach (var col in _columns)
+            {
+                <div class="comparison-cell">@(col.AuditIterations?.ToString() ?? "—")</div>
+            }
+
+            <div class="comparison-row-label">Blocking findings</div>
+            @foreach (var col in _columns)
+            {
+                <div class="comparison-cell">@(col.FinalAuditBlockingFindings?.ToString() ?? "—")</div>
             }
         }
     </div>
