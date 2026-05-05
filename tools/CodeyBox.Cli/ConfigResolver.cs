@@ -30,8 +30,25 @@ internal static class ConfigResolver
         if (!string.IsNullOrEmpty(flagUrl)) result.ApiBaseUrl = flagUrl;
         if (!string.IsNullOrEmpty(flagKey)) result.ApiKey = flagKey;
 
+        // Warn when --api-key flag is used: the value appears in the OS process list.
+        if (!string.IsNullOrEmpty(flagKey) && (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()))
+            Console.Error.WriteLine("Warning: --api-key is visible in the OS process list. Prefer CODEYBOX_CLI_API_KEY env var in scripts.");
+
+        // Warn when a non-loopback HTTP URL is configured: bearer token would be transmitted in cleartext.
+        if (Uri.TryCreate(result.ApiBaseUrl, UriKind.Absolute, out var apiUri)
+            && apiUri.Scheme == "http"
+            && !IsLoopbackHost(apiUri.Host))
+            Console.Error.WriteLine(
+                $"Warning: API base URL '{result.ApiBaseUrl}' uses plaintext HTTP on a non-loopback address; the bearer token will be sent unencrypted.");
+
         return result;
     }
+
+    private static bool IsLoopbackHost(string host) =>
+        host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]";
 
     internal static CliConfig? LoadConfigFile()
     {
@@ -42,8 +59,9 @@ internal static class ConfigResolver
             var json = File.ReadAllText(path);
             return JsonSerializer.Deserialize(json, CliJsonContext.Default.CliConfig);
         }
-        catch
+        catch (Exception e) when (e is JsonException or IOException)
         {
+            Console.Error.WriteLine($"Warning: config file exists but could not be loaded ({path}): {e.Message}");
             return null;
         }
     }
@@ -59,9 +77,12 @@ internal static class ConfigResolver
 
         var path = ConfigFilePath;
         var json = JsonSerializer.Serialize(config, CliJsonContext.Default.CliConfig);
-        File.WriteAllText(path, json);
-        // Restrict file to owner read/write only on Unix.
+        // Write to a temp file and set permissions before renaming into place, to avoid a
+        // window where the config file exists but is world-readable (TOCTOU, CWE-732).
+        var tmpPath = path + ".tmp";
+        File.WriteAllText(tmpPath, json);
         if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            File.SetUnixFileMode(tmpPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        File.Move(tmpPath, path, overwrite: true);
     }
 }

@@ -8,8 +8,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <!-- ILC warnings from System.CommandLine beta4 reflection usage are expected -->
-    <IlcTreatWarningsAsErrors>false</IlcTreatWarningsAsErrors>
+    <IlcTreatWarningsAsErrors>true</IlcTreatWarningsAsErrors>
     <!-- No project references to src/CodeyBox.* — coupling is REST+JSON only. -->
   </PropertyGroup>
 
@@ -19,6 +18,14 @@
 
   <ItemGroup>
     <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Suppress ILC reflection-analysis warnings emitted by System.CommandLine beta4 internals.
+         Tracked: remove once an AOT-safe stable release is available. -->
+    <IlcArg Include="--nowarn:IL2026" />
+    <IlcArg Include="--nowarn:IL2072" />
+    <IlcArg Include="--nowarn:IL2075" />
   </ItemGroup>
 
 </Project>

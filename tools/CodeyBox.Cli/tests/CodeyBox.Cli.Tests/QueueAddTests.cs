@@ -121,6 +121,43 @@ public sealed class QueueAddTests
     }
 
     [Fact]
+    public async Task Add_PromptFileFromFilePath_ReadsFile()
+    {
+        HttpRequestMessage? captured = null;
+        var factory = MakeFactory(req =>
+        {
+            captured = req;
+            return SampleData.CreatedWorkItemResponse();
+        });
+
+        var tmpFile = Path.GetTempFileName();
+        try
+        {
+            await File.WriteAllTextAsync(tmpFile, "Prompt from file", System.Text.Encoding.UTF8);
+            using var output = new TestOutput();
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+            try
+            {
+                var code = await CliApp.InvokeAsync(
+                    ["queue", "add", "--project", "foo", "--title", "T", "--prompt-file", tmpFile],
+                    factory);
+
+                Assert.Equal(0, code);
+                var body = await captured!.Content!.ReadFromJsonAsync(CliJsonContext.Default.CreateWorkItemRequest);
+                Assert.Equal("Prompt from file", body!.Prompt);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+            }
+        }
+        finally
+        {
+            File.Delete(tmpFile);
+        }
+    }
+
+    [Fact]
     public async Task Add_Quiet_PrintsOnlyId()
     {
         var item = SampleData.WorkItem();

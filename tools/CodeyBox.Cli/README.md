@@ -61,7 +61,7 @@ codeybox queue add --project myapp --title "Add healthz endpoint" --prompt "Add 
 codeybox queue add --project myapp --title "Refactor logging" --prompt-file ./prompt.md
 
 # Prompt from stdin (pipe-friendly)
-echo "Add a healthz endpoint" | codeybox queue add --project myapp --title "healthz"  # --prompt-file -
+echo "Add a healthz endpoint" | codeybox queue add --project myapp --title "healthz" --prompt-file -
 
 # All options
 codeybox queue add \

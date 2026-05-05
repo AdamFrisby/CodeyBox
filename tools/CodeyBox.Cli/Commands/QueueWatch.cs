@@ -16,7 +16,7 @@ internal static class QueueWatch
         var cmd = new Command("watch", "Poll a work item and print each state transition");
 
         var idArg = new Argument<string>("id", "Work item ID");
-        var streamOpt = new Option<bool>("--stream", "Attempt to stream agent stdout (falls back to polling)");
+        var streamOpt = new Option<bool>("--stream", "(reserved) streaming not yet implemented; state polling is always used");
 
         cmd.AddArgument(idArg);
         cmd.AddOption(streamOpt);

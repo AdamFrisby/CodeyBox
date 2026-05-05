@@ -65,18 +65,26 @@ internal static class QueueAdd
             string? prompt;
             if (promptFile is not null)
             {
+                string? cappedText;
                 if (promptFile == "-")
-                    prompt = await Console.In.ReadToEndAsync(ct);
-                else
-                    prompt = await File.ReadAllTextAsync(promptFile, ct);
-
-                if (prompt.Length > MaxPromptLength)
                 {
-                    await Console.Error.WriteLineAsync(
-                        $"Error: prompt exceeds 10 MB limit ({prompt.Length:N0} characters). Use a smaller file.");
+                    cappedText = await ReadCappedAsync(Console.In, MaxPromptLength, ct);
+                }
+                else
+                {
+                    using var fs = File.OpenRead(promptFile);
+                    using var sr = new StreamReader(fs, System.Text.Encoding.UTF8);
+                    cappedText = await ReadCappedAsync(sr, MaxPromptLength, ct);
+                }
+
+                if (cappedText is null)
+                {
+                    await Console.Error.WriteLineAsync("Error: prompt exceeds 10 MB limit. Use a smaller file.");
                     ctx.ExitCode = 1;
                     return;
                 }
+
+                prompt = cappedText;
             }
             else if (promptText is not null)
             {
@@ -145,5 +153,20 @@ internal static class QueueAdd
         });
 
         return cmd;
+    }
+
+    // Reads up to maxLength+1 characters from reader; returns null if the limit is exceeded,
+    // so the guard fires before the full content is materialised in memory.
+    private static async Task<string?> ReadCappedAsync(TextReader reader, int maxLength, CancellationToken ct)
+    {
+        var sb = new System.Text.StringBuilder();
+        var buf = new char[4096];
+        int read;
+        while ((read = await reader.ReadAsync(buf.AsMemory(), ct)) > 0)
+        {
+            sb.Append(buf, 0, read);
+            if (sb.Length > maxLength) return null;
+        }
+        return sb.ToString();
     }
 }
