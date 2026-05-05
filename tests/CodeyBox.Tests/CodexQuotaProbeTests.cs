@@ -16,6 +16,7 @@ public sealed class CodexQuotaProbeTests
     {
         Agent = AgentKind.Codex,
         Billing = AgentBilling.Subscription,
+        QualityScore = 100,
     };
 
     // Default subscription and usage bodies that produce a valid snapshot.

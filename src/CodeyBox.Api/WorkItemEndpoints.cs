@@ -17,6 +17,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/dependents", GetDependentsAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
+        group.MapPost("/{id}/uncancel", UncancelAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -202,6 +203,8 @@ internal static class WorkItemEndpoints
             item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
         if (req.MergeTimeoutMinutes is { } m)
             item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
+        if (req.MinModelScore is { } minScore)
+            item = item with { MinModelScore = Math.Clamp(minScore, 0, 200) };
 
         try { await store.CreateAsync(item, ct); }
         catch (WorkItemExternalIdConflictException)
@@ -334,7 +337,8 @@ internal static class WorkItemEndpoints
 
         // Only resume from terminal-failed states. Done items have nothing
         // to retry; non-terminal states would race the pipeline.
-        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled))
+        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled
+            or WorkItemState.AbandonedAfterRecoveryAttempts))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
@@ -363,7 +367,8 @@ internal static class WorkItemEndpoints
                 });
         }
 
-        var resumed = item.With(resumeState.Value, error: null);
+        // Reset RecoveryAttempts so an abandoned item is not immediately re-abandoned on next restart.
+        var resumed = item.With(resumeState.Value, error: null) with { RecoveryAttempts = 0 };
         await store.UpdateAsync(resumed, ct);
         AuditLog.WorkItemRetried(workItemId, from);
         await queue.EnqueueAsync(resumed.Id, ct);
@@ -384,13 +389,15 @@ internal static class WorkItemEndpoints
         var workItemId = item!.Id;
 
         if (item.State is WorkItemState.Done or WorkItemState.Failed
-            or WorkItemState.Cancelled or WorkItemState.AuditFailed)
+            or WorkItemState.Cancelled or WorkItemState.AuditFailed
+            or WorkItemState.AbandonedAfterRecoveryAttempts)
             return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
 
         var wasActive = cancellations.Cancel(workItemId);
         if (!wasActive)
         {
-            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API");
+            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API",
+                WorkItemCancellationReason.OperatorRequested);
             await store.UpdateAsync(cancelled, ct);
             AuditLog.WorkItemCancelled(workItemId);
             var project = await projects.GetAsync(item.ProjectId, ct);
@@ -431,11 +438,56 @@ internal static class WorkItemEndpoints
             // Queued in the DB. If a worker raced and transitioned it to Working between
             // the ListAsync snapshot and now, the WHERE guard returns 0 rows and we skip
             // the audit log — no spurious WorkItemDependentCancelled for in-flight items.
-            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled");
+            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled",
+                WorkItemCancellationReason.ParentCascaded);
             var updated = await store.TryUpdateIfStateAsync(cancelled, WorkItemState.Queued, ct);
             if (updated)
                 AuditLog.WorkItemDependentCancelled(target.Id, cancelledId);
         }
+    }
+
+    /// <summary>
+    /// Resets a Cancelled work item back to Queued so it will be retried.
+    ///
+    /// Returns 409 Conflict when:
+    ///   - The item is not in Cancelled state.
+    ///   - The cancellation was operator-requested (use POST /workitems with the
+    ///     same body to re-create; respecting an explicit operator cancel is intentional).
+    ///
+    /// Succeeds for:
+    ///   - Items with cancellation_reason = ParentCascaded (parent was since retried).
+    ///   - Legacy items with cancellation_reason IS NULL (ambiguous; likely a host-shutdown
+    ///     victim from before the no-shutdown-cancel fix was deployed).
+    /// </summary>
+    private static async Task<IResult> UncancelAsync(
+        string id,
+        IWorkItemStore store,
+        ITaskQueue queue,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State != WorkItemState.Cancelled)
+            return Results.Conflict(new
+            {
+                error = $"cannot uncancel item in state {item.State}; only Cancelled items can be uncancelled",
+            });
+
+        if (item.CancellationReason == WorkItemCancellationReason.OperatorRequested)
+            return Results.Conflict(new
+            {
+                error = "cannot uncancel an operator-requested cancellation; use POST /workitems with the same body to re-create the work item",
+            });
+
+        var requeued = item.With(WorkItemState.Queued) with { RecoveryAttempts = 0 };
+        var updated = await store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
+        if (!updated)
+            return Results.Conflict(new { error = "concurrent uncancel request already processed this item" });
+        await queue.EnqueueAsync(requeued.Id, ct);
+        AuditLog.WorkItemRetried(requeued.Id, "uncancel");
+
+        return Results.Ok(new { id = requeued.Id.ToString(), state = requeued.State.ToString() });
     }
 
     /// <summary>
@@ -734,7 +786,8 @@ internal static class WorkItemEndpoints
             item.DependsOn.Select(d => d.ToString()).ToList(),
             depsSatisfied,
             depExtIds,
-            item.QueuePosition);
+            item.QueuePosition,
+            item.MinModelScore);
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -763,7 +816,8 @@ internal static class WorkItemEndpoints
 
         var isTerminal = item.State is
             WorkItemState.Done or WorkItemState.Failed or
-            WorkItemState.Cancelled or WorkItemState.AuditFailed;
+            WorkItemState.Cancelled or WorkItemState.AuditFailed or
+            WorkItemState.AbandonedAfterRecoveryAttempts;
 
         var entries = await timeline.GetTimelineAsync(workItemId.ToString(), isTerminal, item.CreatedAt, ct);
 
@@ -823,7 +877,8 @@ public sealed record CreateWorkItemRequest(
     int? WorkTimeoutMinutes,
     int? MergeTimeoutMinutes,
     string? ExternalId = null,
-    string[]? DependsOn = null);
+    string[]? DependsOn = null,
+    int? MinModelScore = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -856,7 +911,8 @@ public sealed record WorkItemDto(
     IReadOnlyList<string> DependsOn,
     bool DependsOnSatisfied,
     IReadOnlyDictionary<string, string?> DependsOnExternalIds,
-    long QueuePosition = 0);
+    long QueuePosition = 0,
+    int MinModelScore = 95);
 
 public sealed record ProjectDto(
     string Id,

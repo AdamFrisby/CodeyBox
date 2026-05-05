@@ -19,4 +19,15 @@ public interface ICredentialProvider
 public sealed record AgentCredential(
     AgentKind Agent,
     IReadOnlyDictionary<string, string> EnvironmentVariables,
-    IReadOnlyDictionary<string, string> Files);
+    IReadOnlyDictionary<string, string> Files)
+{
+    /// <summary>
+    /// Optional expiry for time-bound credentials issued by vault-style plugins.
+    /// When set, the orchestrator caches the credential up to this instant and
+    /// re-fetches afterward. When null (the default for all built-in providers)
+    /// the credential is never cached — every pickup re-reads the underlying
+    /// source (e.g. the OAuth JSON file) so live rotations propagate without
+    /// an orchestrator restart.
+    /// </summary>
+    public DateTimeOffset? ExpiresAt { get; init; }
+}

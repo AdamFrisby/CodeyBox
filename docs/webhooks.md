@@ -30,6 +30,9 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
+| `sandbox.leak_detected` | A leaked `codeybox-*` Multipass VM was detected (see [Details](#sandbox_leak-details)) |
+| `sandbox.leak_disposed` | A leaked sandbox was successfully auto-disposed |
+| `sandbox.leak_dispose_failed` | Auto-disposal of a leaked sandbox failed |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -242,6 +245,33 @@ populated with the affected item and its project.
 at **work-item pickup** (a subsequent `work_item.failed` event also fires and
 carries the work-item context). Subscribe to `agent.smoke_failed` to alert on
 credential problems independently of whether any work items were affected.
+
+---
+
+### `sandbox_leak` details
+
+When `event` is `sandbox.leak_detected`, `sandbox.leak_disposed`, or
+`sandbox.leak_dispose_failed`, the `details` field carries the sandbox's
+diagnostic information. `workItem` and `project` are always `null` — leaked
+sandboxes are not associated with a specific work item.
+
+```json
+{
+  "details": {
+    "name": "codeybox-a1b2c3d4e5f6",
+    "ageMinutes": 127.3,
+    "diskMb": null
+  }
+}
+```
+
+| Field | Type | Present on | Description |
+|---|---|---|---|
+| `name` | string | all | VM name matching the `codeybox-*` prefix |
+| `ageMinutes` | number | all | Age of the sandbox in minutes at detection time |
+| `diskMb` | number\|null | all | Disk usage in MiB, if available; null otherwise |
+| `disposedAt` | ISO-8601 | `sandbox.leak_disposed` | Timestamp when the sandbox was successfully disposed |
+| `error` | string | `sandbox.leak_dispose_failed` | Human-readable failure reason (e.g. `"timeout"` or multipass error) |
 
 ---
 
