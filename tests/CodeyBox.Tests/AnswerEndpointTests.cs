@@ -280,6 +280,32 @@ public sealed class AnswerEndpointTests : IDisposable
 
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
+
+    [Fact]
+    public async Task AnswerQuestion_OversizedAnswer_Returns400()
+    {
+        var item = await CreateWorkItemAsync();
+        await CreateQuestionAsync(item, "q-001");
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/answer",
+            new { questionId = "q-001", answer = new string('x', 4001) });
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task DismissQuestion_OversizedReason_Returns400()
+    {
+        var item = await CreateWorkItemAsync();
+        await CreateQuestionAsync(item, "q-001");
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/dismiss-question",
+            new { questionId = "q-001", reason = new string('x', 501) });
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
 }
 
 internal sealed class AnswerEndpointFactory : WebApplicationFactory<Program>

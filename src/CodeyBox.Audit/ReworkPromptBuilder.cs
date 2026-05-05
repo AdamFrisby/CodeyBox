@@ -15,7 +15,8 @@ public static class ReworkPromptBuilder
         IReadOnlyList<AuditFinding> findings,
         int iteration,
         int maxIterations,
-        IReadOnlyList<WorkItemQuestion>? answeredQuestions = null)
+        IReadOnlyList<WorkItemQuestion>? answeredQuestions = null,
+        bool allowAgentQuestions = false)
     {
         var sb = new StringBuilder();
         sb.AppendLine("## Rework requested");
@@ -30,6 +31,16 @@ public static class ReworkPromptBuilder
         sb.AppendLine("    " + CodeyBoxTrailers.CoAuthoredBy);
         sb.AppendLine();
 
+        if (allowAgentQuestions)
+        {
+            sb.AppendLine("You may still emit `<codeybox-question>` blocks if you hit genuine ambiguity:");
+            sb.AppendLine();
+            sb.AppendLine("    <codeybox-question id=\"q-001\">Question text here. State the decision and your default if no answer comes.</codeybox-question>");
+            sb.AppendLine();
+            sb.AppendLine("Then **continue working with your default**. Don't block. The id must be alphanumeric with hyphens/underscores only. A maximum of 10 questions per work item is enforced.");
+            sb.AppendLine();
+        }
+
         // Inject operator answers so the agent can apply them.
         var answered = answeredQuestions?.Where(q => q.State == "answered").ToList();
         if (answered is { Count: > 0 })
@@ -40,7 +51,12 @@ public static class ReworkPromptBuilder
             sb.AppendLine();
             foreach (var q in answered)
             {
-                sb.Append("- **").Append(q.QuestionId).Append("**: ").AppendLine(q.QuestionText);
+                sb.Append("- **").Append(q.QuestionId).AppendLine("**");
+                sb.AppendLine("  Question:");
+                sb.AppendLine("  ```");
+                foreach (var line in (q.QuestionText ?? string.Empty).Split('\n'))
+                    sb.Append("  ").AppendLine(line.TrimEnd('\r'));
+                sb.AppendLine("  ```");
                 sb.AppendLine("  Answer:");
                 sb.AppendLine("  ```");
                 foreach (var line in (q.AnswerText ?? string.Empty).Split('\n'))

@@ -107,8 +107,18 @@ Answered questions are injected into the agent's rework prompt:
 ```
 ## Operator answers to your questions
 
-**q-migration-strategy** — Should I use forward-only migrations or allow rollbacks?
-> Use rollbacks — our CI pipeline supports them.
+You asked the following question(s) and the operator has responded:
+
+- **q-migration-strategy**
+  Question:
+  ```
+  Should I use forward-only migrations or allow rollbacks?
+  Default: forward-only (matches the rest of the codebase).
+  ```
+  Answer:
+  ```
+  Use rollbacks — our CI pipeline supports them.
+  ```
 
 Apply these answers to your work.
 ```
@@ -169,5 +179,6 @@ orchestrator's replay pass deliberately skips `NeedsOperatorInput` items.
 - Question text is capped at 4 000 characters per question.
 - There is a hard cap of 10 questions per work item regardless of how many
   `<codeybox-question>` blocks the agent emits.
-- The `answeredBy` field on a question records the identity of the operator who
-  supplied the answer (when the caller's identity is available from the auth layer).
+- The `answeredBy` field is present in the `work_item.question_answered` webhook
+  payload and in `GET /workitems/{id}/questions` responses, but is currently always
+  `null` — the API-key authentication layer does not yet provide caller identity.

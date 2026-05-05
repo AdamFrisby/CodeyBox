@@ -706,6 +706,8 @@ internal static class WorkItemEndpoints
         if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
         if (string.IsNullOrWhiteSpace(req.QuestionId))
             return Results.BadRequest(new { error = "questionId is required" });
+        if (!System.Text.RegularExpressions.Regex.IsMatch(req.QuestionId, @"^[a-zA-Z0-9_-]{1,64}$"))
+            return Results.BadRequest(new { error = "questionId must be 1-64 alphanumeric/hyphen/underscore characters" });
         if (string.IsNullOrWhiteSpace(req.Answer))
             return Results.BadRequest(new { error = "answer is required" });
         if (req.Answer.Length > 4000)
@@ -714,7 +716,10 @@ internal static class WorkItemEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var question = await questionStore.GetAsync(item!.Id.ToString(), req.QuestionId, ct);
+        if (item!.State != WorkItemState.NeedsOperatorInput)
+            return Results.Conflict(new { error = "work item is not waiting for operator input" });
+
+        var question = await questionStore.GetAsync(item.Id.ToString(), req.QuestionId, ct);
         if (question is null) return Results.NotFound(new { error = $"question '{req.QuestionId}' not found" });
 
         // Idempotent: answering an already-answered question is a no-op.
@@ -730,7 +735,7 @@ internal static class WorkItemEndpoints
             Event = "work_item.question_answered",
             WorkItem = item,
             Project = project,
-            Details = new { workItemId = item.Id.ToString(), projectId = item.ProjectId.Value, questionId = req.QuestionId, answer = redactedAnswer },
+            Details = new QuestionAnsweredDetails(item.Id.ToString(), item.ProjectId.Value, req.QuestionId, redactedAnswer, AnsweredBy: null),
         }, ct);
 
         // Transition out of NeedsOperatorInput if all questions are now resolved.
@@ -752,6 +757,8 @@ internal static class WorkItemEndpoints
         if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
         if (string.IsNullOrWhiteSpace(req.QuestionId))
             return Results.BadRequest(new { error = "questionId is required" });
+        if (!System.Text.RegularExpressions.Regex.IsMatch(req.QuestionId, @"^[a-zA-Z0-9_-]{1,64}$"))
+            return Results.BadRequest(new { error = "questionId must be 1-64 alphanumeric/hyphen/underscore characters" });
         if (string.IsNullOrWhiteSpace(req.Reason))
             return Results.BadRequest(new { error = "reason is required" });
         if (req.Reason.Length > 500)
@@ -760,7 +767,10 @@ internal static class WorkItemEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var question = await questionStore.GetAsync(item!.Id.ToString(), req.QuestionId, ct);
+        if (item!.State != WorkItemState.NeedsOperatorInput)
+            return Results.Conflict(new { error = "work item is not waiting for operator input" });
+
+        var question = await questionStore.GetAsync(item.Id.ToString(), req.QuestionId, ct);
         if (question is null) return Results.NotFound(new { error = $"question '{req.QuestionId}' not found" });
 
         if (question.State != "open")
@@ -775,7 +785,7 @@ internal static class WorkItemEndpoints
             Event = "work_item.question_dismissed",
             WorkItem = item,
             Project = project,
-            Details = new { workItemId = item.Id.ToString(), projectId = item.ProjectId.Value, questionId = req.QuestionId, reason = redactedReason },
+            Details = new QuestionDismissedDetails(item.Id.ToString(), item.ProjectId.Value, req.QuestionId, redactedReason),
         }, ct);
 
         // Transition out of NeedsOperatorInput if all questions are now resolved.

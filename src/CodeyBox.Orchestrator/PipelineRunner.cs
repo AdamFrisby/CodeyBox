@@ -627,7 +627,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
                 : (IReadOnlyList<WorkItemQuestion>)[];
-            var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions);
+            var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions, project.AllowAgentQuestions);
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
             var reworkStdout = await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct,
@@ -1946,14 +1946,14 @@ internal sealed record QuestionAskedDetails(
     string QuestionId,
     string QuestionText);
 
-internal sealed record QuestionAnsweredDetails(
+public sealed record QuestionAnsweredDetails(
     string WorkItemId,
     string ProjectId,
     string QuestionId,
     string Answer,
     string? AnsweredBy);
 
-internal sealed record QuestionDismissedDetails(
+public sealed record QuestionDismissedDetails(
     string WorkItemId,
     string ProjectId,
     string QuestionId,

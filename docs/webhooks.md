@@ -30,9 +30,10 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
+| `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
 | `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
-| `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` |
-| `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` |
+| `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` (see [Details](#question_answered-details)) |
+| `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` (see [Details](#question_dismissed-details)) |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -239,6 +240,52 @@ One event fires **per new question**. If the agent emits three `<codeybox-questi
 | `questionText` | string | The trimmed question text (≤ 4000 chars; redacted of secrets) |
 
 Subscribe to `work_item.question_asked` to alert operators when a work item needs human input before it can proceed.
+
+### `question_answered` details
+
+When `event` is `work_item.question_answered`, the `details` field carries the answered question:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "projectId": "my-project",
+    "questionId": "q-001",
+    "answer": "Use approach B; we standardise on those across the codebase.",
+    "answeredBy": null
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `projectId` | string | Project the work item belongs to |
+| `questionId` | string | The question ID that was answered |
+| `answer` | string | The operator's answer (redacted of secrets) |
+| `answeredBy` | string\|null | Identity of the operator who answered; currently always `null` (auth layer does not yet populate caller identity) |
+
+### `question_dismissed` details
+
+When `event` is `work_item.question_dismissed`, the `details` field carries the dismissed question:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "projectId": "my-project",
+    "questionId": "q-001",
+    "reason": "Out of scope for this PR."
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `projectId` | string | Project the work item belongs to |
+| `questionId` | string | The question ID that was dismissed |
+| `reason` | string | The operator's reason for dismissal (redacted of secrets) |
 
 ---
 
