@@ -174,6 +174,7 @@ public sealed class GitHubReleasePublishTests : IDisposable
             new StaticCredentialProvider(),
             new FixedUpstreamFactory(_upstream),
             [],
+            new NullChangelogGenerator(),
             new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
             new InMemoryTaskQueue(),
             new NullHostApplicationLifetime(),

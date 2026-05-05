@@ -34,6 +34,7 @@ public sealed class ReleaseService
     private readonly ICredentialProvider _credentials;
     private readonly IUpstreamRemoteFactory _upstreamFactory;
     private readonly IReadOnlyList<IDeepAuditor> _deepAuditors;
+    private readonly IChangelogGenerator _changelog;
     private readonly PipelineOptions _pipelineOpts;
     private readonly ITaskQueue _queue;
     private readonly IHostApplicationLifetime _lifetime;
@@ -57,6 +58,7 @@ public sealed class ReleaseService
         ICredentialProvider credentials,
         IUpstreamRemoteFactory upstreamFactory,
         IEnumerable<IDeepAuditor> deepAuditors,
+        IChangelogGenerator changelog,
         PipelineOptions pipelineOpts,
         ITaskQueue queue,
         IHostApplicationLifetime lifetime,
@@ -72,6 +74,7 @@ public sealed class ReleaseService
         _credentials = credentials;
         _upstreamFactory = upstreamFactory;
         _deepAuditors = deepAuditors.ToList();
+        _changelog = changelog;
         _pipelineOpts = pipelineOpts;
         _queue = queue;
         _lifetime = lifetime;
@@ -425,7 +428,7 @@ public sealed class ReleaseService
             {
                 Id = WorkItemId.New(),
                 ProjectId = project.Id,
-                Title = $"[Release {release.Name}] Address deep-audit findings (iteration {iteration})",
+                Title = $"[Release {SanitizeFindingText(release.Name, 100)}] Address deep-audit findings (iteration {iteration})",
                 Prompt = remediationPrompt,
                 ReleaseId = release.Id,
                 BaseBranch = release.BranchName,
@@ -598,9 +601,10 @@ public sealed class ReleaseService
             var tag = !string.IsNullOrWhiteSpace(release.TargetTag)
                 ? release.TargetTag
                 : project.ReleaseConfig.GitHubTagTemplate.Replace("{name}", release.Name, StringComparison.Ordinal);
+            var releaseNotes = await GenerateReleaseNotesAsync(release, project, tag, ct);
             try
             {
-                var releaseUrl = await upstream.CreateTagAndReleaseAsync(tag, outcome.MergedSha ?? string.Empty, null, ct);
+                var releaseUrl = await upstream.CreateTagAndReleaseAsync(tag, outcome.MergedSha ?? string.Empty, releaseNotes, ct);
                 _log.LogInformation("Release {Id}: GitHub release created for tag '{Tag}' at {Url}", release.Id, tag, releaseUrl);
             }
             catch (Exception ex)
@@ -616,6 +620,36 @@ public sealed class ReleaseService
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private async Task<string?> GenerateReleaseNotesAsync(
+        Release release, Project project, string tag, CancellationToken ct)
+    {
+        try
+        {
+            var items = await CollectWorkItemsAsync(release.Id, ct);
+            var prs = items.Select((item, idx) => new MergedPullRequest(
+                Number: idx + 1,
+                Title: item.Title,
+                Body: string.Empty,
+                MergedAt: item.UpdatedAt.ToString("o"),
+                AuthorTrailers: [],
+                ChangedFiles: [])).ToList();
+            var request = new ChangelogRequest
+            {
+                ProjectId = project.Id,
+                FromTag = release.BaseCommitSha ?? string.Empty,
+                ToTag = tag,
+                PullRequests = prs,
+            };
+            var entry = await _changelog.GenerateAsync(request, ct);
+            return entry.Markdown;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Release {Id}: changelog generation failed; publishing GitHub release without notes", release.Id);
+            return null;
+        }
+    }
 
     private async Task FailReleaseAsync(Release release, string reason, CancellationToken ct)
     {
@@ -790,6 +824,10 @@ public sealed class ReleaseService
         foreach (var (relativePath, contents) in credential.Files)
         {
             var safePath = relativePath.Replace('\\', '/').TrimStart('/');
+            if (safePath.Contains("..", StringComparison.Ordinal))
+                throw new ArgumentException($"Credential file path must not contain '..': {relativePath}");
+            if (safePath.Length == 0)
+                throw new ArgumentException($"Credential file name resolves empty: {relativePath}");
             var fullPath = $"{SandboxConventions.CredentialsDir}/{safePath}";
             var dir = fullPath[..fullPath.LastIndexOf('/')];
             await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", dir] }, ct);

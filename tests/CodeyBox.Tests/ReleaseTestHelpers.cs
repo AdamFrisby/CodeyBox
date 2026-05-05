@@ -53,7 +53,8 @@ internal static class ReleaseTestHelper
         ITaskQueue? taskQueue = null,
         ISandboxProvider? sandboxes = null,
         IGitHost? gitHost = null,
-        IUpstreamRemoteFactory? upstreamFactory = null)
+        IUpstreamRemoteFactory? upstreamFactory = null,
+        IChangelogGenerator? changelog = null)
     {
         return new ReleaseService(
             releaseStore,
@@ -66,6 +67,7 @@ internal static class ReleaseTestHelper
             new StaticCredentialProvider(),
             upstreamFactory ?? new TestUpstreamFactory(),
             deepAuditors ?? [],
+            changelog ?? new NullChangelogGenerator(),
             new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
             taskQueue ?? new InMemoryTaskQueue(),
             new NullHostApplicationLifetime(),
@@ -344,4 +346,16 @@ internal sealed class AlwaysSucceedSandboxProvider : ISandboxProvider
 
     public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         => Task.FromResult<ISandbox>(new AlwaysSucceedSandbox());
+}
+
+/// <summary>No-op changelog generator for tests that don't exercise release note generation.</summary>
+internal sealed class NullChangelogGenerator : IChangelogGenerator
+{
+    public Task<ChangelogEntry> GenerateAsync(ChangelogRequest request, CancellationToken ct)
+        => Task.FromResult(new ChangelogEntry
+        {
+            ToTag = request.ToTag,
+            Markdown = string.Empty,
+            CategoryToPrNumbers = new Dictionary<string, IReadOnlyList<int>>(),
+        });
 }

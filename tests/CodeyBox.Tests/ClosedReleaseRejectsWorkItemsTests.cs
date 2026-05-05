@@ -162,6 +162,126 @@ public sealed class ClosedReleaseRejectsWorkItemsTests : IDisposable
     }
 }
 
+/// <summary>
+/// Verifies that POST /workitems with a releaseId against a project with
+/// ReleaseConfig.Enabled=false returns 400 (spec constraint).
+/// </summary>
+[Collection("GlobalSerilog")]
+public sealed class ReleaseDisabledProjectRejectsReleaseIdTests : IDisposable
+{
+    private readonly DisabledReleaseApiFactory _factory = new();
+    private readonly HttpClient _client;
+
+    public ReleaseDisabledProjectRejectsReleaseIdTests()
+    {
+        _client = _factory.CreateClient();
+    }
+
+    public void Dispose()
+    {
+        _client.Dispose();
+        _factory.Dispose();
+    }
+
+    [Fact]
+    public async Task CreateWorkItem_WithReleaseId_AgainstDisabledProject_Returns400()
+    {
+        // Create an Open release so we get past the release-lookup and state checks
+        // and exercise the project Enabled=false guard (WorkItemEndpoints.cs:197).
+        var relId = ReleaseId.New();
+        await _factory.ReleaseStore.CreateAsync(new Release
+        {
+            Id = relId,
+            ProjectId = new ProjectId("disabled-project"),
+            Name = $"test-{relId}",
+            State = ReleaseState.Open,
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "disabled-project",
+            title = "test item",
+            prompt = "do the thing",
+            releaseId = relId.ToString(),
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+}
+
+/// <summary>
+/// Verifies that the POST /releases/{id}/release endpoint enforces project-scope
+/// authorization (IDOR guard) and the confirmation-token requirement.
+/// </summary>
+[Collection("GlobalSerilog")]
+public sealed class ForceBeginReviewAuthTests : IDisposable
+{
+    private readonly ReleaseWorkItemApiFactory _factory = new();
+    private readonly HttpClient _client;
+
+    public ForceBeginReviewAuthTests()
+    {
+        _client = _factory.CreateClient();
+    }
+
+    public void Dispose()
+    {
+        _client.Dispose();
+        _factory.Dispose();
+    }
+
+    [Fact]
+    public async Task ForceRelease_WrongConfirmation_Returns400()
+    {
+        var response = await _client.PostAsJsonAsync(
+            $"/releases/{ReleaseId.New()}/release?projectId=test-project",
+            new { confirmation = "wrong" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task ForceRelease_MissingProjectId_Returns400()
+    {
+        var relId = ReleaseId.New();
+        await _factory.ReleaseStore.CreateAsync(new Release
+        {
+            Id = relId,
+            ProjectId = new ProjectId("test-project"),
+            Name = $"test-{relId}",
+            State = ReleaseState.Closed,
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+
+        var response = await _client.PostAsJsonAsync(
+            $"/releases/{relId}/release",
+            new { confirmation = "yes-i-know-the-risk" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task ForceRelease_WrongProjectId_Returns403()
+    {
+        var relId = ReleaseId.New();
+        await _factory.ReleaseStore.CreateAsync(new Release
+        {
+            Id = relId,
+            ProjectId = new ProjectId("test-project"),
+            Name = $"test-{relId}",
+            State = ReleaseState.Closed,
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+
+        var response = await _client.PostAsJsonAsync(
+            $"/releases/{relId}/release?projectId=other-project",
+            new { confirmation = "yes-i-know-the-risk" });
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+}
+
 internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
 {
     private readonly string _dbPath = Path.Combine(
@@ -218,6 +338,63 @@ internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
         if (disposing)
         {
             WorkItemStore.Dispose();
+            ReleaseStore.Dispose();
+            try { File.Delete(_dbPath); } catch { }
+        }
+        base.Dispose(disposing);
+    }
+}
+
+internal sealed class DisabledReleaseApiFactory : WebApplicationFactory<Program>
+{
+    private readonly string _dbPath = Path.Combine(
+        Path.GetTempPath(), $"cb-rel-disabled-{Guid.NewGuid():N}.db");
+
+    public SqliteReleaseStore ReleaseStore { get; }
+
+    public DisabledReleaseApiFactory()
+    {
+        ReleaseStore = new SqliteReleaseStore(_dbPath);
+    }
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseEnvironment("Development");
+        builder.ConfigureAppConfiguration((_, cfg) =>
+        {
+            var tmp = Path.GetTempPath();
+            cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                ["CodeyBox:StateDatabasePath"] = _dbPath,
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+            });
+        });
+        builder.ConfigureTestServices(services =>
+        {
+            services.RemoveAll<IHostedService>();
+
+            services.RemoveAll<IReleaseStore>();
+            services.AddSingleton<IReleaseStore>(ReleaseStore);
+
+            services.RemoveAll<IProjectRepository>();
+            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
+                new Project
+                {
+                    Id = new ProjectId("disabled-project"),
+                    DisplayName = "Disabled Release Project",
+                    RepositoryUrl = "https://github.com/test/repo",
+                    ReleaseConfig = new ProjectReleaseConfig { Enabled = false },
+                }));
+        });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
             ReleaseStore.Dispose();
             try { File.Delete(_dbPath); } catch { }
         }

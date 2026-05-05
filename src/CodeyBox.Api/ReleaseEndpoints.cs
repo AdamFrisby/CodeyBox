@@ -196,12 +196,16 @@ internal static class ReleaseEndpoints
 
     private static async Task<IResult> CloseAsync(
         string id,
+        string? projectId,
         IReleaseStore store,
         ReleaseService releaseService,
         CancellationToken ct)
     {
         var (release, err) = await ResolveAsync(id, store, ct);
         if (err is not null) return err;
+
+        var authErr = VerifyProjectScope(projectId, release!);
+        if (authErr is not null) return authErr;
 
         var (success, error) = await releaseService.CloseAsync(release!.Id, ct);
         if (!success) return Results.BadRequest(new { error });
@@ -214,6 +218,7 @@ internal static class ReleaseEndpoints
 
     private static async Task<IResult> ReopenAsync(
         string id,
+        string? projectId,
         ReopenReleaseRequest req,
         IReleaseStore store,
         ReleaseService releaseService,
@@ -224,6 +229,9 @@ internal static class ReleaseEndpoints
 
         var (release, err) = await ResolveAsync(id, store, ct);
         if (err is not null) return err;
+
+        var authErr = VerifyProjectScope(projectId, release!);
+        if (authErr is not null) return authErr;
 
         var (success, error) = await releaseService.ReopenAsync(release!.Id, req.Reason, ct);
         if (!success) return Results.BadRequest(new { error });
@@ -236,12 +244,16 @@ internal static class ReleaseEndpoints
 
     private static async Task<IResult> AbandonAsync(
         string id,
+        string? projectId,
         IReleaseStore store,
         ReleaseService releaseService,
         CancellationToken ct)
     {
         var (release, err) = await ResolveAsync(id, store, ct);
         if (err is not null) return err;
+
+        var authErr = VerifyProjectScope(projectId, release!);
+        if (authErr is not null) return authErr;
 
         var (success, error) = await releaseService.AbandonAsync(release!.Id, ct);
         if (!success) return Results.BadRequest(new { error });
@@ -254,6 +266,7 @@ internal static class ReleaseEndpoints
 
     private static async Task<IResult> ReleaseAsync(
         string id,
+        string? projectId,
         ForceReleaseRequest req,
         IReleaseStore store,
         ReleaseService releaseService,
@@ -265,6 +278,9 @@ internal static class ReleaseEndpoints
         var (release, err) = await ResolveAsync(id, store, ct);
         if (err is not null) return err;
 
+        var authErr = VerifyProjectScope(projectId, release!);
+        if (authErr is not null) return authErr;
+
         var (success, error) = await releaseService.ForceBeginReviewAsync(release!.Id, ct);
         if (!success) return Results.BadRequest(new { error });
 
@@ -273,6 +289,17 @@ internal static class ReleaseEndpoints
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
+
+    // Prevents IDOR: the caller must supply the release's owning project ID and it must match.
+    private static IResult? VerifyProjectScope(string? projectId, Release release)
+    {
+        if (string.IsNullOrWhiteSpace(projectId))
+            return Results.BadRequest(new { error = "projectId query parameter is required" });
+        ProjectId pid;
+        try { pid = new ProjectId(projectId); }
+        catch (ArgumentException) { return Results.BadRequest(new { error = "invalid projectId" }); }
+        return pid != release.ProjectId ? Results.StatusCode(403) : null;
+    }
 
     private static async Task<(Release? release, IResult? error)> ResolveAsync(
         string idSegment,

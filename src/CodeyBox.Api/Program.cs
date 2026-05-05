@@ -677,6 +677,7 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetRequiredService<IUpstreamRemoteFactory>(),
     sp.GetServices<IDeepAuditor>(),
+    sp.GetRequiredService<IChangelogGenerator>(),
     sp.GetRequiredService<PipelineOptions>(),
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IHostApplicationLifetime>(),
