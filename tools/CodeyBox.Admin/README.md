@@ -65,7 +65,7 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 | In-flight | Count of non-terminal, non-Queued items |
 | Last 5 | Glyphs for the 5 most recent terminal items (✓ Done, ✗ Failed/AuditFailed, ! Cancelled) |
 | Budget (30 d) | Rolling 30-day spend if cost-reporting is available, with a bar; `—` otherwise |
-| Actions | Link to the queue page filtered by project |
+| Actions | "Pause project" / "Resume project" buttons (falls back to global pause while per-project pause is pending) |
 
 **Limitations (pending future work items):**
 

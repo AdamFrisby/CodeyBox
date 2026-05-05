@@ -21,9 +21,10 @@ internal static class FleetEndpoints
         var logger = loggerFactory.CreateLogger("CodeyBox.Api.FleetEndpoints");
         var allProjects = await projects.ListAsync(ct);
 
-        // Two SQL aggregation passes — no work item bodies loaded into memory.
+        // Three single-pass SQL queries — no per-project N+1.
         var stateCounts = await workItems.GetFleetStateCountsAsync(ct);
         var recentOutcomes = await workItems.GetFleetRecentOutcomesAsync(5, ct);
+        var pauseStates = await workItems.GetFleetPauseStatesAsync(ct);
 
         var countsByProject = stateCounts.ToLookup(r => r.ProjectId);
         var outcomesByProject = recentOutcomes.ToLookup(r => r.ProjectId);
@@ -31,6 +32,21 @@ internal static class FleetEndpoints
         var costStore = sp.GetService<IWorkItemCostStore>();
         var now = DateTimeOffset.UtcNow;
         var costFrom = now.AddDays(-30);
+
+        // Single bulk cost query — avoids N+1 when cost-reporting has landed.
+        Dictionary<string, double>? costByProject = null;
+        if (costStore is not null)
+        {
+            try
+            {
+                var costSummary = await costStore.GetFleetCostSummaryAsync(costFrom, now, ct);
+                costByProject = costSummary.ToDictionary(c => c.ProjectId, c => c.TotalUsd);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to load fleet cost summary");
+            }
+        }
 
         var summaries = new List<object>(allProjects.Count);
         foreach (var project in allProjects)
@@ -60,19 +76,13 @@ internal static class FleetEndpoints
 
             double? monthlySpendUsd = null;
             string budgetThresholdState = "unknown";
-            if (costStore is not null)
+            if (costByProject is not null)
             {
-                try
-                {
-                    var costs = await costStore.GetByProjectAsync(projectId, costFrom, now, ct);
-                    monthlySpendUsd = costs.Sum(c => c.EstimatedUsd);
-                    budgetThresholdState = "ok";
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex, "Failed to load cost data for project {ProjectId}", projectId);
-                }
+                monthlySpendUsd = costByProject.TryGetValue(projectId, out var spend) ? spend : 0.0;
+                budgetThresholdState = "ok";
             }
+
+            var isPaused = pauseStates.TryGetValue(projectId, out var paused) && paused;
 
             summaries.Add(new
             {
@@ -82,7 +92,7 @@ internal static class FleetEndpoints
                 inFlightCount,
                 currentPhase,
                 recentOutcomes = projectOutcomes,
-                isPaused = false,
+                isPaused,
                 pausedReason = (string?)null,
                 monthlySpendUsd,
                 monthlyBudgetUsd = (double?)null,

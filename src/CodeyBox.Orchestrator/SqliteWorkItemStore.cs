@@ -346,6 +346,24 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         return results;
     }
 
+    public async Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT project_id, is_paused FROM project_queue_state";
+        try
+        {
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            var results = new Dictionary<string, bool>();
+            while (await reader.ReadAsync(ct))
+                results[reader.GetString(0)] = reader.GetInt32(1) != 0;
+            return results;
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("no such table"))
+        {
+            return new Dictionary<string, bool>();
+        }
+    }
+
     public void Dispose()
     {
         _conn.Dispose();

@@ -137,14 +137,28 @@ else
 
     private async Task PauseProjectAsync(string projectId)
     {
-        await ApiClient.PauseProjectAsync(projectId, "Operator pause from Fleet view");
-        await LoadAsync();
+        try
+        {
+            await ApiClient.PauseProjectAsync(projectId, "Operator pause from Fleet view");
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
     }
 
     private async Task ResumeProjectAsync(string projectId)
     {
-        await ApiClient.ResumeProjectAsync(projectId);
-        await LoadAsync();
+        try
+        {
+            await ApiClient.ResumeProjectAsync(projectId);
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
     }
 
     public void Dispose()

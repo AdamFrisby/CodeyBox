@@ -56,4 +56,12 @@ public interface IWorkItemStore
     /// Terminal states: Done, Failed, AuditFailed, Cancelled.
     /// </summary>
     Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default);
+
+    /// <summary>
+    /// Fleet aggregation: returns per-project pause states read from the
+    /// <c>project_queue_state</c> table (added by the budget-alerts work item).
+    /// Returns an empty dictionary when the table does not yet exist so callers
+    /// can treat every project as un-paused without crashing.
+    /// </summary>
+    Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default);
 }

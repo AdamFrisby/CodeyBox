@@ -166,6 +166,31 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         return results;
     }
 
+    public async Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+    {
+        using var readConn = new SqliteConnection($"Data Source={_path};Mode=ReadOnly");
+        readConn.Open();
+
+        using var cmd = readConn.CreateCommand();
+        cmd.CommandText = """
+            SELECT w.project_id, SUM(c.estimated_usd)
+            FROM work_item_costs c
+            JOIN work_items w ON w.id = c.work_item_id
+            WHERE c.started_at >= $from
+              AND c.started_at < $to
+            GROUP BY w.project_id
+            """;
+        cmd.Parameters.AddWithValue("$from", from.ToString("O"));
+        cmd.Parameters.AddWithValue("$to", to.ToString("O"));
+
+        var results = new List<(string, double)>();
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            results.Add((reader.GetString(0), reader.GetDouble(1)));
+        return results;
+    }
+
     public async Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);

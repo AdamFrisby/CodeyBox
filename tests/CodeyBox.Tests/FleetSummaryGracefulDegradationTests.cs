@@ -13,14 +13,22 @@ using CodeyBox.Orchestrator;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Tests that GET /fleet/summary degrades gracefully when the cost store is
-/// unavailable (e.g. cost-reporting work item not yet landed). Budget fields
-/// must be null; the endpoint must not throw.
+/// Tests that GET /fleet/summary degrades gracefully when the cost store
+/// reads throw (e.g., work_item_costs table not yet created). Budget fields
+/// must be null; the endpoint must not propagate the exception.
+///
+/// Note: the 'if (costStore is not null)' null-service branch in FleetEndpoints
+/// is exercised only when IWorkItemCostStore is absent from the DI container. In
+/// production and integration tests IWorkItemCostStore is always registered
+/// (Program.cs line ~706) because other endpoints take it as a required DI
+/// parameter; removing it crashes router initialization. The throwing-store path
+/// below is the operationally realistic graceful-degradation scenario and covers
+/// the important code paths.
 /// </summary>
 [Collection("GlobalSerilog")]
 public sealed class FleetSummaryGracefulDegradationTests : IDisposable
 {
-    private readonly NoCostStoreFleetFactory _factory = new();
+    private readonly ThrowingCostStoreFleetFactory _factory = new();
     private readonly HttpClient _client;
 
     public FleetSummaryGracefulDegradationTests()
@@ -35,14 +43,14 @@ public sealed class FleetSummaryGracefulDegradationTests : IDisposable
     }
 
     [Fact]
-    public async Task GetFleetSummary_WithoutCostStore_Returns200()
+    public async Task GetFleetSummary_WithThrowingCostStore_Returns200()
     {
         var resp = await _client.GetAsync("/fleet/summary");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
     }
 
     [Fact]
-    public async Task GetFleetSummary_WithoutCostStore_BudgetFieldsNull()
+    public async Task GetFleetSummary_WithThrowingCostStore_BudgetFieldsNull()
     {
         var resp = await _client.GetAsync("/fleet/summary");
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetDegradationRow>>();
@@ -56,19 +64,7 @@ public sealed class FleetSummaryGracefulDegradationTests : IDisposable
     }
 
     [Fact]
-    public async Task GetFleetSummary_WithThrowingCostStore_BudgetFieldsNull()
-    {
-        // The factory uses a throwing store; the endpoint must still succeed.
-        var resp = await _client.GetAsync("/fleet/summary");
-        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
-
-        var summaries = await resp.Content.ReadFromJsonAsync<List<FleetDegradationRow>>();
-        Assert.NotNull(summaries);
-        Assert.Null(summaries[0].MonthlySpendUsd);
-    }
-
-    [Fact]
-    public async Task GetFleetSummary_WithoutCostStore_OtherFieldsStillPopulated()
+    public async Task GetFleetSummary_WithThrowingCostStore_OtherFieldsStillPopulated()
     {
         await _factory.Store.CreateAsync(new WorkItem
         {
@@ -82,7 +78,7 @@ public sealed class FleetSummaryGracefulDegradationTests : IDisposable
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetDegradationRow>>();
         var row = summaries![0];
 
-        // State counts and project metadata still populated.
+        // State counts and project metadata still populated despite cost-store failure.
         Assert.Equal("deg-proj", row.ProjectId);
         Assert.Equal(1, row.QueuedCount);
         Assert.False(row.IsPaused);
@@ -99,17 +95,19 @@ public sealed class FleetSummaryGracefulDegradationTests : IDisposable
 }
 
 /// <summary>
-/// Factory where IWorkItemCostStore is replaced with a stub that always throws,
-/// simulating the scenario where cost-reporting hasn't landed.
+/// Factory where IWorkItemCostStore is replaced with a stub that always throws
+/// on reads, simulating the scenario where the work_item_costs table has not yet
+/// been created (cost-reporting work item not landed). The endpoint must catch
+/// the exception and return null budget fields rather than propagating the error.
 /// </summary>
-internal sealed class NoCostStoreFleetFactory : WebApplicationFactory<Program>
+internal sealed class ThrowingCostStoreFleetFactory : WebApplicationFactory<Program>
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-fleet-deg-{Guid.NewGuid():N}.db");
 
     public SqliteWorkItemStore Store { get; }
 
-    public NoCostStoreFleetFactory()
+    public ThrowingCostStoreFleetFactory()
     {
         Store = new SqliteWorkItemStore(_dbPath);
     }
@@ -160,7 +158,7 @@ internal sealed class NoCostStoreFleetFactory : WebApplicationFactory<Program>
 }
 
 /// <summary>
-/// Stub IWorkItemCostStore whose reads always throw, simulating a missing table.
+/// Stub IWorkItemCostStore whose reads always throw, simulating a missing or broken table.
 /// </summary>
 internal sealed class ThrowingWorkItemCostStore : IWorkItemCostStore
 {
@@ -173,6 +171,10 @@ internal sealed class ThrowingWorkItemCostStore : IWorkItemCostStore
     public Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
         string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
         => Task.FromException<IReadOnlyList<WorkItemCost>>(new InvalidOperationException("no such table: work_item_costs"));
+
+    public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+        => Task.FromException<IReadOnlyList<(string, double)>>(new InvalidOperationException("no such table: work_item_costs"));
 
     public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)
         => Task.CompletedTask;
