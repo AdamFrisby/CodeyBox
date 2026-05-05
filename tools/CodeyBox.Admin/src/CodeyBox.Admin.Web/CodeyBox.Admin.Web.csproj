@@ -7,4 +7,9 @@
     <!-- No project references to src/CodeyBox.* — coupling is REST+JSON only. -->
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- .NET SignalR client for server-side hub connection (live stdout panel). -->
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.0" />
+  </ItemGroup>
+
 </Project>

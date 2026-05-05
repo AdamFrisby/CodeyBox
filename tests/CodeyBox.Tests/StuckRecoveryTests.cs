@@ -50,7 +50,7 @@ public sealed class StuckRecoveryTests : IDisposable
 
         public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory,
             string prompt, AgentCredential? credential, string? modelId = null,
-            string? reasoningMode = null, CancellationToken ct = default)
+            string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
         {
             // Block until cancelled — simulates a deadlocked agent
             await Task.Delay(Timeout.Infinite, ct);

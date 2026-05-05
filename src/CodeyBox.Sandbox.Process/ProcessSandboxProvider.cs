@@ -186,8 +186,20 @@ internal sealed class ProcessSandbox : ISandbox
         using var proc = new System.Diagnostics.Process { StartInfo = psi };
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderr.AppendLine(e.Data); };
+        proc.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data is null) return;
+            var line = e.Data + "\n";
+            stdout.Append(line);
+            exec.StdoutChunkCallback?.Invoke(line);
+        };
+        proc.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is null) return;
+            var line = e.Data + "\n";
+            stderr.Append(line);
+            exec.StderrChunkCallback?.Invoke(line);
+        };
 
         proc.Start();
         proc.BeginOutputReadLine();

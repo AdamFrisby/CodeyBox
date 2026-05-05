@@ -9,6 +9,7 @@ using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Api;
+using CodeyBox.Api.Hubs;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -724,6 +725,16 @@ builder.Services.AddSingleton<IChangelogGenerator>(sp =>
     }
 }
 
+// --- SignalR (live agent stdout) ----------------------------------------------
+// AgentStdoutHub requires no additional packages on ASP.NET Core 8+.
+// Auth is enforced by the existing ApiKeyAuth middleware on the HTTP upgrade
+// request — the hub itself needs no [Authorize] attribute because no ASP.NET
+// Core authentication scheme is registered.
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<AgentStdoutBroadcastService>();
+builder.Services.AddSingleton<IStdoutBroadcaster>(sp =>
+    sp.GetRequiredService<AgentStdoutBroadcastService>());
+
 // --- Audit timeline reader ---------------------------------------------------
 builder.Services.AddSingleton(sp =>
 {
@@ -850,7 +861,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     null,
     sp.GetRequiredService<IWorkItemCostStore>(),
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(),
-    sp.GetRequiredService<AgentCostCalculator>()));
+    sp.GetRequiredService<AgentCostCalculator>(),
+    sp.GetRequiredService<IStdoutBroadcaster>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
@@ -922,6 +934,7 @@ ChangelogEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);
 SandboxEndpoints.Map(app);
 
+app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
 try

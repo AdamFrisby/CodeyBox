@@ -1144,9 +1144,25 @@ internal sealed class MultipassSandbox : ISandbox
         try
         {
             using var p = new Process { StartInfo = psi };
+            var stdout = new StringBuilder();
+            var stderr = new StringBuilder();
+            p.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stdout.Append(line);
+                exec.StdoutChunkCallback?.Invoke(line);
+            };
+            p.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stderr.Append(line);
+                exec.StderrChunkCallback?.Invoke(line);
+            };
             p.Start();
-            var stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
-            var stderrTask = p.StandardError.ReadToEndAsync(ct);
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
             if (exec.Stdin is not null)
             {
                 await p.StandardInput.WriteAsync(exec.Stdin);
@@ -1158,7 +1174,7 @@ internal sealed class MultipassSandbox : ISandbox
                 try { p.Kill(entireProcessTree: true); } catch { }
                 throw;
             }
-            return new SandboxExecResult(p.ExitCode, await stdoutTask, await stderrTask);
+            return new SandboxExecResult(p.ExitCode, stdout.ToString(), stderr.ToString());
         }
         finally
         {

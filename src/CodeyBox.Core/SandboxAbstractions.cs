@@ -171,6 +171,15 @@ public sealed record SandboxExec
     public string? WorkingDirectory { get; init; }
     public IReadOnlyDictionary<string, string>? ExtraEnvironment { get; init; }
     public string? Stdin { get; init; }
+
+    /// <summary>
+    /// Optional callback invoked per stdout chunk as the process emits it.
+    /// Sandbox provider best-effort: chunks may aggregate or split arbitrarily;
+    /// receiver MUST not rely on line boundaries. Called from arbitrary
+    /// threads; receiver is responsible for thread safety.
+    /// </summary>
+    public Action<string>? StdoutChunkCallback { get; init; }
+    public Action<string>? StderrChunkCallback { get; init; }
 }
 
 public sealed record SandboxExecResult(int ExitCode, string Stdout, string Stderr)
