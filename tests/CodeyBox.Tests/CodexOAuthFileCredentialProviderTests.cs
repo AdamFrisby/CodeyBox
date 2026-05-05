@@ -33,6 +33,55 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task GetAsync_ReadsCodexAuthJsonFromEnvironmentForCodex()
+    {
+        const string envVar = "CODEYBOX_TEST_CODEX_AUTH_JSON";
+        var original = Environment.GetEnvironmentVariable(envVar);
+        var authJson = "{\"tokens\":{\"access_token\":\"env-token\"}}";
+        Environment.SetEnvironmentVariable(envVar, authJson);
+        try
+        {
+            var provider = new CodexAuthJsonEnvironmentCredentialProvider(envVar);
+
+            var credential = await provider.GetAsync(AgentKind.Codex);
+
+            Assert.NotNull(credential);
+            Assert.Equal(AgentKind.Codex, credential!.Agent);
+            Assert.Equal(authJson, credential.EnvironmentVariables["CODEX_AUTH_JSON"]);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(envVar, original);
+        }
+    }
+
+    [Fact]
+    public async Task GetAsync_WhenCodexAuthJsonEnvironmentMalformed_FallsThroughToNextProvider()
+    {
+        const string envVar = "CODEYBOX_TEST_CODEX_AUTH_JSON";
+        var original = Environment.GetEnvironmentVariable(envVar);
+        Environment.SetEnvironmentVariable(envVar, "not json");
+        try
+        {
+            var envAuthProvider = new CodexAuthJsonEnvironmentCredentialProvider(envVar);
+            var apiCredential = new AgentCredential(
+                AgentKind.Codex,
+                new Dictionary<string, string> { ["OPENAI_API_KEY"] = "api-key" },
+                new Dictionary<string, string>());
+            var chain = new ChainedCredentialProvider([envAuthProvider, new FixedProvider(apiCredential)]);
+
+            var credential = await chain.GetAsync(AgentKind.Codex);
+
+            Assert.NotNull(credential);
+            Assert.Equal("api-key", credential!.EnvironmentVariables["OPENAI_API_KEY"]);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(envVar, original);
+        }
+    }
+
+    [Fact]
     public async Task GetAsync_WhenFileMissing_FallsThroughToNextProvider()
     {
         var fileProvider = new CodexOAuthFileCredentialProvider(Path.Combine(_workspace, "missing.json"));
@@ -58,6 +107,34 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
         var credential = await provider.GetAsync(AgentKind.Claude);
 
         Assert.Null(credential);
+    }
+
+    [Fact]
+    public async Task ChainPrefersCodexAuthJsonEnvironmentOverFile()
+    {
+        const string envVar = "CODEYBOX_TEST_CODEX_AUTH_JSON";
+        var original = Environment.GetEnvironmentVariable(envVar);
+        var envAuthJson = "{\"tokens\":{\"access_token\":\"env-token\"}}";
+        var fileAuthJson = "{\"tokens\":{\"access_token\":\"file-token\"}}";
+        Environment.SetEnvironmentVariable(envVar, envAuthJson);
+        try
+        {
+            var authPath = Path.Combine(_workspace, "auth.json");
+            await File.WriteAllTextAsync(authPath, fileAuthJson);
+            var chain = new ChainedCredentialProvider([
+                new CodexAuthJsonEnvironmentCredentialProvider(envVar),
+                new CodexOAuthFileCredentialProvider(authPath),
+            ]);
+
+            var credential = await chain.GetAsync(AgentKind.Codex);
+
+            Assert.NotNull(credential);
+            Assert.Equal(envAuthJson, credential!.EnvironmentVariables["CODEX_AUTH_JSON"]);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(envVar, original);
+        }
     }
 
     private sealed class FixedProvider(AgentCredential credential) : ICredentialProvider

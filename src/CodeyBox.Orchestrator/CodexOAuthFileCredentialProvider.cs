@@ -56,7 +56,67 @@ public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
             return null;
         }
 
-        // Validate it parses as JSON with at least the access-token shape we expect.
+        if (!CodexAuthJsonCredential.TryCreate(raw, out var credential))
+        {
+            _log?.LogWarning("Codex OAuth file {Path} has neither tokens.access_token nor OPENAI_API_KEY; falling through", _filePath);
+            return null;
+        }
+
+        return credential;
+    }
+}
+
+/// <summary>
+/// Reads a pre-materialised Codex auth JSON blob from <c>CODEX_AUTH_JSON</c>.
+/// This supports deployments where the host process receives the auth file as
+/// an environment secret rather than at <c>~/.codex/auth.json</c>.
+/// </summary>
+public sealed class CodexAuthJsonEnvironmentCredentialProvider : ICredentialProvider
+{
+    private const string DefaultEnvironmentVariable = "CODEX_AUTH_JSON";
+    private readonly string _environmentVariable;
+    private readonly ILogger<CodexAuthJsonEnvironmentCredentialProvider>? _log;
+
+    public CodexAuthJsonEnvironmentCredentialProvider(
+        ILogger<CodexAuthJsonEnvironmentCredentialProvider>? log = null)
+        : this(DefaultEnvironmentVariable, log)
+    {
+    }
+
+    public CodexAuthJsonEnvironmentCredentialProvider(
+        string environmentVariable,
+        ILogger<CodexAuthJsonEnvironmentCredentialProvider>? log = null)
+    {
+        if (string.IsNullOrWhiteSpace(environmentVariable))
+            throw new ArgumentException("Environment variable name must not be empty", nameof(environmentVariable));
+        _environmentVariable = environmentVariable;
+        _log = log;
+    }
+
+    public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+    {
+        if (agent != AgentKind.Codex)
+            return Task.FromResult<AgentCredential?>(null);
+
+        var raw = Environment.GetEnvironmentVariable(_environmentVariable);
+        if (string.IsNullOrWhiteSpace(raw))
+            return Task.FromResult<AgentCredential?>(null);
+
+        if (!CodexAuthJsonCredential.TryCreate(raw, out var credential))
+        {
+            _log?.LogWarning("Environment variable {Variable} is not usable Codex auth JSON; falling through", _environmentVariable);
+            return Task.FromResult<AgentCredential?>(null);
+        }
+
+        return Task.FromResult<AgentCredential?>(credential);
+    }
+}
+
+internal static class CodexAuthJsonCredential
+{
+    public static bool TryCreate(string raw, out AgentCredential credential)
+    {
+        credential = null!;
         try
         {
             using var doc = JsonDocument.Parse(raw);
@@ -71,18 +131,17 @@ public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
                 && k.ValueKind == JsonValueKind.String
                 && !string.IsNullOrEmpty(k.GetString());
             if (!hasTokens && !hasApiKey)
-            {
-                _log?.LogWarning("Codex OAuth file {Path} has neither tokens.access_token nor OPENAI_API_KEY; falling through", _filePath);
-                return null;
-            }
+                return false;
         }
-        catch (JsonException ex)
+        catch (JsonException)
         {
-            _log?.LogWarning(ex, "Codex OAuth file {Path} is not valid JSON; falling through", _filePath);
-            return null;
+            return false;
         }
 
-        var env = new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = raw };
-        return new AgentCredential(AgentKind.Codex, env, new Dictionary<string, string>());
+        credential = new AgentCredential(
+            AgentKind.Codex,
+            new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = raw },
+            new Dictionary<string, string>());
+        return true;
     }
 }

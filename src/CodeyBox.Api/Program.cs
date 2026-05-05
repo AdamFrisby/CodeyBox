@@ -464,7 +464,10 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
 
     // Codex (ChatGPT subscription) auth file. Default ~/.codex/auth.json — the
     // codex CLI hard-reads that path. CodexAgentRunner writes the file into
-    // the sandbox before invoking codex.
+    // the sandbox before invoking codex. Prefer an explicit CODEX_AUTH_JSON
+    // environment secret when the host process is already provisioned that way.
+    builtInFirst.Add(new CodexAuthJsonEnvironmentCredentialProvider(
+        sp.GetService<ILogger<CodexAuthJsonEnvironmentCredentialProvider>>()));
     var codexOauthFile =
         Environment.GetEnvironmentVariable("CODEYBOX_CODEX_OAUTH_FILE")
         ?? builder.Configuration["CodeyBox:CodexOAuthFile"]
