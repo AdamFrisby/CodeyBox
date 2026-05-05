@@ -284,6 +284,11 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemDto?>(null);
     public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
         => Task.FromResult<WorkItemReplaysDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDiffDto?>(null);
+
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }
 
 /// <summary>
@@ -367,4 +372,9 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemDto?>(null);
     public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
         => Task.FromResult<WorkItemReplaysDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDiffDto?>(null);
+
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }

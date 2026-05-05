@@ -4,22 +4,27 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Resolves which agent member to use for a work item by probing quota across
-/// the members of the requested <see cref="AgentClass"/> in preference order.
+/// Resolves which agent member to use for a work item by applying a scalar
+/// quality-score model across the members of the requested <see cref="AgentClass"/>.
 ///
 /// Resolution algorithm (per pickup attempt):
 /// <list type="number">
 ///   <item>Determine the class: <see cref="WorkItem.AgentClassId"/> → <see cref="Project.DefaultAgentClass"/> → null (no routing).</item>
-///   <item>For each member in preference order: probe quota via the registered <see cref="IAgentQuotaProbe"/>.</item>
-///   <item>PayPerApi members are handled by <see cref="PayPerApiQuotaProbe"/> (always 100%).</item>
+///   <item>Filter members to those whose base <see cref="AgentMembership.QualityScore"/> ≥ <see cref="WorkItem.MinModelScore"/> (eligibility gate; TOD modifiers do not affect the floor check).</item>
+///   <item>If no member is eligible, fail with <c>ROUTING_NO_ELIGIBLE</c> — no silent downgrade.</item>
+///   <item>Compute each eligible member's effective score: base + sum of applicable time-of-day modifiers.</item>
+///   <item>Sort descending by effective score; ties broken by Subscription before PayPerApi, then original config order.</item>
+///   <item>Probe quota in sorted order; pick the first member at or above <see cref="QuotaRouterOptions.MinQuotaPct"/>.</item>
+///   <item>PayPerApi members use <see cref="PayPerApiQuotaProbe"/> (always 100%).</item>
 ///   <item>Subscription members with no registered probe fall back to <see cref="NullQuotaProbe"/> (unknown → fail-open).</item>
-///   <item>Pick the first member where AvailablePct &lt; 0 (unknown → fail-open) or AvailablePct ≥ MinQuotaPct.</item>
-///   <item>If no member qualifies and at least one Subscription member exists → ShouldWait=true, re-enqueue later.</item>
-///   <item>If only PayPerApi members exist → fire the first member regardless (exceeding quota costs money; it never fails the call).</item>
+///   <item>If all eligible subscription members are exhausted → ShouldWait=true, re-enqueue later.</item>
+///   <item>If only PayPerApi eligible members remain → fire the first regardless (costs money; never hard-fails).</item>
 /// </list>
 ///
 /// Called on every pickup attempt; all quota reads go through cached
 /// <see cref="IAgentQuotaProbe"/> implementations to keep the hot path cheap.
+/// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
+/// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
 public sealed class AgentClassRouter
 {
@@ -29,12 +34,17 @@ public sealed class AgentClassRouter
     private readonly IAgentQuotaProbe _nullProbe;
     private readonly QuotaRouterOptions _opts;
     private readonly ILogger<AgentClassRouter> _log;
+    private readonly TimeProvider _time;
+    // Pre-parsed TOD modifiers: evaluated on every pickup, zero-alloc.
+    private readonly IReadOnlyList<ParsedTodModifier> _todModifiers;
 
     public AgentClassRouter(
         IReadOnlyList<AgentClass> catalog,
         IEnumerable<IAgentQuotaProbe> probes,
         QuotaRouterOptions opts,
-        ILogger<AgentClassRouter> log)
+        ILogger<AgentClassRouter> log,
+        TimeProvider? timeProvider = null,
+        IReadOnlyList<ParsedTodModifier>? todModifiers = null)
     {
         _catalog = catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
         var probeList = probes.ToList();
@@ -47,7 +57,8 @@ public sealed class AgentClassRouter
         _nullProbe = probeList.OfType<NullQuotaProbe>().FirstOrDefault() ?? new NullQuotaProbe();
         _opts = opts;
         _log = log;
-
+        _time = timeProvider ?? TimeProvider.System;
+        _todModifiers = todModifiers ?? [];
     }
 
     /// <summary>
@@ -72,28 +83,101 @@ public sealed class AgentClassRouter
             return new AgentRoutingDecision { Reason = $"unknown agent class '{classId}'" };
         }
 
-        var hasSubscription = agentClass.Members.Any(m => m.Billing == AgentBilling.Subscription);
+        // Step 1: filter by base QualityScore — TOD modifiers do not affect eligibility.
+        var eligible = agentClass.Members
+            .Select((m, idx) => (Member: m, ConfigIndex: idx))
+            .Where(x => x.Member.QualityScore >= item.MinModelScore)
+            .ToList();
 
-        foreach (var member in agentClass.Members)
+        if (eligible.Count == 0)
         {
+            var best = agentClass.Members.Count > 0
+                ? agentClass.Members.Max(m => m.QualityScore)
+                : 0;
+            var reason = $"ROUTING_NO_ELIGIBLE: no member of class '{classId}' meets " +
+                         $"MinModelScore={item.MinModelScore} (best available={best})";
+            _log.LogError("Work item {Id}: {Reason}", item.Id, reason);
+            // Emit scored audit event so below-floor rejects appear in the audit log.
+            var nowUtcFloor = _time.GetUtcNow();
+            var belowFloor = agentClass.Members
+                .Select(m => (
+                    Agent: m.Agent,
+                    ModelId: m.ModelId,
+                    EffectiveScore: m.QualityScore + ComputeTodModifier(m.Agent, nowUtcFloor),
+                    RejectReason: $"below floor ({m.QualityScore} < {item.MinModelScore})"))
+                .ToList();
+            AuditLog.QuotaRouterNoEligible(item.Id, classId, item.MinModelScore, belowFloor);
+            return new AgentRoutingDecision { Reason = reason, NoEligibleMembers = true };
+        }
+
+        // Step 2: compute effective scores (base + TOD modifier).
+        var nowUtc = _time.GetUtcNow();
+        var scored = eligible.Select(x => new ScoredMember(
+            Member: x.Member,
+            BaseScore: x.Member.QualityScore,
+            EffectiveScore: x.Member.QualityScore + ComputeTodModifier(x.Member.Agent, nowUtc),
+            ConfigIndex: x.ConfigIndex
+        )).ToList();
+
+        // Step 3: sort — highest effective score first; ties: Subscription before PayPerApi, then config order.
+        var sorted = scored
+            .OrderByDescending(x => x.EffectiveScore)
+            .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
+            .ThenBy(x => x.ConfigIndex)
+            .ToList();
+
+        // Rejected members accumulate for the audit event.
+        var rejected = new List<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)>();
+
+        // Also track which below-floor members were filtered out.
+        foreach (var m in agentClass.Members)
+        {
+            if (m.QualityScore < item.MinModelScore)
+            {
+                var eff = m.QualityScore + ComputeTodModifier(m.Agent, nowUtc);
+                rejected.Add((m.Agent, m.ModelId, eff, $"below floor ({m.QualityScore} < {item.MinModelScore})"));
+            }
+        }
+
+        var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
+
+        // Step 4: probe quota in sorted order; pick the first viable member.
+        foreach (var entry in sorted)
+        {
+            var member = entry.Member;
             var snapshot = await ProbeAsync(member, ct);
 
-            // Include notes so PayPerApi synthetic probes are distinguishable from real
-            // measurements in the audit log.
             AuditLog.QuotaProbed(member.Agent, classId, snapshot.AvailablePct, snapshot.ResetAt, snapshot.Notes);
 
             // AvailablePct < 0 means unknown → fail-open (treat as available).
             if (snapshot.AvailablePct < 0 || snapshot.AvailablePct >= _opts.MinQuotaPct)
             {
+                // Mark all remaining sorted entries as "ranked lower" for the audit event.
+                foreach (var other in sorted.Where(x => x != entry))
+                    rejected.Add((other.Member.Agent, other.Member.ModelId, other.EffectiveScore, "ranked lower"));
+
+                var modDesc = DescribeModifiers(member.Agent, nowUtc);
+                AuditLog.QuotaRouterScored(
+                    item.Id, classId,
+                    member.Agent, member.ModelId,
+                    entry.BaseScore, entry.EffectiveScore, modDesc,
+                    rejected);
+
                 _log.LogInformation(
-                    "Work item {Id}: routed to {Agent}/{Billing} (available={Avail:F1}%)",
-                    item.Id, member.Agent, member.Billing, snapshot.AvailablePct);
+                    "Work item {Id}: routed to {Agent}/{Billing} model={Model} " +
+                    "baseScore={Base} effectiveScore={Eff} (available={Avail:F1}%)",
+                    item.Id, member.Agent, member.Billing,
+                    member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
+                    snapshot.AvailablePct);
+
                 return new AgentRoutingDecision
                 {
                     Chosen = member,
-                    Reason = $"{member.Agent}/{member.Billing}: {snapshot.AvailablePct:F1}% available",
+                    Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {snapshot.AvailablePct:F1}% available",
                 };
             }
+
+            rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "quota exhausted"));
         }
 
         // No member is above the threshold.
@@ -108,10 +192,9 @@ public sealed class AgentClassRouter
             };
         }
 
-        // Only PayPerApi members reached here — this path is unreachable in
-        // normal operation (PayPerApi always returns 100%), but guard against
-        // unusual custom probes returning low values for PayPerApi members.
-        var fallback = agentClass.Members[0];
+        // Only PayPerApi members reached here — unreachable in normal operation
+        // (PayPerApi always returns 100%), but guard against unusual custom probes.
+        var fallback = sorted[0].Member;
         _log.LogWarning(
             "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
             item.Id, classId, fallback.Agent);
@@ -130,14 +213,79 @@ public sealed class AgentClassRouter
             return probe.GetAvailabilityAsync(member, ct);
         return _nullProbe.GetAvailabilityAsync(member, ct);
     }
+
+    private int ComputeTodModifier(AgentKind agent, DateTimeOffset nowUtc)
+    {
+        var total = 0;
+        foreach (var mod in _todModifiers)
+        {
+            if (mod.Agent != agent) continue;
+            foreach (var window in mod.Windows)
+            {
+                if (IsInWindow(window, nowUtc))
+                    total += mod.Modifier;
+            }
+        }
+        return total;
+    }
+
+    private string DescribeModifiers(AgentKind agent, DateTimeOffset nowUtc)
+    {
+        var parts = new List<string>();
+        foreach (var mod in _todModifiers)
+        {
+            if (mod.Agent != agent) continue;
+            foreach (var window in mod.Windows)
+            {
+                if (IsInWindow(window, nowUtc))
+                    parts.Add($"{mod.Modifier:+0;-0}(tod)");
+            }
+        }
+        return parts.Count == 0 ? "none" : string.Join(",", parts);
+    }
+
+    private static bool IsInWindow(ParsedTimeWindow window, DateTimeOffset nowUtc)
+    {
+        if (!window.Days.Contains(nowUtc.DayOfWeek)) return false;
+        var t = nowUtc.TimeOfDay;
+        // Wrap-around window (e.g. 22:00–02:00): active outside the gap.
+        return window.Start <= window.End
+            ? t >= window.Start && t < window.End
+            : t >= window.Start || t < window.End;
+    }
+
+    private sealed record ScoredMember(
+        AgentMembership Member,
+        int BaseScore,
+        int EffectiveScore,
+        int ConfigIndex);
 }
+
+/// <summary>
+/// A pre-parsed time-of-day modifier entry, built once at startup from
+/// <c>CodeyBox:AgentScoreModifiers:ByTimeOfDay</c> config.
+/// </summary>
+public sealed record ParsedTodModifier(
+    AgentKind Agent,
+    int Modifier,
+    IReadOnlyList<ParsedTimeWindow> Windows);
+
+/// <summary>
+/// A pre-parsed UTC time window. <see cref="Start"/> &gt; <see cref="End"/>
+/// indicates a wrap-around window (e.g. 22:00–02:00).
+/// </summary>
+public sealed record ParsedTimeWindow(
+    IReadOnlySet<DayOfWeek> Days,
+    TimeSpan Start,
+    TimeSpan End);
 
 /// <summary>Routing decision returned by <see cref="AgentClassRouter"/>.</summary>
 public sealed record AgentRoutingDecision
 {
     /// <summary>
     /// The chosen member, or null when no agent class was configured (the caller
-    /// should fall through to its direct agent pick — no quota probe happened).
+    /// should fall through to its direct agent pick — no quota probe happened),
+    /// or when <see cref="NoEligibleMembers"/> is true (item should fail fast).
     /// </summary>
     public AgentMembership? Chosen { get; init; }
 
@@ -152,6 +300,12 @@ public sealed record AgentRoutingDecision
 
     /// <summary>Human-readable reason for log output.</summary>
     public string Reason { get; init; } = "";
+
+    /// <summary>
+    /// True when no class member meets the work item's MinModelScore floor.
+    /// The caller must fail the item immediately rather than waiting or routing.
+    /// </summary>
+    public bool NoEligibleMembers { get; init; }
 }
 
 /// <summary>

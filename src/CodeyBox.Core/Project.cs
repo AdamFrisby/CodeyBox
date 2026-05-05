@@ -109,6 +109,22 @@ public sealed record Project
     /// over the global <c>CodeyBox:Changelog</c> options.
     /// </summary>
     public ProjectChangelog? Changelog { get; init; }
+
+    /// <summary>
+    /// Ordered list of credential plugin IDs this project prefers. When set,
+    /// only the listed plugin IDs are included in the credential chain for this
+    /// project, in the order given (between the built-in OAuth-file provider and
+    /// the env-var fallback). Plugins not in this list are skipped. An empty
+    /// list means "use all discovered plugins in global discovery order."
+    ///
+    /// <para>Example: <c>["myorg.vault-creds", "myorg.aws-ssm"]</c> — the chain
+    /// tries Vault first, then AWS SSM, and falls back to env vars. A plugin
+    /// installed but not listed (e.g. "myorg.1password") is not tried.</para>
+    ///
+    /// <para>See <c>docs/credential-plugins.md</c> for the full chain-order
+    /// rationale and per-project override semantics.</para>
+    /// </summary>
+    public IReadOnlyList<string> CredentialProviderPriority { get; init; } = [];
 }
 
 /// <summary>
@@ -185,6 +201,15 @@ public sealed record ProjectUpstream
     /// is empty the generator is skipped and the static template is used.
     /// </summary>
     public ProjectPrDescription PrDescription { get; init; } = new();
+
+    /// <summary>
+    /// Plugin-specific key/value settings passed to the upstream remote plugin
+    /// named by <see cref="Kind"/>. Plugin authors document which keys they read.
+    /// Accessible at runtime via
+    /// <c>IUpstreamPluginHost.GetProjectUpstreamConfig(projectId)</c>.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> PluginConfig { get; init; }
+        = new Dictionary<string, string>();
 
     public static ProjectUpstream Noop { get; } = new();
 }
@@ -282,6 +307,16 @@ public sealed record ProjectAudit
     /// </summary>
     public IReadOnlyDictionary<string, AgentKind> PerAuditorAgent { get; init; }
         = new Dictionary<string, AgentKind>();
+
+    /// <summary>
+    /// Maximum number of LLM auditors to run concurrently within an audit
+    /// iteration. Default 3 matches the typical security/completeness/cheating
+    /// set. Set to 1 to disable parallelism and fall back to sequential
+    /// execution — useful for debugging or subscription accounts hitting 429s.
+    /// Each parallel LLM auditor runs in its own sandbox clone to avoid result
+    /// file races. Tool auditors are unaffected and always run sequentially.
+    /// </summary>
+    public int MaxLlmAuditorParallelism { get; init; } = 3;
 }
 
 /// <summary>

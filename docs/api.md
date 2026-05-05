@@ -26,6 +26,10 @@ The default Kestrel bind is `127.0.0.1:5000`. To expose externally,
 front it with a TLS-terminating reverse proxy (nginx, Caddy, …) and set
 `ASPNETCORE_URLS` to the local address the proxy connects to.
 
+## Observability
+
+When OpenTelemetry is enabled (see [`observability.md`](observability.md)), all incoming HTTP requests are automatically traced as spans via `AspNetCore` instrumentation. The `traceparent` response header is set on every request so callers can correlate client-side traces with server-side spans.
+
 ## Endpoints
 
 ### `POST /workitems`
@@ -376,6 +380,91 @@ span multiple models.  `byWorkItem` is sorted by `started_at` descending.
 * Returns `404 Not Found` when the project does not exist.
 * Returns `400 Bad Request` when `from` or `to` cannot be parsed as ISO-8601.
 
+### `GET /workitems/{id}/diff`
+
+Returns the unified diff between the base branch and the work branch for a
+work item's bare repository.
+
+**Content negotiation** — the response format depends on the `Accept` header:
+
+| Accept header | Response |
+|---------------|----------|
+| `application/json` (explicit) | JSON object (see shape below) |
+| anything else | `text/x-diff` raw patch text |
+
+**Response (200 OK, `application/json`):**
+
+```json
+{
+  "workItemId": "aabbccdd-0000-0000-0000-000000000001",
+  "baseBranch": "main",
+  "workBranch": "codeybox/aabbccdd",
+  "baseCommitSha": "abc123...",
+  "workCommitSha": "def456...",
+  "filesChanged": 3,
+  "linesAdded": 42,
+  "linesRemoved": 7,
+  "diff": "diff --git a/foo.cs b/foo.cs\n...",
+  "truncated": false
+}
+```
+
+When the diff exceeds **1 MB** in JSON mode, `truncated` is `true` and `diff`
+ends with:
+
+```
+[... diff truncated at 1 MB. Download the raw diff for full output. ...]
+```
+
+When the diff exceeds **10 MB** in raw mode, the response ends with:
+
+```
+[... diff truncated at 10 MB. ...]
+```
+
+When the diff spans **more than 1 000 files**, the response includes
+`changedFiles` (array of paths) and `hint` instead of the full diff text:
+
+```json
+{
+  "workItemId": "...",
+  "filesChanged": 1234,
+  "truncated": true,
+  "hint": "This diff spans 1234 files and is too large to display inline. Review on GitHub.",
+  "changedFiles": ["src/Foo.cs", "src/Bar.cs", "..."],
+  "diff": null
+}
+```
+
+All diff output is **secret-redacted**: GitHub PATs, Anthropic API keys, and
+Google API keys are replaced with `***` before the response is written.
+
+**Status codes:**
+
+* `200 OK` — diff available (JSON or raw text depending on `Accept`).
+* `204 No Content` — work item exists but no repo yet, or base and work
+  branches are at the same commit (no diff).
+* `400 Bad Request` — `{id}` is not a valid UUID.
+* `404 Not Found` — work item does not exist.
+
+### `GET /workitems/{id}/stdout-tail`
+
+Returns the recent tail of the agent's live stdout, buffered in the orchestrator's
+in-memory ring buffer (capped at 16 KB). Useful for late-joining dashboard clients
+that missed the beginning of a stream. Returns `text/plain; charset=utf-8`.
+
+The content is pre-redacted: GitHub PATs, Anthropic API keys, and Google API keys
+are replaced with `***` before the output ever reaches the buffer.
+
+* Returns `200 OK` with the buffered tail as `text/plain`. Response body is empty
+  when the ring buffer has no entry for this work item (item hasn't started, or
+  orchestrator was restarted since the run).
+* Returns `400 Bad Request` when `{id}` is not a valid GUID.
+* Returns `404 Not Found` when the work item does not exist.
+
+**Note:** This endpoint returns a static snapshot. For a live stream use the
+SignalR hub below.
+
 ### `GET /workitems/{id}/timings`
 
 Returns per-step wall-clock timing data for a single work item as a structured
@@ -479,6 +568,65 @@ Fetch a single project by its id.
 * Returns `400 Bad Request` if `id` is not a valid project identifier.
 * Returns `404 Not Found` if the project does not exist.
 
+### `GET /workers`
+
+List currently-registered worker slots from the heartbeat registry. Useful for operator-grade introspection of what the process is currently doing, and for diagnosing stale rows after a crash.
+
+Response: `200 OK` with a JSON array:
+
+```json
+[
+  {
+    "workerId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "hostName": "codeybox-host-01",
+    "processId": 12345,
+    "startedAt": "2026-05-04T10:00:00.000+00:00",
+    "lastHeartbeatAt": "2026-05-04T10:05:15.000+00:00",
+    "currentWorkItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  }
+]
+```
+
+| Field | Description |
+|---|---|
+| `workerId` | GUID unique to this process start |
+| `hostName` | Hostname of the machine running the worker |
+| `processId` | OS process ID |
+| `startedAt` | When this worker slot registered |
+| `lastHeartbeatAt` | When the heartbeat last fired (updated every `HeartbeatInterval`, default 15 s) |
+| `currentWorkItemId` | UUID of the work item being processed, or `null` if none |
+
+An empty array means no workers are currently registered. A row with a stale `lastHeartbeatAt` means the worker process has crashed and the dead-worker reaper will recover it on the next sweep (or has already done so and the row wasn't cleaned up). See [`recovery.md`](recovery.md) for the full reaper design.
+
+### `GET /sandboxes/leaked`
+
+Returns the list of `codeybox-*` Multipass VMs that were detected as leaked on
+the most recent reaper sweep (default every 15 minutes). An empty array means
+no leaks were found on the last sweep.
+
+```json
+[
+  {
+    "name": "codeybox-a1b2c3d4e5f6",
+    "createdAt": "2026-05-04T02:00:00+00:00",
+    "ageMinutes": 127.3,
+    "diskMb": null
+  }
+]
+```
+
+See [`sandbox-leaks.md`](sandbox-leaks.md) for full leak detection semantics.
+
+### `POST /sandboxes/leaked/{name}/dispose`
+
+Operator-triggered dispose of a leaked sandbox by name. The name must start with
+`codeybox-`. Returns `{ "disposed": "<name>" }` on success.
+
+* Returns `400` if the name does not start with `codeybox-`.
+* Returns `404` if the sandbox is not present in the latest leaked list (use `GET /sandboxes/leaked` to verify it is detected as a leak before calling).
+* Returns `504` if the dispose times out (5-minute per-sandbox cap).
+* Returns `500` on other errors.
+
 ### `GET /healthz`
 
 Liveness probe. Returns `{ "status": "ok" }`.
@@ -539,6 +687,49 @@ GitHub HMAC instead.
 * Repositories not matching any configured project return `202 Accepted` silently.
 
 See [`changelog-automation.md`](changelog-automation.md) for setup instructions.
+
+## SignalR hub — live agent stdout
+
+The orchestrator exposes a SignalR hub at `/hubs/agent-stdout` for streaming
+agent output in real time to connected clients.
+
+### Authentication
+
+The hub endpoint is protected by the same bearer-token middleware as the REST
+API. Pass the token as a request header on the WebSocket upgrade:
+
+```
+Authorization: Bearer <CODEYBOX_API_KEY>
+```
+
+### Hub methods (client → server)
+
+| Method | Arguments | Description |
+|--------|-----------|-------------|
+| `SubscribeAsync` | `workItemId: string` | Join the group for a work item. |
+| `UnsubscribeAsync` | `workItemId: string` | Leave the group for a work item. |
+
+### Hub events (server → client)
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `stdoutChunk` | `{ workItemId, phase, chunk }` | A batch of stdout. `phase` is `"work"`, `"merge"`, or the audit phase name. `chunk` is a pre-redacted UTF-8 string. Chunks are debounced: at most one push per 100 ms or 4 KB, whichever comes first. |
+| `streamComplete` | `{ workItemId }` | Fired when the pipeline exits (success or failure). No more chunks will follow for this work item. |
+
+### Late-joining clients
+
+Clients that connect after an agent has already started can fetch the recent tail
+from `GET /workitems/{id}/stdout-tail` and then subscribe to the hub to receive
+subsequent chunks.
+
+### Security
+
+Secret patterns are redacted **before** they reach the ring buffer or the hub:
+GitHub PATs (`gho_*`, `ghp_*`, `github_pat_*`), Anthropic keys (`sk-ant-*`),
+and Google API keys (`AIza…`) are replaced with `***`. Unknown secret formats
+are **not** redacted — treat agent stdout as potentially sensitive.
+
+The orchestrator never broadcasts the work item prompt over the hub.
 
 ## Work item record
 

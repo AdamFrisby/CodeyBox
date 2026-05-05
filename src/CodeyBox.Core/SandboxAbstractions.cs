@@ -18,7 +18,53 @@ public interface ISandboxProvider
     /// regardless of state.
     /// </summary>
     Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns all sandboxes on the host that belong to this provider
+    /// (i.e. match the <c>codeybox-*</c> naming prefix). Used by the
+    /// <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> to detect
+    /// sandboxes that outlived their work item.
+    ///
+    /// <para>Implementations that have no persistent sandbox lifecycle
+    /// (bubblewrap, process) return an empty list.</para>
+    ///
+    /// <para>Implementations that shell out to an external tool (multipass)
+    /// cache results for a short TTL to avoid hammering the daemon on
+    /// repeated API calls.</para>
+    /// </summary>
+    Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Best-effort dispose of a sandbox by name. Used by the
+    /// <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> when
+    /// <c>AutoDispose=true</c>, and by the
+    /// <c>POST /sandboxes/leaked/{name}/dispose</c> operator endpoint.
+    ///
+    /// <para>Implementations that have no persistent lifecycle (bubblewrap,
+    /// process) are no-ops. Implementations may throw on failure; all callers
+    /// must wrap invocations in try/catch and log the exception.</para>
+    /// </summary>
+    Task DisposeLeakedAsync(string name, CancellationToken ct);
 }
+
+/// <summary>
+/// Snapshot of a sandbox that exists on the host, returned by
+/// <see cref="ISandboxProvider.ListAllManagedAsync"/>.
+/// </summary>
+/// <param name="Name">VM name / namespace ID.</param>
+/// <param name="CreatedAt">Best-effort creation timestamp; null if not derivable.</param>
+/// <param name="DiskBytes">Reported disk usage; null if not available.</param>
+/// <param name="IsTrackedActive">
+/// True when this sandbox was created by the current orchestrator process
+/// and has not yet been disposed. False means the sandbox exists on the
+/// host but the current process has no record of creating it — the primary
+/// indicator of a leak.
+/// </param>
+public sealed record ManagedSandboxInfo(
+    string Name,
+    DateTimeOffset? CreatedAt,
+    long? DiskBytes,
+    bool IsTrackedActive);
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable
@@ -125,6 +171,15 @@ public sealed record SandboxExec
     public string? WorkingDirectory { get; init; }
     public IReadOnlyDictionary<string, string>? ExtraEnvironment { get; init; }
     public string? Stdin { get; init; }
+
+    /// <summary>
+    /// Optional callback invoked per stdout chunk as the process emits it.
+    /// Sandbox provider best-effort: chunks may aggregate or split arbitrarily;
+    /// receiver MUST not rely on line boundaries. Called from arbitrary
+    /// threads; receiver is responsible for thread safety.
+    /// </summary>
+    public Action<string>? StdoutChunkCallback { get; init; }
+    public Action<string>? StderrChunkCallback { get; init; }
 }
 
 public sealed record SandboxExecResult(int ExitCode, string Stdout, string Stderr)

@@ -1,5 +1,6 @@
 using Bunit;
 using Microsoft.Extensions.DependencyInjection;
+using CodeyBox.Admin.Web;
 using CodeyBox.Admin.Web.Models;
 using CodeyBox.Admin.Web.Services;
 using WorkItemDetailPage = CodeyBox.Admin.Web.Components.Pages.WorkItemDetail;
@@ -8,6 +9,12 @@ namespace CodeyBox.Admin.Tests;
 
 public sealed class WorkItemDetailPageTests : TestContext
 {
+    public WorkItemDetailPageTests()
+    {
+        // OrchestratorHubSettings is injected by WorkItemDetail; empty URL skips the live hub connection.
+        Services.AddSingleton(new OrchestratorHubSettings("", null));
+    }
+
     private static WorkItemDto MakeItem(string id, string title, string state = "Queued") => new()
     {
         Id = id,

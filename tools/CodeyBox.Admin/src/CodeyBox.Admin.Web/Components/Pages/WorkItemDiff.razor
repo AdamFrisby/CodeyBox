@@ -1,0 +1,230 @@
+@page "/work-items/{Id}/diff"
+@inject ICodeyBoxApiClient ApiClient
+@inject IConfiguration Configuration
+@inject ILogger<WorkItemDiff> Logger
+@using System.Text.Encodings.Web
+
+@*
+  Diff tab — server-side rendered unified diff view.
+
+  Dependency decision: diff2html (NPM) is listed in the work item spec as the
+  preferred renderer. However, importing a precompiled JS bundle conflicts with
+  the dashboard's no-external-JS-frameworks policy (see README) and requires
+  an out-of-band download step that can't be automated here. The spec explicitly
+  offers server-side Razor rendering as an alternative: "More code, but zero JS
+  dependency." That is the approach taken here. The diff is parsed and rendered
+  as styled HTML entirely on the server; no client-side JS is required beyond
+  Blazor's own runtime.
+*@
+
+<PageTitle>Diff — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found or diff not available yet.</p>
+}
+else if (_noDiff)
+{
+    <h1>Diff — <a href="/work-items/@Id">@Id[..Math.Min(8, Id.Length)]</a></h1>
+    <p class="diff-empty">No diff available yet. The agent may not have pushed to the work branch.</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_diff is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <h1>Diff — <a href="/work-items/@Id">@Id[..Math.Min(8, Id.Length)]</a></h1>
+
+    <div class="diff-toolbar">
+        <span class="diff-summary">
+            <span class="diff-added">+@_diff.LinesAdded</span>
+            <span class="diff-removed">-@_diff.LinesRemoved</span>
+            across @_diff.FilesChanged file@(_diff.FilesChanged == 1 ? "" : "s")
+        </span>
+
+        <a href="@(ApiBaseUrl)/workitems/@Uri.EscapeDataString(Id)/diff"
+           class="btn diff-patch-link"
+           download="@($"{Id[..Math.Min(8,Id.Length)]}.patch")">
+            Copy as patch ↓
+        </a>
+
+        <label class="diff-ws-toggle">
+            <input type="checkbox" @bind="_showWhitespace" /> Show whitespace
+        </label>
+    </div>
+
+    @if (_diff.Truncated)
+    {
+        <div class="diff-truncated-banner">
+            Diff truncated at 1 MB.
+            <a href="@(ApiBaseUrl)/workitems/@Uri.EscapeDataString(Id)/diff">Download full patch</a>.
+        </div>
+    }
+
+    @if (_diff.Hint is not null)
+    {
+        <div class="diff-truncated-banner">@_diff.Hint</div>
+    }
+
+    @if (_fileList.Count > 0)
+    {
+        <div class="diff-file-list">
+            <strong>Files changed:</strong>
+            <ul>
+                @foreach (var f in _fileList)
+                {
+                    <li><a href="#@FileAnchor(f)">@f</a></li>
+                }
+            </ul>
+        </div>
+    }
+
+    @foreach (var section in _parsedSections)
+    {
+        <section class="diff-file-section" id="@FileAnchor(section.FilePath)">
+            <div class="diff-file-header-bar">@(section.FilePath)</div>
+            <div class="diff-view @(_showWhitespace ? "diff-ws-visible" : "")">
+                @foreach (var line in section.Lines)
+                {
+                    <div class="@line.CssClass">@RenderLine(line)</div>
+                }
+            </div>
+        </section>
+    }
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private WorkItemDiffDto? _diff;
+    private string? _error;
+    private bool _notFound;
+    private bool _noDiff;
+    private bool _showWhitespace = true;
+
+    private List<string> _fileList = [];
+    private List<DiffSection> _parsedSections = [];
+
+    protected override async Task OnParametersSetAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        _noDiff = false;
+        _fileList = [];
+        _parsedSections = [];
+
+        try
+        {
+            _diff = await ApiClient.GetWorkItemDiffAsync(Id);
+            if (_diff is null)
+            {
+                _noDiff = true;
+                return;
+            }
+            _parsedSections = ParseDiff(_diff.Diff);
+            _fileList = _parsedSections.Count > 0
+                ? _parsedSections.Select(s => s.FilePath).ToList()
+                : _diff.ChangedFiles;
+        }
+        catch (HttpRequestException ex) when ((int?)ex.StatusCode == 404)
+        {
+            _notFound = true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load diff for {Id}", Id);
+            _error = "Failed to load diff. Check server logs for details.";
+        }
+    }
+
+    private string ApiBaseUrl =>
+        (Configuration.GetValue<string>("CodeyBoxAdmin:ApiBaseUrl") ?? "http://localhost:5050").TrimEnd('/');
+
+    private MarkupString RenderLine(DiffLine line)
+    {
+        if (!_showWhitespace || line.CssClass is not ("diff-add" or "diff-del"))
+            return (MarkupString)HtmlEncoder.Default.Encode(line.Content);
+
+        var encoded = HtmlEncoder.Default.Encode(line.Content);
+        var marked = encoded
+            .Replace(" ", "<span class=\"diff-ws-char\">·</span>")
+            .Replace("\t", "<span class=\"diff-ws-char\">→</span>");
+        return (MarkupString)marked;
+    }
+
+    private static string FileAnchor(string filePath) =>
+        filePath.Replace("/", "-").Replace(".", "-").Replace("_", "-");
+
+    private static List<DiffSection> ParseDiff(string? diffText)
+    {
+        if (string.IsNullOrEmpty(diffText)) return [];
+
+        var result = new List<DiffSection>();
+        DiffSection? current = null;
+
+        foreach (var line in diffText.Split('\n'))
+        {
+            if (line.StartsWith("diff --git ", StringComparison.Ordinal))
+            {
+                // "diff --git a/path/to/file b/path/to/file"
+                var remainder = line["diff --git a/".Length..];
+                var spaceB = remainder.IndexOf(" b/", StringComparison.Ordinal);
+                var filePath = spaceB >= 0 ? remainder[..spaceB] : remainder;
+                current = new DiffSection(filePath, []);
+                result.Add(current);
+            }
+            else if (current is not null)
+            {
+                var cssClass = GetLineCssClass(line);
+                current.Lines.Add(new DiffLine(line, cssClass));
+            }
+            else if (line.StartsWith("--- ", StringComparison.Ordinal) ||
+                     line.StartsWith("+++ ", StringComparison.Ordinal))
+            {
+                // Fallback: no "diff --git" header (plain patch format).
+                var filePath = line.Length > 4 ? line[4..].TrimStart('a', '/', 'b') : line;
+                if (line.StartsWith("--- ", StringComparison.Ordinal))
+                {
+                    current = new DiffSection(filePath.TrimStart('/'), []);
+                    result.Add(current);
+                }
+                current?.Lines.Add(new DiffLine(line, GetLineCssClass(line)));
+            }
+        }
+
+        return result;
+    }
+
+    private static string GetLineCssClass(string line)
+    {
+        if (line.StartsWith("+++ ", StringComparison.Ordinal) ||
+            line.StartsWith("--- ", StringComparison.Ordinal) ||
+            line.StartsWith("index ", StringComparison.Ordinal))
+            return "diff-meta";
+
+        if (line.StartsWith("@@", StringComparison.Ordinal))
+            return "diff-hunk";
+
+        if (line.StartsWith("+", StringComparison.Ordinal))
+            return "diff-add";
+
+        if (line.StartsWith("-", StringComparison.Ordinal))
+            return "diff-del";
+
+        return "diff-ctx";
+    }
+
+    private sealed record DiffLine(string Content, string CssClass);
+    private sealed class DiffSection(string filePath, List<DiffLine> lines)
+    {
+        public string FilePath { get; } = filePath;
+        public List<DiffLine> Lines { get; } = lines;
+    }
+}

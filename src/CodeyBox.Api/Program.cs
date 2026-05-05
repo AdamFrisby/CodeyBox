@@ -1,10 +1,15 @@
 using Microsoft.Extensions.Options;
+using OpenTelemetry.Exporter;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Api;
+using CodeyBox.Api.Hubs;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -116,6 +121,41 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
     builder.Host.UseSerilog();
 }
 
+// ── OpenTelemetry ─────────────────────────────────────────────────────────
+// Off by default (OtelOptions.Enabled = false). Operators opt in by setting
+// CodeyBox:Otel:Enabled=true and CodeyBox:Otel:OtlpEndpoint. When disabled,
+// no OTel types are registered — zero overhead in the default configuration.
+{
+    var cbConf = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
+        ?? new CodeyBoxOptions();
+    var otelOpts = cbConf.Otel;
+    OtelOptions.Validate(otelOpts);
+
+    if (otelOpts.Enabled)
+    {
+        builder.Services.AddOpenTelemetry()
+            .ConfigureResource(r => r
+                .AddService(otelOpts.ServiceName, serviceVersion: otelOpts.ServiceVersion)
+                .AddAttributes(otelOpts.ResourceAttributes.Select(
+                    kv => new KeyValuePair<string, object>(kv.Key, kv.Value))))
+            .WithTracing(t => t
+                .AddSource("CodeyBox.Pipeline")
+                .AddSource("CodeyBox.Sandbox")
+                .AddSource("CodeyBox.Upstream")
+                .AddSource("CodeyBox.Audit")
+                .AddAspNetCoreInstrumentation()
+                .AddHttpClientInstrumentation()
+                .AddOtlpExporter(o => ConfigureOtlp(o, otelOpts)))
+            .WithMetrics(m => m
+                .AddMeter("CodeyBox.Pipeline")
+                .AddMeter("CodeyBox.Sandbox")
+                .AddMeter("CodeyBox.Audit")
+                .AddMeter("CodeyBox.Upstream")
+                .AddRuntimeInstrumentation()
+                .AddOtlpExporter(o => ConfigureOtlp(o, otelOpts)));
+    }
+}
+
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
 builder.Services.Configure<ProjectsOptions>(builder.Configuration.GetSection("CodeyBox"));
 
@@ -133,6 +173,16 @@ ApiKeyAuth.Configure(builder);
 //                 kernel. Single 'snap install multipass' on Ubuntu, no
 //                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
+
+static void ConfigureOtlp(OtlpExporterOptions o, OtelOptions opts)
+{
+    o.Endpoint = new Uri(opts.OtlpEndpoint!);
+    o.Protocol = opts.ExportProtocol == "httpprotobuf"
+        ? OtlpExportProtocol.HttpProtobuf
+        : OtlpExportProtocol.Grpc;
+    if (!string.IsNullOrEmpty(opts.OtlpHeaders))
+        o.Headers = opts.OtlpHeaders;
+}
 
 static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
 {
@@ -206,11 +256,30 @@ static IReadOnlyList<AgentClass> BuildAndValidateAgentClasses(
             if (!Enum.TryParse<AgentBilling>(m.Billing, ignoreCase: true, out var billing))
                 throw new InvalidOperationException(
                     $"AgentClass '{classOpts.Id}': unknown Billing '{m.Billing}'. Expected Subscription or PayPerApi");
+            if (m.QualityScore is null)
+                throw new InvalidOperationException(
+                    $"AgentClass '{classOpts.Id}': member '{m.Agent}' is missing QualityScore. " +
+                    $"Add QualityScore=N (0–200); see docs/agent-classes.md for recommended values.");
+            var score = m.QualityScore.Value;
+            if (score < 0 || score > 200)
+                throw new InvalidOperationException(
+                    $"AgentClass '{classOpts.Id}': member '{m.Agent}' has QualityScore={score} which is outside the valid range 0–200.");
+            // Gemini at frontier-adjacent tier REQUIRES ReasoningMode="high" — running
+            // standard-reasoning Gemini in a >=90 slot misrepresents its capability.
+            var agentKind = new AgentKind(m.Agent);
+            if (agentKind == AgentKind.Gemini && score >= 90 &&
+                !string.Equals(m.ReasoningMode, "high", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"AgentClass '{classOpts.Id}': Gemini member with QualityScore={score} (≥90) requires " +
+                    $"ReasoningMode=\"high\". Either set ReasoningMode=\"high\" (requires @google/gemini-cli ≥0.1.9 " +
+                    $"with --thinking support; install via MultipassExtraRuncmd) or lower QualityScore below 90.");
             members.Add(new AgentMembership
             {
-                Agent = new AgentKind(m.Agent),
+                Agent = agentKind,
                 Billing = billing,
                 ModelId = m.ModelId,
+                QualityScore = score,
+                ReasoningMode = m.ReasoningMode,
             });
         }
 
@@ -228,6 +297,78 @@ static IReadOnlyList<AgentClass> BuildAndValidateAgentClasses(
                 : classOpts.DisplayName,
             Members = members,
         });
+    }
+
+    return result;
+}
+
+static IReadOnlyList<ParsedTodModifier> BuildAndValidateTodModifiers(
+    AgentScoreModifiersOptions opts, ILogger log)
+{
+    // Allowed day-code → DayOfWeek mapping (three-letter abbreviations).
+    var dayMap = new Dictionary<string, DayOfWeek>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Mon"] = DayOfWeek.Monday,
+        ["Tue"] = DayOfWeek.Tuesday,
+        ["Wed"] = DayOfWeek.Wednesday,
+        ["Thu"] = DayOfWeek.Thursday,
+        ["Fri"] = DayOfWeek.Friday,
+        ["Sat"] = DayOfWeek.Saturday,
+        ["Sun"] = DayOfWeek.Sunday,
+    };
+
+    var result = new List<ParsedTodModifier>();
+    foreach (var entry in opts.ByTimeOfDay)
+    {
+        if (string.IsNullOrWhiteSpace(entry.Agent))
+            throw new InvalidOperationException("AgentScoreModifiers.ByTimeOfDay: entry is missing Agent value");
+
+        if (Math.Abs(entry.Modifier) > 5)
+            throw new InvalidOperationException(
+                $"AgentScoreModifiers.ByTimeOfDay: modifier for '{entry.Agent}' is {entry.Modifier}; " +
+                $"absolute value must be ≤ 5. Modifiers are tiebreakers, not eligibility gates. " +
+                $"Use MinModelScore on the work item to gate by capability.");
+
+        var parsedWindows = new List<ParsedTimeWindow>();
+        foreach (var w in entry.Windows)
+        {
+            var days = new HashSet<DayOfWeek>();
+            foreach (var d in w.Days)
+            {
+                if (!dayMap.TryGetValue(d, out var dow))
+                    throw new InvalidOperationException(
+                        $"AgentScoreModifiers.ByTimeOfDay: unknown day code '{d}' for agent '{entry.Agent}'. " +
+                        $"Valid codes: Mon, Tue, Wed, Thu, Fri, Sat, Sun.");
+                days.Add(dow);
+            }
+            if (days.Count == 0)
+                throw new InvalidOperationException(
+                    $"AgentScoreModifiers.ByTimeOfDay: window for agent '{entry.Agent}' has no days.");
+
+            if (!TimeSpan.TryParseExact(w.StartUtc, @"hh\:mm", null, out var start))
+                throw new InvalidOperationException(
+                    $"AgentScoreModifiers.ByTimeOfDay: StartUtc '{w.StartUtc}' for agent '{entry.Agent}' is not a valid HH:mm time.");
+            if (!TimeSpan.TryParseExact(w.EndUtc, @"hh\:mm", null, out var end))
+                throw new InvalidOperationException(
+                    $"AgentScoreModifiers.ByTimeOfDay: EndUtc '{w.EndUtc}' for agent '{entry.Agent}' is not a valid HH:mm time.");
+
+            parsedWindows.Add(new ParsedTimeWindow(days, start, end));
+        }
+
+        result.Add(new ParsedTodModifier(new AgentKind(entry.Agent), entry.Modifier, parsedWindows));
+    }
+
+    // Log active windows so operators can audit the schedule at startup.
+    if (result.Count > 0)
+    {
+        foreach (var mod in result)
+        {
+            var windowDescs = mod.Windows.Select(w =>
+                $"[{string.Join(",", w.Days)} {w.Start:hh\\:mm}–{w.End:hh\\:mm} UTC]");
+            log.LogInformation(
+                "AgentScoreModifiers: agent={Agent} modifier={Modifier:+0;-0} windows={Windows}",
+                mod.Agent.Value, mod.Modifier, string.Join(", ", windowDescs));
+        }
     }
 
     return result;
@@ -266,19 +407,42 @@ builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 
+// Plugin discovery result captured before builder.Build() so the credential
+// provider factory below can reference the list directly without any async
+// blocking. Populated by AddCodeyBoxPlugins (called in the plugin-foundation
+// section near the end of service registration).
+IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
+
 // --- Credentials -------------------------------------------------------------
 // Each agent's API key has a per-agent host env var that maps to the
 // canonical sandbox env var the agent CLI reads. Operators add new agents
 // by appending to this list (or registering a different ICredentialProvider).
 //
-// The chain reads Claude's OAuth token fresh from a JSON file (default
-// ~/.claude/.credentials.json, the path the local `claude` CLI refreshes
-// in-place) on every pickup, so a host-side token rotation is picked up
-// without an orchestrator restart. If the file is absent or empty, the
-// env-var provider supplies the value the host launcher exported.
-builder.Services.AddSingleton<ICredentialProvider>(sp =>
+// Chain order: BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV.
+//
+// 1. ClaudeOAuthFileCredentialProvider — reads Claude's token fresh from a
+//    JSON file (default ~/.claude/.credentials.json, the path the local
+//    `claude` CLI refreshes in-place) on every pickup, so a host-side token
+//    rotation is picked up without an orchestrator restart.
+// 2. Plugin ICredentialProvider implementations — inserted in discovery order
+//    (between OAuth-file and env-var). Vault-issued short-lived credentials
+//    are preferred over env-var fallbacks. Per-project ordering is expressed
+//    via Project.CredentialProviderPriority; see docs/credential-plugins.md.
+// 3. EnvironmentCredentialProvider — catch-all fallback reading host env vars.
+//
+// Operators with no credential plugins see zero behaviour change: the chain
+// is identical to the pre-plugin OAuth-file → env-var behaviour.
+//
+// ChainedCredentialProvider is registered under three service types so that:
+//   - ICredentialProvider resolves the global chain (smoke gates, startup validation).
+//   - IProjectAwareCredentialProvider lets PipelineRunner apply per-project
+//     CredentialProviderPriority at agent pickup time.
+//   - ChainedCredentialProvider is directly resolvable for callers that need both.
+builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
 {
-    var providers = new List<ICredentialProvider>();
+    var builtInFirst = new List<ICredentialProvider>();
+    var namedPlugins = new List<(string Id, ICredentialProvider Provider)>();
+    var builtInLast = new List<ICredentialProvider>();
 
     var oauthFile =
         Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_OAUTH_FILE")
@@ -292,13 +456,30 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
             oauthFile = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 oauthFile[2..]);
-        providers.Add(new ClaudeOAuthFileCredentialProvider(
+        builtInFirst.Add(new ClaudeOAuthFileCredentialProvider(
             oauthFile,
             sandboxEnvVar: "CLAUDE_CODE_OAUTH_TOKEN",
             sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
     }
 
-    providers.Add(new EnvironmentCredentialProvider(new[]
+    // Enumerate plugin-registered ICredentialProvider types using the list captured
+    // from AddCodeyBoxPlugins (called before builder.Build()). Each plugin type is
+    // registered in DI under its concrete type by PluginLoader.RegisterPlugins;
+    // we resolve by concrete type (not by ICredentialProvider) to avoid resolving
+    // the ChainedCredentialProvider itself and causing infinite recursion.
+    // Plugin IDs are stored alongside providers so per-project
+    // CredentialProviderPriority can filter and reorder them at pickup time.
+    var credentialProviderType = typeof(ICredentialProvider);
+    foreach (var plugin in preDiscoveredPlugins ?? [])
+    {
+        foreach (var type in plugin.RegisteredTypes)
+        {
+            if (credentialProviderType.IsAssignableFrom(type))
+                namedPlugins.Add((plugin.PluginId, (ICredentialProvider)sp.GetRequiredService(type)));
+        }
+    }
+
+    builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         // Claude Code accepts either ANTHROPIC_API_KEY (real API key, format
         // sk-ant-api03-…) or CLAUDE_CODE_OAUTH_TOKEN (OAuth access token,
@@ -312,8 +493,14 @@ builder.Services.AddSingleton<ICredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
     }));
 
-    return new ChainedCredentialProvider(providers);
+    return new ChainedCredentialProvider(
+        builtInFirst,
+        namedPlugins,
+        builtInLast,
+        log: sp.GetService<ILogger<ChainedCredentialProvider>>());
 });
+builder.Services.AddSingleton<ICredentialProvider>(sp => sp.GetRequiredService<ChainedCredentialProvider>());
+builder.Services.AddSingleton<IProjectAwareCredentialProvider>(sp => sp.GetRequiredService<ChainedCredentialProvider>());
 
 // --- HTTP clients ------------------------------------------------------------
 // Named client for GitHub upstream. GitHub requires a User-Agent header.
@@ -381,11 +568,16 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
     // Build and validate the catalog.
     var catalog = BuildAndValidateAgentClasses(cbOpts.AgentClasses, startupLog);
 
+    // Build and validate time-of-day score modifiers.
+    var todModifiers = BuildAndValidateTodModifiers(cbOpts.AgentScoreModifiers, startupLog);
+
     return new AgentClassRouter(
         catalog,
         sp.GetServices<IAgentQuotaProbe>(),
         sp.GetRequiredService<QuotaRouterOptions>(),
-        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentClassRouter>());
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentClassRouter>(),
+        TimeProvider.System,
+        todModifiers);
 });
 
 // --- Credential smoke probes -------------------------------------------------
@@ -533,6 +725,16 @@ builder.Services.AddSingleton<IChangelogGenerator>(sp =>
     }
 }
 
+// --- SignalR (live agent stdout) ----------------------------------------------
+// AgentStdoutHub requires no additional packages on ASP.NET Core 8+.
+// Auth is enforced by the existing ApiKeyAuth middleware on the HTTP upgrade
+// request — the hub itself needs no [Authorize] attribute because no ASP.NET
+// Core authentication scheme is registered.
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<AgentStdoutBroadcastService>();
+builder.Services.AddSingleton<IStdoutBroadcaster>(sp =>
+    sp.GetRequiredService<AgentStdoutBroadcastService>());
+
 // --- Audit timeline reader ---------------------------------------------------
 builder.Services.AddSingleton(sp =>
 {
@@ -573,6 +775,26 @@ builder.Services.AddSingleton<IQueueController>(sp =>
 });
 builder.Services.AddSingleton<InMemoryTaskQueue>();
 builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTaskQueue>());
+
+// --- Dead-worker registry + reaper -------------------------------------------
+builder.Services.AddSingleton<IWorkerRegistry>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteWorkerRegistry(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteWorkerRegistry>>());
+});
+builder.Services.AddSingleton<DeadWorkerOptions>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.DeadWorker;
+    opts.Validate();
+    return opts;
+});
+builder.Services.AddSingleton<DeadWorkerReaper>(sp => new DeadWorkerReaper(
+    sp.GetRequiredService<IWorkerRegistry>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<DeadWorkerOptions>(),
+    sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
+    sp.GetRequiredService<IWebhookDispatcher>()));
 
 // --- Agent cost extractors + calculator ------------------------------------
 builder.Services.AddSingleton<AgentCostCalculator>(sp =>
@@ -639,7 +861,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     null,
     sp.GetRequiredService<IWorkItemCostStore>(),
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(),
-    sp.GetRequiredService<AgentCostCalculator>()));
+    sp.GetRequiredService<AgentCostCalculator>(),
+    sp.GetRequiredService<IStdoutBroadcaster>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
@@ -659,8 +882,12 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<AgentClassRouter>(),
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
-    sp.GetRequiredService<IWebhookDispatcher>()));
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IWorkerRegistry>(),
+    sp.GetRequiredService<DeadWorkerOptions>(),
+    sp.GetRequiredService<DeadWorkerReaper>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetServices<IAgentSmokeProbe>(),
@@ -676,12 +903,23 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog.RetainedDays,
     sp.GetRequiredService<ILogger<AuditReportRetentionService>>()));
 
+builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.SandboxLeak;
+    return new SandboxLeakReaper(
+        sp.GetRequiredService<ISandboxProvider>(),
+        sp.GetRequiredService<IWebhookDispatcher>(),
+        opts,
+        sp.GetRequiredService<ILogger<SandboxLeakReaper>>());
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
+
 // --- Plugin foundation -------------------------------------------------------
 // Discovers assemblies from CodeyBox:Plugins, registers plugin types under
 // their Core interfaces before the container is frozen, then runs
 // IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
 // See docs/plugins.md for author guidance, allowlist config, and threat model.
-builder.Services.AddCodeyBoxPlugins(builder.Configuration);
+preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
 
 var app = builder.Build();
 
@@ -690,10 +928,14 @@ app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
 WorkItemEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
+WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
+WorkerRegistryEndpoints.Map(app);
+SandboxEndpoints.Map(app);
 
+app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
 try
@@ -727,6 +969,9 @@ namespace CodeyBox.Api
 
         /// <summary>Worker pool sizing and spawn-pacing configuration.</summary>
         public WorkerPoolOptions WorkerPool { get; set; } = new();
+
+        /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
+        public DeadWorkerOptions DeadWorker { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
@@ -819,14 +1064,86 @@ namespace CodeyBox.Api
         /// <summary>Quota router tuning knobs.</summary>
         public QuotaRouterConfig QuotaRouter { get; set; } = new();
 
+        /// <summary>
+        /// Time-of-day score modifiers. Applied as small effective-score adjustments
+        /// to act as tiebreakers between near-equivalent models during peak cost windows.
+        /// See docs/configuration.md for the schedule schema.
+        /// </summary>
+        public AgentScoreModifiersOptions AgentScoreModifiers { get; set; } = new();
+
         /// <summary>Credential smoke test tuning knobs.</summary>
         public SmokeConfig Smoke { get; set; } = new();
 
         /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
         public AgentPricingOptions AgentPricing { get; set; } = new();
 
+        /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
+        public OtelOptions Otel { get; set; } = new();
+
         /// <summary>Changelog automation configuration. See docs/changelog-automation.md.</summary>
         public ChangelogOptions Changelog { get; set; } = new();
+
+        /// <summary>
+        /// Sandbox leak reaper configuration. The reaper periodically scans for
+        /// <c>codeybox-*</c> Multipass VMs that outlived their work item and logs
+        /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
+        /// </summary>
+        public SandboxLeakOptions SandboxLeak { get; set; } = new();
+    }
+
+    /// <summary>
+    /// OpenTelemetry export configuration. Bound from <c>CodeyBox:Otel</c>.
+    /// Off by default — set <see cref="Enabled"/> to true to opt in.
+    /// </summary>
+    public sealed class OtelOptions
+    {
+        /// <summary>Enable OTel export. Default false. Nothing is registered when false.</summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>OTel service.name resource attribute. Default "codeybox".</summary>
+        public string ServiceName { get; set; } = "codeybox";
+
+        /// <summary>OTel service.version — typically a git SHA or release tag.</summary>
+        public string? ServiceVersion { get; set; }
+
+        /// <summary>OTLP collector endpoint, e.g. http://localhost:4317.</summary>
+        public string? OtlpEndpoint { get; set; }
+
+        /// <summary>
+        /// Optional CSV of extra headers forwarded to the OTLP collector,
+        /// e.g. <c>x-honeycomb-team=abc,x-dataset=prod</c>.
+        /// </summary>
+        public string? OtlpHeaders { get; set; }
+
+        /// <summary>OTLP wire format. Either <c>grpc</c> (default) or <c>httpprotobuf</c>.</summary>
+        public string ExportProtocol { get; set; } = "grpc";
+
+        /// <summary>Extra OTel resource attributes merged into every span and metric point.</summary>
+        public Dictionary<string, string> ResourceAttributes { get; set; } = [];
+
+        /// <summary>
+        /// Validates the options, throwing <see cref="InvalidOperationException"/> when
+        /// <see cref="Enabled"/> is true and the configuration is incomplete or invalid.
+        /// Safe to call when disabled — no-ops immediately.
+        /// </summary>
+        public static void Validate(OtelOptions opts)
+        {
+            if (!opts.Enabled) return;
+
+            if (string.IsNullOrWhiteSpace(opts.OtlpEndpoint))
+                throw new InvalidOperationException(
+                    "CodeyBox:Otel:OtlpEndpoint must be set when CodeyBox:Otel:Enabled=true.");
+
+            if (!Uri.TryCreate(opts.OtlpEndpoint, UriKind.Absolute, out var endpointUri)
+                || endpointUri.Scheme is not "http" and not "https")
+                throw new InvalidOperationException(
+                    $"CodeyBox:Otel:OtlpEndpoint '{opts.OtlpEndpoint}' is not a valid http/https URL.");
+
+            if (opts.ExportProtocol is not "grpc" and not "httpprotobuf")
+                throw new InvalidOperationException(
+                    $"CodeyBox:Otel:ExportProtocol '{opts.ExportProtocol}' is not valid. " +
+                    "Expected 'grpc' or 'httpprotobuf'.");
+        }
     }
 
     /// <summary>
@@ -901,6 +1218,16 @@ namespace CodeyBox.Api
         public string Billing { get; set; } = "Subscription";
         /// <summary>Optional model override, e.g. "claude-opus-4-7".</summary>
         public string? ModelId { get; set; }
+        /// <summary>
+        /// Operator-curated capability score (0–200). Required; no silent default.
+        /// See docs/agent-classes.md for recommended seed values.
+        /// </summary>
+        public int? QualityScore { get; set; }
+        /// <summary>
+        /// Optional reasoning-effort knob, e.g. "high". Required for Gemini
+        /// members with QualityScore >= 90.
+        /// </summary>
+        public string? ReasoningMode { get; set; }
     }
 
     /// <summary>Quota router tuning. Bound from CodeyBox:QuotaRouter.</summary>
@@ -912,6 +1239,42 @@ namespace CodeyBox.Api
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
         public int QuotaCacheTtlSeconds { get; set; } = 60;
+    }
+
+    /// <summary>
+    /// Top-level score-modifier config. Bound from <c>CodeyBox:AgentScoreModifiers</c>.
+    /// </summary>
+    public sealed class AgentScoreModifiersOptions
+    {
+        /// <summary>Time-of-day modifier entries.</summary>
+        public List<TimeOfDayModifierOptions> ByTimeOfDay { get; set; } = [];
+    }
+
+    /// <summary>One time-of-day modifier entry.</summary>
+    public sealed class TimeOfDayModifierOptions
+    {
+        /// <summary>Agent kind value, e.g. "claude".</summary>
+        public string Agent { get; set; } = string.Empty;
+        /// <summary>
+        /// Score delta applied during matching windows. Negative values reduce
+        /// effective score; positive values increase it. Bounded to ±5 at startup.
+        /// </summary>
+        public int Modifier { get; set; }
+        /// <summary>Human annotation for config readability; not used at runtime.</summary>
+        public string? Comment { get; set; }
+        /// <summary>Windows during which the modifier is active.</summary>
+        public List<TimeWindowOptions> Windows { get; set; } = [];
+    }
+
+    /// <summary>A single UTC time window within a week.</summary>
+    public sealed class TimeWindowOptions
+    {
+        /// <summary>Three-letter day codes: Mon, Tue, Wed, Thu, Fri, Sat, Sun.</summary>
+        public List<string> Days { get; set; } = [];
+        /// <summary>Window start time in HH:mm UTC (inclusive).</summary>
+        public string StartUtc { get; set; } = "00:00";
+        /// <summary>Window end time in HH:mm UTC (exclusive). Wrap-around is supported (e.g. 22:00–02:00).</summary>
+        public string EndUtc { get; set; } = "00:00";
     }
 
     /// <summary>
