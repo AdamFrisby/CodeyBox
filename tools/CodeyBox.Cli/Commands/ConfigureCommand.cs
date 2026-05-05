@@ -19,7 +19,7 @@ internal static class ConfigureCommand
         var existing = ConfigResolver.LoadConfigFile();
 
         Console.Write($"API base URL [{existing?.ApiBaseUrl ?? "http://localhost:5050"}]: ");
-        var urlInput = await ReadLineAsync(ct);
+        var urlInput = await ReadLineAsync();
         var url = string.IsNullOrWhiteSpace(urlInput)
             ? (existing?.ApiBaseUrl ?? "http://localhost:5050")
             : urlInput.Trim();
@@ -42,10 +42,7 @@ internal static class ConfigureCommand
         Console.WriteLine($"Configuration saved to {ConfigResolver.ConfigFilePath}");
     }
 
-    private static async Task<string?> ReadLineAsync(CancellationToken ct)
-    {
-        return await Task.Run(Console.ReadLine, ct);
-    }
+    private static Task<string?> ReadLineAsync() => Task.Run(Console.ReadLine);
 
     private static string? ReadPassword()
     {

@@ -60,6 +60,8 @@ internal static class QueueAdd
             var flagUrl = ctx.ParseResult.GetValueForOption(apiUrlOpt);
             var flagKey = ctx.ParseResult.GetValueForOption(apiKeyOpt);
 
+            const int MaxPromptLength = 10 * 1024 * 1024; // 10 MB character cap
+
             string? prompt;
             if (promptFile is not null)
             {
@@ -67,6 +69,14 @@ internal static class QueueAdd
                     prompt = await Console.In.ReadToEndAsync(ct);
                 else
                     prompt = await File.ReadAllTextAsync(promptFile, ct);
+
+                if (prompt.Length > MaxPromptLength)
+                {
+                    await Console.Error.WriteLineAsync(
+                        $"Error: prompt exceeds 10 MB limit ({prompt.Length:N0} characters). Use a smaller file.");
+                    ctx.ExitCode = 1;
+                    return;
+                }
             }
             else if (promptText is not null)
             {

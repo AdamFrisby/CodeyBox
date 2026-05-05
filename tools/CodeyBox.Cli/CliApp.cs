@@ -25,7 +25,8 @@ internal static class CliApp
         clientFactory ??= CodeyBoxClient.Create;
 
         var apiUrlOpt = new Option<string?>("--api-url", "Override the orchestrator API base URL");
-        var apiKeyOpt = new Option<string?>("--api-key", "Override the API bearer token");
+        var apiKeyOpt = new Option<string?>("--api-key",
+            "Override the API bearer token (visible in process list on Linux; prefer CODEYBOX_CLI_API_KEY env var in scripts)");
 
         var root = new RootCommand("CodeyBox CLI — interact with the CodeyBox orchestrator REST API");
         root.AddGlobalOption(apiUrlOpt);

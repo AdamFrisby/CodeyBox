@@ -28,6 +28,15 @@ internal static class QueueRetry
             var flagUrl = ctx.ParseResult.GetValueForOption(apiUrlOpt);
             var flagKey = ctx.ParseResult.GetValueForOption(apiKeyOpt);
 
+            string[] validFromValues = ["work", "audit", "merge", "upstream"];
+            if (!validFromValues.Contains(from, StringComparer.OrdinalIgnoreCase))
+            {
+                await Console.Error.WriteLineAsync(
+                    $"Error: --from must be one of: work, audit, merge, upstream (got '{from}').");
+                ctx.ExitCode = 1;
+                return;
+            }
+
             var config = ConfigResolver.Resolve(flagUrl, flagKey);
             if (!config.HasApiKey)
             {

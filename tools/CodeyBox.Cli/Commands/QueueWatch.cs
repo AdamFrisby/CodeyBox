@@ -26,8 +26,12 @@ internal static class QueueWatch
             var ct = ctx.GetCancellationToken();
 
             var id = ctx.ParseResult.GetValueForArgument(idArg);
+            var stream = ctx.ParseResult.GetValueForOption(streamOpt);
             var flagUrl = ctx.ParseResult.GetValueForOption(apiUrlOpt);
             var flagKey = ctx.ParseResult.GetValueForOption(apiKeyOpt);
+
+            if (stream)
+                await Console.Error.WriteLineAsync("Note: streaming not yet available; using state polling.");
 
             var config = ConfigResolver.Resolve(flagUrl, flagKey);
             if (!config.HasApiKey)

@@ -17,7 +17,11 @@ internal sealed class CodeyBoxClient
 
     internal static CodeyBoxClient Create(ResolvedConfig config)
     {
-        var http = new HttpClient { BaseAddress = new Uri(config.ApiBaseUrl) };
+        var http = new HttpClient
+        {
+            BaseAddress = new Uri(config.ApiBaseUrl),
+            Timeout = TimeSpan.FromSeconds(30),
+        };
         if (!string.IsNullOrEmpty(config.ApiKey))
             http.DefaultRequestHeaders.Authorization =
                 new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ApiKey);
@@ -76,6 +80,9 @@ internal sealed class CodeyBoxClient
     {
         if (resp.IsSuccessStatusCode) return;
         var body = await resp.Content.ReadAsStringAsync(ct);
+        // Truncate verbose 5xx bodies to avoid leaking server internals (stack traces, hostnames).
+        if ((int)resp.StatusCode >= 500 && body.Length > 200)
+            body = body[..200] + "... (truncated)";
         throw new CodeyBoxApiException((int)resp.StatusCode, body);
     }
 }

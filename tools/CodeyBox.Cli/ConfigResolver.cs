@@ -52,7 +52,16 @@ internal static class ConfigResolver
     {
         var dir = ConfigDir;
         Directory.CreateDirectory(dir);
+        // Restrict directory to owner-only on Unix so the API key cannot be read by other local users (CWE-732).
+        if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+            File.SetUnixFileMode(dir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var path = ConfigFilePath;
         var json = JsonSerializer.Serialize(config, CliJsonContext.Default.CliConfig);
-        File.WriteAllText(ConfigFilePath, json);
+        File.WriteAllText(path, json);
+        // Restrict file to owner read/write only on Unix.
+        if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 }
