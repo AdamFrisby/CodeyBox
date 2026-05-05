@@ -137,6 +137,38 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task ChainFallsBackToConventionalOpenAiApiKeyForCodex()
+    {
+        const string namespacedVar = "CODEYBOX_TEST_CODEX_API_KEY";
+        const string conventionalVar = "CODEYBOX_TEST_OPENAI_API_KEY";
+        var originalNamespaced = Environment.GetEnvironmentVariable(namespacedVar);
+        var originalConventional = Environment.GetEnvironmentVariable(conventionalVar);
+        Environment.SetEnvironmentVariable(namespacedVar, null);
+        Environment.SetEnvironmentVariable(conventionalVar, "direct-openai-key");
+        try
+        {
+            var chain = new ChainedCredentialProvider([
+                new EnvironmentCredentialProvider([
+                    new AgentCredentialMapping(AgentKind.Codex, namespacedVar, "OPENAI_API_KEY"),
+                ]),
+                new EnvironmentCredentialProvider([
+                    new AgentCredentialMapping(AgentKind.Codex, conventionalVar, "OPENAI_API_KEY"),
+                ]),
+            ]);
+
+            var credential = await chain.GetAsync(AgentKind.Codex);
+
+            Assert.NotNull(credential);
+            Assert.Equal("direct-openai-key", credential!.EnvironmentVariables["OPENAI_API_KEY"]);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(namespacedVar, originalNamespaced);
+            Environment.SetEnvironmentVariable(conventionalVar, originalConventional);
+        }
+    }
+
     private sealed class FixedProvider(AgentCredential credential) : ICredentialProvider
     {
         public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)

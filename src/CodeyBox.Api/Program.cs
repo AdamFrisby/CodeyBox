@@ -513,6 +513,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
     }));
+    builtInLast.Add(new EnvironmentCredentialProvider(new[]
+    {
+        // Also accept the conventional OpenAI SDK variable. This keeps Codex
+        // audit runners authenticated in hosts that inject OPENAI_API_KEY
+        // directly instead of the CodeyBox-namespaced variant above.
+        new AgentCredentialMapping(AgentKind.Codex, "OPENAI_API_KEY", "OPENAI_API_KEY"),
+    }));
 
     return new ChainedCredentialProvider(
         builtInFirst,
