@@ -36,4 +36,23 @@ public interface IWorkItemStore
     /// MaxConcurrentForProject enforcement.
     /// </summary>
     Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Look up a work item by its caller-supplied external ID within a project.
+    /// Returns null when no matching item exists.
+    /// </summary>
+    Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns all work items whose <c>replay_of_work_item_id</c> matches
+    /// <paramref name="sourceId"/>, in creation order (oldest first).
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Clears <c>replay_of_work_item_id</c> for every work item that was a replay of
+    /// <paramref name="sourceId"/>. Called when the source is cancelled so replays
+    /// become orphaned but keep running.
+    /// </summary>
+    Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default);
 }

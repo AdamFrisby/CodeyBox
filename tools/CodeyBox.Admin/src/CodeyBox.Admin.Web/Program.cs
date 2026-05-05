@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using CodeyBox.Admin.Web.Services;
+using CodeyBox.Admin.Web;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -42,15 +43,22 @@ else
 
 // Typed HTTP client for the CodeyBox orchestrator API.
 // The API bearer token is read from the CODEYBOX_API_KEY env var — never written to config files.
+var orchestratorApiKey = Environment.GetEnvironmentVariable("CODEYBOX_API_KEY");
 builder.Services.AddHttpClient<CodeyBoxApiClient>(client =>
 {
     client.BaseAddress = new Uri(apiBaseUrl);
-    var apiKey = Environment.GetEnvironmentVariable("CODEYBOX_API_KEY");
-    if (!string.IsNullOrEmpty(apiKey))
+    if (!string.IsNullOrEmpty(orchestratorApiKey))
         client.DefaultRequestHeaders.Authorization =
-            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", orchestratorApiKey);
 });
 builder.Services.AddScoped<ICodeyBoxApiClient>(sp => sp.GetRequiredService<CodeyBoxApiClient>());
+
+// Live stdout hub settings — used by WorkItemDetail to connect to the
+// orchestrator's SignalR hub for streaming agent output. The hub URL is
+// derived from the orchestrator base URL; the API key authenticates the
+// server-side .NET HubConnection (never sent to the browser).
+var hubUrl = new Uri(new Uri(apiBaseUrl), "/hubs/agent-stdout").ToString();
+builder.Services.AddSingleton(new OrchestratorHubSettings(hubUrl, orchestratorApiKey));
 
 var app = builder.Build();
 

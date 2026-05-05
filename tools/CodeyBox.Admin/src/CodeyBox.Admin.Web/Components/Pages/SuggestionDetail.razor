@@ -21,7 +21,7 @@ else if (_suggestion is not null)
         <span class="@_suggestion.SeverityCss">@_suggestion.Severity</span>
         <span>effort: @_suggestion.EstimatedEffort</span>
         <span>project: @_suggestion.ProjectId</span>
-        <span>from: <a href="/work-items/@_suggestion.SourceWorkItemId">@_suggestion.ShortWorkItemId</a></span>
+        <span>from: <a href="/work-items/@_suggestion.SourceWorkItemId">@_suggestion.ShortWorkItemId</a>@(_sourceExternalId is not null ? $" ({_sourceExternalId})" : "")</span>
         <span>@_suggestion.Age ago</span>
         <span class="state-@_suggestion.State.ToLowerInvariant()">@_suggestion.State</span>
     </div>
@@ -81,6 +81,7 @@ else if (_suggestion is not null)
     [Parameter] public string Id { get; set; } = "";
 
     private SuggestionDto? _suggestion;
+    private string? _sourceExternalId;
     private string? _error;
     private string? _actionError;
     private bool _showDismissModal;
@@ -91,7 +92,12 @@ else if (_suggestion is not null)
         try
         {
             _suggestion = await ApiClient.GetSuggestionAsync(Id);
-            if (_suggestion is null) _error = "Suggestion not found.";
+            if (_suggestion is null) { _error = "Suggestion not found."; return; }
+            if (!string.IsNullOrEmpty(_suggestion.SourceWorkItemId))
+            {
+                var sourceItem = await ApiClient.GetWorkItemAsync(_suggestion.SourceWorkItemId);
+                _sourceExternalId = sourceItem?.ExternalId;
+            }
         }
         catch (Exception ex) { _error = ex.Message; }
     }

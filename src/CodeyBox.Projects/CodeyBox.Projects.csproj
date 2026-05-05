@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit\CodeyBox.Audit.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit.Llm\CodeyBox.Audit.Llm.csproj" />
@@ -12,6 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.7" />
     <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.7" />
   </ItemGroup>
 

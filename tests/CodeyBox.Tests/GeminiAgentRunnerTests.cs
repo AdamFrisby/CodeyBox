@@ -102,6 +102,28 @@ public sealed class GeminiAgentRunnerTests
         Assert.DoesNotContain("--model", sandbox.CapturedExec!.Argv);
     }
 
+    [Fact]
+    public async Task RunAsync_WithReasoningModeHigh_InjectsThinkingFlag()
+    {
+        var sandbox = new CapturingSandbox();
+        var runner = new GeminiAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null, reasoningMode: "high");
+
+        Assert.Contains("--thinking", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithoutReasoningMode_NoThinkingFlag()
+    {
+        var sandbox = new CapturingSandbox();
+        var runner = new GeminiAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null, reasoningMode: null);
+
+        Assert.DoesNotContain("--thinking", sandbox.CapturedExec!.Argv);
+    }
+
     // ── Binary override ───────────────────────────────────────────────────────
 
     [Fact]

@@ -2,9 +2,9 @@
 
 An **agent class** is a named group of interchangeable agents. Instead of
 binding a work item directly to `claude` or `codex`, you bind it to a class
-such as `frontier-coding`. At pickup time the orchestrator probes each class
-member in preference order, picks the first one above the quota threshold,
-and falls back to peers if the preferred one is exhausted.
+such as `frontier-coding`. At pickup time the orchestrator scores each class
+member by capability, applies a small time-of-day modifier if configured, and
+picks the highest-scoring member above the quota threshold.
 
 This solves two real problems:
 
@@ -29,9 +29,10 @@ Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
         "Id": "frontier-coding",
         "DisplayName": "Frontier coding agents",
         "Members": [
-          { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7" },
-          { "Agent": "codex",  "Billing": "Subscription", "ModelId": "codex-5.5" },
-          { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-7" }
+          { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7", "QualityScore": 100 },
+          { "Agent": "codex",  "Billing": "Subscription", "ModelId": "gpt-5.5",         "QualityScore": 100 },
+          { "Agent": "gemini", "Billing": "Subscription", "ModelId": "gemini-3-flash",  "QualityScore": 95, "ReasoningMode": "high" },
+          { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-7", "QualityScore": 100 }
         ]
       }
     ]
@@ -39,13 +40,17 @@ Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
 }
 ```
 
+The JSON order no longer determines preference (effective score does); it is
+only a tiebreaker when scores are equal. Keep the obvious order for readability
+— operators read the config.
+
 ### Fields
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `Id` | yes | Stable identifier used in work items and projects. Case-insensitive. |
 | `DisplayName` | no | Human label for logs. Defaults to `Id`. |
-| `Members` | yes | One or more members in **preference order**. First member is tried first. |
+| `Members` | yes | One or more members. Order is a last-resort tiebreaker; `QualityScore` drives selection. |
 
 ### Member fields
 
@@ -53,7 +58,69 @@ Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
 |-------|----------|-------------|
 | `Agent` | yes | Agent kind value: `claude`, `codex`, `copilot`, `gemini`, or any custom kind. |
 | `Billing` | yes | `Subscription` or `PayPerApi` (see below). |
-| `ModelId` | no | Optional model override passed to the agent CLI. Reserved for CLIs that accept a `--model` flag; currently advisory. |
+| `ModelId` | no | Optional model override passed to the agent CLI as `--model`. |
+| `QualityScore` | **yes** | Operator-curated capability score on a 0–200 scale. No silent default; startup rejects missing scores with a migration message. |
+| `ReasoningMode` | no* | Agent CLI reasoning knob, e.g. `"high"`. *Required for Gemini members with `QualityScore` ≥ 90. |
+
+---
+
+## Quality scores
+
+`QualityScore` is an operator-controlled integer (0–200) that encodes how
+capable the member is relative to its peers. Higher = more capable.
+
+### Recommended seed values
+
+| Model | Score | Notes |
+|-------|-------|-------|
+| `claude-opus-4-7` | **100** | Frontier |
+| `gpt-5.5` | **100** | Frontier, tied |
+| Gemini 3 Flash (high reasoning) | **95** | Frontier-adjacent |
+| `claude-sonnet-4-6`, GPT-5 base | **80** | Mid-tier |
+| Gemini 3 Flash (standard) | **70** | Standard |
+| Claude Haiku, mini variants | **50** | Economy |
+
+These are starting points — adjust them freely. `QualityScore=100` on two
+models means "interchangeable for this work; swap freely".
+
+### How scores drive selection
+
+1. **Floor filter.** Each work item carries a `MinModelScore` (default 95).
+   Members whose *base* score is below the floor are excluded before any quota
+   probe. The router never silently downgrades to a weaker model.
+2. **Effective score.** Time-of-day modifiers (see below) are added to the base
+   score to produce each member's *effective* score for this pickup.
+3. **Sort.** Members are sorted descending by effective score. Ties are broken
+   by billing (`Subscription` before `PayPerApi`), then original config order.
+4. **Quota probe.** Members are probed in sorted order; the first one with
+   sufficient quota wins.
+
+The effective score of a member can drop *below* the floor after a TOD modifier
+is applied — that is intentional. The floor check uses the *base* score because
+TOD modifiers are preference-shaping tiebreakers, not capability gates. A model
+with base score 95 remains eligible even if a −1 modifier makes its effective
+score 94.
+
+### No eligible member
+
+If no member's base score meets the floor, the work item **fails immediately**
+with error `ROUTING_NO_ELIGIBLE: no member of class '...' meets MinModelScore=N`.
+The item is not retried; the operator must lower `MinModelScore` on the item or
+add a capable member to the class.
+
+---
+
+## Time-of-day score modifiers
+
+Small score deltas that fire during defined UTC time windows act as tiebreakers
+between near-equivalent models. See `docs/configuration.md` for the full
+`CodeyBox:AgentScoreModifiers` schema.
+
+**Design intent:** a modifier of −1 is *only* enough to break a tie between two
+models with equal base score (e.g. Opus 100 → effective 99 vs Codex 100 →
+effective 100). It never demotes a genuinely superior model below an inferior
+one (Opus eff 99 still beats Gemini eff 95). Modifiers are bounded to ±5 at
+startup to prevent accidental gating.
 
 ---
 
@@ -79,7 +146,7 @@ quota cap. The orchestrator never waits for PayPerApi members.
 so items are never blocked indefinitely:
 
 ```json
-{ "Agent": "claude", "Billing": "PayPerApi", "ModelId": "claude-opus-4-7" }
+{ "Agent": "claude", "Billing": "PayPerApi", "ModelId": "claude-opus-4-7", "QualityScore": 100 }
 ```
 
 A startup warning is emitted when a class has only Subscription members.
@@ -91,24 +158,26 @@ A startup warning is emitted when a class has only Subscription members.
 On every pickup attempt for a work item with an `AgentClassId`:
 
 1. Resolve the class from the catalog (case-insensitive on `Id`).
-2. For each member in preference order:
-   - If `Billing = PayPerApi`: treat as available (no HTTP call).
-   - Otherwise: call the registered `IAgentQuotaProbe` for the agent kind.
-     - Probe result is cached per probe instance for `QuotaCacheTtl` (default
-       60 s) to avoid hammering the endpoint on every pickup.
-     - Unknown (`AvailablePct < 0`) → fail-open, treat as available.
-   - If `AvailablePct ≥ MinQuotaPct` (or unknown): pick this member and stop.
-3. If no member qualifies:
-   - Class has at least one Subscription member → set `ShouldWait = true`,
-     schedule re-enqueue after `QuotaRecheckInterval`, emit
-     `quota_router.deferred` audit event.
+2. **Filter** members to those whose base `QualityScore ≥ item.MinModelScore`.
+   If none qualify, fail immediately with `ROUTING_NO_ELIGIBLE`.
+3. **Compute effective scores**: `effective = base + sum(active TOD modifiers)`.
+4. **Sort** descending by effective score. Ties: Subscription before PayPerApi,
+   then original config order.
+5. **Probe quota** in sorted order:
+   - `PayPerApi` → treat as available (no HTTP call).
+   - `Subscription` → call the registered `IAgentQuotaProbe`, cache result for
+     `QuotaCacheTtl` (default 60 s).
+   - Unknown (`AvailablePct < 0`) → fail-open, treat as available.
+   - Pick the first member where `AvailablePct ≥ MinQuotaPct` (or unknown).
+6. If no member qualifies (all exhausted):
+   - Class has at least one Subscription member → `ShouldWait = true`,
+     schedule re-enqueue after `QuotaRecheckInterval`.
    - Class has only PayPerApi members → fire the first member anyway (this
      path is unreachable in normal operation since PayPerApi probes always
      return 100 %).
 
 When `AgentClassId` is null and the project has no `DefaultAgentClass`, the
-router is skipped entirely — no probe call, no wait, identical to the
-pre-quota-router behaviour.
+router is skipped entirely — no probe call, no wait.
 
 ---
 
@@ -190,10 +259,27 @@ Set via the `POST /workitems` API:
 When set, the orchestrator routes via the named class. When null, falls back
 to `Project.DefaultAgentClass`, then to direct `Agent` pick (legacy behaviour).
 
+### `WorkItem.MinModelScore`
+
+The minimum `QualityScore` the router will accept for this item. Default `95`
+allows Gemini-3-Flash-high-reasoning (score 95) as a frontier-adjacent fallback.
+Lower it (e.g. `70`) for low-stakes work that can tolerate a weaker model:
+
+```json
+{
+  "projectId": "my-app",
+  "title": "Fix typo in README",
+  "prompt": "...",
+  "minModelScore": 70
+}
+```
+
+There is no `AllowEconomyFallback` flag — `MinModelScore` is the single concept.
+
 ### `Project.DefaultAgentClass`
 
-Set once per project in config so all work items inherit quota routing
-without specifying `agentClassId` on every item:
+Set once per project so all work items inherit quota routing without specifying
+`agentClassId` on every item:
 
 ```json
 {
@@ -219,8 +305,8 @@ Key differences:
 | | Agent class (work phase) | AuditAgent (audit phase) |
 |---|---|---|
 | Configured on | `AgentClasses` catalog + `WorkItem.AgentClassId` | `Project.Audit.AuditAgent` |
-| Resolution | Quota-probe across members in preference order | Three-level: PerAuditorAgent → AuditAgent → work agent |
-| Quota events | `quota_router.probed`, `.waiting`, `.deferred` | `quota_router.audit_fallthrough` |
+| Resolution | Score + quota probe across members | Three-level: PerAuditorAgent → AuditAgent → work agent |
+| Quota events | `quota_router.probed`, `.scored`, `.waiting`, `.deferred` | `quota_router.audit_fallthrough` |
 | Applies to | Every phase (work, rework, merge) | LLM auditors only |
 
 Auditors are **not** class-routed — they pin to a specific agent kind, not a
@@ -235,6 +321,7 @@ All routing decisions are emitted as `Audit=true` events:
 | Event name | When |
 |------------|------|
 | `quota_router.probed` | After each probe call (agent, class, available %). |
+| `quota_router.scored` | Once per pickup: chosen member's base/effective score and applied modifiers; all rejected members with their scores and reasons. |
 | `quota_router.waiting` | When all Subscription members are exhausted. |
 | `quota_router.deferred` | When the orchestrator schedules a deferred re-enqueue. |
 | `quota_router.audit_fallthrough` | When the audit agent's quota was low and the pipeline fell through to the work agent. |
@@ -249,5 +336,8 @@ At startup the orchestrator validates the `AgentClasses` config:
 - Each class has at least one member.
 - Each member `Agent` is non-empty.
 - Each member `Billing` is `Subscription` or `PayPerApi`.
+- Each member has a `QualityScore` in 0–200. Missing scores are **rejected**
+  with a migration message: add `QualityScore=N; see docs/agent-classes.md`.
+- Gemini members with `QualityScore ≥ 90` must have `ReasoningMode="high"`.
 - A class with only Subscription members emits a startup **warning**:
-  > AgentClass 'X' has no PayPerApi fallback — items may wait indefinitely if all subscriptions are exhausted
+  > AgentClass 'X' has no PayPerApi fallback — items may wait indefinitely

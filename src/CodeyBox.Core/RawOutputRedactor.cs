@@ -8,9 +8,11 @@ namespace CodeyBox.Core;
 /// </summary>
 public static partial class RawOutputRedactor
 {
-    // Matches the same patterns as SensitiveDataRedactionEnricher.SecretValuePattern.
+    // Matches the same patterns as SensitiveDataRedactionEnricher.SecretValuePattern,
+    // plus additional families: AWS IAM, Stripe, generic OpenAI, PEM private-key headers,
+    // and Slack bot/user tokens.
     [GeneratedRegex(
-        @"(?:gho_[A-Za-z0-9]+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]{35,})",
+        @"(?:gho_[A-Za-z0-9]+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]{35,}|AKIA[A-Z0-9]{16}|sk_live_[A-Za-z0-9]+|sk_test_[A-Za-z0-9]+|sk-[A-Za-z0-9]{32,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xoxb-[A-Za-z0-9_-]+|xoxp-[A-Za-z0-9_-]+)",
         RegexOptions.CultureInvariant)]
     private static partial Regex SecretPattern();
 

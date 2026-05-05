@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>true</IsPackable>
+    <PackageId>CodeyBox.PluginSdk</PackageId>
+    <Description>SDK for writing CodeyBox plugins. Reference this package and CodeyBox.Core only — never orchestrator internals. Plugins built against this SDK implement Core interfaces (IAuditor, IUpstreamRemote, ICredentialProvider, …) and are discovered at runtime via reflection.</Description>
+    <RepositoryUrl>https://github.com/AdamFrisby/codeybox</RepositoryUrl>
+    <PackageTags>codeybox;plugin;sdk</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.7" />
+  </ItemGroup>
+
+</Project>

@@ -237,7 +237,7 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
     public Task<string?> PromoteSuggestionAsync(
         string id, string? extraInstructions = null, string? agent = null,
         string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
-        string? agentClassId = null, CancellationToken ct = default)
+        string? agentClassId = null, string? externalId = null, CancellationToken ct = default)
         => Task.FromResult<string?>("fake-work-item-id");
 
     public Task<List<WorkItemDto>> GetWorkItemsAsync(CancellationToken ct = default)
@@ -286,6 +286,17 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<ProjectQueueStateDto?>(null);
     public Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<PluginDto>());
+    public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDto?>(null);
+    public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemReplaysDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDiffDto?>(null);
+
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }
 
 /// <summary>
@@ -321,7 +332,7 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
     public Task<string?> PromoteSuggestionAsync(
         string id, string? extraInstructions = null, string? agent = null,
         string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
-        string? agentClassId = null, CancellationToken ct = default)
+        string? agentClassId = null, string? externalId = null, CancellationToken ct = default)
         => Task.FromResult<string?>("fake-work-item-id");
 
     // ── Stubs for remaining interface members ─────────────────────────────────
@@ -371,4 +382,15 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<ProjectQueueStateDto?>(null);
     public Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<PluginDto>());
+    public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDto?>(null);
+    public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemReplaysDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDiffDto?>(null);
+
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }

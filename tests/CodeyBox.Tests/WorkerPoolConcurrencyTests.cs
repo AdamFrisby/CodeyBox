@@ -105,7 +105,7 @@ internal sealed class LatchedPipelineRunner : IPipelineRunner
         _onExit = onExit;
     }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         _onEnter();
         try

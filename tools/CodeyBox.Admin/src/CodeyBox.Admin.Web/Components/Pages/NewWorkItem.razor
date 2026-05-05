@@ -40,6 +40,12 @@
     </div>
 
     <div class="form-group">
+        <label for="externalId">External ID <span class="form-hint">(optional — e.g. JIRA-1234, GH-#456)</span></label>
+        <InputText id="externalId" @bind-Value="_form.ExternalId" class="form-control"
+                   placeholder="e.g. JIRA-1234" />
+    </div>
+
+    <div class="form-group">
         <label for="title">Title</label>
         <InputText id="title" @bind-Value="_form.Title" class="form-control" />
         <ValidationMessage For="() => _form.Title" />
@@ -174,6 +180,7 @@
             var req = new CreateWorkItemRequest
             {
                 ProjectId = _form.ProjectId,
+                ExternalId = string.IsNullOrWhiteSpace(_form.ExternalId) ? null : _form.ExternalId.Trim(),
                 Title = _form.Title,
                 Prompt = _form.Prompt,
                 Agent = string.IsNullOrWhiteSpace(_form.Agent) ? null : _form.Agent,
@@ -208,7 +215,8 @@
                 extraInstructions: string.IsNullOrWhiteSpace(_form.Prompt) ? null : _form.Prompt,
                 agent: string.IsNullOrWhiteSpace(_form.Agent) ? null : _form.Agent,
                 workBranch: string.IsNullOrWhiteSpace(_form.WorkBranch) ? null : _form.WorkBranch,
-                pushUpstream: _form.PushUpstream);
+                pushUpstream: _form.PushUpstream,
+                externalId: string.IsNullOrWhiteSpace(_form.ExternalId) ? null : _form.ExternalId.Trim());
             if (workItemId is not null)
                 Nav.NavigateTo($"/work-items/{workItemId}");
             else
@@ -236,6 +244,7 @@
         [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Prompt is required.")]
         public string Prompt { get; set; } = "";
 
+        public string? ExternalId { get; set; }
         public string? Agent { get; set; }
         public string? WorkBranch { get; set; }
         public bool PushUpstream { get; set; } = true;

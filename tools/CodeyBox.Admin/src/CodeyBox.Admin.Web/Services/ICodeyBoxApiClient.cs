@@ -30,6 +30,8 @@ public interface ICodeyBoxApiClient
     Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default);
     Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default);
     Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default);
+    // ── Live stdout tail ──────────────────────────────────────────────────────
+    Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default);
 
     // ── Audit timeline ────────────────────────────────────────────────────────
     Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
@@ -48,6 +50,18 @@ public interface ICodeyBoxApiClient
     Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default);
     Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default);
 
+    // ── Plugins ───────────────────────────────────────────────────────────────
+    Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default);
+    // ── Replay ────────────────────────────────────────────────────────────────
+    Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default);
+    Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default);
+    // ── Diff ──────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Fetches the pending diff for a work item as JSON. Returns null when the
+    /// work item has no diff yet (204 No Content) or does not exist (404).
+    /// </summary>
+    Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default);
+
     // ── Suggestions ───────────────────────────────────────────────────────────
     Task<List<SuggestionDto>> GetSuggestionsAsync(
         string? projectId = null, string? category = null, string? severity = null,
@@ -63,6 +77,7 @@ public interface ICodeyBoxApiClient
         string? baseBranch = null,
         bool? pushUpstream = null,
         string? agentClassId = null,
+        string? externalId = null,
         CancellationToken ct = default);
 }
 

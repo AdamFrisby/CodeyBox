@@ -125,6 +125,7 @@ defaults expecting them to be replaced wholesale by per-project overrides.
   "FailingSeverity": "Error",
   "PerIterationTimeoutMinutes": 10,
   "StopOnFirstFailure": false,
+  "MaxLlmAuditorParallelism": 3,
   "Languages": ["python", "typescript"],
   "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"],
   "Custom": [
@@ -143,6 +144,14 @@ The orchestrator's effective auditor list for each project is:
 ```
 Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 ```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `MaxIterations` | int | `3` | How many audit + rework cycles to attempt before giving up with `AuditFailed` |
+| `FailingSeverity` | string | `"Error"` | Findings at or above this severity block the merge. `"Warning"` or `"Info"` can be used to widen the gate. |
+| `PerIterationTimeoutMinutes` | int | `10` | Wall-clock cap on a single audit iteration's sandbox |
+| `StopOnFirstFailure` | bool | `false` | Stop running auditors as soon as one returns a blocking finding — useful when cheap linters precede expensive LLM auditors |
+| `MaxLlmAuditorParallelism` | int | `3` | Max LLM auditors running concurrently. Default `3` means `security:llm-review`, `completeness:llm-review`, and `cheating:llm-review` all run at the same time. Set to `1` to serialize them if you hit API 429 rate-limit errors. Tool auditors are unaffected and always run sequentially. |
 
 ### Languages (built-in presets)
 
@@ -312,13 +321,38 @@ creation — never silently degrades to "no enforcement."
 
 ### Custom auditors
 
-Three kinds, all configured in JSON:
+Four kinds, all configured in JSON:
 
-| Kind           | Required fields           | Notes                                  |
-|----------------|---------------------------|----------------------------------------|
-| `shell`        | `Name`, `Argv`            | Exit 0 = pass; non-zero = Error finding|
-| `diff-pattern` | `Name`, `Patterns[]`      | Regex against added lines in diff      |
-| `llm`          | `Name`, `ReviewFocus`     | LLM review with the project's agent    |
+| Kind           | Required fields           | Notes                                              |
+|----------------|---------------------------|----------------------------------------------------|
+| `shell`        | `Name`, `Argv`            | Exit 0 = pass; non-zero = Error finding            |
+| `diff-pattern` | `Name`, `Patterns[]`      | Regex against added lines in diff                  |
+| `llm`          | `Name`, `ReviewFocus`     | LLM review with the project's agent                |
+| `plugin`       | `PluginId`                | Delegates to a loaded third-party `IAuditor` plugin |
+
+#### Plugin auditors
+
+Plugin auditors let operators ship custom audit logic as standalone NuGet packages
+without modifying CodeyBox core. To enable one, the plugin DLL must be discovered
+by the host (see `CodeyBox:Plugins` configuration), and its ID must be in the
+allowlist.
+
+```json
+"Audit": {
+  "Custom": [
+    { "Kind": "plugin", "PluginId": "myorg.no-var-keyword" },
+    { "Kind": "plugin", "PluginId": "myorg.xml-doc-required" }
+  ]
+}
+```
+
+`PluginId` must match the `id` declared in the plugin's `[CodeyBoxPlugin]`
+attribute. If the plugin is not loaded, the composer logs a warning and skips
+the entry — other auditors continue normally. No `Name` field is required; the
+plugin's own `IAuditor.Name` is used in findings and logs.
+
+See [`docs/auditor-plugins.md`](auditor-plugins.md) for the full authoring guide,
+project skeleton, and sample plugin.
 
 ## Per-project upstream
 
@@ -341,6 +375,36 @@ item; in-flight pushes keep their pre-rotation value.
 For `git-generic`, set `GenericUrl` and rely on the host git config
 (askpass, SSH agent) for auth. For `noop`, no upstream push happens and
 the host bare repo is the source of truth.
+
+### Plugin upstreams and PluginConfig
+
+When `Kind` is not a built-in (`noop`, `github`, `git-generic`), the orchestrator
+looks for a plugin-registered `IUpstreamRemote` whose `Name` matches. Plugins read
+their per-project settings from `Upstream.PluginConfig`:
+
+```json
+"Upstream": {
+  "Kind": "gitea",
+  "TokenEnvVar": "MY_GITEA_TOKEN",
+  "PluginConfig": {
+    "BaseUrl": "https://git.mycompany.example/api/v1",
+    "Owner": "myteam",
+    "Repository": "myproject"
+  }
+}
+```
+
+The keys inside `PluginConfig` are plugin-defined. Check the plugin's documentation
+for which keys it reads. The orchestrator passes this dictionary to the plugin via
+`IPluginHost.GetProjectUpstreamConfig(projectId)` — plugins must not rely on any
+other per-project state injection mechanism.
+
+**Token security**: tokens must **never** go into `PluginConfig`. Always use
+`TokenEnvVar` to name the environment variable holding the token; the plugin reads it
+with `Environment.GetEnvironmentVariable(...)`.
+
+See [`docs/upstream-plugins.md`](upstream-plugins.md) for how to author an upstream
+remote plugin.
 
 ### GitHub upstream: pull request flow
 
@@ -501,6 +565,84 @@ POST /workitems            — body now requires "projectId" instead of "reposit
   "pushUpstream": true     // optional — gates phase 4 push
 }
 ```
+
+## Credential provider priority
+
+When multiple [credential plugins](credential-plugins.md) are installed, a project
+can declare which plugins it prefers and in what order:
+
+```json
+{
+  "CodeyBox": {
+    "Projects": [
+      {
+        "Id": "my-app",
+        "CredentialProviderPriority": ["myorg.vault-creds", "myorg.aws-ssm"]
+      }
+    ]
+  }
+}
+```
+
+### How it works
+
+The `CredentialProviderPriority` list replaces the plugin slot for this project:
+
+- Listed plugins are tried **in order**, between the built-in OAuth-file provider
+  and the env-var fallback (BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV).
+- Plugins installed but **not listed** are excluded for this project.
+- An ID in the list that does not match any installed plugin is **skipped with a
+  warning** (not an error) so a misconfigured ID doesn't break the whole chain.
+- An **empty** `CredentialProviderPriority` (the default) includes all discovered
+  plugins in global discovery order — identical to having no credential plugins at
+  all from the operator's perspective.
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `CredentialProviderPriority` | `string[]` | `[]` | Ordered list of credential plugin IDs to include in the credential chain for this project. |
+
+### Example — vault first, AWS SSM fallback, no 1Password
+
+```json
+{
+  "Id": "payments-service",
+  "CredentialProviderPriority": ["myorg.vault-creds", "myorg.aws-ssm"]
+}
+```
+
+The chain for `payments-service` is:
+1. Built-in OAuth-file (Claude only)
+2. `myorg.vault-creds` plugin
+3. `myorg.aws-ssm` plugin
+4. Built-in env-var (catch-all)
+
+`myorg.1password`, even if installed and allowlisted globally, is never tried for
+this project.
+
+### Example — default behavior (all plugins in discovery order)
+
+```json
+{
+  "Id": "simple-project",
+  "CredentialProviderPriority": []
+}
+```
+
+An empty list is the default. All discovered plugins are included in global
+discovery order. If no plugin returns a credential, the chain falls through to
+the built-in env-var provider.
+
+> **Tip:** Operators who want env-var-only behaviour should not install credential
+> plugins or should leave the global plugin allowlist empty. There is no
+> configuration option that excludes all installed plugins while keeping the
+> built-in providers.
+
+See [`docs/credential-plugins.md`](credential-plugins.md) for the full plugin
+author guide, chain-order rationale, and sample implementation.
+
+---
 
 ## Plugging in a different project source
 

@@ -438,7 +438,7 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<string?> PromoteSuggestionAsync(
         string id, string? extraInstructions = null, string? agent = null,
         string? workBranch = null, string? baseBranch = null, bool? pushUpstream = null,
-        string? agentClassId = null, CancellationToken ct = default)
+        string? agentClassId = null, string? externalId = null, CancellationToken ct = default)
         => Task.FromResult<string?>("fake-work-item-id");
 
     public AuditReportsDto? AuditReportsOverride { get; set; }
@@ -476,4 +476,38 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<PluginDto>());
+    public WorkItemReplaysDto? ReplaysOverride { get; set; }
+
+    public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
+    {
+        var item = _items.FirstOrDefault(i => i.Id == id);
+        if (item is null || !item.IsTerminal) return Task.FromResult<WorkItemDto?>(null);
+        var replay = new WorkItemDto
+        {
+            Id = Guid.NewGuid().ToString(),
+            ProjectId = item.ProjectId,
+            Title = item.Title,
+            Prompt = item.Prompt,
+            Agent = req.Agent ?? item.Agent,
+            State = "Queued",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            ReplayOfWorkItemId = item.Id,
+        };
+        _items.Add(replay);
+        return Task.FromResult<WorkItemDto?>(replay);
+    }
+
+    public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(ReplaysOverride);
+    public Dictionary<string, WorkItemDiffDto> DiffOverride { get; } = [];
+
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(DiffOverride.TryGetValue(id, out var d) ? (WorkItemDiffDto?)d : null);
+    public Dictionary<string, string> StdoutTailOverride { get; } = [];
+
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(StdoutTailOverride.TryGetValue(workItemId, out var t) ? t : null);
 }
