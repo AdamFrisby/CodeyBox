@@ -13,6 +13,7 @@ public sealed class FleetSummaryDto
     public string? CurrentPhase { get; set; }
     public List<string> RecentOutcomes { get; set; } = [];
     public bool IsPaused { get; set; }
+    public bool HasRecentFailures { get; set; }
     public string? PausedReason { get; set; }
     public double? MonthlySpendUsd { get; set; }
     public double? MonthlyBudgetUsd { get; set; }
@@ -20,10 +21,11 @@ public sealed class FleetSummaryDto
 
     /// <summary>
     /// Derived status indicator color for the UI dot.
-    /// Red if paused. Blue if in-flight. Yellow if only queued. Grey if idle.
+    /// Red if paused or ≥3 of the last 5 outcomes are failures.
+    /// Blue if in-flight. Yellow if only queued. Grey if idle.
     /// </summary>
     public string StatusColor =>
-        IsPaused ? "red" :
+        IsPaused || HasRecentFailures ? "red" :
         InFlightCount > 0 ? "blue" :
         QueuedCount > 0 ? "yellow" :
         "grey";

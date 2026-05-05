@@ -54,6 +54,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
         Assert.Null(row.CurrentPhase);
         Assert.Empty(row.RecentOutcomes);
         Assert.False(row.IsPaused);
+        Assert.False(row.HasRecentFailures);
     }
 
     [Fact]
@@ -66,7 +67,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
-        var row = summaries![0];
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
         Assert.Equal(2, row.QueuedCount);
         Assert.Equal(0, row.InFlightCount);
         Assert.Null(row.CurrentPhase);
@@ -79,7 +80,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
 
         var resp = await _client.GetAsync("/fleet/summary");
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
-        var row = summaries![0];
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
         Assert.Equal(0, row.QueuedCount);
         Assert.Equal(1, row.InFlightCount);
         Assert.Equal("Working", row.CurrentPhase);
@@ -96,7 +97,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
 
         var resp = await _client.GetAsync("/fleet/summary");
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
-        var row = summaries![0];
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
 
         Assert.Equal(3, row.RecentOutcomes.Count);
         Assert.Equal("Failed", row.RecentOutcomes[0]);   // newest first
@@ -113,7 +114,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
 
         var resp = await _client.GetAsync("/fleet/summary");
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
-        Assert.Equal(5, summaries![0].RecentOutcomes.Count);
+        Assert.Equal(5, summaries!.Single(r => r.ProjectId == "proj-alpha").RecentOutcomes.Count);
     }
 
     [Fact]
@@ -124,7 +125,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
 
         var resp = await _client.GetAsync("/fleet/summary");
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
-        var row = summaries![0];
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
 
         Assert.Equal(1, row.InFlightCount);
         Assert.Single(row.RecentOutcomes);
@@ -167,6 +168,55 @@ public sealed class FleetSummaryEndpointTests : IDisposable
         Assert.All(summaries!, r => Assert.Equal("ok", r.BudgetThresholdState));
     }
 
+    [Fact]
+    public async Task GetFleetSummary_ThreeOrMoreRecentFailures_HasRecentFailuresTrue()
+    {
+        // Seed 3 failed and 1 successful outcome for proj-alpha.
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Failed);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Failed);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Failed);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Done);
+
+        var resp = await _client.GetAsync("/fleet/summary");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
+        var alpha = summaries!.Single(r => r.ProjectId == "proj-alpha");
+        Assert.True(alpha.HasRecentFailures);
+
+        // proj-beta with no items should not have recent failures.
+        var beta = summaries!.Single(r => r.ProjectId == "proj-beta");
+        Assert.False(beta.HasRecentFailures);
+    }
+
+    [Fact]
+    public async Task GetFleetSummary_TwoRecentFailures_HasRecentFailuresFalse()
+    {
+        // Only 2 failures — below the ≥3 threshold.
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Failed);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Failed);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Done);
+
+        var resp = await _client.GetAsync("/fleet/summary");
+        var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
+        Assert.False(row.HasRecentFailures);
+    }
+
+    [Fact]
+    public async Task GetFleetSummary_AuditFailedCountsAsFailureForRedDot()
+    {
+        // AuditFailed should count toward the ≥3 threshold.
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.AuditFailed);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Failed);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.AuditFailed);
+
+        var resp = await _client.GetAsync("/fleet/summary");
+        var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
+        Assert.True(row.HasRecentFailures);
+    }
+
     // ── Local record shapes for deserialization ────────────────────────────────
 
     private sealed record FleetRow(
@@ -177,6 +227,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
         string? CurrentPhase,
         List<string> RecentOutcomes,
         bool IsPaused,
+        bool HasRecentFailures,
         string? PausedReason,
         double? MonthlySpendUsd,
         double? MonthlyBudgetUsd,
