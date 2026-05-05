@@ -37,6 +37,16 @@ public interface IGitHost
     /// phases need the prior phase's branch/merge state in the bare repo.
     /// </summary>
     Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns <c>git diff --stat</c> and <c>git diff</c> output comparing
+    /// <paramref name="baseBranch"/> and <paramref name="workBranch"/> in the
+    /// host bare repo. Returns empty strings when the diff cannot be computed
+    /// (e.g. repo not found, branch does not exist). Never throws.
+    /// </summary>
+    Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+        string repositoryId, string baseBranch, string workBranch,
+        CancellationToken ct = default);
 }
 
 /// <summary>

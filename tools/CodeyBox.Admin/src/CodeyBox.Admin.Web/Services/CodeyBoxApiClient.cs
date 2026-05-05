@@ -78,6 +78,13 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return resp.IsSuccessStatusCode;
     }
 
+    public async Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(workItemId)}/stdout-tail", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
     public async Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default)
     {
         var resp = await _http.GetAsync("/queue/status", ct);

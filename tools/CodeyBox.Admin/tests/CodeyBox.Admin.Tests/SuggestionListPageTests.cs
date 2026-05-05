@@ -282,6 +282,9 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<ProjectCostsDto?>(null);
     public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
         => Task.FromResult<WorkItemDiffDto?>(null);
+
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }
 
 /// <summary>
@@ -363,4 +366,7 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<ProjectCostsDto?>(null);
     public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
         => Task.FromResult<WorkItemDiffDto?>(null);
+
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }

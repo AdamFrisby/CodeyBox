@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    SAMPLE PLUGIN — upstream remote for Gitea.
+
+    Rules (same as all CodeyBox plugins):
+    - Reference CodeyBox.PluginSdk only (which transitively pulls CodeyBox.Core).
+    - Never reference CodeyBox.Orchestrator or CodeyBox.Api.
+    - Additional NuGet packages are allowed for HTTP client functionality.
+
+    See docs/upstream-plugins.md for authoring guidance.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.7" />
+  </ItemGroup>
+
+</Project>

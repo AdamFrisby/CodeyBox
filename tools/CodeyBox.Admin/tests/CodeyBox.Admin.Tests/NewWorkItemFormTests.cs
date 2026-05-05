@@ -285,4 +285,6 @@ public sealed class CapturingApiClient : ICodeyBoxApiClient
 
     public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
         => Task.FromResult<WorkItemDiffDto?>(null);
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }

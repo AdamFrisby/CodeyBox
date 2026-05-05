@@ -29,7 +29,11 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
+| `work_item.recovered` | Dead-worker reaper recovered a work item that was mid-flight when its worker crashed (see [Details](#recovered-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
+| `sandbox.leak_detected` | A leaked `codeybox-*` Multipass VM was detected (see [Details](#sandbox_leak-details)) |
+| `sandbox.leak_disposed` | A leaked sandbox was successfully auto-disposed |
+| `sandbox.leak_dispose_failed` | Auto-disposal of a leaked sandbox failed |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -215,6 +219,36 @@ carry the same `workItem` and `project` context.
 See [`suggestions.md`](suggestions.md) for the full agent contract and operator
 workflow.
 
+### `recovered` details
+
+When `event` is `work_item.recovered`, the `details` field is populated:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "projectId": "my-project",
+    "fromState": "Working",
+    "toState": "Queued",
+    "reason": "dead worker detected",
+    "recoveryAttempt": 1,
+    "maxRecoveryAttempts": 2
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the recovered work item |
+| `projectId` | string | Project the item belongs to |
+| `fromState` | string | State the item was in when the worker was declared dead |
+| `toState` | string | State the item was transitioned to; `"Failed"` if `MaxRecoveryAttempts` was exceeded |
+| `reason` | string | Always `"dead worker detected"` |
+| `recoveryAttempt` | int | Which recovery attempt this is (1-based) |
+| `maxRecoveryAttempts` | int | The configured cap before the item is failed permanently |
+
+`work_item.recovered` fires even when `toState` is `"Failed"` (i.e. the cap was exceeded). Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](recovery.md) for the full state-mapping rules and configuration.
+
 ### `agent_smoke_failed` details
 
 When `event` is `agent.smoke_failed`, the `details` field is always populated.
@@ -242,6 +276,33 @@ populated with the affected item and its project.
 at **work-item pickup** (a subsequent `work_item.failed` event also fires and
 carries the work-item context). Subscribe to `agent.smoke_failed` to alert on
 credential problems independently of whether any work items were affected.
+
+---
+
+### `sandbox_leak` details
+
+When `event` is `sandbox.leak_detected`, `sandbox.leak_disposed`, or
+`sandbox.leak_dispose_failed`, the `details` field carries the sandbox's
+diagnostic information. `workItem` and `project` are always `null` — leaked
+sandboxes are not associated with a specific work item.
+
+```json
+{
+  "details": {
+    "name": "codeybox-a1b2c3d4e5f6",
+    "ageMinutes": 127.3,
+    "diskMb": null
+  }
+}
+```
+
+| Field | Type | Present on | Description |
+|---|---|---|---|
+| `name` | string | all | VM name matching the `codeybox-*` prefix |
+| `ageMinutes` | number | all | Age of the sandbox in minutes at detection time |
+| `diskMb` | number\|null | all | Disk usage in MiB, if available; null otherwise |
+| `disposedAt` | ISO-8601 | `sandbox.leak_disposed` | Timestamp when the sandbox was successfully disposed |
+| `error` | string | `sandbox.leak_dispose_failed` | Human-readable failure reason (e.g. `"timeout"` or multipass error) |
 
 ---
 

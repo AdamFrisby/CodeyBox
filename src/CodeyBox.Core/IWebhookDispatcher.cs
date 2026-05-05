@@ -11,6 +11,18 @@ public interface IWebhookDispatcher
     Task PublishAsync(WebhookEvent evt, CancellationToken ct);
 }
 
+/// <summary>Details payload for sandbox leak events.</summary>
+public sealed record SandboxLeakDetails
+{
+    public required string Name { get; init; }
+    public double AgeMinutes { get; init; }
+    public long? DiskMb { get; init; }
+    /// <summary>Set only for <c>sandbox.leak_disposed</c>.</summary>
+    public DateTimeOffset? DisposedAt { get; init; }
+    /// <summary>Set only for <c>sandbox.leak_dispose_failed</c>.</summary>
+    public string? Error { get; init; }
+}
+
 /// <summary>
 /// Details payload for the <c>agent.smoke_failed</c> event, fired when a
 /// credential smoke test fails at startup or at work-item pickup.

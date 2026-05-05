@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    This is a CLASS LIBRARY, not a test project. It is the canonical reference
+    implementation showing how to author a CodeyBox plugin. The orchestrator
+    test suite loads it at runtime via the plugin loader integration test.
+
+    Rules:
+    - Reference CodeyBox.PluginSdk only (which transitively pulls CodeyBox.Core).
+    - Never reference CodeyBox.Orchestrator or CodeyBox.Api.
+    - Keep it minimal and well-commented so it doubles as documentation.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+  </ItemGroup>
+
+</Project>

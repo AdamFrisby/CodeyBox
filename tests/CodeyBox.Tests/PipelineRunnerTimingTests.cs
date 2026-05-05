@@ -239,6 +239,12 @@ public sealed class PipelineRunnerTimingTests : IDisposable
                 ? new TimedFakeSandbox(inner, _timings, itemId.Value, phase)
                 : inner;
         }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            _inner.DisposeLeakedAsync(name, ct);
     }
 
     internal sealed class TimedFakeSandbox : ISandbox
