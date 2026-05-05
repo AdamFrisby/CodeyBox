@@ -83,6 +83,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Partial unique index: enforces per-project uniqueness while allowing NULL coexistence.
         RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_external_id_per_project ON work_items(project_id, external_id) WHERE external_id IS NOT NULL;");
 
+        // Additive migration: link a replay to its source work item.
+        // Cleared (set to NULL) when the source is cancelled so replays keep running.
+        RunMigration("ALTER TABLE work_items ADD COLUMN replay_of_work_item_id TEXT;");
+
+        // Index for cheap replay-listing queries.
+        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_replay_of ON work_items(replay_of_work_item_id) WHERE replay_of_work_item_id IS NOT NULL;");
+
+        // Additive migration: store the SHA of the merge commit produced during the merge phase.
+        RunMigration("ALTER TABLE work_items ADD COLUMN merge_sha TEXT;");
         // Additive migration: minimum quality-score floor for routing.
         // Default 95 preserves existing semantics (frontier-adjacent fallback allowed).
         RunMigration("ALTER TABLE work_items ADD COLUMN min_model_score INTEGER NOT NULL DEFAULT 95;");
@@ -121,11 +130,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
-                    stuck_retries, started_at, external_id, min_model_score,
-                    cancellation_reason, recovery_attempts)
+                    stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
+                    min_model_score, cancellation_reason, recovery_attempts)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
-                    $sretries, $started_at, $external_id, $min_model_score,
-                    $cancellation_reason, $recovery_attempts);
+                    $sretries, $started_at, $external_id, $replay_of, $merge_sha,
+                    $min_model_score, $cancellation_reason, $recovery_attempts);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -157,6 +166,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
+                    replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts
@@ -186,6 +196,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
+                    replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts
@@ -320,6 +331,43 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         return await reader.ReadAsync(ct) ? Read(reader) : null;
     }
 
+    public async IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(
+        WorkItemId sourceId, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT * FROM work_items
+            WHERE replay_of_work_item_id = $source_id
+            ORDER BY created_at ASC;
+            """;
+        cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return Read(reader);
+    }
+
+    public async Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items
+                SET replay_of_work_item_id = NULL,
+                    updated_at = $now
+                WHERE replay_of_work_item_id = $source_id;
+                """;
+            cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public void Dispose()
     {
         _conn.Dispose();
@@ -350,6 +398,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$sretries", item.StuckRetries);
         cmd.Parameters.AddWithValue("$started_at", (object?)item.StartedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$external_id", (object?)item.ExternalId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$replay_of", (object?)item.ReplayOfWorkItemId?.ToString() ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$merge_sha", (object?)item.MergeSha ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$min_model_score", item.MinModelScore);
         cmd.Parameters.AddWithValue("$cancellation_reason",
             item.CancellationReason.HasValue ? (object)item.CancellationReason.Value.ToString() : DBNull.Value);
@@ -379,6 +429,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         StuckRetries = r.GetInt32(r.GetOrdinal("stuck_retries")),
         StartedAt = ReadNullableDateTimeOffset(r, "started_at"),
         ExternalId = r.IsDBNull(r.GetOrdinal("external_id")) ? null : r.GetString(r.GetOrdinal("external_id")),
+        ReplayOfWorkItemId = ReadNullableWorkItemId(r, "replay_of_work_item_id"),
+        MergeSha = r.IsDBNull(r.GetOrdinal("merge_sha")) ? null : r.GetString(r.GetOrdinal("merge_sha")),
         MinModelScore = ReadInt32OrDefault(r, "min_model_score", defaultValue: 95),
         CancellationReason = ReadCancellationReason(r),
         RecoveryAttempts = ReadInt32OrDefault(r, "recovery_attempts", defaultValue: 0),
@@ -404,6 +456,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         return r.IsDBNull(ord)
             ? null
             : DateTimeOffset.Parse(r.GetString(ord), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static WorkItemId? ReadNullableWorkItemId(SqliteDataReader r, string column)
+    {
+        var ord = r.GetOrdinal(column);
+        if (r.IsDBNull(ord)) return null;
+        var raw = r.GetString(ord);
+        return Guid.TryParse(raw, out var g) ? new WorkItemId(g) : null;
     }
 
     private static IReadOnlyList<WorkItemId> ReadDependsOn(SqliteDataReader r)

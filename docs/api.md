@@ -100,6 +100,46 @@ The composite form is unambiguous and works with all endpoints that accept `{id}
 Returns `400 Bad Request` when the colon form has an empty project or externalId part.
 Returns `404 Not Found` when the project exists but has no item with that externalId.
 
+### `POST /workitems/{id}/replay`
+
+Clone a terminal work item and run it with a different agent or model. See
+[`replay.md`](replay.md) for full semantics.
+
+**Request body** (all optional):
+
+```json
+{
+  "agent": "gemini",
+  "agentClassId": "frontier-coding",
+  "workBranch": "feat/foo-replay-gemini"
+}
+```
+
+- `agent` — override agent kind. Clears `agentClassId` when set.
+- `modelId` — **not accepted**; always returns `400 Bad Request`. Model is resolved at pickup from `AgentMembership`. Use `agentClassId` to route via a class that specifies the target model.
+- `agentClassId` — route via a named agent class. Clears `agent` when set.
+- `workBranch` — defaults to `<source-branch>-replay-<short-id>`.
+
+Returns `201 Created` with the new work item record.  
+Returns `400 Bad Request` if source is not terminal, agent is unknown, branch is invalid, or `modelId` is set.  
+Returns `404 Not Found` if source does not exist.
+
+### `GET /workitems/{id}/replays`
+
+Return the source work item and all items that replay it, recursively (BFS across all replay descendants).
+
+```json
+{
+  "source": { ...workItemDto },
+  "replays": [
+    { ...workItemDto, "replayOfWorkItemId": "<source-id>" }
+  ]
+}
+```
+
+Replays are ordered by `created_at` ascending. Returns `404 Not Found` if the
+item does not exist.
+
 ### `GET /workitems/{id}/dependents`
 
 List work items that directly depend on this one. Useful for inspecting

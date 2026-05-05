@@ -138,6 +138,20 @@ public sealed record WorkItem
     public string? ExternalId { get; init; }
 
     /// <summary>
+    /// When set, identifies the source work item this item was created as a replay of.
+    /// Immutable after creation. Null for items not created via the replay API.
+    /// When the source is cancelled the link is cleared (orphaned) but the replay
+    /// continues running.
+    /// </summary>
+    public WorkItemId? ReplayOfWorkItemId { get; init; }
+
+    /// <summary>
+    /// SHA of the merge commit produced during the merge phase. Populated by the
+    /// pipeline runner when the merge completes; null until then.
+    /// </summary>
+    public string? MergeSha { get; init; }
+
+    /// <summary>
     /// Number of times this work item has been automatically recovered by the
     /// dead-worker reaper after an orphaning crash. Incremented on each recovery
     /// transition; capped at <c>DeadWorkerOptions.MaxRecoveryAttempts</c> before

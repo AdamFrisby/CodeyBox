@@ -274,6 +274,7 @@ public sealed class PipelineRunner : IPipelineRunner
                             phaseCt));
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
+                await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
                 await Transition(item, WorkItemState.Merged, ct, project);
             }
 
