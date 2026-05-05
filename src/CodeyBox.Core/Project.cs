@@ -341,7 +341,7 @@ public sealed record ProjectReleaseConfig
 
     /// <summary>
     /// Named deep auditors to run in the in_review phase. Each entry is a built-in
-    /// auditor name ("owasp:asvs-review", "arch:coherence-review", "deps:cve-scan") or
+    /// auditor name ("owasp-asvs", "arch-coherence", "deps-cve-scan") or
     /// a plugin auditor ID. Empty list = skip deep audit (in_review immediately succeeds).
     /// </summary>
     public IReadOnlyList<string> DeepAuditors { get; init; } = [];

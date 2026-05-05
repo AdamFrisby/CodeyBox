@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -135,18 +137,28 @@ public sealed class ReleaseService
             throw new InvalidOperationException($"Could not resolve origin/{defaultBranch}: {headResult.Stderr}");
         var baseCommitSha = headResult.Stdout.Trim();
 
-        // Try SETIFNULL atomically before doing git work.
+        // Create branch locally and push to remote BEFORE writing to DB, so that any
+        // concurrent worker that loses the DB race reads a branch that already exists.
+        // Two workers may race on the push; "already exists" is a safe non-fatal outcome.
+        await RunSandboxCmd(sandbox, ct, "git", "-C", "/work/repo", "checkout", "-b", branchName);
+        var pushResult = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", "/work/repo", "push", "origin", $"{branchName}:{branchName}"],
+        }, ct);
+        if (!pushResult.Success &&
+            !pushResult.Stderr.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"command failed: git push {branchName}\n{pushResult.Stderr}");
+        }
+
+        // Now atomically record in DB. The winner proceeds; the loser reads the winner's value.
         var won = await _releases.TrySetBranchAsync(release.Id, branchName, baseCommitSha, ct);
         if (!won)
         {
-            // Another worker created the branch; re-read and return existing values.
             var refreshed = await _releases.GetAsync(release.Id, ct);
             return (refreshed?.BranchName ?? branchName, refreshed?.BaseCommitSha ?? baseCommitSha);
         }
-
-        // We won the race — create and push the branch.
-        await RunSandboxCmd(sandbox, ct, "git", "-C", "/work/repo", "checkout", "-b", branchName);
-        await RunSandboxCmd(sandbox, ct, "git", "-C", "/work/repo", "push", "origin", $"{branchName}:{branchName}");
 
         _log.LogInformation("Release {ReleaseId} branch '{Branch}' created at {Sha}",
             release.Id, branchName, baseCommitSha);
@@ -284,8 +296,19 @@ public sealed class ReleaseService
             return;
         }
 
-        // Resolve deep auditors for this project.
-        var auditorNames = project.ReleaseConfig.DeepAuditors;
+        // Apply per-release config overrides from ConfigJson (if any).
+        ReleaseConfigOverrides? overrides = null;
+        if (release.ConfigJson is { Length: > 2 })
+        {
+            try { overrides = JsonSerializer.Deserialize<ReleaseConfigOverrides>(release.ConfigJson); }
+            catch (JsonException ex)
+            {
+                _log.LogWarning(ex, "Release {Id}: failed to parse ConfigJson; using project defaults", release.Id);
+            }
+        }
+
+        // Resolve deep auditors (per-release override takes precedence over project default).
+        var auditorNames = overrides?.DeepAuditors ?? project.ReleaseConfig.DeepAuditors;
         var auditors = _deepAuditors
             .Where(a => auditorNames.Contains(a.Name, StringComparer.OrdinalIgnoreCase))
             .ToList();
@@ -298,7 +321,7 @@ public sealed class ReleaseService
             return;
         }
 
-        var maxIterations = project.ReleaseConfig.DeepAuditMaxIterations;
+        var maxIterations = overrides?.DeepAuditMaxIterations ?? project.ReleaseConfig.DeepAuditMaxIterations;
 
         for (var iteration = 1; iteration <= maxIterations; iteration++)
         {
@@ -633,6 +656,16 @@ public sealed class ReleaseService
         var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
         if (!r.Success)
             throw new InvalidOperationException($"command failed: {string.Join(' ', argv)}\n{r.Stderr}");
+    }
+
+    /// <summary>Subset of ProjectReleaseConfig that can be overridden per-release via Release.ConfigJson.</summary>
+    private sealed class ReleaseConfigOverrides
+    {
+        [JsonPropertyName("deepAuditors")]
+        public IReadOnlyList<string>? DeepAuditors { get; init; }
+
+        [JsonPropertyName("deepAuditMaxIterations")]
+        public int? DeepAuditMaxIterations { get; init; }
     }
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)

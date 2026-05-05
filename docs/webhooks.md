@@ -358,13 +358,16 @@ see [`releases.md`](releases.md)).
 
 | Event | Fired when |
 |---|---|
+| `release.created` | New release created via `POST /releases` |
 | `release.closed` | Release transitioned `open → closed` |
 | `release.abandoned` | Release was abandoned |
 | `release.reopened` | Failed release was re-opened (`failed → open`) |
 | `release.has_failed_work_items` | Release closed but some linked work items failed/cancelled |
 | `release.in_review` | Release transitioned `closed → in_review`; deep audit starting |
 | `release.deep_audit_iteration_complete` | One deep audit iteration finished (both pass and fail) |
-| `release.released` | Release merged to main; GitHub release created (if configured) |
+| `release.deep_audit_remediation_dispatched` | Remediation work item auto-created for a deep-audit iteration |
+| `release.work_item_added` | Work item linked to this release via `POST /workitems` with `releaseId` |
+| `release.published` | Release merged to main; GitHub release created (if configured) |
 | `release.failed` | Deep audit exceeded max iterations; human review required |
 | `release.sync_conflict` | `ReleaseMainSyncService` detected a merge conflict merging `main` into a release branch |
 

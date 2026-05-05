@@ -30,18 +30,18 @@ internal static class ReleaseTestHelper
         string auditorName,
         int maxIterations = 3,
         string id = "test-project") => new()
-    {
-        Id = new ProjectId(id),
-        DisplayName = "Test",
-        RepositoryUrl = "file:///tmp/noop",
-        ReleaseConfig = new ProjectReleaseConfig
         {
-            Enabled = true,
-            AutoSyncMainInterval = null,
-            DeepAuditors = [auditorName],
-            DeepAuditMaxIterations = maxIterations,
-        },
-    };
+            Id = new ProjectId(id),
+            DisplayName = "Test",
+            RepositoryUrl = "file:///tmp/noop",
+            ReleaseConfig = new ProjectReleaseConfig
+            {
+                Enabled = true,
+                AutoSyncMainInterval = null,
+                DeepAuditors = [auditorName],
+                DeepAuditMaxIterations = maxIterations,
+            },
+        };
 
     public static ReleaseService BuildService(
         IReleaseStore releaseStore,
