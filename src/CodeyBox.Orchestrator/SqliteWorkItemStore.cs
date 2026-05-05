@@ -388,6 +388,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         catch (SqliteException ex) when (ex.Message.Contains("no such table"))
         {
             return new Dictionary<string, bool>();
+        }
+    }
+
     public async IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(
         WorkItemId sourceId, [EnumeratorCancellation] CancellationToken ct = default)
     {

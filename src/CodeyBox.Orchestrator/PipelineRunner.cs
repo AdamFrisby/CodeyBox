@@ -100,7 +100,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IWorkItemCostStore? costStore = null,
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? costExtractors = null,
         AgentCostCalculator? costCalculator = null,
-        IWorkItemQuestionStore? questionStore = null)
+        IWorkItemQuestionStore? questionStore = null,
         IStdoutBroadcaster? stdoutBroadcaster = null)
     {
         _sandboxes = sandboxes;
@@ -660,9 +660,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogInformation("Audit iteration {Iter} passed for {Id} ({NonBlocking} non-blocking findings)",
                     iteration, item.Id, nonBlocking);
                 AuditLog.AuditPassed(iteration);
-                return false;
                 CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "passed"));
-                return;
+                return false;
             }
 
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",

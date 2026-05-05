@@ -151,14 +151,6 @@ public sealed record WorkItem
     /// </summary>
     public string? MergeSha { get; init; }
 
-    /// <summary>
-    /// Number of times this work item has been automatically recovered by the
-    /// dead-worker reaper after an orphaning crash. Incremented on each recovery
-    /// transition; capped at <c>DeadWorkerOptions.MaxRecoveryAttempts</c> before
-    /// the item is transitioned to Failed.
-    /// </summary>
-    public int RecoveryAttempts { get; init; }
-
     public WorkItem With(
         WorkItemState state,
         string? error = null,

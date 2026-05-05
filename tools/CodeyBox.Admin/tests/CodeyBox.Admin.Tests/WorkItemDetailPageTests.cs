@@ -225,10 +225,6 @@ public sealed class WorkItemDetailPageTests : TestContext
     }
 
     [Fact]
-    public void WorkItemDetail_NoQuestions_DoesNotShowQuestionsSection()
-    {
-        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Working");
-    [Fact]
     public void WorkItemDetail_ShowsReplayButton_ForTerminalItem()
     {
         var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Done");

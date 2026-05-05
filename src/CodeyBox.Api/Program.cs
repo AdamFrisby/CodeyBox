@@ -867,7 +867,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IWorkItemCostStore>(),
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(),
     sp.GetRequiredService<AgentCostCalculator>(),
-    sp.GetService<IWorkItemQuestionStore>()));
+    sp.GetService<IWorkItemQuestionStore>(),
     sp.GetRequiredService<IStdoutBroadcaster>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>

@@ -144,6 +144,8 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
             new { }, JsonOptions, ct);
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadFromJsonAsync<ProjectQueueStateDto>(JsonOptions, ct);
+    }
+
     public async Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync(
@@ -225,6 +227,8 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
             $"/workitems/{Uri.EscapeDataString(workItemId)}/dismiss-question",
             new { questionId, reason }, JsonOptions, ct);
         return resp.IsSuccessStatusCode;
+    }
+
     public async Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
     {
         var result = await _http.GetFromJsonAsync<List<PluginDto>>("/plugins", JsonOptions, ct);
