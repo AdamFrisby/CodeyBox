@@ -1,102 +1,202 @@
-using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Tests DepsCveScanDeepAuditor in the "failing" path — Critical or High CVEs
-/// must cause passed=false with Error-severity findings.
+/// Verifies that when deep auditors persistently return blocking Errors across all
+/// iterations, ReleaseService.RunDeepAuditPhaseAsync transitions the release to
+/// Failed after DeepAuditMaxIterations and populates FailedReason.
 /// </summary>
-public sealed class DeepAuditFailureTests
+public sealed class DeepAuditFailureTests : IDisposable
 {
-    private static readonly DeepAuditContext TestCtx = new(
-        ReleaseId: ReleaseId.New(),
-        ProjectId: new ProjectId("test"),
-        BranchName: "release/v1.0",
-        Iteration: 1);
+    private const string AuditorName = "test-failure-auditor";
 
-    [Fact]
-    public async Task DepsCveScan_HighSeverity_FailsWithErrorFinding()
+    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"cb-fail-{Guid.NewGuid():N}.db");
+    private readonly SqliteReleaseStore _releaseStore;
+    private readonly SqliteWorkItemStore _workItemStore;
+    private readonly CapturingWebhookDispatcher _webhooks = new();
+
+    public DeepAuditFailureTests()
     {
-        var output =
-            "Project 'MyApp' has the following vulnerable packages:\n" +
-            "   [net10.0]:\n" +
-            "   > VulnPkg   1.2.3   1.2.3   High   https://example.com/advisory\n";
-        var sandbox = new ScriptedSandbox(new SandboxExecResult(0, output, ""));
-        var auditor = new DepsCveScanDeepAuditor();
+        _releaseStore = new SqliteReleaseStore(_dbPath);
+        _workItemStore = new SqliteWorkItemStore(_dbPath);
+    }
 
-        var result = await auditor.RunAsync(sandbox, "/work", TestCtx);
-
-        Assert.False(result.Passed);
-        Assert.Single(result.Findings);
-        Assert.Equal(AuditSeverity.Error, result.Findings[0].Severity);
-        Assert.Contains("VulnPkg", result.Findings[0].Title);
-        Assert.Contains("High", result.Findings[0].Title);
+    public void Dispose()
+    {
+        _workItemStore.Dispose();
+        _releaseStore.Dispose();
+        try { File.Delete(_dbPath); } catch { }
     }
 
     [Fact]
-    public async Task DepsCveScan_CriticalSeverity_FailsWithErrorFinding()
+    public async Task PersistentErrors_TransitionsToFailed_AfterMaxIterations()
     {
-        var output =
-            "Project 'MyApp' has the following vulnerable packages:\n" +
-            "   [net10.0]:\n" +
-            "   > CritPkg   0.9.0   0.9.0   Critical   https://example.com/advisory\n";
-        var sandbox = new ScriptedSandbox(new SandboxExecResult(0, output, ""));
-        var auditor = new DepsCveScanDeepAuditor();
+        const int maxIterations = 2;
 
-        var result = await auditor.RunAsync(sandbox, "/work", TestCtx);
+        // Auditor always returns a blocking error — more results than maxIterations to be safe.
+        var alwaysError = Enumerable.Repeat(
+            new AuditResult(false, [new AuditFinding(AuditorName, AuditSeverity.Error, "Persistent bug", "Not fixed")]),
+            maxIterations + 2).ToArray();
 
-        Assert.False(result.Passed);
-        Assert.Equal(AuditSeverity.Error, result.Findings[0].Severity);
+        var auditor = new ScriptedDeepAuditor(AuditorName, alwaysError);
+        var (svc, rel, _) = await SetupAsync(auditor, maxIterations);
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        var final = await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 10);
+
+        Assert.Equal(ReleaseState.Failed, final);
     }
 
     [Fact]
-    public async Task DepsCveScan_MixedSeverities_FailsIfAnyError()
+    public async Task PersistentErrors_FailedReasonContainsIterationCount()
     {
-        var output =
-            "Project 'MyApp' has the following vulnerable packages:\n" +
-            "   [net10.0]:\n" +
-            "   > LowPkg      3.0.0   3.0.0   Low      https://example.com/adv1\n" +
-            "   > HighPkg     4.0.0   4.0.0   High     https://example.com/adv2\n" +
-            "   > ModeratePkg 5.0.0   5.0.0   Moderate https://example.com/adv3\n";
-        var sandbox = new ScriptedSandbox(new SandboxExecResult(0, output, ""));
-        var auditor = new DepsCveScanDeepAuditor();
+        const int maxIterations = 2;
+        var alwaysError = Enumerable.Repeat(
+            new AuditResult(false, [new AuditFinding(AuditorName, AuditSeverity.Error, "Still broken", "Won't converge")]),
+            maxIterations + 2).ToArray();
 
-        var result = await auditor.RunAsync(sandbox, "/work", TestCtx);
+        var auditor = new ScriptedDeepAuditor(AuditorName, alwaysError);
+        var (svc, rel, _) = await SetupAsync(auditor, maxIterations);
 
-        Assert.False(result.Passed);
-        Assert.Equal(3, result.Findings.Count);
-        Assert.Contains(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.Contains(result.Findings, f => f.Severity == AuditSeverity.Warning);
-        Assert.Contains(result.Findings, f => f.Severity == AuditSeverity.Info);
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 10);
+
+        var refreshed = await _releaseStore.GetAsync(rel.Id);
+        Assert.NotNull(refreshed!.FailedReason);
+        Assert.Contains(maxIterations.ToString(), refreshed.FailedReason);
     }
 
     [Fact]
-    public async Task DepsCveScan_FindingIncludesAdvisoryUrl()
+    public async Task PersistentErrors_EmitsReleaseFailedWebhook()
     {
-        var output =
-            "Project 'MyApp' has the following vulnerable packages:\n" +
-            "   [net10.0]:\n" +
-            "   > BadPkg   2.0.0   2.0.0   High   https://github.com/advisories/GHSA-1234\n";
-        var sandbox = new ScriptedSandbox(new SandboxExecResult(0, output, ""));
-        var auditor = new DepsCveScanDeepAuditor();
+        const int maxIterations = 2;
+        var alwaysError = Enumerable.Repeat(
+            new AuditResult(false, [new AuditFinding(AuditorName, AuditSeverity.Error, "Error", "Error")]),
+            maxIterations + 2).ToArray();
 
-        var result = await auditor.RunAsync(sandbox, "/work", TestCtx);
+        var auditor = new ScriptedDeepAuditor(AuditorName, alwaysError);
+        var (svc, rel, _) = await SetupAsync(auditor, maxIterations);
 
-        var finding = Assert.Single(result.Findings);
-        Assert.Contains("https://github.com/advisories/GHSA-1234", finding.Description);
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 10);
+
+        Assert.Contains(_webhooks.Events, e => e.Event == "release.failed");
     }
 
     [Fact]
-    public async Task DepsCveScan_RawOutputCaptured()
+    public async Task PersistentErrors_MaxIterationsRemediationItemsCreated()
     {
-        var output = "some raw output\n> Pkg 1.0.0 1.0.0 High https://example.com/\n";
-        var sandbox = new ScriptedSandbox(new SandboxExecResult(0, output, ""));
-        var auditor = new DepsCveScanDeepAuditor();
+        // With maxIterations=2 and persistent errors, expect 1 remediation item
+        // (created after iter 1; iter 2 is the last attempt so no further item).
+        const int maxIterations = 2;
+        var alwaysError = Enumerable.Repeat(
+            new AuditResult(false, [new AuditFinding(AuditorName, AuditSeverity.Error, "Error", "Error")]),
+            maxIterations + 2).ToArray();
 
-        var result = await auditor.RunAsync(sandbox, "/work", TestCtx);
+        var auditor = new ScriptedDeepAuditor(AuditorName, alwaysError);
+        var (svc, rel, _) = await SetupAsync(auditor, maxIterations);
 
-        Assert.NotNull(result.RawOutput);
-        Assert.Contains("some raw output", result.RawOutput);
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 10);
+
+        // Count remediation work items (exclude the original seeded item).
+        var allItems = new List<WorkItem>();
+        await foreach (var wi in _workItemStore.ListByReleaseAsync(rel.Id, default))
+            allItems.Add(wi);
+
+        var remediationItems = allItems.Where(wi =>
+            wi.Title.Contains("deep-audit", StringComparison.OrdinalIgnoreCase) ||
+            wi.Title.Contains("remediation", StringComparison.OrdinalIgnoreCase)).ToList();
+
+        // maxIterations=2: remediation after iter 1, then iter 2 hits max → fail (no item for iter 2).
+        Assert.Single(remediationItems);
+    }
+
+    [Fact]
+    public async Task PersistentErrors_WithSingleIteration_FailsImmediately()
+    {
+        // maxIterations=1: no remediation items created; fails on the first (and only) pass.
+        const int maxIterations = 1;
+        var auditor = new ScriptedDeepAuditor(AuditorName,
+            new AuditResult(false, [new AuditFinding(AuditorName, AuditSeverity.Error, "Error", "Error")]));
+
+        var (svc, rel, _) = await SetupAsync(auditor, maxIterations);
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        var final = await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+
+        Assert.Equal(ReleaseState.Failed, final);
+
+        // No remediation items when maxIterations=1.
+        var allItems = new List<WorkItem>();
+        await foreach (var wi in _workItemStore.ListByReleaseAsync(rel.Id, default))
+            allItems.Add(wi);
+
+        Assert.DoesNotContain(allItems, wi =>
+            wi.Title.Contains("deep-audit", StringComparison.OrdinalIgnoreCase) ||
+            wi.Title.Contains("remediation", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private async Task<(ReleaseService svc, Release rel, WorkItem item)> SetupAsync(
+        ScriptedDeepAuditor auditor,
+        int maxIterations)
+    {
+        var projects = new InMemoryProjectRepository(
+            ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: maxIterations));
+        var autoCompleteQueue = new AutoCompleteTaskQueue(_workItemStore);
+        var svc = ReleaseTestHelper.BuildService(
+            _releaseStore, _workItemStore, projects, _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: autoCompleteQueue,
+            sandboxes: new AlwaysSucceedSandboxProvider(),
+            gitHost: new DeepAuditTestGitHost());
+
+        var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(rel);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "seed item",
+            Prompt = "do work",
+            Agent = AgentKind.Claude,
+            ReleaseId = rel.Id,
+        };
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        return (svc, rel, item);
+    }
+
+    private async Task<ReleaseState> PollUntilAsync(
+        ReleaseId id,
+        Func<ReleaseState, bool> predicate,
+        int timeoutSeconds)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(timeoutSeconds);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var r = await _releaseStore.GetAsync(id);
+            if (r is not null && predicate(r.State))
+                return r.State;
+            await Task.Delay(20);
+        }
+        var final = await _releaseStore.GetAsync(id);
+        return final?.State ?? ReleaseState.Open;
     }
 }

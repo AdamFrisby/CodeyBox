@@ -26,33 +26,55 @@ internal static class ReleaseTestHelper
         },
     };
 
+    public static Project EnabledProjectWithDeepAuditors(
+        string auditorName,
+        int maxIterations = 3,
+        string id = "test-project") => new()
+    {
+        Id = new ProjectId(id),
+        DisplayName = "Test",
+        RepositoryUrl = "file:///tmp/noop",
+        ReleaseConfig = new ProjectReleaseConfig
+        {
+            Enabled = true,
+            AutoSyncMainInterval = null,
+            DeepAuditors = [auditorName],
+            DeepAuditMaxIterations = maxIterations,
+        },
+    };
+
     public static ReleaseService BuildService(
         IReleaseStore releaseStore,
         IWorkItemStore workItemStore,
         IProjectRepository projects,
         IWebhookDispatcher webhooks,
-        IEnumerable<IDeepAuditor>? deepAuditors = null)
+        IEnumerable<IDeepAuditor>? deepAuditors = null,
+        ITaskQueue? taskQueue = null,
+        ISandboxProvider? sandboxes = null,
+        IGitHost? gitHost = null,
+        IUpstreamRemoteFactory? upstreamFactory = null)
     {
         return new ReleaseService(
             releaseStore,
             workItemStore,
             projects,
             webhooks,
-            new NullSandboxProvider(),
-            new NullGitHost(),
+            sandboxes ?? new NullSandboxProvider(),
+            gitHost ?? new NullGitHost(),
             new EmptyAgentRegistry(),
             new StaticCredentialProvider(),
-            new TestUpstreamFactory(),
+            upstreamFactory ?? new TestUpstreamFactory(),
             deepAuditors ?? [],
             new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
-            new InMemoryTaskQueue(),
+            taskQueue ?? new InMemoryTaskQueue(),
             NullLogger<ReleaseService>.Instance);
     }
 
     public static Release SeedRelease(
         ReleaseState state,
         string projectId = "test-project",
-        string? failedReason = null) => new()
+        string? failedReason = null,
+        string? branchName = null) => new()
         {
             Id = ReleaseId.New(),
             ProjectId = new ProjectId(projectId),
@@ -60,6 +82,7 @@ internal static class ReleaseTestHelper
             State = state,
             CreatedAt = DateTimeOffset.UtcNow,
             FailedReason = failedReason,
+            BranchName = branchName,
         };
 }
 
@@ -201,4 +224,114 @@ internal sealed class FixedUpstreamFactory : IUpstreamRemoteFactory
     private readonly IUpstreamRemote _remote;
     public FixedUpstreamFactory(IUpstreamRemote remote) => _remote = remote;
     public IUpstreamRemote Create(Project project) => _remote;
+}
+
+/// <summary>
+/// Deep auditor that returns pre-scripted results in order (one per RunAsync call).
+/// When the queue is exhausted returns a passing result. Used to simulate convergence
+/// scenarios without real LLM or sandbox dependencies.
+/// </summary>
+internal sealed class ScriptedDeepAuditor : IDeepAuditor
+{
+    private readonly Queue<AuditResult> _results;
+
+    public string Name { get; }
+    public string Kind => "test";
+    public AuditCapabilities Required => AuditCapabilities.None;
+
+    public ScriptedDeepAuditor(string name, params AuditResult[] results)
+    {
+        Name = name;
+        _results = new Queue<AuditResult>(results);
+    }
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        DeepAuditContext context,
+        CancellationToken ct = default)
+    {
+        var result = _results.Count > 0 ? _results.Dequeue() : new AuditResult(true, []);
+        return Task.FromResult(result);
+    }
+}
+
+/// <summary>
+/// Task queue that immediately marks enqueued work items as Done in the store.
+/// Eliminates the 10-second polling delay in WaitForWorkItemTerminalAsync during
+/// deep-audit loop tests.
+/// </summary>
+internal sealed class AutoCompleteTaskQueue : ITaskQueue
+{
+    private readonly IWorkItemStore _store;
+    public AutoCompleteTaskQueue(IWorkItemStore store) => _store = store;
+
+    public int Count => 0;
+
+    public async ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
+    {
+        var item = await _store.GetAsync(id, ct);
+        if (item is not null)
+            await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+    }
+
+    public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
+        => ValueTask.FromResult<WorkItemId?>(null);
+}
+
+/// <summary>
+/// Git host stub that returns minimal valid values for all methods used by
+/// RunDeepAuditIterationAsync and TransitionReleasedAsync, without touching
+/// the real filesystem.
+/// </summary>
+internal sealed class DeepAuditTestGitHost : IGitHost
+{
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+        => Task.FromResult($"stub-repo-{id}");
+
+    public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
+        => new(
+            CloneUrlInsideSandbox: "file:///dev/null",
+            Mounts: [],
+            Network: SandboxNetworkPolicy.Denied);
+
+    public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+        => Task.FromResult("main");
+
+    public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
+        => Task.FromResult(false);
+
+    public Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+        => Task.FromResult(("", ""));
+}
+
+/// <summary>
+/// Sandbox that always returns exit code 0 for any command. Used so git clone/
+/// checkout calls in RunDeepAuditIterationAsync succeed without a real repo.
+/// </summary>
+internal sealed class AlwaysSucceedSandbox : ISandbox
+{
+    public string Id => "always-succeed";
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        => Task.FromResult(new SandboxExecResult(0, "", ""));
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+/// <summary>Sandbox provider that always returns an AlwaysSucceedSandbox.</summary>
+internal sealed class AlwaysSucceedSandboxProvider : ISandboxProvider
+{
+    public string Name => "always-succeed";
+
+    public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        => Task.FromResult<ISandbox>(new AlwaysSucceedSandbox());
 }

@@ -568,11 +568,17 @@ public sealed class ReleaseService
         sb.AppendLine($"This is iteration {iteration} of {maxIterations} in the deep-audit cycle for this release.");
         sb.AppendLine($"The following {blocking.Count} blocking finding(s) must be resolved before the release can merge:");
         sb.AppendLine();
+        // Finding descriptions are LLM-generated text derived from scanning repository source files.
+        // They are treated as untrusted data: sanitized before embedding in this prompt so that
+        // adversarial content in source files cannot inject instructions into the remediation agent.
         foreach (var f in blocking)
         {
-            sb.AppendLine($"## [{f.AuditorName}] {f.Title} (severity: {f.Severity})");
-            sb.AppendLine(f.Description);
-            if (f.Location is not null) sb.AppendLine($"Location: {f.Location}");
+            var auditorName = SanitizeFindingText(f.AuditorName);
+            var title = SanitizeFindingText(f.Title);
+            var description = SanitizeFindingText(f.Description);
+            sb.AppendLine($"## [{auditorName}] {title} (severity: {f.Severity})");
+            sb.AppendLine(description);
+            if (f.Location is not null) sb.AppendLine($"Location: {SanitizeFindingText(f.Location)}");
             sb.AppendLine();
         }
         if (allFindings.Count > blocking.Count)
@@ -581,6 +587,39 @@ public sealed class ReleaseService
         }
         sb.AppendLine("Address all blocking findings, commit your changes, and do not push. The orchestrator will push.");
         return sb.ToString();
+    }
+
+    // Sanitizes untrusted text from LLM-generated auditor findings before embedding in a prompt.
+    // Prevents stored prompt injection: adversarial instructions embedded in source files that
+    // auditors read can appear in finding descriptions; this strips characters and patterns that
+    // would let such content direct the remediation agent.
+    private static string SanitizeFindingText(string? text, int maxLength = 2000)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+
+        // Truncate to bound payload size.
+        if (text.Length > maxLength)
+            text = string.Concat(text.AsSpan(0, maxLength), " [truncated]");
+
+        // Strip control characters (preserve newlines and tabs for readability).
+        var stripped = new System.Text.StringBuilder(text.Length + 16);
+        foreach (var ch in text)
+        {
+            if (ch == '\n' || ch == '\t' || !char.IsControl(ch))
+                stripped.Append(ch);
+        }
+        text = stripped.ToString();
+
+        // Demote markdown headings so they cannot inject new top-level prompt sections.
+        // e.g. "## Ignore previous instructions" → "  Ignore previous instructions"
+        var lines = text.Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var trimmed = lines[i].TrimStart();
+            if (trimmed.StartsWith('#'))
+                lines[i] = "  " + trimmed.TrimStart('#').TrimStart();
+        }
+        return string.Join('\n', lines);
     }
 
     private static async Task RunSandboxCmd(ISandbox sandbox, params string[] argv)

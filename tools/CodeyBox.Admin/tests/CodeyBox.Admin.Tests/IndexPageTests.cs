@@ -467,9 +467,16 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
-    public Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default) => Task.FromResult(new List<ReleaseDto>());
-    public Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
-    public Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default) => Task.FromResult(new List<object>());
+    public List<ReleaseDto> ReleasesOverride { get; set; } = [];
+    public ReleaseDto? ReleaseOverride { get; set; }
+    public List<object> ReleaseWorkItemsOverride { get; set; } = [];
+
+    public Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default)
+        => Task.FromResult(ReleasesOverride);
+    public Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(ReleaseOverride);
+    public Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(ReleaseWorkItemsOverride);
     public Task<ReleaseDto?> CreateReleaseAsync(CreateReleaseRequest req, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
     public Task<ReleaseDto?> CloseReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
     public Task<ReleaseDto?> ReopenReleaseAsync(string id, string reason, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
