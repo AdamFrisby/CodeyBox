@@ -1230,6 +1230,9 @@ public sealed class PipelineRunner : IPipelineRunner
             WorkItemPrompt = item.Prompt,
             AddressedFindings = addressedFindings,
             AgentStdout = agentStdout,
+            TokenEnvVar = project.Upstream.TokenEnvVar,
+            AutoMerge = project.Upstream.AutoMerge,
+            MergeMethod = project.Upstream.MergeMethod,
         };
 
         // Capture the outcome from a successful CompleteAsync so the local

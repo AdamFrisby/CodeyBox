@@ -29,6 +29,7 @@
     <Project Path="tests/CodeyBox.PluginSdk.SampleTests/CodeyBox.PluginSdk.SampleTests.csproj" />
   </Folder>
   <Folder Name="/samples/">
+    <Project Path="samples/CodeyBox.SampleGiteaUpstreamPlugin/CodeyBox.SampleGiteaUpstreamPlugin.csproj" />
     <Project Path="samples/CodeyBox.SampleVaultCredentialPlugin/CodeyBox.SampleVaultCredentialPlugin.csproj" />
   </Folder>
   <Folder Name="/tools/">
