@@ -15,4 +15,7 @@ public sealed class NoopUpstreamRemote : IUpstreamRemote
 
     public Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
         => Task.FromResult(new UpstreamCompletionOutcome { Skipped = true });
+
+    public Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)
+        => Task.FromResult(true);
 }

@@ -42,4 +42,10 @@ public interface IWorkItemStore
     /// Returns null when no matching item exists.
     /// </summary>
     Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default);
+
+    /// <summary>
+    /// List all work items linked to the given release. Used by the release
+    /// state machine to check whether all items have reached a terminal state.
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default);
 }

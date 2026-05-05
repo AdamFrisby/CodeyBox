@@ -47,6 +47,7 @@ internal static class WorkItemEndpoints
         ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
+        IReleaseStore? releaseStore,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(req.Title)) return Results.BadRequest(new { error = "title is required" });
@@ -171,6 +172,32 @@ internal static class WorkItemEndpoints
         if (cyclePath is not null)
             return Results.BadRequest(new { error = $"circular dependency detected: {cyclePath}" });
 
+        // ── Release binding ───────────────────────────────────────────────────
+
+        ReleaseId? releaseId = null;
+        if (!string.IsNullOrWhiteSpace(req.ReleaseId))
+        {
+            if (releaseStore is null)
+                return Results.BadRequest(new { error = "release management is not available" });
+
+            if (!ReleaseId.TryParse(req.ReleaseId, out var rid))
+                return Results.BadRequest(new { error = "invalid releaseId" });
+
+            var rel = await releaseStore.GetAsync(rid, ct);
+            if (rel is null)
+                return Results.NotFound(new { error = $"release '{req.ReleaseId}' not found" });
+            if (rel.ProjectId != pid)
+                return Results.BadRequest(new { error = "release belongs to a different project" });
+            if (rel.State != ReleaseState.Open)
+                return Results.BadRequest(new { error = $"release is {rel.State}; only Open releases accept new work items" });
+
+            var relProject = project;
+            if (relProject is not null && !relProject.ReleaseConfig.Enabled)
+                return Results.BadRequest(new { error = $"release management is not enabled for project '{req.ProjectId}'" });
+
+            releaseId = rid;
+        }
+
         // ── Build and persist ─────────────────────────────────────────────────
 
         string? agentClassId = null;
@@ -197,6 +224,7 @@ internal static class WorkItemEndpoints
             DependsOn = dependsOnIds,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
             ExternalId = externalId,
+            ReleaseId = releaseId,
         };
         if (req.WorkTimeoutMinutes is { } w)
             item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
@@ -734,7 +762,8 @@ internal static class WorkItemEndpoints
             item.DependsOn.Select(d => d.ToString()).ToList(),
             depsSatisfied,
             depExtIds,
-            item.QueuePosition);
+            item.QueuePosition,
+            item.ReleaseId?.ToString());
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -823,7 +852,8 @@ public sealed record CreateWorkItemRequest(
     int? WorkTimeoutMinutes,
     int? MergeTimeoutMinutes,
     string? ExternalId = null,
-    string[]? DependsOn = null);
+    string[]? DependsOn = null,
+    string? ReleaseId = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -856,7 +886,8 @@ public sealed record WorkItemDto(
     IReadOnlyList<string> DependsOn,
     bool DependsOnSatisfied,
     IReadOnlyDictionary<string, string?> DependsOnExternalIds,
-    long QueuePosition = 0);
+    long QueuePosition = 0,
+    string? ReleaseId = null);
 
 public sealed record ProjectDto(
     string Id,

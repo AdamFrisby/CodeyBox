@@ -1,0 +1,293 @@
+@page "/releases"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+
+<PageTitle>Releases — CodeyBox Admin</PageTitle>
+
+<h1>Releases</h1>
+
+@* ── Filters ─────────────────────────────────────────────────────────────── *@
+<div class="suggestion-filters">
+    <label>
+        Project
+        <select @bind="_filterProjectId" @bind:after="LoadAsync">
+            <option value="">All</option>
+            @foreach (var p in _projects)
+            {
+                <option value="@p.Id">@p.DisplayName</option>
+            }
+        </select>
+    </label>
+    <label>
+        State
+        <select @bind="_filterState" @bind:after="LoadAsync">
+            <option value="">All</option>
+            <option value="open">open</option>
+            <option value="closed">closed</option>
+            <option value="in_review">in_review</option>
+            <option value="released">released</option>
+            <option value="failed">failed</option>
+            <option value="abandoned">abandoned</option>
+        </select>
+    </label>
+    <button class="btn btn-primary" @onclick="() => _showCreateModal = true">+ New Release</button>
+</div>
+
+@if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+
+@if (_releases is null)
+{
+    <p>Loading…</p>
+}
+else if (_releases.Count == 0)
+{
+    <p>No releases found.</p>
+}
+else
+{
+    <table class="queue-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Project</th>
+                <th>State</th>
+                <th>Branch</th>
+                <th>Created</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var r in _releases)
+            {
+                <tr>
+                    <td><a href="/releases/@r.Id">@r.Name</a></td>
+                    <td>@r.ProjectId</td>
+                    <td><span class="state-@r.State.ToLowerInvariant()">@r.State</span></td>
+                    <td>@(r.BranchName is not null ? r.BranchName : "—")</td>
+                    <td class="col-age">@r.CreatedAt.ToString("yyyy-MM-dd")</td>
+                    <td class="col-actions">
+                        <a href="/releases/@r.Id" class="btn">view</a>
+                        @if (r.State == "open")
+                        {
+                            <button class="btn" @onclick="() => CloseAsync(r.Id)">close</button>
+                            <button class="btn btn-danger" @onclick="() => AbandonAsync(r.Id)">abandon</button>
+                        }
+                        @if (r.State == "closed")
+                        {
+                            <button class="btn btn-primary" @onclick="() => TriggerAsync(r.Id)">trigger review</button>
+                            <button class="btn" @onclick="() => BeginReopen(r.Id)">reopen</button>
+                        }
+                        @if (r.State == "failed")
+                        {
+                            <button class="btn" @onclick="() => BeginReopen(r.Id)">reopen</button>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@* ── Create release modal ─────────────────────────────────────────────────── *@
+@if (_showCreateModal)
+{
+    <div class="modal-overlay">
+        <div class="modal-box">
+            <h2>New Release</h2>
+            <label>
+                Name <span class="required">*</span>
+                <input type="text" @bind="_createName" class="modal-input" maxlength="200" placeholder="e.g. v1.2.0" />
+            </label>
+            <label>
+                Project <span class="required">*</span>
+                <select @bind="_createProjectId" class="modal-input">
+                    <option value="">— select project —</option>
+                    @foreach (var p in _projects)
+                    {
+                        <option value="@p.Id">@p.DisplayName</option>
+                    }
+                </select>
+            </label>
+            <label>
+                Description
+                <textarea @bind="_createDescription" class="modal-input" rows="3" placeholder="Optional description"></textarea>
+            </label>
+            @if (_createError is not null)
+            {
+                <p class="error-banner">@_createError</p>
+            }
+            <div class="modal-actions">
+                <button class="btn btn-primary" @onclick="DoCreateAsync">Create</button>
+                <button class="btn" @onclick="CloseCreateModal">Cancel</button>
+            </div>
+        </div>
+    </div>
+}
+
+@* ── Reopen modal ─────────────────────────────────────────────────────────── *@
+@if (_showReopenModal)
+{
+    <div class="modal-overlay">
+        <div class="modal-box">
+            <h2>Reopen Release</h2>
+            <label>
+                Reason
+                <input type="text" @bind="_reopenReason" class="modal-input" maxlength="500" placeholder="e.g. reverted release" />
+            </label>
+            @if (_actionError is not null)
+            {
+                <p class="error-banner">@_actionError</p>
+            }
+            <div class="modal-actions">
+                <button class="btn btn-primary" @onclick="DoReopenAsync">Reopen</button>
+                <button class="btn" @onclick="() => _showReopenModal = false">Cancel</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private List<ReleaseDto>? _releases;
+    private List<ProjectDto> _projects = [];
+    private string? _error;
+    private string? _actionError;
+    private string? _filterProjectId;
+    private string? _filterState;
+    private CancellationTokenSource? _cts;
+
+    private bool _showCreateModal;
+    private string _createName = "";
+    private string _createProjectId = "";
+    private string? _createDescription;
+    private string? _createError;
+
+    private bool _showReopenModal;
+    private string? _reopenTargetId;
+    private string _reopenReason = "";
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
+        try { _projects = await ApiClient.GetProjectsAsync(ct); }
+        catch (Exception ex) { _error = ex.Message; }
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        try
+        {
+            _releases = await ApiClient.GetReleasesAsync(
+                projectId: string.IsNullOrEmpty(_filterProjectId) ? null : _filterProjectId,
+                state: string.IsNullOrEmpty(_filterState) ? null : _filterState,
+                ct: ct);
+            _error = null;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _error = ex.Message; }
+    }
+
+    private async Task CloseAsync(string id)
+    {
+        var ct = _cts?.Token ?? default;
+        _actionError = null;
+        try
+        {
+            await ApiClient.CloseReleaseAsync(id, ct);
+            await LoadAsync();
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+
+    private async Task AbandonAsync(string id)
+    {
+        var ct = _cts?.Token ?? default;
+        _actionError = null;
+        try
+        {
+            await ApiClient.AbandonReleaseAsync(id, ct);
+            await LoadAsync();
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+
+    private async Task TriggerAsync(string id)
+    {
+        var ct = _cts?.Token ?? default;
+        _actionError = null;
+        try
+        {
+            await ApiClient.TriggerReleaseAsync(id, ct);
+            await LoadAsync();
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+
+    private void BeginReopen(string id)
+    {
+        _reopenTargetId = id;
+        _reopenReason = "";
+        _actionError = null;
+        _showReopenModal = true;
+    }
+
+    private async Task DoReopenAsync()
+    {
+        if (_reopenTargetId is null) return;
+        var ct = _cts?.Token ?? default;
+        _actionError = null;
+        try
+        {
+            await ApiClient.ReopenReleaseAsync(_reopenTargetId, _reopenReason, ct);
+            _showReopenModal = false;
+            await LoadAsync();
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+
+    private void CloseCreateModal()
+    {
+        _showCreateModal = false;
+        _createName = "";
+        _createProjectId = "";
+        _createDescription = null;
+        _createError = null;
+    }
+
+    private async Task DoCreateAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_createName))
+        {
+            _createError = "Name is required.";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_createProjectId))
+        {
+            _createError = "Project is required.";
+            return;
+        }
+        var ct = _cts?.Token ?? default;
+        _createError = null;
+        try
+        {
+            var created = await ApiClient.CreateReleaseAsync(
+                new CreateReleaseRequest(_createProjectId, _createName, _createDescription), ct);
+            if (created is null)
+            {
+                _createError = "Failed to create release (server returned no data).";
+                return;
+            }
+            CloseCreateModal();
+            Nav.NavigateTo($"/releases/{created.Id}");
+        }
+        catch (Exception ex) { _createError = ex.Message; }
+    }
+
+    public void Dispose() => _cts?.Cancel();
+}

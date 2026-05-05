@@ -25,6 +25,7 @@ public sealed class OrchestratorService : BackgroundService
     private readonly IProjectRepository? _projects;
     private readonly IQueueController? _queueController;
     private readonly IWebhookDispatcher? _webhooks;
+    private readonly ReleaseService? _releaseService;
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -64,7 +65,8 @@ public sealed class OrchestratorService : BackgroundService
         AgentClassRouter? router = null,
         IProjectRepository? projects = null,
         IQueueController? queueController = null,
-        IWebhookDispatcher? webhooks = null)
+        IWebhookDispatcher? webhooks = null,
+        ReleaseService? releaseService = null)
     {
         _queue = queue;
         _store = store;
@@ -76,6 +78,7 @@ public sealed class OrchestratorService : BackgroundService
         _projects = projects;
         _queueController = queueController;
         _webhooks = webhooks;
+        _releaseService = releaseService;
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
     }
 
@@ -304,6 +307,26 @@ public sealed class OrchestratorService : BackgroundService
                 }
             }
 
+            // Release branch override: if this work item is linked to a release,
+            // ensure the release branch exists and point BaseBranch at it so the
+            // pipeline checks out and pushes to the release branch rather than main.
+            if (item.ReleaseId is { } releaseId && project is not null && _releaseService is not null
+                && item.BaseBranch is null)
+            {
+                try
+                {
+                    var releaseBranch = await _releaseService.EnsureReleaseBranchForItemAsync(releaseId, project, ct);
+                    if (releaseBranch is not null)
+                        item = item with { BaseBranch = releaseBranch };
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "Worker {WorkerId}: release branch setup failed for {Id}; item will use configured base branch",
+                        workerIndex, id);
+                }
+            }
+
             // Quota routing: resolve which agent to use, or decide to wait.
             // Skipped entirely (no probe, no wait) when no agent class is configured.
             if (_router is not null)
@@ -396,6 +419,14 @@ public sealed class OrchestratorService : BackgroundService
         // After the pipeline finishes (any outcome), check whether any
         // Queued items were waiting on this item and are now unblocked.
         await EnqueueSatisfiedDependentsAsync(id, ct);
+
+        // Notify the release state machine that a release-linked item has completed.
+        // ReleaseService checks whether all items for the release are now terminal
+        // and, if so, triggers the closed→in_review transition automatically.
+        if (item.ReleaseId is { } completedReleaseId && _releaseService is not null)
+        {
+            _ = Task.Run(() => _releaseService.OnWorkItemTerminalAsync(completedReleaseId, CancellationToken.None));
+        }
     }
 
     private sealed record BudgetDeferral(string Reason, TimeSpan RecheckIn);

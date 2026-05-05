@@ -5,7 +5,9 @@ using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Api;
+using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets;
+using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -434,6 +436,13 @@ builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton<IPresetCatalog, PresetCatalog>();
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
+// --- Built-in deep auditors (release in_review phase) ------------------------
+// Registered as IDeepAuditor; ReleaseService resolves the subset configured per
+// project by name match. LLM auditors require AgentCredentials at runtime.
+builder.Services.AddSingleton<IDeepAuditor, OwaspAsvsDeepAuditor>();
+builder.Services.AddSingleton<IDeepAuditor, ArchCoherenceDeepAuditor>();
+builder.Services.AddSingleton<IDeepAuditor, DepsCveScanDeepAuditor>();
+
 // --- Webhooks ----------------------------------------------------------------
 // AllowAutoRedirect=false prevents SSRF via HTTP 3xx redirects to private
 // addresses that bypass the blocklist in ValidateWebhookUrl.
@@ -541,6 +550,13 @@ builder.Services.AddSingleton(sp =>
 });
 
 // --- Persistence + queue + pipeline + worker pool ----------------------------
+// Release store must be created BEFORE the work-item store so the releases
+// table (referenced by work_items.release_id FK index) is present first.
+builder.Services.AddSingleton<IReleaseStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteReleaseStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IWorkItemStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -649,6 +665,29 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
     new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
+// --- Release management -------------------------------------------------------
+builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
+    sp.GetRequiredService<IReleaseStore>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<ISandboxProvider>(),
+    sp.GetRequiredService<IGitHost>(),
+    sp.GetRequiredService<IAgentRegistry>(),
+    sp.GetRequiredService<ICredentialProvider>(),
+    sp.GetRequiredService<IUpstreamRemoteFactory>(),
+    sp.GetServices<IDeepAuditor>(),
+    sp.GetRequiredService<PipelineOptions>(),
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<ILogger<ReleaseService>>()));
+
+builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
+    sp.GetRequiredService<IReleaseStore>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IUpstreamRemoteFactory>(),
+    sp.GetRequiredService<ILogger<ReleaseMainSyncService>>()));
+
 builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService(
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -659,7 +698,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<AgentClassRouter>(),
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
-    sp.GetRequiredService<IWebhookDispatcher>()));
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetService<ReleaseService>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
@@ -693,6 +733,7 @@ WorkItemCostsEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
+ReleaseEndpoints.Map(app);
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 

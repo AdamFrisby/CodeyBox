@@ -348,3 +348,54 @@ The HMAC secret itself must **never** appear in config files. Put it in an envir
 - Failed deliveries are retried up to `MaxAttempts` times with exponential back-off. After that, a warning is logged and the delivery is abandoned.
 - On graceful shutdown the dispatcher drains in-flight deliveries (up to 30 s timeout).
 - When no endpoints are configured, a no-op dispatcher is used — zero overhead.
+
+---
+
+## Release events
+
+These events fire during the release management lifecycle (opt-in per project;
+see [`releases.md`](releases.md)).
+
+| Event | Fired when |
+|---|---|
+| `release.closed` | Release transitioned `open → closed` |
+| `release.abandoned` | Release was abandoned |
+| `release.reopened` | Failed release was re-opened (`failed → open`) |
+| `release.has_failed_work_items` | Release closed but some linked work items failed/cancelled |
+| `release.in_review` | Release transitioned `closed → in_review`; deep audit starting |
+| `release.deep_audit_iteration_complete` | One deep audit iteration finished (both pass and fail) |
+| `release.released` | Release merged to main; GitHub release created (if configured) |
+| `release.failed` | Deep audit exceeded max iterations; human review required |
+| `release.sync_conflict` | `ReleaseMainSyncService` detected a merge conflict merging `main` into a release branch |
+
+### `release.sync_conflict` details
+
+```json
+{
+  "event": "release.sync_conflict",
+  "occurredAt": "...",
+  "release": { "id": "...", "name": "v1.4.0", "state": "open", ... },
+  "project": { ... },
+  "details": {
+    "sourceBranch": "main",
+    "targetBranch": "release/v1.4.0"
+  }
+}
+```
+
+The conflict must be resolved manually. The sync service backs off for one
+sweep interval before retrying (does not spam retries).
+
+### `release.deep_audit_iteration_complete` details
+
+```json
+{
+  "event": "release.deep_audit_iteration_complete",
+  "details": {
+    "iteration": 2,
+    "maxIterations": 5,
+    "blockingFindings": 3,
+    "totalFindings": 7
+  }
+}
+```

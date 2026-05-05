@@ -60,6 +60,16 @@ public interface ICodeyBoxApiClient
         string? agentClassId = null,
         string? externalId = null,
         CancellationToken ct = default);
+
+    // ── Releases ──────────────────────────────────────────────────────────────
+    Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default);
+    Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default);
+    Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default);
+    Task<ReleaseDto?> CreateReleaseAsync(CreateReleaseRequest req, CancellationToken ct = default);
+    Task<ReleaseDto?> CloseReleaseAsync(string id, CancellationToken ct = default);
+    Task<ReleaseDto?> ReopenReleaseAsync(string id, string reason, CancellationToken ct = default);
+    Task<ReleaseDto?> AbandonReleaseAsync(string id, CancellationToken ct = default);
+    Task<ReleaseDto?> TriggerReleaseAsync(string id, CancellationToken ct = default);
 }
 
 /// <summary>Request body for PATCH /workitems/{id}.</summary>

@@ -256,4 +256,67 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadFromJsonAsync<ProjectCostsDto>(JsonOptions, ct);
     }
+
+    // ── Releases ──────────────────────────────────────────────────────────────
+
+    public async Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(projectId)) parts.Add($"projectId={Uri.EscapeDataString(projectId)}");
+        if (!string.IsNullOrEmpty(state)) parts.Add($"state={Uri.EscapeDataString(state)}");
+        var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
+        var result = await _http.GetFromJsonAsync<List<ReleaseDto>>($"/releases{qs}", JsonOptions, ct);
+        return result ?? [];
+    }
+
+    public async Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/releases/{Uri.EscapeDataString(id)}", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<ReleaseDto>(JsonOptions, ct);
+    }
+
+    public async Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<object>>($"/releases/{Uri.EscapeDataString(id)}/workitems", JsonOptions, ct);
+        return result ?? [];
+    }
+
+    public async Task<ReleaseDto?> CreateReleaseAsync(CreateReleaseRequest req, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync("/releases", req, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ReleaseDto>(JsonOptions, ct);
+    }
+
+    public async Task<ReleaseDto?> CloseReleaseAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsync($"/releases/{Uri.EscapeDataString(id)}/close", null, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ReleaseDto>(JsonOptions, ct);
+    }
+
+    public async Task<ReleaseDto?> ReopenReleaseAsync(string id, string reason, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/releases/{Uri.EscapeDataString(id)}/reopen",
+            new ReopenReleaseRequest(reason), JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ReleaseDto>(JsonOptions, ct);
+    }
+
+    public async Task<ReleaseDto?> AbandonReleaseAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsync($"/releases/{Uri.EscapeDataString(id)}/abandon", null, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ReleaseDto>(JsonOptions, ct);
+    }
+
+    public async Task<ReleaseDto?> TriggerReleaseAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsync($"/releases/{Uri.EscapeDataString(id)}/release", null, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ReleaseDto>(JsonOptions, ct);
+    }
 }

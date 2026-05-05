@@ -1,0 +1,295 @@
+@page "/releases/{Id}"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+@inject NavigationManager Nav
+
+<PageTitle>Release — CodeyBox Admin</PageTitle>
+
+@if (_release is null && _error is null)
+{
+    <p>Loading…</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_release is not null)
+{
+    <h1>@_release.Name</h1>
+
+    <div class="suggestion-meta">
+        <span class="state-@_release.State.ToLowerInvariant()">@_release.State</span>
+        <span>project: @_release.ProjectId</span>
+        @if (_release.BranchName is not null)
+        {
+            <span>branch: <code>@_release.BranchName</code></span>
+        }
+        @if (_release.TargetTag is not null)
+        {
+            <span>tag: <code>@_release.TargetTag</code></span>
+        }
+        <span>created: @_release.CreatedAt.ToString("yyyy-MM-dd HH:mm")</span>
+        @if (_release.ClosedAt is not null)
+        {
+            <span>closed: @_release.ClosedAt.Value.ToString("yyyy-MM-dd HH:mm")</span>
+        }
+        @if (_release.ReviewStartedAt is not null)
+        {
+            <span>review started: @_release.ReviewStartedAt.Value.ToString("yyyy-MM-dd HH:mm")</span>
+        }
+        @if (_release.ReleasedAt is not null)
+        {
+            <span>released: @_release.ReleasedAt.Value.ToString("yyyy-MM-dd HH:mm")</span>
+        }
+        @if (_release.FailedReason is not null)
+        {
+            <span class="error-banner">failed: @_release.FailedReason</span>
+        }
+    </div>
+
+    @if (!string.IsNullOrEmpty(_release.Description))
+    {
+        <p>@_release.Description</p>
+    }
+
+    @* ── Actions ────────────────────────────────────────────────────────────── *@
+    <div class="suggestion-actions">
+        @if (_release.State == "open")
+        {
+            <button class="btn" @onclick="CloseReleaseAsync">Close</button>
+            <button class="btn btn-danger" @onclick="AbandonReleaseAsync">Abandon</button>
+        }
+        @if (_release.State == "closed")
+        {
+            <button class="btn btn-primary" @onclick="TriggerReviewAsync">Trigger Review</button>
+            <button class="btn" @onclick="() => _showReopenModal = true">Reopen</button>
+        }
+        @if (_release.State == "failed")
+        {
+            <button class="btn" @onclick="() => _showReopenModal = true">Reopen</button>
+        }
+    </div>
+
+    @if (_actionError is not null)
+    {
+        <p class="error-banner">@_actionError</p>
+    }
+
+    @* ── Work items ─────────────────────────────────────────────────────────── *@
+    <h2>Work Items</h2>
+
+    @if (_workItemsError is not null)
+    {
+        <p class="error-banner">@_workItemsError</p>
+    }
+    else if (_workItems is null)
+    {
+        <p>Loading work items…</p>
+    }
+    else if (_workItems.Count == 0)
+    {
+        <p>No work items in this release.</p>
+    }
+    else
+    {
+        <table class="queue-table">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Title</th>
+                    <th>State</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var wi in _workItems)
+                {
+                    <tr>
+                        <td><a href="/work-items/@wi.Id">@wi.Id[..8]</a></td>
+                        <td><a href="/work-items/@wi.Id">@wi.Title</a></td>
+                        <td><span class="state-@wi.State.ToLowerInvariant()">@wi.State</span></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
+    @* ── Timeline ────────────────────────────────────────────────────────────── *@
+    <h2>Timeline</h2>
+
+    @if (_timelineError is not null)
+    {
+        <p class="error-banner">@_timelineError</p>
+    }
+    else if (_timeline is null)
+    {
+        <p>Loading timeline…</p>
+    }
+    else if (_timeline.Entries.Count == 0)
+    {
+        <p>No timeline events.</p>
+    }
+    else
+    {
+        <table class="queue-table">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Kind</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var ev in _timeline.Entries)
+                {
+                    <tr>
+                        <td class="col-age">@ev.OccurredAt.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                        <td><code>@ev.Kind</code></td>
+                        <td>@ev.Summary</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+
+@* ── Reopen modal ─────────────────────────────────────────────────────────── *@
+@if (_showReopenModal)
+{
+    <div class="modal-overlay">
+        <div class="modal-box">
+            <h2>Reopen Release</h2>
+            <label>
+                Reason
+                <input type="text" @bind="_reopenReason" class="modal-input" maxlength="500" placeholder="e.g. reverted" />
+            </label>
+            @if (_actionError is not null)
+            {
+                <p class="error-banner">@_actionError</p>
+            }
+            <div class="modal-actions">
+                <button class="btn btn-primary" @onclick="DoReopenAsync">Reopen</button>
+                <button class="btn" @onclick="() => _showReopenModal = false">Cancel</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private ReleaseDto? _release;
+    private List<WorkItemSummary>? _workItems;
+    private WorkItemTimelineDto? _timeline;
+    private string? _error;
+    private string? _actionError;
+    private string? _workItemsError;
+    private string? _timelineError;
+
+    private bool _showReopenModal;
+    private string _reopenReason = "";
+
+    private CancellationTokenSource? _cts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await Task.WhenAll(LoadReleaseAsync(), LoadWorkItemsAsync(), LoadTimelineAsync());
+    }
+
+    private async Task LoadReleaseAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        try
+        {
+            _release = await ApiClient.GetReleaseAsync(Id, ct);
+            if (_release is null) _error = "Release not found.";
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _error = ex.Message; }
+    }
+
+    private async Task LoadWorkItemsAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        try
+        {
+            var raw = await ApiClient.GetReleaseWorkItemsAsync(Id, ct);
+            _workItems = raw
+                .Select(obj => System.Text.Json.JsonSerializer.Deserialize<WorkItemSummary>(
+                    System.Text.Json.JsonSerializer.Serialize(obj)))
+                .Where(w => w is not null)
+                .Select(w => w!)
+                .ToList();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _workItemsError = ex.Message; }
+    }
+
+    private async Task LoadTimelineAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        try
+        {
+            // Use the work-item timeline API with the release ID to get release-scoped events
+            _timeline = await ApiClient.GetWorkItemTimelineAsync(Id, ct: ct);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _timelineError = ex.Message; }
+    }
+
+    private async Task CloseReleaseAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        _actionError = null;
+        try
+        {
+            var updated = await ApiClient.CloseReleaseAsync(Id, ct);
+            if (updated is not null) _release = updated;
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+
+    private async Task AbandonReleaseAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        _actionError = null;
+        try
+        {
+            var updated = await ApiClient.AbandonReleaseAsync(Id, ct);
+            if (updated is not null) _release = updated;
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+
+    private async Task TriggerReviewAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        _actionError = null;
+        try
+        {
+            var updated = await ApiClient.TriggerReleaseAsync(Id, ct);
+            if (updated is not null) _release = updated;
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+
+    private async Task DoReopenAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        _actionError = null;
+        try
+        {
+            var updated = await ApiClient.ReopenReleaseAsync(Id, _reopenReason, ct);
+            if (updated is not null)
+            {
+                _release = updated;
+                _showReopenModal = false;
+            }
+        }
+        catch (Exception ex) { _actionError = ex.Message; }
+    }
+
+    public void Dispose() => _cts?.Cancel();
+
+    private sealed record WorkItemSummary(string Id, string Title, string State);
+}

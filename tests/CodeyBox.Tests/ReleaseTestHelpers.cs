@@ -1,0 +1,153 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Agents;
+using CodeyBox.Core;
+using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
+using CodeyBox.Webhooks;
+
+namespace CodeyBox.Tests;
+
+/// <summary>
+/// Shared helpers for release-related tests. Provides stub implementations
+/// for the heavy infrastructure (sandbox, git host, agents) that is never
+/// invoked by pure state-machine tests.
+/// </summary>
+internal static class ReleaseTestHelper
+{
+    public static Project EnabledProject(string id = "test-project") => new()
+    {
+        Id = new ProjectId(id),
+        DisplayName = "Test",
+        RepositoryUrl = "file:///tmp/noop",
+        ReleaseConfig = new ProjectReleaseConfig
+        {
+            Enabled = true,
+            AutoSyncMainInterval = null,
+        },
+    };
+
+    public static ReleaseService BuildService(
+        IReleaseStore releaseStore,
+        IWorkItemStore workItemStore,
+        IProjectRepository projects,
+        IWebhookDispatcher webhooks,
+        IEnumerable<IDeepAuditor>? deepAuditors = null)
+    {
+        return new ReleaseService(
+            releaseStore,
+            workItemStore,
+            projects,
+            webhooks,
+            new NullSandboxProvider(),
+            new NullGitHost(),
+            new EmptyAgentRegistry(),
+            new StaticCredentialProvider(),
+            new TestUpstreamFactory(),
+            deepAuditors ?? [],
+            new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
+            new InMemoryTaskQueue(),
+            NullLogger<ReleaseService>.Instance);
+    }
+
+    public static Release SeedRelease(
+        ReleaseState state,
+        string projectId = "test-project",
+        string? failedReason = null) => new()
+    {
+        Id = ReleaseId.New(),
+        ProjectId = new ProjectId(projectId),
+        Name = $"v1.0-{Guid.NewGuid():N}",
+        State = state,
+        CreatedAt = DateTimeOffset.UtcNow,
+        FailedReason = failedReason,
+    };
+}
+
+internal sealed class NullSandboxProvider : ISandboxProvider
+{
+    public string Name => "null";
+    public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        => throw new NotSupportedException("NullSandboxProvider does not support CreateAsync");
+}
+
+internal sealed class NullGitHost : IGitHost
+{
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+        => throw new NotSupportedException();
+    public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
+        => throw new NotSupportedException();
+    public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+        => throw new NotSupportedException();
+    public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+        => throw new NotSupportedException();
+    public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+        => Task.CompletedTask;
+    public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
+        => Task.FromResult(false);
+    public Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+        => Task.FromResult(("", ""));
+}
+
+internal sealed class EmptyAgentRegistry : IAgentRegistry
+{
+    public bool TryGet(AgentKind kind, out IAgentRunner runner)
+    {
+        runner = null!;
+        return false;
+    }
+    public IReadOnlyCollection<AgentKind> Available => [];
+}
+
+/// <summary>Fake sandbox that returns a pre-configured output for exec calls.</summary>
+internal sealed class ScriptedSandbox : ISandbox
+{
+    private readonly Queue<SandboxExecResult> _results;
+
+    public string Id => "scripted";
+
+    public ScriptedSandbox(params SandboxExecResult[] results)
+    {
+        _results = new Queue<SandboxExecResult>(results);
+    }
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+    {
+        var r = _results.Count > 0
+            ? _results.Dequeue()
+            : new SandboxExecResult(0, "", "");
+        return Task.FromResult(r);
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+/// <summary>Configurable fake upstream remote for merge tests.</summary>
+internal sealed class FakeMergeUpstreamRemote : IUpstreamRemote
+{
+    public string Name => "fake-merge";
+    public bool MergeResult { get; set; } = true;
+    public List<(string Target, string Source)> MergeAttempts { get; } = [];
+
+    public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
+        => Task.FromResult(new UpstreamPushResult(true, null));
+
+    public Task<UpstreamCompletionOutcome> CompleteAsync(
+        UpstreamCompletionRequest req, CancellationToken ct = default)
+        => Task.FromResult(new UpstreamCompletionOutcome { BranchPushed = true });
+
+    public Task<bool> TryMergeUpstreamBranchAsync(
+        string targetBranch, string sourceBranch, CancellationToken ct = default)
+    {
+        MergeAttempts.Add((targetBranch, sourceBranch));
+        return Task.FromResult(MergeResult);
+    }
+}
+
+internal sealed class FakeMergeUpstreamFactory : IUpstreamRemoteFactory
+{
+    private readonly FakeMergeUpstreamRemote _remote;
+    public FakeMergeUpstreamFactory(FakeMergeUpstreamRemote remote) => _remote = remote;
+    public IUpstreamRemote Create(Project project) => _remote;
+}

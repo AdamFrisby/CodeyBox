@@ -24,4 +24,10 @@ public sealed record WebhookEvent
 
     /// <summary>Optional event-specific payload; serialised as-is into the "details" field.</summary>
     public object? Details { get; init; }
+
+    /// <summary>
+    /// Set for release-scoped events (event names starting with "release.").
+    /// Null for work-item and agent events.
+    /// </summary>
+    public Release? Release { get; init; }
 }

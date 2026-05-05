@@ -26,6 +26,16 @@ public interface IUpstreamRemote
     /// for graceful soft-failures (e.g. PR already exists).
     /// </summary>
     Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default);
+
+    /// <summary>
+    /// Attempts to merge <paramref name="sourceBranch"/> into <paramref name="targetBranch"/>
+    /// on the upstream (e.g. GitHub Merges API, or host-side git merge+push for generic git).
+    /// Returns <c>true</c> when the merge succeeded or the target was already up-to-date.
+    /// Returns <c>false</c> when a merge conflict is detected; the caller should emit a
+    /// <c>release.sync_conflict</c> event and leave the conflict for a human to resolve.
+    /// Throws on unexpected infrastructure failures (network error, auth failure, etc.).
+    /// </summary>
+    Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default);
 }
 
 public sealed record UpstreamPushResult(bool Success, string? Error);

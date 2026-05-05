@@ -12,6 +12,8 @@
     <ProjectReference Include="..\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\CodeyBox.Projects\CodeyBox.Projects.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit.Presets\CodeyBox.Audit.Presets.csproj" />
+    <ProjectReference Include="..\CodeyBox.Audit.Llm\CodeyBox.Audit.Llm.csproj" />
+    <ProjectReference Include="..\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
     <ProjectReference Include="..\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />

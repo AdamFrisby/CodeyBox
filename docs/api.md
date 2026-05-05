@@ -576,6 +576,74 @@ Per-project config (upstream, audit policy, per-phase network profiles)
 lives under `Projects[]` — see [`projects.md`](projects.md). Host-side
 network profile setup lives in [`host-firewall.md`](host-firewall.md).
 
+---
+
+## Release endpoints
+
+See [`releases.md`](releases.md) for a full introduction to the release
+management feature.
+
+### `POST /releases`
+
+Create a new release. The target project must have `release.enabled = true`.
+
+```json
+{
+  "projectId": "my-app",
+  "name": "v1.4.0",
+  "description": "Optional release description"
+}
+```
+
+Returns `201 Created` with the `ReleaseDto` body.
+
+Validation rules: `name` is required (≤ 200 chars, no control characters),
+must be unique per project, and the project must exist and have releases enabled.
+
+### `GET /releases`
+
+List releases. Query params: `?projectId=` and `?state=` (both optional).
+Returns newest-first. State values: `open`, `closed`, `in_review`, `released`,
+`failed`, `abandoned`.
+
+### `GET /releases/{id}`
+
+Get a single release by ID. Returns `404` if not found.
+
+### `GET /releases/{id}/workitems`
+
+List work items linked to this release. Returns lightweight summaries
+(id, title, state).
+
+### `POST /releases/{id}/close`
+
+Transition `open → closed`. Returns the updated `ReleaseDto`. Returns `400`
+if the release is not `open`.
+
+If all work items linked to the release are already terminal, the
+`closed → in_review` transition fires immediately in the background.
+
+### `POST /releases/{id}/reopen`
+
+Re-open a `failed` release for additional remediation. Body:
+
+```json
+{ "reason": "rolling back release; applying hotfix separately" }
+```
+
+Returns `400` if the release is not `failed`.
+
+### `POST /releases/{id}/abandon`
+
+Abandon a release from any non-`released` state. Accepts any state except
+`released`.
+
+### `POST /releases/{id}/release`
+
+Force-start the deep-audit phase on a `closed` release, bypassing the
+"wait for all work items" guard. Returns `202 Accepted`. Returns `400`
+if the release is not `closed`.
+
 Secrets come from environment variables (never `appsettings.json`):
 
 * `CODEYBOX_API_KEY` (REST bearer token)

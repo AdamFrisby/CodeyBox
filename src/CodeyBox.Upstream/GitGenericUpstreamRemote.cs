@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using CodeyBox.Core;
 
 namespace CodeyBox.Upstream;
@@ -51,6 +52,74 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
             throw new InvalidOperationException(
                 $"Failed to push '{request.BaseBranch}' to '{safeUrl}': {safeMessage}", ex);
         }
+    }
+
+    /// <summary>
+    /// Clones <paramref name="targetBranch"/> to a temp directory, fetches
+    /// <paramref name="sourceBranch"/> from origin, and attempts <c>git merge</c>.
+    /// On conflict returns false; on success pushes back to origin and returns true.
+    /// The temp directory is deleted regardless of outcome.
+    /// </summary>
+    public async Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)
+    {
+        var tmpDir = Path.Combine(Path.GetTempPath(), "codeybox-sync-" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tmpDir);
+            var clone = await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment,
+                "clone", "--branch", targetBranch, "--single-branch", "--", _opts.UpstreamUrl, tmpDir);
+            if (clone.ExitCode != 0)
+                throw new InvalidOperationException($"git clone failed: {clone.Stderr}");
+
+            var fetch = await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment, "fetch", "origin", sourceBranch);
+            if (fetch.ExitCode != 0)
+                throw new InvalidOperationException($"git fetch failed: {fetch.Stderr}");
+
+            var merge = await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment,
+                "merge", $"FETCH_HEAD", "--no-edit", "--no-ff");
+            if (merge.ExitCode != 0)
+            {
+                await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment, "merge", "--abort");
+                return false;
+            }
+
+            var push = await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment, "push", "origin", targetBranch);
+            if (push.ExitCode != 0)
+                throw new InvalidOperationException($"git push failed: {push.Stderr}");
+
+            return true;
+        }
+        finally
+        {
+            try { if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true); }
+            catch { /* best-effort cleanup */ }
+        }
+    }
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
+        string workdir, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? extraEnv,
+        params string[] args)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = workdir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        if (extraEnv is not null)
+            foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;
+
+        using var p = new Process { StartInfo = psi };
+        p.Start();
+        var stdout = await p.StandardOutput.ReadToEndAsync(ct);
+        var stderr = await p.StandardError.ReadToEndAsync(ct);
+        await p.WaitForExitAsync(ct);
+        return (p.ExitCode, stdout, stderr);
     }
 
     private static string ScrubUrlCredentials(string url)

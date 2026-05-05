@@ -205,6 +205,28 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         };
     }
 
+    /// <summary>
+    /// Uses the GitHub Merges API to merge <paramref name="sourceBranch"/> into
+    /// <paramref name="targetBranch"/>. Returns false on 409 Conflict; true on
+    /// 201 (merge commit created) or 204 (already up-to-date).
+    /// </summary>
+    public async Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)
+    {
+        var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/merges";
+        var body = new GitHubMergesRequest(targetBranch, sourceBranch,
+            $"chore: sync {sourceBranch} into {targetBranch}");
+
+        using var req = BuildRequest(HttpMethod.Post, url);
+        req.Content = JsonContent.Create(body);
+
+        using var response = await SendAsync(req, ct);
+
+        if (response.StatusCode == HttpStatusCode.Conflict) return false;
+        if (response.StatusCode == HttpStatusCode.NoContent) return true; // already up-to-date
+        response.EnsureSuccessStatusCode();
+        return true;
+    }
+
     // -------------------------------------------------------------------------
     // Description generation
     // -------------------------------------------------------------------------
@@ -413,3 +435,8 @@ internal sealed record GitHubPrResponse(
 
 internal sealed record GitHubMergeResponse(
     [property: JsonPropertyName("sha")] string? Sha);
+
+internal sealed record GitHubMergesRequest(
+    [property: JsonPropertyName("base")] string Base,
+    [property: JsonPropertyName("head")] string Head,
+    [property: JsonPropertyName("commit_message")] string CommitMessage);

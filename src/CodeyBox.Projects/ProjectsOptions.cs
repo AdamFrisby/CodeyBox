@@ -33,6 +33,32 @@ public sealed class ProjectConfig
     public ProjectAuditConfig? Audit { get; set; }
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
     public ProjectBudgetConfig? Budget { get; set; }
+    public ProjectReleaseConfigOptions? Release { get; set; }
+}
+
+/// <summary>
+/// Config-binding shape for per-project release management settings.
+/// Maps to <see cref="CodeyBox.Core.ProjectReleaseConfig"/> after resolution.
+/// All fields are nullable; missing fields take the defaults defined on
+/// <see cref="CodeyBox.Core.ProjectReleaseConfig"/>.
+/// </summary>
+public sealed class ProjectReleaseConfigOptions
+{
+    public bool? Enabled { get; set; }
+    public string? BranchNameTemplate { get; set; }
+
+    /// <summary>
+    /// Auto-sync interval in minutes. Null = disabled (no periodic merge of main
+    /// into the release branch). 0 = also disabled. Default: 720 (12 h).
+    /// </summary>
+    public int? AutoSyncMainIntervalMinutes { get; set; }
+
+    /// <summary>Named deep auditors to run during the in_review phase.</summary>
+    public List<string>? DeepAuditors { get; set; }
+
+    public int? DeepAuditMaxIterations { get; set; }
+    public bool? CreateGitHubRelease { get; set; }
+    public string? GitHubTagTemplate { get; set; }
 }
 
 /// <summary>

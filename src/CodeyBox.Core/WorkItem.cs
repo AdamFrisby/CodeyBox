@@ -105,6 +105,14 @@ public sealed record WorkItem
     /// </summary>
     public string? ExternalId { get; init; }
 
+    /// <summary>
+    /// The release this work item belongs to. When set, the orchestrator targets the
+    /// release branch instead of the project's default base branch, and the release state
+    /// machine tracks this item's terminal state for the closed→in_review auto-transition.
+    /// Null = merge directly to main (legacy/default behaviour).
+    /// </summary>
+    public ReleaseId? ReleaseId { get; init; }
+
     public WorkItem With(WorkItemState state, string? error = null) => this with
     {
         State = state,
