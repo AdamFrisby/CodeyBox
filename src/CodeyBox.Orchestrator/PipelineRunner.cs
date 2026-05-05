@@ -774,7 +774,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
                 foreach (var (auditor, runner) in toolPairs)
                 {
-                    var run = await ExecAuditorAsync(sandbox, auditor, runner, ctx, ct);
+                    var run = await ExecAuditorAsync(sandbox, auditor, runner, credential, ctx, ct);
                     await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
                     if (needsCreds && runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= runner.Kind;
@@ -802,7 +802,7 @@ public sealed class PipelineRunner : IPipelineRunner
                             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
                         await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
                         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
-                        return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, ctx, ct);
+                        return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, credential, ctx, ct);
                     }
                     finally { sem.Release(); }
                 }).ToList();
@@ -834,6 +834,7 @@ public sealed class PipelineRunner : IPipelineRunner
         ISandbox sandbox,
         IAuditor auditor,
         IAgentRunner runner,
+        AgentCredential? credential,
         AuditContext ctx,
         CancellationToken ct)
     {
@@ -842,7 +843,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var sw = Stopwatch.StartNew();
         // Thread the resolved runner into the context so LlmReviewAuditor
         // can use the cross-review agent instead of its baked-in default.
-        var auditorCtx = ctx with { AuditRunner = runner };
+        var auditorCtx = ctx with { AuditRunner = runner, AuditCredential = credential };
         var timingScope = await TimingScope.BeginAsync(
             _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
             iteration: ctx.Iteration,
