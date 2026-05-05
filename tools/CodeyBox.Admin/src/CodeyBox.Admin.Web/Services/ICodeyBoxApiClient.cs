@@ -50,6 +50,10 @@ public interface ICodeyBoxApiClient
     Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default);
     Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default);
 
+    // ── Fleet ─────────────────────────────────────────────────────────────────
+    Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default);
+    Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default);
+    Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default);
     // ── Plugins ───────────────────────────────────────────────────────────────
     Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default);
     // ── Replay ────────────────────────────────────────────────────────────────

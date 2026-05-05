@@ -413,6 +413,52 @@ h1 {
 .budget-bar.budget-warn { background: #f39c12; }
 .budget-bar.budget-full { background: #e74c3c; }
 
+/* ── Fleet view ─────────────────────────────────────────────────────────────── */
+
+.fleet-dot {
+    font-size: 1.1rem;
+    line-height: 1;
+}
+
+.fleet-dot-grey   { color: #999; }
+.fleet-dot-blue   { color: #2980b9; }
+.fleet-dot-yellow { color: #f39c12; }
+.fleet-dot-red    { color: #e74c3c; }
+
+.fleet-outcomes {
+    display: flex;
+    gap: 0.25rem;
+    align-items: center;
+}
+
+.fleet-outcome {
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
+.fleet-outcome-ok     { color: #1e8449; }
+.fleet-outcome-fail   { color: #c0392b; }
+.fleet-outcome-cancel { color: #7f8c8d; }
+
+.btn-fleet-pause {
+    color: #c0392b;
+    border-color: #c0392b;
+}
+
+.btn-fleet-pause:hover {
+    background: #ffeaea;
+}
+
+.btn-fleet-resume {
+    background: #1e8449;
+    color: #fff;
+    border-color: #1e8449;
+}
+
+.btn-fleet-resume:hover {
+    background: #145a32;
+}
+
 /* ── Timeline ────────────────────────────────────────────────────────────────── */
 
 .timeline-live-badge {

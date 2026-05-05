@@ -42,6 +42,7 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 | Route | Description |
 |-------|-------------|
 | `/` | Queue overview — all work items, auto-refreshes every 5 s |
+| `/fleet` | Fleet view — one row per project: status dot, current phase, queued/in-flight counts, last-5 outcomes, 30-day spend. Auto-refreshes every 5 s. |
 | `/work-items/new` | Create a new work item |
 | `/work-items/{id}` | Detail view: full prompt (collapsible), state, error, deps; live stdout panel for in-flight items |
 | `/work-items/{id}/edit` | Edit title/prompt/agent — Queued items only |
@@ -49,6 +50,28 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 | `/work-items/{id}/timings` | Per-item timing breakdown — stacked bar of phases, drill-down step table, top-10 slowest steps |
 | `/work-items/{id}/diff` | Diff preview — unified diff of the work branch vs. base branch, with file list, +/- stats, truncation banner, and "Copy as patch" link |
 | `/timings/aggregate` | System-wide aggregate — median and p95 per step across the last N completed work items, configurable N picker |
+
+## Fleet view
+
+`/fleet` is the operator dashboard for running 5–20+ projects. It answers "what is everything doing right now?" at a glance without opening individual queue pages.
+
+**Columns per project:**
+
+| Column | Description |
+|--------|-------------|
+| Project | Display name + short ID |
+| Status | Colored dot — grey (idle), blue (in-flight), yellow (queued only), red (paused) |
+| Current phase | State of the most-recently-updated in-flight item, or `—` |
+| Queued | Count of items in `Queued` state |
+| In-flight | Count of non-terminal, non-Queued items |
+| Last 5 | Glyphs for the 5 most recent terminal items (✓ Done, ✗ Failed/AuditFailed, ! Cancelled) |
+| Budget (30 d) | Rolling 30-day spend if cost-reporting is available, with a bar; `—` otherwise |
+| Actions | "Pause project" / "Resume project" buttons (falls back to global pause while per-project pause is pending) |
+
+**Limitations (pending future work items):**
+
+- Per-project pause/resume requires the *budget-alerts* work item. The page shows a fallback banner directing operators to the global pause button on the Queue page.
+- `monthlyBudgetUsd` (spend cap) requires the *budget-alerts* work item. Until then the budget column shows spend only.
 
 ## In scope (v1)
 

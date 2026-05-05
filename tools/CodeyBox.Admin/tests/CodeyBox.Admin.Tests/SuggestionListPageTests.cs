@@ -280,6 +280,10 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<FleetSummaryDto>());
+    public Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default) => Task.FromResult(false);
+    public Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default) => Task.FromResult(false);
     public Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult<ProjectBudgetDto?>(null);
     public Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default)
@@ -376,6 +380,10 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<FleetSummaryDto>());
+    public Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default) => Task.FromResult(false);
+    public Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default) => Task.FromResult(false);
     public Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult<ProjectBudgetDto?>(null);
     public Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default)

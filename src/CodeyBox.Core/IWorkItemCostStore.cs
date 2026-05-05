@@ -20,6 +20,15 @@ public interface IWorkItemCostStore
     Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
         string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
 
+    /// <summary>
+    /// Fleet aggregation: returns per-project cost totals for cost records whose
+    /// <c>started_at</c> falls within [<paramref name="from"/>, <paramref name="to"/>).
+    /// Returns one row per project that has any matching records. Used by GET /fleet/summary
+    /// to avoid per-project N+1 queries.
+    /// </summary>
+    Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
+
     /// <summary>Deletes all cost records for a work item (cascade with parent item deletion).</summary>
     Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default);
 

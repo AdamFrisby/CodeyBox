@@ -96,6 +96,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Default 95 preserves existing semantics (frontier-adjacent fallback allowed).
         RunMigration("ALTER TABLE work_items ADD COLUMN min_model_score INTEGER NOT NULL DEFAULT 95;");
 
+        // Composite indexes for fleet summary aggregation queries.
+        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_state ON work_items(project_id, state);");
+        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_updated ON work_items(project_id, updated_at);");
         // Additive migration: why the item was cancelled (OperatorRequested, ParentCascaded, HostShutdown).
         // NULL means legacy row or non-cancelled item.
         RunMigration("ALTER TABLE work_items ADD COLUMN cancellation_reason TEXT;");
@@ -331,6 +334,57 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         return await reader.ReadAsync(ct) ? Read(reader) : null;
     }
 
+    public async Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT project_id, state, COUNT(*) AS cnt, MAX(updated_at) AS max_updated_at
+            FROM work_items
+            GROUP BY project_id, state;
+            """;
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        var results = new List<(string, int, int, string)>();
+        while (await reader.ReadAsync(ct))
+            results.Add((reader.GetString(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetString(3)));
+        return results;
+    }
+
+    public async Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
+            WITH ranked AS (
+                SELECT project_id, state,
+                       ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
+                FROM work_items
+                WHERE state IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.Cancelled})
+            )
+            SELECT project_id, state FROM ranked WHERE rn <= $per_project
+            ORDER BY project_id, rn;
+            """;
+        cmd.Parameters.AddWithValue("$per_project", perProject);
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        var results = new List<(string, int)>();
+        while (await reader.ReadAsync(ct))
+            results.Add((reader.GetString(0), reader.GetInt32(1)));
+        return results;
+    }
+
+    public async Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT project_id, is_paused FROM project_queue_state";
+        try
+        {
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            var results = new Dictionary<string, bool>();
+            while (await reader.ReadAsync(ct))
+                results[reader.GetString(0)] = reader.GetInt32(1) != 0;
+            return results;
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("no such table"))
+        {
+            return new Dictionary<string, bool>();
     public async IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(
         WorkItemId sourceId, [EnumeratorCancellation] CancellationToken ct = default)
     {
