@@ -13,8 +13,7 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); }
-        catch { }
+        Directory.Delete(_workspace, recursive: true);
     }
 
     [Fact]
@@ -44,7 +43,7 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         await CommitToHostRepoAsync(gitHost.GetRepoPath(repoId), "README.md", "local\n", "local conflicting change");
         await CommitToUpstreamAsync(upstreamBare, "README.md", "remote\n", "remote conflicting change");
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<UpstreamPushReconcileConflictException>(() =>
             gitHost.PushToUpstreamAsync(repoId, upstreamBare, "main", new Dictionary<string, string>()));
 
         Assert.Contains("upstream rebase conflict on main; manual resolution required", ex.Message);

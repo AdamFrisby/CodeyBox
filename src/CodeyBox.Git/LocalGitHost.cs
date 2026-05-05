@@ -225,8 +225,7 @@ public sealed class LocalGitHost : IGitHost
                 if (pull.ExitCode != 0)
                 {
                     await RunGitAsync(worktreePath, CancellationToken.None, "merge", "--abort");
-                    throw new InvalidOperationException(
-                        $"upstream merge conflict on {branch}; manual resolution required: {pull.Stderr}");
+                    throw new UpstreamPushReconcileConflictException(branch, "merge");
                 }
                 return;
             }
@@ -240,8 +239,7 @@ public sealed class LocalGitHost : IGitHost
             if (rebase.ExitCode != 0)
             {
                 await RunGitAsync(worktreePath, CancellationToken.None, "rebase", "--abort");
-                throw new InvalidOperationException(
-                    $"upstream rebase conflict on {branch}; manual resolution required: {rebase.Stderr}");
+                throw new UpstreamPushReconcileConflictException(branch, "rebase");
             }
         }
         finally

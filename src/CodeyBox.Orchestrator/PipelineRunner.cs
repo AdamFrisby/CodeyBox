@@ -1361,6 +1361,13 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             catch (Exception ex)
             {
+                if (TryGetUpstreamReconcileConflict(ex, out var conflict))
+                {
+                    _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
+                    await TransitionFailed(item, conflict.Message, ct, project);
+                    break;
+                }
+
                 _log.LogWarning("Upstream complete attempt {Attempt} failed: {Error}", attempt, ex.Message);
                 if (attempt < _opts.UpstreamPushMaxAttempts)
                     await Task.Delay(_opts.UpstreamPushBackoff, ct);
@@ -1391,6 +1398,21 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             await Transition(item, WorkItemState.Done, ct, project);
         }
+    }
+
+    private static bool TryGetUpstreamReconcileConflict(Exception ex, out UpstreamPushReconcileConflictException conflict)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is UpstreamPushReconcileConflictException typed)
+            {
+                conflict = typed;
+                return true;
+            }
+        }
+
+        conflict = null!;
+        return false;
     }
 
     /// <summary>
