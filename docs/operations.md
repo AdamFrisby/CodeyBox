@@ -62,7 +62,7 @@ to a safe restart point:
 | `Auditing` | `WorkComplete` | Work commit is real; audit re-runs |
 | `Reworking` | `WorkComplete` | Previous rework commit preserved if pushed; audit re-checks |
 | `Merging` | `AuditPassed` | Audit verdict is preserved; merge retried |
-| `UpstreamPushing` | (unchanged) | `UpstreamPushAttempts` retry logic handles it |
+| `UpstreamPushing` | `Merged` | Keeping `UpstreamPushing` would replay the full pipeline from scratch; push is retried via `UpstreamPushAttempts` |
 | `WorkComplete` / `AuditPassed` / `Merged` | (unchanged) | Pipeline resumes at the correct phase |
 
 Each recovery increments the item's `recoveryAttempts` counter. After

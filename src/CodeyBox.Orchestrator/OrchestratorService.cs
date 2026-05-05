@@ -223,8 +223,9 @@ public sealed class OrchestratorService : BackgroundService
     ///   Auditing        → WorkComplete (work commit is real; re-run the audit suite)
     ///   Reworking       → WorkComplete (re-run audit to confirm or re-rework)
     ///   Merging         → AuditPassed  (audit verdict is real; retry the merge)
-    ///   UpstreamPushing → (left as-is; UpstreamPushAttempts retry logic handles it)
-    ///   WorkComplete / AuditPassed / Merged → (left as-is; pipeline resumes at correct phase)
+    ///   UpstreamPushing → Merged     (keeping UpstreamPushing leaves skipWork/skipAudit/skipMerge
+    ///                                  all false, triggering a full pipeline replay from scratch)
+    ///   WorkComplete / AuditPassed / Merged → (re-enqueued as-is; pipeline resumes at correct phase)
     ///
     /// Each recovery increments <see cref="WorkItem.RecoveryAttempts"/>. Items that
     /// exceed <see cref="OrchestratorOptions.MaxRecoveryAttempts"/> are transitioned
@@ -317,10 +318,16 @@ public sealed class OrchestratorService : BackgroundService
 
         if (targetState is null) return null;
 
-        // WorkComplete / AuditPassed / Merged / UpstreamPushing→Merged: bump RecoveryAttempts but keep state.
-        var newAttempts = item.RecoveryAttempts + 1;
+        // Only backward-reset transitions (Working→Queued, Auditing→WorkComplete, etc.) and
+        // UpstreamPushing→Merged represent genuinely interrupted in-flight work and count
+        // against the recovery cap. Passthrough re-enqueues (WorkComplete/AuditPassed/Merged
+        // left as-is) are natural resting points — a routine rolling restart should not burn
+        // a recovery credit for items waiting between pipeline phases.
+        bool isInterruptedWork = targetState.Value != item.State;
+        var newAttempts = isInterruptedWork ? item.RecoveryAttempts + 1 : item.RecoveryAttempts;
+
         // MaxRecoveryAttempts <= 0 means unlimited (no cap). Only enforce when > 0.
-        if (_opts.MaxRecoveryAttempts > 0 && newAttempts > _opts.MaxRecoveryAttempts)
+        if (isInterruptedWork && _opts.MaxRecoveryAttempts > 0 && newAttempts > _opts.MaxRecoveryAttempts)
         {
             return item with
             {

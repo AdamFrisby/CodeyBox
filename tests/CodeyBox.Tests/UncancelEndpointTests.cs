@@ -110,6 +110,34 @@ public sealed class UncancelEndpointTests : IDisposable
         Assert.Equal(WorkItemState.Queued, readBack!.State);
     }
 
+    // ── RecoveryAttempts is reset on uncancel ─────────────────────────────────
+
+    [Fact]
+    public async Task Uncancel_ResetsRecoveryAttempts()
+    {
+        // Item accumulated two recovery attempts before being cascade-cancelled.
+        // After uncancel the counter must be zeroed so the next host-shutdown
+        // recovery does not immediately abandon it.
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Cancelled,
+            CancellationReason = WorkItemCancellationReason.ParentCascaded,
+            RecoveryAttempts = 2,
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var resp = await _client.PostAsync($"/workitems/{item.Id}/uncancel", null);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, readBack!.State);
+        Assert.Equal(0, readBack.RecoveryAttempts);
+    }
+
     // ── 404 for unknown ID ────────────────────────────────────────────────────
 
     [Fact]

@@ -480,7 +480,7 @@ internal static class WorkItemEndpoints
                 error = "cannot uncancel an operator-requested cancellation; use POST /workitems with the same body to re-create the work item",
             });
 
-        var requeued = item.With(WorkItemState.Queued);
+        var requeued = item.With(WorkItemState.Queued) with { RecoveryAttempts = 0 };
         var updated = await store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
         if (!updated)
             return Results.Conflict(new { error = "concurrent uncancel request already processed this item" });

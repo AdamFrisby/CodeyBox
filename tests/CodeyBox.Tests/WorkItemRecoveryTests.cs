@@ -127,9 +127,11 @@ public sealed class WorkItemRecoveryTests : IDisposable
 
         // UpstreamPushing is recovered as Merged so PipelineRunner's skip flags
         // route it directly to RunUpstreamPushPhaseAsync instead of replaying
-        // the full work+audit+merge pipeline.
+        // the full work+audit+merge pipeline. This IS interrupted in-flight work,
+        // so RecoveryAttempts must be incremented.
         var recovered = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Merged, recovered!.State);
+        Assert.Equal(1, recovered.RecoveryAttempts);
         Assert.Equal(1, queue.Count);
     }
 
@@ -226,8 +228,11 @@ public sealed class WorkItemRecoveryTests : IDisposable
     [InlineData(WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.Merged)]
-    public async Task MidFlightPassThroughStates_ReenqueuedWithIncrementedAttempts(WorkItemState state)
+    public async Task MidFlightPassThroughStates_ReenqueuedWithoutIncrementingAttempts(WorkItemState state)
     {
+        // WorkComplete / AuditPassed / Merged are natural resting points between pipeline
+        // phases, not indicators of interrupted in-flight work. A routine orchestrator
+        // restart while an item sits in one of these states must not burn a recovery credit.
         var item = Item(state);
         await _store.CreateAsync(item);
 
@@ -241,7 +246,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
 
         var recovered = await _store.GetAsync(item.Id);
         Assert.Equal(state, recovered!.State);
-        Assert.Equal(1, recovered.RecoveryAttempts);
+        Assert.Equal(0, recovered.RecoveryAttempts);
         Assert.Equal(1, queue.Count);
     }
 
