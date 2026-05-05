@@ -40,7 +40,7 @@ public static partial class QuestionParser
             {
                 log.LogWarning(
                     "codeybox-question: invalid id '{Id}' (must be alphanumeric/hyphen/underscore, ≤ 64 chars); ignoring",
-                    rawId);
+                    rawId.ReplaceLineEndings("\\n"));
                 continue;
             }
 

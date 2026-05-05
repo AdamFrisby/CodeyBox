@@ -468,12 +468,26 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
 
+    public Dictionary<string, List<QuestionDto>> QuestionsOverride { get; set; } = [];
+
     public Task<List<QuestionDto>> GetQuestionsAsync(string workItemId, CancellationToken ct = default)
-        => Task.FromResult(new List<QuestionDto>());
+        => Task.FromResult(QuestionsOverride.TryGetValue(workItemId, out var qs) ? qs : []);
+
+    public int AnswerQuestionCallCount { get; private set; }
+    public (string workItemId, string questionId, string answer)? LastAnswerCall { get; private set; }
 
     public Task<bool> AnswerQuestionAsync(string workItemId, string questionId, string answer, CancellationToken ct = default)
-        => Task.FromResult(true);
+    {
+        AnswerQuestionCallCount++;
+        LastAnswerCall = (workItemId, questionId, answer);
+        return Task.FromResult(true);
+    }
+
+    public int DismissQuestionCallCount { get; private set; }
 
     public Task<bool> DismissQuestionAsync(string workItemId, string questionId, string reason, CancellationToken ct = default)
-        => Task.FromResult(true);
+    {
+        DismissQuestionCallCount++;
+        return Task.FromResult(true);
+    }
 }

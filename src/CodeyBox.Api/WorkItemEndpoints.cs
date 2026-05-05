@@ -683,7 +683,7 @@ internal static class WorkItemEndpoints
         IWorkItemQuestionStore? questionStore,
         CancellationToken ct)
     {
-        if (questionStore is null) return Results.NotFound(new { error = "question store not configured" });
+        if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
         var questions = await questionStore.ListByWorkItemAsync(item!.Id.ToString(), ct);
@@ -703,7 +703,7 @@ internal static class WorkItemEndpoints
         IProjectRepository projects,
         CancellationToken ct)
     {
-        if (questionStore is null) return Results.NotFound(new { error = "question store not configured" });
+        if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
         if (string.IsNullOrWhiteSpace(req.QuestionId))
             return Results.BadRequest(new { error = "questionId is required" });
         if (string.IsNullOrWhiteSpace(req.Answer))
@@ -749,7 +749,7 @@ internal static class WorkItemEndpoints
         IProjectRepository projects,
         CancellationToken ct)
     {
-        if (questionStore is null) return Results.NotFound(new { error = "question store not configured" });
+        if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
         if (string.IsNullOrWhiteSpace(req.QuestionId))
             return Results.BadRequest(new { error = "questionId is required" });
         if (string.IsNullOrWhiteSpace(req.Reason))

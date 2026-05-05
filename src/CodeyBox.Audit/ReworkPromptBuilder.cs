@@ -40,8 +40,12 @@ public static class ReworkPromptBuilder
             sb.AppendLine();
             foreach (var q in answered)
             {
-                sb.Append("- **").Append(q.QuestionId).Append("**: \"").Append(q.QuestionText).AppendLine("\"");
-                sb.Append("  Answer: \"").Append(q.AnswerText).AppendLine("\"");
+                sb.Append("- **").Append(q.QuestionId).Append("**: ").AppendLine(q.QuestionText);
+                sb.AppendLine("  Answer:");
+                sb.AppendLine("  ```");
+                foreach (var line in (q.AnswerText ?? string.Empty).Split('\n'))
+                    sb.Append("  ").AppendLine(line.TrimEnd('\r'));
+                sb.AppendLine("  ```");
                 sb.AppendLine();
             }
             sb.AppendLine("Apply these answers to your work.");

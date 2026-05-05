@@ -146,6 +146,29 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
     }
 
     [Fact]
+    public async Task QuestionCap_ViaRealPipelineRunner_OnlyTenStored()
+    {
+        // Feeds 12 question blocks through the real PipelineRunner and verifies
+        // the cap (MaxQuestionsPerWorkItem = 10) is enforced by TryParkForQuestionsAsync.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = BuildWithQuestions(seed, allowQuestions: true);
+        tp.Agent.QuestionsToEmit = [.. Enumerable.Range(1, 12).Select(i => $"q-{i:D3}")];
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Cap test",
+            Prompt = "do something",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var questions = await tp.QuestionStore.ListByWorkItemAsync(item.Id.ToString());
+        Assert.Equal(10, questions.Count);
+    }
+
+    [Fact]
     public async Task ReworkPhaseEmitsQuestion_ParksAtNeedsOperatorInput()
     {
         // Work phase completes without a question; the auditor then generates a
@@ -220,6 +243,8 @@ internal sealed class QuestionEmittingAgent : IAgentRunner
 {
     public AgentKind Kind { get; } = AgentKind.Claude;
     public string? QuestionToEmit { get; set; }
+    /// <summary>When set, overrides QuestionToEmit and emits all listed question IDs.</summary>
+    public List<string> QuestionsToEmit { get; set; } = [];
     public string SeedRepoUrl { get; set; } = "";
     /// <summary>When true, only emit the question on rework (non-merge) calls after the first.</summary>
     public bool EmitOnlyOnRework { get; set; } = false;
@@ -255,10 +280,15 @@ internal sealed class QuestionEmittingAgent : IAgentRunner
 
         _nonMergeCallCount++;
 
-        // Emit the question in stdout if configured (and not deferred to rework).
-        var emitQuestion = QuestionToEmit is not null && (!EmitOnlyOnRework || _nonMergeCallCount > 1);
-        var stdout = emitQuestion
-            ? $"<codeybox-question id=\"{QuestionToEmit}\">Should I use approach A or B? Default: A.</codeybox-question>"
+        // Collect which question IDs to emit.
+        var questionIds = QuestionsToEmit.Count > 0
+            ? QuestionsToEmit
+            : QuestionToEmit is not null ? [QuestionToEmit] : (IEnumerable<string>)[];
+
+        var shouldEmit = questionIds.Any() && (!EmitOnlyOnRework || _nonMergeCallCount > 1);
+        var stdout = shouldEmit
+            ? string.Join("\n", questionIds.Select(id =>
+                $"<codeybox-question id=\"{id}\">Should I use approach A or B? Default: A.</codeybox-question>"))
             : string.Empty;
 
         return new AgentResult(true, "ok", stdout, null);

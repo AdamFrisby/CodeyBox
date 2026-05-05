@@ -120,4 +120,112 @@ public sealed class WorkItemDetailPageTests : TestContext
         Assert.Contains("Replay", cut.Markup);
         Assert.Contains("/timeline", cut.Markup);
     }
+
+    private static QuestionDto MakeOpenQuestion(string workItemId, string questionId, string text) => new()
+    {
+        Id = Guid.NewGuid().ToString(),
+        WorkItemId = workItemId,
+        QuestionId = questionId,
+        QuestionText = text,
+        State = "open",
+        AskedAt = DateTimeOffset.UtcNow,
+    };
+
+    [Fact]
+    public void WorkItemDetail_WithOpenQuestion_ShowsQuestionsSection()
+    {
+        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "NeedsOperatorInput");
+        var fake = new FakeApiClient([item]);
+        fake.QuestionsOverride[item.Id] = [MakeOpenQuestion(item.Id, "q-001", "Which approach to use?")];
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+
+        Assert.Contains("Questions", cut.Markup);
+        Assert.Contains("q-001", cut.Markup);
+        Assert.Contains("Which approach to use?", cut.Markup);
+    }
+
+    [Fact]
+    public void WorkItemDetail_WithOpenQuestion_ShowsAnswerTextareaAndButtons()
+    {
+        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "NeedsOperatorInput");
+        var fake = new FakeApiClient([item]);
+        fake.QuestionsOverride[item.Id] = [MakeOpenQuestion(item.Id, "q-001", "Which approach?")];
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+
+        Assert.Contains("textarea", cut.Markup);
+        Assert.Contains("Submit", cut.Markup);
+        Assert.Contains("Dismiss", cut.Markup);
+    }
+
+    [Fact]
+    public void WorkItemDetail_WithAnsweredQuestion_ShowsAnswerText()
+    {
+        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Reworking");
+        var fake = new FakeApiClient([item]);
+        fake.QuestionsOverride[item.Id] =
+        [
+            new QuestionDto
+            {
+                Id = Guid.NewGuid().ToString(),
+                WorkItemId = item.Id,
+                QuestionId = "q-001",
+                QuestionText = "Which approach?",
+                State = "answered",
+                AskedAt = DateTimeOffset.UtcNow,
+                AnsweredAt = DateTimeOffset.UtcNow,
+                AnswerText = "Use approach B.",
+            }
+        ];
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+
+        Assert.Contains("Answered", cut.Markup, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Use approach B.", cut.Markup);
+        Assert.DoesNotContain("Submit", cut.Markup);
+    }
+
+    [Fact]
+    public void WorkItemDetail_WithDismissedQuestion_ShowsDismissedMessage()
+    {
+        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Reworking");
+        var fake = new FakeApiClient([item]);
+        fake.QuestionsOverride[item.Id] =
+        [
+            new QuestionDto
+            {
+                Id = Guid.NewGuid().ToString(),
+                WorkItemId = item.Id,
+                QuestionId = "q-002",
+                QuestionText = "Which library?",
+                State = "dismissed",
+                AskedAt = DateTimeOffset.UtcNow,
+                DismissedAt = DateTimeOffset.UtcNow,
+                DismissReason = "Out of scope for this PR.",
+            }
+        ];
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+
+        Assert.Contains("Dismissed", cut.Markup, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Out of scope for this PR.", cut.Markup);
+        Assert.DoesNotContain("Submit", cut.Markup);
+    }
+
+    [Fact]
+    public void WorkItemDetail_NoQuestions_DoesNotShowQuestionsSection()
+    {
+        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Working");
+        var fake = new FakeApiClient([item]);
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+
+        Assert.DoesNotContain("question-block", cut.Markup);
+    }
 }
