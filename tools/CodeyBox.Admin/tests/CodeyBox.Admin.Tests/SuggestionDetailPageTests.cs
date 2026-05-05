@@ -165,6 +165,7 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default) => Task.FromResult<AggregateTimingsDto?>(null);
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default) => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default) => Task.FromResult(new List<PluginDto>());
     public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default) => Task.FromResult<WorkItemDto?>(null);
     public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemReplaysDto?>(null);
     public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemDiffDto?>(null);
@@ -223,6 +224,7 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default) => Task.FromResult<AggregateTimingsDto?>(null);
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default) => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default) => Task.FromResult(new List<PluginDto>());
     public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default) => Task.FromResult<WorkItemDto?>(null);
     public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemReplaysDto?>(null);
     public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemDiffDto?>(null);
