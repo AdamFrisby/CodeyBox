@@ -120,6 +120,11 @@ else
                 <tr class="state-@item.State.ToLowerInvariant()">
                     <td class="col-id">
                         <a href="/work-items/@item.Id">@item.ShortId</a>
+                        @if (item.ExternalId is not null)
+                        {
+                            var display = item.ExternalId.Length > 16 ? item.ExternalId[..16] + "…" : item.ExternalId;
+                            <span class="external-id" title="@item.ExternalId">@display</span>
+                        }
                     </td>
                     <td>@item.ProjectId</td>
                     <td>@item.Title</td>

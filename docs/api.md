@@ -39,6 +39,7 @@ Queue a new work item.
 ```json
 {
   "projectId": "my-app",
+  "externalId": "JIRA-1234",
   "title": "Add JSON config support",
   "prompt": "Add a --config flag that reads settings from a JSON file. Update README.",
   "agent": null,
@@ -51,6 +52,11 @@ Queue a new work item.
 
 * `projectId` — required. Must match a configured project (see
   [`projects.md`](projects.md)). Unknown ids are rejected.
+* `externalId` — optional caller-supplied identifier (e.g. `"JIRA-1234"`,
+  `"GH-456"`, `"sprint-7:ticket-99"`). Must be 1–256 ASCII printable
+  characters (no whitespace, no `/`, no `?`, no `;` `<` `=` `>`), must not start with `wi-`,
+  must not be a UUID. Unique per project. Rejected with `400` on
+  duplicate. See [`external-ids.md`](external-ids.md) for the full contract.
 * `title` — short label, ≤ 200 chars, no leading dash, no control chars.
 * `prompt` — what to give to the agent. ≤ 64 KB.
 * `agent` — optional override. `"claude"`, `"copilot"`, `"codex"`, `"gemini"`, or any
@@ -66,10 +72,12 @@ Queue a new work item.
   caller cannot bypass it by aliasing the two).
 * `pushUpstream` — if `true` *and* the project has an upstream configured,
   push to it after merge.
-* `dependsOn` — optional array of work item IDs. The item will not be
-  picked up until every listed dependency has reached a terminal state
-  (`Done`, `Failed`, `AuditFailed`, or `Cancelled`). Unknown IDs, self
-  references, and cycles are rejected with `400`. See
+* `dependsOn` — optional array of work item IDs **or externalIds**. Each
+  entry is resolved: if it parses as a UUID it is looked up by internal ID;
+  otherwise it is looked up by `externalId` within the same project. This
+  allows batching dependent items without waiting for UUID responses — see
+  [`external-ids.md`](external-ids.md#dependency-batching-without-round-trips).
+  Unknown IDs, self references, and cycles are rejected with `400`. See
   [`work-items.md`](work-items.md) for details.
 
 Response: `201 Created` with the work item record.
@@ -80,7 +88,17 @@ List all work items, newest first.
 
 ### `GET /workitems/{id}`
 
-Fetch a single work item by id (UUID).
+Fetch a single work item. The `{id}` path segment accepts either:
+
+- A UUID: `GET /workitems/abcd-1234-...`
+- A composite `<projectId>:<externalId>`: `GET /workitems/my-app:JIRA-1234`
+
+The composite form is unambiguous and works with all endpoints that accept `{id}`
+(`GET`, `DELETE`, `PATCH /workitems/{id}`, `POST /workitems/{id}/retry`,
+`GET /workitems/{id}/dependents`, `GET /workitems/{id}/timeline`, etc.).
+
+Returns `400 Bad Request` when the colon form has an empty project or externalId part.
+Returns `404 Not Found` when the project exists but has no item with that externalId.
 
 ### `GET /workitems/{id}/dependents`
 
@@ -425,15 +443,132 @@ Fetch a single project by its id.
 * Returns `400 Bad Request` if `id` is not a valid project identifier.
 * Returns `404 Not Found` if the project does not exist.
 
+### `GET /workers`
+
+List currently-registered worker slots from the heartbeat registry. Useful for operator-grade introspection of what the process is currently doing, and for diagnosing stale rows after a crash.
+
+Response: `200 OK` with a JSON array:
+
+```json
+[
+  {
+    "workerId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "hostName": "codeybox-host-01",
+    "processId": 12345,
+    "startedAt": "2026-05-04T10:00:00.000+00:00",
+    "lastHeartbeatAt": "2026-05-04T10:05:15.000+00:00",
+    "currentWorkItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  }
+]
+```
+
+| Field | Description |
+|---|---|
+| `workerId` | GUID unique to this process start |
+| `hostName` | Hostname of the machine running the worker |
+| `processId` | OS process ID |
+| `startedAt` | When this worker slot registered |
+| `lastHeartbeatAt` | When the heartbeat last fired (updated every `HeartbeatInterval`, default 15 s) |
+| `currentWorkItemId` | UUID of the work item being processed, or `null` if none |
+
+An empty array means no workers are currently registered. A row with a stale `lastHeartbeatAt` means the worker process has crashed and the dead-worker reaper will recover it on the next sweep (or has already done so and the row wasn't cleaned up). See [`recovery.md`](recovery.md) for the full reaper design.
+
+### `GET /sandboxes/leaked`
+
+Returns the list of `codeybox-*` Multipass VMs that were detected as leaked on
+the most recent reaper sweep (default every 15 minutes). An empty array means
+no leaks were found on the last sweep.
+
+```json
+[
+  {
+    "name": "codeybox-a1b2c3d4e5f6",
+    "createdAt": "2026-05-04T02:00:00+00:00",
+    "ageMinutes": 127.3,
+    "diskMb": null
+  }
+]
+```
+
+See [`sandbox-leaks.md`](sandbox-leaks.md) for full leak detection semantics.
+
+### `POST /sandboxes/leaked/{name}/dispose`
+
+Operator-triggered dispose of a leaked sandbox by name. The name must start with
+`codeybox-`. Returns `{ "disposed": "<name>" }` on success.
+
+* Returns `400` if the name does not start with `codeybox-`.
+* Returns `404` if the sandbox is not present in the latest leaked list (use `GET /sandboxes/leaked` to verify it is detected as a leak before calling).
+* Returns `504` if the dispose times out (5-minute per-sandbox cap).
+* Returns `500` on other errors.
+
 ### `GET /healthz`
 
 Liveness probe. Returns `{ "status": "ok" }`.
+
+### `POST /projects/{id}/release`
+
+Generate a CHANGELOG.md entry for a release. Enumerates merged PRs between
+`fromTag` and `toTag`, calls the configured LLM to categorise and summarise
+them, and returns the generated markdown immediately.
+
+Requires the project to have a GitHub upstream configured with a valid PAT.
+
+```json
+{
+  "fromTag": "v1.2.0",
+  "toTag":   "v1.3.0"
+}
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "markdown": "## [v1.3.0] - 2026-05-15\n\n### Added\n- ...\n",
+  "categoryToPrNumbers": {
+    "Added": [16, 18],
+    "Fixed": [17]
+  },
+  "wasCapped": false
+}
+```
+
+`wasCapped: true` means the release contained more than 200 PRs and the
+oldest were omitted.
+
+* Returns `400 Bad Request` when `fromTag` or `toTag` is missing, the
+  project has no GitHub upstream configured, or changelog automation is
+  disabled for the project.
+* Returns `404 Not Found` when the project does not exist.
+
+See [`changelog-automation.md`](changelog-automation.md) for configuration
+and the webhook flow.
+
+### `POST /webhooks/github/release`
+
+Receive a GitHub `release` webhook event. Validates the
+`X-Hub-Signature-256` HMAC, resolves the project by repository URL,
+generates a changelog entry, and creates a work item to apply it to
+`CHANGELOG.md`. Returns `202 Accepted` immediately; the work item runs
+through the normal pipeline.
+
+This endpoint is **exempt from API-key authentication**. It validates the
+GitHub HMAC instead.
+
+* A missing or invalid `X-Hub-Signature-256` returns `401` with no body.
+* Non-`release` event types (e.g. `ping`) return `202 Accepted` silently.
+* Non-`published`/`released` actions (e.g. `deleted`) return `202 Accepted` silently.
+* Repositories not matching any configured project return `202 Accepted` silently.
+
+See [`changelog-automation.md`](changelog-automation.md) for setup instructions.
 
 ## Work item record
 
 ```json
 {
   "id": "5b6e...",
+  "externalId": "JIRA-1234",
   "projectId": "my-app",
   "title": "...",
   "prompt": "Add a --config flag …",
@@ -447,11 +582,19 @@ Liveness probe. Returns `{ "status": "ok" }`.
   "upstreamPushAttempts": 0,
   "dependsOn": [],
   "dependsOnSatisfied": true,
+  "dependsOnExternalIds": {},
   "queuePosition": 0
 }
 ```
 
+`externalId` is the caller-supplied identifier, or `null` when not provided. See
+[`external-ids.md`](external-ids.md) for the validation rules and usage patterns.
+
 `prompt` is the full task text given to the agent (≤ 64 KB).
+
+`dependsOnExternalIds` is a map of dependency UUID → externalId for each item in
+`dependsOn`. Values are `null` for dependencies that have no externalId. Useful
+for displaying human-readable dependency labels.
 
 `queuePosition` is an ordering hint for Queued items set by `POST /workitems/reorder`. Smaller values sort first. Items not yet explicitly reordered have a position derived from their creation timestamp and sort after explicitly positioned items.
 

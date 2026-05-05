@@ -103,6 +103,42 @@ public sealed record Project
     /// time can grant it; another project's merge phase can stay isolated.
     /// </summary>
     public ProjectNetworkProfiles NetworkProfiles { get; init; } = new();
+
+    /// <summary>
+    /// Per-project changelog automation overrides. When set, these take precedence
+    /// over the global <c>CodeyBox:Changelog</c> options.
+    /// </summary>
+    public ProjectChangelog? Changelog { get; init; }
+
+    /// <summary>
+    /// Ordered list of credential plugin IDs this project prefers. When set,
+    /// only the listed plugin IDs are included in the credential chain for this
+    /// project, in the order given (between the built-in OAuth-file provider and
+    /// the env-var fallback). Plugins not in this list are skipped. An empty
+    /// list means "use all discovered plugins in global discovery order."
+    ///
+    /// <para>Example: <c>["myorg.vault-creds", "myorg.aws-ssm"]</c> — the chain
+    /// tries Vault first, then AWS SSM, and falls back to env vars. A plugin
+    /// installed but not listed (e.g. "myorg.1password") is not tried.</para>
+    ///
+    /// <para>See <c>docs/credential-plugins.md</c> for the full chain-order
+    /// rationale and per-project override semantics.</para>
+    /// </summary>
+    public IReadOnlyList<string> CredentialProviderPriority { get; init; } = [];
+}
+
+/// <summary>
+/// Per-project changelog automation overrides. Unset fields fall back to the
+/// global <c>ChangelogOptions</c>. See <c>docs/changelog-automation.md</c>.
+/// </summary>
+public sealed record ProjectChangelog
+{
+    /// <summary>Override the global Enabled flag for this project.</summary>
+    public bool? Enabled { get; init; }
+    /// <summary>Path to CHANGELOG.md within the project repo. Overrides global ChangelogPath.</summary>
+    public string? ChangelogPath { get; init; }
+    /// <summary>Section header format. Overrides global SectionHeaderFormat.</summary>
+    public string? SectionHeaderFormat { get; init; }
 }
 
 /// <summary>
@@ -160,7 +196,59 @@ public sealed record ProjectUpstream
     /// </summary>
     public string? PullRequestTitleTemplate { get; init; }
 
+    /// <summary>
+    /// LLM-generated PR description settings. When <see cref="ProjectPrDescription.SandboxImageReference"/>
+    /// is empty the generator is skipped and the static template is used.
+    /// </summary>
+    public ProjectPrDescription PrDescription { get; init; } = new();
+
+    /// <summary>
+    /// Plugin-specific key/value settings passed to the upstream remote plugin
+    /// named by <see cref="Kind"/>. Plugin authors document which keys they read.
+    /// Accessible at runtime via
+    /// <c>IUpstreamPluginHost.GetProjectUpstreamConfig(projectId)</c>.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> PluginConfig { get; init; }
+        = new Dictionary<string, string>();
+
     public static ProjectUpstream Noop { get; } = new();
+}
+
+/// <summary>
+/// Per-project LLM-generated PR description configuration.
+/// See <c>docs/git-workflow.md</c> for configuration guidance.
+/// </summary>
+public sealed record ProjectPrDescription
+{
+    /// <summary>When false the generator is skipped entirely. Default: true.</summary>
+    public bool Enabled { get; init; } = true;
+
+    /// <summary>Agent kind for generation, e.g. "claude". Default: "claude".</summary>
+    public string GeneratorAgent { get; init; } = "claude";
+
+    /// <summary>Optional model override forwarded to the agent runner.</summary>
+    public string? GeneratorModelId { get; init; }
+
+    /// <summary>
+    /// Max UTF-8 byte size of the diff sent to the LLM. Diffs larger than this are
+    /// truncated from the middle. Default: 32 768 bytes (32 KB).
+    /// </summary>
+    public int MaxDiffBytes { get; init; } = 32_768;
+
+    /// <summary>
+    /// Hard deadline for the generation round-trip. On expiry the static template
+    /// is used. Default: 30 seconds.
+    /// </summary>
+    public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Container / VM image reference for the generator sandbox. Must have the
+    /// configured agent CLI installed. When empty the generator is disabled.
+    /// </summary>
+    public string SandboxImageReference { get; init; } = string.Empty;
+
+    /// <summary>Hosts reachable from the generator sandbox. Default: Anthropic API.</summary>
+    public IReadOnlyList<string> AgentAllowedHosts { get; init; } = ["api.anthropic.com"];
 }
 
 /// <summary>
@@ -219,6 +307,16 @@ public sealed record ProjectAudit
     /// </summary>
     public IReadOnlyDictionary<string, AgentKind> PerAuditorAgent { get; init; }
         = new Dictionary<string, AgentKind>();
+
+    /// <summary>
+    /// Maximum number of LLM auditors to run concurrently within an audit
+    /// iteration. Default 3 matches the typical security/completeness/cheating
+    /// set. Set to 1 to disable parallelism and fall back to sequential
+    /// execution — useful for debugging or subscription accounts hitting 429s.
+    /// Each parallel LLM auditor runs in its own sandbox clone to avoid result
+    /// file races. Tool auditors are unaffected and always run sequentially.
+    /// </summary>
+    public int MaxLlmAuditorParallelism { get; init; } = 3;
 }
 
 /// <summary>

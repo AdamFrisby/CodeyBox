@@ -17,6 +17,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/dependents", GetDependentsAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
+        group.MapPost("/{id}/uncancel", UncancelAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -88,6 +89,23 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = ex.Message });
         }
 
+        // ── ExternalId validation ─────────────────────────────────────────────
+
+        string? externalId = null;
+        if (!string.IsNullOrEmpty(req.ExternalId))
+        {
+            try { Validation.ValidateExternalId(req.ExternalId, nameof(req.ExternalId)); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            externalId = req.ExternalId;
+
+            var conflict = await store.GetByExternalIdAsync(pid, externalId, ct);
+            if (conflict is not null)
+                return Results.BadRequest(new
+                {
+                    error = $"externalId '{externalId}' already exists in project '{pid}' for work item {conflict.Id} (state: {conflict.State})"
+                });
+        }
+
         AgentKind? agentOverride = null;
         if (!string.IsNullOrWhiteSpace(req.Agent))
         {
@@ -105,23 +123,43 @@ internal static class WorkItemEndpoints
         if ((req.DependsOn?.Length ?? 0) > 100)
             return Results.BadRequest(new { error = "dependsOn must contain at most 100 entries" });
 
-        var dependsOnIds = new List<WorkItemId>();
-        foreach (var rawId in req.DependsOn ?? [])
+        // Load all existing items — used for existence/cycle checks and externalId resolution.
+        // Skip the scan entirely when dependsOn is empty to avoid an O(N) read for the common case.
+        var allItems = new List<WorkItem>();
+        var allItemsByExternalId = new Dictionary<string, WorkItem>(StringComparer.Ordinal);
+        if (req.DependsOn?.Length > 0)
         {
-            if (!Guid.TryParse(rawId, out var g))
-                return Results.BadRequest(new { error = $"dependency '{rawId}' is not a valid work item id" });
-            dependsOnIds.Add(new WorkItemId(g));
+            await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
+            // GroupBy guards against data-inconsistency duplicates (index corruption, missed migration):
+            // last-wins ensures a deterministic result rather than an unhandled InvalidOperationException.
+            allItemsByExternalId = allItems
+                .Where(i => i.ExternalId != null && i.ProjectId == pid)
+                .GroupBy(i => i.ExternalId!)
+                .ToDictionary(g => g.Key, g => g.Last());
         }
 
         var newId = WorkItemId.New();
+        var dependsOnIds = new List<WorkItemId>();
+        foreach (var rawId in req.DependsOn ?? [])
+        {
+            if (rawId is null)
+                return Results.BadRequest(new { error = $"dependency could not be resolved: null entry in dependsOn array" });
+            if (Guid.TryParse(rawId, out var g))
+            {
+                dependsOnIds.Add(new WorkItemId(g));
+            }
+            else
+            {
+                // Treat as externalId within the same project.
+                if (!allItemsByExternalId.TryGetValue(rawId, out var depByExtId))
+                    return Results.BadRequest(new { error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{rawId}' in project '{pid}'" });
+                dependsOnIds.Add(depByExtId.Id);
+            }
+        }
 
         // Self-dependency check: explicit guard per spec.
         if (dependsOnIds.Contains(newId))
             return Results.BadRequest(new { error = "a work item cannot depend on itself" });
-
-        // Load all existing items once — used for both existence and cycle checks.
-        var allItems = new List<WorkItem>();
-        await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
 
         // Existence check: every dep must already be in the store.
         var missingDep = WorkItemDependencies.FindMissingDependency(dependsOnIds, allItems);
@@ -159,29 +197,47 @@ internal static class WorkItemEndpoints
             PushUpstream = req.PushUpstream ?? true,
             DependsOn = dependsOnIds,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
+            ExternalId = externalId,
         };
         if (req.WorkTimeoutMinutes is { } w)
             item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
         if (req.MergeTimeoutMinutes is { } m)
             item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
+        if (req.MinModelScore is { } minScore)
+            item = item with { MinModelScore = Math.Clamp(minScore, 0, 200) };
 
-        await store.CreateAsync(item, ct);
+        try { await store.CreateAsync(item, ct); }
+        catch (WorkItemExternalIdConflictException)
+        {
+            var concurrentConflict = await store.GetByExternalIdAsync(pid, externalId!, ct);
+            var conflictDetail = concurrentConflict is not null
+                ? $"for work item {concurrentConflict.Id} (state: {concurrentConflict.State})"
+                : "(concurrent duplicate)";
+            return Results.BadRequest(new
+            {
+                error = $"externalId '{externalId}' already exists in project '{pid}' {conflictDetail}"
+            });
+        }
         AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
 
         // Re-read dep states after persisting to avoid TOCTOU: a dep may have
         // transitioned to terminal between the allItems snapshot and the commit.
         // Using fresh reads ensures we don't miss the initial enqueue.
         var freshDepStates = new Dictionary<WorkItemId, WorkItemState>();
+        var freshDepExternalIds = new Dictionary<WorkItemId, string?>();
         foreach (var depId in dependsOnIds)
         {
             var dep = await store.GetAsync(depId, ct);
             if (dep is not null)
+            {
                 freshDepStates[depId] = dep.State;
+                freshDepExternalIds[depId] = dep.ExternalId;
+            }
         }
         if (WorkItemDependencies.AreSatisfied(item.DependsOn, freshDepStates))
             await queue.EnqueueAsync(item.Id, ct);
 
-        return Results.Created($"/workitems/{item.Id}", ToDto(item, project, freshDepStates));
+        return Results.Created($"/workitems/{item.Id}", ToDto(item, project, freshDepStates, freshDepExternalIds));
     }
 
     private static async Task<IResult> ListAsync(IWorkItemStore store, IProjectRepository projects, CancellationToken ct)
@@ -190,32 +246,39 @@ internal static class WorkItemEndpoints
         var allItems = new List<WorkItem>();
         await foreach (var item in store.ListAsync(ct)) allItems.Add(item);
         var statesById = WorkItemDependencies.BuildStateMap(allItems);
+        var externalIdsById = allItems.ToDictionary(i => i.Id, i => i.ExternalId);
 
         var list = allItems.Select(item =>
         {
             allProjects.TryGetValue(item.ProjectId.Value, out var p);
-            return ToDto(item, p, statesById);
+            var depExternalIds = item.DependsOn
+                .Where(d => externalIdsById.TryGetValue(d, out _))
+                .ToDictionary(d => d, d => externalIdsById[d]);
+            return ToDto(item, p, statesById, depExternalIds);
         }).ToList();
         return Results.Ok(list);
     }
 
     private static async Task<IResult> GetAsync(string id, IWorkItemStore store, IProjectRepository projects, CancellationToken ct)
     {
-        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
-        var item = await store.GetAsync(new WorkItemId(g), ct);
-        if (item is null) return Results.NotFound();
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
 
         // Read only the dep states needed — avoids an O(N) full-store scan.
         var statesById = new Dictionary<WorkItemId, WorkItemState>();
-        foreach (var depId in item.DependsOn)
+        var depExternalIds = new Dictionary<WorkItemId, string?>();
+        foreach (var depId in item!.DependsOn)
         {
             var dep = await store.GetAsync(depId, ct);
             if (dep is not null)
+            {
                 statesById[depId] = dep.State;
+                depExternalIds[depId] = dep.ExternalId;
+            }
         }
 
         var project = await projects.GetAsync(item.ProjectId, ct);
-        return Results.Ok(ToDto(item, project, statesById));
+        return Results.Ok(ToDto(item, project, statesById, depExternalIds));
     }
 
     /// <summary>
@@ -228,14 +291,14 @@ internal static class WorkItemEndpoints
         IProjectRepository projects,
         CancellationToken ct)
     {
-        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
-        var targetId = new WorkItemId(g);
-        var target = await store.GetAsync(targetId, ct);
-        if (target is null) return Results.NotFound();
+        var (target, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+        var targetId = target!.Id;
 
         var allItems = new List<WorkItem>();
         await foreach (var item in store.ListAsync(ct)) allItems.Add(item);
         var statesById = WorkItemDependencies.BuildStateMap(allItems);
+        var externalIdsById = allItems.ToDictionary(i => i.Id, i => i.ExternalId);
         var allProjects = (await projects.ListAsync(ct)).ToDictionary(p => p.Id.Value);
 
         var dependents = allItems
@@ -243,7 +306,10 @@ internal static class WorkItemEndpoints
             .Select(item =>
             {
                 allProjects.TryGetValue(item.ProjectId.Value, out var p);
-                return ToDto(item, p, statesById);
+                var depExternalIds = item.DependsOn
+                    .Where(d => externalIdsById.ContainsKey(d))
+                    .ToDictionary(d => d, d => externalIdsById[d]);
+                return ToDto(item, p, statesById, depExternalIds);
             })
             .ToList();
 
@@ -265,14 +331,14 @@ internal static class WorkItemEndpoints
         IGitHost gitHost,
         CancellationToken ct)
     {
-        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
-        var workItemId = new WorkItemId(g);
-        var item = await store.GetAsync(workItemId, ct);
-        if (item is null) return Results.NotFound();
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+        var workItemId = item!.Id;
 
         // Only resume from terminal-failed states. Done items have nothing
         // to retry; non-terminal states would race the pipeline.
-        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled))
+        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled
+            or WorkItemState.AbandonedAfterRecoveryAttempts))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
@@ -292,20 +358,21 @@ internal static class WorkItemEndpoints
         // operator deleted it, fail loudly rather than re-clone empty.
         if (resumeState != WorkItemState.Queued)
         {
-            var present = await gitHost.RepositoryExistsAsync(item.Id, ct);
+            var present = await gitHost.RepositoryExistsAsync(workItemId, ct);
             if (!present)
                 return Results.Conflict(new
                 {
-                    error = $"cannot retry from '{from}': bare repo for work item {id} no longer exists",
+                    error = $"cannot retry from '{from}': bare repo for work item {workItemId} no longer exists",
                     hint = "retry with from=\"work\" to start over from a fresh clone"
                 });
         }
 
-        var resumed = item.With(resumeState.Value, error: null);
+        // Reset RecoveryAttempts so an abandoned item is not immediately re-abandoned on next restart.
+        var resumed = item.With(resumeState.Value, error: null) with { RecoveryAttempts = 0 };
         await store.UpdateAsync(resumed, ct);
         AuditLog.WorkItemRetried(workItemId, from);
         await queue.EnqueueAsync(resumed.Id, ct);
-        return Results.Accepted($"/workitems/{id}", new { id, from, state = resumeState.Value.ToString() });
+        return Results.Accepted($"/workitems/{workItemId}", new { id = workItemId.ToString(), from, state = resumeState.Value.ToString() });
     }
 
     private static async Task<IResult> CancelAsync(
@@ -317,18 +384,20 @@ internal static class WorkItemEndpoints
         ITimingStore? timings,
         CancellationToken ct)
     {
-        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
-        var workItemId = new WorkItemId(g);
-        var item = await store.GetAsync(workItemId, ct);
-        if (item is null) return Results.NotFound();
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+        var workItemId = item!.Id;
+
         if (item.State is WorkItemState.Done or WorkItemState.Failed
-            or WorkItemState.Cancelled or WorkItemState.AuditFailed)
+            or WorkItemState.Cancelled or WorkItemState.AuditFailed
+            or WorkItemState.AbandonedAfterRecoveryAttempts)
             return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
 
         var wasActive = cancellations.Cancel(workItemId);
         if (!wasActive)
         {
-            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API");
+            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API",
+                WorkItemCancellationReason.OperatorRequested);
             await store.UpdateAsync(cancelled, ct);
             AuditLog.WorkItemCancelled(workItemId);
             var project = await projects.GetAsync(item.ProjectId, ct);
@@ -351,7 +420,7 @@ internal static class WorkItemEndpoints
         // one. In-flight items (non-Queued) are left to run their course.
         await CascadeCancelDependentsAsync(workItemId, store, ct);
 
-        return Results.Accepted($"/workitems/{id}");
+        return Results.Accepted($"/workitems/{workItemId}");
     }
 
     private static async Task CascadeCancelDependentsAsync(
@@ -369,11 +438,56 @@ internal static class WorkItemEndpoints
             // Queued in the DB. If a worker raced and transitioned it to Working between
             // the ListAsync snapshot and now, the WHERE guard returns 0 rows and we skip
             // the audit log — no spurious WorkItemDependentCancelled for in-flight items.
-            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled");
+            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled",
+                WorkItemCancellationReason.ParentCascaded);
             var updated = await store.TryUpdateIfStateAsync(cancelled, WorkItemState.Queued, ct);
             if (updated)
                 AuditLog.WorkItemDependentCancelled(target.Id, cancelledId);
         }
+    }
+
+    /// <summary>
+    /// Resets a Cancelled work item back to Queued so it will be retried.
+    ///
+    /// Returns 409 Conflict when:
+    ///   - The item is not in Cancelled state.
+    ///   - The cancellation was operator-requested (use POST /workitems with the
+    ///     same body to re-create; respecting an explicit operator cancel is intentional).
+    ///
+    /// Succeeds for:
+    ///   - Items with cancellation_reason = ParentCascaded (parent was since retried).
+    ///   - Legacy items with cancellation_reason IS NULL (ambiguous; likely a host-shutdown
+    ///     victim from before the no-shutdown-cancel fix was deployed).
+    /// </summary>
+    private static async Task<IResult> UncancelAsync(
+        string id,
+        IWorkItemStore store,
+        ITaskQueue queue,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State != WorkItemState.Cancelled)
+            return Results.Conflict(new
+            {
+                error = $"cannot uncancel item in state {item.State}; only Cancelled items can be uncancelled",
+            });
+
+        if (item.CancellationReason == WorkItemCancellationReason.OperatorRequested)
+            return Results.Conflict(new
+            {
+                error = "cannot uncancel an operator-requested cancellation; use POST /workitems with the same body to re-create the work item",
+            });
+
+        var requeued = item.With(WorkItemState.Queued) with { RecoveryAttempts = 0 };
+        var updated = await store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
+        if (!updated)
+            return Results.Conflict(new { error = "concurrent uncancel request already processed this item" });
+        await queue.EnqueueAsync(requeued.Id, ct);
+        AuditLog.WorkItemRetried(requeued.Id, "uncancel");
+
+        return Results.Ok(new { id = requeued.Id.ToString(), state = requeued.State.ToString() });
     }
 
     /// <summary>
@@ -388,10 +502,10 @@ internal static class WorkItemEndpoints
         IAgentRegistry agents,
         CancellationToken ct)
     {
-        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
-        var workItemId = new WorkItemId(g);
-        var item = await store.GetAsync(workItemId, ct);
-        if (item is null) return Results.NotFound();
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+        var workItemId = item!.Id;
+
         if (item.State != WorkItemState.Queued)
             return Results.Conflict(new { error = $"cannot edit item in state {item.State}; only Queued items are editable" });
 
@@ -431,8 +545,20 @@ internal static class WorkItemEndpoints
             promptChanged: body.Prompt is not null,
             agentChanged: body.Agent is not null);
 
+        var statesById = new Dictionary<WorkItemId, WorkItemState>();
+        var depExternalIds = new Dictionary<WorkItemId, string?>();
+        foreach (var depId in updated.DependsOn)
+        {
+            var dep = await store.GetAsync(depId, ct);
+            if (dep is not null)
+            {
+                statesById[depId] = dep.State;
+                depExternalIds[depId] = dep.ExternalId;
+            }
+        }
+
         var project = await projects.GetAsync(updated.ProjectId, ct);
-        return Results.Ok(ToDto(updated, project, new Dictionary<WorkItemId, WorkItemState>()));
+        return Results.Ok(ToDto(updated, project, statesById, depExternalIds));
     }
 
     /// <summary>
@@ -598,11 +724,53 @@ internal static class WorkItemEndpoints
         return project is null ? Results.NotFound() : Results.Ok(ToProjectDto(project));
     }
 
-    private static WorkItemDto ToDto(WorkItem item, Project? project, IReadOnlyDictionary<WorkItemId, WorkItemState> statesById)
+    // ── Work item resolver ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Resolves a route path segment to a <see cref="WorkItem"/>. Accepts either
+    /// a UUID or a composite <c>projectId:externalId</c> form. Returns the item
+    /// and a null error result on success, or a null item with an error result on failure.
+    /// </summary>
+    private static async Task<(WorkItem? item, IResult? error)> ResolveWorkItemAsync(
+        string idSegment,
+        IWorkItemStore store,
+        CancellationToken ct)
+    {
+        if (idSegment.Contains(':'))
+        {
+            var colonIdx = idSegment.IndexOf(':');
+            var projectPart = idSegment[..colonIdx];
+            var externalPart = idSegment[(colonIdx + 1)..];
+            if (string.IsNullOrEmpty(projectPart) || string.IsNullOrEmpty(externalPart))
+                return (null, Results.BadRequest(new { error = "composite id format requires non-empty projectId and externalId: '<projectId>:<externalId>'" }));
+            ProjectId pid;
+            try { pid = new ProjectId(projectPart); }
+            catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
+            try { Validation.ValidateExternalId(externalPart, "externalId"); }
+            catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
+            var byExtId = await store.GetByExternalIdAsync(pid, externalPart, ct);
+            return byExtId is null ? (null, Results.NotFound()) : (byExtId, null);
+        }
+
+        if (!Guid.TryParse(idSegment, out var g))
+            return (null, Results.BadRequest(new { error = "invalid id" }));
+        var byId = await store.GetAsync(new WorkItemId(g), ct);
+        return byId is null ? (null, Results.NotFound()) : (byId, null);
+    }
+
+    private static WorkItemDto ToDto(
+        WorkItem item,
+        Project? project,
+        IReadOnlyDictionary<WorkItemId, WorkItemState> statesById,
+        IReadOnlyDictionary<WorkItemId, string?>? depExternalIds = null)
     {
         var depsSatisfied = WorkItemDependencies.AreSatisfied(item.DependsOn, statesById);
+        var depExtIds = item.DependsOn.ToDictionary(
+            d => d.ToString(),
+            d => depExternalIds is not null && depExternalIds.TryGetValue(d, out var eid) ? eid : null);
         return new WorkItemDto(
             item.Id.ToString(),
+            item.ExternalId,
             item.ProjectId.Value,
             item.Title,
             item.Prompt,
@@ -617,7 +785,9 @@ internal static class WorkItemEndpoints
             item.UpstreamPushAttempts,
             item.DependsOn.Select(d => d.ToString()).ToList(),
             depsSatisfied,
-            item.QueuePosition);
+            depExtIds,
+            item.QueuePosition,
+            item.MinModelScore);
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -640,14 +810,14 @@ internal static class WorkItemEndpoints
         AuditLogTimelineReader timeline,
         CancellationToken ct)
     {
-        if (!Guid.TryParse(id, out var g)) return Results.BadRequest(new { error = "invalid id" });
-        var workItemId = new WorkItemId(g);
-        var item = await store.GetAsync(workItemId, ct);
-        if (item is null) return Results.NotFound();
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+        var workItemId = item!.Id;
 
         var isTerminal = item.State is
             WorkItemState.Done or WorkItemState.Failed or
-            WorkItemState.Cancelled or WorkItemState.AuditFailed;
+            WorkItemState.Cancelled or WorkItemState.AuditFailed or
+            WorkItemState.AbandonedAfterRecoveryAttempts;
 
         var entries = await timeline.GetTimelineAsync(workItemId.ToString(), isTerminal, item.CreatedAt, ct);
 
@@ -674,7 +844,7 @@ internal static class WorkItemEndpoints
                 entryIter == iter);
         }
 
-        return Results.Ok(new WorkItemTimelineResponse(id, filtered.ToList()));
+        return Results.Ok(new WorkItemTimelineResponse(workItemId.ToString(), filtered.ToList()));
     }
 
     private static bool TryGetIterationFromDetails(object details, out int iteration)
@@ -706,7 +876,9 @@ public sealed record CreateWorkItemRequest(
     bool? PushUpstream,
     int? WorkTimeoutMinutes,
     int? MergeTimeoutMinutes,
-    string[]? DependsOn = null);
+    string? ExternalId = null,
+    string[]? DependsOn = null,
+    int? MinModelScore = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -723,6 +895,7 @@ public sealed record WorkItemTimelineResponse(string WorkItemId, IReadOnlyList<T
 
 public sealed record WorkItemDto(
     string Id,
+    string? ExternalId,
     string ProjectId,
     string Title,
     string Prompt,
@@ -737,7 +910,9 @@ public sealed record WorkItemDto(
     int UpstreamPushAttempts,
     IReadOnlyList<string> DependsOn,
     bool DependsOnSatisfied,
-    long QueuePosition = 0);
+    IReadOnlyDictionary<string, string?> DependsOnExternalIds,
+    long QueuePosition = 0,
+    int MinModelScore = 95);
 
 public sealed record ProjectDto(
     string Id,

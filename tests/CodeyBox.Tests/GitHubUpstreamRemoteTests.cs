@@ -262,6 +262,10 @@ internal sealed class FakeGitHost : IGitHost
 
     public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
         => Task.FromResult(true);
+
+    public Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+        => Task.FromResult(("", ""));
 }
 
 internal sealed class FakeHttpMessageHandler : HttpMessageHandler
@@ -331,4 +335,8 @@ internal sealed class ThrowingFakeGitHost : IGitHost
 
     public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
         => Task.FromResult(true);
+
+    public Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+        => Task.FromResult(("", ""));
 }

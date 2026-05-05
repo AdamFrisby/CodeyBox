@@ -146,6 +146,21 @@ internal static class SuggestionEndpoints
         if (body?.ExtraInstructions?.Length > 64 * 1024)
             return Results.BadRequest(new { error = "extraInstructions must be <= 64 KB" });
 
+        string? externalId = null;
+        if (!string.IsNullOrEmpty(body?.ExternalId))
+        {
+            try { Validation.ValidateExternalId(body.ExternalId, nameof(body.ExternalId)); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            externalId = body.ExternalId;
+
+            var conflict = await workItemStore.GetByExternalIdAsync(pid, externalId, ct);
+            if (conflict is not null)
+                return Results.BadRequest(new
+                {
+                    error = $"externalId '{externalId}' already exists in project '{pid}' for work item {conflict.Id} (state: {conflict.State})"
+                });
+        }
+
         var newId = WorkItemId.New();
         // Wrap agent-supplied content in explicit delimiters so the receiving agent
         // can distinguish advisory context from operator instructions (OWASP LLM01).
@@ -180,6 +195,7 @@ internal static class SuggestionEndpoints
             PushUpstream = body?.PushUpstream ?? true,
             AgentClassId = body?.AgentClassId,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
+            ExternalId = externalId,
         };
 
         // Atomically claim the suggestion BEFORE creating the work item.
@@ -194,6 +210,16 @@ internal static class SuggestionEndpoints
             AuditLog.SuggestionPromoted(id, newId.ToString());
             AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
             await queue.EnqueueAsync(item.Id, ct);
+        }
+        catch (WorkItemExternalIdConflictException)
+        {
+            // Concurrent duplicate: revert the suggestion so the operator can retry with a different externalId.
+            try { await store.UpdateAsync(suggestion with { State = "open", PromotedToWorkItemId = null }, CancellationToken.None); }
+            catch { /* best-effort revert */ }
+            return Results.BadRequest(new
+            {
+                error = $"externalId '{externalId}' already exists in project '{pid}' (concurrent duplicate)"
+            });
         }
         catch (Exception)
         {
@@ -273,7 +299,8 @@ public sealed record PromoteSuggestionRequest(
     bool? PushUpstream = null,
     string? BaseBranch = null,
     string? AgentClassId = null,
-    string? ExtraInstructions = null);
+    string? ExtraInstructions = null,
+    string? ExternalId = null);
 
 public sealed record SuggestionDto(
     string Id,

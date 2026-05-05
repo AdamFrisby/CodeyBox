@@ -36,4 +36,10 @@ public interface IWorkItemStore
     /// MaxConcurrentForProject enforcement.
     /// </summary>
     Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Look up a work item by its caller-supplied external ID within a project.
+    /// Returns null when no matching item exists.
+    /// </summary>
+    Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default);
 }

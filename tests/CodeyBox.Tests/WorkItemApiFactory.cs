@@ -54,8 +54,23 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
             services.AddSingleton<IWorkItemStore>(Store);
 
             // Replace the file-backed project repository with an in-memory stub.
+            // "test-project" is the primary project used by most tests.
+            // "second-project" is seeded so cross-project uniqueness tests can verify that
+            // the same externalId is allowed in two different projects.
             services.RemoveAll<IProjectRepository>();
-            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository());
+            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
+                new Project
+                {
+                    Id = new ProjectId("test-project"),
+                    DisplayName = "Test Project",
+                    RepositoryUrl = "https://github.com/test/repo",
+                },
+                new Project
+                {
+                    Id = new ProjectId("second-project"),
+                    DisplayName = "Second Project",
+                    RepositoryUrl = "https://github.com/test/repo2",
+                }));
         });
     }
 

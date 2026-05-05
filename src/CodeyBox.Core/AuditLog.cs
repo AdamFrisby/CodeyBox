@@ -47,6 +47,18 @@ public static class AuditLog
         Audit("work_item.retried")
             .Information("Work item {WorkItemId} retried from phase {From}", id.ToString(), from);
 
+    public static void WorkItemRecovered(WorkItemId id, string fromState, string toState, int attempt) =>
+        Audit("work_item.recovered")
+            .Information(
+                "Recovering {WorkItemId} from non-terminal state {FromState} → {ToState} (recovery attempt {Attempt}, presumed lost on prior shutdown)",
+                id.ToString(), fromState, toState, attempt);
+
+    public static void WorkItemAbandonedAfterRecovery(WorkItemId id, int maxAttempts) =>
+        Audit("work_item.abandoned_after_recovery")
+            .Warning(
+                "Work item {WorkItemId} abandoned after {MaxAttempts} recovery attempts; operator intervention required",
+                id.ToString(), maxAttempts);
+
     public static void WorkItemFailed(WorkItemId id, string error) =>
         Audit("work_item.failed")
             .Warning("Work item {WorkItemId} failed: {Error}", id.ToString(), error);
@@ -129,6 +141,21 @@ public static class AuditLog
     public static void SandboxDisposed(string vmName) =>
         Audit("sandbox.disposed")
             .Information("Sandbox {VmName} disposed", vmName);
+
+    public static void SandboxLeakDetected(string name, double ageMinutes, long? diskMb) =>
+        Audit("sandbox.leak_detected")
+            .Warning("Leaked sandbox detected: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB",
+                name, ageMinutes, diskMb);
+
+    public static void SandboxLeakDisposed(string name, double ageMinutes, long? diskMb, DateTimeOffset disposedAt) =>
+        Audit("sandbox.leak_disposed")
+            .Information("Leaked sandbox disposed: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB disposedAt={DisposedAt}",
+                name, ageMinutes, diskMb, disposedAt);
+
+    public static void SandboxLeakDisposeFailed(string name, double ageMinutes, long? diskMb, string error) =>
+        Audit("sandbox.leak_dispose_failed")
+            .Warning("Failed to dispose leaked sandbox {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB: {Error}",
+                name, ageMinutes, diskMb, error);
 
     // ── Upstream remote ──────────────────────────────────────────────────────
 
@@ -266,6 +293,51 @@ public static class AuditLog
                 "Suggestion {SuggestionId} could not be reverted to open after promotion failure; stuck in 'accepted' with no linked work item",
                 suggestionId);
 
+    // ── Changelog automation ─────────────────────────────────────────────────
+
+    public static void ChangelogReleaseRequested(string projectId, string fromTag, string toTag, int prCount) =>
+        Audit("changelog.release_requested")
+            .Information("Changelog generation requested for project {ProjectId}: {FromTag}→{ToTag} ({PrCount} PRs)",
+                projectId, fromTag, toTag, prCount);
+
+    public static void ChangelogGenerated(string projectId, string toTag, string category, int prCount) =>
+        Audit("changelog.generated")
+            .Information("Changelog generated for project {ProjectId} tag {ToTag}: {Category} ({PrCount} PRs)",
+                projectId, toTag, category, prCount);
+
+    public static void ChangelogWebhookReceived(string owner, string repo, string tagName) =>
+        Audit("changelog.webhook_received")
+            .Information("GitHub release webhook received for {Owner}/{Repo} tag {TagName}", owner, repo, tagName);
+
+    public static void ChangelogWebhookRejected(string reason) =>
+        Audit("changelog.webhook_rejected")
+            .Warning("GitHub release webhook rejected: {Reason}", reason);
+
+    public static void ChangelogWorkItemCreated(string workItemId, string projectId, string toTag) =>
+        Audit("changelog.work_item_created")
+            .Information("Changelog work item {WorkItemId} created for project {ProjectId} tag {ToTag}",
+                workItemId, projectId, toTag);
+
+    // ── Dead-worker recovery ─────────────────────────────────────────────────
+
+    public static void WorkerRegistered(string workerId, string hostName, int processId) =>
+        Audit("worker.registered")
+            .Information("Worker {WorkerId} registered on {HostName} (pid={ProcessId})", workerId, hostName, processId);
+
+    public static void WorkerDeregistered(string workerId) =>
+        Audit("worker.deregistered")
+            .Information("Worker {WorkerId} deregistered (clean shutdown)", workerId);
+
+    public static void DeadWorkerRecovered(WorkItemId itemId, string workerId, WorkItemState fromState, WorkItemState toState, int attempt) =>
+        Audit("work_item.worker_dead_recovered")
+            .Information("Dead worker {WorkerId}: recovered work item {WorkItemId} from {FromState} to {ToState} (attempt {Attempt})",
+                workerId, itemId.ToString(), fromState.ToString(), toState.ToString(), attempt);
+
+    public static void DeadWorkerFailedTerminal(WorkItemId itemId, string workerId, int attempt) =>
+        Audit("work_item.worker_dead_failed_terminal")
+            .Warning("Dead worker {WorkerId}: work item {WorkItemId} exceeded MaxRecoveryAttempts at attempt {Attempt}; transitioned to Failed",
+                workerId, itemId.ToString(), attempt);
+
     // ── Budget caps ──────────────────────────────────────────────────────────
 
     public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>
@@ -289,6 +361,68 @@ public static class AuditLog
         Audit("quota_router.deferred")
             .Information("Quota router: work item {WorkItemId} deferred — re-enqueue scheduled in {RecheckMs}ms",
                 id.ToString(), (long)recheckIn.TotalMilliseconds);
+
+    /// <summary>
+    /// Emitted when all class members fail the MinModelScore floor check. Records
+    /// the rejected members and their below-floor reasons so the audit log captures
+    /// the failure detail even though no member was chosen.
+    /// </summary>
+    public static void QuotaRouterNoEligible(
+        WorkItemId id,
+        string classId,
+        int minModelScore,
+        IEnumerable<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)> rejected) =>
+        Audit("quota_router.scored")
+            .Warning(
+                "Quota router no-eligible: workItem={WorkItemId} class={ClassId} minModelScore={MinModelScore} " +
+                "rejected=[{Rejected}]",
+                id.ToString(), classId, minModelScore,
+                string.Join("; ", rejected.Select(r => $"{r.Agent.Value}/{r.ModelId ?? "(default)"}:eff={r.EffectiveScore}:{r.RejectReason}")));
+
+    /// <summary>
+    /// Emitted once per pickup after a score-based routing decision. Records the
+    /// chosen member's scores and all rejected members with their reject reasons,
+    /// enabling post-hoc inspection of routing decisions without re-running.
+    /// </summary>
+    public static void QuotaRouterScored(
+        WorkItemId id,
+        string classId,
+        AgentKind chosenAgent,
+        string? chosenModelId,
+        int chosenBaseScore,
+        int chosenEffectiveScore,
+        string appliedModifiers,
+        IEnumerable<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)> rejected) =>
+        Audit("quota_router.scored")
+            .Information(
+                "Quota router scored: workItem={WorkItemId} class={ClassId} " +
+                "chosen={Agent}/{ModelId} baseScore={BaseScore} effectiveScore={EffectiveScore} modifiers={Modifiers} " +
+                "rejected=[{Rejected}]",
+                id.ToString(), classId,
+                chosenAgent.Value, chosenModelId ?? "(default)", chosenBaseScore, chosenEffectiveScore,
+                appliedModifiers,
+                string.Join("; ", rejected.Select(r => $"{r.Agent.Value}/{r.ModelId ?? "(default)"}:eff={r.EffectiveScore}:{r.RejectReason}")));
+
+    // ── Plugin loading ───────────────────────────────────────────────────────
+
+    public static void PluginLoaded(string pluginId, string displayName, string assemblyPath) =>
+        Audit("plugin.loaded")
+            .Information("Plugin loaded: {PluginId} ({DisplayName}) from {AssemblyPath}",
+                pluginId, displayName, assemblyPath);
+
+    public static void PluginSkippedNotAllowlisted(string pluginId, string assemblyPath) =>
+        Audit("plugin.skipped_not_allowlisted")
+            .Information("Plugin {PluginId} skipped: not in Plugins.Allowlist (path: {AssemblyPath})",
+                pluginId, assemblyPath);
+
+    public static void PluginSkippedApiVersion(string pluginId, string required, string current) =>
+        Audit("plugin.skipped_api_version")
+            .Error("Plugin {PluginId} requires host API version {Required} but this host provides {Current}; plugin not loaded",
+                pluginId, required, current);
+
+    public static void PluginInitializationFailed(string pluginId, Exception exception) =>
+        Audit("plugin.initialization_failed")
+            .Error(exception, "Plugin {PluginId} initialization failed; plugin not available", pluginId);
 
     // ── Internal helper ──────────────────────────────────────────────────────
 

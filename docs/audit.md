@@ -328,6 +328,68 @@ gains an optional `auditAgentKind` field in its `details` object:
   is active for that iteration.
 - `null` when all auditors used the work agent.
 
+## LLM auditor parallelism
+
+By default, LLM-driven auditors within an audit iteration run **concurrently**.
+`security:llm-review`, `completeness:llm-review`, and `cheating:llm-review`
+all start at the same time, so wall-clock latency is approximately
+`max(individual)` (~5–13 min) rather than the sum (~15–35 min).
+
+Each parallel LLM auditor receives its own sandbox clone. Isolation ensures
+a crash or file write in one auditor's sandbox cannot corrupt another's
+`/audit/result.json` output.
+
+Tool auditors (`security:gitleaks`, `security:semgrep`, language presets,
+shell commands, diff-pattern matchers) are unaffected: they always run
+sequentially in a single shared sandbox, regardless of this setting.
+
+### Configuration
+
+```json
+"Audit": {
+  "MaxLlmAuditorParallelism": 3
+}
+```
+
+| Value | Behaviour |
+|---|---|
+| `3` (default) | All three standard LLM auditors run concurrently — fastest audit wall-clock |
+| `2` | Two run concurrently; the third waits for a free slot |
+| `1` | Fully sequential — useful for debugging or avoiding API 429 errors |
+
+**If you hit 429 rate-limit errors during audit**, set `MaxLlmAuditorParallelism: 1`.
+The three LLM auditors queue up and their individual latencies are unchanged —
+you trade total wall-clock time for reduced concurrent token draw.
+
+**Choosing an intermediate value**: the audit is subscription-friendly when
+`MaxLlmAuditorParallelism × peak-tokens-per-call < per-account-rate-limit`.
+If your rate limit sits between 1× and 3× your per-auditor peak token draw,
+set `MaxLlmAuditorParallelism: 2` rather than dropping all the way to `1`.
+
+### Known limitations
+
+**`StopOnFirstFailure` within the LLM group**: once parallel execution begins,
+all LLM auditors run to completion before findings are checked against
+`StopOnFirstFailure`. Short-circuiting still works between the tool-auditor
+phase and the LLM-auditor phase (a failing tool auditor still prevents LLM
+auditors from starting), but within the LLM group there is no early exit.
+A project that relies on `StopOnFirstFailure` to cap LLM token spend should
+set `MaxLlmAuditorParallelism: 1` so the sequential short-circuit applies.
+
+**Baseline-image baking**: if sandbox baseline images have not been pre-baked,
+parallel LLM auditor clones serialise on the bake step during the first audit
+iteration. Subsequent iterations reuse the baked image and run concurrently as
+expected. This is not a regression versus sequential execution — it only
+affects the first iteration when images are cold.
+
+### Observability
+
+The existing `auditor.run` event is emitted once per auditor after its sandbox
+completes. Events are emitted in **registration order** (the order auditors
+appear in the config), not completion order — `Task.WhenAll` returns results
+in input-task order and the post-processing loop iterates that stable array.
+Use the auditor `name` property to correlate events with findings.
+
 ## Security notes
 
 The audit phase widens the attack surface in two ways:

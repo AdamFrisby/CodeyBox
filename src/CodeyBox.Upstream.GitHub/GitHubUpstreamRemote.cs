@@ -21,6 +21,13 @@ namespace CodeyBox.Upstream.GitHub;
 ///   - Token is scrubbed from any error message before it leaves this class.
 ///   - HTTP requests carry Authorization: token <PAT> as a request header;
 ///     the header is added per-request so the shared HttpClient is not mutated.
+///
+/// PR description:
+///   When an <see cref="IPullRequestDescriptionGenerator"/> is supplied and
+///   <see cref="PrDescriptionOptions.Enabled"/> is true, the PR body is
+///   produced by the LLM generator rather than the static template.
+///   On timeout or any generator failure the static template is used instead.
+///   The generator call is bounded by <see cref="PrDescriptionOptions.Timeout"/>.
 /// </summary>
 public sealed class GitHubUpstreamRemote : IUpstreamRemote
 {
@@ -29,19 +36,22 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private readonly ILogger<GitHubUpstreamRemote> _log;
     private readonly GitHubUpstreamOptions _opts;
     private readonly ITimingStore? _timings;
+    private readonly IPullRequestDescriptionGenerator? _descriptionGenerator;
 
     public GitHubUpstreamRemote(
         IGitHost gitHost,
         IHttpClientFactory httpClientFactory,
         ILogger<GitHubUpstreamRemote> log,
         GitHubUpstreamOptions opts,
-        ITimingStore? timings = null)
+        ITimingStore? timings = null,
+        IPullRequestDescriptionGenerator? descriptionGenerator = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
         _log = log;
         _opts = opts;
         _timings = timings;
+        _descriptionGenerator = descriptionGenerator;
         if (string.IsNullOrEmpty(_opts.Token))
             throw new ArgumentException("GitHub PAT must be provided", nameof(opts));
         if (!IsValidRemoteName(_opts.Owner))
@@ -84,8 +94,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     /// <summary>
     /// Full GitHub completion flow:
     ///   1. Push work branch to GitHub.
-    ///   2. Open a PR (workBranch → baseBranch).
-    ///   3. If AutoMerge=true, merge the PR via the GitHub API.
+    ///   2. Build PR description (LLM-generated or static fallback).
+    ///   3. Open a PR (workBranch → baseBranch).
+    ///   4. If AutoMerge=true, merge the PR via the GitHub API.
     ///
     /// Transient failures (network, unexpected HTTP errors) throw so the
     /// orchestrator can retry. Soft errors (422 PR already exists, 405 PR not
@@ -129,14 +140,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             }
         }
 
-        // Step 2: open PR
+        // Step 2: build PR description (LLM or static fallback)
+        var description = await BuildDescriptionAsync(request, ct);
+
+        // Step 3: open PR
         var prTitle = BuildPrTitle(request.Title, request.WorkBranch);
         GitHubPrResponse? pr;
         await using (var createPrScope = await TimingScope.BeginAsync(
             _timings, request.WorkItemId, "upstream_push", "upstream.api_create_pr",
             log: _log))
         {
-            pr = await CreatePullRequestAsync(request, prTitle, ct);
+            pr = await CreatePullRequestAsync(request, prTitle, description, ct);
         }
 
         if (pr is null)
@@ -166,7 +180,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             };
         }
 
-        // Step 3: auto-merge
+        // Step 4: auto-merge
         string? mergedSha;
         string? mergeNotes;
         await using (var mergeScope = await TimingScope.BeginAsync(
@@ -193,12 +207,94 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     }
 
     // -------------------------------------------------------------------------
+    // Description generation
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Attempts LLM-generated description; falls back to the static template
+    /// from <see cref="UpstreamCompletionRequest.Description"/> on any failure.
+    /// Appends the standard CodeyBox footer to whichever body is used.
+    /// Never throws — generator failures are warnings, not errors.
+    /// </summary>
+    private async Task<string> BuildDescriptionAsync(UpstreamCompletionRequest request, CancellationToken ct)
+    {
+        var staticBody = request.Description ?? string.Empty;
+
+        if (_descriptionGenerator is null || !_opts.PrDescription.Enabled)
+            return staticBody + PrFooter;
+
+        try
+        {
+            using var genCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            genCts.CancelAfter(_opts.PrDescription.Timeout);
+
+            // Prefer raw agent stdout over the formatted static body for the reasoning tail.
+            var agentTailRaw = ExtractAgentReasoningTail(request.AgentStdout ?? request.Description);
+            var agentTail = agentTailRaw is null ? null : RawOutputRedactor.Redact(agentTailRaw);
+            // Redact before sending to LLM — diff may contain accidentally-committed tokens.
+            // Truncation to MaxDiffBytes is applied inside GenerateAsync.
+            var redactedDiff = RawOutputRedactor.Redact(request.FullDiff);
+            // Cap DiffStat at 4 KB; large changesets can produce hundreds of KB of stat output.
+            var redactedStat = RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(request.DiffStat), 4096);
+            // Truncate prompt using UTF-8 byte count to honour the documented 2 KB cap.
+            var redactedPrompt = RawOutputRedactor.Redact(
+                RawOutputRedactor.TruncateToBytes(request.WorkItemPrompt ?? string.Empty, 2048));
+
+            var genRequest = new PullRequestDescriptionRequest
+            {
+                DiffSummary = redactedStat,
+                FullDiff = redactedDiff,
+                Title = request.Title,
+                Prompt = redactedPrompt,
+                AddressedFindings = request.AddressedFindings,
+                AgentReasoningTail = agentTail,
+            };
+
+            var generated = await _descriptionGenerator.GenerateAsync(genRequest, genCts.Token);
+            // Redact the generated body — the LLM may echo secrets from the diff.
+            generated = RawOutputRedactor.Redact(generated);
+            _log.LogInformation("LLM-generated PR description produced ({Chars} chars)", generated.Length);
+            return generated + PrFooter;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            _log.LogWarning("PR description generation timed out after {Timeout}; using static template",
+                _opts.PrDescription.Timeout);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning("PR description generation failed ({Message}); using static template", ex.Message);
+        }
+
+        return staticBody + PrFooter;
+    }
+
+    /// <summary>Returns the last 2 KB of <paramref name="text"/> (raw agent stdout or fallback).</summary>
+    private static string? ExtractAgentReasoningTail(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        const int maxTailChars = 2048;
+        return text.Length <= maxTailChars ? text : text[^maxTailChars..];
+    }
+
+    // Standard footer appended to every PR body (LLM-generated or static).
+    // The Co-Authored-By trailer identifies CodeyBox as a co-author on the
+    // forge side; the 🤖 line links back to the platform for operators.
+    private const string PrFooter = "\n\n---\n*Co-Authored-By: CodeyBox <noreply@codeybox.invalid>*  \n🤖 Generated with [CodeyBox](https://codeybox.invalid)";
+
+    // -------------------------------------------------------------------------
+    // GitHub API helpers
+    // -------------------------------------------------------------------------
 
     private async Task<GitHubPrResponse?> CreatePullRequestAsync(
-        UpstreamCompletionRequest request, string prTitle, CancellationToken ct)
+        UpstreamCompletionRequest request, string prTitle, string description, CancellationToken ct)
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls";
-        var body = new GitHubCreatePrRequest(prTitle, request.Description ?? string.Empty, request.WorkBranch, request.BaseBranch);
+        var body = new GitHubCreatePrRequest(prTitle, description, request.WorkBranch, request.BaseBranch);
 
         using var req = BuildRequest(HttpMethod.Post, url);
         req.Content = JsonContent.Create(body);
@@ -301,6 +397,9 @@ public sealed record GitHubUpstreamOptions
     public string MergeMethod { get; init; } = "merge";
     public bool AutoMerge { get; init; }
     public string? PullRequestTitleTemplate { get; init; }
+
+    /// <summary>LLM-generated PR description settings.</summary>
+    public PrDescriptionOptions PrDescription { get; init; } = new();
 
     // Prevent the auto-generated record ToString() from rendering Token in plaintext
     // (e.g. when the instance is passed to a structured logger via {Opts}).

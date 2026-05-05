@@ -206,9 +206,10 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         string? baseBranch = null,
         bool? pushUpstream = null,
         string? agentClassId = null,
+        string? externalId = null,
         CancellationToken ct = default)
     {
-        var body = new { extraInstructions, agent, workBranch, baseBranch, pushUpstream, agentClassId };
+        var body = new { extraInstructions, agent, workBranch, baseBranch, pushUpstream, agentClassId, externalId };
         var resp = await _http.PostAsJsonAsync(
             $"/suggestions/{Uri.EscapeDataString(id)}/promote",
             body, JsonOptions, ct);
