@@ -98,6 +98,7 @@ public sealed class LocalGitHost : IGitHost
         string upstreamUrl,
         string branch,
         IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
         CancellationToken ct = default)
     {
         Validation.ValidateRepositoryUrl(upstreamUrl, nameof(upstreamUrl));
@@ -111,8 +112,21 @@ public sealed class LocalGitHost : IGitHost
             ct,
             extraEnv: upstreamEnv,
             "push", upstreamUrl, $"{branch}:{branch}");
-        if (rc.ExitCode != 0)
+        if (rc.ExitCode == 0)
+            return;
+
+        if (!IsNonFastForwardRejection(rc.Stdout, rc.Stderr))
             throw new InvalidOperationException($"git push to upstream failed: {rc.Stderr}");
+
+        await ReconcileRejectedUpstreamPushAsync(path, upstreamUrl, branch, upstreamEnv, reconcileStrategy, ct);
+
+        rc = await RunGitAsync(
+            workdir: path,
+            ct,
+            extraEnv: upstreamEnv,
+            "push", upstreamUrl, $"{branch}:{branch}");
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException($"git push to upstream failed after reconcile: {rc.Stderr}");
     }
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
@@ -163,6 +177,83 @@ public sealed class LocalGitHost : IGitHost
     }
 
     public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
+
+    private static bool IsNonFastForwardRejection(string stdout, string stderr)
+    {
+        var output = stdout + "\n" + stderr;
+        return output.Contains("non-fast-forward", StringComparison.OrdinalIgnoreCase)
+            || output.Contains("! [rejected]", StringComparison.OrdinalIgnoreCase)
+            || output.Contains("fetch first", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task ReconcileRejectedUpstreamPushAsync(
+        string bareRepoPath,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy,
+        CancellationToken ct)
+    {
+        var upstreamRef = $"refs/remotes/codeybox-upstream/{branch}";
+        var fetch = await RunGitAsync(
+            workdir: bareRepoPath,
+            ct,
+            extraEnv: upstreamEnv,
+            "fetch", "--no-tags", upstreamUrl, $"+refs/heads/{branch}:{upstreamRef}");
+        if (fetch.ExitCode != 0)
+            throw new InvalidOperationException($"git fetch upstream branch '{branch}' failed: {fetch.Stderr}");
+
+        var worktreePath = Path.Combine(Path.GetTempPath(), "codeybox-upstream-reconcile-" + Guid.NewGuid().ToString("N"));
+        var worktreeAdded = false;
+        try
+        {
+            var add = await RunGitAsync(bareRepoPath, ct, "worktree", "add", worktreePath, branch);
+            if (add.ExitCode != 0)
+                throw new InvalidOperationException($"git worktree add for upstream reconcile failed: {add.Stderr}");
+            worktreeAdded = true;
+
+            if (reconcileStrategy == UpstreamPushReconcileStrategy.Merge)
+            {
+                var pull = await RunGitAsync(
+                    workdir: worktreePath,
+                    ct,
+                    extraEnv: upstreamEnv,
+                    "-c", "user.name=CodeyBox",
+                    "-c", "user.email=codeybox@localhost",
+                    "pull", "--no-rebase", "--no-edit", upstreamUrl, branch);
+                if (pull.ExitCode != 0)
+                {
+                    await RunGitAsync(worktreePath, CancellationToken.None, "merge", "--abort");
+                    throw new InvalidOperationException(
+                        $"upstream merge conflict on {branch}; manual resolution required: {pull.Stderr}");
+                }
+                return;
+            }
+
+            var rebase = await RunGitAsync(
+                worktreePath,
+                ct,
+                "-c", "user.name=CodeyBox",
+                "-c", "user.email=codeybox@localhost",
+                "rebase", upstreamRef);
+            if (rebase.ExitCode != 0)
+            {
+                await RunGitAsync(worktreePath, CancellationToken.None, "rebase", "--abort");
+                throw new InvalidOperationException(
+                    $"upstream rebase conflict on {branch}; manual resolution required: {rebase.Stderr}");
+            }
+        }
+        finally
+        {
+            if (worktreeAdded)
+                await RunGitAsync(bareRepoPath, CancellationToken.None, "worktree", "remove", "--force", worktreePath);
+            if (Directory.Exists(worktreePath))
+            {
+                try { Directory.Delete(worktreePath, recursive: true); }
+                catch { }
+            }
+        }
+    }
 
     private static void ApplyReceivePolicy(string barePath)
     {

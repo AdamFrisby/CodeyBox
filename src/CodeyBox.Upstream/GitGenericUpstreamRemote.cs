@@ -24,7 +24,7 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
     {
         try
         {
-            await _gitHost.PushToUpstreamAsync(repositoryId, _opts.UpstreamUrl, branch, _opts.ExtraEnvironment, ct);
+            await _gitHost.PushToUpstreamAsync(repositoryId, _opts.UpstreamUrl, branch, _opts.ExtraEnvironment, ct: ct);
             return new UpstreamPushResult(true, null);
         }
         catch (Exception ex)
@@ -38,7 +38,13 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
         // Generic git has no PR concept — push baseBranch and report done.
         try
         {
-            await _gitHost.PushToUpstreamAsync(request.RepositoryId, _opts.UpstreamUrl, request.BaseBranch, _opts.ExtraEnvironment, ct);
+            await _gitHost.PushToUpstreamAsync(
+                request.RepositoryId,
+                _opts.UpstreamUrl,
+                request.BaseBranch,
+                _opts.ExtraEnvironment,
+                ToReconcileStrategy(request.MergeMethod),
+                ct);
             AuditLog.UpstreamPush(request.BaseBranch, ScrubUrlCredentials(_opts.UpstreamUrl));
             return new UpstreamCompletionOutcome { BranchPushed = true };
         }
@@ -69,6 +75,11 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
             return "[url-redacted]";
         }
     }
+
+    private static UpstreamPushReconcileStrategy ToReconcileStrategy(string mergeMethod)
+        => mergeMethod.Equals("rebase", StringComparison.OrdinalIgnoreCase)
+            ? UpstreamPushReconcileStrategy.Rebase
+            : UpstreamPushReconcileStrategy.Merge;
 }
 
 public sealed record GitGenericUpstreamOptions
