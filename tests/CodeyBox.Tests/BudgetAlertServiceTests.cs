@@ -235,12 +235,14 @@ internal sealed class CapturingQueueController : IQueueController
 
     public Dictionary<string, string> ProjectPaused { get; } = new();
     public HashSet<string> ProjectResumed { get; } = [];
+    public int PauseProjectCallCount { get; private set; }
 
     public Task PauseAsync(string reason, CancellationToken ct = default) => Task.CompletedTask;
     public Task ResumeAsync(CancellationToken ct = default) => Task.CompletedTask;
 
     public Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct = default)
     {
+        PauseProjectCallCount++;
         ProjectPaused[projectId.Value] = reason;
         return Task.CompletedTask;
     }

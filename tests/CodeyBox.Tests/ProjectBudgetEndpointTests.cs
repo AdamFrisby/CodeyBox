@@ -49,7 +49,8 @@ public sealed class ProjectBudgetEndpointTests : IClassFixture<BudgetApiFactory>
         {
             Id = WorkItemId.New(),
             ProjectId = new ProjectId("budget-project-with-spend"),
-            Title = "t", Prompt = "p",
+            Title = "t",
+            Prompt = "p",
             State = WorkItemState.Done,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow,

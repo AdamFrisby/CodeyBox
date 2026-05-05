@@ -71,11 +71,12 @@ public sealed class BudgetAlertAutoPauseTests : IDisposable
             NullLogger<BudgetAlertService>.Instance);
 
         await svc.RunSweepAsync(CancellationToken.None);
-        var pauseCallCount = queue.ProjectPaused.Count; // track state after first tick
-        await svc.RunSweepAsync(CancellationToken.None); // second tick should not re-pause
+        var pauseCallCount = queue.PauseProjectCallCount; // 1 after the first tick
+        await svc.RunSweepAsync(CancellationToken.None); // second tick — already Exceeded, no re-fire
 
-        // PauseProjectAsync called at most once (state was already Exceeded).
-        Assert.Equal(pauseCallCount, queue.ProjectPaused.Count);
+        // Edge-trigger: PauseProjectAsync must be called exactly once regardless of
+        // how many consecutive ticks remain above the hard cap.
+        Assert.Equal(pauseCallCount, queue.PauseProjectCallCount);
     }
 
     [Fact]
@@ -145,9 +146,15 @@ public sealed class BudgetAlertAutoPauseTests : IDisposable
     {
         using var itemStore = new SqliteWorkItemStore(_dbPath);
         using var queueController = new SqliteQueueController(
-            _dbPath, Microsoft.Extensions.Logging.Abstractions.NullLogger<SqliteQueueController>.Instance);
+            _dbPath, NullLogger<SqliteQueueController>.Instance);
 
         var pid = new ProjectId("proj-pickup-paused");
+        var project = new Project
+        {
+            Id = pid,
+            DisplayName = "Pickup Paused",
+            RepositoryUrl = "https://example.com/paused",
+        };
         var item = new WorkItem
         {
             Id = WorkItemId.New(),
@@ -158,11 +165,42 @@ public sealed class BudgetAlertAutoPauseTests : IDisposable
         };
         await itemStore.CreateAsync(item);
 
+        // Pause the project before the orchestrator picks up the item.
         await queueController.PauseProjectAsync(pid, "budget exceeded");
 
-        var state = await queueController.GetProjectStateAsync(pid);
-        Assert.NotNull(state);
-        Assert.True(state!.Paused);
-        Assert.Equal("budget exceeded", state.PausedReason);
+        var taskQueue = new InMemoryTaskQueue();
+        await taskQueue.EnqueueAsync(item.Id, CancellationToken.None);
+
+        // FakePipelineRunner records every item it executes — it must stay empty.
+        var pipeline = new FakePipelineRunner(itemStore);
+        var registry = new CancellationRegistry(CancellationToken.None);
+
+        // OnWorkerSpawned fires right before Task.Run inside the dispatch loop,
+        // i.e. after the item is dequeued and before RunItemAsync executes.
+        var spawnedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var svc = new OrchestratorService(
+            taskQueue, itemStore, pipeline, registry,
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 1,
+                OnWorkerSpawned = () => spawnedTcs.TrySetResult(),
+            },
+            NullLogger<OrchestratorService>.Instance,
+            projects: new InMemoryProjectRepository(project),
+            queueController: queueController);
+
+        using var cts = new CancellationTokenSource();
+        _ = svc.StartAsync(cts.Token);
+
+        // Wait until the dispatch loop picks up the item, then give RunItemAsync
+        // time to complete the per-project pause check and return.
+        await spawnedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(200);
+
+        await cts.CancelAsync();
+        await svc.StopAsync(CancellationToken.None);
+
+        // The pipeline must never have been invoked for the paused project.
+        Assert.Empty(pipeline.Executed);
     }
 }

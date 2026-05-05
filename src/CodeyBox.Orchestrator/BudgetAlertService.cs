@@ -77,11 +77,18 @@ public sealed class BudgetAlertService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var minInterval = TimeSpan.FromSeconds(30);
+        var checkInterval = _opts.CheckInterval < minInterval ? minInterval : _opts.CheckInterval;
+        if (_opts.CheckInterval < minInterval)
+            _log.LogWarning(
+                "BudgetAlerts:CheckInterval {Configured} is below the 30-second minimum; using 30s to prevent I/O saturation",
+                _opts.CheckInterval);
+
         // Stagger the first tick by 30 seconds so startup noise settles.
-        try { await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken); }
+        try { await Task.Delay(minInterval, stoppingToken); }
         catch (OperationCanceledException) { return; }
 
-        using var timer = new PeriodicTimer(_opts.CheckInterval);
+        using var timer = new PeriodicTimer(checkInterval);
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -217,7 +224,7 @@ public sealed class BudgetAlertService : BackgroundService
     {
         try
         {
-            _ = _webhooks.PublishAsync(new WebhookEvent
+            await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = eventName,
                 Project = project,
@@ -265,8 +272,7 @@ public sealed class BudgetAlertService : BackgroundService
     }
 
     private static bool IsTableMissingException(Exception ex) =>
-        ex.Message.Contains("no such table", StringComparison.OrdinalIgnoreCase) ||
-        ex.Message.Contains("work_item_costs", StringComparison.OrdinalIgnoreCase);
+        ex.Message.Contains("no such table", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Reads the current previous-state snapshot for a project (for testing).

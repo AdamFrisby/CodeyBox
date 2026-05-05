@@ -41,9 +41,12 @@ internal static class ProjectBudgetEndpoints
             {
                 spendUsd = await costStore.SumEstimatedUsdAsync(project.Id.Value, windowStart, now, ct);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // Table may not exist yet; treat as zero spend.
+                // Swallow only the case where cost-reporting hasn't migrated yet.
+                if (!ex.Message.Contains("no such table", StringComparison.OrdinalIgnoreCase))
+                    return Results.Problem("Cost store unavailable; check server logs.", statusCode: 500);
+                // Table missing → treat as zero spend (migration not yet run).
             }
         }
 

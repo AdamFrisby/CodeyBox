@@ -149,7 +149,7 @@ else
                         @item.ProjectId
                         @if (projPaused && item.IsQueued)
                         {
-                            <span class="project-paused-badge" title="Project paused — @cb!.ProjectQueue.PausedReason">⏸ PROJECT PAUSED — budget exceeded</span>
+                            <span class="project-paused-badge" title="@cb!.ProjectQueue.PausedReason">⏸ PROJECT PAUSED — budget exceeded — $@cb!.CurrentSpendUsd.ToString("F2") over $@cb!.MonthlyBudgetUsd.ToString("F2")</span>
                         }
                     </td>
                     <td>@item.Title</td>
