@@ -626,9 +626,10 @@ for the Fleet dashboard view — one round-trip per refresh instead of N+1 per-p
 | `pausedReason` | string? | Pause reason, or `null` |
 | `monthlySpendUsd` | number? | Rolling 30-day spend in USD (null when cost-reporting unavailable) |
 | `monthlyBudgetUsd` | number? | Monthly spend cap in USD (null until budget-alerts work item lands) |
-| `budgetThresholdState` | string | `"ok"`, `"warning"` (≥80%), `"critical"` (≥100%), or `"unknown"` |
+| `budgetThresholdState` | string | `"ok"` when cost data is available; `"unknown"` when cost-reporting is unavailable. (`"warning"` ≥80% and `"critical"` ≥100% are defined by the budget-alerts work item and not yet emitted.) |
 
 **Notes:**
 - Projects with zero work items return `currentPhase: null, recentOutcomes: []`.
 - `monthlySpendUsd` and `monthlyBudgetUsd` are `null` when the cost store is unavailable; the endpoint never errors on missing cost data.
 - `isPaused` is always `false` until the budget-alerts work item adds `project_queue_state` table support.
+- `budgetThresholdState` is currently limited to `"ok"` or `"unknown"`; threshold-based values (`"warning"`, `"critical"`) require the budget-alerts work item.

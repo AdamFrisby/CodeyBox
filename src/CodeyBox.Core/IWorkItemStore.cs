@@ -42,4 +42,18 @@ public interface IWorkItemStore
     /// Returns null when no matching item exists.
     /// </summary>
     Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Fleet aggregation: returns (project_id, state, count, max_updated_at) rows produced by
+    /// SELECT project_id, state, COUNT(*), MAX(updated_at) FROM work_items GROUP BY project_id, state.
+    /// Hits the composite index on (project_id, state). No work item bodies are loaded.
+    /// </summary>
+    Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Fleet aggregation: returns the most-recent <paramref name="perProject"/> terminal work item states
+    /// per project, newest-first. Uses ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC).
+    /// Terminal states: Done, Failed, AuditFailed, Cancelled.
+    /// </summary>
+    Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default);
 }

@@ -250,6 +250,20 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return result ?? [];
     }
 
+    public async Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default)
+    {
+        // Per-project pause requires the budget-alerts work item; fall back to global pause.
+        var result = await PauseQueueAsync(reason ?? $"Fleet pause: {projectId}", ct);
+        return result is not null;
+    }
+
+    public async Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default)
+    {
+        // Per-project resume requires the budget-alerts work item; fall back to global resume.
+        var result = await ResumeQueueAsync(ct);
+        return result is not null;
+    }
+
     public async Task<ProjectCostsDto?> GetProjectCostsAsync(
         string projectId, string? from = null, string? to = null, CancellationToken ct = default)
     {

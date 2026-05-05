@@ -166,6 +166,8 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default) => Task.FromResult<ProjectCostsDto?>(null);
     public Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default) => Task.FromResult(new List<FleetSummaryDto>());
+    public Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default) => Task.FromResult(false);
+    public Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default) => Task.FromResult(false);
 }
 
 /// <summary>
@@ -220,4 +222,6 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default) => Task.FromResult<ProjectCostsDto?>(null);
     public Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default) => Task.FromResult(new List<FleetSummaryDto>());
+    public Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default) => Task.FromResult(false);
+    public Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default) => Task.FromResult(false);
 }

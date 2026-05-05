@@ -21,17 +21,17 @@ public sealed class FleetPageTests : TestContext
         List<string>? outcomes = null,
         bool isPaused = false,
         double? spendUsd = null) => new()
-    {
-        ProjectId = projectId,
-        DisplayName = displayName,
-        QueuedCount = queued,
-        InFlightCount = inFlight,
-        CurrentPhase = currentPhase,
-        RecentOutcomes = outcomes ?? [],
-        IsPaused = isPaused,
-        MonthlySpendUsd = spendUsd,
-        BudgetThresholdState = spendUsd.HasValue ? "ok" : "unknown",
-    };
+        {
+            ProjectId = projectId,
+            DisplayName = displayName,
+            QueuedCount = queued,
+            InFlightCount = inFlight,
+            CurrentPhase = currentPhase,
+            RecentOutcomes = outcomes ?? [],
+            IsPaused = isPaused,
+            MonthlySpendUsd = spendUsd,
+            BudgetThresholdState = spendUsd.HasValue ? "ok" : "unknown",
+        };
 
     [Fact]
     public void Fleet_OneRowPerProject()

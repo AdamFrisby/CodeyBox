@@ -8,42 +8,57 @@ namespace CodeyBox.Admin.Tests;
 
 /// <summary>
 /// Tests for the per-project action buttons on the Fleet page. Until the
-/// budget-alerts work item lands, per-project pause is not available; the
-/// page shows a fallback banner and a "queue" link per project.
+/// budget-alerts work item lands, per-project pause falls back to the global
+/// pause queue; the fallback banner is always shown.
 /// </summary>
 public sealed class FleetPagePauseButtonTests : TestContext
 {
     [Fact]
-    public void Fleet_QueueLink_Present_PerProject()
+    public void Fleet_PauseButton_Present_WhenProjectNotPaused()
     {
         var fake = new FakeApiClient([]);
         fake.FleetSummaryOverride =
         [
-            new FleetSummaryDto { ProjectId = "my-project", DisplayName = "My Project" },
+            new FleetSummaryDto { ProjectId = "proj-a", DisplayName = "A", IsPaused = false },
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<FleetPage>();
 
-        // Each row has a "queue" link.
-        Assert.Contains("queue", cut.Markup);
-        Assert.Contains("my-project", cut.Markup);
+        Assert.Contains("Pause project", cut.Markup);
     }
 
     [Fact]
-    public void Fleet_QueueLink_IncludesProjectId()
+    public void Fleet_PauseButton_CallsApiWithProjectIdAndReason()
     {
         var fake = new FakeApiClient([]);
         fake.FleetSummaryOverride =
         [
-            new FleetSummaryDto { ProjectId = "proj-x", DisplayName = "X" },
+            new FleetSummaryDto { ProjectId = "my-project", DisplayName = "My Project", IsPaused = false },
+        ];
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<FleetPage>();
+        cut.Find(".btn-fleet-pause").Click();
+
+        Assert.Equal("my-project", fake.FleetSummaryPauseProjectIdCaptured);
+        Assert.NotNull(fake.FleetSummaryPauseReasonCaptured);
+    }
+
+    [Fact]
+    public void Fleet_ResumeButton_Present_WhenProjectPaused()
+    {
+        var fake = new FakeApiClient([]);
+        fake.FleetSummaryOverride =
+        [
+            new FleetSummaryDto { ProjectId = "proj-b", DisplayName = "B", IsPaused = true },
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<FleetPage>();
 
-        // The queue link should encode the project ID as a query param.
-        Assert.Contains("proj-x", cut.Markup);
+        Assert.Contains("Resume project", cut.Markup);
+        Assert.DoesNotContain("Pause project", cut.Markup);
     }
 
     [Fact]
@@ -58,7 +73,6 @@ public sealed class FleetPagePauseButtonTests : TestContext
 
         var cut = RenderComponent<FleetPage>();
 
-        // The fallback banner must reference the Queue page for global pause.
         Assert.Contains("Queue", cut.Markup);
         Assert.Contains("global pause", cut.Markup);
     }

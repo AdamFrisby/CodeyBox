@@ -45,6 +45,8 @@ public interface ICodeyBoxApiClient
 
     // ── Fleet ─────────────────────────────────────────────────────────────────
     Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default);
+    Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default);
+    Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default);
 
     // ── Suggestions ───────────────────────────────────────────────────────────
     Task<List<SuggestionDto>> GetSuggestionsAsync(

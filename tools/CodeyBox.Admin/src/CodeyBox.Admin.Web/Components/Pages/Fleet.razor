@@ -81,9 +81,14 @@ else
                         }
                     </td>
                     <td>
-                        @* Per-project pause/resume requires budget-alerts work item.
-                           When that lands, wire IsPaused + project-level pause endpoint here. *@
-                        <a href="/?project=@Uri.EscapeDataString(s.ProjectId)" class="btn">queue</a>
+                        @if (s.IsPaused)
+                        {
+                            <button class="btn btn-fleet-resume" @onclick="() => ResumeProjectAsync(s.ProjectId)">Resume project</button>
+                        }
+                        else
+                        {
+                            <button class="btn btn-fleet-pause" @onclick="() => PauseProjectAsync(s.ProjectId)">Pause project</button>
+                        }
                     </td>
                 </tr>
             }
@@ -128,6 +133,18 @@ else
         {
             _error = ex.Message;
         }
+    }
+
+    private async Task PauseProjectAsync(string projectId)
+    {
+        await ApiClient.PauseProjectAsync(projectId, "Operator pause from Fleet view");
+        await LoadAsync();
+    }
+
+    private async Task ResumeProjectAsync(string projectId)
+    {
+        await ApiClient.ResumeProjectAsync(projectId);
+        await LoadAsync();
     }
 
     public void Dispose()
