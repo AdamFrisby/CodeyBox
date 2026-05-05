@@ -53,6 +53,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWorkItemCostStore? _costStore;
     private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? _costExtractors;
     private readonly AgentCostCalculator? _costCalculator;
+    private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
     // Null when no probes were provided (fail-open: no quota gate on audit agent).
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
@@ -100,6 +101,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? costExtractors = null,
         AgentCostCalculator? costCalculator = null,
         IWorkItemQuestionStore? questionStore = null)
+        IStdoutBroadcaster? stdoutBroadcaster = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -116,6 +118,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _costStore = costStore;
         _costExtractors = costExtractors;
         _costCalculator = costCalculator;
+        _stdoutBroadcaster = stdoutBroadcaster;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -130,7 +133,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _questionStore = questionStore;
     }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         using var workItemScope = AuditLog.WorkItemScope(item.Id);
 
@@ -284,6 +287,7 @@ public sealed class PipelineRunner : IPipelineRunner
                             phaseCt));
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
+                await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
                 await Transition(item, WorkItemState.Merged, ct, project);
             }
 
@@ -300,18 +304,32 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-            if (current.State is not WorkItemState.Done and not WorkItemState.Failed)
+            if (hostShutdownToken.IsCancellationRequested)
             {
-                var cancelled = current.With(WorkItemState.Cancelled, "cancelled");
-                await _store.UpdateAsync(cancelled, CancellationToken.None);
-                AuditLog.WorkItemCancelled(item.Id);
-                await _webhooks.PublishAsync(new WebhookEvent
+                // Host is shutting down — leave the item in its current mid-flight
+                // state. The recovery loop will reset and re-enqueue it on next startup.
+                _log.LogInformation(
+                    "Work item {Id} interrupted by host shutdown; leaving in mid-flight state for recovery",
+                    item.Id);
+            }
+            else
+            {
+                // Operator-requested cancel (DELETE /workitems/{id}).
+                var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+                if (current.State is not WorkItemState.Done and not WorkItemState.Failed
+                    and not WorkItemState.AbandonedAfterRecoveryAttempts)
                 {
-                    Event = "work_item.cancelled",
-                    WorkItem = cancelled,
-                    Project = project,
-                }, CancellationToken.None);
+                    var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
+                        WorkItemCancellationReason.OperatorRequested);
+                    await _store.UpdateAsync(cancelled, CancellationToken.None);
+                    AuditLog.WorkItemCancelled(item.Id);
+                    await _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.cancelled",
+                        WorkItem = cancelled,
+                        Project = project,
+                    }, CancellationToken.None);
+                }
             }
             throw;
         }
@@ -336,6 +354,14 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project);
+        }
+        finally
+        {
+            if (_stdoutBroadcaster is not null)
+            {
+                try { await _stdoutBroadcaster.CompleteAsync(item.Id); }
+                catch { /* best-effort: SignalR clients may have disconnected */ }
+            }
         }
     }
 
@@ -397,21 +423,33 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         int? iteration = null)
     {
-        var credential = await _credentials.GetAsync(runner.Kind, ct);
+        // Apply per-project credential plugin ordering when configured.
+        // IProjectAwareCredentialProvider is implemented by ChainedCredentialProvider
+        // in production; test stubs that inject a plain ICredentialProvider fall back
+        // to the global chain automatically.
+        var credential = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
         var agentPhase = isInitial ? "work" : "rework";
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase);
 
+        var sandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        sandboxStartSw.Stop();
+        CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
 
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        await using (var cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox", log: _log))
+        TimingScope cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox",
+            activitySource: CodeyBoxActivities.Sandbox, log: _log);
+        await using (cloneScope)
         {
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
         }
+        CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
         if (isInitial)
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch);
         else
@@ -439,12 +477,21 @@ public sealed class PipelineRunner : IPipelineRunner
         var agentExecScope = await TimingScope.BeginAsync(
             _timings, item.Id, agentPhase, "agent.exec",
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-            log: _log);
+            log: _log,
+            activitySource: CodeyBoxActivities.Pipeline);
+        Action<string>? stdoutCallback = _stdoutBroadcaster is { } broadcaster
+            ? chunk => broadcaster.BroadcastChunk(item.Id, agentPhase, chunk)
+            : null;
+
         AgentResult agentResult;
         await using (agentExecScope)
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct,
+                stdoutChunkCallback: stdoutCallback);
         }
+        CodeyBoxMeters.AgentDuration.Record(agentExecScope.ElapsedMs,
+            new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+            new KeyValuePair<string, object?>("phase", agentPhase));
 
         var agentEndedAt = DateTimeOffset.UtcNow;
         var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
@@ -510,7 +557,8 @@ public sealed class PipelineRunner : IPipelineRunner
             var commitMessage = isInitial
                 ? $"codeybox: {item.Title}{CoAuthoredByTrailer}"
                 : $"codeybox rework: address audit findings{CoAuthoredByTrailer}";
-            await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit", log: _log))
+            await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit",
+                activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
             }
@@ -533,7 +581,8 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException(msg);
         }
 
-        await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo", log: _log))
+        await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo",
+            activitySource: CodeyBoxActivities.Sandbox, log: _log))
         {
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
         }
@@ -593,6 +642,8 @@ public sealed class PipelineRunner : IPipelineRunner
             var nonBlocking = findings.Count - blocking.Count;
 
             AuditLog.AuditIterationComplete(iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking);
+            CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
+                new KeyValuePair<string, object?>("iteration", iteration.ToString()));
 
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -610,6 +661,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     iteration, item.Id, nonBlocking);
                 AuditLog.AuditPassed(iteration);
                 return false;
+                CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "passed"));
+                return;
             }
 
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
@@ -618,11 +671,13 @@ public sealed class PipelineRunner : IPipelineRunner
             if (iteration == project.Audit.MaxIterations)
             {
                 AuditLog.AuditFailed(iteration, blocking.Count);
+                CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
                 var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
             }
 
+            CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "reworking"));
             await Transition(item, WorkItemState.Reworking, ct, project);
             var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
@@ -691,66 +746,155 @@ public sealed class PipelineRunner : IPipelineRunner
             // Tool-only auditors get the project's "audit-tool" profile
             // (typically isolated/no-egress); LLM-driven auditors get the
             // "audit-agent" profile (typically same as the work profile).
-            AgentCredential? credential = needsCreds ? await _credentials.GetAsync(groupRunner.Kind, ct) : null;
+            AgentCredential? credential = needsCreds
+                ? (_credentials is IProjectAwareCredentialProvider pac1
+                    ? await pac1.GetAsync(groupRunner.Kind, project.CredentialProviderPriority, ct)
+                    : await _credentials.GetAsync(groupRunner.Kind, ct))
+                : null;
             var access = _gitHost.GetSandboxAccess(repoId);
             var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
                 hostNetworkProfile: profile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit");
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
 
-            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-            if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+            // Within each capability group, split by Kind so tool auditors stay
+            // sequential in a shared sandbox while LLM auditors each get their
+            // own isolated clone and run concurrently (wall-clock ≈ max individual,
+            // not sum). Tool auditors that share filesystem state must stay sequential.
+            var toolPairs = group.Where(x => x.Auditor.Kind != "llm").ToList();
+            var llmPairs = group.Where(x => x.Auditor.Kind == "llm").ToList();
 
-            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
-
-            foreach (var (auditor, runner) in group)
+            // Tool auditors: one shared sandbox, sequential.
+            if (toolPairs.Count > 0)
             {
-                _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
-                var auditorStarted = DateTimeOffset.UtcNow;
-                var auditorSw = Stopwatch.StartNew();
-                var auditorStartedAt = DateTimeOffset.UtcNow;
-                // Thread the resolved runner into the context so LlmReviewAuditor
-                // can use the cross-review agent instead of its baked-in default.
-                var auditorCtx = ctx with { AuditRunner = runner };
-                AuditResult result;
-                var auditorScope = await TimingScope.BeginAsync(
-                    _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
-                    iteration: ctx.Iteration,
-                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-                    log: _log);
-                await using (auditorScope)
+                await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+                if (credential is not null && credential.Files.Count > 0)
+                    await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
+
+                foreach (var (auditor, runner) in toolPairs)
                 {
-                    result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+                    var run = await ExecAuditorAsync(sandbox, auditor, runner, ctx, ct);
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
+                    if (needsCreds && runner.Kind != workRunner.Kind)
+                        activeAuditAgentKind ??= runner.Kind;
+                    findings.AddRange(run.Result.Findings);
+                    if (project.Audit.StopOnFirstFailure && run.Result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+                        return (findings, activeAuditAgentKind);
                 }
-                auditorSw.Stop();
-                if (needsCreds)
+            }
+
+            // LLM auditors: one sandbox per auditor, run concurrently capped by
+            // MaxLlmAuditorParallelism. Independent sandboxes prevent races on
+            // /audit/result.json. Post-processing is sequential and stable-ordered.
+            if (llmPairs.Count > 0)
+            {
+                var maxPar = project.Audit.MaxLlmAuditorParallelism;
+                using var sem = new SemaphoreSlim(maxPar, maxPar);
+
+                var llmTasks = llmPairs.Select(async pair =>
                 {
-                    await TryRecordCostAsync(result.RawOutput, null,
-                        runner.Kind, ctx.WorkItemId, "audit", ctx.Iteration,
-                        auditorStartedAt, auditorStartedAt + auditorSw.Elapsed);
+                    await sem.WaitAsync(ct);
+                    try
+                    {
+                        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+                        if (credential is not null && credential.Files.Count > 0)
+                            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
+                        return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, ctx, ct);
+                    }
+                    finally { sem.Release(); }
+                }).ToList();
+
+                var llmRuns = await Task.WhenAll(llmTasks);
+
+                // Post-process in stable auditor order (same as llmPairs).
+                foreach (var run in llmRuns)
+                {
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
+                    if (needsCreds && run.Runner.Kind != workRunner.Kind)
+                        activeAuditAgentKind ??= run.Runner.Kind;
+                    findings.AddRange(run.Result.Findings);
                 }
-                await EmitAuditorSubStepsAsync(auditor.Name, result.RawOutput,
-                    ctx.WorkItemId, ctx.Iteration, auditorStartedAt);
-                await EmitToolCallCountsAsync(result.RawOutput, ctx.WorkItemId, "audit",
-                    auditorScope.ElapsedMs, ct, iteration: ctx.Iteration);
-                var worstSeverity = result.Findings.Count > 0
-                    ? ((AuditSeverity)result.Findings.Max(f => (int)f.Severity)).ToString()
-                    : "none";
-                AuditLog.AuditorRun(auditor.Name, worstSeverity, auditorSw.Elapsed, runner.Kind);
-                // Track whether any LLM auditor ran with a different agent (cross-review).
-                if (needsCreds && runner.Kind != workRunner.Kind)
-                    activeAuditAgentKind ??= runner.Kind;
-                findings.AddRange(result.Findings);
-                await PersistAuditReportAsync(ctx, auditor, result, auditorStarted, auditorSw.Elapsed, ct);
-                if (project.Audit.StopOnFirstFailure && result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+                if (project.Audit.StopOnFirstFailure && findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
                     return (findings, activeAuditAgentKind);
             }
         }
 
         return (findings, activeAuditAgentKind);
     }
+
+    /// <summary>
+    /// Runs a single auditor inside <paramref name="sandbox"/>, wrapping it
+    /// in a timing scope. Safe to call concurrently from parallel tasks — all
+    /// state is local to this invocation.
+    /// </summary>
+    private async Task<AuditorRunRecord> ExecAuditorAsync(
+        ISandbox sandbox,
+        IAuditor auditor,
+        IAgentRunner runner,
+        AuditContext ctx,
+        CancellationToken ct)
+    {
+        _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
+        var startedAt = DateTimeOffset.UtcNow;
+        var sw = Stopwatch.StartNew();
+        // Thread the resolved runner into the context so LlmReviewAuditor
+        // can use the cross-review agent instead of its baked-in default.
+        var auditorCtx = ctx with { AuditRunner = runner };
+        var timingScope = await TimingScope.BeginAsync(
+            _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
+            iteration: ctx.Iteration,
+            metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+            log: _log);
+        AuditResult result;
+        await using (timingScope)
+        {
+            result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+        }
+        sw.Stop();
+        return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs);
+    }
+
+    /// <summary>
+    /// Handles all post-run bookkeeping for a completed auditor: cost capture,
+    /// sub-step emission, structured logging, and audit-report persistence.
+    /// Always called sequentially (never from parallel tasks) to keep writes
+    /// to external stores ordered and safe.
+    /// </summary>
+    private async Task PostProcessAuditorRunAsync(
+        AuditorRunRecord run,
+        IAgentRunner workRunner,
+        bool needsCreds,
+        AuditContext ctx,
+        CancellationToken ct)
+    {
+        if (needsCreds)
+        {
+            await TryRecordCostAsync(run.Result.RawOutput, null,
+                run.Runner.Kind, ctx.WorkItemId, "audit", ctx.Iteration,
+                run.StartedAt, run.StartedAt + run.Elapsed);
+        }
+        await EmitAuditorSubStepsAsync(run.Auditor.Name, run.Result.RawOutput,
+            ctx.WorkItemId, ctx.Iteration, run.StartedAt);
+        await EmitToolCallCountsAsync(run.Result.RawOutput, ctx.WorkItemId, "audit",
+            run.ScopeElapsedMs, ct, iteration: ctx.Iteration);
+        var worstSeverity = run.Result.Findings.Count > 0
+            ? ((AuditSeverity)run.Result.Findings.Max(f => (int)f.Severity)).ToString()
+            : "none";
+        AuditLog.AuditorRun(run.Auditor.Name, worstSeverity, run.Elapsed, run.Runner.Kind);
+        await PersistAuditReportAsync(ctx, run.Auditor, run.Result, run.StartedAt, run.Elapsed, ct);
+    }
+
+    private sealed record AuditorRunRecord(
+        IAuditor Auditor,
+        IAgentRunner Runner,
+        AuditResult Result,
+        DateTimeOffset StartedAt,
+        TimeSpan Elapsed,
+        long ScopeElapsedMs);
 
     private async Task PersistAuditReportAsync(
         AuditContext ctx,
@@ -856,7 +1000,9 @@ public sealed class PipelineRunner : IPipelineRunner
 
         // Credential check: if the audit agent has no credentials configured,
         // fall back gracefully — operators may configure agents incrementally.
-        var cred = await _credentials.GetAsync(kind.Value, ct);
+        var cred = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(kind.Value, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(kind.Value, ct);
         if (cred is null)
         {
             _log.LogWarning(
@@ -871,7 +1017,7 @@ public sealed class PipelineRunner : IPipelineRunner
             && _auditQuotaProbesByKind.TryGetValue(kind.Value, out var probe))
         {
             var snapshot = await probe.GetAvailabilityAsync(
-                new AgentMembership { Agent = kind.Value, Billing = AgentBilling.Subscription }, ct);
+                new AgentMembership { Agent = kind.Value, Billing = AgentBilling.Subscription, QualityScore = 100 }, ct);
             if (snapshot.AvailablePct >= 0 && snapshot.AvailablePct < _auditQuotaOptions.MinQuotaPct)
             {
                 AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);
@@ -907,18 +1053,28 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         CancellationToken ct)
     {
-        var credential = await _credentials.GetAsync(runner.Kind, ct);
+        var credential = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge");
+        var mergeSandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        mergeSandboxStartSw.Stop();
+        CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        await using (var mergeCloneScope = await TimingScope.BeginAsync(_timings, item.Id, "merge", "git.clone_into_sandbox", log: _log))
+        var mergeCloneScope = await TimingScope.BeginAsync(
+            _timings, item.Id, "merge", "git.clone_into_sandbox",
+            activitySource: CodeyBoxActivities.Sandbox, log: _log);
+        await using (mergeCloneScope)
         {
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
         }
+        CodeyBoxMeters.SandboxLifecycle.Record(mergeCloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
         var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
         await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
@@ -938,12 +1094,20 @@ public sealed class PipelineRunner : IPipelineRunner
         var mergeExecScope = await TimingScope.BeginAsync(
             _timings, item.Id, "merge", "agent.exec",
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-            log: _log);
+            log: _log,
+            activitySource: CodeyBoxActivities.Pipeline);
+        Action<string>? mergeStdoutCallback = _stdoutBroadcaster is { } mergeBroadcaster
+            ? chunk => mergeBroadcaster.BroadcastChunk(item.Id, "merge", chunk)
+            : null;
         AgentResult agentResult;
         await using (mergeExecScope)
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, ct);
+            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct,
+                stdoutChunkCallback: mergeStdoutCallback);
         }
+        CodeyBoxMeters.AgentDuration.Record(mergeExecScope.ElapsedMs,
+            new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+            new KeyValuePair<string, object?>("phase", "merge"));
 
         var mergeEndedAt = DateTimeOffset.UtcNow;
         var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecScope.ElapsedMs);
@@ -1161,6 +1325,9 @@ public sealed class PipelineRunner : IPipelineRunner
             WorkItemPrompt = item.Prompt,
             AddressedFindings = addressedFindings,
             AgentStdout = agentStdout,
+            TokenEnvVar = project.Upstream.TokenEnvVar,
+            AutoMerge = project.Upstream.AutoMerge,
+            MergeMethod = project.Upstream.MergeMethod,
         };
 
         // Capture the outcome from a successful CompleteAsync so the local
@@ -1664,6 +1831,7 @@ public sealed class PipelineRunner : IPipelineRunner
         await _store.UpdateAsync(next, ct);
         _log.LogInformation("Work item {Id} → {State}", item.Id, state);
         AuditLog.WorkItemTransitioned(item.Id, state.ToString());
+        CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", state.ToString()));
         if (project is not null)
             await _webhooks.PublishAsync(new WebhookEvent
             {

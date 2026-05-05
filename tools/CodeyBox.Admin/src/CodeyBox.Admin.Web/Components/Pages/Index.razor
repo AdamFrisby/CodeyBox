@@ -54,29 +54,52 @@
 }
 
 @* ── Budget usage bars ───────────────────────────────────────────────────── *@
-@if (_budgetUsage.Count > 0)
+@if (_budgetUsage.Count > 0 || _costBudgets.Count > 0)
 {
     <div style="margin-bottom:1rem;">
         <strong style="font-size:0.85rem;display:block;margin-bottom:0.4rem;">Project budget</strong>
-        @foreach (var (pid, u) in _budgetUsage)
+        @foreach (var pid in _budgetUsage.Keys.Union(_costBudgets.Keys).Distinct())
         {
-            var hPct = BudgetPct(u.LastHour, u.Limits.PerHour);
-            var dPct = BudgetPct(u.Last24h, u.Limits.PerDay);
-            var cPct = BudgetPct(u.CurrentlyInFlight, u.Limits.Concurrent);
-            <div style="display:flex;align-items:center;gap:1rem;padding:0.2rem 0;font-size:0.82rem;">
+            _budgetUsage.TryGetValue(pid, out var u);
+            _costBudgets.TryGetValue(pid, out var cb);
+            var hPct = u is not null ? BudgetPct(u.LastHour, u.Limits.PerHour) : 0;
+            var dPct = u is not null ? BudgetPct(u.Last24h, u.Limits.PerDay) : 0;
+            var cPct = u is not null ? BudgetPct(u.CurrentlyInFlight, u.Limits.Concurrent) : 0;
+            var costPct = cb is not null && cb.MonthlyBudgetUsd > 0 ? (int)Math.Min(100, cb.Pct) : 0;
+            var costCss = cb?.ThresholdState switch { "exceeded" => "budget-full", "warning" => "budget-warn", _ => "" };
+            <div style="display:flex;align-items:center;gap:1rem;padding:0.2rem 0;font-size:0.82rem;flex-wrap:wrap;">
                 <span style="min-width:8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="@pid">@pid</span>
-                <span>
-                    <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(hPct)" style="width:@(Math.Min(100, hPct))%"></span></span>
-                    <span style="margin-left:0.3rem;">@u.LastHour/@(u.Limits.PerHour == 0 ? "∞" : u.Limits.PerHour.ToString())/h</span>
-                </span>
-                <span>
-                    <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(dPct)" style="width:@(Math.Min(100, dPct))%"></span></span>
-                    <span style="margin-left:0.3rem;">@u.Last24h/@(u.Limits.PerDay == 0 ? "∞" : u.Limits.PerDay.ToString())/24h</span>
-                </span>
-                <span>
-                    <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(cPct)" style="width:@(Math.Min(100, cPct))%"></span></span>
-                    <span style="margin-left:0.3rem;">@u.CurrentlyInFlight/@(u.Limits.Concurrent == 0 ? "∞" : u.Limits.Concurrent.ToString()) fly</span>
-                </span>
+                @if (u is not null)
+                {
+                    <span>
+                        <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(hPct)" style="width:@(Math.Min(100, hPct))%"></span></span>
+                        <span style="margin-left:0.3rem;">@u.LastHour/@(u.Limits.PerHour == 0 ? "∞" : u.Limits.PerHour.ToString())/h</span>
+                    </span>
+                    <span>
+                        <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(dPct)" style="width:@(Math.Min(100, dPct))%"></span></span>
+                        <span style="margin-left:0.3rem;">@u.Last24h/@(u.Limits.PerDay == 0 ? "∞" : u.Limits.PerDay.ToString())/24h</span>
+                    </span>
+                    <span>
+                        <span class="budget-bar-wrap"><span class="budget-bar @BudgetCss(cPct)" style="width:@(Math.Min(100, cPct))%"></span></span>
+                        <span style="margin-left:0.3rem;">@u.CurrentlyInFlight/@(u.Limits.Concurrent == 0 ? "∞" : u.Limits.Concurrent.ToString()) fly</span>
+                    </span>
+                }
+                @if (cb is not null && cb.MonthlyBudgetUsd > 0)
+                {
+                    <span title="30-day cost budget: $@cb.CurrentSpendUsd.ToString("F2") of $@cb.MonthlyBudgetUsd.ToString("F2") (@cb.Pct.ToString("F1")%)">
+                        <span class="budget-bar-wrap"><span class="budget-bar @costCss" style="width:@costPct%"></span></span>
+                        <span style="margin-left:0.3rem;">$@cb.CurrentSpendUsd.ToString("F2")/$@cb.MonthlyBudgetUsd.ToString("F2")/30d</span>
+                    </span>
+                }
+                @if (cb?.ProjectQueue?.Paused == true)
+                {
+                    <span style="color:#c00;font-weight:bold;">⏸ PROJECT PAUSED</span>
+                    <button class="btn btn-sm" @onclick="() => ResumeProjectAsync(pid)">Resume</button>
+                }
+                else
+                {
+                    <button class="btn btn-sm" @onclick="() => PauseProjectAsync(pid)">Pause project</button>
+                }
             </div>
         }
     </div>
@@ -117,6 +140,7 @@ else
         <tbody>
             @foreach (var item in _items)
             {
+                var projPaused = _costBudgets.TryGetValue(item.ProjectId, out var cb) && cb?.ProjectQueue?.Paused == true;
                 <tr class="state-@item.State.ToLowerInvariant()">
                     <td class="col-id">
                         <a href="/work-items/@item.Id">@item.ShortId</a>
@@ -126,7 +150,13 @@ else
                             <span class="external-id" title="@item.ExternalId">@display</span>
                         }
                     </td>
-                    <td>@item.ProjectId</td>
+                    <td>
+                        @item.ProjectId
+                        @if (projPaused && item.IsQueued)
+                        {
+                            <span class="project-paused-badge" title="@cb!.ProjectQueue.PausedReason">⏸ PROJECT PAUSED — budget exceeded — $@cb!.CurrentSpendUsd.ToString("F2") over $@cb!.MonthlyBudgetUsd.ToString("F2")</span>
+                        }
+                    </td>
                     <td>@item.Title</td>
                     <td>@item.Agent</td>
                     <td class="col-state">@item.State</td>
@@ -164,6 +194,7 @@ else
     private List<WorkItemDto>? _items;
     private QueueStatusDto? _queueStatus;
     private Dictionary<string, BudgetUsageDto> _budgetUsage = [];
+    private Dictionary<string, ProjectBudgetDto> _costBudgets = [];
     private string? _error;
     private string? _resumeError;
     private CancellationTokenSource? _cts;
@@ -219,6 +250,7 @@ else
             .Distinct()
             .ToList() ?? [];
         var usage = new Dictionary<string, BudgetUsageDto>();
+        var costBudgets = new Dictionary<string, ProjectBudgetDto>();
         foreach (var pid in projectIds)
         {
             try
@@ -228,8 +260,37 @@ else
             }
             catch (HttpRequestException) { /* non-critical */ }
             catch (TaskCanceledException) { /* non-critical */ }
+
+            try
+            {
+                var cb = await ApiClient.GetProjectBudgetAsync(pid);
+                if (cb is not null) costBudgets[pid] = cb;
+            }
+            catch (HttpRequestException) { /* non-critical */ }
+            catch (TaskCanceledException) { /* non-critical */ }
         }
         _budgetUsage = usage;
+        _costBudgets = costBudgets;
+    }
+
+    private async Task PauseProjectAsync(string projectId)
+    {
+        try
+        {
+            await ApiClient.PauseProjectQueueAsync(projectId, "manual pause via admin dashboard");
+            await LoadAsync();
+        }
+        catch (Exception ex) { _resumeError = ex.Message; }
+    }
+
+    private async Task ResumeProjectAsync(string projectId)
+    {
+        try
+        {
+            await ApiClient.ResumeProjectQueueAsync(projectId);
+            await LoadAsync();
+        }
+        catch (Exception ex) { _resumeError = ex.Message; }
     }
 
     private async Task CancelAsync(string id)

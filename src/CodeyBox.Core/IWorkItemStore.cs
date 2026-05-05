@@ -42,4 +42,37 @@ public interface IWorkItemStore
     /// Returns null when no matching item exists.
     /// </summary>
     Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Fleet aggregation: returns (project_id, state, count, max_updated_at) rows produced by
+    /// SELECT project_id, state, COUNT(*), MAX(updated_at) FROM work_items GROUP BY project_id, state.
+    /// Hits the composite index on (project_id, state). No work item bodies are loaded.
+    /// </summary>
+    Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Fleet aggregation: returns the most-recent <paramref name="perProject"/> terminal work item states
+    /// per project, newest-first. Uses ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC).
+    /// Terminal states: Done, Failed, AuditFailed, Cancelled.
+    /// </summary>
+    Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default);
+
+    /// <summary>
+    /// Fleet aggregation: returns per-project pause states read from the
+    /// <c>project_queue_state</c> table (added by the budget-alerts work item).
+    /// Returns an empty dictionary when the table does not yet exist so callers
+    /// can treat every project as un-paused without crashing.
+    /// </summary>
+    Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default);
+    /// Returns all work items whose <c>replay_of_work_item_id</c> matches
+    /// <paramref name="sourceId"/>, in creation order (oldest first).
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Clears <c>replay_of_work_item_id</c> for every work item that was a replay of
+    /// <paramref name="sourceId"/>. Called when the source is cancelled so replays
+    /// become orphaned but keep running.
+    /// </summary>
+    Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default);
 }

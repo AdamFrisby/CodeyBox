@@ -413,6 +413,52 @@ h1 {
 .budget-bar.budget-warn { background: #f39c12; }
 .budget-bar.budget-full { background: #e74c3c; }
 
+/* ── Fleet view ─────────────────────────────────────────────────────────────── */
+
+.fleet-dot {
+    font-size: 1.1rem;
+    line-height: 1;
+}
+
+.fleet-dot-grey   { color: #999; }
+.fleet-dot-blue   { color: #2980b9; }
+.fleet-dot-yellow { color: #f39c12; }
+.fleet-dot-red    { color: #e74c3c; }
+
+.fleet-outcomes {
+    display: flex;
+    gap: 0.25rem;
+    align-items: center;
+}
+
+.fleet-outcome {
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
+.fleet-outcome-ok     { color: #1e8449; }
+.fleet-outcome-fail   { color: #c0392b; }
+.fleet-outcome-cancel { color: #7f8c8d; }
+
+.btn-fleet-pause {
+    color: #c0392b;
+    border-color: #c0392b;
+}
+
+.btn-fleet-pause:hover {
+    background: #ffeaea;
+}
+
+.btn-fleet-resume {
+    background: #1e8449;
+    color: #fff;
+    border-color: #1e8449;
+}
+
+.btn-fleet-resume:hover {
+    background: #145a32;
+}
+
 /* ── Timeline ────────────────────────────────────────────────────────────────── */
 
 .timeline-live-badge {
@@ -616,4 +662,135 @@ h1 {
 .btn-xs {
     font-size: 0.72rem;
     padding: 0.15rem 0.35rem;
+}
+
+/* ── Diff viewer ─────────────────────────────────────────────────────────────── */
+
+.diff-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.diff-summary {
+    font-size: 0.9rem;
+}
+
+.diff-added {
+    color: #22863a;
+    font-weight: 600;
+}
+
+.diff-removed {
+    color: #cb2431;
+    font-weight: 600;
+}
+
+.diff-ws-toggle {
+    font-size: 0.85rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.diff-ws-visible .diff-ws-char {
+    color: #6a6aff;
+    font-weight: bold;
+}
+
+.diff-patch-link {
+    font-size: 0.8rem;
+}
+
+.diff-truncated-banner {
+    background: #fff3cd;
+    border: 1px solid #ffc107;
+    border-radius: 3px;
+    padding: 0.4rem 0.7rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.85rem;
+}
+
+.diff-file-list {
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 0.6rem 0.8rem;
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+}
+
+.diff-file-list ul {
+    margin: 0.3rem 0 0 1rem;
+    padding: 0;
+}
+
+.diff-file-list li {
+    font-family: monospace;
+    margin: 0.15rem 0;
+}
+
+.diff-file-section {
+    margin-bottom: 1.5rem;
+}
+
+.diff-file-header-bar {
+    background: #f1f8ff;
+    border: 1px solid #c8e1ff;
+    border-radius: 4px 4px 0 0;
+    padding: 0.3rem 0.6rem;
+    font-family: monospace;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #0366d6;
+}
+
+.diff-view {
+    font-family: monospace;
+    font-size: 0.82rem;
+    line-height: 1.45;
+    border: 1px solid #ddd;
+    border-top: none;
+    border-radius: 0 0 4px 4px;
+    overflow-x: auto;
+    background: #fff;
+}
+
+.diff-view > div {
+    padding: 0 0.5rem;
+    white-space: pre;
+    min-width: max-content;
+}
+
+.diff-add {
+    background: #e6ffed;
+    color: #22863a;
+}
+
+.diff-del {
+    background: #ffeef0;
+    color: #cb2431;
+}
+
+.diff-hunk {
+    background: #f1f8ff;
+    color: #0366d6;
+}
+
+.diff-meta {
+    background: #f8f9fa;
+    color: #586069;
+}
+
+.diff-ctx {
+    color: #222;
+}
+
+.diff-empty {
+    color: #666;
+    font-style: italic;
+    margin-top: 0.5rem;
 }

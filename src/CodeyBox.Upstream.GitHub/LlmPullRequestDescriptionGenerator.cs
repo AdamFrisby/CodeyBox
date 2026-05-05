@@ -92,7 +92,7 @@ public sealed class LlmPullRequestDescriptionGenerator : IPullRequestDescription
             }
         }
 
-        var result = await runner.RunAsync(sandbox, "/work", prompt, credential: null, _opts.GeneratorModelId, ct);
+        var result = await runner.RunAsync(sandbox, "/work", prompt, credential: null, _opts.GeneratorModelId, reasoningMode: null, ct);
 
         if (!result.Success || string.IsNullOrWhiteSpace(result.Stdout))
             throw new InvalidOperationException(

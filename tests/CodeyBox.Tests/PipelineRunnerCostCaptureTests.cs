@@ -302,8 +302,16 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
 
+        public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
+            DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<(string, double)>>([]);
+
         public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)
             => Task.CompletedTask;
+
+        public Task<decimal> SumEstimatedUsdAsync(
+            string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+            => Task.FromResult(0m);
     }
 
     // ── Fake LLM auditor (needsCreds=true path) ───────────────────────────────
@@ -332,7 +340,15 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
 
+        public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
+            DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<(string, double)>>([]);
+
         public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)
             => Task.CompletedTask;
+
+        public Task<decimal> SumEstimatedUsdAsync(
+            string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+            => Task.FromResult(0m);
     }
 }

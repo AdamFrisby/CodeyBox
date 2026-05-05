@@ -11,6 +11,18 @@ public interface IWebhookDispatcher
     Task PublishAsync(WebhookEvent evt, CancellationToken ct);
 }
 
+/// <summary>Details payload for sandbox leak events.</summary>
+public sealed record SandboxLeakDetails
+{
+    public required string Name { get; init; }
+    public double AgeMinutes { get; init; }
+    public long? DiskMb { get; init; }
+    /// <summary>Set only for <c>sandbox.leak_disposed</c>.</summary>
+    public DateTimeOffset? DisposedAt { get; init; }
+    /// <summary>Set only for <c>sandbox.leak_dispose_failed</c>.</summary>
+    public string? Error { get; init; }
+}
+
 /// <summary>
 /// Details payload for the <c>agent.smoke_failed</c> event, fired when a
 /// credential smoke test fails at startup or at work-item pickup.
@@ -33,4 +45,17 @@ public sealed record PullRequestOpenedDetails
     public required int PullRequestNumber { get; init; }
     public required string PullRequestUrl { get; init; }
     public string? MergedSha { get; init; }
+}
+
+/// <summary>
+/// Details payload for the <c>project.budget_warning</c>,
+/// <c>project.budget_exceeded</c>, and <c>project.budget_recovered</c> events.
+/// </summary>
+public sealed record ProjectBudgetEventDetails
+{
+    public required string ProjectId { get; init; }
+    public required decimal CurrentSpendUsd { get; init; }
+    public required decimal BudgetUsd { get; init; }
+    public required double Pct { get; init; }
+    public required int ThresholdPct { get; init; }
 }

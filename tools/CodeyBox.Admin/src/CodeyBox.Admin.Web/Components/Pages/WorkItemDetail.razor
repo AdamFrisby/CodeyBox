@@ -1,8 +1,12 @@
 @page "/work-items/{Id}"
 @using CodeyBox.Admin.Web.Models
+@using Microsoft.AspNetCore.SignalR.Client
 @inject ICodeyBoxApiClient ApiClient
 @inject NavigationManager Nav
 @inject ILogger<WorkItemDetail> Logger
+@inject OrchestratorHubSettings HubSettings
+@inject IJSRuntime JS
+@implements IAsyncDisposable
 
 <PageTitle>Work Item — CodeyBox Admin</PageTitle>
 
@@ -27,10 +31,16 @@ else
         {
             <a href="/work-items/@_item.Id/edit" class="btn">Edit</a>
         }
-        <a href="/work-items/@_item.Id/timeline" class="btn">Replay</a>
+        <a href="/work-items/@_item.Id/timeline" class="btn">Timeline</a>
         <a href="/work-items/@_item.Id/audit-reports" class="btn">Audit Reports</a>
         <a href="/work-items/@_item.Id/timings" class="btn">Timings</a>
         <a href="/work-items/@_item.Id/costs" class="btn">Costs</a>
+        @if (_item.IsTerminal)
+        {
+            <a href="/work-items/@_item.Id/comparison" class="btn">Comparison</a>
+            <button class="btn" @onclick="OpenReplayModal">Replay</button>
+        }
+        <a href="/work-items/@_item.Id/diff" class="btn">Diff</a>
         @if (!_item.IsTerminal)
         {
             <button class="btn btn-danger" @onclick="CancelAsync">Cancel</button>
@@ -63,6 +73,13 @@ else
         @if (_item.LastError is not null)
         {
             <tr><th>Last error</th><td class="last-error">@_item.LastError</td></tr>
+        }
+        @if (_item.ReplayOfWorkItemId is not null)
+        {
+            <tr>
+                <th>Replay of</th>
+                <td><a href="/work-items/@_item.ReplayOfWorkItemId">@_item.ReplayOfWorkItemId[..Math.Min(8, _item.ReplayOfWorkItemId.Length)]</a></td>
+            </tr>
         }
         @if (_item.DependsOn.Count > 0)
         {
@@ -112,6 +129,52 @@ else
             }
         </details>
     }
+    @if (!_item.IsTerminal || !string.IsNullOrEmpty(_liveStdout))
+    {
+        <div class="live-stdout">
+            <h2>@(_item.IsTerminal ? "Output Tail" : "Live Output")</h2>
+            <pre class="stdout-stream" @ref="_streamRef">@_liveStdout</pre>
+            @if (_streamDone)
+            {
+                <p class="stdout-done">Stream complete.</p>
+            }
+        </div>
+    }
+}
+
+@if (_showReplayModal && _item is not null)
+{
+    <div class="modal-overlay">
+        <div class="modal-box">
+            <h2>Replay on different agent</h2>
+            @if (_replayError is not null)
+            {
+                <p class="error-banner">@_replayError</p>
+            }
+            <div class="form-group">
+                <label>Agent</label>
+                <select class="modal-input" @bind="_replayAgent">
+                    <option value="">— keep current (@_item.Agent) —</option>
+                    <option value="claude">claude</option>
+                    <option value="codex">codex</option>
+                    <option value="copilot">copilot</option>
+                    <option value="gemini">gemini</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Agent class ID <span class="hint">(optional — routes to a class that specifies the model)</span></label>
+                <input class="modal-input" type="text" placeholder="e.g. frontier-coding" @bind="_replayAgentClassId" />
+            </div>
+            <div class="form-group">
+                <label>Work branch <span class="hint">(optional, auto-generated if blank)</span></label>
+                <input class="modal-input" type="text" placeholder="auto-generated" @bind="_replayWorkBranch" />
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-danger" @onclick="ConfirmReplayAsync">Create replay</button>
+                <button class="btn" @onclick="CloseReplayModal">Cancel</button>
+            </div>
+        </div>
+    </div>
 }
 
 @code {
@@ -124,11 +187,27 @@ else
     private List<QuestionDto> _questions = [];
     private Dictionary<string, string> _answerInputs = [];
 
+    private bool _showReplayModal;
+    private string? _replayAgent;
+    private string? _replayAgentClassId;
+    private string? _replayWorkBranch;
+    private string? _replayError;
+    private Microsoft.AspNetCore.SignalR.Client.HubConnection? _hub;
+    private string _liveStdout = "";
+    private bool _streamDone;
+    private ElementReference _streamRef;
+
     protected override async Task OnParametersSetAsync()
     {
         if (Id == _loadedId) return;
         _loadedId = Id;
         await LoadAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && _item is { IsTerminal: false })
+            await ConnectToHubAsync();
     }
 
     private async Task LoadAsync()
@@ -152,6 +231,67 @@ else
             Logger.LogError(ex, "Failed to load work item {Id}", Id);
             _error = "Failed to load work item. Check server logs for details.";
         }
+    }
+
+    private async Task ConnectToHubAsync()
+    {
+        // Fetch the initial ring-buffer tail for late-join context.
+        try
+        {
+            var tail = await ApiClient.GetStdoutTailAsync(_item!.Id);
+            if (!string.IsNullOrEmpty(tail))
+            {
+                _liveStdout = tail;
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not fetch stdout tail for {Id}", _item!.Id);
+        }
+
+        if (string.IsNullOrEmpty(HubSettings.HubUrl)) return;
+
+        var builder = new Microsoft.AspNetCore.SignalR.Client.HubConnectionBuilder()
+            .WithUrl(HubSettings.HubUrl, opts =>
+            {
+                if (!string.IsNullOrEmpty(HubSettings.ApiKey))
+                    opts.Headers.Add("Authorization", $"Bearer {HubSettings.ApiKey}");
+            });
+
+        _hub = builder.Build();
+
+        _hub.On<StdoutChunkPayload>("stdoutChunk", async payload =>
+        {
+            _liveStdout += payload.Chunk;
+            await InvokeAsync(async () =>
+            {
+                StateHasChanged();
+                await ScrollToBottomAsync();
+            });
+        });
+
+        _hub.On<object?>("streamComplete", async _ =>
+        {
+            _streamDone = true;
+            await InvokeAsync(StateHasChanged);
+        });
+
+        try
+        {
+            await _hub.StartAsync();
+            await _hub.InvokeAsync("SubscribeAsync", _item!.Id);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Could not connect to live stdout hub for {Id}", _item!.Id);
+        }
+    }
+
+    private async Task ScrollToBottomAsync()
+    {
+        try { await JS.InvokeVoidAsync("codeyboxScrollToBottom", _streamRef); }
+        catch { /* no-op if JS is unavailable (e.g. prerender) */ }
     }
 
     private async Task CancelAsync()
@@ -182,4 +322,50 @@ else
         await ApiClient.DismissQuestionAsync(Id, questionId, "Dismissed by operator.");
         await LoadAsync();
     }
+    private void OpenReplayModal()
+    {
+        _replayAgent = null;
+        _replayAgentClassId = null;
+        _replayWorkBranch = null;
+        _replayError = null;
+        _showReplayModal = true;
+    }
+
+    private void CloseReplayModal()
+    {
+        _showReplayModal = false;
+        _replayError = null;
+    }
+
+    private async Task ConfirmReplayAsync()
+    {
+        _replayError = null;
+        var req = new ReplayWorkItemRequest
+        {
+            Agent = string.IsNullOrWhiteSpace(_replayAgent) ? null : _replayAgent,
+            AgentClassId = string.IsNullOrWhiteSpace(_replayAgentClassId) ? null : _replayAgentClassId,
+            WorkBranch = string.IsNullOrWhiteSpace(_replayWorkBranch) ? null : _replayWorkBranch,
+        };
+
+        var result = await ApiClient.ReplayWorkItemAsync(Id, req);
+        if (result is null)
+        {
+            _replayError = "Failed to create replay. Check that agent is valid and the source item is in a terminal state.";
+            return;
+        }
+
+        _showReplayModal = false;
+        Nav.NavigateTo($"/work-items/{result.Id}");
+    }
+    public async ValueTask DisposeAsync()
+    {
+        if (_hub is { } hub)
+        {
+            try { await hub.InvokeAsync("UnsubscribeAsync", _item?.Id ?? ""); }
+            catch { /* best-effort */ }
+            await hub.DisposeAsync();
+        }
+    }
+
+    private sealed record StdoutChunkPayload(string WorkItemId, string Phase, string Chunk);
 }

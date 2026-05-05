@@ -172,7 +172,7 @@ internal sealed class CountingPipelineRunner : IPipelineRunner
         _onRun = onRun;
     }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         _onRun();
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
@@ -198,7 +198,7 @@ internal sealed class BlockingPipelineRunner : IPipelineRunner
         _onComplete = onComplete;
     }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         _onStart();
         await _proceedGate;

@@ -1,0 +1,89 @@
+@page "/plugins"
+@inject ICodeyBoxApiClient ApiClient
+
+<PageTitle>Auditor Plugins — CodeyBox Admin</PageTitle>
+
+<h1>Auditor Plugins</h1>
+
+<p>
+    Plugins listed here are currently loaded and available for use in project audit configuration.
+    To enable a plugin for a project, add an entry to the project's <code>Audit.Custom</code> list
+    in <code>appsettings.json</code>:
+</p>
+
+<pre><code>"Custom": [
+  { "Kind": "plugin", "PluginId": "&lt;plugin-id&gt;" }
+]</code></pre>
+
+<p>See <a href="https://github.com/AdamFrisby/codeybox/blob/main/docs/auditor-plugins.md">docs/auditor-plugins.md</a> for the authoring guide.</p>
+
+@if (_error is not null)
+{
+    <p class="error-banner">Error loading plugins: @_error</p>
+}
+else if (_plugins is null)
+{
+    <p>Loading…</p>
+}
+else if (_plugins.Count == 0)
+{
+    <p>No auditor plugins are currently loaded. Drop a plugin DLL into the configured plugin directory and restart the orchestrator.</p>
+}
+else
+{
+    <table class="queue-table">
+        <thead>
+            <tr>
+                <th>Plugin ID</th>
+                <th>Display Name</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var plugin in _plugins)
+            {
+                <tr>
+                    <td><code>@plugin.PluginId</code></td>
+                    <td>@plugin.DisplayName</td>
+                    <td>
+                        <button class="btn btn-xs" @onclick="() => ToggleSnippet(plugin.PluginId)">
+                            Add to project
+                        </button>
+                    </td>
+                </tr>
+                @if (_expandedPluginId == plugin.PluginId)
+                {
+                    <tr>
+                        <td colspan="3" class="plugin-snippet-row">
+                            <p>Add the following entry to the project's <code>Audit.Custom</code> array in <code>appsettings.json</code>:</p>
+                            <pre><code>{ "Kind": "plugin", "PluginId": "@plugin.PluginId" }</code></pre>
+                        </td>
+                    </tr>
+                }
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private List<PluginDto>? _plugins;
+    private string? _error;
+    private string? _expandedPluginId;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _plugins = await ApiClient.GetAuditorPluginsAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    private void ToggleSnippet(string pluginId)
+    {
+        _expandedPluginId = _expandedPluginId == pluginId ? null : pluginId;
+    }
+}

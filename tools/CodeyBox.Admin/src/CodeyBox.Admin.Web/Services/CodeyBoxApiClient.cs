@@ -78,6 +78,13 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return resp.IsSuccessStatusCode;
     }
 
+    public async Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(workItemId)}/stdout-tail", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
     public async Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default)
     {
         var resp = await _http.GetAsync("/queue/status", ct);
@@ -112,6 +119,45 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         var resp = await _http.GetAsync($"/projects/{Uri.EscapeDataString(projectId)}/budget/usage", ct);
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadFromJsonAsync<BudgetUsageDto>(JsonOptions, ct);
+    }
+
+    public async Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/projects/{Uri.EscapeDataString(projectId)}/budget", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ProjectBudgetDto>(JsonOptions, ct);
+    }
+
+    public async Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/projects/{Uri.EscapeDataString(projectId)}/queue/pause",
+            new { reason }, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ProjectQueueStateDto>(JsonOptions, ct);
+    }
+
+    public async Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/projects/{Uri.EscapeDataString(projectId)}/queue/resume",
+            new { }, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ProjectQueueStateDto>(JsonOptions, ct);
+    public async Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/workitems/{Uri.EscapeDataString(id)}/replay", req, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<WorkItemDto>(JsonOptions, ct);
+    }
+
+    public async Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/replays", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemReplaysDto>(JsonOptions, ct);
     }
 
     public async Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default)
@@ -179,6 +225,10 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
             $"/workitems/{Uri.EscapeDataString(workItemId)}/dismiss-question",
             new { questionId, reason }, JsonOptions, ct);
         return resp.IsSuccessStatusCode;
+    public async Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<PluginDto>>("/plugins", JsonOptions, ct);
+        return result ?? [];
     }
 
     public async Task<List<SuggestionDto>> GetSuggestionsAsync(
@@ -243,6 +293,17 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
 
     private sealed record PromoteResponse(string WorkItemId);
 
+    public async Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+    {
+        var req = new HttpRequestMessage(HttpMethod.Get, $"/workitems/{Uri.EscapeDataString(id)}/diff");
+        req.Headers.Accept.ParseAdd("application/json");
+        var resp = await _http.SendAsync(req, ct);
+        if (resp.StatusCode is System.Net.HttpStatusCode.NotFound
+            or System.Net.HttpStatusCode.NoContent) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemDiffDto>(JsonOptions, ct);
+    }
+
     public async Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default)
     {
         var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/timings", ct);
@@ -265,6 +326,26 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadFromJsonAsync<WorkItemCostsDto>(JsonOptions, ct);
+    }
+
+    public async Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<FleetSummaryDto>>("/fleet/summary", JsonOptions, ct);
+        return result ?? [];
+    }
+
+    public async Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default)
+    {
+        // Per-project pause requires the budget-alerts work item; fall back to global pause.
+        var result = await PauseQueueAsync(reason ?? $"Fleet pause: {projectId}", ct);
+        return result is not null;
+    }
+
+    public async Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default)
+    {
+        // Per-project resume requires the budget-alerts work item; fall back to global resume.
+        var result = await ResumeQueueAsync(ct);
+        return result is not null;
     }
 
     public async Task<ProjectCostsDto?> GetProjectCostsAsync(

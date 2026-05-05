@@ -29,11 +29,20 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
+| `project.budget_warning` | Project's 30-day spend crossed the warning threshold (see [Details](#projectbudget_warning-details)) |
+| `project.budget_exceeded` | Project's 30-day spend crossed the hard cap; project queue auto-paused (see [Details](#projectbudget_warning-details)) |
+| `project.budget_recovered` | Project's 30-day spend dropped back below the warning threshold (see [Details](#projectbudget_warning-details)) |
+| `project.queue_paused` | Per-project queue was paused (manual or auto) |
+| `project.queue_resumed` | Per-project queue was resumed |
+| `work_item.recovered` | Dead-worker reaper recovered a work item that was mid-flight when its worker crashed (see [Details](#recovered-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
 | `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
 | `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` (see [Details](#question_answered-details)) |
 | `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` (see [Details](#question_dismissed-details)) |
+| `sandbox.leak_detected` | A leaked `codeybox-*` Multipass VM was detected (see [Details](#sandbox_leak-details)) |
+| `sandbox.leak_disposed` | A leaked sandbox was successfully auto-disposed |
+| `sandbox.leak_dispose_failed` | Auto-disposal of a leaked sandbox failed |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -244,6 +253,12 @@ Subscribe to `work_item.question_asked` to alert operators when a work item need
 ### `question_answered` details
 
 When `event` is `work_item.question_answered`, the `details` field carries the answered question:
+### `project.budget_warning` details
+
+When `event` is `project.budget_warning`, `project.budget_exceeded`, or `project.budget_recovered`, the `details` field is populated. `workItem` is `null` (these are project-level events, not tied to a specific work item).
+### `recovered` details
+
+When `event` is `work_item.recovered`, the `details` field is populated:
 
 ```json
 {
@@ -253,6 +268,18 @@ When `event` is `work_item.question_answered`, the `details` field carries the a
     "questionId": "q-001",
     "answer": "Use approach B; we standardise on those across the codebase.",
     "answeredBy": null
+    "projectId": "my-app",
+    "currentSpendUsd": 432.18,
+    "budgetUsd": 500.00,
+    "pct": 86.4,
+    "thresholdPct": 80
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "projectId": "my-project",
+    "fromState": "Working",
+    "toState": "Queued",
+    "reason": "dead worker detected",
+    "recoveryAttempt": 1,
+    "maxRecoveryAttempts": 2
   }
 }
 ```
@@ -288,6 +315,26 @@ When `event` is `work_item.question_dismissed`, the `details` field carries the 
 | `reason` | string | The operator's reason for dismissal (redacted of secrets) |
 
 ---
+| `projectId` | string | Project whose budget triggered the event |
+| `currentSpendUsd` | decimal | 30-day rolling spend at time of event |
+| `budgetUsd` | decimal | Configured `MonthlyCostBudgetUsd` |
+| `pct` | number | `currentSpendUsd / budgetUsd * 100` |
+| `thresholdPct` | int | The threshold that was crossed (`CostWarningThresholdPct` or `CostHardCapPct`) |
+
+On restart, the first sweep tick re-fires any events that apply (idempotency requirement). Receivers should de-duplicate by `(projectId, thresholdState)` — the `pct` value lets you derive which band you're in.
+
+See [`budget-alerts.md`](budget-alerts.md) for configuration and edge-trigger semantics.
+
+---
+| `workItemId` | string | UUID of the recovered work item |
+| `projectId` | string | Project the item belongs to |
+| `fromState` | string | State the item was in when the worker was declared dead |
+| `toState` | string | State the item was transitioned to; `"Failed"` if `MaxRecoveryAttempts` was exceeded |
+| `reason` | string | Always `"dead worker detected"` |
+| `recoveryAttempt` | int | Which recovery attempt this is (1-based) |
+| `maxRecoveryAttempts` | int | The configured cap before the item is failed permanently |
+
+`work_item.recovered` fires even when `toState` is `"Failed"` (i.e. the cap was exceeded). Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](recovery.md) for the full state-mapping rules and configuration.
 
 ### `agent_smoke_failed` details
 
@@ -316,6 +363,33 @@ populated with the affected item and its project.
 at **work-item pickup** (a subsequent `work_item.failed` event also fires and
 carries the work-item context). Subscribe to `agent.smoke_failed` to alert on
 credential problems independently of whether any work items were affected.
+
+---
+
+### `sandbox_leak` details
+
+When `event` is `sandbox.leak_detected`, `sandbox.leak_disposed`, or
+`sandbox.leak_dispose_failed`, the `details` field carries the sandbox's
+diagnostic information. `workItem` and `project` are always `null` — leaked
+sandboxes are not associated with a specific work item.
+
+```json
+{
+  "details": {
+    "name": "codeybox-a1b2c3d4e5f6",
+    "ageMinutes": 127.3,
+    "diskMb": null
+  }
+}
+```
+
+| Field | Type | Present on | Description |
+|---|---|---|---|
+| `name` | string | all | VM name matching the `codeybox-*` prefix |
+| `ageMinutes` | number | all | Age of the sandbox in minutes at detection time |
+| `diskMb` | number\|null | all | Disk usage in MiB, if available; null otherwise |
+| `disposedAt` | ISO-8601 | `sandbox.leak_disposed` | Timestamp when the sandbox was successfully disposed |
+| `error` | string | `sandbox.leak_dispose_failed` | Human-readable failure reason (e.g. `"timeout"` or multipass error) |
 
 ---
 

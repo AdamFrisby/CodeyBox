@@ -42,12 +42,36 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 | Route | Description |
 |-------|-------------|
 | `/` | Queue overview — all work items, auto-refreshes every 5 s |
+| `/fleet` | Fleet view — one row per project: status dot, current phase, queued/in-flight counts, last-5 outcomes, 30-day spend. Auto-refreshes every 5 s. |
 | `/work-items/new` | Create a new work item |
-| `/work-items/{id}` | Detail view: full prompt (collapsible), state, error, deps |
+| `/work-items/{id}` | Detail view: full prompt (collapsible), state, error, deps; live stdout panel for in-flight items |
 | `/work-items/{id}/edit` | Edit title/prompt/agent — Queued items only |
 | `/work-items/{id}/timeline` | Audit-replay timeline — chronological log of every agent/audit event. Auto-refreshes every 5 s for in-flight items. Supports `?kind=`, `?since=`, `?iteration=` filter params. |
 | `/work-items/{id}/timings` | Per-item timing breakdown — stacked bar of phases, drill-down step table, top-10 slowest steps |
+| `/work-items/{id}/diff` | Diff preview — unified diff of the work branch vs. base branch, with file list, +/- stats, truncation banner, and "Copy as patch" link |
 | `/timings/aggregate` | System-wide aggregate — median and p95 per step across the last N completed work items, configurable N picker |
+
+## Fleet view
+
+`/fleet` is the operator dashboard for running 5–20+ projects. It answers "what is everything doing right now?" at a glance without opening individual queue pages.
+
+**Columns per project:**
+
+| Column | Description |
+|--------|-------------|
+| Project | Display name + short ID |
+| Status | Colored dot — grey (idle), blue (in-flight), yellow (queued only), red (paused) |
+| Current phase | State of the most-recently-updated in-flight item, or `—` |
+| Queued | Count of items in `Queued` state |
+| In-flight | Count of non-terminal, non-Queued items |
+| Last 5 | Glyphs for the 5 most recent terminal items (✓ Done, ✗ Failed/AuditFailed, ! Cancelled) |
+| Budget (30 d) | Rolling 30-day spend if cost-reporting is available, with a bar; `—` otherwise |
+| Actions | "Pause project" / "Resume project" buttons (falls back to global pause while per-project pause is pending) |
+
+**Limitations (pending future work items):**
+
+- Per-project pause/resume requires the *budget-alerts* work item. The page shows a fallback banner directing operators to the global pause button on the Queue page.
+- `monthlyBudgetUsd` (spend cap) requires the *budget-alerts* work item. Until then the budget column shows spend only.
 
 ## In scope (v1)
 
@@ -58,12 +82,37 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 - Retry terminal-failed item from work/audit
 - Drill-in detail view with collapsible prompt
 - Audit-replay timeline with per-kind filter chips, iteration grouping, copy-as-JSON
+- Live stdout panel on work-item detail: real-time streaming via SignalR, sticky auto-scroll, tail fetch for late-joining
+
+## Live Stdout
+
+The work-item detail page (`/work-items/{id}`) shows a **Live Output** panel while
+an agent is running. Once the run finishes the panel switches to **Output Tail** and
+shows the last 16 KB buffered by the orchestrator.
+
+**How it works:**
+1. On first render the page calls `GET /workitems/{id}/stdout-tail` to populate the
+   initial tail (in case the user navigated to the page after the run started).
+2. It then opens a server-side .NET SignalR connection to `{ApiBaseUrl}/hubs/agent-stdout`
+   and subscribes to the work item's group.  The bearer token from `CODEYBOX_API_KEY`
+   is sent as a request header — it never reaches the browser.
+3. Each `stdoutChunk` event appends to the `<pre>` panel.  Auto-scroll is sticky: if
+   you scroll up, auto-scroll suspends; scrolling back to the bottom resumes it.
+4. The `streamComplete` event shows a "Stream complete." footer and the panel heading
+   switches to "Output Tail".
+
+**Security:** secrets (GitHub PATs, Anthropic keys) are redacted by the orchestrator
+before reaching the hub.  The work item prompt is never broadcast.
 
 ## Out of scope (v1)
 
 - Drag-and-drop reorder (HTML5 DnD is wired but not implemented)
 - Webhook delivery log
 - Multi-user auth (only a single cookie gate placeholder)
+
+### Diff rendering
+
+The diff page renders unified diffs server-side in Razor (no JavaScript dependency). `diff2html` was considered but not adopted — it requires either an NPM build step or CDN access from the server, while server-side rendering achieves the same result with zero extra dependencies. The parser splits the diff by `diff --git` headers (falling back to `--- /+++` lines) and maps each line to a CSS class (`diff-add`, `diff-del`, `diff-hunk`, `diff-meta`, `diff-ctx`) for coloring.
 
 ## Architecture
 

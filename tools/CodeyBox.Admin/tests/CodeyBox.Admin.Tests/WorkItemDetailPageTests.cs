@@ -1,5 +1,6 @@
 using Bunit;
 using Microsoft.Extensions.DependencyInjection;
+using CodeyBox.Admin.Web;
 using CodeyBox.Admin.Web.Models;
 using CodeyBox.Admin.Web.Services;
 using WorkItemDetailPage = CodeyBox.Admin.Web.Components.Pages.WorkItemDetail;
@@ -8,6 +9,12 @@ namespace CodeyBox.Admin.Tests;
 
 public sealed class WorkItemDetailPageTests : TestContext
 {
+    public WorkItemDetailPageTests()
+    {
+        // OrchestratorHubSettings is injected by WorkItemDetail; empty URL skips the live hub connection.
+        Services.AddSingleton(new OrchestratorHubSettings("", null));
+    }
+
     private static WorkItemDto MakeItem(string id, string title, string state = "Queued") => new()
     {
         Id = id,
@@ -109,7 +116,7 @@ public sealed class WorkItemDetailPageTests : TestContext
     }
 
     [Fact]
-    public void WorkItemDetail_ShowsReplayButton_ForAnyItem()
+    public void WorkItemDetail_ShowsTimelineButton_ForAnyItem()
     {
         var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Working");
         var fake = new FakeApiClient([item]);
@@ -117,7 +124,7 @@ public sealed class WorkItemDetailPageTests : TestContext
 
         var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
-        Assert.Contains("Replay", cut.Markup);
+        Assert.Contains("Timeline", cut.Markup);
         Assert.Contains("/timeline", cut.Markup);
     }
 
@@ -221,11 +228,16 @@ public sealed class WorkItemDetailPageTests : TestContext
     public void WorkItemDetail_NoQuestions_DoesNotShowQuestionsSection()
     {
         var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Working");
+    [Fact]
+    public void WorkItemDetail_ShowsReplayButton_ForTerminalItem()
+    {
+        var item = MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task", "Done");
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.DoesNotContain("question-block", cut.Markup);
+        Assert.Contains("Replay", cut.Markup);
     }
 }

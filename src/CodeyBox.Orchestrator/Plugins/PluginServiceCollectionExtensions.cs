@@ -19,7 +19,12 @@ public static class PluginServiceCollectionExtensions
     /// implement, and registers the <see cref="IPluginLoader"/> service and
     /// startup initializer.
     /// </summary>
-    public static IServiceCollection AddCodeyBoxPlugins(
+    /// <returns>
+    /// The list of plugins discovered during this call. Callers may capture this
+    /// list to avoid calling <see cref="IPluginLoader.DiscoverAndLoadAsync"/> later
+    /// (e.g. inside a DI factory, where async blocking is unsafe).
+    /// </returns>
+    public static IReadOnlyList<LoadedPlugin> AddCodeyBoxPlugins(
         this IServiceCollection services,
         IConfiguration configuration)
     {
@@ -44,6 +49,6 @@ public static class PluginServiceCollectionExtensions
 
         services.AddHostedService<PluginInitializationService>();
 
-        return services;
+        return discovered;
     }
 }

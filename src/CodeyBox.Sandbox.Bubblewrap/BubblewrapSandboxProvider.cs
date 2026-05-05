@@ -50,6 +50,19 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
 
     public string Name => "bubblewrap";
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Bubblewrap sandboxes are transient processes with no persistent lifecycle
+    /// marker the reaper can interrogate after a crash. The process exits on its
+    /// own when the orchestrator dies, leaving only a tmpfs staging directory.
+    /// Returns empty — bubblewrap leaks are not tracked by the reaper.
+    /// </remarks>
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+    /// <inheritdoc/>
+    public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
         var timingStore = _timings is not null && spec.TimingWorkItemId.HasValue ? _timings : null;
@@ -179,8 +192,20 @@ internal sealed class BubblewrapSandbox : ISandbox
             using var proc = new Process { StartInfo = psi };
             var stdout = new StringBuilder();
             var stderr = new StringBuilder();
-            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
-            proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderr.AppendLine(e.Data); };
+            proc.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stdout.Append(line);
+                exec.StdoutChunkCallback?.Invoke(line);
+            };
+            proc.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stderr.Append(line);
+                exec.StderrChunkCallback?.Invoke(line);
+            };
             proc.Start();
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
