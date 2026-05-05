@@ -1,6 +1,6 @@
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/CodeyBox.Cli/CodeyBox.Cli.csproj" />
+    <Project Path="src/CodeyBox.Cli/CodeyBox.Wizard.csproj" />
     <Project Path="src/CodeyBox.Agents.Claude/CodeyBox.Agents.Claude.csproj" />
     <Project Path="src/CodeyBox.Agents.Codex/CodeyBox.Agents.Codex.csproj" />
     <Project Path="src/CodeyBox.Agents.Gemini/CodeyBox.Agents.Gemini.csproj" />
@@ -34,5 +34,7 @@
   <Folder Name="/tools/">
     <Project Path="tools/CodeyBox.Admin/src/CodeyBox.Admin.Web/CodeyBox.Admin.Web.csproj" />
     <Project Path="tools/CodeyBox.Admin/tests/CodeyBox.Admin.Tests/CodeyBox.Admin.Tests.csproj" />
+    <Project Path="tools/CodeyBox.Cli/CodeyBox.Cli.csproj" />
+    <Project Path="tools/CodeyBox.Cli/tests/CodeyBox.Cli.Tests/CodeyBox.Cli.Tests.csproj" />
   </Folder>
 </Solution>
