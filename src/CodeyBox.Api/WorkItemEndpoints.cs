@@ -48,6 +48,7 @@ internal static class WorkItemEndpoints
         IProjectRepository projects,
         IAgentRegistry agents,
         IReleaseStore? releaseStore,
+        IWebhookDispatcher webhooks,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(req.Title)) return Results.BadRequest(new { error = "title is required" });
@@ -174,6 +175,7 @@ internal static class WorkItemEndpoints
 
         // ── Release binding ───────────────────────────────────────────────────
 
+        Release? boundRelease = null;
         ReleaseId? releaseId = null;
         if (!string.IsNullOrWhiteSpace(req.ReleaseId))
         {
@@ -195,6 +197,7 @@ internal static class WorkItemEndpoints
             if (relProject is not null && !relProject.ReleaseConfig.Enabled)
                 return Results.BadRequest(new { error = $"release management is not enabled for project '{req.ProjectId}'" });
 
+            boundRelease = rel;
             releaseId = rid;
         }
 
@@ -261,6 +264,15 @@ internal static class WorkItemEndpoints
         }
         if (WorkItemDependencies.AreSatisfied(item.DependsOn, freshDepStates))
             await queue.EnqueueAsync(item.Id, ct);
+
+        if (boundRelease is not null)
+            await webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "release.work_item_added",
+                WorkItem = item,
+                Project = project,
+                Release = boundRelease,
+            }, ct);
 
         return Results.Created($"/workitems/{item.Id}", ToDto(item, project, freshDepStates, freshDepExternalIds));
     }

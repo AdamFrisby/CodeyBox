@@ -165,6 +165,14 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default) => Task.FromResult<AggregateTimingsDto?>(null);
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default) => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default) => Task.FromResult(new List<ReleaseDto>());
+    public Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default) => Task.FromResult(new List<object>());
+    public Task<ReleaseDto?> CreateReleaseAsync(CreateReleaseRequest req, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<ReleaseDto?> CloseReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<ReleaseDto?> ReopenReleaseAsync(string id, string reason, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<ReleaseDto?> AbandonReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<ReleaseDto?> TriggerReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
 }
 
 /// <summary>
@@ -218,4 +226,12 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default) => Task.FromResult<AggregateTimingsDto?>(null);
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default) => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default) => Task.FromResult(new List<ReleaseDto>());
+    public Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default) => Task.FromResult(new List<object>());
+    public Task<ReleaseDto?> CreateReleaseAsync(CreateReleaseRequest req, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<ReleaseDto?> CloseReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<ReleaseDto?> ReopenReleaseAsync(string id, string reason, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<ReleaseDto?> AbandonReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+    public Task<ReleaseDto?> TriggerReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
 }

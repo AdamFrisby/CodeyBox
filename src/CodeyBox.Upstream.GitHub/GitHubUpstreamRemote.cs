@@ -227,6 +227,35 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return true;
     }
 
+    /// <summary>
+    /// Creates a lightweight tag at <paramref name="sha"/> and publishes a GitHub
+    /// release via POST /repos/{owner}/{repo}/releases. GitHub creates the tag
+    /// object automatically when <c>tag_name</c> does not yet exist.
+    /// Returns the HTML URL of the created release, or null on 422 (already exists).
+    /// Throws on unexpected HTTP failures so the caller can decide how to handle.
+    /// </summary>
+    public async Task<string?> CreateTagAndReleaseAsync(string tagName, string sha, string? releaseNotes, CancellationToken ct = default)
+    {
+        var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/releases";
+        var body = new GitHubCreateReleaseRequest(tagName, sha, tagName, releaseNotes ?? string.Empty);
+
+        using var req = BuildRequest(HttpMethod.Post, url);
+        req.Content = JsonContent.Create(body);
+
+        using var response = await SendAsync(req, ct);
+
+        if (response.StatusCode == HttpStatusCode.UnprocessableEntity)
+        {
+            _log.LogWarning("GitHub POST /releases returned 422 for tag {Tag}; release may already exist", tagName);
+            return null;
+        }
+
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<GitHubReleaseResponse>(ct);
+        _log.LogInformation("GitHub release created for tag {Tag}: {Url}", tagName, result?.HtmlUrl);
+        return result?.HtmlUrl;
+    }
+
     // -------------------------------------------------------------------------
     // Description generation
     // -------------------------------------------------------------------------
@@ -440,3 +469,13 @@ internal sealed record GitHubMergesRequest(
     [property: JsonPropertyName("base")] string Base,
     [property: JsonPropertyName("head")] string Head,
     [property: JsonPropertyName("commit_message")] string CommitMessage);
+
+internal sealed record GitHubCreateReleaseRequest(
+    [property: JsonPropertyName("tag_name")] string TagName,
+    [property: JsonPropertyName("target_commitish")] string TargetCommitish,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("body")] string Body);
+
+internal sealed record GitHubReleaseResponse(
+    [property: JsonPropertyName("id")] long Id,
+    [property: JsonPropertyName("html_url")] string? HtmlUrl);

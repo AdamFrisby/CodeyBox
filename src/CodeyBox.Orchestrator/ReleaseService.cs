@@ -480,6 +480,23 @@ public sealed class ReleaseService
 
         var released = release with { State = ReleaseState.Released, ReleasedAt = DateTimeOffset.UtcNow };
         await _releases.UpdateAsync(released, ct);
+
+        if (project.ReleaseConfig.CreateGitHubRelease)
+        {
+            var tag = !string.IsNullOrWhiteSpace(release.TargetTag)
+                ? release.TargetTag
+                : project.ReleaseConfig.GitHubTagTemplate.Replace("{name}", release.Name, StringComparison.Ordinal);
+            try
+            {
+                var releaseUrl = await upstream.CreateTagAndReleaseAsync(tag, outcome.MergedSha ?? string.Empty, null, ct);
+                _log.LogInformation("Release {Id}: GitHub release created for tag '{Tag}' at {Url}", release.Id, tag, releaseUrl);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Release {Id}: GitHub release creation for tag '{Tag}' failed; continuing", release.Id, tag);
+            }
+        }
+
         await PublishAsync("release.published", released, project, ct,
             new { pullRequestUrl = outcome.PullRequestUrl, mergedSha = outcome.MergedSha });
 

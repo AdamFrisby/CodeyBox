@@ -53,14 +53,14 @@ internal static class ReleaseTestHelper
         ReleaseState state,
         string projectId = "test-project",
         string? failedReason = null) => new()
-    {
-        Id = ReleaseId.New(),
-        ProjectId = new ProjectId(projectId),
-        Name = $"v1.0-{Guid.NewGuid():N}",
-        State = state,
-        CreatedAt = DateTimeOffset.UtcNow,
-        FailedReason = failedReason,
-    };
+        {
+            Id = ReleaseId.New(),
+            ProjectId = new ProjectId(projectId),
+            Name = $"v1.0-{Guid.NewGuid():N}",
+            State = state,
+            CreatedAt = DateTimeOffset.UtcNow,
+            FailedReason = failedReason,
+        };
 }
 
 internal sealed class NullSandboxProvider : ISandboxProvider
@@ -149,5 +149,56 @@ internal sealed class FakeMergeUpstreamFactory : IUpstreamRemoteFactory
 {
     private readonly FakeMergeUpstreamRemote _remote;
     public FakeMergeUpstreamFactory(FakeMergeUpstreamRemote remote) => _remote = remote;
+    public IUpstreamRemote Create(Project project) => _remote;
+}
+
+/// <summary>Stub git host that returns predictable values without touching the filesystem.</summary>
+internal sealed class StubGitHost : IGitHost
+{
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+        => Task.FromResult($"stub-repo-{id}");
+    public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
+        => throw new NotSupportedException();
+    public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+        => Task.FromResult("main");
+    public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+        => Task.CompletedTask;
+    public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+        => Task.CompletedTask;
+    public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
+        => Task.FromResult(false);
+    public Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+        => Task.FromResult(("", ""));
+}
+
+/// <summary>Upstream remote that records CreateTagAndReleaseAsync calls and completes successfully.</summary>
+internal sealed class CapturingUpstreamRemote : IUpstreamRemote
+{
+    public string Name => "capturing";
+    public List<(string Tag, string Sha, string? Notes)> TagAndReleaseRequests { get; } = [];
+
+    public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
+        => Task.FromResult(new UpstreamPushResult(true, null));
+
+    public Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest req, CancellationToken ct = default)
+        => Task.FromResult(new UpstreamCompletionOutcome { BranchPushed = true, MergedSha = "abc123" });
+
+    public Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)
+        => Task.FromResult(true);
+
+    public Task<string?> CreateTagAndReleaseAsync(string tagName, string sha, string? releaseNotes, CancellationToken ct = default)
+    {
+        TagAndReleaseRequests.Add((tagName, sha, releaseNotes));
+        return Task.FromResult<string?>("https://github.com/example/repo/releases/tag/" + tagName);
+    }
+}
+
+/// <summary>Upstream factory that always returns the same pre-built remote.</summary>
+internal sealed class FixedUpstreamFactory : IUpstreamRemoteFactory
+{
+    private readonly IUpstreamRemote _remote;
+    public FixedUpstreamFactory(IUpstreamRemote remote) => _remote = remote;
     public IUpstreamRemote Create(Project project) => _remote;
 }

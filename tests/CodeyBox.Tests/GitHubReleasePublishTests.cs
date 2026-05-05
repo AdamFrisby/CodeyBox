@@ -1,141 +1,173 @@
 using CodeyBox.Core;
-using CodeyBox.Upstream;
+using CodeyBox.Orchestrator;
+using CodeyBox.Webhooks;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Tests TryMergeUpstreamBranchAsync on GitGenericUpstreamRemote using a
-/// real local git repo. Creates two branches, makes diverging commits, then
-/// verifies that the merge succeeds (or detects conflict on conflicting content).
+/// Tests that when CreateGitHubRelease=true, ReleaseService calls the upstream's
+/// CreateTagAndReleaseAsync after the release branch merges to main, and that the
+/// tag is derived from GitHubTagTemplate. Also verifies that when the flag is false,
+/// no tag-creation call is made.
 /// </summary>
-public sealed class GitHubReleasePublishTests : IAsyncLifetime
+public sealed class GitHubReleasePublishTests : IDisposable
 {
-    private string _repoDir = "";
-    private string _tmpDir = "";
+    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"cb-ghp-{Guid.NewGuid():N}.db");
+    private readonly SqliteReleaseStore _releaseStore;
+    private readonly SqliteWorkItemStore _workItemStore;
+    private readonly CapturingWebhookDispatcher _webhooks = new();
+    private readonly CapturingUpstreamRemote _upstream = new();
 
-    public async Task InitializeAsync()
+    public GitHubReleasePublishTests()
     {
-        _tmpDir = Path.Combine(Path.GetTempPath(), $"cb-pub-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(_tmpDir);
-
-        // Bare origin repo
-        var originDir = Path.Combine(_tmpDir, "origin.git");
-        Directory.CreateDirectory(originDir);
-        await TestSupport.RunGit(originDir, "init", "--bare", "-b", "main");
-
-        // Working clone
-        _repoDir = Path.Combine(_tmpDir, "work");
-        await TestSupport.RunGit(_tmpDir, "clone", originDir, "work");
-        await TestSupport.RunGit(_repoDir, "config", "user.email", "t@l");
-        await TestSupport.RunGit(_repoDir, "config", "user.name", "T");
-
-        // Initial commit on main
-        await File.WriteAllTextAsync(Path.Combine(_repoDir, "README.md"), "initial\n");
-        await TestSupport.RunGit(_repoDir, "add", "README.md");
-        await TestSupport.RunGit(_repoDir, "commit", "-m", "initial");
-        await TestSupport.RunGit(_repoDir, "push", "origin", "main");
-
-        // Release branch from main
-        await TestSupport.RunGit(_repoDir, "checkout", "-b", "release/v1.0");
-        await File.WriteAllTextAsync(Path.Combine(_repoDir, "release-note.txt"), "release\n");
-        await TestSupport.RunGit(_repoDir, "add", "release-note.txt");
-        await TestSupport.RunGit(_repoDir, "commit", "-m", "release branch commit");
-        await TestSupport.RunGit(_repoDir, "push", "origin", "release/v1.0");
-
-        // New commit on main (diverge)
-        await TestSupport.RunGit(_repoDir, "checkout", "main");
-        await File.WriteAllTextAsync(Path.Combine(_repoDir, "main-change.txt"), "main update\n");
-        await TestSupport.RunGit(_repoDir, "add", "main-change.txt");
-        await TestSupport.RunGit(_repoDir, "commit", "-m", "main branch update");
-        await TestSupport.RunGit(_repoDir, "push", "origin", "main");
+        _releaseStore = new SqliteReleaseStore(_dbPath);
+        _workItemStore = new SqliteWorkItemStore(_dbPath);
     }
 
-    public Task DisposeAsync()
+    public void Dispose()
     {
-        try { Directory.Delete(_tmpDir, recursive: true); } catch { }
-        return Task.CompletedTask;
+        _workItemStore.Dispose();
+        _releaseStore.Dispose();
+        try { File.Delete(_dbPath); } catch { }
     }
 
     [Fact]
-    public async Task TryMergeUpstreamBranchAsync_CleanMerge_ReturnsTrue()
+    public async Task Released_WithCreateGitHubRelease_CreatesTagViaUpstream()
     {
-        var originUrl = Path.Combine(_tmpDir, "origin.git");
-        var opts = new GitGenericUpstreamOptions
+        var project = new Project
         {
-            UpstreamUrl = originUrl,
-            ExtraEnvironment = new Dictionary<string, string>
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = "file:///tmp/noop",
+            ReleaseConfig = new ProjectReleaseConfig
             {
-                ["GIT_AUTHOR_NAME"] = "Test",
-                ["GIT_AUTHOR_EMAIL"] = "t@l",
-                ["GIT_COMMITTER_NAME"] = "Test",
-                ["GIT_COMMITTER_EMAIL"] = "t@l",
+                Enabled = true,
+                CreateGitHubRelease = true,
+                GitHubTagTemplate = "v{name}",
+                DeepAuditors = [],
+                AutoSyncMainInterval = null,
             },
         };
-        var remote = new GitGenericUpstreamRemote(new ThrowingGitHost(), opts);
+        var svc = BuildService(project);
 
-        var merged = await remote.TryMergeUpstreamBranchAsync("release/v1.0", "main");
+        var rel = new Release
+        {
+            Id = ReleaseId.New(),
+            ProjectId = project.Id,
+            Name = "1.0",
+            State = ReleaseState.Closed,
+            BranchName = "release/1.0",
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+        await _releaseStore.CreateAsync(rel);
 
-        Assert.True(merged);
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await WaitForStateAsync(rel.Id, ReleaseState.Released, ReleaseState.Failed);
+
+        var refreshed = await _releaseStore.GetAsync(rel.Id);
+        Assert.Equal(ReleaseState.Released, refreshed!.State);
+        Assert.Single(_upstream.TagAndReleaseRequests);
+        Assert.Equal("v1.0", _upstream.TagAndReleaseRequests[0].Tag);
     }
 
     [Fact]
-    public async Task TryMergeUpstreamBranchAsync_AlreadyUpToDate_ReturnsTrue()
+    public async Task Released_WithTargetTagOverride_UsesTargetTag()
     {
-        var originUrl = Path.Combine(_tmpDir, "origin.git");
-        var opts = new GitGenericUpstreamOptions
+        var project = new Project
         {
-            UpstreamUrl = originUrl,
-            ExtraEnvironment = new Dictionary<string, string>
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = "file:///tmp/noop",
+            ReleaseConfig = new ProjectReleaseConfig
             {
-                ["GIT_AUTHOR_NAME"] = "Test",
-                ["GIT_AUTHOR_EMAIL"] = "t@l",
-                ["GIT_COMMITTER_NAME"] = "Test",
-                ["GIT_COMMITTER_EMAIL"] = "t@l",
+                Enabled = true,
+                CreateGitHubRelease = true,
+                GitHubTagTemplate = "v{name}",
+                DeepAuditors = [],
+                AutoSyncMainInterval = null,
             },
         };
-        var remote = new GitGenericUpstreamRemote(new ThrowingGitHost(), opts);
+        var svc = BuildService(project);
 
-        // Merge once (brings release/v1.0 up-to-date with main)
-        await remote.TryMergeUpstreamBranchAsync("release/v1.0", "main");
+        var rel = new Release
+        {
+            Id = ReleaseId.New(),
+            ProjectId = project.Id,
+            Name = "1.0",
+            State = ReleaseState.Closed,
+            BranchName = "release/1.0",
+            TargetTag = "custom-tag-1.0",
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+        await _releaseStore.CreateAsync(rel);
 
-        // Merge again — release already contains main's content
-        var merged = await remote.TryMergeUpstreamBranchAsync("release/v1.0", "main");
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await WaitForStateAsync(rel.Id, ReleaseState.Released, ReleaseState.Failed);
 
-        Assert.True(merged);
+        Assert.Single(_upstream.TagAndReleaseRequests);
+        Assert.Equal("custom-tag-1.0", _upstream.TagAndReleaseRequests[0].Tag);
     }
 
     [Fact]
-    public async Task TryMergeUpstreamBranchAsync_ConflictingContent_ReturnsFalse()
+    public async Task Released_WithoutCreateGitHubRelease_DoesNotCallCreateTag()
     {
-        var originUrl = Path.Combine(_tmpDir, "origin.git");
-
-        // Create conflicting commit on release branch for the same file as main
-        var clone = Path.Combine(_tmpDir, "conflict-clone");
-        await TestSupport.RunGit(_tmpDir, "clone", originUrl, "conflict-clone");
-        await TestSupport.RunGit(clone, "config", "user.email", "t@l");
-        await TestSupport.RunGit(clone, "config", "user.name", "T");
-        await TestSupport.RunGit(clone, "checkout", "release/v1.0");
-        // Write conflicting content to the same file that main also modified
-        await File.WriteAllTextAsync(Path.Combine(clone, "main-change.txt"), "conflicting release content\n");
-        await TestSupport.RunGit(clone, "add", "main-change.txt");
-        await TestSupport.RunGit(clone, "commit", "-m", "conflicting change on release");
-        await TestSupport.RunGit(clone, "push", "origin", "release/v1.0");
-
-        var opts = new GitGenericUpstreamOptions
+        var project = new Project
         {
-            UpstreamUrl = originUrl,
-            ExtraEnvironment = new Dictionary<string, string>
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = "file:///tmp/noop",
+            ReleaseConfig = new ProjectReleaseConfig
             {
-                ["GIT_AUTHOR_NAME"] = "Test",
-                ["GIT_AUTHOR_EMAIL"] = "t@l",
-                ["GIT_COMMITTER_NAME"] = "Test",
-                ["GIT_COMMITTER_EMAIL"] = "t@l",
+                Enabled = true,
+                CreateGitHubRelease = false,
+                DeepAuditors = [],
+                AutoSyncMainInterval = null,
             },
         };
-        var remote = new GitGenericUpstreamRemote(new ThrowingGitHost(), opts);
+        var svc = BuildService(project);
 
-        var merged = await remote.TryMergeUpstreamBranchAsync("release/v1.0", "main");
+        var rel = new Release
+        {
+            Id = ReleaseId.New(),
+            ProjectId = project.Id,
+            Name = "2.0",
+            State = ReleaseState.Closed,
+            BranchName = "release/2.0",
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+        await _releaseStore.CreateAsync(rel);
 
-        Assert.False(merged);
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await WaitForStateAsync(rel.Id, ReleaseState.Released, ReleaseState.Failed);
+
+        Assert.Empty(_upstream.TagAndReleaseRequests);
+    }
+
+    private ReleaseService BuildService(Project project) =>
+        new ReleaseService(
+            _releaseStore,
+            _workItemStore,
+            new InMemoryProjectRepository(project),
+            _webhooks,
+            new NullSandboxProvider(),
+            new StubGitHost(),
+            new EmptyAgentRegistry(),
+            new StaticCredentialProvider(),
+            new FixedUpstreamFactory(_upstream),
+            [],
+            new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
+            new InMemoryTaskQueue(),
+            NullLogger<ReleaseService>.Instance);
+
+    private async Task WaitForStateAsync(ReleaseId id, params ReleaseState[] terminal)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+            var r = await _releaseStore.GetAsync(id);
+            if (r is not null && terminal.Contains(r.State)) return;
+        }
     }
 }

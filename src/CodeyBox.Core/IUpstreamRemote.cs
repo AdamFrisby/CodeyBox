@@ -36,6 +36,16 @@ public interface IUpstreamRemote
     /// Throws on unexpected infrastructure failures (network error, auth failure, etc.).
     /// </summary>
     Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default);
+
+    /// <summary>
+    /// Creates a tag at <paramref name="sha"/> and publishes a release named
+    /// <paramref name="tagName"/> on the upstream forge. Returns the URL of the
+    /// created release, or <c>null</c> when the upstream kind does not support
+    /// forge releases (e.g. noop, git-generic). Never throws on unsupported — the
+    /// caller logs and continues; a missing GitHub release is not a hard failure.
+    /// </summary>
+    Task<string?> CreateTagAndReleaseAsync(string tagName, string sha, string? releaseNotes, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }
 
 public sealed record UpstreamPushResult(bool Success, string? Error);

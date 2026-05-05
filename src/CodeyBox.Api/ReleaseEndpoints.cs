@@ -24,6 +24,7 @@ internal static class ReleaseEndpoints
         CreateReleaseRequest req,
         IReleaseStore store,
         IProjectRepository projects,
+        IWebhookDispatcher webhooks,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(req.Name))
@@ -61,6 +62,12 @@ internal static class ReleaseEndpoints
         };
 
         await store.CreateAsync(release, ct);
+        await webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "release.created",
+            Release = release,
+            Project = project,
+        }, ct);
         return Results.Created($"/releases/{release.Id}", ToDto(release));
     }
 
