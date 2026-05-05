@@ -57,7 +57,8 @@ internal static class ProjectBudgetEndpoints
         string thresholdState = "ok";
         if (budget.MonthlyCostBudgetUsd > 0)
         {
-            if (budget.CostHardCapPct > 0 && pct >= budget.CostHardCapPct)
+            var effectiveCap = budget.CostHardCapPct > 0 ? budget.CostHardCapPct : 100;
+            if (pct >= effectiveCap)
                 thresholdState = "exceeded";
             else if (budget.CostWarningThresholdPct > 0 && pct >= budget.CostWarningThresholdPct)
                 thresholdState = "warning";

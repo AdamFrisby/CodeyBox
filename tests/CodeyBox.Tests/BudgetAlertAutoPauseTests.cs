@@ -85,16 +85,20 @@ public sealed class BudgetAlertAutoPauseTests : IDisposable
         var costs = new CapturingCostStore();
         costs.SetSpend(ProjectB.Value, 110m);
         var queue = new CapturingQueueController();
+        var webhooks = new BudgetWebhookCollector();
 
         var svc = new BudgetAlertService(
             new InMemoryProjectRepository(MakeProject(hardCapPct: 0)),
-            costs, queue, new BudgetWebhookCollector(),
+            costs, queue, webhooks,
             new BudgetAlertOptions(),
             NullLogger<BudgetAlertService>.Instance);
 
         await svc.RunSweepAsync(CancellationToken.None);
 
+        // Auto-pause must not trigger when hard cap is disabled.
         Assert.False(queue.ProjectPaused.ContainsKey(ProjectB.Value));
+        // But the exceeded webhook must still fire (CostHardCapPct=0 only disables auto-pause).
+        Assert.Contains(webhooks.Published, e => e.Event == "project.budget_exceeded");
     }
 
     // ── Auto-resume on recovery ───────────────────────────────────────────────

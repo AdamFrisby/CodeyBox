@@ -208,7 +208,10 @@ public sealed class BudgetAlertService : BackgroundService
 
     private static BudgetThresholdState ComputeThresholdState(double pct, ProjectBudget budget)
     {
-        if (budget.CostHardCapPct > 0 && pct >= budget.CostHardCapPct)
+        // CostHardCapPct=0 disables auto-pause but the exceeded webhook still fires at
+        // 100% of the budget. Use 100 as the effective cap when the operator omits it.
+        var effectiveCap = budget.CostHardCapPct > 0 ? budget.CostHardCapPct : 100;
+        if (pct >= effectiveCap)
             return BudgetThresholdState.Exceeded;
         if (budget.CostWarningThresholdPct > 0 && pct >= budget.CostWarningThresholdPct)
             return BudgetThresholdState.Warning;
