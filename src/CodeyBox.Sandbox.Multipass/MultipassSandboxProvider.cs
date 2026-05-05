@@ -1042,18 +1042,22 @@ public sealed record MultipassSandboxOptions
     public int BaselineDiskGB { get; init; } = 12;
 
     /// <summary>
-    /// Memory (gibibytes) for the baseline VM. Default 4 GiB. Multipass's
-    /// default of 1 GiB is too tight for the long-running agent sessions
-    /// the rework loop produces — agents that keep their conversation
-    /// history in memory can OOM mid-rework. Clones inherit this
-    /// allocation. Lower if your sessions are short.
+    /// Memory (gibibytes) for the baseline VM. Default 12 GiB. Sized to the
+    /// CPU count: MSBuild spawns one worker per core during build, and each
+    /// worker can allocate ~1 GiB at peak; with <see cref="BaselineCpus"/>=6
+    /// a 4 GiB allocation OOMs and surfaces as a CLR fatal during MSBuild's
+    /// project enumeration. Long-running agent sessions also keep their
+    /// conversation history in memory. Lower at your own risk if you also
+    /// lower <see cref="BaselineCpus"/>.
     /// </summary>
-    public int BaselineMemoryGB { get; init; } = 4;
+    public int BaselineMemoryGB { get; init; } = 12;
 
     /// <summary>
-    /// vCPU count for the baseline VM. Default 6. Multipass's default is
-    /// 1; bumping speeds up build / scan / install cold-starts when the
-    /// underlying tools parallelise.
+    /// vCPU count for the baseline VM. Default 6. Multipass's default is 1;
+    /// bumping speeds up build / scan / install cold-starts when the
+    /// underlying tools parallelise. Keep <see cref="BaselineMemoryGB"/>
+    /// at roughly 2× this value: MSBuild spawns one worker per core and
+    /// each can peak around 1 GiB, plus baseline OS/services overhead.
     /// </summary>
     public int BaselineCpus { get; init; } = 6;
 }
