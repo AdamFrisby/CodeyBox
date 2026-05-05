@@ -122,7 +122,7 @@ Returns `404 Not Found` if source does not exist.
 
 ### `GET /workitems/{id}/replays`
 
-Return the source work item and all items that directly replay it.
+Return the source work item and all items that replay it, recursively (BFS across all replay descendants).
 
 ```json
 {

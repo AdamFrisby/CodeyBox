@@ -92,6 +92,20 @@ public sealed class ReplayValidationTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
     }
 
+    // ── 400 for invalid agentClassId ─────────────────────────────────────────
+
+    [Fact]
+    public async Task Replay_AgentClassIdTooLong_Returns400()
+    {
+        var source = Item(WorkItemState.Done);
+        await _factory.Store.CreateAsync(source);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{source.Id}/replay",
+            new { agentClassId = new string('x', 201) });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     // ── 400 for invalid work branch ───────────────────────────────────────────
 
     [Fact]

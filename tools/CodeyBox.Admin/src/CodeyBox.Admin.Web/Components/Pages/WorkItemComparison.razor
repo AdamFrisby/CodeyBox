@@ -66,11 +66,7 @@ else
         @foreach (var col in _columns)
         {
             <div class="comparison-cell">
-                @if (col.ExternalId is not null && col.ExternalId.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                {
-                    <a href="@col.ExternalId" target="_blank" rel="noopener noreferrer">@col.ExternalId</a>
-                }
-                else if (col.ExternalId is not null)
+                @if (col.ExternalId is not null)
                 {
                     <code>@col.ExternalId</code>
                 }
@@ -85,7 +81,7 @@ else
         @foreach (var col in _columns)
         {
             <div class="comparison-cell">
-                @if (col.MergeSha is not null && col.RepositoryUrl is not null)
+                @if (col.MergeSha is not null && col.RepositoryUrl is not null && IsValidSha(col.MergeSha))
                 {
                     <a href="@col.RepositoryUrl/commit/@col.MergeSha" target="_blank" rel="noopener noreferrer">
                         <code>@col.MergeSha[..Math.Min(8, col.MergeSha.Length)]</code>
@@ -102,7 +98,7 @@ else
             </div>
         }
 
-        @if (_sourceMergeSha is not null && _columns.Any(c => c.Id != _data.Source.Id && c.MergeSha is not null) && _repoUrl is not null)
+        @if (_sourceMergeSha is not null && IsValidSha(_sourceMergeSha) && _columns.Any(c => c.Id != _data.Source.Id && c.MergeSha is not null && IsValidSha(c.MergeSha)) && _repoUrl is not null)
         {
             <div class="comparison-row-label">Diff vs source</div>
             @foreach (var col in _columns)
@@ -112,7 +108,7 @@ else
                     {
                         <span>—</span>
                     }
-                    else if (col.MergeSha is not null)
+                    else if (col.MergeSha is not null && IsValidSha(col.MergeSha))
                     {
                         <a href="@_repoUrl/compare/@_sourceMergeSha...@col.MergeSha" target="_blank" rel="noopener noreferrer">view diff</a>
                     }
@@ -238,4 +234,7 @@ else
         if (ms < 60_000) return $"{ms / 1000.0:F1}s";
         return $"{ms / 60_000.0:F1}m";
     }
+
+    private static bool IsValidSha(string sha) =>
+        sha.Length == 40 && sha.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
 }

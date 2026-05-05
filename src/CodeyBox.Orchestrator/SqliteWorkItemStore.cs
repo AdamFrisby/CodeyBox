@@ -335,10 +335,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
                 UPDATE work_items
-                SET replay_of_work_item_id = NULL
+                SET replay_of_work_item_id = NULL,
+                    updated_at = $now
                 WHERE replay_of_work_item_id = $source_id;
                 """;
             cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
         }
         finally

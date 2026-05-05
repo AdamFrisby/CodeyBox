@@ -373,7 +373,7 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
-    /// Create a replay of a terminal work item, optionally swapping the agent or model.
+    /// Create a replay of a terminal work item, optionally swapping the agent via agentClassId.
     /// The new item gets the same prompt, base branch, and dependsOn list; it runs
     /// independently with its own ID, work branch, and audit iterations.
     /// </summary>
@@ -445,7 +445,7 @@ internal static class WorkItemEndpoints
         {
             var shortId = newId.Value.ToString("N")[..8];
             workBranch = source.WorkBranch is { Length: > 0 } wb
-                ? $"{(wb.Length > 230 ? wb[..230] : wb)}-replay-{shortId}"
+                ? $"{TruncateToGitBranchPrefix(wb)}-replay-{shortId}"
                 : $"replay-{shortId}";
         }
 
@@ -491,7 +491,7 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
-    /// Returns the source work item and all its replays (recursively, depth-first BFS)
+    /// Returns the source work item and all its replays recursively (BFS)
     /// in chronological order at each level. When the given ID is itself a replay, that
     /// item becomes the "source" in the response and its own descendants are "replays".
     /// </summary>
@@ -505,26 +505,26 @@ internal static class WorkItemEndpoints
         var (source, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        // Load all items once for dep-state map, externalId lookup, and recursive traversal.
-        var allItems = new List<WorkItem>();
-        await foreach (var i in store.ListAsync(ct)) allItems.Add(i);
-        var statesById = WorkItemDependencies.BuildStateMap(allItems);
-        var externalIdsById = allItems.ToDictionary(i => i.Id, i => i.ExternalId);
         var allProjects = (await projects.ListAsync(ct)).ToDictionary(p => p.Id.Value);
-
-        // Group all replay children by their source ID for O(1) lookup during BFS.
-        var replaysBySource = allItems
-            .Where(i => i.ReplayOfWorkItemId.HasValue)
-            .GroupBy(i => i.ReplayOfWorkItemId!.Value)
-            .ToDictionary(g => g.Key, g => g.OrderBy(x => x.CreatedAt).ToList());
 
         async Task<WorkItemDto> BuildDtoWithAuditAsync(WorkItem item)
         {
             allProjects.TryGetValue(item.ProjectId.Value, out var proj);
-            var depExtIds = item.DependsOn
-                .Where(d => externalIdsById.ContainsKey(d))
-                .ToDictionary(d => d, d => externalIdsById[d]);
-            var dto = ToDto(item, proj, statesById, depExtIds);
+
+            // Fetch dependency states and external IDs individually to avoid a full table scan.
+            var depStates = new Dictionary<WorkItemId, WorkItemState>();
+            var depExtIds = new Dictionary<WorkItemId, string?>();
+            foreach (var depId in item.DependsOn)
+            {
+                var dep = await store.GetAsync(depId, ct);
+                if (dep is not null)
+                {
+                    depStates[depId] = dep.State;
+                    depExtIds[depId] = dep.ExternalId;
+                }
+            }
+
+            var dto = ToDto(item, proj, depStates, depExtIds);
 
             var reports = await reportStore.GetByWorkItemAsync(item.Id.ToString(), ct);
             if (reports.Count > 0)
@@ -540,7 +540,7 @@ internal static class WorkItemEndpoints
             return dto;
         }
 
-        // BFS to collect all descendants of source in chronological order.
+        // BFS using ListByReplaySourceAsync — targeted per-source indexed queries, no full table scan.
         var replays = new List<WorkItemDto>();
         var toVisit = new Queue<WorkItemId>();
         toVisit.Enqueue(source!.Id);
@@ -548,8 +548,7 @@ internal static class WorkItemEndpoints
         while (toVisit.Count > 0)
         {
             var current = toVisit.Dequeue();
-            if (!replaysBySource.TryGetValue(current, out var children)) continue;
-            foreach (var child in children)
+            await foreach (var child in store.ListByReplaySourceAsync(current, ct))
             {
                 replays.Add(await BuildDtoWithAuditAsync(child));
                 toVisit.Enqueue(child.Id);
@@ -897,6 +896,18 @@ internal static class WorkItemEndpoints
             return (null, Results.BadRequest(new { error = "invalid id" }));
         var byId = await store.GetAsync(new WorkItemId(g), ct);
         return byId is null ? (null, Results.NotFound()) : (byId, null);
+    }
+
+    // Git branch names have a 255-byte UTF-8 limit. The auto-generated suffix "-replay-{8hex}" is 17 bytes,
+    // so the prefix may be at most 238 bytes.
+    private static string TruncateToGitBranchPrefix(string branch)
+    {
+        const int maxPrefixBytes = 255 - 17;
+        if (System.Text.Encoding.UTF8.GetByteCount(branch) <= maxPrefixBytes) return branch;
+        var len = branch.Length;
+        while (len > 0 && System.Text.Encoding.UTF8.GetByteCount(branch.AsSpan(0, len)) > maxPrefixBytes)
+            len--;
+        return branch[..len];
     }
 
     private static WorkItemDto ToDto(
