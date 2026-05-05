@@ -280,6 +280,8 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDiffDto?>(null);
 
     public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
@@ -362,6 +364,8 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDiffDto?>(null);
 
     public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
         => Task.FromResult<string?>(null);

@@ -47,6 +47,7 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 | `/work-items/{id}/edit` | Edit title/prompt/agent — Queued items only |
 | `/work-items/{id}/timeline` | Audit-replay timeline — chronological log of every agent/audit event. Auto-refreshes every 5 s for in-flight items. Supports `?kind=`, `?since=`, `?iteration=` filter params. |
 | `/work-items/{id}/timings` | Per-item timing breakdown — stacked bar of phases, drill-down step table, top-10 slowest steps |
+| `/work-items/{id}/diff` | Diff preview — unified diff of the work branch vs. base branch, with file list, +/- stats, truncation banner, and "Copy as patch" link |
 | `/timings/aggregate` | System-wide aggregate — median and p95 per step across the last N completed work items, configurable N picker |
 
 ## In scope (v1)
@@ -85,6 +86,10 @@ before reaching the hub.  The work item prompt is never broadcast.
 - Drag-and-drop reorder (HTML5 DnD is wired but not implemented)
 - Webhook delivery log
 - Multi-user auth (only a single cookie gate placeholder)
+
+### Diff rendering
+
+The diff page renders unified diffs server-side in Razor (no JavaScript dependency). `diff2html` was considered but not adopted — it requires either an NPM build step or CDN access from the server, while server-side rendering achieves the same result with zero extra dependencies. The parser splits the diff by `diff --git` headers (falling back to `--- /+++` lines) and maps each line to a CSS class (`diff-add`, `diff-del`, `diff-hunk`, `diff-meta`, `diff-ctx`) for coloring.
 
 ## Architecture
 

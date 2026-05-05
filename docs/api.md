@@ -340,6 +340,73 @@ span multiple models.  `byWorkItem` is sorted by `started_at` descending.
 * Returns `404 Not Found` when the project does not exist.
 * Returns `400 Bad Request` when `from` or `to` cannot be parsed as ISO-8601.
 
+### `GET /workitems/{id}/diff`
+
+Returns the unified diff between the base branch and the work branch for a
+work item's bare repository.
+
+**Content negotiation** — the response format depends on the `Accept` header:
+
+| Accept header | Response |
+|---------------|----------|
+| `application/json` (explicit) | JSON object (see shape below) |
+| anything else | `text/x-diff` raw patch text |
+
+**Response (200 OK, `application/json`):**
+
+```json
+{
+  "workItemId": "aabbccdd-0000-0000-0000-000000000001",
+  "baseBranch": "main",
+  "workBranch": "codeybox/aabbccdd",
+  "baseCommitSha": "abc123...",
+  "workCommitSha": "def456...",
+  "filesChanged": 3,
+  "linesAdded": 42,
+  "linesRemoved": 7,
+  "diff": "diff --git a/foo.cs b/foo.cs\n...",
+  "truncated": false
+}
+```
+
+When the diff exceeds **1 MB** in JSON mode, `truncated` is `true` and `diff`
+ends with:
+
+```
+[... diff truncated at 1 MB. Download the raw diff for full output. ...]
+```
+
+When the diff exceeds **10 MB** in raw mode, the response ends with:
+
+```
+[... diff truncated at 10 MB. ...]
+```
+
+When the diff spans **more than 1 000 files**, the response includes
+`changedFiles` (array of paths) and `hint` instead of the full diff text:
+
+```json
+{
+  "workItemId": "...",
+  "filesChanged": 1234,
+  "truncated": true,
+  "hint": "This diff spans 1234 files and is too large to display inline. Review on GitHub.",
+  "changedFiles": ["src/Foo.cs", "src/Bar.cs", "..."],
+  "diff": null
+}
+```
+
+All diff output is **secret-redacted**: GitHub PATs, Anthropic API keys, and
+Google API keys are replaced with `***` before the response is written.
+
+**Status codes:**
+
+* `200 OK` — diff available (JSON or raw text depending on `Accept`).
+* `204 No Content` — work item exists but no repo yet, or base and work
+  branches are at the same commit (no diff).
+* `400 Bad Request` — `{id}` is not a valid UUID.
+* `404 Not Found` — work item does not exist.
+
 ### `GET /workitems/{id}/stdout-tail`
 
 Returns the recent tail of the agent's live stdout, buffered in the orchestrator's

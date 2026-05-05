@@ -468,6 +468,10 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
 
+    public Dictionary<string, WorkItemDiffDto> DiffOverride { get; } = [];
+
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(DiffOverride.TryGetValue(id, out var d) ? (WorkItemDiffDto?)d : null);
     public Dictionary<string, string> StdoutTailOverride { get; } = [];
 
     public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
