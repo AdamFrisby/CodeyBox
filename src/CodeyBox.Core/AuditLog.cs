@@ -47,6 +47,18 @@ public static class AuditLog
         Audit("work_item.retried")
             .Information("Work item {WorkItemId} retried from phase {From}", id.ToString(), from);
 
+    public static void WorkItemRecovered(WorkItemId id, string fromState, string toState, int attempt) =>
+        Audit("work_item.recovered")
+            .Information(
+                "Recovering {WorkItemId} from non-terminal state {FromState} → {ToState} (recovery attempt {Attempt}, presumed lost on prior shutdown)",
+                id.ToString(), fromState, toState, attempt);
+
+    public static void WorkItemAbandonedAfterRecovery(WorkItemId id, int maxAttempts) =>
+        Audit("work_item.abandoned_after_recovery")
+            .Warning(
+                "Work item {WorkItemId} abandoned after {MaxAttempts} recovery attempts; operator intervention required",
+                id.ToString(), maxAttempts);
+
     public static void WorkItemFailed(WorkItemId id, string error) =>
         Audit("work_item.failed")
             .Warning("Work item {WorkItemId} failed: {Error}", id.ToString(), error);

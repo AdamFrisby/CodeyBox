@@ -263,7 +263,7 @@ internal sealed class AgentTrackingPipeline : IPipelineRunner
 
     public AgentTrackingPipeline(IWorkItemStore store) => _store = store;
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         LastAgent = item.Agent;
         ReceivedNullAgent = item.Agent is null;

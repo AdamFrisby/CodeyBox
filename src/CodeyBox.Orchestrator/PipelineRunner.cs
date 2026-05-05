@@ -127,7 +127,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
     }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         using var workItemScope = AuditLog.WorkItemScope(item.Id);
 
@@ -287,18 +287,32 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-            if (current.State is not WorkItemState.Done and not WorkItemState.Failed)
+            if (hostShutdownToken.IsCancellationRequested)
             {
-                var cancelled = current.With(WorkItemState.Cancelled, "cancelled");
-                await _store.UpdateAsync(cancelled, CancellationToken.None);
-                AuditLog.WorkItemCancelled(item.Id);
-                await _webhooks.PublishAsync(new WebhookEvent
+                // Host is shutting down — leave the item in its current mid-flight
+                // state. The recovery loop will reset and re-enqueue it on next startup.
+                _log.LogInformation(
+                    "Work item {Id} interrupted by host shutdown; leaving in mid-flight state for recovery",
+                    item.Id);
+            }
+            else
+            {
+                // Operator-requested cancel (DELETE /workitems/{id}).
+                var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+                if (current.State is not WorkItemState.Done and not WorkItemState.Failed
+                    and not WorkItemState.AbandonedAfterRecoveryAttempts)
                 {
-                    Event = "work_item.cancelled",
-                    WorkItem = cancelled,
-                    Project = project,
-                }, CancellationToken.None);
+                    var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
+                        WorkItemCancellationReason.OperatorRequested);
+                    await _store.UpdateAsync(cancelled, CancellationToken.None);
+                    AuditLog.WorkItemCancelled(item.Id);
+                    await _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.cancelled",
+                        WorkItem = cancelled,
+                        Project = project,
+                    }, CancellationToken.None);
+                }
             }
             throw;
         }
