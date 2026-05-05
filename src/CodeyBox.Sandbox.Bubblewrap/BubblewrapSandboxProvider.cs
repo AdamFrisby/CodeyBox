@@ -50,6 +50,19 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
 
     public string Name => "bubblewrap";
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Bubblewrap sandboxes are transient processes with no persistent lifecycle
+    /// marker the reaper can interrogate after a crash. The process exits on its
+    /// own when the orchestrator dies, leaving only a tmpfs staging directory.
+    /// Returns empty — bubblewrap leaks are not tracked by the reaper.
+    /// </remarks>
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+    /// <inheritdoc/>
+    public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
         var timingStore = _timings is not null && spec.TimingWorkItemId.HasValue ? _timings : null;

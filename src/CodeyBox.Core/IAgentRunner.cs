@@ -19,6 +19,7 @@ public interface IAgentRunner
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
+        string? reasoningMode = null,
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null);
 }

@@ -48,10 +48,10 @@ public sealed class AgentClassRouterTests
     };
 
     private static AgentMembership Sub(AgentKind kind) =>
-        new() { Agent = kind, Billing = AgentBilling.Subscription };
+        new() { Agent = kind, Billing = AgentBilling.Subscription, QualityScore = 100 };
 
     private static AgentMembership Api(AgentKind kind) =>
-        new() { Agent = kind, Billing = AgentBilling.PayPerApi };
+        new() { Agent = kind, Billing = AgentBilling.PayPerApi, QualityScore = 100 };
 
     // ── No class configured ──────────────────────────────────────────────────
 

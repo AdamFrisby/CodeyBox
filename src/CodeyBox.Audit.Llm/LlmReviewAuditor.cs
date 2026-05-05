@@ -46,7 +46,7 @@ public sealed class LlmReviewAuditor : IAuditor
         // Use the per-invocation override supplied by the pipeline for cross-review,
         // falling back to the baked-in runner from options (backwards compat).
         var agent = context.AuditRunner ?? _opts.Agent;
-        var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, credential: null, modelId: null, ct,
+        var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, credential: null, modelId: null, reasoningMode: null, ct,
             stdoutChunkCallback: context.StdoutChunkCallback);
 
         // The pipeline already populates SandboxSpec.Environment with the

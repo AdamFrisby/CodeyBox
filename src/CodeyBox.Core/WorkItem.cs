@@ -50,6 +50,22 @@ public sealed record WorkItem
     /// <summary>Last error message if state is Failed.</summary>
     public string? LastError { get; init; }
 
+    /// <summary>
+    /// Why the item was cancelled. Only populated when <see cref="State"/> is
+    /// <see cref="WorkItemState.Cancelled"/>; null for all other states and for
+    /// legacy rows written before this column existed.
+    /// </summary>
+    public WorkItemCancellationReason? CancellationReason { get; init; }
+
+    /// <summary>
+    /// How many times the recovery loop has reset this item from a mid-flight
+    /// state back to a recoverable state after successive host shutdowns. When
+    /// this reaches <c>OrchestratorOptions.MaxRecoveryAttempts</c> the item is
+    /// transitioned to <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>
+    /// instead of being re-queued.
+    /// </summary>
+    public int RecoveryAttempts { get; init; }
+
     /// <summary>Number of attempts that have been made on the upstream-push phase.</summary>
     public int UpstreamPushAttempts { get; init; }
 
@@ -84,6 +100,22 @@ public sealed record WorkItem
     public string? ModelId { get; init; }
 
     /// <summary>
+    /// Runtime-only reasoning-mode hint set by the quota router from the chosen
+    /// <see cref="AgentMembership.ReasoningMode"/>. Not persisted; resolved at
+    /// each pickup. The agent runner translates this into the appropriate CLI flag.
+    /// </summary>
+    public string? ReasoningMode { get; init; }
+
+    /// <summary>
+    /// Minimum acceptable <see cref="AgentMembership.QualityScore"/> for this work item.
+    /// The router picks any member whose base score is at or above this floor.
+    /// Default 95: Gemini-3-Flash-high-reasoning is allowed as a frontier-adjacent fallback.
+    /// Set lower (e.g. 70) for low-stakes work that can tolerate a weaker model.
+    /// Persisted; existing records without the column default to 95 on read.
+    /// </summary>
+    public int MinModelScore { get; init; } = 95;
+
+    /// <summary>
     /// Display and pickup ordering for Queued items. Set to <c>CreatedAt.Ticks</c> on
     /// first persist so items sort in creation order by default. <see cref="IWorkItemStore.ReorderAsync"/>
     /// overwrites this with small integers (1, 2, 3 …) so explicitly prioritised items
@@ -105,13 +137,29 @@ public sealed record WorkItem
     /// </summary>
     public string? ExternalId { get; init; }
 
-    public WorkItem With(WorkItemState state, string? error = null) => this with
-    {
-        State = state,
-        LastError = error,
-        UpdatedAt = DateTimeOffset.UtcNow,
-        // Clear StartedAt when re-queuing: retried items must not appear in-flight
-        // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
-        StartedAt = state == WorkItemState.Queued ? null : StartedAt,
-    };
+    /// <summary>
+    /// Number of times this work item has been automatically recovered by the
+    /// dead-worker reaper after an orphaning crash. Incremented on each recovery
+    /// transition; capped at <c>DeadWorkerOptions.MaxRecoveryAttempts</c> before
+    /// the item is transitioned to Failed.
+    /// </summary>
+    public int RecoveryAttempts { get; init; }
+
+    public WorkItem With(
+        WorkItemState state,
+        string? error = null,
+        WorkItemCancellationReason? cancellationReason = null) => this with
+        {
+            State = state,
+            LastError = error,
+            // CancellationReason is only meaningful when transitioning to Cancelled.
+            CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            // Clear StartedAt when re-queuing: retried items must not appear in-flight
+            // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
+            StartedAt = state == WorkItemState.Queued ? null : StartedAt,
+            // Clear WorkBranch when re-queuing from Working: the in-flight branch is
+            // gone; the next pickup generates a fresh one.
+            WorkBranch = state == WorkItemState.Queued ? null : WorkBranch,
+        };
 }

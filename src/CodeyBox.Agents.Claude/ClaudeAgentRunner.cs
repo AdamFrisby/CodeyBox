@@ -18,15 +18,22 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string Binary { get; init; } = "claude";
 
-    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null)
+    /// <summary>
+    /// Default model passed to <c>--model</c> when no per-item override is provided.
+    /// Pinned to Opus to avoid the CLI defaulting to a lighter model.
+    /// </summary>
+    public string? DefaultModelId { get; init; } = "claude-opus-4-7";
+
+    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null)
     {
         // claude --print sends a single prompt and exits. --dangerously-skip-permissions
         // is appropriate inside the sandbox: the VM boundary IS the permission boundary.
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
-        if (!string.IsNullOrEmpty(modelId))
+        var effectiveModel = modelId ?? DefaultModelId;
+        if (!string.IsNullOrEmpty(effectiveModel))
         {
             argv.Add("--model");
-            argv.Add(modelId);
+            argv.Add(effectiveModel);
         }
         argv.Add(prompt);
         return new AgentInvocation(argv);

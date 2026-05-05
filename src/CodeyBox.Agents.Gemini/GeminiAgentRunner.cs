@@ -27,7 +27,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string Binary { get; init; } = "gemini";
 
-    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null)
+    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null)
     {
         // gemini --yolo -p "<prompt>": sends a single non-interactive prompt and exits.
         // --yolo skips all tool-use confirmation prompts — appropriate inside the
@@ -38,6 +38,12 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
             argv.Add("--model");
             argv.Add(modelId);
         }
+        // ReasoningMode="high" maps to --thinking, which enables Gemini's extended
+        // thinking (high-quality reasoning) mode. Requires @google/gemini-cli ≥ 0.1.9.
+        // Config validation rejects Gemini members with QualityScore >= 90 without
+        // ReasoningMode="high", so this branch fires for all frontier-adjacent Gemini slots.
+        if (string.Equals(reasoningMode, "high", StringComparison.OrdinalIgnoreCase))
+            argv.Add("--thinking");
         argv.Add("-p");
         argv.Add(prompt);
         return new AgentInvocation(argv);
@@ -49,6 +55,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
+        string? reasoningMode = null,
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null)
     {
@@ -57,7 +64,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
         Action<string>? strippingCallback = stdoutChunkCallback is null
             ? null
             : chunk => stdoutChunkCallback(Strip(chunk) ?? string.Empty);
-        var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, ct, strippingCallback);
+        var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, strippingCallback);
         return result with
         {
             Stdout = Strip(result.Stdout),

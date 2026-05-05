@@ -133,6 +133,9 @@ public sealed class ProjectRepository : IProjectRepository
             : rawPerAuditor.Where(kvp => !string.IsNullOrWhiteSpace(kvp.Value))
                            .ToDictionary(kvp => kvp.Key, kvp => new AgentKind(kvp.Value));
 
+        // Clamp to >= 1: SemaphoreSlim requires maxCount >= 1.
+        var mergedMaxLlmPar = Math.Max(1, project?.MaxLlmAuditorParallelism ?? defaults?.MaxLlmAuditorParallelism ?? 3);
+
         return new ProjectAudit
         {
             MaxIterations = mergedMaxIter,
@@ -147,6 +150,7 @@ public sealed class ProjectRepository : IProjectRepository
             Custom = mergedCustom,
             AuditAgent = mergedAuditAgent,
             PerAuditorAgent = mergedPerAuditorAgent,
+            MaxLlmAuditorParallelism = mergedMaxLlmPar,
         };
     }
 

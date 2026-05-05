@@ -227,7 +227,7 @@ internal sealed class FixedOutputAgentRunner : IAgentRunner
     public FixedOutputAgentRunner(string output) => _output = output;
     public AgentKind Kind => AgentKind.Claude;
     public Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt,
-        AgentCredential? credential, string? modelId = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
+        AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
         => Task.FromResult(new AgentResult(!string.IsNullOrEmpty(_output), "ok", _output, null));
 }
 
@@ -238,7 +238,7 @@ internal sealed class CapturingAgentRunner : IAgentRunner
     public CapturingAgentRunner(string output) => _output = output;
     public AgentKind Kind => AgentKind.Claude;
     public Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt,
-        AgentCredential? credential, string? modelId = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
+        AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
     {
         LastPrompt = prompt;
         return Task.FromResult(new AgentResult(true, "ok", _output, null));
@@ -270,6 +270,9 @@ internal sealed class InProcessFakeSandboxProvider : ISandboxProvider
     public string Name => "fake";
     public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         => Task.FromResult<ISandbox>(new NoOpFakeSandbox());
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+    public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
 }
 
 internal sealed class NoOpFakeSandbox : ISandbox

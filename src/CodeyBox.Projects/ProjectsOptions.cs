@@ -98,6 +98,12 @@ public sealed class ProjectAuditConfig
     /// Per-auditor agent overrides. Keys are auditor names; values are agent kind strings.
     /// </summary>
     public Dictionary<string, string>? PerAuditorAgent { get; set; }
+
+    /// <summary>
+    /// Maximum number of LLM auditors to run concurrently within an audit iteration.
+    /// Null = inherit global default. Set to 1 to serialise (useful for 429-prone accounts).
+    /// </summary>
+    public int? MaxLlmAuditorParallelism { get; set; }
 }
 
 public sealed class CustomAuditorConfig
