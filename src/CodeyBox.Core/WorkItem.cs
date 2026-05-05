@@ -141,17 +141,17 @@ public sealed record WorkItem
         WorkItemState state,
         string? error = null,
         WorkItemCancellationReason? cancellationReason = null) => this with
-    {
-        State = state,
-        LastError = error,
-        // CancellationReason is only meaningful when transitioning to Cancelled.
-        CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
-        UpdatedAt = DateTimeOffset.UtcNow,
-        // Clear StartedAt when re-queuing: retried items must not appear in-flight
-        // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
-        StartedAt = state == WorkItemState.Queued ? null : StartedAt,
-        // Clear WorkBranch when re-queuing from Working: the in-flight branch is
-        // gone; the next pickup generates a fresh one.
-        WorkBranch = state == WorkItemState.Queued ? null : WorkBranch,
-    };
+        {
+            State = state,
+            LastError = error,
+            // CancellationReason is only meaningful when transitioning to Cancelled.
+            CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            // Clear StartedAt when re-queuing: retried items must not appear in-flight
+            // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
+            StartedAt = state == WorkItemState.Queued ? null : StartedAt,
+            // Clear WorkBranch when re-queuing from Working: the in-flight branch is
+            // gone; the next pickup generates a fresh one.
+            WorkBranch = state == WorkItemState.Queued ? null : WorkBranch,
+        };
 }

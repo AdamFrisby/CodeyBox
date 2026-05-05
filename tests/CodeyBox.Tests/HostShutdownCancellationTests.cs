@@ -1,31 +1,40 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Agents;
+using CodeyBox.Audit;
+using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
+using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
+using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using CodeyBox.Upstream;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Verifies that signalling host shutdown (via the hostShutdownToken) does NOT
-/// transition an in-flight work item to Cancelled. The item should remain in its
-/// mid-flight state so the recovery loop can pick it up on the next start.
+/// Integration tests that exercise the real <see cref="PipelineRunner"/> shutdown semantics.
 ///
-/// Operator-requested cancel (DELETE /workitems/{id}) must still produce Cancelled.
+/// Host shutdown (IHostApplicationLifetime.ApplicationStopping): the pipeline must leave
+/// the item in its current mid-flight state so the recovery loop can pick it up on next start.
+///
+/// Operator-requested cancel (DELETE /workitems/{id}): the pipeline must transition to
+/// Cancelled with CancellationReason=OperatorRequested.
 /// </summary>
+[Collection("Pipeline integration")]
 public sealed class HostShutdownCancellationTests : IDisposable
 {
-    private readonly string _dbPath =
-        Path.Combine(Path.GetTempPath(), $"codeybox-shutdown-{Guid.NewGuid():N}.db");
-    private readonly SqliteWorkItemStore _store;
+    private readonly string _workspace;
 
     public HostShutdownCancellationTests()
     {
-        _store = new SqliteWorkItemStore(_dbPath);
+        _workspace = Directory.CreateTempSubdirectory("codeybox-shutdown-").FullName;
     }
 
     public void Dispose()
     {
-        _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        try { Directory.Delete(_workspace, recursive: true); } catch { }
     }
 
     private static WorkItem NewItem() => new()
@@ -37,36 +46,71 @@ public sealed class HostShutdownCancellationTests : IDisposable
         State = WorkItemState.Queued,
     };
 
+    private ShutdownTestHarness BuildBlockingPipeline(string seedRepoUrl)
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+
+        var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var prs = new InMemoryPullRequestService();
+        var registry = new AgentRegistry([new BlockingAgentRunner()]);
+
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seedRepoUrl,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit { MaxIterations = 3, AuditTypes = [] },
+        });
+
+        var presetCatalog = new ScriptedAuditorCatalog([]);
+        var composer = new ProjectAuditorComposer(presetCatalog);
+        var upstreamFactory = new TestUpstreamFactory();
+
+        var pipeline = new PipelineRunner(
+            sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
+            projects, upstreamFactory, composer, store,
+            new NullWebhookDispatcher(),
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance);
+
+        return new ShutdownTestHarness(pipeline, store);
+    }
+
     // ── Host shutdown: leave item in mid-flight state ─────────────────────────
 
     [Fact]
     public async Task HostShutdown_DoesNotCancelItem_LeavesWorkingState()
     {
-        using var hostShutdownCts = new CancellationTokenSource();
-        using var itemCts = CancellationTokenSource.CreateLinkedTokenSource(hostShutdownCts.Token);
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var harness = BuildBlockingPipeline(seed);
 
         var item = NewItem();
-        await _store.CreateAsync(item);
+        await harness.Store.CreateAsync(item);
 
-        // Transition to Working to simulate mid-flight
-        var working = item.With(WorkItemState.Working);
-        await _store.UpdateAsync(working);
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+        using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            hostShutdownCts.Token, operatorCancelCts.Token);
 
-        // Create a pipeline that blocks until the token fires, then exits
-        var pipeline = new BlockingShutdownPipeline(_store);
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, combinedCts.Token, hostShutdownCts.Token));
 
-        // Fire host shutdown — this cancels both hostShutdownCts and the linked itemCts
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(30);
-            await hostShutdownCts.CancelAsync();
-        });
+        // Poll until the real PipelineRunner has committed Working state to the DB
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
 
-        // RunAsync should throw (Task)CanceledException; item must remain Working
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
-            await pipeline.RunAsync(working, itemCts.Token, hostShutdownCts.Token));
+        // Signal host shutdown — both hostShutdownToken and combinedCts fire
+        await hostShutdownCts.CancelAsync();
 
-        var final = await _store.GetAsync(item.Id);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+
+        var final = await harness.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, final!.State);
         Assert.Null(final.CancellationReason);
     }
@@ -76,67 +120,84 @@ public sealed class HostShutdownCancellationTests : IDisposable
     [Fact]
     public async Task OperatorCancel_TransitionsItem_ToCancelled_WithReason()
     {
-        using var hostShutdownCts = new CancellationTokenSource(); // never fires
-        using var itemCts = new CancellationTokenSource();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var harness = BuildBlockingPipeline(seed);
 
         var item = NewItem();
-        await _store.CreateAsync(item);
+        await harness.Store.CreateAsync(item);
 
-        var working = item.With(WorkItemState.Working);
-        await _store.UpdateAsync(working);
+        using var hostShutdownCts = new CancellationTokenSource(); // never fires in this test
+        using var operatorCancelCts = new CancellationTokenSource();
+        using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            hostShutdownCts.Token, operatorCancelCts.Token);
 
-        var pipeline = new BlockingShutdownPipeline(_store);
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, combinedCts.Token, hostShutdownCts.Token));
 
-        // Fire item-level cancel only (not host shutdown)
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(30);
-            await itemCts.CancelAsync();
-        });
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
-            await pipeline.RunAsync(working, itemCts.Token, hostShutdownCts.Token));
+        // Signal operator cancel only — hostShutdownToken does NOT fire
+        await operatorCancelCts.CancelAsync();
 
-        var final = await _store.GetAsync(item.Id);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+
+        var final = await harness.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Cancelled, final!.State);
         Assert.Equal(WorkItemCancellationReason.OperatorRequested, final.CancellationReason);
+    }
+
+    private static async Task WaitForStateAsync(
+        SqliteWorkItemStore store, WorkItemId id, WorkItemState target, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var current = await store.GetAsync(id);
+            if (current?.State == target) return;
+            await Task.Delay(25);
+        }
+        var actual = (await store.GetAsync(id))?.State;
+        throw new TimeoutException(
+            $"Item {id} did not reach state {target} within {timeout}; final state: {actual}");
     }
 }
 
 /// <summary>
-/// Minimal pipeline that writes the item to Working, blocks on the cancellation
-/// token, then delegates to PipelineRunner's cancellation semantics via a
-/// direct re-implementation of the key catch clause.
+/// Disposable bundle of pipeline resources used by <see cref="HostShutdownCancellationTests"/>.
 /// </summary>
-internal sealed class BlockingShutdownPipeline : IPipelineRunner
+internal sealed class ShutdownTestHarness : IDisposable
 {
-    private readonly IWorkItemStore _store;
-    public BlockingShutdownPipeline(IWorkItemStore store) => _store = store;
+    public PipelineRunner Pipeline { get; }
+    public SqliteWorkItemStore Store { get; }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+    public ShutdownTestHarness(PipelineRunner pipeline, SqliteWorkItemStore store)
     {
-        try
-        {
-            await Task.Delay(Timeout.Infinite, ct);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            if (hostShutdownToken.IsCancellationRequested)
-            {
-                // Host shutdown — leave state unchanged so recovery can pick it up
-            }
-            else
-            {
-                // Operator cancel
-                var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-                if (current.State is not WorkItemState.Done and not WorkItemState.Failed)
-                {
-                    var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
-                        WorkItemCancellationReason.OperatorRequested);
-                    await _store.UpdateAsync(cancelled, CancellationToken.None);
-                }
-            }
-            throw;
-        }
+        Pipeline = pipeline;
+        Store = store;
+    }
+
+    public void Dispose() => Store.Dispose();
+}
+
+/// <summary>
+/// Agent runner that blocks indefinitely until the cancellation token fires.
+/// Holds the pipeline in the Working phase so shutdown tests can signal cancellation
+/// while the item is provably mid-flight.
+/// </summary>
+internal sealed class BlockingAgentRunner : IAgentRunner
+{
+    public AgentKind Kind { get; init; } = AgentKind.Claude;
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        await Task.Delay(Timeout.Infinite, ct);
+        return new AgentResult(false, "unreachable", null, null);
     }
 }

@@ -337,7 +337,8 @@ internal static class WorkItemEndpoints
 
         // Only resume from terminal-failed states. Done items have nothing
         // to retry; non-terminal states would race the pipeline.
-        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled))
+        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled
+            or WorkItemState.AbandonedAfterRecoveryAttempts))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
@@ -366,7 +367,8 @@ internal static class WorkItemEndpoints
                 });
         }
 
-        var resumed = item.With(resumeState.Value, error: null);
+        // Reset RecoveryAttempts so an abandoned item is not immediately re-abandoned on next restart.
+        var resumed = item.With(resumeState.Value, error: null) with { RecoveryAttempts = 0 };
         await store.UpdateAsync(resumed, ct);
         AuditLog.WorkItemRetried(workItemId, from);
         await queue.EnqueueAsync(resumed.Id, ct);
@@ -387,7 +389,8 @@ internal static class WorkItemEndpoints
         var workItemId = item!.Id;
 
         if (item.State is WorkItemState.Done or WorkItemState.Failed
-            or WorkItemState.Cancelled or WorkItemState.AuditFailed)
+            or WorkItemState.Cancelled or WorkItemState.AuditFailed
+            or WorkItemState.AbandonedAfterRecoveryAttempts)
             return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
 
         var wasActive = cancellations.Cancel(workItemId);
@@ -478,7 +481,9 @@ internal static class WorkItemEndpoints
             });
 
         var requeued = item.With(WorkItemState.Queued);
-        await store.UpdateAsync(requeued, ct);
+        var updated = await store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
+        if (!updated)
+            return Results.Conflict(new { error = "concurrent uncancel request already processed this item" });
         await queue.EnqueueAsync(requeued.Id, ct);
         AuditLog.WorkItemRetried(requeued.Id, "uncancel");
 
@@ -811,7 +816,8 @@ internal static class WorkItemEndpoints
 
         var isTerminal = item.State is
             WorkItemState.Done or WorkItemState.Failed or
-            WorkItemState.Cancelled or WorkItemState.AuditFailed;
+            WorkItemState.Cancelled or WorkItemState.AuditFailed or
+            WorkItemState.AbandonedAfterRecoveryAttempts;
 
         var entries = await timeline.GetTimelineAsync(workItemId.ToString(), isTerminal, item.CreatedAt, ct);
 

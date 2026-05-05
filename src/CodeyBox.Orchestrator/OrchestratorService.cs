@@ -319,7 +319,8 @@ public sealed class OrchestratorService : BackgroundService
 
         // WorkComplete / AuditPassed / Merged: bump RecoveryAttempts but keep state.
         var newAttempts = item.RecoveryAttempts + 1;
-        if (newAttempts > _opts.MaxRecoveryAttempts)
+        // MaxRecoveryAttempts <= 0 means unlimited (no cap). Only enforce when > 0.
+        if (_opts.MaxRecoveryAttempts > 0 && newAttempts > _opts.MaxRecoveryAttempts)
         {
             return item with
             {
@@ -608,7 +609,9 @@ public sealed record OrchestratorOptions
     /// Maximum number of times the recovery loop will reset a mid-flight work
     /// item before giving up and transitioning it to
     /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>. Default 3.
-    /// Set to 0 to disable the cap (not recommended in production).
+    /// Set to 0 (or any negative value) to disable the cap and recover indefinitely
+    /// (not recommended in production — a permanently-stuck item will be re-enqueued
+    /// on every orchestrator restart without bound).
     /// </summary>
     public int MaxRecoveryAttempts { get; init; } = 3;
 
