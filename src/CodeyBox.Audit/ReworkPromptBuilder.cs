@@ -10,7 +10,12 @@ namespace CodeyBox.Audit;
 /// </summary>
 public static class ReworkPromptBuilder
 {
-    public static string Build(string originalPrompt, IReadOnlyList<AuditFinding> findings, int iteration, int maxIterations)
+    public static string Build(
+        string originalPrompt,
+        IReadOnlyList<AuditFinding> findings,
+        int iteration,
+        int maxIterations,
+        IReadOnlyList<WorkItemQuestion>? answeredQuestions = null)
     {
         var sb = new StringBuilder();
         sb.AppendLine("## Rework requested");
@@ -24,6 +29,24 @@ public static class ReworkPromptBuilder
         sb.AppendLine();
         sb.AppendLine("    " + CodeyBoxTrailers.CoAuthoredBy);
         sb.AppendLine();
+
+        // Inject operator answers so the agent can apply them.
+        var answered = answeredQuestions?.Where(q => q.State == "answered").ToList();
+        if (answered is { Count: > 0 })
+        {
+            sb.AppendLine("## Operator answers to your questions");
+            sb.AppendLine();
+            sb.AppendLine("You asked the following question(s) and the operator has responded:");
+            sb.AppendLine();
+            foreach (var q in answered)
+            {
+                sb.Append("- **").Append(q.QuestionId).Append("**: \"").Append(q.QuestionText).AppendLine("\"");
+                sb.Append("  Answer: \"").Append(q.AnswerText).AppendLine("\"");
+                sb.AppendLine();
+            }
+            sb.AppendLine("Apply these answers to your work.");
+            sb.AppendLine();
+        }
 
         var grouped = findings.GroupBy(f => f.AuditorName);
         foreach (var group in grouped)

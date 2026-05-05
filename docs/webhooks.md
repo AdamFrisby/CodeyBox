@@ -30,6 +30,9 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
+| `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
+| `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` |
+| `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -214,6 +217,30 @@ carry the same `workItem` and `project` context.
 
 See [`suggestions.md`](suggestions.md) for the full agent contract and operator
 workflow.
+
+### `question_asked` details
+
+When `event` is `work_item.question_asked`, the `details` field carries the question that was parked:
+
+```json
+{
+  "details": {
+    "questionId": "q-001",
+    "questionText": "Which database migration strategy should I use?"
+  }
+}
+```
+
+One event fires **per new question**. If the agent emits three `<codeybox-question>` blocks in a single run, three events fire. Questions that already exist (duplicate `questionId` for the same work item) are silently ignored and do not fire a new event.
+
+| Field | Type | Description |
+|---|---|---|
+| `questionId` | string | The `id` attribute from the `<codeybox-question>` tag (≤ 64 alphanumeric/dash/underscore chars) |
+| `questionText` | string | The trimmed question text (≤ 4000 chars; redacted of secrets) |
+
+Subscribe to `work_item.question_asked` to alert operators when a work item needs human input before it can proceed.
+
+---
 
 ### `agent_smoke_failed` details
 

@@ -57,6 +57,7 @@ public sealed class PipelineRunner : IPipelineRunner
     // Null when no probes were provided (fail-open: no quota gate on audit agent).
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
     private readonly QuotaRouterOptions _auditQuotaOptions;
+    private readonly IWorkItemQuestionStore? _questionStore;
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -97,7 +98,8 @@ public sealed class PipelineRunner : IPipelineRunner
         ITimingStore? timingStore = null,
         IWorkItemCostStore? costStore = null,
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? costExtractors = null,
-        AgentCostCalculator? costCalculator = null)
+        AgentCostCalculator? costCalculator = null,
+        IWorkItemQuestionStore? questionStore = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -125,6 +127,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
                 .ToDictionary(p => p.Kind);
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
+        _questionStore = questionStore;
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct)
@@ -221,17 +224,26 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!skipWork)
             {
                 await Transition(item, WorkItemState.Working, ct, project);
+                string? workAgentStdout = null;
                 using (var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
                     workCts.CancelAfter(item.WorkTimeout);
-                    await RunWithStuckProbeAsync(item, project, agentKind, "work", workCts, ct, phaseCt =>
+                    workAgentStdout = await RunWithStuckProbeAsync(item, project, agentKind, "work", workCts, ct, phaseCt =>
                         RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                            BuildInitialWorkPrompt(item.Prompt), isInitial: true,
+                            BuildInitialWorkPrompt(item.Prompt, project.AllowAgentQuestions), isInitial: true,
                             networkProfile: project.NetworkProfiles.Work,
                             project: project,
                             phaseCt));
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
+
+                // When agent questions are enabled, parse stdout for <codeybox-question> blocks
+                // and park the work item at NeedsOperatorInput if any new questions were found.
+                if (project.AllowAgentQuestions && _questionStore is not null && workAgentStdout is not null)
+                {
+                    var parked = await TryParkForQuestionsAsync(item, project, workAgentStdout, ct);
+                    if (parked) return; // Pipeline parked; resume when operator answers.
+                }
             }
 
             // -------- Phase 1.5: Audit + rework loop --------
@@ -328,8 +340,27 @@ public sealed class PipelineRunner : IPipelineRunner
 
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
 
-    internal static string BuildInitialWorkPrompt(string userPrompt) =>
-        $"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.\n\n{userPrompt}";
+    internal static string BuildInitialWorkPrompt(string userPrompt, bool allowAgentQuestions = false)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
+
+        if (allowAgentQuestions)
+        {
+            sb.Append("""
+
+
+                If during your work you hit a decision that genuinely requires operator input — an ambiguous requirement, a missing convention, a trade-off the prompt didn't anticipate — write a single line to stdout in this exact format:
+
+                <codeybox-question id="q-001">Question text here. Be specific. State the decision and your default if no answer comes.</codeybox-question>
+
+                Then **continue working with your default**. Don't block. The orchestrator will surface the question to the operator; if they answer before your next iteration, you'll see it. If they don't, your default stands. Use this sparingly — only when a wrong default would significantly impact the design. The id must be alphanumeric with hyphens/underscores only (e.g. "q-001", "q-naming"). A maximum of 10 questions per work item is enforced.
+                """);
+        }
+
+        sb.Append($"\n\n{userPrompt}");
+        return sb.ToString();
+    }
 
     /// <summary>
     /// Resolves the git author identity to use for sandbox commits.
@@ -350,8 +381,9 @@ public sealed class PipelineRunner : IPipelineRunner
     /// branch is created from <paramref name="baseBranch"/>. On rework calls
     /// the branch is checked out as-is (with the work-phase commits already
     /// on it) and the agent stacks new commits on top.
+    /// Returns the agent's stdout for post-phase processing (e.g. question parsing).
     /// </summary>
-    private async Task RunAgentPhaseAsync(
+    private async Task<string?> RunAgentPhaseAsync(
         WorkItem item,
         IAgentRunner runner,
         string repoId,
@@ -508,6 +540,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
         if (isInitial && suggestionsJson is not null)
             await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
+
+        return agentResult.Stdout;
     }
 
     // Returns a 2 KB tail of agent output for inclusion in audit log events.
@@ -589,16 +623,21 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             await Transition(item, WorkItemState.Reworking, ct, project);
-            var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations);
+            var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
+                ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
+                : (IReadOnlyList<WorkItemQuestion>)[];
+            var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions);
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
-            await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct, phaseCt =>
-                RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
+            await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct, async phaseCt =>
+            {
+                await RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
                     reworkPrompt, isInitial: false,
                     networkProfile: project.NetworkProfiles.Rework,
                     project: project,
                     phaseCt,
-                    iteration: iteration));
+                    iteration: iteration);
+            });
         }
     }
 
@@ -1664,6 +1703,7 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItemState.Done => "work_item.done",
         WorkItemState.Failed => "work_item.failed",
         WorkItemState.Cancelled => "work_item.cancelled",
+        WorkItemState.NeedsOperatorInput => "work_item.needs_operator_input",
         _ => $"work_item.{state.ToString().ToLowerInvariant()}",
     };
 
@@ -1729,6 +1769,73 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex, "Cost: failed to persist row for work item {Id} phase '{Phase}'",
                 workItemId, phase);
         }
+    }
+
+    // ── Question parsing + NeedsOperatorInput parking ───────────────────────
+
+    private const int MaxQuestionsPerWorkItem = 10;
+
+    /// <summary>
+    /// Parses agent stdout for question blocks, persists new ones, and transitions
+    /// the work item to NeedsOperatorInput if at least one new question was created.
+    /// Returns true when the work item was parked; false otherwise.
+    /// </summary>
+    private async Task<bool> TryParkForQuestionsAsync(
+        WorkItem item, Project project, string agentStdout, CancellationToken ct)
+    {
+        var parsed = QuestionParser.Parse(agentStdout, _log);
+        if (parsed.Count == 0) return false;
+
+        // Count existing questions to enforce the per-work-item cap.
+        var existing = await _questionStore!.ListByWorkItemAsync(item.Id.ToString(), ct);
+        var existingCount = existing.Count;
+
+        var newQuestions = new List<WorkItemQuestion>();
+        foreach (var p in parsed)
+        {
+            if (existingCount + newQuestions.Count >= MaxQuestionsPerWorkItem)
+            {
+                _log.LogWarning(
+                    "Work item {Id}: question cap ({Max}) reached; ignoring additional <codeybox-question> blocks",
+                    item.Id, MaxQuestionsPerWorkItem);
+                break;
+            }
+
+            var question = new WorkItemQuestion
+            {
+                Id = Guid.NewGuid().ToString(),
+                WorkItemId = item.Id.ToString(),
+                QuestionId = p.QuestionId,
+                QuestionText = p.QuestionText,
+                AskedAt = DateTimeOffset.UtcNow,
+            };
+
+            var created = await _questionStore.CreateIfNotExistsAsync(question, ct);
+            if (created)
+                newQuestions.Add(question);
+        }
+
+        if (newQuestions.Count == 0) return false;
+
+        // Transition to NeedsOperatorInput and fire one webhook per new question.
+        await Transition(item, WorkItemState.NeedsOperatorInput, ct, project);
+
+        foreach (var q in newQuestions)
+        {
+            AuditLog.WorkItemTransitioned(item.Id, $"question_asked:{q.QuestionId}");
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.question_asked",
+                WorkItem = await _store.GetAsync(item.Id, CancellationToken.None) ?? item,
+                Project = project,
+                Details = new QuestionAskedDetails(item.Id.ToString(), project.Id.Value, q.QuestionId, q.QuestionText),
+            }, CancellationToken.None);
+        }
+
+        _log.LogInformation(
+            "Work item {Id} parked at NeedsOperatorInput with {Count} open question(s)",
+            item.Id, newQuestions.Count);
+        return true;
     }
 
     // ── Suggestion pickup ────────────────────────────────────────────────────
@@ -1827,6 +1934,25 @@ internal sealed class AuditFailedException : Exception
 {
     public AuditFailedException(string message) : base(message) { }
 }
+
+internal sealed record QuestionAskedDetails(
+    string WorkItemId,
+    string ProjectId,
+    string QuestionId,
+    string QuestionText);
+
+internal sealed record QuestionAnsweredDetails(
+    string WorkItemId,
+    string ProjectId,
+    string QuestionId,
+    string Answer,
+    string? AnsweredBy);
+
+internal sealed record QuestionDismissedDetails(
+    string WorkItemId,
+    string ProjectId,
+    string QuestionId,
+    string Reason);
 
 internal sealed record AuditIterationDetails(
     int Iteration,

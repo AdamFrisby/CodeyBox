@@ -109,6 +109,14 @@ public sealed record Project
     /// over the global <c>CodeyBox:Changelog</c> options.
     /// </summary>
     public ProjectChangelog? Changelog { get; init; }
+
+    /// <summary>
+    /// When true, agents in this project may emit structured <c>&lt;codeybox-question&gt;</c>
+    /// blocks mid-work to escalate ambiguity to the operator. The work item parks
+    /// at NeedsOperatorInput, fires a webhook, and waits for POST /workitems/{id}/answer.
+    /// Default false: agents must make their own calls.
+    /// </summary>
+    public bool AllowAgentQuestions { get; init; } = false;
 }
 
 /// <summary>

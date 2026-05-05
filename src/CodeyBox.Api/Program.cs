@@ -551,6 +551,11 @@ builder.Services.AddSingleton<ISuggestionStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteSuggestionStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IWorkItemQuestionStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteWorkItemQuestionStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -639,7 +644,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     null,
     sp.GetRequiredService<IWorkItemCostStore>(),
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(),
-    sp.GetRequiredService<AgentCostCalculator>()));
+    sp.GetRequiredService<AgentCostCalculator>(),
+    sp.GetService<IWorkItemQuestionStore>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {

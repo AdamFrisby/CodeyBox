@@ -226,6 +226,8 @@ public sealed class OrchestratorService : BackgroundService
             WorkItemState.Working, WorkItemState.WorkComplete,
             WorkItemState.Merging, WorkItemState.Merged, WorkItemState.UpstreamPushing,
             WorkItemState.Auditing, WorkItemState.Reworking, WorkItemState.AuditPassed,
+            // NeedsOperatorInput is deliberately excluded: parked items stay parked
+            // on restart and are only re-enqueued when the operator answers via the API.
         };
 
         foreach (var item in allItems)
@@ -263,6 +265,14 @@ public sealed class OrchestratorService : BackgroundService
             or WorkItemState.Failed or WorkItemState.AuditFailed)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
+            return;
+        }
+
+        // Items parked waiting for operator input must not be processed by a worker.
+        // They are re-enqueued by the answer/dismiss-question endpoints when all questions resolve.
+        if (item.State is WorkItemState.NeedsOperatorInput)
+        {
+            _log.LogWarning("Worker {WorkerId} skipping {Id}: still in NeedsOperatorInput state", workerIndex, id);
             return;
         }
 
