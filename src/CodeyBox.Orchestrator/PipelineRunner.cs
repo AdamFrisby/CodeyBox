@@ -250,7 +250,8 @@ public sealed class PipelineRunner : IPipelineRunner
             var auditors = _auditorComposer.Compose(project, agentRunner);
             if (auditors.Count > 0 && !skipAudit)
             {
-                await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct);
+                var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct);
+                if (auditParked) return; // Pipeline parked; resume when operator answers.
                 await Transition(item, WorkItemState.AuditPassed, ct, project);
             }
 
@@ -564,7 +565,7 @@ public sealed class PipelineRunner : IPipelineRunner
             kind.Value, result.Success, result.Summary, Display(Tail(result.Stdout)), Display(Tail(result.Stderr)));
     }
 
-    private async Task RunAuditLoopAsync(
+    private async Task<bool> RunAuditLoopAsync(
         WorkItem item,
         Project project,
         IAgentRunner runner,
@@ -608,7 +609,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogInformation("Audit iteration {Iter} passed for {Id} ({NonBlocking} non-blocking findings)",
                     iteration, item.Id, nonBlocking);
                 AuditLog.AuditPassed(iteration);
-                return;
+                return false;
             }
 
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
@@ -639,9 +640,10 @@ public sealed class PipelineRunner : IPipelineRunner
             if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
             {
                 var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
-                if (parked) return;
+                if (parked) return true;
             }
         }
+        return false;
     }
 
     private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(
