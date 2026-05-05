@@ -29,6 +29,11 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
+| `project.budget_warning` | Project's 30-day spend crossed the warning threshold (see [Details](#projectbudget_warning-details)) |
+| `project.budget_exceeded` | Project's 30-day spend crossed the hard cap; project queue auto-paused (see [Details](#projectbudget_warning-details)) |
+| `project.budget_recovered` | Project's 30-day spend dropped back below the warning threshold (see [Details](#projectbudget_warning-details)) |
+| `project.queue_paused` | Per-project queue was paused (manual or auto) |
+| `project.queue_resumed` | Per-project queue was resumed |
 | `work_item.recovered` | Dead-worker reaper recovered a work item that was mid-flight when its worker crashed (see [Details](#recovered-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `sandbox.leak_detected` | A leaked `codeybox-*` Multipass VM was detected (see [Details](#sandbox_leak-details)) |
@@ -219,6 +224,9 @@ carry the same `workItem` and `project` context.
 See [`suggestions.md`](suggestions.md) for the full agent contract and operator
 workflow.
 
+### `project.budget_warning` details
+
+When `event` is `project.budget_warning`, `project.budget_exceeded`, or `project.budget_recovered`, the `details` field is populated. `workItem` is `null` (these are project-level events, not tied to a specific work item).
 ### `recovered` details
 
 When `event` is `work_item.recovered`, the `details` field is populated:
@@ -226,6 +234,11 @@ When `event` is `work_item.recovered`, the `details` field is populated:
 ```json
 {
   "details": {
+    "projectId": "my-app",
+    "currentSpendUsd": 432.18,
+    "budgetUsd": 500.00,
+    "pct": 86.4,
+    "thresholdPct": 80
     "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "projectId": "my-project",
     "fromState": "Working",
@@ -239,6 +252,17 @@ When `event` is `work_item.recovered`, the `details` field is populated:
 
 | Field | Type | Description |
 |---|---|---|
+| `projectId` | string | Project whose budget triggered the event |
+| `currentSpendUsd` | decimal | 30-day rolling spend at time of event |
+| `budgetUsd` | decimal | Configured `MonthlyCostBudgetUsd` |
+| `pct` | number | `currentSpendUsd / budgetUsd * 100` |
+| `thresholdPct` | int | The threshold that was crossed (`CostWarningThresholdPct` or `CostHardCapPct`) |
+
+On restart, the first sweep tick re-fires any events that apply (idempotency requirement). Receivers should de-duplicate by `(projectId, thresholdState)` — the `pct` value lets you derive which band you're in.
+
+See [`budget-alerts.md`](budget-alerts.md) for configuration and edge-trigger semantics.
+
+---
 | `workItemId` | string | UUID of the recovered work item |
 | `projectId` | string | Project the item belongs to |
 | `fromState` | string | State the item was in when the worker was declared dead |

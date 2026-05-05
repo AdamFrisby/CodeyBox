@@ -182,6 +182,31 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         }
     }
 
+    public async Task<decimal> SumEstimatedUsdAsync(
+        string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+    {
+        using var readConn = new SqliteConnection($"Data Source={_path};Mode=ReadOnly");
+        readConn.Open();
+
+        using var cmd = readConn.CreateCommand();
+        // Single aggregation query; idx_costs_project_time covers (work_item_id, started_at)
+        // and the join to work_items on project_id is fast with that index.
+        cmd.CommandText = """
+            SELECT COALESCE(SUM(c.estimated_usd), 0.0)
+            FROM work_item_costs c
+            JOIN work_items w ON w.id = c.work_item_id
+            WHERE w.project_id = $proj
+              AND c.started_at >= $from
+              AND c.started_at < $to
+            """;
+        cmd.Parameters.AddWithValue("$proj", projectId);
+        cmd.Parameters.AddWithValue("$from", from.ToString("O"));
+        cmd.Parameters.AddWithValue("$to", to.ToString("O"));
+
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return Convert.ToDecimal(result ?? 0.0);
+    }
+
     private static WorkItemCost ReadRow(SqliteDataReader r) => new()
     {
         Id = r.GetString(0),

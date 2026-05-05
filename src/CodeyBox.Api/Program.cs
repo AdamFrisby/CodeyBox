@@ -902,6 +902,13 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
     sp.GetRequiredService<IAuditReportStore>(),
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog.RetainedDays,
     sp.GetRequiredService<ILogger<AuditReportRetentionService>>()));
+builder.Services.AddHostedService(sp => new BudgetAlertService(
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IWorkItemCostStore>(),
+    sp.GetRequiredService<IQueueController>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.BudgetAlerts,
+    sp.GetRequiredService<ILogger<BudgetAlertService>>()));
 
 builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 {
@@ -928,6 +935,7 @@ app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
 WorkItemEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
+ProjectBudgetEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
@@ -1078,6 +1086,8 @@ namespace CodeyBox.Api
         /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
         public AgentPricingOptions AgentPricing { get; set; } = new();
 
+        /// <summary>Monthly cost-budget alert sweep configuration. See docs/budget-alerts.md.</summary>
+        public BudgetAlertOptions BudgetAlerts { get; set; } = new();
         /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 

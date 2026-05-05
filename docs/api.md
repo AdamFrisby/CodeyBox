@@ -568,6 +568,50 @@ Fetch a single project by its id.
 * Returns `400 Bad Request` if `id` is not a valid project identifier.
 * Returns `404 Not Found` if the project does not exist.
 
+### `GET /projects/{id}/budget`
+
+Returns the monthly cost budget status for a project.
+
+```json
+{
+  "projectId": "my-app",
+  "monthlyBudgetUsd": 500.00,
+  "currentSpendUsd": 432.18,
+  "pct": 86.4,
+  "warningThresholdPct": 80,
+  "hardCapPct": 100,
+  "thresholdState": "warning",
+  "windowStart": "2026-04-02T15:30:00Z",
+  "windowEnd":   "2026-05-02T15:30:00Z",
+  "projectQueue": {
+    "paused": false,
+    "pausedAt": null,
+    "pausedReason": null
+  }
+}
+```
+
+`thresholdState` is one of `ok | warning | exceeded`. When `monthlyBudgetUsd = 0` the state is always `ok`.
+
+### `POST /projects/{id}/queue/pause`
+
+Manually pause work-item pickup for a single project. In-flight items continue to completion.
+
+```json
+{ "reason": "manual maintenance window" }
+```
+
+* `reason` — required, ≤ 500 chars, no control characters.
+* Returns `200 OK` with `{ "projectId", "paused": true, "pausedAt", "pausedReason" }`.
+* Returns `400 Bad Request` if reason is missing or invalid.
+* Returns `404 Not Found` if the project does not exist.
+
+### `POST /projects/{id}/queue/resume`
+
+Clear a per-project queue pause. No-op if the project is not paused.
+
+* Returns `200 OK` with `{ "projectId", "paused": false, "pausedAt": null, "pausedReason": null }`.
+* Returns `404 Not Found` if the project does not exist.
 ### `GET /workers`
 
 List currently-registered worker slots from the heartbeat registry. Useful for operator-grade introspection of what the process is currently doing, and for diagnosing stale rows after a crash.

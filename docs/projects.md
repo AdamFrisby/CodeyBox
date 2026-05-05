@@ -510,7 +510,37 @@ Returns current consumption against the configured limits:
 }
 ```
 
-The admin dashboard shows this as colour-coded usage bars per project
+The admin dashboard shows this as colour-coded usage bars per project.
+
+---
+
+## Monthly cost budget
+
+Set `Budget.MonthlyCostBudgetUsd > 0` to enable spend tracking and automatic alerts over a rolling 30-day window. See [budget-alerts.md](budget-alerts.md) for the full description.
+
+```json
+{
+  "Budget": {
+    "MaxItemsPerHour": 10,
+    "MaxItemsPerDay": 50,
+    "MaxConcurrentForProject": 2,
+
+    "MonthlyCostBudgetUsd": 500.00,
+    "CostWarningThresholdPct": 80,
+    "CostHardCapPct": 100,
+    "AutoResumeOnRecovery": false
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `MonthlyCostBudgetUsd` | `decimal` | `0` | Max USD spend in rolling 30-day window. 0 = unlimited. |
+| `CostWarningThresholdPct` | `int` | `80` | Webhook warning threshold percentage. 0 = disabled. |
+| `CostHardCapPct` | `int` | `100` | Auto-pause + webhook threshold percentage. 0 = no auto-pause. |
+| `AutoResumeOnRecovery` | `bool` | `false` | Auto-resume when spend drops back below `CostWarningThresholdPct`. |
+
+A project with `MonthlyCostBudgetUsd = 0` (the default) ignores all threshold configuration — no alerts, no auto-pause.
 (yellow ≥ 80%, red = 100%).
 
 ## REST API

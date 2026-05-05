@@ -345,6 +345,33 @@ public static class AuditLog
             .Information("Work item {WorkItemId} for project {ProjectId} deferred by budget cap: {Reason}",
                 id.ToString(), projectId.Value, reason);
 
+    public static void ProjectQueuePaused(ProjectId projectId, string reason) =>
+        Audit("project_queue.paused")
+            .Information("Project {ProjectId} queue paused: {Reason}", projectId.Value, reason);
+
+    public static void ProjectQueueResumed(ProjectId projectId) =>
+        Audit("project_queue.resumed")
+            .Information("Project {ProjectId} queue resumed", projectId.Value);
+
+    public static void BudgetAlertWarning(ProjectId projectId, decimal spendUsd, decimal budgetUsd, double pct) =>
+        Audit("budget_alert.warning")
+            .Warning("Project {ProjectId} budget warning: ${SpendUsd:F4} of ${BudgetUsd:F2} ({Pct:F1}%)",
+                projectId.Value, spendUsd, budgetUsd, pct);
+
+    public static void BudgetAlertExceeded(ProjectId projectId, decimal spendUsd, decimal budgetUsd, double pct) =>
+        Audit("budget_alert.exceeded")
+            .Warning("Project {ProjectId} budget exceeded: ${SpendUsd:F4} of ${BudgetUsd:F2} ({Pct:F1}%)",
+                projectId.Value, spendUsd, budgetUsd, pct);
+
+    public static void BudgetAlertRecovered(ProjectId projectId, decimal spendUsd, decimal budgetUsd, double pct) =>
+        Audit("budget_alert.recovered")
+            .Information("Project {ProjectId} budget recovered: ${SpendUsd:F4} of ${BudgetUsd:F2} ({Pct:F1}%)",
+                projectId.Value, spendUsd, budgetUsd, pct);
+
+    public static void BudgetAlertServiceStartupSafe(string reason) =>
+        Audit("budget_alert.startup_safe")
+            .Warning("BudgetAlertService: {Reason}; cost-budget checks will be skipped until the next tick", reason);
+
     // ── Quota router ─────────────────────────────────────────────────────────
 
     public static void QuotaProbed(AgentKind agent, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null) =>

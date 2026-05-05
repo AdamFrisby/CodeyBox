@@ -121,6 +121,29 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<BudgetUsageDto>(JsonOptions, ct);
     }
 
+    public async Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/projects/{Uri.EscapeDataString(projectId)}/budget", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ProjectBudgetDto>(JsonOptions, ct);
+    }
+
+    public async Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/projects/{Uri.EscapeDataString(projectId)}/queue/pause",
+            new { reason }, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ProjectQueueStateDto>(JsonOptions, ct);
+    }
+
+    public async Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/projects/{Uri.EscapeDataString(projectId)}/queue/resume",
+            new { }, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ProjectQueueStateDto>(JsonOptions, ct);
     public async Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync(

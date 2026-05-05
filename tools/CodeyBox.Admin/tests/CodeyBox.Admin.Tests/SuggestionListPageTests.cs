@@ -280,6 +280,12 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default)
+        => Task.FromResult<ProjectBudgetDto?>(null);
+    public Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default)
+        => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default)
+        => Task.FromResult<ProjectQueueStateDto?>(null);
     public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
         => Task.FromResult(new List<PluginDto>());
     public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
@@ -370,6 +376,12 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemCostsDto?>(null);
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
+    public Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default)
+        => Task.FromResult<ProjectBudgetDto?>(null);
+    public Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default)
+        => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default)
+        => Task.FromResult<ProjectQueueStateDto?>(null);
     public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
         => Task.FromResult(new List<PluginDto>());
     public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
