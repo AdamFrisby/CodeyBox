@@ -318,6 +318,26 @@ public static class AuditLog
             .Information("Changelog work item {WorkItemId} created for project {ProjectId} tag {ToTag}",
                 workItemId, projectId, toTag);
 
+    // ── Dead-worker recovery ─────────────────────────────────────────────────
+
+    public static void WorkerRegistered(string workerId, string hostName, int processId) =>
+        Audit("worker.registered")
+            .Information("Worker {WorkerId} registered on {HostName} (pid={ProcessId})", workerId, hostName, processId);
+
+    public static void WorkerDeregistered(string workerId) =>
+        Audit("worker.deregistered")
+            .Information("Worker {WorkerId} deregistered (clean shutdown)", workerId);
+
+    public static void DeadWorkerRecovered(WorkItemId itemId, string workerId, WorkItemState fromState, WorkItemState toState, int attempt) =>
+        Audit("work_item.worker_dead_recovered")
+            .Information("Dead worker {WorkerId}: recovered work item {WorkItemId} from {FromState} to {ToState} (attempt {Attempt})",
+                workerId, itemId.ToString(), fromState.ToString(), toState.ToString(), attempt);
+
+    public static void DeadWorkerFailedTerminal(WorkItemId itemId, string workerId, int attempt) =>
+        Audit("work_item.worker_dead_failed_terminal")
+            .Warning("Dead worker {WorkerId}: work item {WorkItemId} exceeded MaxRecoveryAttempts at attempt {Attempt}; transitioned to Failed",
+                workerId, itemId.ToString(), attempt);
+
     // ── Budget caps ──────────────────────────────────────────────────────────
 
     public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>

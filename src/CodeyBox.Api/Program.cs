@@ -716,6 +716,26 @@ builder.Services.AddSingleton<IQueueController>(sp =>
 builder.Services.AddSingleton<InMemoryTaskQueue>();
 builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTaskQueue>());
 
+// --- Dead-worker registry + reaper -------------------------------------------
+builder.Services.AddSingleton<IWorkerRegistry>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteWorkerRegistry(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteWorkerRegistry>>());
+});
+builder.Services.AddSingleton<DeadWorkerOptions>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.DeadWorker;
+    opts.Validate();
+    return opts;
+});
+builder.Services.AddSingleton<DeadWorkerReaper>(sp => new DeadWorkerReaper(
+    sp.GetRequiredService<IWorkerRegistry>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<DeadWorkerOptions>(),
+    sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
+    sp.GetRequiredService<IWebhookDispatcher>()));
+
 // --- Agent cost extractors + calculator ------------------------------------
 builder.Services.AddSingleton<AgentCostCalculator>(sp =>
 {
@@ -801,8 +821,12 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<AgentClassRouter>(),
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
-    sp.GetRequiredService<IWebhookDispatcher>()));
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IWorkerRegistry>(),
+    sp.GetRequiredService<DeadWorkerOptions>(),
+    sp.GetRequiredService<DeadWorkerReaper>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetServices<IAgentSmokeProbe>(),
@@ -846,6 +870,7 @@ WorkItemCostsEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
+WorkerRegistryEndpoints.Map(app);
 SandboxEndpoints.Map(app);
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
@@ -881,6 +906,9 @@ namespace CodeyBox.Api
 
         /// <summary>Worker pool sizing and spawn-pacing configuration.</summary>
         public WorkerPoolOptions WorkerPool { get; set; } = new();
+
+        /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
+        public DeadWorkerOptions DeadWorker { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;

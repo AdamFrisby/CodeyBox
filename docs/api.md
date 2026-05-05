@@ -439,6 +439,36 @@ Fetch a single project by its id.
 * Returns `400 Bad Request` if `id` is not a valid project identifier.
 * Returns `404 Not Found` if the project does not exist.
 
+### `GET /workers`
+
+List currently-registered worker slots from the heartbeat registry. Useful for operator-grade introspection of what the process is currently doing, and for diagnosing stale rows after a crash.
+
+Response: `200 OK` with a JSON array:
+
+```json
+[
+  {
+    "workerId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "hostName": "codeybox-host-01",
+    "processId": 12345,
+    "startedAt": "2026-05-04T10:00:00.000+00:00",
+    "lastHeartbeatAt": "2026-05-04T10:05:15.000+00:00",
+    "currentWorkItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  }
+]
+```
+
+| Field | Description |
+|---|---|
+| `workerId` | GUID unique to this process start |
+| `hostName` | Hostname of the machine running the worker |
+| `processId` | OS process ID |
+| `startedAt` | When this worker slot registered |
+| `lastHeartbeatAt` | When the heartbeat last fired (updated every `HeartbeatInterval`, default 15 s) |
+| `currentWorkItemId` | UUID of the work item being processed, or `null` if none |
+
+An empty array means no workers are currently registered. A row with a stale `lastHeartbeatAt` means the worker process has crashed and the dead-worker reaper will recover it on the next sweep (or has already done so and the row wasn't cleaned up). See [`recovery.md`](recovery.md) for the full reaper design.
+
 ### `GET /sandboxes/leaked`
 
 Returns the list of `codeybox-*` Multipass VMs that were detected as leaked on

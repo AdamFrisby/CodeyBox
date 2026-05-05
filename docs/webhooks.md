@@ -29,6 +29,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
+| `work_item.recovered` | Dead-worker reaper recovered a work item that was mid-flight when its worker crashed (see [Details](#recovered-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `sandbox.leak_detected` | A leaked `codeybox-*` Multipass VM was detected (see [Details](#sandbox_leak-details)) |
 | `sandbox.leak_disposed` | A leaked sandbox was successfully auto-disposed |
@@ -217,6 +218,36 @@ carry the same `workItem` and `project` context.
 
 See [`suggestions.md`](suggestions.md) for the full agent contract and operator
 workflow.
+
+### `recovered` details
+
+When `event` is `work_item.recovered`, the `details` field is populated:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "projectId": "my-project",
+    "fromState": "Working",
+    "toState": "Queued",
+    "reason": "dead worker detected",
+    "recoveryAttempt": 1,
+    "maxRecoveryAttempts": 2
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the recovered work item |
+| `projectId` | string | Project the item belongs to |
+| `fromState` | string | State the item was in when the worker was declared dead |
+| `toState` | string | State the item was transitioned to; `"Failed"` if `MaxRecoveryAttempts` was exceeded |
+| `reason` | string | Always `"dead worker detected"` |
+| `recoveryAttempt` | int | Which recovery attempt this is (1-based) |
+| `maxRecoveryAttempts` | int | The configured cap before the item is failed permanently |
+
+`work_item.recovered` fires even when `toState` is `"Failed"` (i.e. the cap was exceeded). Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](recovery.md) for the full state-mapping rules and configuration.
 
 ### `agent_smoke_failed` details
 

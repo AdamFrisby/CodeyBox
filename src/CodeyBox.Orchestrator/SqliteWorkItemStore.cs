@@ -91,8 +91,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // NULL means legacy row or non-cancelled item.
         RunMigration("ALTER TABLE work_items ADD COLUMN cancellation_reason TEXT;");
 
-        // Additive migration: how many times the recovery loop has reset this item.
-        // Default 0 = never recovered. Capped at OrchestratorOptions.MaxRecoveryAttempts.
+        // Additive migration: how many times the recovery loop / dead-worker reaper
+        // has reset this item. Default 0 = never recovered. Capped at MaxRecoveryAttempts.
         RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;");
     }
 

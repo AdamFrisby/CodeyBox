@@ -25,6 +25,9 @@ public sealed class OrchestratorService : BackgroundService
     private readonly IProjectRepository? _projects;
     private readonly IQueueController? _queueController;
     private readonly IWebhookDispatcher? _webhooks;
+    private readonly IWorkerRegistry? _workerRegistry;
+    private readonly DeadWorkerOptions? _deadWorkerOpts;
+    private readonly DeadWorkerReaper? _reaper;
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -64,7 +67,10 @@ public sealed class OrchestratorService : BackgroundService
         AgentClassRouter? router = null,
         IProjectRepository? projects = null,
         IQueueController? queueController = null,
-        IWebhookDispatcher? webhooks = null)
+        IWebhookDispatcher? webhooks = null,
+        IWorkerRegistry? workerRegistry = null,
+        DeadWorkerOptions? deadWorkerOpts = null,
+        DeadWorkerReaper? reaper = null)
     {
         _queue = queue;
         _store = store;
@@ -76,6 +82,9 @@ public sealed class OrchestratorService : BackgroundService
         _projects = projects;
         _queueController = queueController;
         _webhooks = webhooks;
+        _workerRegistry = workerRegistry;
+        _deadWorkerOpts = deadWorkerOpts;
+        _reaper = reaper;
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
     }
 
@@ -99,6 +108,14 @@ public sealed class OrchestratorService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Run the reaper once at startup before replaying pending items.
+        // This transitions any items that were mid-flight when the previous
+        // process crashed back to a recoverable state, so ReplayPendingAsync
+        // finds them in their correct target states (Queued, WorkComplete, …)
+        // rather than the stale worker-owned states.
+        if (_reaper is not null)
+            await _reaper.RunOnceAsync(stoppingToken);
+
         await ReplayPendingAsync(stoppingToken);
 
         // Collect in-flight item tasks so we can await them all on shutdown.
@@ -292,6 +309,23 @@ public sealed class OrchestratorService : BackgroundService
         }
     }
 
+    private async Task HeartbeatLoopAsync(string workerId, string currentWorkItemId, TimeSpan interval, CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(interval);
+        while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+        {
+            try
+            {
+                await _workerRegistry!.HeartbeatAsync(workerId, currentWorkItemId, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                // Fail-soft: transient storage failures must not kill the worker.
+                _log.LogWarning(ex, "Heartbeat failed for worker {WorkerId}; will retry on next interval", workerId);
+            }
+        }
+    }
+
     /// <summary>
     /// Builds the recovered state for a mid-flight work item, or returns null
     /// if the item does not need recovery (terminal or Queued).
@@ -365,6 +399,40 @@ public sealed class OrchestratorService : BackgroundService
             _log.LogInformation(
                 "Worker {WorkerId} skipping {Id}: already being processed by another worker", workerIndex, id);
             return;
+        }
+
+        // Register this execution in the worker registry so the dead-worker
+        // reaper can detect and recover it if this process crashes mid-flight.
+        string? registeredWorkerId = null;
+        CancellationTokenSource? heartbeatCts = null;
+        if (_workerRegistry is not null && _deadWorkerOpts is not null)
+        {
+            registeredWorkerId = Guid.NewGuid().ToString();
+            var reg = new WorkerRegistration
+            {
+                WorkerId = registeredWorkerId,
+                HostName = Environment.MachineName,
+                ProcessId = Environment.ProcessId,
+                StartedAt = DateTimeOffset.UtcNow,
+                LastHeartbeatAt = DateTimeOffset.UtcNow,
+                CurrentWorkItemId = id.ToString(),
+            };
+            try
+            {
+                await _workerRegistry.RegisterAsync(reg, ct);
+                AuditLog.WorkerRegistered(registeredWorkerId, reg.HostName, reg.ProcessId);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Failed to register worker {WorkerId} for item {Id}; continuing without heartbeat", registeredWorkerId, id);
+                registeredWorkerId = null;
+            }
+
+            if (registeredWorkerId is not null)
+            {
+                heartbeatCts = new CancellationTokenSource();
+                _ = HeartbeatLoopAsync(registeredWorkerId, id.ToString(), _deadWorkerOpts.HeartbeatInterval, heartbeatCts.Token);
+            }
         }
 
         try
@@ -490,6 +558,25 @@ public sealed class OrchestratorService : BackgroundService
         finally
         {
             _activeItems.TryRemove(id, out _);
+
+            // Stop the heartbeat and remove the registry row on any exit path
+            // (success, failure, or cancellation). On clean exit this clears
+            // the current_work_item_id linkage; on crash the row stays and the
+            // reaper cleans it up after DeadWorkerThreshold elapses.
+            if (registeredWorkerId is not null)
+            {
+                heartbeatCts?.Cancel();
+                heartbeatCts?.Dispose();
+                try
+                {
+                    await _workerRegistry!.DeregisterAsync(registeredWorkerId, CancellationToken.None);
+                    AuditLog.WorkerDeregistered(registeredWorkerId);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Failed to deregister worker {WorkerId}; row will be reaped by DeadWorkerReaper", registeredWorkerId);
+                }
+            }
         }
 
         // After the pipeline finishes (any outcome), check whether any
