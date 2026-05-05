@@ -60,6 +60,7 @@ public sealed class ProjectRepository : IProjectRepository
             Audit = ResolveAudit(pc.Audit, defaults.Audit),
             NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),
             Budget = ResolveBudget(pc.Budget),
+            ReleaseConfig = ResolveReleaseConfig(pc.Release),
         };
     }
 
@@ -178,6 +179,25 @@ public sealed class ProjectRepository : IProjectRepository
         "warning" or "warn" => AuditSeverity.Warning,
         _ => AuditSeverity.Error,
     };
+
+    private static ProjectReleaseConfig ResolveReleaseConfig(ProjectReleaseConfigOptions? c)
+    {
+        if (c is null) return new();
+        var defaults = new ProjectReleaseConfig();
+        TimeSpan? syncInterval = c.AutoSyncMainIntervalMinutes.HasValue
+            ? (c.AutoSyncMainIntervalMinutes.Value <= 0 ? null : TimeSpan.FromMinutes(c.AutoSyncMainIntervalMinutes.Value))
+            : defaults.AutoSyncMainInterval;
+        return new ProjectReleaseConfig
+        {
+            Enabled = c.Enabled ?? defaults.Enabled,
+            BranchNameTemplate = c.BranchNameTemplate ?? defaults.BranchNameTemplate,
+            AutoSyncMainInterval = syncInterval,
+            DeepAuditors = c.DeepAuditors is not null ? [.. c.DeepAuditors] : defaults.DeepAuditors,
+            DeepAuditMaxIterations = c.DeepAuditMaxIterations ?? defaults.DeepAuditMaxIterations,
+            CreateGitHubRelease = c.CreateGitHubRelease ?? defaults.CreateGitHubRelease,
+            GitHubTagTemplate = c.GitHubTagTemplate ?? defaults.GitHubTagTemplate,
+        };
+    }
 
     private static CustomAuditorDescriptor ResolveCustom(CustomAuditorConfig c)
     {

@@ -142,6 +142,8 @@ public sealed record Project
     /// Default false: agents must make their own calls.
     /// </summary>
     public bool AllowAgentQuestions { get; init; } = false;
+
+    /// <summary>
     /// Ordered list of credential plugin IDs this project prefers. When set,
     /// only the listed plugin IDs are included in the credential chain for this
     /// project, in the order given (between the built-in OAuth-file provider and
@@ -156,6 +158,14 @@ public sealed record Project
     /// rationale and per-project override semantics.</para>
     /// </summary>
     public IReadOnlyList<string> CredentialProviderPriority { get; init; } = [];
+
+    /// <summary>
+    /// Release management configuration. When <see cref="ProjectReleaseConfig.Enabled"/>
+    /// is false (the default) the release flow is completely inactive for this project:
+    /// POSTing a work item with a <c>releaseId</c> returns 400, and no release branches
+    /// are ever created. Opt in by setting Enabled=true.
+    /// </summary>
+    public ProjectReleaseConfig ReleaseConfig { get; init; } = new();
 }
 
 /// <summary>
@@ -383,4 +393,57 @@ public sealed record DiffPatternDescriptor
 {
     public required string Description { get; init; }
     public required string Regex { get; init; }
+}
+
+/// <summary>
+/// Per-project release management configuration.
+/// This feature is opt-in: set <see cref="Enabled"/> to true to activate it.
+/// Projects with <see cref="Enabled"/> = false see zero behaviour change.
+/// </summary>
+public sealed record ProjectReleaseConfig
+{
+    /// <summary>
+    /// When true this project participates in the release flow.
+    /// When false (default), a work item POST with a releaseId returns 400.
+    /// </summary>
+    public bool Enabled { get; init; }
+
+    /// <summary>
+    /// Branch name template. <c>{name}</c> is replaced with the release name.
+    /// Default: <c>release/{name}</c>.
+    /// </summary>
+    public string BranchNameTemplate { get; init; } = "release/{name}";
+
+    /// <summary>
+    /// Auto-merge main into the release branch at this interval while the release is open.
+    /// Keeps release-branch divergence bounded and reduces final-merge conflict surface.
+    /// Null = disabled. Default: 12 hours.
+    /// </summary>
+    public TimeSpan? AutoSyncMainInterval { get; init; } = TimeSpan.FromHours(12);
+
+    /// <summary>
+    /// Named deep auditors to run in the in_review phase. Each entry is a built-in
+    /// auditor name ("owasp-asvs", "arch-coherence", "deps-cve-scan") or
+    /// a plugin auditor ID. Empty list = skip deep audit (in_review immediately succeeds).
+    /// </summary>
+    public IReadOnlyList<string> DeepAuditors { get; init; } = [];
+
+    /// <summary>
+    /// Maximum iterations of deep audit + remediation work items before the release
+    /// transitions to <see cref="ReleaseState.Failed"/>. Default: 5.
+    /// Lower than the per-PR limit because convergence at the codebase level is harder.
+    /// </summary>
+    public int DeepAuditMaxIterations { get; init; } = 5;
+
+    /// <summary>
+    /// When true, on the <see cref="ReleaseState.Released"/> transition, also create a
+    /// GitHub release via the project's existing upstream remote. Default: false.
+    /// </summary>
+    public bool CreateGitHubRelease { get; init; }
+
+    /// <summary>
+    /// Template for the GitHub release tag when <see cref="CreateGitHubRelease"/> is true.
+    /// <c>{name}</c> is replaced with the release name. Default: <c>{name}</c>.
+    /// </summary>
+    public string GitHubTagTemplate { get; init; } = "{name}";
 }

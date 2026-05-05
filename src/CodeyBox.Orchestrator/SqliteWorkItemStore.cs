@@ -106,6 +106,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Additive migration: how many times the recovery loop / dead-worker reaper
         // has reset this item. Default 0 = never recovered. Capped at MaxRecoveryAttempts.
         RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;");
+
+        // Additive migration: link work items to a release. NULL = legacy / merge-to-main behaviour.
+        RunMigration("ALTER TABLE work_items ADD COLUMN release_id TEXT;");
+
+        // Index for release state machine queries (all items for a release).
+        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_release ON work_items(release_id) WHERE release_id IS NOT NULL;");
     }
 
     private void RunMigration(string sql)
@@ -134,10 +140,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                     stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
-                    min_model_score, cancellation_reason, recovery_attempts)
+                    min_model_score, cancellation_reason, recovery_attempts, release_id)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                     $sretries, $started_at, $external_id, $replay_of, $merge_sha,
-                    $min_model_score, $cancellation_reason, $recovery_attempts);
+                    $min_model_score, $cancellation_reason, $recovery_attempts, $release_id);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -172,7 +178,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
-                    recovery_attempts = $recovery_attempts
+                    recovery_attempts = $recovery_attempts,
+                    release_id = $release_id
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -202,7 +209,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
-                    recovery_attempts = $recovery_attempts
+                    recovery_attempts = $recovery_attempts,
+                    release_id = $release_id
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -428,6 +436,19 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    public async IAsyncEnumerable<WorkItem> ListByReleaseAsync(
+        CodeyBox.Core.ReleaseId releaseId,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM work_items WHERE release_id = $rid ORDER BY created_at;";
+        cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return Read(reader);
+    }
+
+
     public void Dispose()
     {
         _conn.Dispose();
@@ -464,6 +485,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$cancellation_reason",
             item.CancellationReason.HasValue ? (object)item.CancellationReason.Value.ToString() : DBNull.Value);
         cmd.Parameters.AddWithValue("$recovery_attempts", item.RecoveryAttempts);
+        cmd.Parameters.AddWithValue("$release_id", (object?)item.ReleaseId?.ToString() ?? DBNull.Value);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -494,6 +516,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         MinModelScore = ReadInt32OrDefault(r, "min_model_score", defaultValue: 95),
         CancellationReason = ReadCancellationReason(r),
         RecoveryAttempts = ReadInt32OrDefault(r, "recovery_attempts", defaultValue: 0),
+        ReleaseId = ReadNullableReleaseId(r, "release_id"),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)
@@ -524,6 +547,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         if (r.IsDBNull(ord)) return null;
         var raw = r.GetString(ord);
         return Guid.TryParse(raw, out var g) ? new WorkItemId(g) : null;
+    }
+
+    private static CodeyBox.Core.ReleaseId? ReadNullableReleaseId(SqliteDataReader r, string col)
+    {
+        var ord = r.GetOrdinal(col);
+        if (r.IsDBNull(ord)) return null;
+        return CodeyBox.Core.ReleaseId.TryParse(r.GetString(ord), out var rid) ? rid : null;
     }
 
     private static IReadOnlyList<WorkItemId> ReadDependsOn(SqliteDataReader r)

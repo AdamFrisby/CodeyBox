@@ -661,3 +661,40 @@ the orchestrator only reads through the interface.
 
 For one-off auditors that don't need a preset (project-specific build
 checks, etc.), use a `Custom` entry in the project config — no code change.
+
+---
+
+## Release management
+
+Releases group work items that target a shared release branch instead of
+`main`. The feature is **opt-in** via `release.enabled = true`. See
+[`releases.md`](releases.md) for a complete description.
+
+```yaml
+projects:
+  - id: my-app
+    release:
+      enabled: true
+      branchNameTemplate: "release/{name}"   # {name} → release.name value
+      autoSyncMainIntervalMinutes: 720        # 0 = disabled
+      deepAuditors:
+        - owasp-asvs
+        - arch-coherence
+        - deps-cve-scan
+      deepAuditMaxIterations: 5
+```
+
+**`branchNameTemplate`** — template for the release branch name. `{name}` is
+replaced with the release's `name` field (e.g. `"v1.4.0"` →
+`"release/v1.4.0"`). Default: `"release/{name}"`.
+
+**`autoSyncMainIntervalMinutes`** — how often (in minutes) the
+`ReleaseMainSyncService` background service merges `main` into each open
+release branch. Set to `0` to disable. Default: `720` (12 h).
+
+**`deepAuditors`** — list of auditor names to run during the `in_review`
+phase. Built-in values: `owasp-asvs`, `arch-coherence`, `deps-cve-scan`.
+Empty list = skip deep audit (transition directly to `released`).
+
+**`deepAuditMaxIterations`** — maximum number of deep audit iterations before
+transitioning to `failed`. Default: `5`.
