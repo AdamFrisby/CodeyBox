@@ -118,7 +118,7 @@ public sealed class LocalGitHost : IGitHost
         if (!IsNonFastForwardRejection(rc.Stdout, rc.Stderr))
             throw new InvalidOperationException($"git push to upstream failed: {rc.Stderr}");
 
-        await ReconcileRejectedUpstreamPushAsync(path, upstreamUrl, branch, upstreamEnv, reconcileStrategy, ct);
+        await ReconcileRejectedUpstreamPushAsync(path, upstreamUrl, branch, upstreamEnv, reconcileStrategy, _log, ct);
 
         rc = await RunGitAsync(
             workdir: path,
@@ -192,6 +192,7 @@ public sealed class LocalGitHost : IGitHost
         string branch,
         IReadOnlyDictionary<string, string> upstreamEnv,
         UpstreamPushReconcileStrategy reconcileStrategy,
+        ILogger<LocalGitHost> log,
         CancellationToken ct)
     {
         var upstreamRef = $"refs/remotes/codeybox-upstream/{branch}";
@@ -249,8 +250,14 @@ public sealed class LocalGitHost : IGitHost
                 await RunGitAsync(bareRepoPath, CancellationToken.None, "worktree", "remove", "--force", worktreePath);
             if (Directory.Exists(worktreePath))
             {
-                try { Directory.Delete(worktreePath, recursive: true); }
-                catch { }
+                try
+                {
+                    Directory.Delete(worktreePath, recursive: true);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    log.LogWarning(ex, "Failed to remove upstream reconcile worktree at {Path}", worktreePath);
+                }
             }
         }
     }
