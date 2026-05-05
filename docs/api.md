@@ -1000,3 +1000,7 @@ for the Fleet dashboard view — one round-trip per refresh instead of N+1 per-p
 - `monthlySpendUsd` and `monthlyBudgetUsd` are `null` when the cost store is unavailable; the endpoint never errors on missing cost data.
 - `isPaused` is always `false` until the budget-alerts work item adds `project_queue_state` table support.
 - `budgetThresholdState` is currently limited to `"ok"` or `"unknown"`; threshold-based values (`"warning"`, `"critical"`) require the budget-alerts work item.
+
+## Local Development
+
+For local dev, run `local/run-e2e.sh` from the repo root, which boots the orchestrator on http://127.0.0.1:5050.
