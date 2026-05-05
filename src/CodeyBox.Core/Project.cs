@@ -15,6 +15,31 @@ public sealed record ProjectBudget
     /// 0 = unlimited (subject to global MaxConcurrentWorkers).
     /// </summary>
     public int MaxConcurrentForProject { get; init; }
+
+    /// <summary>
+    /// Maximum estimated USD spend per rolling 30-day window. 0 = unlimited.
+    /// Computed from work_item_costs.estimated_usd summed across all work items
+    /// belonging to this project whose started_at is within the window.
+    /// </summary>
+    public decimal MonthlyCostBudgetUsd { get; init; }
+
+    /// <summary>
+    /// Webhook fires at this percentage of the monthly cost budget (default 80).
+    /// Set to 0 to disable the warning event. Ignored when MonthlyCostBudgetUsd = 0.
+    /// </summary>
+    public int CostWarningThresholdPct { get; init; } = 80;
+
+    /// <summary>
+    /// The project queue is automatically paused at this percentage (default 100).
+    /// Set to 0 to disable auto-pause (webhook still fires). Ignored when MonthlyCostBudgetUsd = 0.
+    /// </summary>
+    public int CostHardCapPct { get; init; } = 100;
+
+    /// <summary>
+    /// When true, the project queue is automatically resumed when spend drops back below
+    /// CostWarningThresholdPct. Default false; operator should manually unpause to acknowledge.
+    /// </summary>
+    public bool AutoResumeOnRecovery { get; init; }
 }
 
 /// <summary>

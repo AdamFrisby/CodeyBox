@@ -34,3 +34,16 @@ public sealed record PullRequestOpenedDetails
     public required string PullRequestUrl { get; init; }
     public string? MergedSha { get; init; }
 }
+
+/// <summary>
+/// Details payload for the <c>project.budget_warning</c>,
+/// <c>project.budget_exceeded</c>, and <c>project.budget_recovered</c> events.
+/// </summary>
+public sealed record ProjectBudgetEventDetails
+{
+    public required string ProjectId { get; init; }
+    public required decimal CurrentSpendUsd { get; init; }
+    public required decimal BudgetUsd { get; init; }
+    public required double Pct { get; init; }
+    public required int ThresholdPct { get; init; }
+}

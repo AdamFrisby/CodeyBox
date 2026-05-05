@@ -26,6 +26,11 @@ public interface ICodeyBoxApiClient
     // ── Budget usage ──────────────────────────────────────────────────────────
     Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default);
 
+    // ── Monthly cost budget ───────────────────────────────────────────────────
+    Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default);
+    Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default);
+    Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default);
+
     // ── Audit timeline ────────────────────────────────────────────────────────
     Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
         string id, string? kind = null, string? since = null, int? iteration = null,

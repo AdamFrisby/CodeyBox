@@ -319,6 +319,22 @@ public sealed class OrchestratorService : BackgroundService
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId };
             }
 
+            // Per-project pause gate: check before the budget lock so paused projects
+            // don't consume a budget lock slot. Block is pickup-only; in-flight items
+            // already running are not cancelled (same semantics as the global pause).
+            if (project is not null && _queueController is not null)
+            {
+                var projState = await _queueController.GetProjectStateAsync(item.ProjectId, ct);
+                if (projState is { Paused: true })
+                {
+                    _log.LogInformation(
+                        "Worker {WorkerId} skipping {Id}: project {ProjectId} queue is paused — {Reason}",
+                        workerIndex, id, item.ProjectId.Value, projState.PausedReason);
+                    ScheduleDeferredRequeue(item.Id, TimeSpan.FromMinutes(1), ct);
+                    return;
+                }
+            }
+
             // Budget gate + StartedAt write held under a per-project lock to prevent
             // TOCTOU: without the lock, concurrent workers for the same project can all
             // pass the budget check before any of them has committed StartedAt, allowing

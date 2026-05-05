@@ -22,4 +22,14 @@ public interface IWorkItemCostStore
 
     /// <summary>Deletes all cost records for a work item (cascade with parent item deletion).</summary>
     Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the SUM of estimated_usd for all cost records belonging to work items
+    /// in <paramref name="projectId"/> whose started_at falls within
+    /// [<paramref name="from"/>, <paramref name="to"/>). Uses a single aggregation
+    /// query against the indexed (work_item_id, started_at) column; safe to call
+    /// frequently.
+    /// </summary>
+    Task<decimal> SumEstimatedUsdAsync(
+        string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
 }

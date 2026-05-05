@@ -304,6 +304,10 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)
             => Task.CompletedTask;
+
+        public Task<decimal> SumEstimatedUsdAsync(
+            string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+            => Task.FromResult(0m);
     }
 
     // ── Fake LLM auditor (needsCreds=true path) ───────────────────────────────
@@ -334,5 +338,9 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)
             => Task.CompletedTask;
+
+        public Task<decimal> SumEstimatedUsdAsync(
+            string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+            => Task.FromResult(0m);
     }
 }
