@@ -1051,11 +1051,11 @@ public sealed record MultipassSandboxOptions
     public int BaselineMemoryGB { get; init; } = 4;
 
     /// <summary>
-    /// vCPU count for the baseline VM. Default 2. Multipass's default is
+    /// vCPU count for the baseline VM. Default 6. Multipass's default is
     /// 1; bumping speeds up build / scan / install cold-starts when the
     /// underlying tools parallelise.
     /// </summary>
-    public int BaselineCpus { get; init; } = 2;
+    public int BaselineCpus { get; init; } = 6;
 }
 
 internal sealed class MultipassSandbox : ISandbox

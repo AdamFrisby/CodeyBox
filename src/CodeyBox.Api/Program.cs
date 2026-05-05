@@ -462,6 +462,23 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
             sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
     }
 
+    // Codex (ChatGPT subscription) auth file. Default ~/.codex/auth.json — the
+    // codex CLI hard-reads that path. CodexAgentRunner writes the file into
+    // the sandbox before invoking codex.
+    var codexOauthFile =
+        Environment.GetEnvironmentVariable("CODEYBOX_CODEX_OAUTH_FILE")
+        ?? builder.Configuration["CodeyBox:CodexOAuthFile"];
+    if (!string.IsNullOrWhiteSpace(codexOauthFile))
+    {
+        if (codexOauthFile.StartsWith("~/", StringComparison.Ordinal))
+            codexOauthFile = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                codexOauthFile[2..]);
+        builtInFirst.Add(new CodexOAuthFileCredentialProvider(
+            codexOauthFile,
+            sp.GetService<ILogger<CodexOAuthFileCredentialProvider>>()));
+    }
+
     // Enumerate plugin-registered ICredentialProvider types using the list captured
     // from AddCodeyBoxPlugins (called before builder.Build()). Each plugin type is
     // registered in DI under its concrete type by PluginLoader.RegisterPlugins;
