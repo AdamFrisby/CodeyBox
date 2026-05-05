@@ -24,6 +24,16 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
 
     public string Name => "process";
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The process provider has no managed VM lifecycle; it returns an empty list.
+    /// </remarks>
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+    /// <inheritdoc/>
+    public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
     public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
         var id = Guid.NewGuid().ToString("N");
