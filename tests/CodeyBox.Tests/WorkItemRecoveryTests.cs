@@ -111,7 +111,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
     }
 
     [Fact]
-    public async Task UpstreamPushing_IsReenqueued_WithoutStateChange()
+    public async Task UpstreamPushing_IsReenqueued_AsMerged()
     {
         var item = Item(WorkItemState.UpstreamPushing);
         await _store.CreateAsync(item);
@@ -125,9 +125,11 @@ public sealed class WorkItemRecoveryTests : IDisposable
 
         await svc.ReplayPendingForTestAsync(CancellationToken.None);
 
-        // UpstreamPushing is re-enqueued as-is; UpstreamPushAttempts handles retries
+        // UpstreamPushing is recovered as Merged so PipelineRunner's skip flags
+        // route it directly to RunUpstreamPushPhaseAsync instead of replaying
+        // the full work+audit+merge pipeline.
         var recovered = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.UpstreamPushing, recovered!.State);
+        Assert.Equal(WorkItemState.Merged, recovered!.State);
         Assert.Equal(1, queue.Count);
     }
 

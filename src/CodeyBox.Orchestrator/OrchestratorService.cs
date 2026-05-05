@@ -303,21 +303,21 @@ public sealed class OrchestratorService : BackgroundService
             WorkItemState.Auditing => WorkItemState.WorkComplete,
             WorkItemState.Reworking => WorkItemState.WorkComplete,
             WorkItemState.Merging => WorkItemState.AuditPassed,
-            // UpstreamPushing: leave as-is; UpstreamPushAttempts handles retries.
             // WorkComplete / AuditPassed / Merged: pipeline resumes at the correct
             // phase; no state change needed, just re-enqueue.
+            // UpstreamPushing → Merged: the skip flags in PipelineRunner treat Merged
+            // as "all phases done, go straight to RunUpstreamPushPhaseAsync". Keeping
+            // UpstreamPushing would leave skipWork/skipAudit/skipMerge all false and
+            // trigger a full pipeline replay from scratch.
             WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged
                 => item.State,
-            WorkItemState.UpstreamPushing => item.State,
+            WorkItemState.UpstreamPushing => WorkItemState.Merged,
             _ => null,
         };
 
         if (targetState is null) return null;
 
-        // UpstreamPushing items are re-enqueued without state mutation.
-        if (targetState == WorkItemState.UpstreamPushing) return item;
-
-        // WorkComplete / AuditPassed / Merged: bump RecoveryAttempts but keep state.
+        // WorkComplete / AuditPassed / Merged / UpstreamPushing→Merged: bump RecoveryAttempts but keep state.
         var newAttempts = item.RecoveryAttempts + 1;
         // MaxRecoveryAttempts <= 0 means unlimited (no cap). Only enforce when > 0.
         if (_opts.MaxRecoveryAttempts > 0 && newAttempts > _opts.MaxRecoveryAttempts)
