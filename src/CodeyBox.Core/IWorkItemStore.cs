@@ -64,6 +64,8 @@ public interface IWorkItemStore
     /// can treat every project as un-paused without crashing.
     /// </summary>
     Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// Returns all work items whose <c>replay_of_work_item_id</c> matches
     /// <paramref name="sourceId"/>, in creation order (oldest first).
     /// </summary>
@@ -75,4 +77,10 @@ public interface IWorkItemStore
     /// become orphaned but keep running.
     /// </summary>
     Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default);
+
+    /// <summary>
+    /// List all work items linked to the given release. Used by the release
+    /// state machine to check whether all items have reached a terminal state.
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default);
 }

@@ -24,6 +24,30 @@ public static partial class Validation
     private static partial Regex BranchNameRegex();
 
     /// <summary>
+    /// Git tag name: ASCII alnum plus a small set of separators. Slashes are
+    /// excluded (tags don't need namespacing), keeping the set conservative
+    /// and safe for URL path segments and JSON bodies.
+    /// </summary>
+    [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9._\-]{0,249}$", RegexOptions.CultureInvariant)]
+    private static partial Regex TagNameRegex();
+
+    public static void ValidateTagName(string name, string fieldName = "targetTag")
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException($"{fieldName} must not be empty", fieldName);
+        if (name.Length > 250)
+            throw new ArgumentException($"{fieldName} must be <= 250 chars", fieldName);
+        if (name.Contains("..", StringComparison.Ordinal))
+            throw new ArgumentException($"{fieldName} must not contain '..'", fieldName);
+        if (name.EndsWith(".lock", StringComparison.Ordinal))
+            throw new ArgumentException($"{fieldName} must not end with '.lock'", fieldName);
+        if (name.AsSpan().IndexOfAny(['\n', '\r', '\0', '~', '^', ':', '?', '*', '[', '\\']) >= 0)
+            throw new ArgumentException($"{fieldName} contains characters invalid in a git refname", fieldName);
+        if (!TagNameRegex().IsMatch(name))
+            throw new ArgumentException($"{fieldName} '{name}' is not a valid tag name", fieldName);
+    }
+
+    /// <summary>
     /// Repository URL: accept https/http/git/ssh URIs, scp-like git URLs
     /// (user@host:path), or absolute filesystem paths. Reject anything with
     /// a leading dash so git can't interpret it as an option.

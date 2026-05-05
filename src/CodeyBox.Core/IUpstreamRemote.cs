@@ -26,6 +26,26 @@ public interface IUpstreamRemote
     /// for graceful soft-failures (e.g. PR already exists).
     /// </summary>
     Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default);
+
+    /// <summary>
+    /// Attempts to merge <paramref name="sourceBranch"/> into <paramref name="targetBranch"/>
+    /// on the upstream (e.g. GitHub Merges API, or host-side git merge+push for generic git).
+    /// Returns <c>true</c> when the merge succeeded or the target was already up-to-date.
+    /// Returns <c>false</c> when a merge conflict is detected; the caller should emit a
+    /// <c>release.sync_conflict</c> event and leave the conflict for a human to resolve.
+    /// Throws on unexpected infrastructure failures (network error, auth failure, etc.).
+    /// </summary>
+    Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default);
+
+    /// <summary>
+    /// Creates a tag at <paramref name="sha"/> and publishes a release named
+    /// <paramref name="tagName"/> on the upstream forge. Returns the URL of the
+    /// created release, or <c>null</c> when the upstream kind does not support
+    /// forge releases (e.g. noop, git-generic). Never throws on unsupported — the
+    /// caller logs and continues; a missing GitHub release is not a hard failure.
+    /// </summary>
+    Task<string?> CreateTagAndReleaseAsync(string tagName, string sha, string? releaseNotes, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }
 
 public sealed record UpstreamPushResult(bool Success, string? Error);

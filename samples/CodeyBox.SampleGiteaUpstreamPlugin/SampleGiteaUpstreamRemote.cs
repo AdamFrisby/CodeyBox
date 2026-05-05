@@ -75,6 +75,14 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
         => Task.FromResult(new UpstreamPushResult(
             false, "push-only not supported by this plugin; use CompleteAsync"));
 
+    // Release management hook: merge the source branch into the target branch
+    // upstream. Sample plugin returns true (no-op) since per-project config is
+    // not reachable in this code path; production plugins should call the Gitea
+    // merge API or perform a host-side git merge+push.
+    public Task<bool> TryMergeUpstreamBranchAsync(
+        string targetBranch, string sourceBranch, CancellationToken ct = default)
+        => Task.FromResult(true);
+
     public async Task<UpstreamCompletionOutcome> CompleteAsync(
         UpstreamCompletionRequest request, CancellationToken ct = default)
     {
