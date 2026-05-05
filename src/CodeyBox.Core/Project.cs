@@ -136,6 +136,12 @@ public sealed record Project
     public ProjectChangelog? Changelog { get; init; }
 
     /// <summary>
+    /// When true, agents in this project may emit structured <c>&lt;codeybox-question&gt;</c>
+    /// blocks mid-work to escalate ambiguity to the operator. The work item parks
+    /// at NeedsOperatorInput, fires a webhook, and waits for POST /workitems/{id}/answer.
+    /// Default false: agents must make their own calls.
+    /// </summary>
+    public bool AllowAgentQuestions { get; init; } = false;
     /// Ordered list of credential plugin IDs this project prefers. When set,
     /// only the listed plugin IDs are included in the credential chain for this
     /// project, in the order given (between the built-in OAuth-file provider and

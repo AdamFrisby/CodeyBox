@@ -283,6 +283,14 @@ public sealed class CapturingApiClient : ICodeyBoxApiClient
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
 
+    public Task<List<QuestionDto>> GetQuestionsAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult(new List<QuestionDto>());
+
+    public Task<bool> AnswerQuestionAsync(string workItemId, string questionId, string answer, CancellationToken ct = default)
+        => Task.FromResult(true);
+
+    public Task<bool> DismissQuestionAsync(string workItemId, string questionId, string reason, CancellationToken ct = default)
+        => Task.FromResult(true);
     public Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default)
         => Task.FromResult(new List<FleetSummaryDto>());
     public Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default) => Task.FromResult(false);

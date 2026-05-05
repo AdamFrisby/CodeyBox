@@ -490,6 +490,96 @@ SQLite cursor rather than loading all rows into memory.
 **Response (200 OK):** step-stat array.  See [`timings.md`](timings.md) for
 the full schema.
 
+### `GET /workitems/{id}/questions`
+
+List all questions the agent asked for a work item.
+
+* Returns `200 OK` with a JSON array of question records (ordered by `askedAt` ascending):
+
+```json
+[
+  {
+    "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "workItemId": "5b6e...",
+    "questionId": "q-001",
+    "questionText": "Which database migration strategy should I use?",
+    "state": "open",
+    "askedAt": "2026-05-05T10:00:00+00:00",
+    "answeredAt": null,
+    "answerText": null,
+    "answeredBy": null,
+    "dismissedAt": null,
+    "dismissReason": null
+  }
+]
+```
+
+`state` is one of `"open"`, `"answered"`, or `"dismissed"`.
+
+* Returns `404 Not Found` when the work item does not exist.
+
+### `POST /workitems/{id}/answer`
+
+Provide an operator answer to one of the agent's questions.
+
+```json
+{
+  "questionId": "q-001",
+  "answer": "Use approach B; we standardise on forward-only migrations."
+}
+```
+
+* `questionId` — required, must be non-empty.
+* `answer` — required, must be non-empty.
+
+When all questions for the work item are in a terminal state (`answered` or `dismissed`), the item transitions from `NeedsOperatorInput` to `WorkComplete` and is re-enqueued so the agent can continue with the answers.
+
+**Response (200 OK):**
+
+```json
+{ "status": "answered" }
+```
+
+When the question was already answered (idempotent no-op):
+
+```json
+{ "status": "no-op" }
+```
+
+* Returns `400 Bad Request` when `questionId` or `answer` is empty.
+* Returns `404 Not Found` when the work item or question does not exist.
+
+### `POST /workitems/{id}/dismiss-question`
+
+Dismiss an agent question without providing an answer (e.g. it is out of scope or the agent should use its default).
+
+```json
+{
+  "questionId": "q-001",
+  "reason": "Out of scope for this PR; use the project default."
+}
+```
+
+* `questionId` — required, must be non-empty.
+* `reason` — required, must be non-empty.
+
+Dismissed questions are **not shown** to the agent in the rework prompt; the agent proceeds without any hint that the question was asked. Like `POST /answer`, when all questions are resolved the item transitions to `WorkComplete` and is re-enqueued.
+
+**Response (200 OK):**
+
+```json
+{ "status": "dismissed" }
+```
+
+When the question was already dismissed (idempotent no-op):
+
+```json
+{ "status": "no-op" }
+```
+
+* Returns `400 Bad Request` when `questionId` or `reason` is empty.
+* Returns `404 Not Found` when the work item or question does not exist.
+
 ### `DELETE /workitems/{id}`
 
 Cancel a non-terminal work item.
@@ -812,8 +902,10 @@ for displaying human-readable dependency labels.
 
 `state` is one of: `Queued`, `Working`, `WorkComplete`, `Auditing`,
 `AuditPassed`, `Reworking`, `AuditFailed`, `Merging`, `Merged`,
-`UpstreamPushing`, `Done`, `Failed`, `Cancelled`. Audit states only
-appear when the deployment has registered auditors (see
+`UpstreamPushing`, `Done`, `NeedsOperatorInput`, `Failed`, `Cancelled`.
+`NeedsOperatorInput` means the agent asked one or more questions and is
+waiting for operator input — see [`agent-questions.md`](agent-questions.md).
+Audit states only appear when the deployment has registered auditors (see
 [`audit.md`](audit.md)).
 
 `dependsOn` lists the IDs of work items this item depends on.

@@ -19,6 +19,9 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/replays", GetReplaysAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
+        group.MapGet("/{id}/questions", GetQuestionsAsync);
+        group.MapPost("/{id}/answer", AnswerQuestionAsync);
+        group.MapPost("/{id}/dismiss-question", DismissQuestionAsync);
         group.MapGet("/{id}/stdout-tail", GetStdoutTailAsync);
         group.MapPost("/{id}/uncancel", UncancelAsync);
 
@@ -917,6 +920,162 @@ internal static class WorkItemEndpoints
         return project is null ? Results.NotFound() : Results.Ok(ToProjectDto(project));
     }
 
+    // ── Agent question endpoints ──────────────────────────────────────────────
+
+    private static async Task<IResult> GetQuestionsAsync(
+        string id,
+        IWorkItemStore store,
+        IWorkItemQuestionStore? questionStore,
+        CancellationToken ct)
+    {
+        if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+        var questions = await questionStore.ListByWorkItemAsync(item!.Id.ToString(), ct);
+        return Results.Ok(questions.Select(q => new QuestionDto(
+            q.Id, q.WorkItemId, q.QuestionId, q.QuestionText,
+            q.State, q.AskedAt, q.AnsweredAt, q.AnswerText, q.AnsweredBy,
+            q.DismissedAt, q.DismissReason)));
+    }
+
+    private static async Task<IResult> AnswerQuestionAsync(
+        string id,
+        AnswerQuestionRequest req,
+        IWorkItemStore store,
+        IWorkItemQuestionStore? questionStore,
+        ITaskQueue queue,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
+    {
+        if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
+        if (string.IsNullOrWhiteSpace(req.QuestionId))
+            return Results.BadRequest(new { error = "questionId is required" });
+        if (!System.Text.RegularExpressions.Regex.IsMatch(req.QuestionId, @"^[a-zA-Z0-9_-]{1,64}$"))
+            return Results.BadRequest(new { error = "questionId must be 1-64 alphanumeric/hyphen/underscore characters" });
+        if (string.IsNullOrWhiteSpace(req.Answer))
+            return Results.BadRequest(new { error = "answer is required" });
+        if (req.Answer.Length > 4000)
+            return Results.BadRequest(new { error = "answer must be <= 4000 chars" });
+
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State != WorkItemState.NeedsOperatorInput)
+            return Results.Conflict(new { error = "work item is not waiting for operator input" });
+
+        var question = await questionStore.GetAsync(item.Id.ToString(), req.QuestionId, ct);
+        if (question is null) return Results.NotFound(new { error = $"question '{req.QuestionId}' not found" });
+
+        // Idempotent: answering an already-answered question is a no-op.
+        if (question.State != "open")
+            return Results.Ok(new { status = "no-op", questionState = question.State });
+
+        var redactedAnswer = RawOutputRedactor.Redact(req.Answer);
+        await questionStore.AnswerAsync(item.Id.ToString(), req.QuestionId, redactedAnswer, answeredBy: null, ct);
+
+        var project = await projects.GetAsync(item.ProjectId, ct);
+        await webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "work_item.question_answered",
+            WorkItem = item,
+            Project = project,
+            Details = new QuestionAnsweredDetails(item.Id.ToString(), item.ProjectId.Value, req.QuestionId, redactedAnswer, AnsweredBy: null),
+        }, ct);
+
+        // Transition out of NeedsOperatorInput if all questions are now resolved.
+        await MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
+
+        return Results.Ok(new { status = "answered" });
+    }
+
+    private static async Task<IResult> DismissQuestionAsync(
+        string id,
+        DismissQuestionRequest req,
+        IWorkItemStore store,
+        IWorkItemQuestionStore? questionStore,
+        ITaskQueue queue,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
+    {
+        if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
+        if (string.IsNullOrWhiteSpace(req.QuestionId))
+            return Results.BadRequest(new { error = "questionId is required" });
+        if (!System.Text.RegularExpressions.Regex.IsMatch(req.QuestionId, @"^[a-zA-Z0-9_-]{1,64}$"))
+            return Results.BadRequest(new { error = "questionId must be 1-64 alphanumeric/hyphen/underscore characters" });
+        if (string.IsNullOrWhiteSpace(req.Reason))
+            return Results.BadRequest(new { error = "reason is required" });
+        if (req.Reason.Length > 500)
+            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State != WorkItemState.NeedsOperatorInput)
+            return Results.Conflict(new { error = "work item is not waiting for operator input" });
+
+        var question = await questionStore.GetAsync(item.Id.ToString(), req.QuestionId, ct);
+        if (question is null) return Results.NotFound(new { error = $"question '{req.QuestionId}' not found" });
+
+        if (question.State != "open")
+            return Results.Ok(new { status = "no-op", questionState = question.State });
+
+        var redactedReason = RawOutputRedactor.Redact(req.Reason);
+        await questionStore.DismissAsync(item.Id.ToString(), req.QuestionId, redactedReason, ct);
+
+        var project = await projects.GetAsync(item.ProjectId, ct);
+        await webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "work_item.question_dismissed",
+            WorkItem = item,
+            Project = project,
+            Details = new QuestionDismissedDetails(item.Id.ToString(), item.ProjectId.Value, req.QuestionId, redactedReason),
+        }, ct);
+
+        // Transition out of NeedsOperatorInput if all questions are now resolved.
+        await MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
+
+        return Results.Ok(new { status = "dismissed" });
+    }
+
+    /// <summary>
+    /// When a work item is in NeedsOperatorInput state and all its questions are now
+    /// resolved (answered or dismissed), transitions back to WorkComplete and re-enqueues.
+    /// </summary>
+    private static async Task MaybeResumeFromNeedsOperatorInputAsync(
+        WorkItem item,
+        IWorkItemStore store,
+        IWorkItemQuestionStore questionStore,
+        ITaskQueue queue,
+        IWebhookDispatcher webhooks,
+        Project? project,
+        CancellationToken ct)
+    {
+        var current = await store.GetAsync(item.Id, ct) ?? item;
+        if (current.State != WorkItemState.NeedsOperatorInput) return;
+
+        var allQuestions = await questionStore.ListByWorkItemAsync(item.Id.ToString(), ct);
+        var hasOpen = allQuestions.Any(q => q.State == "open");
+        if (hasOpen) return;
+
+        var resumed = current.With(WorkItemState.WorkComplete);
+        var transitioned = await store.TryUpdateIfStateAsync(resumed, WorkItemState.NeedsOperatorInput, ct);
+        if (!transitioned) return;
+        AuditLog.WorkItemTransitioned(item.Id, "WorkComplete (resumed from NeedsOperatorInput)");
+        await queue.EnqueueAsync(item.Id, ct);
+
+        if (project is not null)
+        {
+            await webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.work_complete",
+                WorkItem = resumed,
+                Project = project,
+            }, ct);
+        }
+    }
+
     // ── Work item resolver ────────────────────────────────────────────────────
 
     /// <summary>
@@ -1154,6 +1313,22 @@ public sealed record ProjectDto(
     IReadOnlyList<string> AuditTypes,
     int AuditMaxIterations);
 
+public sealed record AnswerQuestionRequest(string QuestionId, string Answer);
+
+public sealed record DismissQuestionRequest(string QuestionId, string Reason);
+
+public sealed record QuestionDto(
+    string Id,
+    string WorkItemId,
+    string QuestionId,
+    string QuestionText,
+    string State,
+    DateTimeOffset AskedAt,
+    DateTimeOffset? AnsweredAt,
+    string? AnswerText,
+    string? AnsweredBy,
+    DateTimeOffset? DismissedAt,
+    string? DismissReason);
 public sealed record ReplayWorkItemRequest(
     string? Agent = null,
     string? ModelId = null,

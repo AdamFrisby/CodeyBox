@@ -17,6 +17,7 @@ public enum WorkItemState
     Merged = 4,
     UpstreamPushing = 5,
     Done = 6,
+    NeedsOperatorInput = 10,
     Failed = 100,
     Cancelled = 101,
     AuditFailed = 102,

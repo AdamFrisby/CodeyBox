@@ -313,10 +313,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // visible, preventing the concurrent cap from being exceeded.
         // Terminal states excluded; use cast enum values so renumbering is caught at compile time.
         using var cmd = _conn.CreateCommand();
+        // NeedsOperatorInput items are parked (pipeline not running); exclude them so they
+        // don't consume a concurrent slot while operators are offline for hours/days.
         cmd.CommandText = $"""
             SELECT COUNT(*) FROM work_items
             WHERE project_id = $pid
               AND started_at IS NOT NULL
+              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.NeedsOperatorInput});
               AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);

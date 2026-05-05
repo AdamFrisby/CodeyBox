@@ -265,6 +265,12 @@ public sealed class OrchestratorService : BackgroundService
             .ToList();
         if (legacyBuried.Count > 0)
         {
+            WorkItemState.Working, WorkItemState.WorkComplete,
+            WorkItemState.Merging, WorkItemState.Merged, WorkItemState.UpstreamPushing,
+            WorkItemState.Auditing, WorkItemState.Reworking, WorkItemState.AuditPassed,
+            // NeedsOperatorInput is deliberately excluded: parked items stay parked
+            // on restart and are only re-enqueued when the operator answers via the API.
+        };
             _log.LogWarning(
                 "Found {Count} work item(s) in Cancelled state with ambiguous reason " +
                 "(may have been interrupted by a prior host shutdown before the no-shutdown-cancel fix): {Ids}. " +
@@ -387,6 +393,14 @@ public sealed class OrchestratorService : BackgroundService
             or WorkItemState.AbandonedAfterRecoveryAttempts)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
+            return;
+        }
+
+        // Items parked waiting for operator input must not be processed by a worker.
+        // They are re-enqueued by the answer/dismiss-question endpoints when all questions resolve.
+        if (item.State is WorkItemState.NeedsOperatorInput)
+        {
+            _log.LogWarning("Worker {WorkerId} skipping {Id}: still in NeedsOperatorInput state", workerIndex, id);
             return;
         }
 

@@ -204,6 +204,27 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return parts.Count > 0 ? "?" + string.Join("&", parts) : "";
     }
 
+    public async Task<List<QuestionDto>> GetQuestionsAsync(string workItemId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(workItemId)}/questions", ct);
+        if (!resp.IsSuccessStatusCode) return [];
+        return await resp.Content.ReadFromJsonAsync<List<QuestionDto>>(JsonOptions, ct) ?? [];
+    }
+
+    public async Task<bool> AnswerQuestionAsync(string workItemId, string questionId, string answer, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/workitems/{Uri.EscapeDataString(workItemId)}/answer",
+            new { questionId, answer }, JsonOptions, ct);
+        return resp.IsSuccessStatusCode;
+    }
+
+    public async Task<bool> DismissQuestionAsync(string workItemId, string questionId, string reason, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/workitems/{Uri.EscapeDataString(workItemId)}/dismiss-question",
+            new { questionId, reason }, JsonOptions, ct);
+        return resp.IsSuccessStatusCode;
     public async Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
     {
         var result = await _http.GetFromJsonAsync<List<PluginDto>>("/plugins", JsonOptions, ct);

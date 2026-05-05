@@ -36,6 +36,10 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `project.queue_resumed` | Per-project queue was resumed |
 | `work_item.recovered` | Dead-worker reaper recovered a work item that was mid-flight when its worker crashed (see [Details](#recovered-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
+| `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
+| `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
+| `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` (see [Details](#question_answered-details)) |
+| `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` (see [Details](#question_dismissed-details)) |
 | `sandbox.leak_detected` | A leaked `codeybox-*` Multipass VM was detected (see [Details](#sandbox_leak-details)) |
 | `sandbox.leak_disposed` | A leaked sandbox was successfully auto-disposed |
 | `sandbox.leak_dispose_failed` | Auto-disposal of a leaked sandbox failed |
@@ -224,6 +228,31 @@ carry the same `workItem` and `project` context.
 See [`suggestions.md`](suggestions.md) for the full agent contract and operator
 workflow.
 
+### `question_asked` details
+
+When `event` is `work_item.question_asked`, the `details` field carries the question that was parked:
+
+```json
+{
+  "details": {
+    "questionId": "q-001",
+    "questionText": "Which database migration strategy should I use?"
+  }
+}
+```
+
+One event fires **per new question**. If the agent emits three `<codeybox-question>` blocks in a single run, three events fire. Questions that already exist (duplicate `questionId` for the same work item) are silently ignored and do not fire a new event.
+
+| Field | Type | Description |
+|---|---|---|
+| `questionId` | string | The `id` attribute from the `<codeybox-question>` tag (≤ 64 alphanumeric/dash/underscore chars) |
+| `questionText` | string | The trimmed question text (≤ 4000 chars; redacted of secrets) |
+
+Subscribe to `work_item.question_asked` to alert operators when a work item needs human input before it can proceed.
+
+### `question_answered` details
+
+When `event` is `work_item.question_answered`, the `details` field carries the answered question:
 ### `project.budget_warning` details
 
 When `event` is `project.budget_warning`, `project.budget_exceeded`, or `project.budget_recovered`, the `details` field is populated. `workItem` is `null` (these are project-level events, not tied to a specific work item).
@@ -234,6 +263,11 @@ When `event` is `work_item.recovered`, the `details` field is populated:
 ```json
 {
   "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "projectId": "my-project",
+    "questionId": "q-001",
+    "answer": "Use approach B; we standardise on those across the codebase.",
+    "answeredBy": null
     "projectId": "my-app",
     "currentSpendUsd": 432.18,
     "budgetUsd": 500.00,
@@ -252,6 +286,35 @@ When `event` is `work_item.recovered`, the `details` field is populated:
 
 | Field | Type | Description |
 |---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `projectId` | string | Project the work item belongs to |
+| `questionId` | string | The question ID that was answered |
+| `answer` | string | The operator's answer (redacted of secrets) |
+| `answeredBy` | string\|null | Identity of the operator who answered; currently always `null` (auth layer does not yet populate caller identity) |
+
+### `question_dismissed` details
+
+When `event` is `work_item.question_dismissed`, the `details` field carries the dismissed question:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "projectId": "my-project",
+    "questionId": "q-001",
+    "reason": "Out of scope for this PR."
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `projectId` | string | Project the work item belongs to |
+| `questionId` | string | The question ID that was dismissed |
+| `reason` | string | The operator's reason for dismissal (redacted of secrets) |
+
+---
 | `projectId` | string | Project whose budget triggered the event |
 | `currentSpendUsd` | decimal | 30-day rolling spend at time of event |
 | `budgetUsd` | decimal | Configured `MonthlyCostBudgetUsd` |
