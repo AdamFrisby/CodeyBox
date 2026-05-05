@@ -244,6 +244,12 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<WorkItemCostsDto>(JsonOptions, ct);
     }
 
+    public async Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<FleetSummaryDto>>("/fleet/summary", JsonOptions, ct);
+        return result ?? [];
+    }
+
     public async Task<ProjectCostsDto?> GetProjectCostsAsync(
         string projectId, string? from = null, string? to = null, CancellationToken ct = default)
     {

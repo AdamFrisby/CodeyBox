@@ -1,0 +1,157 @@
+@page "/fleet"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+
+<PageTitle>Fleet — CodeyBox Admin</PageTitle>
+
+<h1>Fleet</h1>
+
+@* ── Per-project pause fallback banner ───────────────────────────────────── *@
+<div class="queue-banner" style="background:#f5f0e0;border:1px solid #d4b800;padding:0.5rem 0.75rem;margin-bottom:1rem;font-size:0.85rem;">
+    Per-project pause requires the budget-alerts work item; falling back to global pause on the
+    <a href="/">Queue</a> page.
+</div>
+
+@if (_error is not null)
+{
+    <p class="error-banner">Error loading fleet: @_error</p>
+}
+
+@if (_summaries is null)
+{
+    <p>Loading…</p>
+}
+else if (_summaries.Count == 0)
+{
+    <p>No projects configured.</p>
+}
+else
+{
+    <table class="queue-table">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th title="Grey=idle, Blue=in-flight, Yellow=queued, Red=paused">Status</th>
+                <th>Current phase</th>
+                <th>Queued</th>
+                <th>In-flight</th>
+                <th>Last 5</th>
+                <th>Budget (30 d)</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var s in _summaries)
+            {
+                <tr>
+                    <td>
+                        <strong>@s.DisplayName</strong>
+                        <br />
+                        <span class="external-id" title="@s.ProjectId">@ShortId(s.ProjectId)</span>
+                    </td>
+                    <td>
+                        <span class="fleet-dot fleet-dot-@s.StatusColor" title="@StatusTitle(s)">●</span>
+                    </td>
+                    <td>@(s.CurrentPhase ?? "—")</td>
+                    <td>@s.QueuedCount</td>
+                    <td>@s.InFlightCount</td>
+                    <td class="fleet-outcomes">
+                        @foreach (var o in s.RecentOutcomes)
+                        {
+                            <span class="fleet-outcome fleet-outcome-@OutcomeCss(o)" title="@o">@OutcomeGlyph(o)</span>
+                        }
+                        @if (s.RecentOutcomes.Count == 0)
+                        {
+                            <span style="color:#999">—</span>
+                        }
+                    </td>
+                    <td>
+                        @if (s.MonthlySpendUsd.HasValue)
+                        {
+                            <div style="display:flex;align-items:center;gap:0.4rem;">
+                                <span class="budget-bar-wrap" style="width:5rem;">
+                                    <span class="budget-bar @s.BudgetBarCss" style="width:@((int)s.BudgetPct)%"></span>
+                                </span>
+                                <span>$@s.MonthlySpendUsd.Value.ToString("0.00")@(s.MonthlyBudgetUsd.HasValue ? $" / ${s.MonthlyBudgetUsd.Value:0}" : "")</span>
+                            </div>
+                        }
+                        else
+                        {
+                            <span style="color:#999">—</span>
+                        }
+                    </td>
+                    <td>
+                        @* Per-project pause/resume requires budget-alerts work item.
+                           When that lands, wire IsPaused + project-level pause endpoint here. *@
+                        <a href="/?project=@Uri.EscapeDataString(s.ProjectId)" class="btn">queue</a>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private List<FleetSummaryDto>? _summaries;
+    private string? _error;
+    private CancellationTokenSource? _cts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await LoadAsync();
+        _ = RefreshLoopAsync(_cts.Token);
+    }
+
+    private async Task RefreshLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                await LoadAsync();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            _summaries = await ApiClient.GetFleetSummaryAsync();
+            _error = null;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+
+    private static string ShortId(string id) =>
+        id.Length > 12 ? id[..12] + "…" : id;
+
+    private static string StatusTitle(FleetSummaryDto s) =>
+        s.IsPaused ? "Paused" :
+        s.InFlightCount > 0 ? "In-flight" :
+        s.QueuedCount > 0 ? "Queued (waiting)" :
+        "Idle";
+
+    private static string OutcomeCss(string state) =>
+        state is "Done" ? "ok" :
+        state is "Failed" or "AuditFailed" ? "fail" :
+        "cancel";
+
+    private static string OutcomeGlyph(string state) =>
+        state is "Done" ? "✓" :
+        state is "Failed" or "AuditFailed" ? "✗" :
+        "!";
+}

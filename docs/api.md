@@ -584,3 +584,51 @@ Secrets come from environment variables (never `appsettings.json`):
 * `CODEYBOX_CODEX_API_KEY`
 * The env var named in each project's `Upstream.TokenEnvVar` (per-project
   upstream credentials — never shared across projects).
+
+---
+
+### `GET /fleet/summary`
+
+Returns a one-pass aggregate summary across all configured projects. Designed
+for the Fleet dashboard view — one round-trip per refresh instead of N+1 per-project calls.
+
+**Response** — array of objects, one per configured project:
+
+```json
+[
+  {
+    "projectId": "my-app",
+    "displayName": "My App",
+    "queuedCount": 3,
+    "inFlightCount": 1,
+    "currentPhase": "Working",
+    "recentOutcomes": ["Done", "Done", "Failed", "Done", "Done"],
+    "isPaused": false,
+    "pausedReason": null,
+    "monthlySpendUsd": 18.42,
+    "monthlyBudgetUsd": null,
+    "budgetThresholdState": "ok"
+  }
+]
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `projectId` | string | Project identifier |
+| `displayName` | string | Human-readable project name |
+| `queuedCount` | int | Items in `Queued` state |
+| `inFlightCount` | int | Items in non-terminal, non-Queued states |
+| `currentPhase` | string? | State of the most-recently-updated in-flight item, or `null` |
+| `recentOutcomes` | string[] | States of the last ≤5 terminal items, newest first |
+| `isPaused` | bool | `true` when the project queue is paused (requires budget-alerts work item; currently always `false`) |
+| `pausedReason` | string? | Pause reason, or `null` |
+| `monthlySpendUsd` | number? | Rolling 30-day spend in USD (null when cost-reporting unavailable) |
+| `monthlyBudgetUsd` | number? | Monthly spend cap in USD (null until budget-alerts work item lands) |
+| `budgetThresholdState` | string | `"ok"`, `"warning"` (≥80%), `"critical"` (≥100%), or `"unknown"` |
+
+**Notes:**
+- Projects with zero work items return `currentPhase: null, recentOutcomes: []`.
+- `monthlySpendUsd` and `monthlyBudgetUsd` are `null` when the cost store is unavailable; the endpoint never errors on missing cost data.
+- `isPaused` is always `false` until the budget-alerts work item adds `project_queue_state` table support.
