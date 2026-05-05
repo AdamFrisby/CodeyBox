@@ -86,6 +86,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Additive migration: minimum quality-score floor for routing.
         // Default 95 preserves existing semantics (frontier-adjacent fallback allowed).
         RunMigration("ALTER TABLE work_items ADD COLUMN min_model_score INTEGER NOT NULL DEFAULT 95;");
+
+        // Additive migration: why the item was cancelled (OperatorRequested, ParentCascaded, HostShutdown).
+        // NULL means legacy row or non-cancelled item.
+        RunMigration("ALTER TABLE work_items ADD COLUMN cancellation_reason TEXT;");
+
+        // Additive migration: how many times the recovery loop has reset this item.
+        // Default 0 = never recovered. Capped at OrchestratorOptions.MaxRecoveryAttempts.
+        RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;");
     }
 
     private void RunMigration(string sql)
@@ -113,9 +121,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
-                    stuck_retries, started_at, external_id, min_model_score)
+                    stuck_retries, started_at, external_id, min_model_score,
+                    cancellation_reason, recovery_attempts)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
-                    $sretries, $started_at, $external_id, $min_model_score);
+                    $sretries, $started_at, $external_id, $min_model_score,
+                    $cancellation_reason, $recovery_attempts);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -147,7 +157,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
-                    min_model_score = $min_model_score
+                    min_model_score = $min_model_score,
+                    cancellation_reason = $cancellation_reason,
+                    recovery_attempts = $recovery_attempts
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -174,7 +186,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
                     stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
-                    min_model_score = $min_model_score
+                    min_model_score = $min_model_score,
+                    cancellation_reason = $cancellation_reason,
+                    recovery_attempts = $recovery_attempts
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -289,7 +303,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             SELECT COUNT(*) FROM work_items
             WHERE project_id = $pid
               AND started_at IS NOT NULL
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed});
+              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);
@@ -337,6 +351,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$started_at", (object?)item.StartedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$external_id", (object?)item.ExternalId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$min_model_score", item.MinModelScore);
+        cmd.Parameters.AddWithValue("$cancellation_reason",
+            item.CancellationReason.HasValue ? (object)item.CancellationReason.Value.ToString() : DBNull.Value);
+        cmd.Parameters.AddWithValue("$recovery_attempts", item.RecoveryAttempts);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -363,7 +380,17 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         StartedAt = ReadNullableDateTimeOffset(r, "started_at"),
         ExternalId = r.IsDBNull(r.GetOrdinal("external_id")) ? null : r.GetString(r.GetOrdinal("external_id")),
         MinModelScore = ReadInt32OrDefault(r, "min_model_score", defaultValue: 95),
+        CancellationReason = ReadCancellationReason(r),
+        RecoveryAttempts = ReadInt32OrDefault(r, "recovery_attempts", defaultValue: 0),
     };
+
+    private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("cancellation_reason");
+        if (r.IsDBNull(ord)) return null;
+        var raw = r.GetString(ord);
+        return Enum.TryParse<WorkItemCancellationReason>(raw, out var val) ? val : null;
+    }
 
     private static int ReadInt32OrDefault(SqliteDataReader r, string column, int defaultValue)
     {

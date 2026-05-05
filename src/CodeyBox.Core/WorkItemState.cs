@@ -20,4 +20,11 @@ public enum WorkItemState
     Failed = 100,
     Cancelled = 101,
     AuditFailed = 102,
+    /// <summary>
+    /// The recovery loop has retried this item <c>MaxRecoveryAttempts</c> times
+    /// after successive host shutdowns and it has never completed. Operator
+    /// intervention required; use <c>POST /workitems/{id}/retry</c> to resume
+    /// manually after investigating.
+    /// </summary>
+    AbandonedAfterRecoveryAttempts = 103,
 }

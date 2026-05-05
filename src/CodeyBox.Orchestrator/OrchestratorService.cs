@@ -205,13 +205,30 @@ public sealed class OrchestratorService : BackgroundService
         return true;
     }
 
+    // Exposed as internal so tests can invoke recovery in isolation without
+    // starting the full worker loop.
+    internal Task ReplayPendingForTestAsync(CancellationToken ct) => ReplayPendingAsync(ct);
+    internal WorkItem? TryBuildRecoveredStateForTest(WorkItem item) => TryBuildRecoveredState(item);
+
     /// <summary>
     /// On startup, re-enqueue work items that were mid-flight when we last
-    /// stopped. Items in non-Queued non-terminal states (Working, Merging,
-    /// etc.) are always re-enqueued — they were already past the dependency
-    /// gate. Queued items are only re-enqueued if all their dependencies are
-    /// currently terminal; those that are still waiting will be enqueued by
-    /// <see cref="EnqueueSatisfiedDependentsAsync"/> when their deps complete.
+    /// stopped. Items in non-Queued non-terminal states are reset to a recoverable
+    /// state and re-enqueued. Queued items are only re-enqueued if all their
+    /// dependencies are currently terminal; those that are still waiting will be
+    /// enqueued by <see cref="EnqueueSatisfiedDependentsAsync"/> when their deps
+    /// complete.
+    ///
+    /// Recovery state mapping:
+    ///   Working         → Queued      (redo from scratch; in-flight branch is gone)
+    ///   Auditing        → WorkComplete (work commit is real; re-run the audit suite)
+    ///   Reworking       → WorkComplete (re-run audit to confirm or re-rework)
+    ///   Merging         → AuditPassed  (audit verdict is real; retry the merge)
+    ///   UpstreamPushing → (left as-is; UpstreamPushAttempts retry logic handles it)
+    ///   WorkComplete / AuditPassed / Merged → (left as-is; pipeline resumes at correct phase)
+    ///
+    /// Each recovery increments <see cref="WorkItem.RecoveryAttempts"/>. Items that
+    /// exceed <see cref="OrchestratorOptions.MaxRecoveryAttempts"/> are transitioned
+    /// to <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> instead.
     /// </summary>
     private async Task ReplayPendingAsync(CancellationToken ct)
     {
@@ -221,19 +238,42 @@ public sealed class OrchestratorService : BackgroundService
             allItems.Add(item);
         var statesById = WorkItemDependencies.BuildStateMap(allItems);
 
-        var nonTerminalNonQueued = new[]
+        // Warn about legacy Cancelled items that may have been buried by a host shutdown
+        // before this fix was deployed (cancellation_reason IS NULL AND last_error = 'cancelled').
+        var legacyBuried = allItems
+            .Where(i => i.State == WorkItemState.Cancelled
+                && i.CancellationReason is null
+                && i.LastError == "cancelled")
+            .ToList();
+        if (legacyBuried.Count > 0)
         {
-            WorkItemState.Working, WorkItemState.WorkComplete,
-            WorkItemState.Merging, WorkItemState.Merged, WorkItemState.UpstreamPushing,
-            WorkItemState.Auditing, WorkItemState.Reworking, WorkItemState.AuditPassed,
-        };
+            _log.LogWarning(
+                "Found {Count} work item(s) in Cancelled state with ambiguous reason " +
+                "(may have been interrupted by a prior host shutdown before the no-shutdown-cancel fix): {Ids}. " +
+                "Use POST /workitems/{{id}}/uncancel to restore any that should be re-queued.",
+                legacyBuried.Count,
+                string.Join(", ", legacyBuried.Select(i => i.Id.ToString())));
+        }
 
         foreach (var item in allItems)
         {
-            if (nonTerminalNonQueued.Contains(item.State))
+            var recovered = TryBuildRecoveredState(item);
+            if (recovered is not null)
             {
-                _log.LogInformation("Recovering work item {Id} (was {State})", item.Id, item.State);
-                await _queue.EnqueueAsync(item.Id, ct);
+                if (recovered.State == WorkItemState.AbandonedAfterRecoveryAttempts)
+                {
+                    await _store.UpdateAsync(recovered, ct);
+                    AuditLog.WorkItemAbandonedAfterRecovery(item.Id, _opts.MaxRecoveryAttempts);
+                    _log.LogWarning(
+                        "Work item {Id} has been abandoned after {Max} recovery attempts; operator intervention required",
+                        item.Id, _opts.MaxRecoveryAttempts);
+                }
+                else
+                {
+                    await _store.UpdateAsync(recovered, ct);
+                    AuditLog.WorkItemRecovered(item.Id, item.State.ToString(), recovered.State.ToString(), recovered.RecoveryAttempts);
+                    await _queue.EnqueueAsync(recovered.Id, ct);
+                }
             }
             else if (item.State == WorkItemState.Queued)
             {
@@ -251,6 +291,47 @@ public sealed class OrchestratorService : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Builds the recovered state for a mid-flight work item, or returns null
+    /// if the item does not need recovery (terminal or Queued).
+    /// </summary>
+    private WorkItem? TryBuildRecoveredState(WorkItem item)
+    {
+        WorkItemState? targetState = item.State switch
+        {
+            WorkItemState.Working => WorkItemState.Queued,
+            WorkItemState.Auditing => WorkItemState.WorkComplete,
+            WorkItemState.Reworking => WorkItemState.WorkComplete,
+            WorkItemState.Merging => WorkItemState.AuditPassed,
+            // UpstreamPushing: leave as-is; UpstreamPushAttempts handles retries.
+            // WorkComplete / AuditPassed / Merged: pipeline resumes at the correct
+            // phase; no state change needed, just re-enqueue.
+            WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged
+                => item.State,
+            WorkItemState.UpstreamPushing => item.State,
+            _ => null,
+        };
+
+        if (targetState is null) return null;
+
+        // UpstreamPushing items are re-enqueued without state mutation.
+        if (targetState == WorkItemState.UpstreamPushing) return item;
+
+        // WorkComplete / AuditPassed / Merged: bump RecoveryAttempts but keep state.
+        var newAttempts = item.RecoveryAttempts + 1;
+        if (newAttempts > _opts.MaxRecoveryAttempts)
+        {
+            return item with
+            {
+                State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+        }
+
+        return item.With(targetState.Value) with { RecoveryAttempts = newAttempts };
+    }
+
     private async Task RunItemAsync(int workerIndex, WorkItemId id, CancellationToken ct)
     {
         var item = await _store.GetAsync(id, ct);
@@ -260,7 +341,8 @@ public sealed class OrchestratorService : BackgroundService
             return;
         }
         if (item.State is WorkItemState.Cancelled or WorkItemState.Done
-            or WorkItemState.Failed or WorkItemState.AuditFailed)
+            or WorkItemState.Failed or WorkItemState.AuditFailed
+            or WorkItemState.AbandonedAfterRecoveryAttempts)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
             return;
@@ -380,7 +462,9 @@ public sealed class OrchestratorService : BackgroundService
             AuditLog.WorkItemPickedUp(workerIndex, item.Id);
             try
             {
-                await _pipeline.RunAsync(item, registration.Token);
+                // Pass ct (the host stoppingToken) as hostShutdownToken so the pipeline
+                // can distinguish "host is shutting down" from "operator cancelled".
+                await _pipeline.RunAsync(item, registration.Token, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -519,6 +603,14 @@ public sealed record OrchestratorOptions
 {
     public int MaxConcurrentWorkers { get; init; } = 1;
     public TimeSpan MinSpawnInterval { get; init; } = TimeSpan.Zero;
+
+    /// <summary>
+    /// Maximum number of times the recovery loop will reset a mid-flight work
+    /// item before giving up and transitioning it to
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>. Default 3.
+    /// Set to 0 to disable the cap (not recommended in production).
+    /// </summary>
+    public int MaxRecoveryAttempts { get; init; } = 3;
 
     /// <summary>
     /// Called by the dispatch loop immediately after the spawn timestamp is
