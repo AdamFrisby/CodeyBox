@@ -158,6 +158,12 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return parts.Count > 0 ? "?" + string.Join("&", parts) : "";
     }
 
+    public async Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<PluginDto>>("/plugins", JsonOptions, ct);
+        return result ?? [];
+    }
+
     public async Task<List<SuggestionDto>> GetSuggestionsAsync(
         string? projectId = null, string? category = null, string? severity = null,
         CancellationToken ct = default)

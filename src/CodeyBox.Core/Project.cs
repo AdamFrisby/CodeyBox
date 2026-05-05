@@ -286,14 +286,28 @@ public sealed record ProjectAudit
 
 /// <summary>
 /// Free-form auditor description. The composer picks the matching factory
-/// (shell, llm, diff-pattern) based on <see cref="Kind"/> and applies the
-/// remaining fields. Lets operators express one-off auditors in config
-/// without writing code.
+/// based on <see cref="Kind"/> and applies the remaining fields.
+///
+/// <para>Kinds: <c>shell</c>, <c>diff-pattern</c>, <c>llm</c>, <c>plugin</c>.</para>
+///
+/// <para>For <c>Kind = "plugin"</c>, set <see cref="PluginId"/> to the plugin's
+/// reverse-domain ID (the value passed to <c>[CodeyBoxPlugin(Id = …)]</c>). The
+/// composer looks up the registered <see cref="IAuditor"/> singleton by that ID
+/// and includes it in the run. <see cref="Name"/> is not used for plugin auditors;
+/// the auditor's own <see cref="IAuditor.Name"/> is used instead.</para>
 /// </summary>
 public sealed record CustomAuditorDescriptor
 {
-    public required string Name { get; init; }
+    public string Name { get; init; } = string.Empty;
     public required string Kind { get; init; }
+
+    /// <summary>
+    /// Plugin reverse-domain ID. Required when <see cref="Kind"/> is <c>"plugin"</c>;
+    /// ignored for all other kinds. Must match the <c>Id</c> declared in the
+    /// plugin's <c>[CodeyBoxPlugin]</c> attribute.
+    /// </summary>
+    public string? PluginId { get; init; }
+
     public IReadOnlyList<string> Argv { get; init; } = [];
     public string? ReviewFocus { get; init; }
     public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];

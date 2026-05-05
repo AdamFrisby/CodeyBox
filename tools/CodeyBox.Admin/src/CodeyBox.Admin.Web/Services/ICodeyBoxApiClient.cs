@@ -43,6 +43,9 @@ public interface ICodeyBoxApiClient
     Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default);
     Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default);
 
+    // ── Plugins ───────────────────────────────────────────────────────────────
+    Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default);
+
     // ── Suggestions ───────────────────────────────────────────────────────────
     Task<List<SuggestionDto>> GetSuggestionsAsync(
         string? projectId = null, string? category = null, string? severity = null,

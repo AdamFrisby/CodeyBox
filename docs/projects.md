@@ -312,13 +312,38 @@ creation — never silently degrades to "no enforcement."
 
 ### Custom auditors
 
-Three kinds, all configured in JSON:
+Four kinds, all configured in JSON:
 
-| Kind           | Required fields           | Notes                                  |
-|----------------|---------------------------|----------------------------------------|
-| `shell`        | `Name`, `Argv`            | Exit 0 = pass; non-zero = Error finding|
-| `diff-pattern` | `Name`, `Patterns[]`      | Regex against added lines in diff      |
-| `llm`          | `Name`, `ReviewFocus`     | LLM review with the project's agent    |
+| Kind           | Required fields           | Notes                                              |
+|----------------|---------------------------|----------------------------------------------------|
+| `shell`        | `Name`, `Argv`            | Exit 0 = pass; non-zero = Error finding            |
+| `diff-pattern` | `Name`, `Patterns[]`      | Regex against added lines in diff                  |
+| `llm`          | `Name`, `ReviewFocus`     | LLM review with the project's agent                |
+| `plugin`       | `PluginId`                | Delegates to a loaded third-party `IAuditor` plugin |
+
+#### Plugin auditors
+
+Plugin auditors let operators ship custom audit logic as standalone NuGet packages
+without modifying CodeyBox core. To enable one, the plugin DLL must be discovered
+by the host (see `CodeyBox:Plugins` configuration), and its ID must be in the
+allowlist.
+
+```json
+"Audit": {
+  "Custom": [
+    { "Kind": "plugin", "PluginId": "myorg.no-var-keyword" },
+    { "Kind": "plugin", "PluginId": "myorg.xml-doc-required" }
+  ]
+}
+```
+
+`PluginId` must match the `id` declared in the plugin's `[CodeyBoxPlugin]`
+attribute. If the plugin is not loaded, the composer logs a warning and skips
+the entry — other auditors continue normally. No `Name` field is required; the
+plugin's own `IAuditor.Name` is used in findings and logs.
+
+See [`docs/auditor-plugins.md`](auditor-plugins.md) for the full authoring guide,
+project skeleton, and sample plugin.
 
 ## Per-project upstream
 

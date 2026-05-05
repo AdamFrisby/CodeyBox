@@ -693,6 +693,7 @@ WorkItemCostsEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
+PluginEndpoints.Map(app);
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
