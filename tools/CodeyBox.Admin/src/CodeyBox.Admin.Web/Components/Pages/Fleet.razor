@@ -127,7 +127,7 @@ else
     {
         try
         {
-            _summaries = await ApiClient.GetFleetSummaryAsync();
+            _summaries = await ApiClient.GetFleetSummaryAsync(_cts?.Token ?? default);
             _error = null;
         }
         catch (Exception ex)

@@ -25,7 +25,7 @@ public sealed class FleetPagePauseButtonTests : TestContext
 
         var cut = RenderComponent<FleetPage>();
 
-        Assert.Contains("Pause project", cut.Markup);
+        Assert.Contains("Pause queue (global)", cut.Markup);
     }
 
     [Fact]
@@ -57,8 +57,8 @@ public sealed class FleetPagePauseButtonTests : TestContext
 
         var cut = RenderComponent<FleetPage>();
 
-        Assert.Contains("Resume project", cut.Markup);
-        Assert.DoesNotContain("Pause project", cut.Markup);
+        Assert.Contains("Resume queue (global)", cut.Markup);
+        Assert.DoesNotContain("Pause queue (global)", cut.Markup);
     }
 
     [Fact]
@@ -74,6 +74,6 @@ public sealed class FleetPagePauseButtonTests : TestContext
         var cut = RenderComponent<FleetPage>();
 
         Assert.Contains("Queue", cut.Markup);
-        Assert.Contains("global pause", cut.Markup);
+        Assert.Contains("global queue pause", cut.Markup);
     }
 }
