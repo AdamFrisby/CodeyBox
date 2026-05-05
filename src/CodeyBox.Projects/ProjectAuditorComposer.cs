@@ -110,6 +110,9 @@ public sealed class ProjectAuditorComposer
     /// </summary>
     private static IAuditor MaterialiseCustom(CustomAuditorDescriptor c, PresetContext ctx)
     {
+        if (string.IsNullOrWhiteSpace(c.Name))
+            throw new InvalidOperationException($"Custom auditor of kind '{c.Kind}' requires a non-empty Name");
+
         return c.Kind.ToLowerInvariant() switch
         {
             "shell" => new ShellCommandAuditor(new ShellCommandAuditorOptions
@@ -122,7 +125,7 @@ public sealed class ProjectAuditorComposer
                 Name = c.Name,
                 Patterns = c.Patterns.Select(p => new DiffPattern
                 {
-                    Regex = new Regex(p.Regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+                    Regex = new Regex(p.Regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeout: TimeSpan.FromSeconds(5)),
                     Description = p.Description,
                 }).ToList(),
             }),
@@ -132,7 +135,7 @@ public sealed class ProjectAuditorComposer
                 Agent = ctx.Agent,
                 ReviewFocus = c.ReviewFocus ?? throw new InvalidOperationException($"llm auditor '{c.Name}' needs ReviewFocus"),
             }),
-            _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm | plugin)"),
+            _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm)"),
         };
     }
 }

@@ -27,9 +27,9 @@ and PluginSdk.
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
-    <!-- For in-tree development, use local project references instead: -->
-    <PackageReference Include="CodeyBox.Core"      Version="*" />
-    <PackageReference Include="CodeyBox.PluginSdk" Version="*" />
+    <!-- Pin to a specific version and update intentionally; avoid Version="*". -->
+    <PackageReference Include="CodeyBox.Core"      Version="1.0.0" />
+    <PackageReference Include="CodeyBox.PluginSdk" Version="1.0.0" />
   </ItemGroup>
 </Project>
 ```

@@ -36,6 +36,7 @@ else
             <tr>
                 <th>Plugin ID</th>
                 <th>Display Name</th>
+                <th>Action</th>
             </tr>
         </thead>
         <tbody>
@@ -44,7 +45,21 @@ else
                 <tr>
                     <td><code>@plugin.PluginId</code></td>
                     <td>@plugin.DisplayName</td>
+                    <td>
+                        <button class="btn btn-xs" @onclick="() => ToggleSnippet(plugin.PluginId)">
+                            Add to project
+                        </button>
+                    </td>
                 </tr>
+                @if (_expandedPluginId == plugin.PluginId)
+                {
+                    <tr>
+                        <td colspan="3" class="plugin-snippet-row">
+                            <p>Add the following entry to the project's <code>Audit.Custom</code> array in <code>appsettings.json</code>:</p>
+                            <pre><code>{ "Kind": "plugin", "PluginId": "@plugin.PluginId" }</code></pre>
+                        </td>
+                    </tr>
+                }
             }
         </tbody>
     </table>
@@ -53,6 +68,7 @@ else
 @code {
     private List<PluginDto>? _plugins;
     private string? _error;
+    private string? _expandedPluginId;
 
     protected override async Task OnInitializedAsync()
     {
@@ -64,5 +80,10 @@ else
         {
             _error = ex.Message;
         }
+    }
+
+    private void ToggleSnippet(string pluginId)
+    {
+        _expandedPluginId = _expandedPluginId == pluginId ? null : pluginId;
     }
 }

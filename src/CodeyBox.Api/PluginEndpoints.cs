@@ -17,7 +17,6 @@ internal static class PluginEndpoints
     /// </summary>
     private static async Task<IResult> GetAuditorPluginsAsync(
         IPluginLoader pluginLoader,
-        IEnumerable<IAuditor> registeredAuditors,
         CancellationToken ct)
     {
         var loaded = await pluginLoader.DiscoverAndLoadAsync(ct);
