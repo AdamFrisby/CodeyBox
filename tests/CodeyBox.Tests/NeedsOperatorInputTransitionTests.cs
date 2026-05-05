@@ -139,6 +139,7 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
             .ToList();
         Assert.Single(questionEvents);
     }
+
 }
 
 internal sealed class TestPipelineWithQuestions : IDisposable

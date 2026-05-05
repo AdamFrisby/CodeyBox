@@ -708,6 +708,8 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = "questionId is required" });
         if (string.IsNullOrWhiteSpace(req.Answer))
             return Results.BadRequest(new { error = "answer is required" });
+        if (req.Answer.Length > 4000)
+            return Results.BadRequest(new { error = "answer must be <= 4000 chars" });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
@@ -719,7 +721,8 @@ internal static class WorkItemEndpoints
         if (question.State != "open")
             return Results.Ok(new { status = "no-op", questionState = question.State });
 
-        await questionStore.AnswerAsync(item.Id.ToString(), req.QuestionId, req.Answer, answeredBy: null, ct);
+        var redactedAnswer = RawOutputRedactor.Redact(req.Answer);
+        await questionStore.AnswerAsync(item.Id.ToString(), req.QuestionId, redactedAnswer, answeredBy: null, ct);
 
         var project = await projects.GetAsync(item.ProjectId, ct);
         await webhooks.PublishAsync(new WebhookEvent
@@ -727,7 +730,7 @@ internal static class WorkItemEndpoints
             Event = "work_item.question_answered",
             WorkItem = item,
             Project = project,
-            Details = new { workItemId = item.Id.ToString(), projectId = item.ProjectId.Value, questionId = req.QuestionId, answer = req.Answer },
+            Details = new { workItemId = item.Id.ToString(), projectId = item.ProjectId.Value, questionId = req.QuestionId, answer = redactedAnswer },
         }, ct);
 
         // Transition out of NeedsOperatorInput if all questions are now resolved.
@@ -751,6 +754,8 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = "questionId is required" });
         if (string.IsNullOrWhiteSpace(req.Reason))
             return Results.BadRequest(new { error = "reason is required" });
+        if (req.Reason.Length > 500)
+            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
@@ -761,7 +766,8 @@ internal static class WorkItemEndpoints
         if (question.State != "open")
             return Results.Ok(new { status = "no-op", questionState = question.State });
 
-        await questionStore.DismissAsync(item.Id.ToString(), req.QuestionId, req.Reason, ct);
+        var redactedReason = RawOutputRedactor.Redact(req.Reason);
+        await questionStore.DismissAsync(item.Id.ToString(), req.QuestionId, redactedReason, ct);
 
         var project = await projects.GetAsync(item.ProjectId, ct);
         await webhooks.PublishAsync(new WebhookEvent
@@ -769,7 +775,7 @@ internal static class WorkItemEndpoints
             Event = "work_item.question_dismissed",
             WorkItem = item,
             Project = project,
-            Details = new { workItemId = item.Id.ToString(), projectId = item.ProjectId.Value, questionId = req.QuestionId, reason = req.Reason },
+            Details = new { workItemId = item.Id.ToString(), projectId = item.ProjectId.Value, questionId = req.QuestionId, reason = redactedReason },
         }, ct);
 
         // Transition out of NeedsOperatorInput if all questions are now resolved.
@@ -799,7 +805,8 @@ internal static class WorkItemEndpoints
         if (hasOpen) return;
 
         var resumed = current.With(WorkItemState.WorkComplete);
-        await store.UpdateAsync(resumed, ct);
+        var transitioned = await store.TryUpdateIfStateAsync(resumed, WorkItemState.NeedsOperatorInput, ct);
+        if (!transitioned) return;
         AuditLog.WorkItemTransitioned(item.Id, "WorkComplete (resumed from NeedsOperatorInput)");
         await queue.EnqueueAsync(item.Id, ct);
 

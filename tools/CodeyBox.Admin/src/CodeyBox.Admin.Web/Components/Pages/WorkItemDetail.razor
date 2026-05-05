@@ -1,4 +1,5 @@
 @page "/work-items/{Id}"
+@using CodeyBox.Admin.Web.Models
 @inject ICodeyBoxApiClient ApiClient
 @inject NavigationManager Nav
 @inject ILogger<WorkItemDetail> Logger
@@ -84,6 +85,33 @@ else
         <summary>Prompt</summary>
         <pre class="prompt-text">@_item.Prompt</pre>
     </details>
+
+    @if (_questions.Count > 0)
+    {
+        <details class="prompt-collapsible" open>
+            <summary>Questions (@_questions.Count)</summary>
+            @foreach (var q in _questions)
+            {
+                <div class="question-block">
+                    <p><strong>[@q.QuestionId]</strong> @q.QuestionText</p>
+                    @if (q.IsOpen)
+                    {
+                        <textarea @bind="_answerInputs[q.QuestionId]" rows="3" placeholder="Your answer…" style="width:100%"></textarea>
+                        <button class="btn" @onclick="() => SubmitAnswerAsync(q.QuestionId)">Submit</button>
+                        <button class="btn" @onclick="() => DismissAsync(q.QuestionId)">Dismiss</button>
+                    }
+                    else if (q.IsAnswered)
+                    {
+                        <p><em>Answered:</em> @q.AnswerText</p>
+                    }
+                    else if (q.IsDismissed)
+                    {
+                        <p><em>Dismissed:</em> @q.DismissReason</p>
+                    }
+                </div>
+            }
+        </details>
+    }
 }
 
 @code {
@@ -93,6 +121,8 @@ else
     private string? _error;
     private bool _notFound;
     private string? _loadedId;
+    private List<QuestionDto> _questions = [];
+    private Dictionary<string, string> _answerInputs = [];
 
     protected override async Task OnParametersSetAsync()
     {
@@ -109,6 +139,13 @@ else
         {
             _item = await ApiClient.GetWorkItemAsync(Id);
             _notFound = _item is null;
+            if (_item is not null)
+            {
+                _questions = await ApiClient.GetQuestionsAsync(Id);
+                _answerInputs = _questions
+                    .Where(q => q.IsOpen)
+                    .ToDictionary(q => q.QuestionId, _ => string.Empty);
+            }
         }
         catch (Exception ex)
         {
@@ -129,6 +166,20 @@ else
     private async Task RetryAsync(string from)
     {
         await ApiClient.RetryWorkItemAsync(Id, from);
+        await LoadAsync();
+    }
+
+    private async Task SubmitAnswerAsync(string questionId)
+    {
+        var answer = _answerInputs.TryGetValue(questionId, out var v) ? v : string.Empty;
+        if (string.IsNullOrWhiteSpace(answer)) return;
+        await ApiClient.AnswerQuestionAsync(Id, questionId, answer);
+        await LoadAsync();
+    }
+
+    private async Task DismissAsync(string questionId)
+    {
+        await ApiClient.DismissQuestionAsync(Id, questionId, "Dismissed by operator.");
         await LoadAsync();
     }
 }

@@ -31,7 +31,7 @@ public sealed class SqliteWorkItemQuestionStore : IWorkItemQuestionStore, IDispo
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS work_item_questions (
                 id            TEXT PRIMARY KEY,
-                work_item_id  TEXT NOT NULL,
+                work_item_id  TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
                 question_id   TEXT NOT NULL,
                 question_text TEXT NOT NULL,
                 asked_at      TEXT NOT NULL,

@@ -629,15 +629,18 @@ public sealed class PipelineRunner : IPipelineRunner
             var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions);
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
-            await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct, async phaseCt =>
-            {
-                await RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
+            var reworkStdout = await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct,
+                phaseCt => RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
                     reworkPrompt, isInitial: false,
                     networkProfile: project.NetworkProfiles.Rework,
                     project: project,
                     phaseCt,
-                    iteration: iteration);
-            });
+                    iteration: iteration));
+            if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
+            {
+                var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
+                if (parked) return;
+            }
         }
     }
 
