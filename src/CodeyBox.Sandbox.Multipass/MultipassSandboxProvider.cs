@@ -1042,22 +1042,23 @@ public sealed record MultipassSandboxOptions
     public int BaselineDiskGB { get; init; } = 12;
 
     /// <summary>
-    /// Memory (gibibytes) for the baseline VM. Default 12 GiB. Sized to the
-    /// CPU count: MSBuild spawns one worker per core during build, and each
-    /// worker can allocate ~1 GiB at peak; with <see cref="BaselineCpus"/>=6
-    /// a 4 GiB allocation OOMs and surfaces as a CLR fatal during MSBuild's
-    /// project enumeration. Long-running agent sessions also keep their
-    /// conversation history in memory. Lower at your own risk if you also
-    /// lower <see cref="BaselineCpus"/>.
+    /// Memory (gibibytes) for the baseline VM. Default 16 GiB. Sized to
+    /// <see cref="BaselineCpus"/>: MSBuild spawns one worker per core at
+    /// ~1 GiB peak each, plus baseline OS / agent / NuGet overhead.
+    /// Bumping CPUs without bumping memory will OOM and surface as a CLR
+    /// fatal during MSBuild's project enumeration. Long-running agent
+    /// sessions also keep their conversation history in memory.
     /// </summary>
-    public int BaselineMemoryGB { get; init; } = 12;
+    public int BaselineMemoryGB { get; init; } = 16;
 
     /// <summary>
     /// vCPU count for the baseline VM. Default 6. Multipass's default is 1;
     /// bumping speeds up build / scan / install cold-starts when the
     /// underlying tools parallelise. Keep <see cref="BaselineMemoryGB"/>
-    /// at roughly 2× this value: MSBuild spawns one worker per core and
-    /// each can peak around 1 GiB, plus baseline OS/services overhead.
+    /// at roughly 2-3× this value or builds OOM under MSBuild's per-core
+    /// worker fan-out. Total host budget is
+    /// <c>WorkerPool:MaxConcurrentWorkers × BaselineCpus</c> vCPUs and
+    /// <c>... × BaselineMemoryGB</c> GiB at saturation.
     /// </summary>
     public int BaselineCpus { get; init; } = 6;
 }
