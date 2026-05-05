@@ -473,6 +473,8 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default)
         => Task.FromResult(ReleasesOverride);
+    public Task<int> GetOpenReleasesCountAsync(CancellationToken ct = default)
+        => Task.FromResult(ReleasesOverride.Count(r => r.State == "Open"));
     public Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default)
         => Task.FromResult(ReleaseOverride);
     public Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default)

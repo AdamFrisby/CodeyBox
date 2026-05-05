@@ -54,17 +54,17 @@ else if (_release is not null)
 
     @* ── Actions ────────────────────────────────────────────────────────────── *@
     <div class="suggestion-actions">
-        @if (_release.State == "open")
+        @if (_release.State == "Open")
         {
             <button class="btn" @onclick="CloseReleaseAsync">Close</button>
             <button class="btn btn-danger" @onclick="AbandonReleaseAsync">Abandon</button>
         }
-        @if (_release.State == "closed")
+        @if (_release.State == "Closed")
         {
             <button class="btn btn-primary" @onclick="TriggerReviewAsync">Trigger Review</button>
             <button class="btn" @onclick="() => _showReopenModal = true">Reopen</button>
         }
-        @if (_release.State == "failed")
+        @if (_release.State == "Failed")
         {
             <button class="btn" @onclick="() => _showReopenModal = true">Reopen</button>
         }

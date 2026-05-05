@@ -108,6 +108,58 @@ public sealed class ClosedReleaseRejectsWorkItemsTests : IDisposable
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
+
+    [Fact]
+    public async Task CreateWorkItem_WithInReviewReleaseId_Returns400()
+    {
+        var relId = ReleaseId.New();
+        var inReview = new Release
+        {
+            Id = relId,
+            ProjectId = new ProjectId("test-project"),
+            Name = $"inreview-{relId}",
+            State = ReleaseState.InReview,
+            CreatedAt = DateTimeOffset.UtcNow,
+            ReviewStartedAt = DateTimeOffset.UtcNow,
+        };
+        await _factory.ReleaseStore.CreateAsync(inReview);
+
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "test item",
+            prompt = "do the thing",
+            releaseId = relId.ToString(),
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CreateWorkItem_WithReleasedReleaseId_Returns400()
+    {
+        var relId = ReleaseId.New();
+        var released = new Release
+        {
+            Id = relId,
+            ProjectId = new ProjectId("test-project"),
+            Name = $"released-{relId}",
+            State = ReleaseState.Released,
+            CreatedAt = DateTimeOffset.UtcNow,
+            ReleasedAt = DateTimeOffset.UtcNow,
+        };
+        await _factory.ReleaseStore.CreateAsync(released);
+
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "test item",
+            prompt = "do the thing",
+            releaseId = relId.ToString(),
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
 }
 
 internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>

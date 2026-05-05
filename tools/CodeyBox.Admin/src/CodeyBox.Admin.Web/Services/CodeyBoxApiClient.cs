@@ -259,6 +259,12 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
 
     // ── Releases ──────────────────────────────────────────────────────────────
 
+    public async Task<int> GetOpenReleasesCountAsync(CancellationToken ct = default)
+    {
+        var releases = await GetReleasesAsync(state: "Open", ct: ct);
+        return releases.Count;
+    }
+
     public async Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default)
     {
         var parts = new List<string>();

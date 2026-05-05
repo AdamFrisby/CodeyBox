@@ -63,6 +63,7 @@ public interface ICodeyBoxApiClient
 
     // ── Releases ──────────────────────────────────────────────────────────────
     Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default);
+    Task<int> GetOpenReleasesCountAsync(CancellationToken ct = default);
     Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default);
     Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default);
     Task<ReleaseDto?> CreateReleaseAsync(CreateReleaseRequest req, CancellationToken ct = default);

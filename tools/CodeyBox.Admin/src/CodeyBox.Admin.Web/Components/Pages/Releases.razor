@@ -71,17 +71,17 @@ else
                     <td class="col-age">@r.CreatedAt.ToString("yyyy-MM-dd")</td>
                     <td class="col-actions">
                         <a href="/releases/@r.Id" class="btn">view</a>
-                        @if (r.State == "open")
+                        @if (r.State == "Open")
                         {
                             <button class="btn" @onclick="() => CloseAsync(r.Id)">close</button>
                             <button class="btn btn-danger" @onclick="() => AbandonAsync(r.Id)">abandon</button>
                         }
-                        @if (r.State == "closed")
+                        @if (r.State == "Closed")
                         {
                             <button class="btn btn-primary" @onclick="() => TriggerAsync(r.Id)">trigger review</button>
                             <button class="btn" @onclick="() => BeginReopen(r.Id)">reopen</button>
                         }
-                        @if (r.State == "failed")
+                        @if (r.State == "Failed")
                         {
                             <button class="btn" @onclick="() => BeginReopen(r.Id)">reopen</button>
                         }

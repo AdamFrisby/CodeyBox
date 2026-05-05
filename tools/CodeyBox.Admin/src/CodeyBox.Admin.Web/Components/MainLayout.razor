@@ -13,7 +13,12 @@
                 <span class="nav-badge">@_openCount</span>
             }
         </NavLink>
-        <NavLink href="/releases">Releases</NavLink>
+        <NavLink href="/releases">
+            Releases@if (_openReleasesCount > 0)
+            {
+                <span class="nav-badge">@_openReleasesCount</span>
+            }
+        </NavLink>
     </nav>
     <main class="admin-main">
         @Body
@@ -22,13 +27,22 @@
 
 @code {
     private int _openCount;
+    private int _openReleasesCount;
 
     protected override async Task OnInitializedAsync()
     {
-        try
-        {
-            _openCount = await ApiClient.GetSuggestionsCountAsync();
-        }
+        await Task.WhenAll(FetchSuggestionsCountAsync(), FetchOpenReleasesCountAsync());
+    }
+
+    private async Task FetchSuggestionsCountAsync()
+    {
+        try { _openCount = await ApiClient.GetSuggestionsCountAsync(); }
         catch (Exception ex) { Logger.LogWarning(ex, "Failed to fetch open suggestion count for nav badge"); }
+    }
+
+    private async Task FetchOpenReleasesCountAsync()
+    {
+        try { _openReleasesCount = await ApiClient.GetOpenReleasesCountAsync(); }
+        catch (Exception ex) { Logger.LogWarning(ex, "Failed to fetch open releases count for nav badge"); }
     }
 }

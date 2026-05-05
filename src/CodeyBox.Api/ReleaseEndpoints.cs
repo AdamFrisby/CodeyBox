@@ -95,7 +95,10 @@ internal static class ReleaseEndpoints
         ReleaseState? stateFilter = null;
         if (!string.IsNullOrWhiteSpace(state))
         {
-            if (!Enum.TryParse<ReleaseState>(state, ignoreCase: true, out var parsed))
+            // Normalize underscore-separated values (e.g. "in_review") to match enum member names
+            // (e.g. "InReview"). The API docs and UI use the underscore form.
+            var normalized = state.Replace("_", "", StringComparison.Ordinal);
+            if (!Enum.TryParse<ReleaseState>(normalized, ignoreCase: true, out var parsed))
                 return Results.BadRequest(new { error = $"unknown state '{state}'" });
             stateFilter = parsed;
         }

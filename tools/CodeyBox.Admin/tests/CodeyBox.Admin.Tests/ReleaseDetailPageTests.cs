@@ -18,7 +18,7 @@ public sealed class ReleaseDetailPageTests : TestContext
     private static ReleaseDto MakeRelease(
         string id = ReleaseId,
         string name = "v1.0.0",
-        string state = "open",
+        string state = "Open",
         string? branchName = "release/v1.0.0",
         string? failedReason = null) => new(
             Id: id,
@@ -59,7 +59,7 @@ public sealed class ReleaseDetailPageTests : TestContext
     public void ReleaseDetail_ShowsStateBadge()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleaseOverride = MakeRelease(state: "open");
+        fake.ReleaseOverride = MakeRelease(state: "Open");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
@@ -198,7 +198,7 @@ public sealed class ReleaseDetailPageTests : TestContext
     public void ReleaseDetail_OpenState_ShowsCloseAndAbandonButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleaseOverride = MakeRelease(state: "open");
+        fake.ReleaseOverride = MakeRelease(state: "Open");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
@@ -211,7 +211,7 @@ public sealed class ReleaseDetailPageTests : TestContext
     public void ReleaseDetail_ClosedState_ShowsTriggerReviewAndReopenButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleaseOverride = MakeRelease(state: "closed");
+        fake.ReleaseOverride = MakeRelease(state: "Closed");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
@@ -224,7 +224,7 @@ public sealed class ReleaseDetailPageTests : TestContext
     public void ReleaseDetail_FailedState_ShowsReopenButton()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleaseOverride = MakeRelease(state: "failed", failedReason: "audit did not converge");
+        fake.ReleaseOverride = MakeRelease(state: "Failed", failedReason: "audit did not converge");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
@@ -236,7 +236,7 @@ public sealed class ReleaseDetailPageTests : TestContext
     public void ReleaseDetail_FailedState_ShowsFailedReason()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleaseOverride = MakeRelease(state: "failed", failedReason: "audit did not converge");
+        fake.ReleaseOverride = MakeRelease(state: "Failed", failedReason: "audit did not converge");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
@@ -248,7 +248,7 @@ public sealed class ReleaseDetailPageTests : TestContext
     public void ReleaseDetail_ReleasedState_NoActionButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleaseOverride = MakeRelease(state: "released");
+        fake.ReleaseOverride = MakeRelease(state: "Released");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
@@ -263,7 +263,7 @@ public sealed class ReleaseDetailPageTests : TestContext
     public void ReleaseDetail_InReviewState_NoActionButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleaseOverride = MakeRelease(state: "in_review");
+        fake.ReleaseOverride = MakeRelease(state: "InReview");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));

@@ -281,6 +281,7 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
     public Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default) => Task.FromResult(new List<ReleaseDto>());
+    public Task<int> GetOpenReleasesCountAsync(CancellationToken ct = default) => Task.FromResult(0);
     public Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
     public Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default) => Task.FromResult(new List<object>());
     public Task<ReleaseDto?> CreateReleaseAsync(CreateReleaseRequest req, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
@@ -368,6 +369,7 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
     public Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default)
         => Task.FromResult<ProjectCostsDto?>(null);
     public Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default) => Task.FromResult(new List<ReleaseDto>());
+    public Task<int> GetOpenReleasesCountAsync(CancellationToken ct = default) => Task.FromResult(0);
     public Task<ReleaseDto?> GetReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
     public Task<List<object>> GetReleaseWorkItemsAsync(string id, CancellationToken ct = default) => Task.FromResult(new List<object>());
     public Task<ReleaseDto?> CreateReleaseAsync(CreateReleaseRequest req, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);

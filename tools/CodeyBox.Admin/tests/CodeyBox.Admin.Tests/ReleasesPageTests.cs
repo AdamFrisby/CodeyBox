@@ -15,7 +15,7 @@ public sealed class ReleasesPageTests : TestContext
     private static ReleaseDto MakeRelease(
         string id = "aaaaaaaa-0000-0000-0000-000000000001",
         string name = "v1.0.0",
-        string state = "open",
+        string state = "Open",
         string? branchName = "release/v1.0.0",
         string projectId = "proj-1") => new(
             Id: id,
@@ -97,7 +97,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_OpenState_ShowsStateBadge()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "open")];
+        fake.ReleasesOverride = [MakeRelease(state: "Open")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -109,7 +109,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_ClosedState_ShowsStateBadge()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "closed")];
+        fake.ReleasesOverride = [MakeRelease(state: "Closed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -121,19 +121,19 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_InReviewState_ShowsStateBadge()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "in_review")];
+        fake.ReleasesOverride = [MakeRelease(state: "InReview")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
 
-        Assert.Contains("state-in_review", cut.Markup);
+        Assert.Contains("state-inreview", cut.Markup);
     }
 
     [Fact]
     public void Releases_ReleasedState_ShowsStateBadge()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "released")];
+        fake.ReleasesOverride = [MakeRelease(state: "Released")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -145,7 +145,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_FailedState_ShowsStateBadge()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "failed")];
+        fake.ReleasesOverride = [MakeRelease(state: "Failed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -157,7 +157,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_OpenRelease_ShowsCloseAndAbandonButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "open")];
+        fake.ReleasesOverride = [MakeRelease(state: "Open")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -170,7 +170,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_OpenRelease_DoesNotShowTriggerReviewButton()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "open")];
+        fake.ReleasesOverride = [MakeRelease(state: "Open")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -182,7 +182,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_ClosedRelease_ShowsTriggerReviewAndReopenButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "closed")];
+        fake.ReleasesOverride = [MakeRelease(state: "Closed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -195,7 +195,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_ClosedRelease_DoesNotShowCloseOrAbandonButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "closed")];
+        fake.ReleasesOverride = [MakeRelease(state: "Closed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -209,7 +209,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_FailedRelease_ShowsReopenButton()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "failed")];
+        fake.ReleasesOverride = [MakeRelease(state: "Failed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -221,7 +221,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_ReleasedRelease_ShowsNoActionButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "released")];
+        fake.ReleasesOverride = [MakeRelease(state: "Released")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();
@@ -263,9 +263,9 @@ public sealed class ReleasesPageTests : TestContext
         var fake = new FakeApiClient([]);
         fake.ReleasesOverride =
         [
-            MakeRelease(id: "aaaaaaaa-0000-0000-0000-000000000001", name: "v1.0.0", state: "released"),
-            MakeRelease(id: "aaaaaaaa-0000-0000-0000-000000000002", name: "v1.1.0", state: "open"),
-            MakeRelease(id: "aaaaaaaa-0000-0000-0000-000000000003", name: "v2.0.0-beta", state: "closed"),
+            MakeRelease(id: "aaaaaaaa-0000-0000-0000-000000000001", name: "v1.0.0", state: "Released"),
+            MakeRelease(id: "aaaaaaaa-0000-0000-0000-000000000002", name: "v1.1.0", state: "Open"),
+            MakeRelease(id: "aaaaaaaa-0000-0000-0000-000000000003", name: "v2.0.0-beta", state: "Closed"),
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
@@ -306,7 +306,7 @@ public sealed class ReleasesPageTests : TestContext
     public void Releases_AbandonedRelease_ShowsNoActionButtons()
     {
         var fake = new FakeApiClient([]);
-        fake.ReleasesOverride = [MakeRelease(state: "abandoned")];
+        fake.ReleasesOverride = [MakeRelease(state: "Abandoned")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<ReleasesPage>();

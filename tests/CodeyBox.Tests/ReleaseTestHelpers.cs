@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -67,6 +68,7 @@ internal static class ReleaseTestHelper
             deepAuditors ?? [],
             new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
             taskQueue ?? new InMemoryTaskQueue(),
+            new NullHostApplicationLifetime(),
             NullLogger<ReleaseService>.Instance);
     }
 
@@ -84,6 +86,14 @@ internal static class ReleaseTestHelper
             FailedReason = failedReason,
             BranchName = branchName,
         };
+}
+
+internal sealed class NullHostApplicationLifetime : IHostApplicationLifetime
+{
+    public CancellationToken ApplicationStarted => CancellationToken.None;
+    public CancellationToken ApplicationStopping => CancellationToken.None;
+    public CancellationToken ApplicationStopped => CancellationToken.None;
+    public void StopApplication() { }
 }
 
 internal sealed class NullSandboxProvider : ISandboxProvider

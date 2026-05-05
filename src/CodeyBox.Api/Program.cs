@@ -679,6 +679,7 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     sp.GetServices<IDeepAuditor>(),
     sp.GetRequiredService<PipelineOptions>(),
     sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<IHostApplicationLifetime>(),
     sp.GetRequiredService<ILogger<ReleaseService>>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(

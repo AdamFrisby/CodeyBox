@@ -176,6 +176,7 @@ public sealed class GitHubReleasePublishTests : IDisposable
             [],
             new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
             new InMemoryTaskQueue(),
+            new NullHostApplicationLifetime(),
             NullLogger<ReleaseService>.Instance);
 
     private async Task WaitForStateAsync(ReleaseId id, params ReleaseState[] terminal)
