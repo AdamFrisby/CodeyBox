@@ -390,15 +390,21 @@ public sealed class PipelineRunner : IPipelineRunner
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase);
 
+        var sandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        sandboxStartSw.Stop();
+        CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
 
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        await using (var cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox", log: _log))
+        TimingScope cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox",
+            activitySource: CodeyBoxActivities.Sandbox, log: _log);
+        await using (cloneScope)
         {
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
         }
+        CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
         if (isInitial)
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch);
         else
@@ -426,12 +432,16 @@ public sealed class PipelineRunner : IPipelineRunner
         var agentExecScope = await TimingScope.BeginAsync(
             _timings, item.Id, agentPhase, "agent.exec",
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-            log: _log);
+            log: _log,
+            activitySource: CodeyBoxActivities.Pipeline);
         AgentResult agentResult;
         await using (agentExecScope)
         {
             agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct);
         }
+        CodeyBoxMeters.AgentDuration.Record(agentExecScope.ElapsedMs,
+            new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+            new KeyValuePair<string, object?>("phase", agentPhase));
 
         var agentEndedAt = DateTimeOffset.UtcNow;
         var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
@@ -497,7 +507,8 @@ public sealed class PipelineRunner : IPipelineRunner
             var commitMessage = isInitial
                 ? $"codeybox: {item.Title}{CoAuthoredByTrailer}"
                 : $"codeybox rework: address audit findings{CoAuthoredByTrailer}";
-            await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit", log: _log))
+            await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit",
+                activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
             }
@@ -520,7 +531,8 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException(msg);
         }
 
-        await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo", log: _log))
+        await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo",
+            activitySource: CodeyBoxActivities.Sandbox, log: _log))
         {
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
         }
@@ -578,6 +590,8 @@ public sealed class PipelineRunner : IPipelineRunner
             var nonBlocking = findings.Count - blocking.Count;
 
             AuditLog.AuditIterationComplete(iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking);
+            CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
+                new KeyValuePair<string, object?>("iteration", iteration.ToString()));
 
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -594,6 +608,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogInformation("Audit iteration {Iter} passed for {Id} ({NonBlocking} non-blocking findings)",
                     iteration, item.Id, nonBlocking);
                 AuditLog.AuditPassed(iteration);
+                CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "passed"));
                 return;
             }
 
@@ -603,11 +618,13 @@ public sealed class PipelineRunner : IPipelineRunner
             if (iteration == project.Audit.MaxIterations)
             {
                 AuditLog.AuditFailed(iteration, blocking.Count);
+                CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
                 var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
             }
 
+            CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "reworking"));
             await Transition(item, WorkItemState.Reworking, ct, project);
             var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations);
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -980,14 +997,22 @@ public sealed class PipelineRunner : IPipelineRunner
         var access = _gitHost.GetSandboxAccess(repoId);
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge");
+        var mergeSandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        mergeSandboxStartSw.Stop();
+        CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        await using (var mergeCloneScope = await TimingScope.BeginAsync(_timings, item.Id, "merge", "git.clone_into_sandbox", log: _log))
+        var mergeCloneScope = await TimingScope.BeginAsync(
+            _timings, item.Id, "merge", "git.clone_into_sandbox",
+            activitySource: CodeyBoxActivities.Sandbox, log: _log);
+        await using (mergeCloneScope)
         {
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
         }
+        CodeyBoxMeters.SandboxLifecycle.Record(mergeCloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
         var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
         await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
@@ -1007,12 +1032,16 @@ public sealed class PipelineRunner : IPipelineRunner
         var mergeExecScope = await TimingScope.BeginAsync(
             _timings, item.Id, "merge", "agent.exec",
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-            log: _log);
+            log: _log,
+            activitySource: CodeyBoxActivities.Pipeline);
         AgentResult agentResult;
         await using (mergeExecScope)
         {
             agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct);
         }
+        CodeyBoxMeters.AgentDuration.Record(mergeExecScope.ElapsedMs,
+            new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+            new KeyValuePair<string, object?>("phase", "merge"));
 
         var mergeEndedAt = DateTimeOffset.UtcNow;
         var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecScope.ElapsedMs);
@@ -1736,6 +1765,7 @@ public sealed class PipelineRunner : IPipelineRunner
         await _store.UpdateAsync(next, ct);
         _log.LogInformation("Work item {Id} → {State}", item.Id, state);
         AuditLog.WorkItemTransitioned(item.Id, state.ToString());
+        CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", state.ToString()));
         if (project is not null)
             await _webhooks.PublishAsync(new WebhookEvent
             {

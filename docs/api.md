@@ -26,6 +26,10 @@ The default Kestrel bind is `127.0.0.1:5000`. To expose externally,
 front it with a TLS-terminating reverse proxy (nginx, Caddy, …) and set
 `ASPNETCORE_URLS` to the local address the proxy connects to.
 
+## Observability
+
+When OpenTelemetry is enabled (see [`observability.md`](observability.md)), all incoming HTTP requests are automatically traced as spans via `AspNetCore` instrumentation. The `traceparent` response header is set on every request so callers can correlate client-side traces with server-side spans.
+
 ## Endpoints
 
 ### `POST /workitems`

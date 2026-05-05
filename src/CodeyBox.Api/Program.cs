@@ -1,4 +1,8 @@
 using Microsoft.Extensions.Options;
+using OpenTelemetry.Exporter;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
@@ -116,6 +120,41 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
     builder.Host.UseSerilog();
 }
 
+// ── OpenTelemetry ─────────────────────────────────────────────────────────
+// Off by default (OtelOptions.Enabled = false). Operators opt in by setting
+// CodeyBox:Otel:Enabled=true and CodeyBox:Otel:OtlpEndpoint. When disabled,
+// no OTel types are registered — zero overhead in the default configuration.
+{
+    var cbConf = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
+        ?? new CodeyBoxOptions();
+    var otelOpts = cbConf.Otel;
+    OtelOptions.Validate(otelOpts);
+
+    if (otelOpts.Enabled)
+    {
+        builder.Services.AddOpenTelemetry()
+            .ConfigureResource(r => r
+                .AddService(otelOpts.ServiceName, serviceVersion: otelOpts.ServiceVersion)
+                .AddAttributes(otelOpts.ResourceAttributes.Select(
+                    kv => new KeyValuePair<string, object>(kv.Key, kv.Value))))
+            .WithTracing(t => t
+                .AddSource("CodeyBox.Pipeline")
+                .AddSource("CodeyBox.Sandbox")
+                .AddSource("CodeyBox.Upstream")
+                .AddSource("CodeyBox.Audit")
+                .AddAspNetCoreInstrumentation()
+                .AddHttpClientInstrumentation()
+                .AddOtlpExporter(o => ConfigureOtlp(o, otelOpts)))
+            .WithMetrics(m => m
+                .AddMeter("CodeyBox.Pipeline")
+                .AddMeter("CodeyBox.Sandbox")
+                .AddMeter("CodeyBox.Audit")
+                .AddMeter("CodeyBox.Upstream")
+                .AddRuntimeInstrumentation()
+                .AddOtlpExporter(o => ConfigureOtlp(o, otelOpts)));
+    }
+}
+
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
 builder.Services.Configure<ProjectsOptions>(builder.Configuration.GetSection("CodeyBox"));
 
@@ -133,6 +172,16 @@ ApiKeyAuth.Configure(builder);
 //                 kernel. Single 'snap install multipass' on Ubuntu, no
 //                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
+
+static void ConfigureOtlp(OtlpExporterOptions o, OtelOptions opts)
+{
+    o.Endpoint = new Uri(opts.OtlpEndpoint!);
+    o.Protocol = opts.ExportProtocol == "httpprotobuf"
+        ? OtlpExportProtocol.HttpProtobuf
+        : OtlpExportProtocol.Grpc;
+    if (!string.IsNullOrEmpty(opts.OtlpHeaders))
+        o.Headers = opts.OtlpHeaders;
+}
 
 static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
 {
@@ -1014,6 +1063,9 @@ namespace CodeyBox.Api
         /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
         public AgentPricingOptions AgentPricing { get; set; } = new();
 
+        /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
+        public OtelOptions Otel { get; set; } = new();
+
         /// <summary>Changelog automation configuration. See docs/changelog-automation.md.</summary>
         public ChangelogOptions Changelog { get; set; } = new();
 
@@ -1023,6 +1075,61 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+    }
+
+    /// <summary>
+    /// OpenTelemetry export configuration. Bound from <c>CodeyBox:Otel</c>.
+    /// Off by default — set <see cref="Enabled"/> to true to opt in.
+    /// </summary>
+    public sealed class OtelOptions
+    {
+        /// <summary>Enable OTel export. Default false. Nothing is registered when false.</summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>OTel service.name resource attribute. Default "codeybox".</summary>
+        public string ServiceName { get; set; } = "codeybox";
+
+        /// <summary>OTel service.version — typically a git SHA or release tag.</summary>
+        public string? ServiceVersion { get; set; }
+
+        /// <summary>OTLP collector endpoint, e.g. http://localhost:4317.</summary>
+        public string? OtlpEndpoint { get; set; }
+
+        /// <summary>
+        /// Optional CSV of extra headers forwarded to the OTLP collector,
+        /// e.g. <c>x-honeycomb-team=abc,x-dataset=prod</c>.
+        /// </summary>
+        public string? OtlpHeaders { get; set; }
+
+        /// <summary>OTLP wire format. Either <c>grpc</c> (default) or <c>httpprotobuf</c>.</summary>
+        public string ExportProtocol { get; set; } = "grpc";
+
+        /// <summary>Extra OTel resource attributes merged into every span and metric point.</summary>
+        public Dictionary<string, string> ResourceAttributes { get; set; } = [];
+
+        /// <summary>
+        /// Validates the options, throwing <see cref="InvalidOperationException"/> when
+        /// <see cref="Enabled"/> is true and the configuration is incomplete or invalid.
+        /// Safe to call when disabled — no-ops immediately.
+        /// </summary>
+        public static void Validate(OtelOptions opts)
+        {
+            if (!opts.Enabled) return;
+
+            if (string.IsNullOrWhiteSpace(opts.OtlpEndpoint))
+                throw new InvalidOperationException(
+                    "CodeyBox:Otel:OtlpEndpoint must be set when CodeyBox:Otel:Enabled=true.");
+
+            if (!Uri.TryCreate(opts.OtlpEndpoint, UriKind.Absolute, out var endpointUri)
+                || endpointUri.Scheme is not "http" and not "https")
+                throw new InvalidOperationException(
+                    $"CodeyBox:Otel:OtlpEndpoint '{opts.OtlpEndpoint}' is not a valid http/https URL.");
+
+            if (opts.ExportProtocol is not "grpc" and not "httpprotobuf")
+                throw new InvalidOperationException(
+                    $"CodeyBox:Otel:ExportProtocol '{opts.ExportProtocol}' is not valid. " +
+                    "Expected 'grpc' or 'httpprotobuf'.");
+        }
     }
 
     /// <summary>

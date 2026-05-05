@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -298,7 +299,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         using var req = BuildRequest(HttpMethod.Post, url);
         req.Content = JsonContent.Create(body);
 
+        var postPrSw = Stopwatch.StartNew();
         using var response = await SendAsync(req, ct);
+        postPrSw.Stop();
+        CodeyBoxMeters.UpstreamApiCallDuration.Record(postPrSw.ElapsedMilliseconds,
+            new KeyValuePair<string, object?>("endpoint", "POST /pulls"),
+            new KeyValuePair<string, object?>("status_code", (int)response.StatusCode));
 
         if (response.StatusCode == HttpStatusCode.UnprocessableEntity)
         {
@@ -326,7 +332,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         using var req = BuildRequest(HttpMethod.Put, url);
         req.Content = JsonContent.Create(body);
 
+        var putMergeSw = Stopwatch.StartNew();
         using var response = await SendAsync(req, ct);
+        putMergeSw.Stop();
+        CodeyBoxMeters.UpstreamApiCallDuration.Record(putMergeSw.ElapsedMilliseconds,
+            new KeyValuePair<string, object?>("endpoint", "PUT /pulls/merge"),
+            new KeyValuePair<string, object?>("status_code", (int)response.StatusCode));
 
         if (response.StatusCode == HttpStatusCode.MethodNotAllowed)
         {
