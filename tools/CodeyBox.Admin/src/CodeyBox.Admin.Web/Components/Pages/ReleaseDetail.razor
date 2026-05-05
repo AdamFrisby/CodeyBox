@@ -113,43 +113,6 @@ else if (_release is not null)
         </table>
     }
 
-    @* ── Timeline ────────────────────────────────────────────────────────────── *@
-    <h2>Timeline</h2>
-
-    @if (_timelineError is not null)
-    {
-        <p class="error-banner">@_timelineError</p>
-    }
-    else if (_timeline is null)
-    {
-        <p>Loading timeline…</p>
-    }
-    else if (_timeline.Entries.Count == 0)
-    {
-        <p>No timeline events.</p>
-    }
-    else
-    {
-        <table class="queue-table">
-            <thead>
-                <tr>
-                    <th>Time</th>
-                    <th>Kind</th>
-                    <th>Details</th>
-                </tr>
-            </thead>
-            <tbody>
-                @foreach (var ev in _timeline.Entries)
-                {
-                    <tr>
-                        <td class="col-age">@ev.OccurredAt.ToString("yyyy-MM-dd HH:mm:ss")</td>
-                        <td><code>@ev.Kind</code></td>
-                        <td>@ev.Summary</td>
-                    </tr>
-                }
-            </tbody>
-        </table>
-    }
 }
 
 @* ── Reopen modal ─────────────────────────────────────────────────────────── *@
@@ -179,11 +142,9 @@ else if (_release is not null)
 
     private ReleaseDto? _release;
     private List<WorkItemSummary>? _workItems;
-    private WorkItemTimelineDto? _timeline;
     private string? _error;
     private string? _actionError;
     private string? _workItemsError;
-    private string? _timelineError;
 
     private bool _showReopenModal;
     private string _reopenReason = "";
@@ -193,7 +154,7 @@ else if (_release is not null)
     protected override async Task OnInitializedAsync()
     {
         _cts = new CancellationTokenSource();
-        await Task.WhenAll(LoadReleaseAsync(), LoadWorkItemsAsync(), LoadTimelineAsync());
+        await Task.WhenAll(LoadReleaseAsync(), LoadWorkItemsAsync());
     }
 
     private async Task LoadReleaseAsync()
@@ -223,18 +184,6 @@ else if (_release is not null)
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _workItemsError = ex.Message; }
-    }
-
-    private async Task LoadTimelineAsync()
-    {
-        var ct = _cts?.Token ?? default;
-        try
-        {
-            // Use the work-item timeline API with the release ID to get release-scoped events
-            _timeline = await ApiClient.GetWorkItemTimelineAsync(Id, ct: ct);
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { _timelineError = ex.Message; }
     }
 
     private async Task CloseReleaseAsync()

@@ -696,10 +696,10 @@ public sealed class ReleaseService
             if (ch != '\n' && ch != '\t' && char.IsControl(ch)) continue;
             // Strip Unicode bidirectional override codepoints that can visually obscure injected
             // content or confuse LLM tokenizers (U+202A-U+202E, U+2066-U+2069, U+200E/F, U+061C).
-            if ((ch >= '‪' && ch <= '‮') ||
-                (ch >= '⁦' && ch <= '⁩') ||
-                ch == '‎' || ch == '‏' ||
-                ch == '؜')
+            if ((ch >= '\u202A' && ch <= '\u202E') ||
+                (ch >= '\u2066' && ch <= '\u2069') ||
+                ch == '\u200E' || ch == '\u200F' ||
+                ch == '\u061C')
                 continue;
             stripped.Append(ch);
         }
@@ -714,7 +714,12 @@ public sealed class ReleaseService
             if (trimmed.StartsWith('#'))
                 lines[i] = "  " + trimmed.TrimStart('#').TrimStart();
         }
-        return string.Join('\n', lines);
+        // XML-escape so that finding content cannot break out of the <finding> tag boundary
+        // in BuildRemediationPrompt and inject new structural XML elements into the prompt.
+        return string.Join('\n', lines)
+            .Replace("&", "&amp;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;");
     }
 
     private static async Task RunSandboxCmd(ISandbox sandbox, params string[] argv)
