@@ -35,7 +35,8 @@ A dependency is **satisfied** when it has reached any of these terminal states:
 | `Done` | Completed successfully |
 | `Failed` | Pipeline error (work, audit, or merge phase) |
 | `AuditFailed` | Audit did not converge within `MaxIterations` |
-| `Cancelled` | Cancelled via `DELETE /workitems/{id}` |
+| `Cancelled` | Operator-requested stop or parent-cascaded cancel (see below) |
+| `AbandonedAfterRecoveryAttempts` | Recovery loop exceeded `MaxRecoveryAttempts`; operator intervention needed |
 
 The gate is satisfied by *any* terminal state, not only `Done`. This is a deliberate design choice: if an upstream item fails, its dependents become eligible so the operator can inspect, manually retry the failed parent, and let the queue resume automatically — no manual re-enqueuing needed.
 
@@ -63,15 +64,39 @@ Cycle detection runs DFS over the full dependency graph (O(V + E) where V is the
 
 ---
 
-## Cancellation propagation
+## Cancellation vs interruption
+
+`state=Cancelled` means **"operator said stop — don't retry"**. It is only written for:
+
+| Reason (`cancellationReason`) | Cause |
+|-------------------------------|-------|
+| `OperatorRequested` | `DELETE /workitems/{id}` or equivalent explicit operator action |
+| `ParentCascaded` | A `dependsOn` parent ended in `Cancelled` state |
+
+Items interrupted by a **host shutdown** (SIGTERM, OOM, reboot) are **not** transitioned to `Cancelled`. They remain in their mid-flight state (`Working`, `Auditing`, `Reworking`, `Merging`, etc.) and the recovery loop resets them to a safe restart point on the next startup.
+
+### Cancellation propagation
 
 When `DELETE /workitems/{id}` is called:
 
-1. The target item is cancelled (either by signalling its active `CancellationToken` if in-flight, or by a direct state transition to `Cancelled` if still queued).
-2. All **Queued** items that transitively depend on the cancelled item are also transitioned to `Cancelled` with `lastError = "parent dependency cancelled"`.
+1. The target item is cancelled (`cancellationReason=OperatorRequested`) either by signalling its active `CancellationToken` if in-flight, or by a direct state transition to `Cancelled` if still queued.
+2. All **Queued** items that transitively depend on the cancelled item are also transitioned to `Cancelled` with `cancellationReason=ParentCascaded` and `lastError = "parent dependency cancelled"`.
 3. **In-flight** dependents (state ≠ `Queued`) are left to run their course — they were already past the dependency gate and may still succeed.
 
 Cascade cancellation is transitive: if A → B → C and A is cancelled, B and C (both `Queued`) are cancelled.
+
+### Uncancelling items
+
+Use `POST /workitems/{id}/uncancel` to reset a `Cancelled` item back to `Queued` when:
+
+- `cancellationReason=ParentCascaded` — the parent has since been retried.
+- `cancellationReason=null` — legacy item whose reason is ambiguous (likely a pre-fix host-shutdown victim; see Operations Guide).
+
+Returns 409 when `cancellationReason=OperatorRequested` — use `POST /workitems` to re-create the item instead.
+
+### AbandonedAfterRecoveryAttempts
+
+When the recovery loop has retried an item more than `CodeyBox:WorkerPool:MaxRecoveryAttempts` times (default 3) without it ever reaching a terminal state, the item is transitioned to `AbandonedAfterRecoveryAttempts` with a descriptive `lastError`. Use `POST /workitems/{id}/retry` to resume manually after investigating the root cause.
 
 ---
 

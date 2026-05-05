@@ -26,6 +26,13 @@ public interface ICodeyBoxApiClient
     // ── Budget usage ──────────────────────────────────────────────────────────
     Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default);
 
+    // ── Monthly cost budget ───────────────────────────────────────────────────
+    Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default);
+    Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default);
+    Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default);
+    // ── Live stdout tail ──────────────────────────────────────────────────────
+    Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default);
+
     // ── Audit timeline ────────────────────────────────────────────────────────
     Task<WorkItemTimelineDto?> GetWorkItemTimelineAsync(
         string id, string? kind = null, string? since = null, int? iteration = null,
@@ -47,6 +54,17 @@ public interface ICodeyBoxApiClient
     Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default);
     Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default);
     Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default);
+    // ── Plugins ───────────────────────────────────────────────────────────────
+    Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default);
+    // ── Replay ────────────────────────────────────────────────────────────────
+    Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default);
+    Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default);
+    // ── Diff ──────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Fetches the pending diff for a work item as JSON. Returns null when the
+    /// work item has no diff yet (204 No Content) or does not exist (404).
+    /// </summary>
+    Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default);
 
     // ── Suggestions ───────────────────────────────────────────────────────────
     Task<List<SuggestionDto>> GetSuggestionsAsync(

@@ -157,6 +157,6 @@ internal sealed class TimestampingPipelineRunner : IPipelineRunner
 
     public TimestampingPipelineRunner(IWorkItemStore store) => _store = store;
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct) =>
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default) =>
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
 }

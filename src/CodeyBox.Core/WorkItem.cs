@@ -50,6 +50,22 @@ public sealed record WorkItem
     /// <summary>Last error message if state is Failed.</summary>
     public string? LastError { get; init; }
 
+    /// <summary>
+    /// Why the item was cancelled. Only populated when <see cref="State"/> is
+    /// <see cref="WorkItemState.Cancelled"/>; null for all other states and for
+    /// legacy rows written before this column existed.
+    /// </summary>
+    public WorkItemCancellationReason? CancellationReason { get; init; }
+
+    /// <summary>
+    /// How many times the recovery loop has reset this item from a mid-flight
+    /// state back to a recoverable state after successive host shutdowns. When
+    /// this reaches <c>OrchestratorOptions.MaxRecoveryAttempts</c> the item is
+    /// transitioned to <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>
+    /// instead of being re-queued.
+    /// </summary>
+    public int RecoveryAttempts { get; init; }
+
     /// <summary>Number of attempts that have been made on the upstream-push phase.</summary>
     public int UpstreamPushAttempts { get; init; }
 
@@ -121,13 +137,43 @@ public sealed record WorkItem
     /// </summary>
     public string? ExternalId { get; init; }
 
-    public WorkItem With(WorkItemState state, string? error = null) => this with
-    {
-        State = state,
-        LastError = error,
-        UpdatedAt = DateTimeOffset.UtcNow,
-        // Clear StartedAt when re-queuing: retried items must not appear in-flight
-        // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
-        StartedAt = state == WorkItemState.Queued ? null : StartedAt,
-    };
+    /// <summary>
+    /// When set, identifies the source work item this item was created as a replay of.
+    /// Immutable after creation. Null for items not created via the replay API.
+    /// When the source is cancelled the link is cleared (orphaned) but the replay
+    /// continues running.
+    /// </summary>
+    public WorkItemId? ReplayOfWorkItemId { get; init; }
+
+    /// <summary>
+    /// SHA of the merge commit produced during the merge phase. Populated by the
+    /// pipeline runner when the merge completes; null until then.
+    /// </summary>
+    public string? MergeSha { get; init; }
+
+    /// <summary>
+    /// Number of times this work item has been automatically recovered by the
+    /// dead-worker reaper after an orphaning crash. Incremented on each recovery
+    /// transition; capped at <c>DeadWorkerOptions.MaxRecoveryAttempts</c> before
+    /// the item is transitioned to Failed.
+    /// </summary>
+    public int RecoveryAttempts { get; init; }
+
+    public WorkItem With(
+        WorkItemState state,
+        string? error = null,
+        WorkItemCancellationReason? cancellationReason = null) => this with
+        {
+            State = state,
+            LastError = error,
+            // CancellationReason is only meaningful when transitioning to Cancelled.
+            CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            // Clear StartedAt when re-queuing: retried items must not appear in-flight
+            // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
+            StartedAt = state == WorkItemState.Queued ? null : StartedAt,
+            // Clear WorkBranch when re-queuing from Working: the in-flight branch is
+            // gone; the next pickup generates a fresh one.
+            WorkBranch = state == WorkItemState.Queued ? null : WorkBranch,
+        };
 }

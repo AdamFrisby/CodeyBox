@@ -47,6 +47,18 @@ public static class AuditLog
         Audit("work_item.retried")
             .Information("Work item {WorkItemId} retried from phase {From}", id.ToString(), from);
 
+    public static void WorkItemRecovered(WorkItemId id, string fromState, string toState, int attempt) =>
+        Audit("work_item.recovered")
+            .Information(
+                "Recovering {WorkItemId} from non-terminal state {FromState} → {ToState} (recovery attempt {Attempt}, presumed lost on prior shutdown)",
+                id.ToString(), fromState, toState, attempt);
+
+    public static void WorkItemAbandonedAfterRecovery(WorkItemId id, int maxAttempts) =>
+        Audit("work_item.abandoned_after_recovery")
+            .Warning(
+                "Work item {WorkItemId} abandoned after {MaxAttempts} recovery attempts; operator intervention required",
+                id.ToString(), maxAttempts);
+
     public static void WorkItemFailed(WorkItemId id, string error) =>
         Audit("work_item.failed")
             .Warning("Work item {WorkItemId} failed: {Error}", id.ToString(), error);
@@ -129,6 +141,21 @@ public static class AuditLog
     public static void SandboxDisposed(string vmName) =>
         Audit("sandbox.disposed")
             .Information("Sandbox {VmName} disposed", vmName);
+
+    public static void SandboxLeakDetected(string name, double ageMinutes, long? diskMb) =>
+        Audit("sandbox.leak_detected")
+            .Warning("Leaked sandbox detected: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB",
+                name, ageMinutes, diskMb);
+
+    public static void SandboxLeakDisposed(string name, double ageMinutes, long? diskMb, DateTimeOffset disposedAt) =>
+        Audit("sandbox.leak_disposed")
+            .Information("Leaked sandbox disposed: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB disposedAt={DisposedAt}",
+                name, ageMinutes, diskMb, disposedAt);
+
+    public static void SandboxLeakDisposeFailed(string name, double ageMinutes, long? diskMb, string error) =>
+        Audit("sandbox.leak_dispose_failed")
+            .Warning("Failed to dispose leaked sandbox {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB: {Error}",
+                name, ageMinutes, diskMb, error);
 
     // ── Upstream remote ──────────────────────────────────────────────────────
 
@@ -291,12 +318,59 @@ public static class AuditLog
             .Information("Changelog work item {WorkItemId} created for project {ProjectId} tag {ToTag}",
                 workItemId, projectId, toTag);
 
+    // ── Dead-worker recovery ─────────────────────────────────────────────────
+
+    public static void WorkerRegistered(string workerId, string hostName, int processId) =>
+        Audit("worker.registered")
+            .Information("Worker {WorkerId} registered on {HostName} (pid={ProcessId})", workerId, hostName, processId);
+
+    public static void WorkerDeregistered(string workerId) =>
+        Audit("worker.deregistered")
+            .Information("Worker {WorkerId} deregistered (clean shutdown)", workerId);
+
+    public static void DeadWorkerRecovered(WorkItemId itemId, string workerId, WorkItemState fromState, WorkItemState toState, int attempt) =>
+        Audit("work_item.worker_dead_recovered")
+            .Information("Dead worker {WorkerId}: recovered work item {WorkItemId} from {FromState} to {ToState} (attempt {Attempt})",
+                workerId, itemId.ToString(), fromState.ToString(), toState.ToString(), attempt);
+
+    public static void DeadWorkerFailedTerminal(WorkItemId itemId, string workerId, int attempt) =>
+        Audit("work_item.worker_dead_failed_terminal")
+            .Warning("Dead worker {WorkerId}: work item {WorkItemId} exceeded MaxRecoveryAttempts at attempt {Attempt}; transitioned to Failed",
+                workerId, itemId.ToString(), attempt);
+
     // ── Budget caps ──────────────────────────────────────────────────────────
 
     public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>
         Audit("budget.deferred")
             .Information("Work item {WorkItemId} for project {ProjectId} deferred by budget cap: {Reason}",
                 id.ToString(), projectId.Value, reason);
+
+    public static void ProjectQueuePaused(ProjectId projectId, string reason) =>
+        Audit("project_queue.paused")
+            .Information("Project {ProjectId} queue paused: {Reason}", projectId.Value, reason);
+
+    public static void ProjectQueueResumed(ProjectId projectId) =>
+        Audit("project_queue.resumed")
+            .Information("Project {ProjectId} queue resumed", projectId.Value);
+
+    public static void BudgetAlertWarning(ProjectId projectId, decimal spendUsd, decimal budgetUsd, double pct) =>
+        Audit("budget_alert.warning")
+            .Warning("Project {ProjectId} budget warning: ${SpendUsd:F4} of ${BudgetUsd:F2} ({Pct:F1}%)",
+                projectId.Value, spendUsd, budgetUsd, pct);
+
+    public static void BudgetAlertExceeded(ProjectId projectId, decimal spendUsd, decimal budgetUsd, double pct) =>
+        Audit("budget_alert.exceeded")
+            .Warning("Project {ProjectId} budget exceeded: ${SpendUsd:F4} of ${BudgetUsd:F2} ({Pct:F1}%)",
+                projectId.Value, spendUsd, budgetUsd, pct);
+
+    public static void BudgetAlertRecovered(ProjectId projectId, decimal spendUsd, decimal budgetUsd, double pct) =>
+        Audit("budget_alert.recovered")
+            .Information("Project {ProjectId} budget recovered: ${SpendUsd:F4} of ${BudgetUsd:F2} ({Pct:F1}%)",
+                projectId.Value, spendUsd, budgetUsd, pct);
+
+    public static void BudgetAlertServiceStartupSafe(string reason) =>
+        Audit("budget_alert.startup_safe")
+            .Warning("BudgetAlertService: {Reason}; cost-budget checks will be skipped until the next tick", reason);
 
     // ── Quota router ─────────────────────────────────────────────────────────
 

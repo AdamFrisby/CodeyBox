@@ -64,4 +64,15 @@ public interface IWorkItemStore
     /// can treat every project as un-paused without crashing.
     /// </summary>
     Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default);
+    /// Returns all work items whose <c>replay_of_work_item_id</c> matches
+    /// <paramref name="sourceId"/>, in creation order (oldest first).
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Clears <c>replay_of_work_item_id</c> for every work item that was a replay of
+    /// <paramref name="sourceId"/>. Called when the source is cancelled so replays
+    /// become orphaned but keep running.
+    /// </summary>
+    Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default);
 }

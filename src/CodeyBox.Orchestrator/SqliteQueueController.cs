@@ -5,13 +5,14 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// SQLite-backed <see cref="IQueueController"/>. Persists the queue state to
-/// the same database file as the work-item store (separate connection, separate
-/// table). On startup the state is loaded; if paused, a warning is emitted at
-/// audit tier so operators don't forget they left the queue paused.
+/// SQLite-backed <see cref="IQueueController"/>. Persists the global queue state
+/// and per-project queue states to the same database file as the work-item store
+/// (separate connection, separate tables). On startup the global state is loaded;
+/// if paused, a warning is emitted so operators don't forget they left it paused.
 /// </summary>
 public sealed class SqliteQueueController : IQueueController, IDisposable
 {
+    private readonly string _dbPath;
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly ILogger<SqliteQueueController> _log;
@@ -36,6 +37,7 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
 
     public SqliteQueueController(string dbPath, ILogger<SqliteQueueController> log)
     {
+        _dbPath = dbPath;
         _log = log;
         var dir = Path.GetDirectoryName(dbPath);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
@@ -62,6 +64,13 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             );
             INSERT OR IGNORE INTO queue_state (singleton, state, updated_at)
             VALUES (1, 0, datetime('now'));
+            CREATE TABLE IF NOT EXISTS project_queue_state (
+                project_id    TEXT PRIMARY KEY,
+                paused        INTEGER NOT NULL DEFAULT 0,
+                paused_at     TEXT,
+                paused_reason TEXT,
+                updated_at    TEXT NOT NULL
+            );
             """;
         cmd.ExecuteNonQuery();
 
@@ -126,6 +135,89 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
         {
             _lock.Release();
         }
+    }
+
+    public async Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            using var cmd = _conn.CreateCommand();
+            // COALESCE(paused_at, $at) keeps the original pause timestamp on repeat calls.
+            cmd.CommandText = """
+                INSERT INTO project_queue_state (project_id, paused, paused_at, paused_reason, updated_at)
+                VALUES ($pid, 1, $at, $reason, $ua)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    paused        = 1,
+                    paused_at     = COALESCE(paused_at, $at),
+                    paused_reason = $reason,
+                    updated_at    = $ua;
+                """;
+            cmd.Parameters.AddWithValue("$pid", projectId.Value);
+            cmd.Parameters.AddWithValue("$at", now.ToString("O"));
+            cmd.Parameters.AddWithValue("$reason", reason);
+            cmd.Parameters.AddWithValue("$ua", now.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct);
+            AuditLog.ProjectQueuePaused(projectId, reason);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    public async Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO project_queue_state (project_id, paused, paused_at, paused_reason, updated_at)
+                VALUES ($pid, 0, NULL, NULL, $ua)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    paused        = 0,
+                    paused_at     = NULL,
+                    paused_reason = NULL,
+                    updated_at    = $ua;
+                """;
+            cmd.Parameters.AddWithValue("$pid", projectId.Value);
+            cmd.Parameters.AddWithValue("$ua", now.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct);
+            AuditLog.ProjectQueueResumed(projectId);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    public async Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct = default)
+    {
+        // Read-only connection so we don't block the write lock during the query.
+        using var rc = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        rc.Open();
+        using var cmd = rc.CreateCommand();
+        cmd.CommandText = """
+            SELECT paused, paused_at, paused_reason
+            FROM project_queue_state
+            WHERE project_id = $pid;
+            """;
+        cmd.Parameters.AddWithValue("$pid", projectId.Value);
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return null;
+
+        var paused = reader.GetInt32(0) == 1;
+        var pausedAtOrd = reader.GetOrdinal("paused_at");
+        var pausedAt = reader.IsDBNull(pausedAtOrd)
+            ? (DateTimeOffset?)null
+            : DateTimeOffset.Parse(reader.GetString(pausedAtOrd), System.Globalization.CultureInfo.InvariantCulture);
+        var reasonOrd = reader.GetOrdinal("paused_reason");
+        var reason = reader.IsDBNull(reasonOrd) ? null : reader.GetString(reasonOrd);
+        return new ProjectQueueState(projectId, paused, pausedAt, reason);
     }
 
     public void Dispose()

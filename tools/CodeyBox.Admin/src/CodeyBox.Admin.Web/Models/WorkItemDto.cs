@@ -24,6 +24,11 @@ public sealed class WorkItemDto
     public bool DependsOnSatisfied { get; set; }
     public Dictionary<string, string?> DependsOnExternalIds { get; set; } = [];
     public long QueuePosition { get; set; }
+    public string? ReplayOfWorkItemId { get; set; }
+    public string? AgentClassId { get; set; }
+    public int? AuditIterations { get; set; }
+    public int? FinalAuditBlockingFindings { get; set; }
+    public string? MergeSha { get; set; }
 
     public bool IsTerminal => State is "Done" or "Failed" or "Cancelled" or "AuditFailed";
     public bool IsQueued => State == "Queued";

@@ -61,7 +61,14 @@ public sealed record AuditContext(
     /// cref="LlmReviewAuditor"/> reads this to use the override instead of
     /// its baked-in runner. Tool auditors ignore it.
     /// </summary>
-    IAgentRunner? AuditRunner = null);
+    IAgentRunner? AuditRunner = null,
+    /// <summary>
+    /// Optional callback invoked per stdout chunk as the LLM agent emits
+    /// output. Set by the pipeline when live-stdout broadcasting is active;
+    /// null otherwise. LLM auditors pass this through to IAgentRunner.RunAsync;
+    /// tool auditors ignore it.
+    /// </summary>
+    Action<string>? StdoutChunkCallback = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(bool Passed, IReadOnlyList<AuditFinding> Findings, string? RawOutput = null);

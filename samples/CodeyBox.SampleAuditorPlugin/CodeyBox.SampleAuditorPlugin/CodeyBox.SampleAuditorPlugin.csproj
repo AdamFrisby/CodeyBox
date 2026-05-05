@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!--
+      When packaging for distribution via NuGet, update these:
+        <PackageId>MyOrg.CodeyBoxPlugin.NoTodo</PackageId>
+        <PackageVersion>1.0.0</PackageVersion>
+      Then replace the ProjectReferences below with NuGet package references:
+        <PackageReference Include="CodeyBox.Core" Version="..." />
+        <PackageReference Include="CodeyBox.PluginSdk" Version="..." />
+    -->
+  </PropertyGroup>
+
+  <!--
+    In-tree development: reference the local CodeyBox.Core and CodeyBox.PluginSdk projects.
+    External operators replace these two ProjectReferences with NuGet PackageReferences.
+    Never reference CodeyBox.Orchestrator, CodeyBox.Api, or any internal project.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+  </ItemGroup>
+
+</Project>

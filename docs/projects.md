@@ -125,6 +125,7 @@ defaults expecting them to be replaced wholesale by per-project overrides.
   "FailingSeverity": "Error",
   "PerIterationTimeoutMinutes": 10,
   "StopOnFirstFailure": false,
+  "MaxLlmAuditorParallelism": 3,
   "Languages": ["python", "typescript"],
   "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"],
   "Custom": [
@@ -143,6 +144,14 @@ The orchestrator's effective auditor list for each project is:
 ```
 Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 ```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `MaxIterations` | int | `3` | How many audit + rework cycles to attempt before giving up with `AuditFailed` |
+| `FailingSeverity` | string | `"Error"` | Findings at or above this severity block the merge. `"Warning"` or `"Info"` can be used to widen the gate. |
+| `PerIterationTimeoutMinutes` | int | `10` | Wall-clock cap on a single audit iteration's sandbox |
+| `StopOnFirstFailure` | bool | `false` | Stop running auditors as soon as one returns a blocking finding — useful when cheap linters precede expensive LLM auditors |
+| `MaxLlmAuditorParallelism` | int | `3` | Max LLM auditors running concurrently. Default `3` means `security:llm-review`, `completeness:llm-review`, and `cheating:llm-review` all run at the same time. Set to `1` to serialize them if you hit API 429 rate-limit errors. Tool auditors are unaffected and always run sequentially. |
 
 ### Languages (built-in presets)
 
@@ -312,13 +321,38 @@ creation — never silently degrades to "no enforcement."
 
 ### Custom auditors
 
-Three kinds, all configured in JSON:
+Four kinds, all configured in JSON:
 
-| Kind           | Required fields           | Notes                                  |
-|----------------|---------------------------|----------------------------------------|
-| `shell`        | `Name`, `Argv`            | Exit 0 = pass; non-zero = Error finding|
-| `diff-pattern` | `Name`, `Patterns[]`      | Regex against added lines in diff      |
-| `llm`          | `Name`, `ReviewFocus`     | LLM review with the project's agent    |
+| Kind           | Required fields           | Notes                                              |
+|----------------|---------------------------|----------------------------------------------------|
+| `shell`        | `Name`, `Argv`            | Exit 0 = pass; non-zero = Error finding            |
+| `diff-pattern` | `Name`, `Patterns[]`      | Regex against added lines in diff                  |
+| `llm`          | `Name`, `ReviewFocus`     | LLM review with the project's agent                |
+| `plugin`       | `PluginId`                | Delegates to a loaded third-party `IAuditor` plugin |
+
+#### Plugin auditors
+
+Plugin auditors let operators ship custom audit logic as standalone NuGet packages
+without modifying CodeyBox core. To enable one, the plugin DLL must be discovered
+by the host (see `CodeyBox:Plugins` configuration), and its ID must be in the
+allowlist.
+
+```json
+"Audit": {
+  "Custom": [
+    { "Kind": "plugin", "PluginId": "myorg.no-var-keyword" },
+    { "Kind": "plugin", "PluginId": "myorg.xml-doc-required" }
+  ]
+}
+```
+
+`PluginId` must match the `id` declared in the plugin's `[CodeyBoxPlugin]`
+attribute. If the plugin is not loaded, the composer logs a warning and skips
+the entry — other auditors continue normally. No `Name` field is required; the
+plugin's own `IAuditor.Name` is used in findings and logs.
+
+See [`docs/auditor-plugins.md`](auditor-plugins.md) for the full authoring guide,
+project skeleton, and sample plugin.
 
 ## Per-project upstream
 
@@ -341,6 +375,36 @@ item; in-flight pushes keep their pre-rotation value.
 For `git-generic`, set `GenericUrl` and rely on the host git config
 (askpass, SSH agent) for auth. For `noop`, no upstream push happens and
 the host bare repo is the source of truth.
+
+### Plugin upstreams and PluginConfig
+
+When `Kind` is not a built-in (`noop`, `github`, `git-generic`), the orchestrator
+looks for a plugin-registered `IUpstreamRemote` whose `Name` matches. Plugins read
+their per-project settings from `Upstream.PluginConfig`:
+
+```json
+"Upstream": {
+  "Kind": "gitea",
+  "TokenEnvVar": "MY_GITEA_TOKEN",
+  "PluginConfig": {
+    "BaseUrl": "https://git.mycompany.example/api/v1",
+    "Owner": "myteam",
+    "Repository": "myproject"
+  }
+}
+```
+
+The keys inside `PluginConfig` are plugin-defined. Check the plugin's documentation
+for which keys it reads. The orchestrator passes this dictionary to the plugin via
+`IPluginHost.GetProjectUpstreamConfig(projectId)` — plugins must not rely on any
+other per-project state injection mechanism.
+
+**Token security**: tokens must **never** go into `PluginConfig`. Always use
+`TokenEnvVar` to name the environment variable holding the token; the plugin reads it
+with `Environment.GetEnvironmentVariable(...)`.
+
+See [`docs/upstream-plugins.md`](upstream-plugins.md) for how to author an upstream
+remote plugin.
 
 ### GitHub upstream: pull request flow
 
@@ -446,7 +510,37 @@ Returns current consumption against the configured limits:
 }
 ```
 
-The admin dashboard shows this as colour-coded usage bars per project
+The admin dashboard shows this as colour-coded usage bars per project.
+
+---
+
+## Monthly cost budget
+
+Set `Budget.MonthlyCostBudgetUsd > 0` to enable spend tracking and automatic alerts over a rolling 30-day window. See [budget-alerts.md](budget-alerts.md) for the full description.
+
+```json
+{
+  "Budget": {
+    "MaxItemsPerHour": 10,
+    "MaxItemsPerDay": 50,
+    "MaxConcurrentForProject": 2,
+
+    "MonthlyCostBudgetUsd": 500.00,
+    "CostWarningThresholdPct": 80,
+    "CostHardCapPct": 100,
+    "AutoResumeOnRecovery": false
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `MonthlyCostBudgetUsd` | `decimal` | `0` | Max USD spend in rolling 30-day window. 0 = unlimited. |
+| `CostWarningThresholdPct` | `int` | `80` | Webhook warning threshold percentage. 0 = disabled. |
+| `CostHardCapPct` | `int` | `100` | Auto-pause + webhook threshold percentage. 0 = no auto-pause. |
+| `AutoResumeOnRecovery` | `bool` | `false` | Auto-resume when spend drops back below `CostWarningThresholdPct`. |
+
+A project with `MonthlyCostBudgetUsd = 0` (the default) ignores all threshold configuration — no alerts, no auto-pause.
 (yellow ≥ 80%, red = 100%).
 
 ## REST API

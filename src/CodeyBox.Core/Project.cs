@@ -15,6 +15,31 @@ public sealed record ProjectBudget
     /// 0 = unlimited (subject to global MaxConcurrentWorkers).
     /// </summary>
     public int MaxConcurrentForProject { get; init; }
+
+    /// <summary>
+    /// Maximum estimated USD spend per rolling 30-day window. 0 = unlimited.
+    /// Computed from work_item_costs.estimated_usd summed across all work items
+    /// belonging to this project whose started_at is within the window.
+    /// </summary>
+    public decimal MonthlyCostBudgetUsd { get; init; }
+
+    /// <summary>
+    /// Webhook fires at this percentage of the monthly cost budget (default 80).
+    /// Set to 0 to disable the warning event. Ignored when MonthlyCostBudgetUsd = 0.
+    /// </summary>
+    public int CostWarningThresholdPct { get; init; } = 80;
+
+    /// <summary>
+    /// The project queue is automatically paused at this percentage (default 100).
+    /// Set to 0 to disable auto-pause (webhook still fires). Ignored when MonthlyCostBudgetUsd = 0.
+    /// </summary>
+    public int CostHardCapPct { get; init; } = 100;
+
+    /// <summary>
+    /// When true, the project queue is automatically resumed when spend drops back below
+    /// CostWarningThresholdPct. Default false; operator should manually unpause to acknowledge.
+    /// </summary>
+    public bool AutoResumeOnRecovery { get; init; }
 }
 
 /// <summary>
@@ -202,6 +227,15 @@ public sealed record ProjectUpstream
     /// </summary>
     public ProjectPrDescription PrDescription { get; init; } = new();
 
+    /// <summary>
+    /// Plugin-specific key/value settings passed to the upstream remote plugin
+    /// named by <see cref="Kind"/>. Plugin authors document which keys they read.
+    /// Accessible at runtime via
+    /// <c>IUpstreamPluginHost.GetProjectUpstreamConfig(projectId)</c>.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> PluginConfig { get; init; }
+        = new Dictionary<string, string>();
+
     public static ProjectUpstream Noop { get; } = new();
 }
 
@@ -298,18 +332,42 @@ public sealed record ProjectAudit
     /// </summary>
     public IReadOnlyDictionary<string, AgentKind> PerAuditorAgent { get; init; }
         = new Dictionary<string, AgentKind>();
+
+    /// <summary>
+    /// Maximum number of LLM auditors to run concurrently within an audit
+    /// iteration. Default 3 matches the typical security/completeness/cheating
+    /// set. Set to 1 to disable parallelism and fall back to sequential
+    /// execution — useful for debugging or subscription accounts hitting 429s.
+    /// Each parallel LLM auditor runs in its own sandbox clone to avoid result
+    /// file races. Tool auditors are unaffected and always run sequentially.
+    /// </summary>
+    public int MaxLlmAuditorParallelism { get; init; } = 3;
 }
 
 /// <summary>
 /// Free-form auditor description. The composer picks the matching factory
-/// (shell, llm, diff-pattern) based on <see cref="Kind"/> and applies the
-/// remaining fields. Lets operators express one-off auditors in config
-/// without writing code.
+/// based on <see cref="Kind"/> and applies the remaining fields.
+///
+/// <para>Kinds: <c>shell</c>, <c>diff-pattern</c>, <c>llm</c>, <c>plugin</c>.</para>
+///
+/// <para>For <c>Kind = "plugin"</c>, set <see cref="PluginId"/> to the plugin's
+/// reverse-domain ID (the value passed to <c>[CodeyBoxPlugin(Id = …)]</c>). The
+/// composer looks up the registered <see cref="IAuditor"/> singleton by that ID
+/// and includes it in the run. <see cref="Name"/> is not used for plugin auditors;
+/// the auditor's own <see cref="IAuditor.Name"/> is used instead.</para>
 /// </summary>
 public sealed record CustomAuditorDescriptor
 {
-    public required string Name { get; init; }
+    public string Name { get; init; } = string.Empty;
     public required string Kind { get; init; }
+
+    /// <summary>
+    /// Plugin reverse-domain ID. Required when <see cref="Kind"/> is <c>"plugin"</c>;
+    /// ignored for all other kinds. Must match the <c>Id</c> declared in the
+    /// plugin's <c>[CodeyBoxPlugin]</c> attribute.
+    /// </summary>
+    public string? PluginId { get; init; }
+
     public IReadOnlyList<string> Argv { get; init; } = [];
     public string? ReviewFocus { get; init; }
     public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];

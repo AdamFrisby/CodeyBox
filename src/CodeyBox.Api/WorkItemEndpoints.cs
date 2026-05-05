@@ -11,12 +11,16 @@ internal static class WorkItemEndpoints
         group.MapPost("/", CreateAsync);
         group.MapPost("/reorder", ReorderWorkItemsAsync);
         group.MapPost("/{id}/retry", RetryAsync);
+        group.MapPost("/{id}/replay", ReplayAsync);
         group.MapGet("/", ListAsync);
         group.MapGet("/{id}", GetAsync);
         group.MapDelete("/{id}", CancelAsync);
         group.MapGet("/{id}/dependents", GetDependentsAsync);
+        group.MapGet("/{id}/replays", GetReplaysAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
+        group.MapGet("/{id}/stdout-tail", GetStdoutTailAsync);
+        group.MapPost("/{id}/uncancel", UncancelAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -336,7 +340,8 @@ internal static class WorkItemEndpoints
 
         // Only resume from terminal-failed states. Done items have nothing
         // to retry; non-terminal states would race the pipeline.
-        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled))
+        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled
+            or WorkItemState.AbandonedAfterRecoveryAttempts))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
@@ -365,11 +370,198 @@ internal static class WorkItemEndpoints
                 });
         }
 
-        var resumed = item.With(resumeState.Value, error: null);
+        // Reset RecoveryAttempts so an abandoned item is not immediately re-abandoned on next restart.
+        var resumed = item.With(resumeState.Value, error: null) with { RecoveryAttempts = 0 };
         await store.UpdateAsync(resumed, ct);
         AuditLog.WorkItemRetried(workItemId, from);
         await queue.EnqueueAsync(resumed.Id, ct);
         return Results.Accepted($"/workitems/{workItemId}", new { id = workItemId.ToString(), from, state = resumeState.Value.ToString() });
+    }
+
+    /// <summary>
+    /// Create a replay of a terminal work item, optionally swapping the agent via agentClassId.
+    /// The new item gets the same prompt, base branch, and dependsOn list; it runs
+    /// independently with its own ID, work branch, and audit iterations.
+    /// </summary>
+    private static async Task<IResult> ReplayAsync(
+        string id,
+        ReplayWorkItemRequest? body,
+        IWorkItemStore store,
+        ITaskQueue queue,
+        IProjectRepository projects,
+        IAgentRegistry agents,
+        CancellationToken ct)
+    {
+        var (source, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var terminalStates = new[]
+        {
+            WorkItemState.Done, WorkItemState.Failed,
+            WorkItemState.AuditFailed, WorkItemState.Cancelled,
+        };
+        if (!terminalStates.Contains(source!.State))
+            return Results.BadRequest(new
+            {
+                error = $"cannot replay work item in state {source.State}; source must be in a terminal state (Done, Failed, AuditFailed, Cancelled)"
+            });
+
+        // Resolve agent override — null means keep the source's agent.
+        AgentKind? agentOverride = source.Agent;
+        string? agentClassOverride = source.AgentClassId;
+
+        if (!string.IsNullOrWhiteSpace(body?.Agent))
+        {
+            var kind = new AgentKind(body.Agent);
+            if (!agents.TryGet(kind, out _))
+                return Results.BadRequest(new { error = $"unknown agent '{body.Agent}'", available = agents.Available.Select(a => a.Value) });
+            agentOverride = kind;
+            agentClassOverride = null; // agent-specific override clears class routing
+        }
+
+        if (!string.IsNullOrWhiteSpace(body?.AgentClassId))
+        {
+            if (body.AgentClassId.Length > 200)
+                return Results.BadRequest(new { error = "agentClassId must be <= 200 chars" });
+            agentClassOverride = body.AgentClassId.Trim();
+            agentOverride = null; // class routing takes precedence
+        }
+
+        if (!string.IsNullOrWhiteSpace(body?.ModelId))
+            return Results.BadRequest(new
+            {
+                error = "modelId is resolved at pickup from AgentMembership and cannot be set directly on a replay; use agentClassId to route via a class that specifies the target model"
+            });
+
+        // Resolve work branch: explicit > auto-generated.
+        var newId = WorkItemId.New();
+        string workBranch;
+        if (!string.IsNullOrWhiteSpace(body?.WorkBranch))
+        {
+            try { Validation.ValidateBranchName(body.WorkBranch, nameof(body.WorkBranch)); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+
+            if (source.BaseBranch is not null &&
+                string.Equals(body.WorkBranch, source.BaseBranch, StringComparison.Ordinal))
+                return Results.BadRequest(new { error = "workBranch must differ from baseBranch" });
+
+            workBranch = body.WorkBranch;
+        }
+        else
+        {
+            var shortId = newId.Value.ToString("N")[..8];
+            workBranch = source.WorkBranch is { Length: > 0 } wb
+                ? $"{TruncateToGitBranchPrefix(wb)}-replay-{shortId}"
+                : $"replay-{shortId}";
+        }
+
+        var project = await projects.GetAsync(source.ProjectId, ct);
+
+        var replay = new WorkItem
+        {
+            Id = newId,
+            ProjectId = source.ProjectId,
+            Title = source.Title,
+            Prompt = source.Prompt,
+            BaseBranch = source.BaseBranch,
+            WorkBranch = workBranch,
+            Agent = agentOverride,
+            AgentClassId = agentClassOverride,
+            PushUpstream = source.PushUpstream,
+            WorkTimeout = source.WorkTimeout,
+            MergeTimeout = source.MergeTimeout,
+            DependsOn = source.DependsOn,
+            QueuePosition = DateTimeOffset.UtcNow.Ticks,
+            ReplayOfWorkItemId = source.Id,
+        };
+
+        await store.CreateAsync(replay, ct);
+        AuditLog.WorkItemCreated(replay.Id, replay.ProjectId, replay.Title);
+
+        // Re-read dep states to decide whether to enqueue immediately.
+        var depStates = new Dictionary<WorkItemId, WorkItemState>();
+        var depExtIds = new Dictionary<WorkItemId, string?>();
+        foreach (var depId in replay.DependsOn)
+        {
+            var dep = await store.GetAsync(depId, ct);
+            if (dep is not null)
+            {
+                depStates[depId] = dep.State;
+                depExtIds[depId] = dep.ExternalId;
+            }
+        }
+        if (WorkItemDependencies.AreSatisfied(replay.DependsOn, depStates))
+            await queue.EnqueueAsync(replay.Id, ct);
+
+        return Results.Created($"/workitems/{replay.Id}", ToDto(replay, project, depStates, depExtIds));
+    }
+
+    /// <summary>
+    /// Returns the source work item and all its replays recursively (BFS)
+    /// in chronological order at each level. When the given ID is itself a replay, that
+    /// item becomes the "source" in the response and its own descendants are "replays".
+    /// </summary>
+    private static async Task<IResult> GetReplaysAsync(
+        string id,
+        IWorkItemStore store,
+        IProjectRepository projects,
+        IAuditReportStore reportStore,
+        CancellationToken ct)
+    {
+        var (source, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var allProjects = (await projects.ListAsync(ct)).ToDictionary(p => p.Id.Value);
+
+        async Task<WorkItemDto> BuildDtoWithAuditAsync(WorkItem item)
+        {
+            allProjects.TryGetValue(item.ProjectId.Value, out var proj);
+
+            // Fetch dependency states and external IDs individually to avoid a full table scan.
+            var depStates = new Dictionary<WorkItemId, WorkItemState>();
+            var depExtIds = new Dictionary<WorkItemId, string?>();
+            foreach (var depId in item.DependsOn)
+            {
+                var dep = await store.GetAsync(depId, ct);
+                if (dep is not null)
+                {
+                    depStates[depId] = dep.State;
+                    depExtIds[depId] = dep.ExternalId;
+                }
+            }
+
+            var dto = ToDto(item, proj, depStates, depExtIds);
+
+            var reports = await reportStore.GetByWorkItemAsync(item.Id.ToString(), ct);
+            if (reports.Count > 0)
+            {
+                var maxIter = reports.Max(r => r.Iteration);
+                var iterCount = reports.Select(r => r.Iteration).Distinct().Count();
+                var lastBlockingCount = reports
+                    .Where(r => r.Iteration == maxIter)
+                    .SelectMany(r => r.Findings)
+                    .Count(f => string.Equals(f.Severity, "Error", StringComparison.OrdinalIgnoreCase));
+                dto = dto with { AuditIterations = iterCount, FinalAuditBlockingFindings = lastBlockingCount };
+            }
+            return dto;
+        }
+
+        // BFS using ListByReplaySourceAsync — targeted per-source indexed queries, no full table scan.
+        var replays = new List<WorkItemDto>();
+        var toVisit = new Queue<WorkItemId>();
+        toVisit.Enqueue(source!.Id);
+
+        while (toVisit.Count > 0)
+        {
+            var current = toVisit.Dequeue();
+            await foreach (var child in store.ListByReplaySourceAsync(current, ct))
+            {
+                replays.Add(await BuildDtoWithAuditAsync(child));
+                toVisit.Enqueue(child.Id);
+            }
+        }
+
+        return Results.Ok(new WorkItemReplaysResponse(await BuildDtoWithAuditAsync(source), replays));
     }
 
     private static async Task<IResult> CancelAsync(
@@ -386,13 +578,15 @@ internal static class WorkItemEndpoints
         var workItemId = item!.Id;
 
         if (item.State is WorkItemState.Done or WorkItemState.Failed
-            or WorkItemState.Cancelled or WorkItemState.AuditFailed)
+            or WorkItemState.Cancelled or WorkItemState.AuditFailed
+            or WorkItemState.AbandonedAfterRecoveryAttempts)
             return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
 
         var wasActive = cancellations.Cancel(workItemId);
         if (!wasActive)
         {
-            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API");
+            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API",
+                WorkItemCancellationReason.OperatorRequested);
             await store.UpdateAsync(cancelled, ct);
             AuditLog.WorkItemCancelled(workItemId);
             var project = await projects.GetAsync(item.ProjectId, ct);
@@ -415,6 +609,10 @@ internal static class WorkItemEndpoints
         // one. In-flight items (non-Queued) are left to run their course.
         await CascadeCancelDependentsAsync(workItemId, store, ct);
 
+        // Orphan any replays: clear their replay_of link so they keep running
+        // but are no longer linked to the (now-cancelled) source.
+        await store.OrphanReplaysAsync(workItemId, ct);
+
         return Results.Accepted($"/workitems/{workItemId}");
     }
 
@@ -433,11 +631,56 @@ internal static class WorkItemEndpoints
             // Queued in the DB. If a worker raced and transitioned it to Working between
             // the ListAsync snapshot and now, the WHERE guard returns 0 rows and we skip
             // the audit log — no spurious WorkItemDependentCancelled for in-flight items.
-            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled");
+            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled",
+                WorkItemCancellationReason.ParentCascaded);
             var updated = await store.TryUpdateIfStateAsync(cancelled, WorkItemState.Queued, ct);
             if (updated)
                 AuditLog.WorkItemDependentCancelled(target.Id, cancelledId);
         }
+    }
+
+    /// <summary>
+    /// Resets a Cancelled work item back to Queued so it will be retried.
+    ///
+    /// Returns 409 Conflict when:
+    ///   - The item is not in Cancelled state.
+    ///   - The cancellation was operator-requested (use POST /workitems with the
+    ///     same body to re-create; respecting an explicit operator cancel is intentional).
+    ///
+    /// Succeeds for:
+    ///   - Items with cancellation_reason = ParentCascaded (parent was since retried).
+    ///   - Legacy items with cancellation_reason IS NULL (ambiguous; likely a host-shutdown
+    ///     victim from before the no-shutdown-cancel fix was deployed).
+    /// </summary>
+    private static async Task<IResult> UncancelAsync(
+        string id,
+        IWorkItemStore store,
+        ITaskQueue queue,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State != WorkItemState.Cancelled)
+            return Results.Conflict(new
+            {
+                error = $"cannot uncancel item in state {item.State}; only Cancelled items can be uncancelled",
+            });
+
+        if (item.CancellationReason == WorkItemCancellationReason.OperatorRequested)
+            return Results.Conflict(new
+            {
+                error = "cannot uncancel an operator-requested cancellation; use POST /workitems with the same body to re-create the work item",
+            });
+
+        var requeued = item.With(WorkItemState.Queued) with { RecoveryAttempts = 0 };
+        var updated = await store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
+        if (!updated)
+            return Results.Conflict(new { error = "concurrent uncancel request already processed this item" });
+        await queue.EnqueueAsync(requeued.Id, ct);
+        AuditLog.WorkItemRetried(requeued.Id, "uncancel");
+
+        return Results.Ok(new { id = requeued.Id.ToString(), state = requeued.State.ToString() });
     }
 
     /// <summary>
@@ -708,6 +951,18 @@ internal static class WorkItemEndpoints
         return byId is null ? (null, Results.NotFound()) : (byId, null);
     }
 
+    // Git branch names have a 255-byte UTF-8 limit. The auto-generated suffix "-replay-{8hex}" is 17 bytes,
+    // so the prefix may be at most 238 bytes.
+    private static string TruncateToGitBranchPrefix(string branch)
+    {
+        const int maxPrefixBytes = 255 - 17;
+        if (System.Text.Encoding.UTF8.GetByteCount(branch) <= maxPrefixBytes) return branch;
+        var len = branch.Length;
+        while (len > 0 && System.Text.Encoding.UTF8.GetByteCount(branch.AsSpan(0, len)) > maxPrefixBytes)
+            len--;
+        return branch[..len];
+    }
+
     private static WorkItemDto ToDto(
         WorkItem item,
         Project? project,
@@ -737,7 +992,10 @@ internal static class WorkItemEndpoints
             depsSatisfied,
             depExtIds,
             item.QueuePosition,
-            item.MinModelScore);
+            item.ReplayOfWorkItemId?.ToString(),
+            item.AgentClassId,
+            MergeSha: item.MergeSha,
+            MinModelScore: item.MinModelScore);
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -750,6 +1008,22 @@ internal static class WorkItemEndpoints
         p.Audit.Languages,
         p.Audit.AuditTypes,
         p.Audit.MaxIterations);
+
+    private static async Task<IResult> GetStdoutTailAsync(
+        string id,
+        IWorkItemStore store,
+        IStdoutBroadcaster broadcaster,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var tail = broadcaster.GetTail(item!.Id);
+        if (tail is null)
+            return Results.Ok("");  // Work item exists but no live stream data yet.
+
+        return Results.Text(tail, "text/plain");
+    }
 
     private static async Task<IResult> GetTimelineAsync(
         string id,
@@ -766,7 +1040,8 @@ internal static class WorkItemEndpoints
 
         var isTerminal = item.State is
             WorkItemState.Done or WorkItemState.Failed or
-            WorkItemState.Cancelled or WorkItemState.AuditFailed;
+            WorkItemState.Cancelled or WorkItemState.AuditFailed or
+            WorkItemState.AbandonedAfterRecoveryAttempts;
 
         var entries = await timeline.GetTimelineAsync(workItemId.ToString(), isTerminal, item.CreatedAt, ct);
 
@@ -861,6 +1136,11 @@ public sealed record WorkItemDto(
     bool DependsOnSatisfied,
     IReadOnlyDictionary<string, string?> DependsOnExternalIds,
     long QueuePosition = 0,
+    string? ReplayOfWorkItemId = null,
+    string? AgentClassId = null,
+    int? AuditIterations = null,
+    int? FinalAuditBlockingFindings = null,
+    string? MergeSha = null,
     int MinModelScore = 95);
 
 public sealed record ProjectDto(
@@ -873,3 +1153,13 @@ public sealed record ProjectDto(
     IReadOnlyList<string> AuditLanguages,
     IReadOnlyList<string> AuditTypes,
     int AuditMaxIterations);
+
+public sealed record ReplayWorkItemRequest(
+    string? Agent = null,
+    string? ModelId = null,
+    string? AgentClassId = null,
+    string? WorkBranch = null);
+
+public sealed record WorkItemReplaysResponse(
+    WorkItemDto Source,
+    IReadOnlyList<WorkItemDto> Replays);

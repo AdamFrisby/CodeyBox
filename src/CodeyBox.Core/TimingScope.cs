@@ -16,21 +16,25 @@ public sealed class TimingScope : IAsyncDisposable
     private readonly Stopwatch _sw;
     private readonly DateTimeOffset _startedAt;
     private readonly ILogger? _log;
+    private readonly Activity? _activity;
     private bool _disposed;
 
-    private TimingScope(ITimingStore? store, string id, Stopwatch sw, DateTimeOffset startedAt, ILogger? log)
+    private TimingScope(ITimingStore? store, string id, Stopwatch sw, DateTimeOffset startedAt, ILogger? log, Activity? activity)
     {
         _store = store;
         _id = id;
         _sw = sw;
         _startedAt = startedAt;
         _log = log;
+        _activity = activity;
     }
 
     /// <summary>
     /// Creates a timing scope and writes the begin row to the store.
     /// Returns a no-op scope when <paramref name="store"/> is null.
     /// Never throws — failures are logged as warnings.
+    /// When <paramref name="activitySource"/> is provided and a listener is registered,
+    /// an OTel <see cref="Activity"/> is started and stopped on disposal.
     /// </summary>
     public static async Task<TimingScope> BeginAsync(
         ITimingStore? store,
@@ -39,14 +43,27 @@ public sealed class TimingScope : IAsyncDisposable
         string step,
         int? iteration = null,
         IReadOnlyDictionary<string, object>? metadata = null,
-        ILogger? log = null)
+        ILogger? log = null,
+        ActivitySource? activitySource = null)
     {
         var id = Guid.NewGuid().ToString("N");
         var startedAt = DateTimeOffset.UtcNow;
         var sw = Stopwatch.StartNew();
 
+        var activity = activitySource?.StartActivity(step, ActivityKind.Internal);
+        if (activity is not null)
+        {
+            activity.SetTag("codeybox.work_item_id", itemId.ToString());
+            activity.SetTag("codeybox.phase", phase);
+            if (iteration is not null)
+                activity.SetTag("codeybox.iteration", iteration.Value.ToString());
+            if (metadata is not null)
+                foreach (var (k, v) in metadata)
+                    activity.SetTag($"codeybox.{k}", v.ToString());
+        }
+
         if (store is null)
-            return new TimingScope(null, id, sw, startedAt, log);
+            return new TimingScope(null, id, sw, startedAt, log, activity);
 
         var metaJson = metadata is not null
             ? JsonSerializer.Serialize(metadata)
@@ -70,10 +87,10 @@ public sealed class TimingScope : IAsyncDisposable
         catch (Exception ex)
         {
             log?.LogWarning(ex, "Timing: failed to write begin for {Step}", step);
-            return new TimingScope(null, id, sw, startedAt, log);
+            return new TimingScope(null, id, sw, startedAt, log, activity);
         }
 
-        return new TimingScope(store, id, sw, startedAt, log);
+        return new TimingScope(store, id, sw, startedAt, log, activity);
     }
 
     /// <summary>Elapsed milliseconds as of the last Stop (after DisposeAsync) or current tick.</summary>
@@ -84,6 +101,8 @@ public sealed class TimingScope : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
         _sw.Stop();
+
+        _activity?.Dispose();
 
         if (_store is null) return;
 

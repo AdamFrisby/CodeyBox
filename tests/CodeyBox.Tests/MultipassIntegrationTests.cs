@@ -145,3 +145,89 @@ public sealed class MultipassIntegrationTests : IDisposable
     // longer installs an in-VM firewall, so there's nothing to assert
     // about network policy from the provider's CLI surface alone.
 }
+
+/// <summary>
+/// Integration tests for <see cref="MultipassSandboxProvider.ListAllManagedAsync"/>.
+/// Skipped unless the <c>multipass</c> CLI is on PATH. These tests verify
+/// that the method correctly shells out to <c>multipass list --format json</c>,
+/// filters results to the <c>codeybox-*</c> prefix (excluding non-CodeyBox VMs
+/// such as the default "primary" VM), and caches results within the TTL.
+/// </summary>
+[Collection("Multipass integration")]
+public sealed class MultipassListAllTests
+{
+    private static readonly bool _multipassAvailable = IsMultipassOnPath();
+
+    private static bool IsMultipassOnPath()
+    {
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo
+            {
+                FileName = "multipass",
+                ArgumentList = { "version" },
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            });
+            if (p is null) return false;
+            p.WaitForExit(5_000);
+            return p.ExitCode == 0;
+        }
+        catch { return false; }
+    }
+
+    private static MultipassSandboxProvider NewProvider() => new(
+        new MultipassSandboxOptions(),
+        NullLogger<MultipassSandboxProvider>.Instance);
+
+    /// <summary>
+    /// Every entry returned by ListAllManagedAsync must carry the codeybox- prefix.
+    /// Non-CodeyBox VMs on the host (e.g. the default "primary" VM, or any
+    /// cb-baseline-* image) must not appear in the result.
+    /// This verifies the prefix-exclusion boundary of FetchManagedSandboxesAsync.
+    /// </summary>
+    [Fact]
+    public async Task ListAllManagedAsync_FiltersToCodeyboxPrefix()
+    {
+        if (!_multipassAvailable) return;
+
+        var provider = NewProvider();
+        var sandboxes = await provider.ListAllManagedAsync(CancellationToken.None);
+
+        Assert.NotNull(sandboxes);
+        Assert.All(sandboxes, s =>
+            Assert.StartsWith("codeybox-", s.Name, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// ListAllManagedAsync must not throw when multipass reports no codeybox-*
+    /// VMs (e.g. on a clean host). An empty list is a valid result.
+    /// </summary>
+    [Fact]
+    public async Task ListAllManagedAsync_DoesNotThrow_WhenNoCodeyboxVMs()
+    {
+        if (!_multipassAvailable) return;
+
+        var provider = NewProvider();
+        // Should not throw; result may be empty.
+        var sandboxes = await provider.ListAllManagedAsync(CancellationToken.None);
+        Assert.NotNull(sandboxes);
+    }
+
+    /// <summary>
+    /// A second call within the 2-minute cache TTL must return the same list
+    /// object (cache hit — no second multipass invocation).
+    /// </summary>
+    [Fact]
+    public async Task ListAllManagedAsync_ReturnsCachedResult_WithinTtl()
+    {
+        if (!_multipassAvailable) return;
+
+        var provider = NewProvider();
+        var first = await provider.ListAllManagedAsync(CancellationToken.None);
+        var second = await provider.ListAllManagedAsync(CancellationToken.None);
+        // Identical reference confirms the second call used the cache.
+        Assert.Same(first, second);
+    }
+}

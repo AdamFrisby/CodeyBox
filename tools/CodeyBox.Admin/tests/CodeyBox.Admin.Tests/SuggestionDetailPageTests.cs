@@ -168,6 +168,15 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default) => Task.FromResult(new List<FleetSummaryDto>());
     public Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default) => Task.FromResult(false);
     public Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default) => Task.FromResult(false);
+    public Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default) => Task.FromResult<ProjectBudgetDto?>(null);
+    public Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default) => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default) => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default) => Task.FromResult(new List<PluginDto>());
+    public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default) => Task.FromResult<WorkItemDto?>(null);
+    public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemReplaysDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemDiffDto?>(null);
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }
 
 /// <summary>
@@ -224,4 +233,13 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default) => Task.FromResult(new List<FleetSummaryDto>());
     public Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default) => Task.FromResult(false);
     public Task<bool> ResumeProjectAsync(string projectId, CancellationToken ct = default) => Task.FromResult(false);
+    public Task<ProjectBudgetDto?> GetProjectBudgetAsync(string projectId, CancellationToken ct = default) => Task.FromResult<ProjectBudgetDto?>(null);
+    public Task<ProjectQueueStateDto?> PauseProjectQueueAsync(string projectId, string reason, CancellationToken ct = default) => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default) => Task.FromResult<ProjectQueueStateDto?>(null);
+    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default) => Task.FromResult(new List<PluginDto>());
+    public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default) => Task.FromResult<WorkItemDto?>(null);
+    public Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemReplaysDto?>(null);
+    public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default) => Task.FromResult<WorkItemDiffDto?>(null);
+    public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }
