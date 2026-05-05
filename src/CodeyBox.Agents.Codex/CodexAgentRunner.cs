@@ -81,6 +81,14 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
             argv.Add("--model");
             argv.Add(effectiveModel);
         }
+        // Reasoning effort is a config-key on the codex CLI rather than a
+        // dedicated flag; pass through `-c` overrides. Accepted values per
+        // the OpenAI Responses API: "minimal" | "low" | "medium" | "high".
+        if (!string.IsNullOrEmpty(reasoningMode))
+        {
+            argv.Add("-c");
+            argv.Add($"model_reasoning_effort={reasoningMode}");
+        }
         argv.Add(prompt);
         return new AgentInvocation(argv);
     }
