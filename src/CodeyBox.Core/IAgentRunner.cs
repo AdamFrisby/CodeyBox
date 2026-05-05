@@ -19,7 +19,9 @@ public interface IAgentRunner
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
-        CancellationToken ct = default);
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null);
 }
 
 public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);

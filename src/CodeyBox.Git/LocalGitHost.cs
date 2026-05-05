@@ -162,7 +162,7 @@ public sealed class LocalGitHost : IGitHost
         );
     }
 
-    internal string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
+    public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
 
     private static void ApplyReceivePolicy(string barePath)
     {

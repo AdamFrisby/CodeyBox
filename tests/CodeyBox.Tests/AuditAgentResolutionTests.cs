@@ -296,7 +296,7 @@ internal sealed class PassthroughRunner : IAgentRunner
     public PassthroughRunner(AgentKind kind) => Kind = kind;
 
     public Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt,
-        AgentCredential? credential, string? modelId = null, CancellationToken ct = default)
+        AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
         => Task.FromResult(new AgentResult(true, "pass", null, null));
 }
 

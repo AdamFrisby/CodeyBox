@@ -150,7 +150,7 @@ internal sealed class RecordingPipelineRunner : IPipelineRunner
         _executed = executed;
     }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         _executed.Add(item.Id);
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);

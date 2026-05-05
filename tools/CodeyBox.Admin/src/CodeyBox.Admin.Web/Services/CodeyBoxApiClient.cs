@@ -78,6 +78,13 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return resp.IsSuccessStatusCode;
     }
 
+    public async Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(workItemId)}/stdout-tail", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
     public async Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default)
     {
         var resp = await _http.GetAsync("/queue/status", ct);
@@ -112,6 +119,22 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         var resp = await _http.GetAsync($"/projects/{Uri.EscapeDataString(projectId)}/budget/usage", ct);
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadFromJsonAsync<BudgetUsageDto>(JsonOptions, ct);
+    }
+
+    public async Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/workitems/{Uri.EscapeDataString(id)}/replay", req, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<WorkItemDto>(JsonOptions, ct);
+    }
+
+    public async Task<WorkItemReplaysDto?> GetReplaysAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/replays", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemReplaysDto>(JsonOptions, ct);
     }
 
     public async Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default)
@@ -225,6 +248,17 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
     }
 
     private sealed record PromoteResponse(string WorkItemId);
+
+    public async Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+    {
+        var req = new HttpRequestMessage(HttpMethod.Get, $"/workitems/{Uri.EscapeDataString(id)}/diff");
+        req.Headers.Accept.ParseAdd("application/json");
+        var resp = await _http.SendAsync(req, ct);
+        if (resp.StatusCode is System.Net.HttpStatusCode.NotFound
+            or System.Net.HttpStatusCode.NoContent) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemDiffDto>(JsonOptions, ct);
+    }
 
     public async Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default)
     {

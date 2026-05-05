@@ -17,6 +17,7 @@ public sealed class ClaudeQuotaProbeTests
     {
         Agent = AgentKind.Claude,
         Billing = AgentBilling.Subscription,
+        QualityScore = 100,
     };
 
     private static ClaudeQuotaProbe BuildProbe(
