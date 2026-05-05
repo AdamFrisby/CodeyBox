@@ -1003,4 +1003,4 @@ for the Fleet dashboard view — one round-trip per refresh instead of N+1 per-p
 
 ## Local Development
 
-For local dev, run `local/run-e2e.sh` from the repo root, which boots the orchestrator on http://127.0.0.1:5050.
+For local dev, create your own `local/run-e2e.sh` and run it from the repo root to boot the orchestrator on http://127.0.0.1:5050 — the `/local/` directory is gitignored (see `.gitignore`) for per-developer dev/test helpers, so no script ships in the tree.
