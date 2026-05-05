@@ -103,7 +103,7 @@ internal sealed class HoldingPipeline : IPipelineRunner
         _holdUntil = holdUntil;
     }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         await _store.UpdateAsync(item.With(WorkItemState.Working), ct);
         await _holdUntil.WaitAsync(ct).ConfigureAwait(false);

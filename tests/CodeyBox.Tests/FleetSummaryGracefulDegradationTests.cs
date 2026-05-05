@@ -178,4 +178,8 @@ internal sealed class ThrowingWorkItemCostStore : IWorkItemCostStore
 
     public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)
         => Task.CompletedTask;
+
+    public Task<decimal> SumEstimatedUsdAsync(
+        string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+        => Task.FromException<decimal>(new InvalidOperationException("no such table: work_item_costs"));
 }

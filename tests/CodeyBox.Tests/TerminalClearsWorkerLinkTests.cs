@@ -100,6 +100,6 @@ internal sealed class TerminalStatePipeline : IPipelineRunner
         _terminalState = terminalState;
     }
 
-    public async Task RunAsync(WorkItem item, CancellationToken ct)
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         => await _store.UpdateAsync(item.With(_terminalState), ct);
 }

@@ -252,7 +252,8 @@ internal sealed class QuestionEmittingAgent : IAgentRunner
 
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox, string workingDirectory, string prompt,
-        AgentCredential? credential, string? modelId = null, CancellationToken ct = default)
+        AgentCredential? credential, string? modelId = null, string? reasoningMode = null,
+        CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
     {
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
         {

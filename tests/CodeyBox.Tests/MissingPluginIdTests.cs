@@ -17,7 +17,7 @@ public sealed class MissingPluginIdTests
     private sealed class FakeAgent : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
-        public Task<AgentResult> RunAsync(ISandbox _, string __, string ___, AgentCredential? ____, string? _____ = null, CancellationToken ______ = default)
+        public Task<AgentResult> RunAsync(ISandbox _, string __, string ___, AgentCredential? ____, string? _____ = null, string? ______ = null, CancellationToken _______ = default, Action<string>? ________ = null)
             => Task.FromResult(new AgentResult(true, "ok", null, null));
     }
 

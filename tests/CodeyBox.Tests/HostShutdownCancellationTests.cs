@@ -195,7 +195,8 @@ internal sealed class BlockingAgentRunner : IAgentRunner
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
     {
         await Task.Delay(Timeout.Infinite, ct);
         return new AgentResult(false, "unreachable", null, null);

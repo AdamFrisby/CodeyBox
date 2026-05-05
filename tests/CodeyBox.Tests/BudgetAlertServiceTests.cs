@@ -214,6 +214,9 @@ internal sealed class CapturingCostStore : IWorkItemCostStore
     public Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
     public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default) => Task.CompletedTask;
+    public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string ProjectId, double TotalUsd)>>([]);
 }
 
 internal sealed class BudgetWebhookCollector : IWebhookDispatcher
