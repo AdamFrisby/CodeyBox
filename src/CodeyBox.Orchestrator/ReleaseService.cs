@@ -258,12 +258,15 @@ public sealed class ReleaseService
 
     private async Task TryBeginReviewAsync(Release release, CancellationToken ct)
     {
-        // Guard: only transition from Closed.
+        // Guard: only transition from Closed. Re-read then CAS-update to prevent concurrent
+        // callers from each starting an independent deep audit.
         var current = await _releases.GetAsync(release.Id, ct);
         if (current is null || current.State != ReleaseState.Closed) return;
 
         var inReview = current with { State = ReleaseState.InReview, ReviewStartedAt = DateTimeOffset.UtcNow };
-        await _releases.UpdateAsync(inReview, ct);
+        // Atomic compare-and-swap: succeeds only if state is still Closed in the DB.
+        if (!await _releases.TryTransitionStateAsync(inReview, ReleaseState.Closed, ct))
+            return;
 
         var project = await _projects.GetAsync(inReview.ProjectId, ct);
         await PublishAsync("release.in_review", inReview, project, ct);
@@ -502,7 +505,12 @@ public sealed class ReleaseService
         }
 
         var released = release with { State = ReleaseState.Released, ReleasedAt = DateTimeOffset.UtcNow };
-        await _releases.UpdateAsync(released, ct);
+        // Guard: only transition to Released if state is still InReview (not abandoned concurrently).
+        if (!await _releases.TryTransitionStateAsync(released, ReleaseState.InReview, ct))
+        {
+            _log.LogInformation("Release {Id}: skipping released transition; state changed concurrently", release.Id);
+            return;
+        }
 
         if (project.ReleaseConfig.CreateGitHubRelease)
         {
@@ -531,7 +539,12 @@ public sealed class ReleaseService
     private async Task FailReleaseAsync(Release release, string reason, CancellationToken ct)
     {
         var failed = release with { State = ReleaseState.Failed, FailedReason = reason };
-        await _releases.UpdateAsync(failed, ct);
+        // Guard: only transition to Failed if state is still InReview (not abandoned or already released).
+        if (!await _releases.TryTransitionStateAsync(failed, ReleaseState.InReview, ct))
+        {
+            _log.LogInformation("Release {Id}: skipping failed transition; state changed concurrently", release.Id);
+            return;
+        }
         var project = await _projects.GetAsync(release.ProjectId, ct);
         await PublishAsync("release.failed", failed, project, ct, new { reason });
         _log.LogWarning("Release {Id} failed: {Reason}", release.Id, reason);
@@ -562,6 +575,7 @@ public sealed class ReleaseService
     }
 
     private static bool AllTerminal(IReadOnlyList<WorkItem> items) =>
+        items.Count > 0 &&
         items.All(i => i.State is WorkItemState.Done or WorkItemState.Failed
                                 or WorkItemState.AuditFailed or WorkItemState.Cancelled);
 

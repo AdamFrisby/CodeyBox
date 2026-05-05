@@ -61,6 +61,7 @@ public sealed class GitHubReleasePublishTests : IDisposable
             CreatedAt = DateTimeOffset.UtcNow,
         };
         await _releaseStore.CreateAsync(rel);
+        await SeedDoneWorkItemAsync(rel.Id, project.Id);
 
         await svc.OnWorkItemTerminalAsync(rel.Id, default);
         await WaitForStateAsync(rel.Id, ReleaseState.Released, ReleaseState.Failed);
@@ -101,6 +102,7 @@ public sealed class GitHubReleasePublishTests : IDisposable
             CreatedAt = DateTimeOffset.UtcNow,
         };
         await _releaseStore.CreateAsync(rel);
+        await SeedDoneWorkItemAsync(rel.Id, project.Id);
 
         await svc.OnWorkItemTerminalAsync(rel.Id, default);
         await WaitForStateAsync(rel.Id, ReleaseState.Released, ReleaseState.Failed);
@@ -137,11 +139,27 @@ public sealed class GitHubReleasePublishTests : IDisposable
             CreatedAt = DateTimeOffset.UtcNow,
         };
         await _releaseStore.CreateAsync(rel);
+        await SeedDoneWorkItemAsync(rel.Id, project.Id);
 
         await svc.OnWorkItemTerminalAsync(rel.Id, default);
         await WaitForStateAsync(rel.Id, ReleaseState.Released, ReleaseState.Failed);
 
         Assert.Empty(_upstream.TagAndReleaseRequests);
+    }
+
+    private async Task SeedDoneWorkItemAsync(ReleaseId releaseId, ProjectId projectId)
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "seed",
+            Prompt = "work",
+            Agent = AgentKind.Claude,
+            ReleaseId = releaseId,
+        };
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
     }
 
     private ReleaseService BuildService(Project project) =>

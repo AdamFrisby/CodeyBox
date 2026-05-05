@@ -165,6 +165,30 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         }
     }
 
+    public async Task<bool> TryTransitionStateAsync(Release release, ReleaseState expectedCurrentState, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE releases SET
+                    project_id = $pid, name = $name, description = $desc, state = $state,
+                    base_commit_sha = $sha, branch_name = $branch,
+                    closed_at = $closed, review_started_at = $review, released_at = $released,
+                    failed_reason = $failed, target_tag = $tag, config_json = $cfg
+                WHERE id = $id AND state = $expectedState;
+                """;
+            Bind(cmd, release);
+            cmd.Parameters.AddWithValue("$expectedState", (int)expectedCurrentState);
+            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public void Dispose()
     {
         _conn.Dispose();

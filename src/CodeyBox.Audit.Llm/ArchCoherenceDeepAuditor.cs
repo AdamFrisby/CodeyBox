@@ -13,7 +13,7 @@ namespace CodeyBox.Audit.Llm;
 /// </summary>
 public sealed class ArchCoherenceDeepAuditor : IDeepAuditor
 {
-    private const string ResultFile = "/audit/result.json";
+    private const string ResultFile = "/audit/arch-result.json";
 
     public string Name => "arch-coherence";
     public string Kind => "llm";
@@ -66,7 +66,7 @@ public sealed class ArchCoherenceDeepAuditor : IDeepAuditor
           would improve testability
         - Naming and structural conventions that contradict the rest of the codebase
 
-        Read the source files and project structure, then write your verdict to {{ResultFile}}:
+        Read the source files and project structure, then write your verdict to /audit/arch-result.json:
 
         {
           "passed": true|false,

@@ -39,6 +39,18 @@ public sealed class DepsCveScanDeepAuditor : IDeepAuditor
                 Description: "Install the .NET SDK in the sandbox image to enable CVE scanning.")],
                 RawOutput: result.Stdout + result.Stderr);
 
+        // Any other non-zero exit means the scan itself failed (no solution file, runtime error, etc.).
+        // Treat as a blocking finding so the gate is not silently bypassed.
+        if (result.ExitCode != 0)
+            return new AuditResult(false, [new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Error,
+                Title: "CVE scan command failed; treating as blocking",
+                Description: $"'dotnet list package --vulnerable' exited with code {result.ExitCode}. " +
+                             "Ensure a valid .NET solution or project file exists in the working directory. " +
+                             $"Stderr: {result.Stderr}")],
+                RawOutput: result.Stdout + result.Stderr);
+
         var rawOutput = result.Stdout + (string.IsNullOrWhiteSpace(result.Stderr) ? "" : "\n" + result.Stderr);
         var findings = ParseFindings(result.Stdout).ToList();
         var hasError = findings.Any(f => f.Severity == AuditSeverity.Error);

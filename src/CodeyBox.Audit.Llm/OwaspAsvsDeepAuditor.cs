@@ -12,7 +12,7 @@ namespace CodeyBox.Audit.Llm;
 /// </summary>
 public sealed class OwaspAsvsDeepAuditor : IDeepAuditor
 {
-    private const string ResultFile = "/audit/result.json";
+    private const string ResultFile = "/audit/owasp-result.json";
 
     public string Name => "owasp-asvs";
     public string Kind => "llm";
@@ -62,7 +62,7 @@ public sealed class OwaspAsvsDeepAuditor : IDeepAuditor
         - V13 API and Web Service: IDOR, broken object-level auth, mass assignment
 
         Read the source files, configuration, and dependency declarations.
-        Then write your verdict to {{ResultFile}} as a single JSON object:
+        Then write your verdict to /audit/owasp-result.json as a single JSON object:
 
         {
           "passed": true|false,

@@ -26,4 +26,12 @@ public interface IReleaseStore
     /// and the values were written; false when another worker already set the branch.
     /// </summary>
     Task<bool> TrySetBranchAsync(ReleaseId id, string branchName, string baseCommitSha, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically transitions to the state in <paramref name="release"/> only when the
+    /// current persisted state equals <paramref name="expectedCurrentState"/> (compare-and-swap).
+    /// Returns true when the row was updated; false when the state did not match, indicating
+    /// a concurrent transition already occurred.
+    /// </summary>
+    Task<bool> TryTransitionStateAsync(Release release, ReleaseState expectedCurrentState, CancellationToken ct = default);
 }

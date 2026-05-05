@@ -62,6 +62,7 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
     /// </summary>
     public async Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)
     {
+        var safeUrl = ScrubUrlCredentials(_opts.UpstreamUrl);
         var tmpDir = Path.Combine(Path.GetTempPath(), "codeybox-sync-" + Guid.NewGuid().ToString("N")[..8]);
         try
         {
@@ -69,11 +70,13 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
             var clone = await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment,
                 "clone", "--branch", targetBranch, "--single-branch", "--", _opts.UpstreamUrl, tmpDir);
             if (clone.ExitCode != 0)
-                throw new InvalidOperationException($"git clone failed: {clone.Stderr}");
+                throw new InvalidOperationException(
+                    $"git clone failed: {clone.Stderr.Replace(_opts.UpstreamUrl, safeUrl, StringComparison.Ordinal)}");
 
             var fetch = await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment, "fetch", "origin", sourceBranch);
             if (fetch.ExitCode != 0)
-                throw new InvalidOperationException($"git fetch failed: {fetch.Stderr}");
+                throw new InvalidOperationException(
+                    $"git fetch failed: {fetch.Stderr.Replace(_opts.UpstreamUrl, safeUrl, StringComparison.Ordinal)}");
 
             var merge = await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment,
                 "merge", $"FETCH_HEAD", "--no-edit", "--no-ff");
@@ -85,7 +88,8 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
 
             var push = await RunGitAsync(tmpDir, ct, _opts.ExtraEnvironment, "push", "origin", targetBranch);
             if (push.ExitCode != 0)
-                throw new InvalidOperationException($"git push failed: {push.Stderr}");
+                throw new InvalidOperationException(
+                    $"git push failed: {push.Stderr.Replace(_opts.UpstreamUrl, safeUrl, StringComparison.Ordinal)}");
 
             return true;
         }

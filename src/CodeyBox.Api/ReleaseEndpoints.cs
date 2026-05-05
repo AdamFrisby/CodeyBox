@@ -47,6 +47,11 @@ internal static class ReleaseEndpoints
         if (!project.ReleaseConfig.Enabled)
             return Results.BadRequest(new { error = $"release management is not enabled for project '{req.ProjectId}'" });
 
+        // Validate that the release name produces a safe git branch name.
+        var computedBranch = project.ReleaseConfig.BranchNameTemplate.Replace("{name}", req.Name);
+        try { Validation.ValidateBranchName(computedBranch, "release name"); }
+        catch (ArgumentException ex) { return Results.BadRequest(new { error = $"invalid release name: {ex.Message}" }); }
+
         var existing = await store.GetByNameAsync(pid, req.Name, ct);
         if (existing is not null)
             return Results.Conflict(new { error = $"a release named '{req.Name}' already exists in project '{req.ProjectId}'" });
@@ -57,6 +62,7 @@ internal static class ReleaseEndpoints
             ProjectId = pid,
             Name = req.Name,
             Description = req.Description,
+            TargetTag = req.TargetTag,
             State = ReleaseState.Open,
             CreatedAt = DateTimeOffset.UtcNow,
         };
@@ -200,10 +206,14 @@ internal static class ReleaseEndpoints
 
     private static async Task<IResult> ReleaseAsync(
         string id,
+        ForceReleaseRequest req,
         IReleaseStore store,
         ReleaseService releaseService,
         CancellationToken ct)
     {
+        if (!string.Equals(req.Confirmation, "yes-i-know-the-risk", StringComparison.Ordinal))
+            return Results.BadRequest(new { error = "confirmation must be 'yes-i-know-the-risk'" });
+
         var (release, err) = await ResolveAsync(id, store, ct);
         if (err is not null) return err;
 
@@ -246,9 +256,12 @@ internal static class ReleaseEndpoints
 public sealed record CreateReleaseRequest(
     string ProjectId,
     string Name,
-    string? Description = null);
+    string? Description = null,
+    string? TargetTag = null);
 
 public sealed record ReopenReleaseRequest(string Reason = "");
+
+public sealed record ForceReleaseRequest(string? Confirmation = null);
 
 public sealed record ReleaseDto(
     string Id,
