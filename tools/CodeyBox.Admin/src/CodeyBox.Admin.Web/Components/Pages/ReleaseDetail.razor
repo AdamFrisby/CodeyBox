@@ -113,6 +113,65 @@ else if (_release is not null)
         </table>
     }
 
+    @* ── Deep-audit timeline ──────────────────────────────────────────────────── *@
+    <h2>Deep Audit Timeline</h2>
+
+    @if (_auditIterationsError is not null)
+    {
+        <p class="error-banner">@_auditIterationsError</p>
+    }
+    else if (_auditIterations is null)
+    {
+        <p>Loading audit timeline…</p>
+    }
+    else if (_auditIterations.Count == 0)
+    {
+        <p>No deep-audit iterations recorded.</p>
+    }
+    else
+    {
+        @foreach (var iter in _auditIterations)
+        {
+            <div class="audit-iter-block">
+                <h3>
+                    Iteration @iter.Iteration / @iter.MaxIterations
+                    <span class="@(iter.BlockingFindings == 0 ? "state-released" : "state-failed")">
+                        @(iter.BlockingFindings == 0 ? "PASSED" : $"{iter.BlockingFindings} blocking")
+                    </span>
+                </h3>
+                <p>@iter.TotalFindings total finding(s), @iter.BlockingFindings blocking &mdash; @iter.CreatedAt.ToString("yyyy-MM-dd HH:mm") UTC</p>
+                @if (iter.RemediationWorkItemId is not null)
+                {
+                    <p>Remediation work item: <a href="/work-items/@iter.RemediationWorkItemId">@iter.RemediationWorkItemId[..8]</a></p>
+                }
+                @if (iter.Findings.Count > 0)
+                {
+                    <table class="queue-table">
+                        <thead>
+                            <tr>
+                                <th>Auditor</th>
+                                <th>Severity</th>
+                                <th>Title</th>
+                                <th>Location</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var f in iter.Findings)
+                            {
+                                <tr>
+                                    <td>@f.AuditorName</td>
+                                    <td><span class="state-@f.Severity.ToLowerInvariant()">@f.Severity</span></td>
+                                    <td>@f.Title</td>
+                                    <td>@(f.Location ?? "")</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </div>
+        }
+    }
+
 }
 
 @* ── Reopen modal ─────────────────────────────────────────────────────────── *@
@@ -142,9 +201,11 @@ else if (_release is not null)
 
     private ReleaseDto? _release;
     private List<WorkItemSummary>? _workItems;
+    private List<ReleaseAuditIterationDto>? _auditIterations;
     private string? _error;
     private string? _actionError;
     private string? _workItemsError;
+    private string? _auditIterationsError;
 
     private bool _showReopenModal;
     private string _reopenReason = "";
@@ -154,7 +215,7 @@ else if (_release is not null)
     protected override async Task OnInitializedAsync()
     {
         _cts = new CancellationTokenSource();
-        await Task.WhenAll(LoadReleaseAsync(), LoadWorkItemsAsync());
+        await Task.WhenAll(LoadReleaseAsync(), LoadWorkItemsAsync(), LoadAuditIterationsAsync());
     }
 
     private async Task LoadReleaseAsync()
@@ -184,6 +245,17 @@ else if (_release is not null)
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _workItemsError = ex.Message; }
+    }
+
+    private async Task LoadAuditIterationsAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        try
+        {
+            _auditIterations = await ApiClient.GetReleaseAuditIterationsAsync(Id, ct);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _auditIterationsError = ex.Message; }
     }
 
     private async Task CloseReleaseAsync()

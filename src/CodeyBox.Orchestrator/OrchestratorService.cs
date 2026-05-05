@@ -425,7 +425,12 @@ public sealed class OrchestratorService : BackgroundService
         // and, if so, triggers the closed→in_review transition automatically.
         if (item.ReleaseId is { } completedReleaseId && _releaseService is not null)
         {
-            _ = Task.Run(() => _releaseService.OnWorkItemTerminalAsync(completedReleaseId, CancellationToken.None));
+            var svc = _releaseService;
+            _ = Task.Run(async () =>
+            {
+                try { await svc.OnWorkItemTerminalAsync(completedReleaseId, CancellationToken.None); }
+                catch (Exception ex) { _log.LogError(ex, "OnWorkItemTerminalAsync threw for release {Id}", completedReleaseId); }
+            });
         }
     }
 

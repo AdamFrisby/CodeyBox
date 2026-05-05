@@ -13,11 +13,14 @@ public interface IReleaseStore
 
     /// <summary>
     /// Lists releases, optionally filtered by project and/or state.
-    /// Returns newest-first.
+    /// Returns newest-first. <paramref name="limit"/> caps the number of rows returned
+    /// (max 1000); <paramref name="offset"/> skips the first N rows for cursor-based paging.
     /// </summary>
     Task<IReadOnlyList<Release>> ListAsync(
         ProjectId? projectId = null,
         ReleaseState? state = null,
+        int? limit = null,
+        int? offset = null,
         CancellationToken ct = default);
 
     /// <summary>
@@ -34,4 +37,10 @@ public interface IReleaseStore
     /// a concurrent transition already occurred.
     /// </summary>
     Task<bool> TryTransitionStateAsync(Release release, ReleaseState expectedCurrentState, CancellationToken ct = default);
+
+    /// <summary>Persists one completed deep-audit iteration for the release timeline.</summary>
+    Task SaveAuditIterationAsync(ReleaseAuditIteration iteration, CancellationToken ct = default);
+
+    /// <summary>Returns all stored deep-audit iterations for a release, ordered by iteration number.</summary>
+    Task<IReadOnlyList<ReleaseAuditIteration>> ListAuditIterationsAsync(ReleaseId releaseId, CancellationToken ct = default);
 }

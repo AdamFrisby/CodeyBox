@@ -204,7 +204,11 @@ public sealed class ReleaseService
 
         // If all items are already terminal → begin review immediately.
         if (AllTerminal(items))
-            _ = Task.Run(() => TryBeginReviewAsync(closed, CancellationToken.None));
+            _ = Task.Run(async () =>
+            {
+                try { await TryBeginReviewAsync(closed, CancellationToken.None); }
+                catch (Exception ex) { _log.LogError(ex, "TryBeginReviewAsync threw for release {Id}", closed.Id); }
+            });
 
         return (true, null);
     }
@@ -251,7 +255,11 @@ public sealed class ReleaseService
         if (release is null) return (false, "release not found");
         if (release.State != ReleaseState.Closed) return (false, $"release is {release.State}, not Closed");
 
-        _ = Task.Run(() => TryBeginReviewAsync(release, CancellationToken.None));
+        _ = Task.Run(async () =>
+        {
+            try { await TryBeginReviewAsync(release, CancellationToken.None); }
+            catch (Exception ex) { _log.LogError(ex, "TryBeginReviewAsync threw for release {Id}", release.Id); }
+        });
         return (true, null);
     }
 
@@ -378,6 +386,16 @@ public sealed class ReleaseService
 
             if (blocking.Count == 0)
             {
+                await _releases.SaveAuditIterationAsync(new ReleaseAuditIteration
+                {
+                    ReleaseId = release.Id,
+                    Iteration = iteration,
+                    MaxIterations = maxIterations,
+                    TotalFindings = findings.Count,
+                    BlockingFindings = 0,
+                    Findings = findings,
+                    CreatedAt = DateTimeOffset.UtcNow,
+                }, ct);
                 _log.LogInformation("Release {Id}: deep audit passed at iteration {Iter}", release.Id, iteration);
                 await TransitionReleasedAsync(current, project, ct);
                 return;
@@ -385,6 +403,16 @@ public sealed class ReleaseService
 
             if (iteration == maxIterations)
             {
+                await _releases.SaveAuditIterationAsync(new ReleaseAuditIteration
+                {
+                    ReleaseId = release.Id,
+                    Iteration = iteration,
+                    MaxIterations = maxIterations,
+                    TotalFindings = findings.Count,
+                    BlockingFindings = blocking.Count,
+                    Findings = findings,
+                    CreatedAt = DateTimeOffset.UtcNow,
+                }, ct);
                 var reason = $"deep audit did not converge after {maxIterations} iterations. " +
                              $"{blocking.Count} blocking finding(s): {string.Join("; ", blocking.Take(3).Select(f => f.Title))}";
                 await FailReleaseAsync(current, reason, ct);
@@ -405,6 +433,17 @@ public sealed class ReleaseService
             };
 
             await _workItems.CreateAsync(remediationItem, ct);
+            await _releases.SaveAuditIterationAsync(new ReleaseAuditIteration
+            {
+                ReleaseId = release.Id,
+                Iteration = iteration,
+                MaxIterations = maxIterations,
+                TotalFindings = findings.Count,
+                BlockingFindings = blocking.Count,
+                Findings = findings,
+                RemediationWorkItemId = remediationItem.Id,
+                CreatedAt = DateTimeOffset.UtcNow,
+            }, ct);
             await PublishAsync("release.deep_audit_remediation_dispatched", current, project, ct,
                 new { workItemId = remediationItem.Id.ToString(), iteration });
             await _queue.EnqueueAsync(remediationItem.Id, ct);

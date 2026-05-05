@@ -265,13 +265,22 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return releases.Count;
     }
 
-    public async Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, CancellationToken ct = default)
+    public async Task<List<ReleaseDto>> GetReleasesAsync(string? projectId = null, string? state = null, int? limit = null, int? offset = null, CancellationToken ct = default)
     {
         var parts = new List<string>();
         if (!string.IsNullOrEmpty(projectId)) parts.Add($"projectId={Uri.EscapeDataString(projectId)}");
         if (!string.IsNullOrEmpty(state)) parts.Add($"state={Uri.EscapeDataString(state)}");
+        if (limit.HasValue) parts.Add($"limit={limit.Value}");
+        if (offset.HasValue) parts.Add($"offset={offset.Value}");
         var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
         var result = await _http.GetFromJsonAsync<List<ReleaseDto>>($"/releases{qs}", JsonOptions, ct);
+        return result ?? [];
+    }
+
+    public async Task<List<ReleaseAuditIterationDto>> GetReleaseAuditIterationsAsync(string id, CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<ReleaseAuditIterationDto>>(
+            $"/releases/{Uri.EscapeDataString(id)}/audit-iterations", JsonOptions, ct);
         return result ?? [];
     }
 
@@ -321,7 +330,10 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
 
     public async Task<ReleaseDto?> TriggerReleaseAsync(string id, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsync($"/releases/{Uri.EscapeDataString(id)}/release", null, ct);
+        var resp = await _http.PostAsJsonAsync(
+            $"/releases/{Uri.EscapeDataString(id)}/release",
+            new { confirmation = "yes-i-know-the-risk" },
+            JsonOptions, ct);
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadFromJsonAsync<ReleaseDto>(JsonOptions, ct);
     }

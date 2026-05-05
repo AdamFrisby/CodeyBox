@@ -12,6 +12,7 @@ internal static class ReleaseEndpoints
         g.MapGet("/", ListAsync);
         g.MapGet("/{id}", GetAsync);
         g.MapGet("/{id}/workitems", GetWorkItemsAsync);
+        g.MapGet("/{id}/audit-iterations", GetAuditIterationsAsync);
         g.MapPost("/{id}/close", CloseAsync);
         g.MapPost("/{id}/reopen", ReopenAsync);
         g.MapPost("/{id}/abandon", AbandonAsync);
@@ -35,6 +36,12 @@ internal static class ReleaseEndpoints
             return Results.BadRequest(new { error = "name must be <= 200 chars" });
         if (req.Name.Any(char.IsControl))
             return Results.BadRequest(new { error = "name must not contain control characters" });
+
+        if (req.TargetTag is not null)
+        {
+            try { Validation.ValidateTagName(req.TargetTag); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        }
 
         ProjectId pid;
         try { pid = new ProjectId(req.ProjectId); }
@@ -82,6 +89,8 @@ internal static class ReleaseEndpoints
     private static async Task<IResult> ListAsync(
         string? projectId,
         string? state,
+        int? limit,
+        int? offset,
         IReleaseStore store,
         CancellationToken ct)
     {
@@ -103,7 +112,12 @@ internal static class ReleaseEndpoints
             stateFilter = parsed;
         }
 
-        var releases = await store.ListAsync(pid, stateFilter, ct);
+        if (limit.HasValue && (limit.Value < 1 || limit.Value > 1000))
+            return Results.BadRequest(new { error = "limit must be between 1 and 1000" });
+        if (offset.HasValue && offset.Value < 0)
+            return Results.BadRequest(new { error = "offset must be >= 0" });
+
+        var releases = await store.ListAsync(pid, stateFilter, limit, offset, ct);
         return Results.Ok(releases.Select(ToDto).ToList());
     }
 
@@ -145,6 +159,37 @@ internal static class ReleaseEndpoints
         }
 
         return Results.Ok(items);
+    }
+
+    // ── GET /releases/{id}/audit-iterations ───────────────────────────────
+
+    private static async Task<IResult> GetAuditIterationsAsync(
+        string id,
+        IReleaseStore releaseStore,
+        CancellationToken ct)
+    {
+        var (release, err) = await ResolveAsync(id, releaseStore, ct);
+        if (err is not null) return err;
+
+        var iterations = await releaseStore.ListAuditIterationsAsync(release!.Id, ct);
+        var dtos = iterations.Select(i => new
+        {
+            iteration = i.Iteration,
+            maxIterations = i.MaxIterations,
+            totalFindings = i.TotalFindings,
+            blockingFindings = i.BlockingFindings,
+            findings = i.Findings.Select(f => new
+            {
+                auditorName = f.AuditorName,
+                severity = f.Severity.ToString(),
+                title = f.Title,
+                description = f.Description,
+                location = f.Location,
+            }).ToList(),
+            remediationWorkItemId = i.RemediationWorkItemId?.ToString(),
+            createdAt = i.CreatedAt,
+        }).ToList();
+        return Results.Ok(dtos);
     }
 
     // ── POST /releases/{id}/close ──────────────────────────────────────────
