@@ -418,7 +418,7 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 // canonical sandbox env var the agent CLI reads. Operators add new agents
 // by appending to this list (or registering a different ICredentialProvider).
 //
-// Chain order: BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV.
+// Chain order: BUILT-IN-FIRST → PLUGINS → BUILT-IN-LAST.
 //
 // 1. ClaudeOAuthFileCredentialProvider — reads Claude's token fresh from a
 //    JSON file (default ~/.claude/.credentials.json, the path the local
@@ -428,7 +428,10 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 //    (between OAuth-file and env-var). Vault-issued short-lived credentials
 //    are preferred over env-var fallbacks. Per-project ordering is expressed
 //    via Project.CredentialProviderPriority; see docs/credential-plugins.md.
-// 3. EnvironmentCredentialProvider — catch-all fallback reading host env vars.
+// 3. CodexOAuthFileCredentialProvider and EnvironmentCredentialProvider —
+//    fallback providers. Codex host auth is deliberately after plugins so a
+//    project-selected credential plugin can isolate Codex credentials from the
+//    operator's ~/.codex/auth.json.
 //
 // Operators with no credential plugins see zero behaviour change: the chain
 // is identical to the pre-plugin OAuth-file → env-var behaviour.
@@ -462,9 +465,9 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
             sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
     }
 
-    // Codex (ChatGPT subscription) auth file. Default ~/.codex/auth.json — the
-    // codex CLI hard-reads that path. CodexAgentRunner writes the file into
-    // the sandbox before invoking codex.
+    // Codex (ChatGPT subscription) auth file. There is intentionally no
+    // implicit ~/.codex/auth.json default here: host Codex auth must be opted
+    // in explicitly and is ordered after project credential plugins.
     var codexOauthFile =
         Environment.GetEnvironmentVariable("CODEYBOX_CODEX_OAUTH_FILE")
         ?? builder.Configuration["CodeyBox:CodexOAuthFile"];
@@ -474,7 +477,7 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
             codexOauthFile = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 codexOauthFile[2..]);
-        builtInFirst.Add(new CodexOAuthFileCredentialProvider(
+        builtInLast.Add(new CodexOAuthFileCredentialProvider(
             codexOauthFile,
             sp.GetService<ILogger<CodexOAuthFileCredentialProvider>>()));
     }

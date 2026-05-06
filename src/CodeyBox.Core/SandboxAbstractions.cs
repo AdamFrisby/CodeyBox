@@ -81,6 +81,16 @@ public interface ISandbox : IAsyncDisposable
 }
 
 /// <summary>
+/// Optional sandbox capability used during graceful host shutdown. A provider
+/// that can preserve an interrupted sandbox should stop it and make subsequent
+/// disposal a no-op so cached state can survive the orchestrator restart.
+/// </summary>
+public interface IPreemptibleSandbox : ISandbox
+{
+    Task StopAndPreserveAsync(CancellationToken ct = default);
+}
+
+/// <summary>
 /// Description of a sandbox to provision. Mounts and environment are the only
 /// channels by which the host injects state into the sandbox.
 /// </summary>

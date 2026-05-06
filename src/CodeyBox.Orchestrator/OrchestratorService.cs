@@ -332,6 +332,16 @@ public sealed class OrchestratorService : BackgroundService
     /// </summary>
     private WorkItem? TryBuildRecoveredState(WorkItem item)
     {
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && item.State is WorkItemState.Working or WorkItemState.Reworking)
+        {
+            return item with
+            {
+                StartedAt = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+        }
+
         WorkItemState? targetState = item.State switch
         {
             WorkItemState.Working => WorkItemState.Queued,
@@ -537,10 +547,17 @@ public sealed class OrchestratorService : BackgroundService
                     }
                     // Record first pickup time inside the lock so the count is visible
                     // to the next worker before it runs its own budget check.
-                    if (item.StartedAt is null)
+                    if (item.StartedAt is null || item.PreemptCheckpoint is not null)
                     {
-                        item = item with { StartedAt = DateTimeOffset.UtcNow };
+                        var pipelineItem = item;
+                        item = item with
+                        {
+                            StartedAt = DateTimeOffset.UtcNow,
+                            PreemptedAt = null,
+                            PreemptCheckpoint = null,
+                        };
                         await _store.UpdateAsync(item, ct);
+                        item = pipelineItem with { StartedAt = item.StartedAt };
                     }
                 }
                 finally
@@ -551,10 +568,17 @@ public sealed class OrchestratorService : BackgroundService
             else
             {
                 // No project → no budget check; still record first pickup time.
-                if (item.StartedAt is null)
+                if (item.StartedAt is null || item.PreemptCheckpoint is not null)
                 {
-                    item = item with { StartedAt = DateTimeOffset.UtcNow };
+                    var pipelineItem = item;
+                    item = item with
+                    {
+                        StartedAt = DateTimeOffset.UtcNow,
+                        PreemptedAt = null,
+                        PreemptCheckpoint = null,
+                    };
                     await _store.UpdateAsync(item, ct);
+                    item = pipelineItem with { StartedAt = item.StartedAt };
                 }
             }
 
@@ -562,9 +586,11 @@ public sealed class OrchestratorService : BackgroundService
             AuditLog.WorkItemPickedUp(workerIndex, item.Id);
             try
             {
-                // Pass ct (the host stoppingToken) as hostShutdownToken so the pipeline
-                // can distinguish "host is shutting down" from "operator cancelled".
-                await _pipeline.RunAsync(item, registration.Token, ct);
+                // Link host shutdown explicitly into the per-item token so
+                // runner.RunAsync is cancelled promptly on SIGTERM even when the
+                // registry implementation is not rooted in the host token.
+                using var pipelineCts = CancellationTokenSource.CreateLinkedTokenSource(registration.Token, ct);
+                await _pipeline.RunAsync(item, pipelineCts.Token, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {

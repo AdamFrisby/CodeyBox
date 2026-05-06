@@ -69,6 +69,26 @@ public sealed class WorkItemRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task PreemptedWorking_ReenqueuesWithoutRecoveryReset()
+    {
+        var item = Item(WorkItemState.Working) with
+        {
+            PreemptedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{Guid.NewGuid()}",
+        };
+        await _store.CreateAsync(item);
+
+        var svc = BuildOrchestrator();
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, recovered!.State);
+        Assert.Equal(0, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
+    }
+
+    [Fact]
     public async Task Auditing_ResetsTo_WorkComplete()
     {
         var item = Item(WorkItemState.Auditing);

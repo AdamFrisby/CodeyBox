@@ -90,6 +90,18 @@ public sealed class DeadWorkerReaper : BackgroundService
             return;
         }
 
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && item.State is WorkItemState.Working or WorkItemState.Reworking)
+        {
+            var preempted = item with { StartedAt = null, UpdatedAt = DateTimeOffset.UtcNow };
+            await _store.UpdateAsync(preempted, ct);
+            await _queue.EnqueueAsync(itemId, ct);
+            _log.LogInformation(
+                "Dead worker {WorkerId}: work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume",
+                worker.WorkerId, itemId, item.PreemptCheckpoint);
+            return;
+        }
+
         var recoveryTarget = MapToRecoveryState(item.State);
         if (recoveryTarget is null)
         {

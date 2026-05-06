@@ -134,7 +134,7 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
     internal static string MapToHostPathInternal(string root, string sandboxPath) => MapToHostPath(root, sandboxPath);
 }
 
-internal sealed class ProcessSandbox : ISandbox
+internal sealed class ProcessSandbox : IPreemptibleSandbox
 {
     private readonly string _root;
     private readonly SandboxSpec _spec;
@@ -262,6 +262,11 @@ internal sealed class ProcessSandbox : ISandbox
             _log.LogWarning(ex, "Failed to clean up ProcessSandbox {Id} root {Root}", Id, _root);
         }
         return ValueTask.CompletedTask;
+    }
+
+    public Task StopAndPreserveAsync(CancellationToken ct = default)
+    {
+        return Task.CompletedTask;
     }
 
     private static void RemoveTreeSafely(string path)

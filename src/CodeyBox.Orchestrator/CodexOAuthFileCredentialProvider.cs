@@ -5,8 +5,8 @@ using Microsoft.Extensions.Logging;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Reads the Codex CLI's subscription-mode auth file (default
-/// <c>~/.codex/auth.json</c>) on every <see cref="GetAsync"/> call and exposes
+/// Reads an explicitly configured Codex CLI subscription-mode auth file on
+/// every <see cref="GetAsync"/> call and exposes
 /// its contents as the env var <c>CODEX_AUTH_JSON</c> in the credential bundle.
 ///
 /// <para>Unlike Claude (which accepts an OAuth token directly via
