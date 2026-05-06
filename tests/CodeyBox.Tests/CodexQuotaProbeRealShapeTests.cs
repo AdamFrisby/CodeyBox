@@ -14,7 +14,9 @@ public sealed class CodexQuotaProbeRealShapeTests
 
         Assert.Equal(63, snapshot.AvailablePct);
         Assert.True(snapshot.PerModel.ContainsKey("GPT-5.3-Codex-Spark"));
+        Assert.True(snapshot.PerModel.ContainsKey(CodexQuotaProbe.DefaultRoutedModelId));
         Assert.Equal(100, snapshot.PerModel["GPT-5.3-Codex-Spark"].AvailablePct);
+        Assert.Equal(100, snapshot.PerModel[CodexQuotaProbe.DefaultRoutedModelId].AvailablePct);
         Assert.Equal("5h-rolling", snapshot.PerModel["GPT-5.3-Codex-Spark"].Window);
         Assert.NotNull(snapshot.ResetAt);
     }

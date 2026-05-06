@@ -19,8 +19,17 @@ namespace CodeyBox.Agents.Codex;
 public sealed class CodexQuotaProbe : IAgentQuotaProbe
 {
     internal const string UsageEndpoint = "https://chatgpt.com/backend-api/wham/usage";
+    internal const string DefaultRoutedModelId = "gpt-5.5";
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
+    private static readonly IReadOnlyDictionary<string, string[]> RoutedModelAliases =
+        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            // Captured WHAM usage names the Codex subscription bucket by its
+            // product/display limit, while the CLI route configured in the
+            // default frontier class is gpt-5.5.
+            ["GPT-5.3-Codex-Spark"] = [DefaultRoutedModelId],
+        };
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly Func<AgentQuotaCredentials> _credentialsProvider;
@@ -161,8 +170,15 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
 
             var quotaSource = item.TryGetProperty("rate_limit", out var rateLimit) ? rateLimit : item;
             var quota = TryParseRateLimit(quotaSource);
-            if (quota is not null)
-                perModel[modelId] = quota;
+            if (quota is null)
+                continue;
+
+            perModel[modelId] = quota;
+            if (RoutedModelAliases.TryGetValue(modelId, out var aliases))
+            {
+                foreach (var alias in aliases)
+                    perModel.TryAdd(alias, quota);
+            }
         }
 
         return perModel;

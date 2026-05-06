@@ -118,6 +118,25 @@ public sealed class CodexQuotaProbeTests
         Assert.Equal(0.0, snap.AvailablePct);
     }
 
+    [Fact]
+    public void ParseResponse_AddsDefaultRoutedAliasForWhamCodexBucket()
+    {
+        var snap = CodexQuotaProbe.ParseResponse("""
+        {
+          "rate_limit": { "primary_window": { "used_percent": 40 } },
+          "additional_rate_limits": [
+            {
+              "limit_name": "GPT-5.3-Codex-Spark",
+              "rate_limit": { "primary_window": { "used_percent": 100 } }
+            }
+          ]
+        }
+        """);
+
+        Assert.Equal(0, snap.PerModel["GPT-5.3-Codex-Spark"].AvailablePct);
+        Assert.Equal(0, snap.PerModel[CodexQuotaProbe.DefaultRoutedModelId].AvailablePct);
+    }
+
     // ── HTTP error handling ───────────────────────────────────────────────────
 
     [Fact]

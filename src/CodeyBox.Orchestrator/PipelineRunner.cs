@@ -446,7 +446,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 agentResult.Stderr,
                 agentEndedAt,
                 _auditQuotaOptions.ObservedFailureRetention,
-                ct);
+                ct,
+                projectId: item.ProjectId);
 
             // Truncate agent-controlled output to prevent unbounded content from
             // reaching the audit log via the exception message chain.
@@ -697,7 +698,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 foreach (var (auditor, runner) in toolPairs)
                 {
                     var run = await ExecAuditorAsync(sandbox, auditor, runner, ctx, ct);
-                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                     if (needsCreds && runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= runner.Kind;
                     findings.AddRange(run.Result.Findings);
@@ -734,7 +735,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // Post-process in stable auditor order (same as llmPairs).
                 foreach (var run in llmRuns)
                 {
-                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                     if (needsCreds && run.Runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= run.Runner.Kind;
                     findings.AddRange(run.Result.Findings);
@@ -789,6 +790,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditorRunRecord run,
         IAgentRunner workRunner,
         bool needsCreds,
+        ProjectId projectId,
         AuditContext ctx,
         CancellationToken ct)
     {
@@ -802,7 +804,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 run.Result.AgentStderr,
                 DateTimeOffset.UtcNow,
                 _auditQuotaOptions.ObservedFailureRetention,
-                ct);
+                ct,
+                projectId: projectId);
         }
 
         if (needsCreds)
@@ -958,7 +961,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 QualityScore = 100,
             };
             if (_quotaFailures is not null
-                && await _quotaFailures.HasRecentAsync(kind.Value, auditMember.ModelId, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct))
+                && await _quotaFailures.HasRecentForProjectAsync(kind.Value, auditMember.ModelId, project.Id, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct))
             {
                 AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);
                 _log.LogWarning(
@@ -973,7 +976,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 || (quota.AvailablePct < 0 && _auditQuotaOptions.UnknownPolicy == QuotaUnknownPolicy.FailOpen)
                 || (quota.AvailablePct < 0
                     && _auditQuotaOptions.UnknownPolicy == QuotaUnknownPolicy.UseObservedFailures
-                    && (_quotaFailures is null || !await _quotaFailures.HasRecentAsync(kind.Value, auditMember.ModelId, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct)));
+                    && (_quotaFailures is null || !await _quotaFailures.HasRecentForProjectAsync(kind.Value, auditMember.ModelId, project.Id, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct)));
             if (!quotaAllows)
             {
                 AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);
@@ -1080,7 +1083,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 agentResult.Stderr,
                 mergeEndedAt,
                 _auditQuotaOptions.ObservedFailureRetention,
-                ct);
+                ct,
+                projectId: item.ProjectId);
             throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
         }
 

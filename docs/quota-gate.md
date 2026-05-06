@@ -15,6 +15,11 @@ contains model-specific buckets keyed by model id. When a class member has
 `ModelId`, the router uses `PerModel[ModelId]` when present; otherwise it falls
 back to the overall percentage.
 
+Codex's WHAM endpoint may name buckets by display limit instead of CLI model
+id. The captured response uses `GPT-5.3-Codex-Spark`; the Codex parser also
+stores that bucket under the routed default `gpt-5.5` so the router can block
+the configured Codex member when that bucket is exhausted.
+
 For multi-window quota responses, the parser uses the most constrained window:
 
 - `primary_window` = 5-hour rolling
@@ -35,8 +40,10 @@ Unexpected JSON fields are ignored. Missing fields make only that part unknown.
 ## Observed-Failure Breaker
 
 When an agent exits unsuccessfully and stderr contains one of the documented
-quota patterns, CodeyBox records `(agent, modelId, failureKind, observedAt)` in
-`state.db`. The router skips the same `(agent, modelId)` for
+quota patterns, CodeyBox records
+`(projectId, agent, modelId, failureKind, observedAt)` in `state.db`. Agent
+stderr is untrusted, so runtime observations are scoped to the triggering
+project; the router skips the same `(projectId, agent, modelId)` for
 `ObservedFailureWindowMinutes` even if the next probe is unknown or stale.
 
 Recognized patterns are intentionally conservative:

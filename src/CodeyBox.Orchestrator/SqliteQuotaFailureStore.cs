@@ -28,29 +28,45 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent TEXT NOT NULL,
                 model_id TEXT,
+                project_id TEXT,
                 failure_kind TEXT NOT NULL,
                 observed_at TEXT NOT NULL
             );
+            """;
+        cmd.ExecuteNonQuery();
+        EnsureProjectIdColumn();
+
+        using var indexCmd = _conn.CreateCommand();
+        indexCmd.CommandText = """
             CREATE INDEX IF NOT EXISTS idx_quota_failures_agent_model_observed
                 ON quota_failures(agent, model_id, observed_at);
+            CREATE INDEX IF NOT EXISTS idx_quota_failures_project_agent_model_observed
+                ON quota_failures(project_id, agent, model_id, observed_at);
             CREATE INDEX IF NOT EXISTS idx_quota_failures_observed
                 ON quota_failures(observed_at);
             """;
-        cmd.ExecuteNonQuery();
+        indexCmd.ExecuteNonQuery();
     }
 
     public async Task RecordAsync(AgentKind agent, string? modelId, QuotaFailureKind kind, DateTimeOffset observedAt, CancellationToken ct = default)
+        => await RecordCoreAsync(agent, modelId, projectId: null, kind, observedAt, ct);
+
+    public async Task RecordForProjectAsync(AgentKind agent, string? modelId, ProjectId projectId, QuotaFailureKind kind, DateTimeOffset observedAt, CancellationToken ct = default)
+        => await RecordCoreAsync(agent, modelId, projectId, kind, observedAt, ct);
+
+    private async Task RecordCoreAsync(AgentKind agent, string? modelId, ProjectId? projectId, QuotaFailureKind kind, DateTimeOffset observedAt, CancellationToken ct)
     {
         await _lock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO quota_failures (agent, model_id, failure_kind, observed_at)
-                VALUES ($agent, $model_id, $failure_kind, $observed_at);
+                INSERT INTO quota_failures (agent, model_id, project_id, failure_kind, observed_at)
+                VALUES ($agent, $model_id, $project_id, $failure_kind, $observed_at);
                 """;
             cmd.Parameters.AddWithValue("$agent", agent.Value);
             cmd.Parameters.AddWithValue("$model_id", modelId is null ? DBNull.Value : modelId);
+            cmd.Parameters.AddWithValue("$project_id", projectId is null ? DBNull.Value : projectId.Value.Value);
             cmd.Parameters.AddWithValue("$failure_kind", kind.ToString());
             cmd.Parameters.AddWithValue("$observed_at", observedAt.ToUniversalTime().ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
@@ -62,22 +78,43 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
     }
 
     public async Task<bool> HasRecentAsync(AgentKind agent, string? modelId, TimeSpan window, DateTimeOffset now, CancellationToken ct = default)
+        => await HasRecentCoreAsync(agent, modelId, projectId: null, includeGlobal: true, window, now, ct);
+
+    public async Task<bool> HasRecentForProjectAsync(AgentKind agent, string? modelId, ProjectId projectId, TimeSpan window, DateTimeOffset now, CancellationToken ct = default)
+        => await HasRecentCoreAsync(agent, modelId, projectId, includeGlobal: true, window, now, ct);
+
+    private async Task<bool> HasRecentCoreAsync(
+        AgentKind agent,
+        string? modelId,
+        ProjectId? projectId,
+        bool includeGlobal,
+        TimeSpan window,
+        DateTimeOffset now,
+        CancellationToken ct)
     {
         await _lock.WaitAsync(ct);
         try
         {
             var cutoff = now.ToUniversalTime() - window;
             using var cmd = _conn.CreateCommand();
+            var projectPredicate = projectId is null
+                ? "project_id IS NULL"
+                : includeGlobal
+                    ? "(project_id = $project_id OR project_id IS NULL)"
+                    : "project_id = $project_id";
             cmd.CommandText = """
                 SELECT 1
                 FROM quota_failures
                 WHERE agent = $agent
                   AND (($model_id IS NULL AND model_id IS NULL) OR model_id = $model_id)
+                  AND __PROJECT_PREDICATE__
                   AND observed_at >= $cutoff
                 LIMIT 1;
-                """;
+                """.Replace("__PROJECT_PREDICATE__", projectPredicate, StringComparison.Ordinal);
             cmd.Parameters.AddWithValue("$agent", agent.Value);
             cmd.Parameters.AddWithValue("$model_id", modelId is null ? DBNull.Value : modelId);
+            if (projectId is not null)
+                cmd.Parameters.AddWithValue("$project_id", projectId.Value.Value);
             cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
             var result = await cmd.ExecuteScalarAsync(ct);
             return result is not null;
@@ -96,7 +133,7 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
             var cutoff = now.ToUniversalTime() - window;
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                SELECT agent, model_id, failure_kind, observed_at
+                SELECT agent, model_id, failure_kind, observed_at, project_id
                 FROM quota_failures
                 WHERE observed_at >= $cutoff
                 ORDER BY observed_at DESC;
@@ -117,7 +154,8 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
                     new AgentKind(reader.GetString(0)),
                     reader.IsDBNull(1) ? null : reader.GetString(1),
                     kind,
-                    observedAt));
+                    observedAt,
+                    reader.IsDBNull(4) ? null : new ProjectId(reader.GetString(4))));
             }
 
             return rows;
@@ -145,4 +183,27 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
     }
 
     public void Dispose() => _conn.Dispose();
+
+    private void EnsureProjectIdColumn()
+    {
+        using var columns = _conn.CreateCommand();
+        columns.CommandText = "PRAGMA table_info(quota_failures);";
+        using var reader = columns.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), "project_id", StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+
+        using var alter = _conn.CreateCommand();
+        alter.CommandText = "ALTER TABLE quota_failures ADD COLUMN project_id TEXT;";
+        alter.ExecuteNonQuery();
+
+        using var index = _conn.CreateCommand();
+        index.CommandText = """
+            CREATE INDEX IF NOT EXISTS idx_quota_failures_project_agent_model_observed
+                ON quota_failures(project_id, agent, model_id, observed_at);
+            """;
+        index.ExecuteNonQuery();
+    }
 }

@@ -30,6 +30,39 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     }
 
     [Fact]
+    public async Task ProjectScopedQuotaFailure_DoesNotBlockDifferentProject()
+    {
+        var now = DateTimeOffset.UtcNow;
+        await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+            _failures,
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            summary: "agent exited 1",
+            stderr: "API Error: 401",
+            now,
+            TimeSpan.FromMinutes(30),
+            CancellationToken.None,
+            projectId: new ProjectId("proj-a"));
+
+        Assert.True(await _failures.HasRecentForProjectAsync(
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            new ProjectId("proj-a"),
+            TimeSpan.FromMinutes(10),
+            now));
+        Assert.False(await _failures.HasRecentForProjectAsync(
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            new ProjectId("proj-b"),
+            TimeSpan.FromMinutes(10),
+            now));
+
+        var decision = await BuildRouter().ResolveAsync(Item(projectId: "proj-b"), null, CancellationToken.None);
+
+        Assert.Equal(AgentKind.Claude, decision.Chosen!.Agent);
+    }
+
+    [Fact]
     public async Task ModelSpecificFailure_DoesNotBlockDifferentModel()
     {
         await _failures.RecordAsync(AgentKind.Claude, "claude-opus-4-7", QuotaFailureKind.LimitReached, DateTimeOffset.UtcNow);
@@ -182,10 +215,10 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
             quotaFailures: _failures);
     }
 
-    private static WorkItem Item() => new()
+    private static WorkItem Item(string projectId = "proj") => new()
     {
         Id = WorkItemId.New(),
-        ProjectId = new ProjectId("proj"),
+        ProjectId = new ProjectId(projectId),
         Title = "t",
         Prompt = "p",
         AgentClassId = "frontier",

@@ -907,9 +907,10 @@ app.MapGet("/quota", async (
             latestSnapshot = snapshot,
             observedFailuresLast60m = failures
                 .Where(f => f.Agent == probe.Kind)
-                .GroupBy(f => new { f.ModelId, f.FailureKind })
+                .GroupBy(f => new { f.ProjectId, f.ModelId, f.FailureKind })
                 .Select(g => new
                 {
+                    projectId = g.Key.ProjectId?.Value,
                     modelId = g.Key.ModelId,
                     failureKind = g.Key.FailureKind.ToString(),
                     count = g.Count(),

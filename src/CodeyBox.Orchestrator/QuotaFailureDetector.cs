@@ -34,7 +34,8 @@ public static class QuotaFailureDetector
         string? stderr,
         DateTimeOffset observedAt,
         TimeSpan retention,
-        CancellationToken ct)
+        CancellationToken ct,
+        ProjectId? projectId = null)
     {
         if (store is null)
             return;
@@ -46,7 +47,11 @@ public static class QuotaFailureDetector
         if (kind is null)
             return;
 
-        await store.RecordAsync(agent, modelId, kind.Value, observedAt, ct);
+        if (projectId is { } scopedProject)
+            await store.RecordForProjectAsync(agent, modelId, scopedProject, kind.Value, observedAt, ct);
+        else
+            await store.RecordAsync(agent, modelId, kind.Value, observedAt, ct);
+
         await store.PruneOlderThanAsync(observedAt - retention, ct);
     }
 }

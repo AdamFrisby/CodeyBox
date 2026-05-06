@@ -203,6 +203,9 @@ Calls `https://chatgpt.com/backend-api/wham/usage` with
 `ChatGPT-Account-Id`.
 
 Parses overall `rate_limit` plus per-model `additional_rate_limits`.
+The WHAM response can use display bucket names such as
+`GPT-5.3-Codex-Spark`; the parser also stores known buckets under their routed
+CLI model id, including `gpt-5.5`.
 
 ### Unknown snapshots
 
