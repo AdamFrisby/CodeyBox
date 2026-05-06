@@ -17,7 +17,7 @@ public sealed class CliAgentPreemptTests
 
         var write = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", "set -e; mkdir -p \"$HOME/.testagent\"; printf '%s\n' session > \"$HOME/.testagent/session.txt\""],
+            Argv = ["sh", "-c", "set -e; mkdir -p \"$HOME/.testagent\"; printf '%s\n' session > \"$HOME/.testagent/session.txt\"; printf '%s\n' secret > \"$HOME/.testagent/auth.json\""],
         });
         Assert.True(write.Success, write.Stderr);
 
@@ -30,6 +30,7 @@ public sealed class CliAgentPreemptTests
         });
         Assert.True(archive.Success, archive.Stderr);
         Assert.Contains("home/.testagent/session.txt", archive.Stdout);
+        Assert.DoesNotContain("home/.testagent/auth.json", archive.Stdout);
 
         var manifest = await sandbox.ExecAsync(new SandboxExec
         {
@@ -38,6 +39,7 @@ public sealed class CliAgentPreemptTests
         });
         Assert.True(manifest.Success, manifest.Stderr);
         Assert.Contains("captured HOME/.testagent", manifest.Stdout);
+        Assert.Contains("removed sensitive home/.testagent/auth.json", manifest.Stdout);
     }
 
     private sealed class TestCliRunner : CliAgentRunnerBase

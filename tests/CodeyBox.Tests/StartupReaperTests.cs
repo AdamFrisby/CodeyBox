@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Collections.Concurrent;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Webhooks;
@@ -33,7 +34,7 @@ public sealed class StartupReaperTests : IDisposable
     }
 
     [Fact]
-    public async Task StartupReaper_RecoversMidFlightItem_BeforeWorkerPickup()
+    public async Task StartupReaper_FailsCrashedWorkingItem_BeforeWorkerPickup()
     {
         // Arrange: an item left in Working state from a previous crash, with a
         // corresponding stale worker row.
@@ -58,7 +59,8 @@ public sealed class StartupReaperTests : IDisposable
         };
         await _registry.RegisterAsync(staleReg);
 
-        // Build a pipeline that marks items Done immediately.
+        // Build a pipeline that would mark items Done immediately if the
+        // crashed item were incorrectly requeued.
         var queue = new InMemoryTaskQueue();
         var pipeline = new ImmediateDonePipeline(_store);
         var cancellations = new CancellationRegistry(CancellationToken.None);
@@ -82,21 +84,23 @@ public sealed class StartupReaperTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Poll until the item is Done (the reaper recovered it → Queued, then
-        // the orchestrator ran it through the pipeline).
+        // Poll until the startup reaper marks the non-preempted Working item
+        // Failed. It must not enter the worker pool again.
         var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
         WorkItem? final = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
             final = await _store.GetAsync(item.Id);
-            if (final?.State == WorkItemState.Done) break;
+            if (final?.State == WorkItemState.Failed) break;
             await Task.Delay(30);
         }
 
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Done, final.State);
+        Assert.Equal(WorkItemState.Failed, final.State);
+        Assert.Contains("without a preempt checkpoint", final.LastError);
+        Assert.Empty(pipeline.Executed);
         // RecoveryAttempts == 1 proves the startup reaper ran and incremented the counter.
         Assert.Equal(1, final.RecoveryAttempts);
     }
@@ -154,8 +158,14 @@ public sealed class StartupReaperTests : IDisposable
 internal sealed class ImmediateDonePipeline : IPipelineRunner
 {
     private readonly IWorkItemStore _store;
+    private readonly ConcurrentBag<WorkItemId> _executed = new();
+    public IReadOnlyCollection<WorkItemId> Executed => _executed;
+
     public ImmediateDonePipeline(IWorkItemStore store) => _store = store;
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
-        => await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+    {
+        _executed.Add(item.Id);
+        await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+    }
 }

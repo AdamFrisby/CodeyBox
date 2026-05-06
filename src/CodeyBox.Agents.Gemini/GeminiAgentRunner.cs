@@ -27,7 +27,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string Binary { get; init; } = "gemini";
 
-    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".gemini"];
+    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".gemini/tmp", ".gemini/history"];
 
     protected override string PreemptProcessPattern => Binary;
 

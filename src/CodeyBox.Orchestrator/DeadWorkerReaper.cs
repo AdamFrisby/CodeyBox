@@ -102,6 +102,25 @@ public sealed class DeadWorkerReaper : BackgroundService
             return;
         }
 
+        if (item.State == WorkItemState.Working)
+        {
+            var failed = item with
+            {
+                State = WorkItemState.Failed,
+                LastError = "worker died while work phase was running without a preempt checkpoint",
+                RecoveryAttempts = item.RecoveryAttempts + 1,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+            await _store.UpdateAsync(failed, ct);
+            _log.LogWarning(
+                "Dead worker {WorkerId}: work item {ItemId} was Working without a preempt checkpoint; marked Failed",
+                worker.WorkerId, itemId);
+            return;
+        }
+
         var recoveryTarget = MapToRecoveryState(item.State);
         if (recoveryTarget is null)
         {
@@ -177,7 +196,6 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// </summary>
     internal static WorkItemState? MapToRecoveryState(WorkItemState state) => state switch
     {
-        WorkItemState.Working => WorkItemState.Queued,
         WorkItemState.Reworking => WorkItemState.Queued,
         WorkItemState.Auditing => WorkItemState.WorkComplete,
         WorkItemState.Merging => WorkItemState.AuditPassed,

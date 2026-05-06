@@ -19,11 +19,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     protected abstract AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null);
 
     /// <summary>
-    /// CLI state directories under HOME that are worth preserving on graceful
-    /// preemption. Subclasses should include the directory where the CLI keeps
-    /// session transcripts, plans, and resumable conversation state.
+    /// CLI state paths under HOME that are worth preserving on graceful
+    /// preemption. Subclasses should include only non-secret transcript,
+    /// plan, and resumable conversation state paths.
     /// </summary>
     protected virtual IReadOnlyList<string> ScratchpadHomeDirectories => [];
+
+    /// <summary>
+    /// File name patterns that must never be captured into a git-backed
+    /// preempt checkpoint. These are intentionally broad: losing a little
+    /// resumability is preferable to committing live CLI credentials.
+    /// </summary>
+    protected virtual IReadOnlyList<string> ScratchpadExcludeFilePatterns =>
+    [
+        "auth.json",
+        "*credential*",
+        "*credentials*",
+        "*token*",
+        "*secret*",
+        "*.pem",
+        "*.key",
+        ".env",
+    ];
 
     /// <summary>
     /// Pattern used only after scratchpad capture to ask the running CLI to stop.
@@ -108,6 +125,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     public virtual async Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default)
     {
         var dirs = string.Join(" ", ScratchpadHomeDirectories.Select(ShellQuote));
+        var excludes = string.Join(" ", ScratchpadExcludeFilePatterns.Select(ShellQuote));
         var pattern = PreemptProcessPattern;
         var result = await sandbox.ExecAsync(new SandboxExec
         {
@@ -120,21 +138,52 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 scratch_tmp="$(mktemp -d .codeybox/preempt-scratchpad.XXXXXX)"
                 manifest="$scratch_tmp/manifest.txt"
                 printf '%s\n' "Preempt requested at $(date -u +%FT%TZ)." > "$manifest"
+                is_excluded() {
+                  name="$(basename "$1")"
+                  for pat in {{excludes}} ""; do
+                    [ -n "$pat" ] || continue
+                    case "$name" in
+                      $pat) return 0 ;;
+                    esac
+                  done
+                  return 1
+                }
+                copy_sanitized() {
+                  src="$1"
+                  dest_parent="$2"
+                  label="$3"
+                  name="$(basename "$src")"
+                  if is_excluded "$name"; then
+                    printf '%s\n' "skipped sensitive $label" >> "$manifest"
+                    return 1
+                  fi
+                  mkdir -p "$dest_parent"
+                  cp -a "$src" "$dest_parent/"
+                  copied="$dest_parent/$name"
+                  find "$copied" -depth | while IFS= read -r file; do
+                    if is_excluded "$file"; then
+                      rm -rf "$file"
+                      printf '%s\n' "removed sensitive ${file#$scratch_tmp/}" >> "$manifest"
+                    fi
+                  done
+                  find "$copied" -depth -type d -empty -delete
+                  [ -e "$copied" ]
+                }
                 captured=0
                 for rel in {{dirs}} ""; do
                   [ -n "$rel" ] || continue
                   rel="${rel#/}"
                   if [ -e "$HOME/$rel" ]; then
-                    mkdir -p "$scratch_tmp/home"
-                    cp -a "$HOME/$rel" "$scratch_tmp/home/"
-                    printf '%s\n' "captured HOME/$rel" >> "$manifest"
-                    captured=1
+                    if copy_sanitized "$HOME/$rel" "$scratch_tmp/home" "HOME/$rel"; then
+                      printf '%s\n' "captured HOME/$rel" >> "$manifest"
+                      captured=1
+                    fi
                   fi
                   if [ -e "$rel" ] && [ "$PWD/$rel" != "$HOME/$rel" ]; then
-                    mkdir -p "$scratch_tmp/work"
-                    cp -a "$rel" "$scratch_tmp/work/"
-                    printf '%s\n' "captured WORK/$rel" >> "$manifest"
-                    captured=1
+                    if copy_sanitized "$rel" "$scratch_tmp/work" "WORK/$rel"; then
+                      printf '%s\n' "captured WORK/$rel" >> "$manifest"
+                      captured=1
+                    fi
                   fi
                 done
                 if [ "$captured" -eq 0 ]; then

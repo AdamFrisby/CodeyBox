@@ -19,7 +19,7 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
 
     public string Binary { get; init; } = "codex";
 
-    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".codex"];
+    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".codex/sessions", ".codex/history.jsonl"];
 
     protected override string PreemptProcessPattern => Binary;
 

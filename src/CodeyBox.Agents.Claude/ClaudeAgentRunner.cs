@@ -24,7 +24,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string? DefaultModelId { get; init; } = "claude-opus-4-7";
 
-    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".claude"];
+    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".claude/projects", ".claude/todos"];
 
     protected override string PreemptProcessPattern => Binary;
 

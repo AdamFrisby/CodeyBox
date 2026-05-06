@@ -236,7 +236,7 @@ public sealed class OrchestratorService : BackgroundService
     /// complete.
     ///
     /// Recovery state mapping:
-    ///   Working         → Queued      (redo from scratch; in-flight branch is gone)
+    ///   Working         → Failed      (crashed work phase without a preempt checkpoint)
     ///   Auditing        → WorkComplete (work commit is real; re-run the audit suite)
     ///   Reworking       → WorkComplete (re-run audit to confirm or re-rework)
     ///   Merging         → AuditPassed  (audit verdict is real; retry the merge)
@@ -285,6 +285,13 @@ public sealed class OrchestratorService : BackgroundService
                     _log.LogWarning(
                         "Work item {Id} has been abandoned after {Max} recovery attempts; operator intervention required",
                         item.Id, _opts.MaxRecoveryAttempts);
+                }
+                else if (recovered.State == WorkItemState.Failed)
+                {
+                    await _store.UpdateAsync(recovered, ct);
+                    _log.LogWarning(
+                        "Work item {Id} was left Working without a preempt checkpoint; marked Failed as a crash case",
+                        item.Id);
                 }
                 else
                 {
@@ -342,9 +349,22 @@ public sealed class OrchestratorService : BackgroundService
             };
         }
 
+        if (item.State == WorkItemState.Working)
+        {
+            return item with
+            {
+                State = WorkItemState.Failed,
+                LastError = "worker died while work phase was running without a preempt checkpoint",
+                RecoveryAttempts = item.RecoveryAttempts + 1,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+        }
+
         WorkItemState? targetState = item.State switch
         {
-            WorkItemState.Working => WorkItemState.Queued,
             WorkItemState.Auditing => WorkItemState.WorkComplete,
             WorkItemState.Reworking => WorkItemState.WorkComplete,
             WorkItemState.Merging => WorkItemState.AuditPassed,
@@ -362,7 +382,7 @@ public sealed class OrchestratorService : BackgroundService
 
         if (targetState is null) return null;
 
-        // Only backward-reset transitions (Working→Queued, Auditing→WorkComplete, etc.) and
+        // Only backward-reset transitions (Auditing→WorkComplete, etc.) and
         // UpstreamPushing→Merged represent genuinely interrupted in-flight work and count
         // against the recovery cap. Passthrough re-enqueues (WorkComplete/AuditPassed/Merged
         // left as-is) are natural resting points — a routine rolling restart should not burn

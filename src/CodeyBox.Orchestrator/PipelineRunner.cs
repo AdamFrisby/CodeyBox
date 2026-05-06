@@ -902,6 +902,8 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             var (findings, activeAuditAgentKind) = await collectTask;
+            if (hostShutdownToken.IsCancellationRequested)
+                throw new OperationCanceledException(hostShutdownToken);
 
             // Emit cross-review event once per iteration when at least one LLM
             // auditor actually ran with a different agent than the work agent.
