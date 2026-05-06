@@ -33,6 +33,11 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal));
         Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json .", StringComparison.Ordinal));
         Assert.Contains(sandbox.Commands, c => c.Contains("safety scan --target . --output json", StringComparison.Ordinal));
+        Assert.Contains(sandbox.ExtraEnvironments, e =>
+            e.TryGetValue("PIP_INDEX_URL", out var indexUrl) &&
+            indexUrl == "https://pypi.org/simple" &&
+            e.TryGetValue("PIP_CONFIG_FILE", out var pipConfigFile) &&
+            pipConfigFile == "/dev/null");
         Assert.Contains(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
         Assert.Contains(sandbox.ExtraEnvironments, e =>
             e.TryGetValue("NPM_CONFIG_REGISTRY", out var registry) &&
@@ -277,6 +282,34 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("django", finding.Title);
         Assert.Contains("PYSEC-2019-13", finding.Description);
+    }
+
+    [Fact]
+    public async Task PythonScannerBlocksRepositoryControlledPackageSourceUrls()
+    {
+        var sandbox = new DispatchSandbox(
+            markerPresent: true,
+            scannerExitCode: 126,
+            scannerStderr: """
+                CODEYBOX_UNSAFE_PYTHON_DEPENDENCY_SOURCE
+                requirements.txt:1: http://169.254.169.254/latest/meta-data
+                pyproject.toml:3: git+ssh://internal.example/pkg.git
+                """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["python"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("blocked repository-controlled package source URLs", finding.Title);
+        Assert.Contains("169.254.169.254", finding.Description);
     }
 
     [Fact]

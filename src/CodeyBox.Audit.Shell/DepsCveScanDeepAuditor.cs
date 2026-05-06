@@ -17,7 +17,41 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     private const int MaxProjectDirectories = 25;
     private const int MaxRawOutputChars = 1_000_000;
     private const string NpmAuditRegistry = "https://registry.npmjs.org/";
+    private const string PythonUnsafeSourceMarker = "CODEYBOX_UNSAFE_PYTHON_DEPENDENCY_SOURCE";
     private const string PythonScannerScript =
+        "validate_python_dependency_sources() { " +
+        "\"$1\" - <<'PY'\n" +
+        "import pathlib, re, sys\n" +
+        "from urllib.parse import urlparse\n" +
+        "allowed_hosts = {'pypi.org', 'files.pythonhosted.org'}\n" +
+        "url_re = re.compile(r'(?i)(?:https?|ftp|file)://[^\\s\\]})>,\"\\']+|(?:git|hg|svn|bzr)\\+[^\\s\\]})>,\"\\']+')\n" +
+        "manifest_names = {'pyproject.toml', 'setup.py', 'setup.cfg'}\n" +
+        "manifests = [p for p in pathlib.Path('.').iterdir() if p.name in manifest_names or p.name.startswith('requirements') and p.suffix == '.txt']\n" +
+        "blocked = []\n" +
+        "for manifest in manifests:\n" +
+        "    try:\n" +
+        "        text = manifest.read_text(encoding='utf-8', errors='ignore')\n" +
+        "    except OSError:\n" +
+        "        continue\n" +
+        "    for line_number, line in enumerate(text.splitlines(), 1):\n" +
+        "        stripped = line.strip()\n" +
+        "        if not stripped or stripped.startswith('#'):\n" +
+        "            continue\n" +
+        "        for match in url_re.finditer(line):\n" +
+        "            raw_url = match.group(0)\n" +
+        "            parsed = urlparse(raw_url.split('+', 1)[1] if '+' in raw_url and '://' in raw_url.split('+', 1)[1] else raw_url)\n" +
+        "            host = (parsed.hostname or '').lower().rstrip('.')\n" +
+        "            if parsed.scheme not in {'https'} or host not in allowed_hosts:\n" +
+        "                blocked.append(f'{manifest}:{line_number}: {raw_url}')\n" +
+        "if blocked:\n" +
+        "    print('" + PythonUnsafeSourceMarker + "', file=sys.stderr)\n" +
+        "    for item in blocked:\n" +
+        "        print(item, file=sys.stderr)\n" +
+        "    sys.exit(126)\n" +
+        "PY\n" +
+        "}; " +
+        "if command -v python3 >/dev/null 2>&1; then validate_python_dependency_sources python3 || exit $?; " +
+        "elif command -v python >/dev/null 2>&1; then validate_python_dependency_sources python || exit $?; fi; " +
         "if [ -f requirements.txt ]; then " +
         "if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json -r requirements.txt; fi; " +
         "if command -v safety >/dev/null 2>&1; then exec safety check -r requirements.txt --json; fi; " +
@@ -34,6 +68,19 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             ["NPM_CONFIG_AUDIT_REGISTRY"] = NpmAuditRegistry,
             ["npm_config_registry"] = NpmAuditRegistry,
             ["npm_config_audit_registry"] = NpmAuditRegistry,
+        };
+
+    private static readonly IReadOnlyDictionary<string, string> PythonScannerEnvironment =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["PIP_CONFIG_FILE"] = "/dev/null",
+            ["PIP_DISABLE_PIP_VERSION_CHECK"] = "1",
+            ["PIP_EXTRA_INDEX_URL"] = "",
+            ["PIP_FIND_LINKS"] = "",
+            ["PIP_INDEX_URL"] = "https://pypi.org/simple",
+            ["PIP_NO_INPUT"] = "1",
+            ["PIP_REQUIRE_VIRTUALENV"] = "0",
+            ["PIP_TRUSTED_HOST"] = "",
         };
 
     private static readonly IReadOnlyDictionary<string, Scanner> Scanners =
@@ -54,7 +101,8 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 "pip-audit or safety not installed in sandbox; CVE scan skipped",
                 "Install pip-audit or safety in the sandbox image to enable Python CVE scanning.",
                 ParsePythonFindings,
-                "Python dependency CVE scanner exited with code {0} but no vulnerability records were parsed."),
+                "Python dependency CVE scanner exited with code {0} but no vulnerability records were parsed.",
+                PythonScannerEnvironment),
             ["node"] = new(
                 "node",
                 LanguageProjectDiscovery.NodeDiscoveryScript,
@@ -171,6 +219,16 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                         Severity: AuditSeverity.Info,
                         Title: scanner.MissingToolTitle,
                         Description: scanner.MissingToolDescription));
+                    continue;
+                }
+
+                if (IsUnsafePythonDependencySource(scanner, result))
+                {
+                    allFindings.Add(new AuditFinding(
+                        AuditorName: Name,
+                        Severity: AuditSeverity.Error,
+                        Title: "Python CVE scan blocked repository-controlled package source URLs",
+                        Description: "Python dependency metadata contains direct package URLs or alternate package-source URLs outside the allowed public package hosts (pypi.org and files.pythonhosted.org). The dependency CVE scanner was not run because those URLs could trigger SSRF from the network-enabled audit sandbox. Stderr: " + TruncatedOutput(result.Stderr, out _)));
                     continue;
                 }
 
@@ -875,6 +933,11 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                result.Stderr.Contains("no such command", StringComparison.OrdinalIgnoreCase) &&
                result.Stderr.Contains("audit", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsUnsafePythonDependencySource(Scanner scanner, SandboxExecResult result)
+        => scanner.Language.Equals("python", StringComparison.OrdinalIgnoreCase) &&
+           result.ExitCode == 126 &&
+           result.Stderr.Contains(PythonUnsafeSourceMarker, StringComparison.Ordinal);
 
     [GeneratedRegex(@"Crate:\s+(?<crate>\S+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex CargoCrateRegex();
