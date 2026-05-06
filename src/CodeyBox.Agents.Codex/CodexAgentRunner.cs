@@ -13,8 +13,10 @@ namespace CodeyBox.Agents.Codex;
 ///         <c>CODEX_AUTH_JSON</c> credential env var before invoking codex.</item>
 /// </list>
 /// </summary>
-public sealed class CodexAgentRunner : CliAgentRunnerBase
+public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
+    private static readonly AsyncLocal<string?> CurrentStructuredStreamFlag = new();
+
     public override AgentKind Kind => AgentKind.Codex;
 
     public string Binary { get; init; } = "codex";
@@ -24,6 +26,9 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string? DefaultModelId { get; init; } = "gpt-5.5";
 
+    public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default) =>
+        await DetectStructuredStreamFlagAsync(sandbox, ct).ConfigureAwait(false) is not null;
+
     public override async Task<AgentResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -32,8 +37,14 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default,
-        Action<string>? stdoutChunkCallback = null)
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
     {
+        var structuredStreamFlag = captureStructuredStream
+            ? await DetectStructuredStreamFlagAsync(sandbox, ct).ConfigureAwait(false)
+            : null;
+        var effectiveCaptureStructuredStream = captureStructuredStream && structuredStreamFlag is not null;
+
         // ChatGPT-subscription auth: write ~/.codex/auth.json into the sandbox.
         // The codex CLI reads ONLY that file path; there's no env-var equivalent.
         //
@@ -58,10 +69,40 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
                 Stderr: write.Stderr);
         }
 
-        return await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback);
+        var previousFlag = CurrentStructuredStreamFlag.Value;
+        CurrentStructuredStreamFlag.Value = structuredStreamFlag;
+        try
+        {
+            var result = await base.RunAsync(
+                sandbox,
+                workingDirectory,
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                ct,
+                stdoutChunkCallback,
+                effectiveCaptureStructuredStream).ConfigureAwait(false);
+
+            if (!captureStructuredStream || structuredStreamFlag is not null)
+                return result;
+
+            var warning = $"Warning: Codex CLI at '{Binary}' does not advertise --json or --json-stream; structured stream capture was disabled.";
+            var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
+            return result with { Stderr = stderr };
+        }
+        finally
+        {
+            CurrentStructuredStreamFlag.Value = previousFlag;
+        }
     }
 
-    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null)
+    protected override AgentInvocation BuildInvocation(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
     {
         // `codex exec <prompt>` runs a non-interactive turn and exits.
         //
@@ -76,6 +117,8 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
             Binary, "exec",
             "--dangerously-bypass-approvals-and-sandbox",
         };
+        if (captureStructuredStream)
+            argv.Add(CurrentStructuredStreamFlag.Value ?? "--json");
         var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))
         {
@@ -92,5 +135,23 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
         }
         argv.Add(prompt);
         return new AgentInvocation(argv);
+    }
+
+    private async Task<string?> DetectStructuredStreamFlagAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        var help = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = [Binary, "exec", "--help"],
+        }, ct).ConfigureAwait(false);
+
+        if (!help.Success)
+            return null;
+
+        var output = string.Concat(help.Stdout, "\n", help.Stderr);
+        if (output.Contains("--json-stream", StringComparison.Ordinal))
+            return "--json-stream";
+        if (output.Contains("--json", StringComparison.Ordinal))
+            return "--json";
+        return null;
     }
 }

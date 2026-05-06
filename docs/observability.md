@@ -4,6 +4,11 @@ CodeyBox emits traces and metrics via the [OpenTelemetry Protocol (OTLP)](https:
 
 When disabled (the default), zero OTel types are registered and there is no runtime overhead.
 
+Structured agent event streams are stored separately from OTel under
+`CodeyBox:AgentStreams`; see [`agent-streams.md`](agent-streams.md). OTel spans
+carry phase and duration metadata, while agent streams preserve the raw
+per-event stdout JSONL for later analysis.
+
 ---
 
 ## Configuration

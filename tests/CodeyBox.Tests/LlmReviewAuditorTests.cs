@@ -48,7 +48,8 @@ public sealed class LlmReviewAuditorTests
             string? modelId = null,
             string? reasoningMode = null,
             CancellationToken ct = default,
-            Action<string>? stdoutChunkCallback = null)
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
         {
             ObservedCredential = credential;
             return Task.FromResult(new AgentResult(true, "ok", "review complete", null));

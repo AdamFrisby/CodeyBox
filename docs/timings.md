@@ -51,28 +51,13 @@ The `metadata_json` column on each row carries extra context:
   `iteration` column, not in `metadata_json`.
 - `upstream.complete` rows include `{"attempt":<n>}`.
 
-### Tool call counts
+### Structured Agent Streams
 
-After each agent run, `AgentStreamJsonParser` parses the agent's stream-json
-(NDJSON) stdout to extract tool call names and invocation counts.
-
-**`agent.tool_call.<name>` rows are emitted** with `duration_ms = 0` and
-`{"count": N}` in `metadata_json`, where *N* is the number of invocations of
-that tool in the run. Per-event timestamps are unavailable in the buffered
-stream-json format, so durations are always zero; the value these rows provide
-is the invocation count surfaced in the per-item `/timings` endpoint. These rows
-are classified as sub-steps (`IsSubStep`) and are excluded from phase totals and
-top-step aggregates to avoid double-counting.
-
-**`agent.thinking_aggregate`** is emitted with `duration_ms` equal to the full
-`agent.exec` duration. Without per-event timestamps all tool-call durations are
-zero, so thinking time equals exec time by construction. Like `agent.tool_call.*`,
-this row is a sub-step and excluded from phase totals.
-
-If the agent's stdout is not in stream-json (NDJSON) format — for example when
-run without `--output-format stream-json` — `AgentStreamJsonParser.TryParse`
-returns null and no tool-call rows are emitted; the pipeline falls back to the
-coarse-grained `agent.exec` row only.
+Agent stdout can be captured losslessly as per-invocation NDJSON under
+`CodeyBox:AgentStreams`; see [`agent-streams.md`](agent-streams.md). The
+pipeline does not emit `agent.tool_call.*` or `agent.thinking_aggregate` timing
+rows from those files. A follow-up analyzer is responsible for reading the
+persisted streams and deriving agent-internal timing data.
 
 ## Database schema
 
@@ -182,11 +167,10 @@ timing code paths check for a null store and silently skip collection.
 
 ## Known limitations
 
-- **Zero-duration tool-call rows**: `agent.tool_call.*` and
-  `agent.thinking_aggregate` rows are emitted but carry `duration_ms = 0` (or
-  equal to `agent.exec`) because the Claude stream-json format provides no
-  per-event timestamps.  They are sub-steps excluded from totals; their
-  utility is the invocation count in `metadata_json` (see §Tool call counts).
+- **Agent-internal timing pending**: structured agent streams are captured to
+  disk, but the pipeline does not analyze them during the run. A follow-up
+  analyzer will derive tool-call and thinking/execution timing rows from the
+  persisted NDJSON files.
 - **No cross-item streaming UI**: the aggregate page shows statistics, not
   individual rows.  A future "timings log" page could stream raw rows for
   deeper analysis.

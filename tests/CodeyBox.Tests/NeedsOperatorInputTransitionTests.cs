@@ -26,7 +26,11 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
         _workspace = Directory.CreateTempSubdirectory("codeybox-q-transition-").FullName;
     public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
 
-    private TestPipelineWithQuestions BuildWithQuestions(string seedRepoUrl, bool allowQuestions, IReadOnlyList<IAuditor>? auditors = null)
+    private TestPipelineWithQuestions BuildWithQuestions(
+        string seedRepoUrl,
+        bool allowQuestions,
+        IReadOnlyList<IAuditor>? auditors = null,
+        IAgentStreamStore? agentStreams = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -69,7 +73,8 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            questionStore: allowQuestions ? questionStore : null);
+            questionStore: allowQuestions ? questionStore : null,
+            agentStreams: agentStreams);
 
         return new TestPipelineWithQuestions(pipeline, store, questionStore, agent, gitHost, gitRoot, webhooks);
     }
@@ -98,6 +103,39 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
         Assert.Single(questions);
         Assert.Equal("q-001", questions[0].QuestionId);
         Assert.Equal("open", questions[0].State);
+    }
+
+    [Fact]
+    public async Task AgentEmitsQuestion_WithStructuredStreamsEnabled_ParksAtNeedsOperatorInput()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var streamStore = new AgentStreamStore(
+            new AgentStreamsOptions { Path = Path.Combine(_workspace, "streams") },
+            NullLogger<AgentStreamStore>.Instance);
+        using var tp = BuildWithQuestions(seed, allowQuestions: true, agentStreams: streamStore);
+        tp.Agent.QuestionToEmit = "q-json";
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Test",
+            Prompt = "do something",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+
+        var questions = await tp.QuestionStore.ListByWorkItemAsync(item.Id.ToString());
+        var question = Assert.Single(questions);
+        Assert.Equal("q-json", question.QuestionId);
+        Assert.Equal("open", question.State);
+
+        var stream = Assert.Single(await streamStore.ListAsync(item.Id), f => f.Phase == "work");
+        var path = Path.Combine(streamStore.Options.Path, item.Id.ToString(), stream.FileName);
+        Assert.Contains("q-json", await File.ReadAllTextAsync(path));
     }
 
     [Fact]
@@ -239,7 +277,7 @@ internal sealed class TestPipelineWithQuestions : IDisposable
 /// Agent that writes a file (so the pipeline sees a commit) and optionally
 /// emits a <codeybox-question> block in its stdout.
 /// </summary>
-internal sealed class QuestionEmittingAgent : IAgentRunner
+internal sealed class QuestionEmittingAgent : IAgentRunner, IStructuredStreamAgentRunner
 {
     public AgentKind Kind { get; } = AgentKind.Claude;
     public string? QuestionToEmit { get; set; }
@@ -250,10 +288,13 @@ internal sealed class QuestionEmittingAgent : IAgentRunner
     public bool EmitOnlyOnRework { get; set; } = false;
     private int _nonMergeCallCount;
 
+    public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default) =>
+        Task.FromResult(true);
+
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox, string workingDirectory, string prompt,
         AgentCredential? credential, string? modelId = null, string? reasoningMode = null,
-        CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
+        CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
     {
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
         {
@@ -287,10 +328,24 @@ internal sealed class QuestionEmittingAgent : IAgentRunner
             : QuestionToEmit is not null ? [QuestionToEmit] : (IEnumerable<string>)[];
 
         var shouldEmit = questionIds.Any() && (!EmitOnlyOnRework || _nonMergeCallCount > 1);
-        var stdout = shouldEmit
+        var plainText = shouldEmit
             ? string.Join("\n", questionIds.Select(id =>
                 $"<codeybox-question id=\"{id}\">Should I use approach A or B? Default: A.</codeybox-question>"))
             : string.Empty;
+        var stdout = captureStructuredStream
+            ? System.Text.Json.JsonSerializer.Serialize(new
+            {
+                type = "assistant",
+                message = new
+                {
+                    role = "assistant",
+                    content = new[] { new { type = "text", text = plainText } },
+                },
+            }) + "\n"
+            : plainText;
+
+        if (captureStructuredStream)
+            stdoutChunkCallback?.Invoke(stdout);
 
         return new AgentResult(true, "ok", stdout, null);
     }

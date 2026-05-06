@@ -39,6 +39,7 @@ public sealed class ReleaseService
     private readonly ITaskQueue _queue;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly ILogger<ReleaseService> _log;
+    private readonly IAgentStreamStore? _agentStreams;
 
     // Caps concurrent deep-audit phases across all releases to bound LLM/sandbox resource usage.
     private const int MaxConcurrentDeepAudits = 4;
@@ -62,7 +63,8 @@ public sealed class ReleaseService
         PipelineOptions pipelineOpts,
         ITaskQueue queue,
         IHostApplicationLifetime lifetime,
-        ILogger<ReleaseService> log)
+        ILogger<ReleaseService> log,
+        IAgentStreamStore? agentStreams = null)
     {
         _releases = releases;
         _workItems = workItems;
@@ -79,6 +81,7 @@ public sealed class ReleaseService
         _queue = queue;
         _lifetime = lifetime;
         _log = log;
+        _agentStreams = agentStreams;
     }
 
     // ── Branch creation ──────────────���─────────────────────────────────���──────
@@ -522,17 +525,26 @@ public sealed class ReleaseService
             await RunSandboxCmd(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, "/work/repo");
             await RunSandboxCmd(sandbox, ct, "git", "-C", "/work/repo", "checkout", release.BranchName);
 
-            var ctx = new DeepAuditContext(
-                ReleaseId: release.Id,
-                ProjectId: project.Id,
-                BranchName: release.BranchName,
-                Iteration: iteration,
-                AuditRunner: runner);
-
             foreach (var auditor in group)
             {
                 _log.LogInformation("Deep auditor {Name} running for release {Id} iteration {Iter}",
                     auditor.Name, release.Id, iteration);
+                var auditPhase = $"audit-llm-{auditor.Name}";
+                var canCaptureStructuredStream = runner is not null
+                    && auditor.Kind == "llm"
+                    && await CanCaptureStructuredStreamAsync(runner, sandbox, auditPhase, ct);
+                var streamCapture = canCaptureStructuredStream
+                    ? await BeginAgentStreamCaptureAsync(new WorkItemId(release.Id.Value), auditPhase, iteration, ct)
+                    : null;
+                var ctx = new DeepAuditContext(
+                    ReleaseId: release.Id,
+                    ProjectId: project.Id,
+                    BranchName: release.BranchName,
+                    Iteration: iteration,
+                    AuditRunner: runner,
+                    StdoutChunkCallback: BuildStdoutCallback(streamCapture),
+                    CaptureStructuredStream: streamCapture is not null);
+
                 try
                 {
                     var result = await auditor.RunAsync(sandbox, "/work/repo", ctx, ct);
@@ -542,10 +554,74 @@ public sealed class ReleaseService
                 {
                     _log.LogWarning(ex, "Deep auditor {Name} threw for release {Id}", auditor.Name, release.Id);
                 }
+                finally
+                {
+                    if (streamCapture is not null)
+                        await streamCapture.DisposeAsync();
+                }
             }
         }
 
         return allFindings;
+    }
+
+    private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
+        WorkItemId workItemId,
+        string phase,
+        int iteration,
+        CancellationToken ct)
+    {
+        if (_agentStreams is null)
+            return null;
+        return await _agentStreams.BeginCaptureAsync(workItemId, phase, iteration, ct);
+    }
+
+    private async Task<bool> CanCaptureStructuredStreamAsync(
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string phase,
+        CancellationToken ct)
+    {
+        if (_agentStreams is null || !_agentStreams.Options.Enabled)
+            return false;
+
+        if (runner is not IStructuredStreamAgentRunner structuredRunner)
+        {
+            _log.LogWarning(
+                "Agent {AgentKind} does not support structured stream capture; skipping stream file for phase {Phase}",
+                runner.Kind.Value,
+                phase);
+            return false;
+        }
+
+        try
+        {
+            if (await structuredRunner.SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false))
+                return true;
+
+            _log.LogWarning(
+                "Agent {AgentKind} structured stream flag is unavailable; skipping stream file for phase {Phase}",
+                runner.Kind.Value,
+                phase);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _log.LogWarning(
+                ex,
+                "Failed to verify structured stream support for agent {AgentKind}; skipping stream file for phase {Phase}",
+                runner.Kind.Value,
+                phase);
+        }
+
+        return false;
+    }
+
+    private static Action<string>? BuildStdoutCallback(AgentStreamCapture? streamCapture)
+    {
+        if (streamCapture is null)
+            return null;
+
+        return streamCapture.WriteChunk;
     }
 
     // ── Releasing ─────────────────────────────────────────────────────────────

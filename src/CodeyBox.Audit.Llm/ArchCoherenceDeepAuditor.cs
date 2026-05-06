@@ -36,7 +36,16 @@ public sealed class ArchCoherenceDeepAuditor : IDeepAuditor
                 Description: "Configure an agent runner in the project's ReleaseConfig.DeepAuditors.")]);
 
         var prompt = BuildPrompt(workingDirectory);
-        var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, credential: null, modelId: null, reasoningMode: null, ct: ct);
+        var agentResult = await agent.RunAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential: null,
+            modelId: null,
+            reasoningMode: null,
+            ct: ct,
+            stdoutChunkCallback: context.StdoutChunkCallback,
+            captureStructuredStream: context.CaptureStructuredStream);
 
         if (!agentResult.Success)
             return new AuditResult(false, [new AuditFinding(

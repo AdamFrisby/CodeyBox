@@ -6,11 +6,9 @@ namespace CodeyBox.Orchestrator;
 /// Best-effort parser for Claude Code's <c>--output-format stream-json</c> stdout.
 /// Returns null when the output is not in NDJSON format (e.g. from <c>--print</c>).
 ///
-/// Per-tool durations are not available from buffered output (no per-event timestamps
-/// in the stream-json format). This parser extracts tool call names and counts only.
-/// Callers use the counts to emit <c>agent.tool_call.*</c> rows with <c>duration_ms = 0</c>
-/// and count in metadata, and to emit <c>agent.thinking_aggregate</c> equal to the full
-/// exec duration. See docs/timings.md §"Tool call counts".
+/// Per-tool durations are not available from buffered output. The capture path
+/// persists stream-json losslessly and intentionally skips this immediate
+/// parser; a follow-up analyzer reads the persisted files.
 /// </summary>
 public static class AgentStreamJsonParser
 {

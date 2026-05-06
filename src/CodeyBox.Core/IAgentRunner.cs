@@ -21,7 +21,17 @@ public interface IAgentRunner
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default,
-        Action<string>? stdoutChunkCallback = null);
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false);
+}
+
+/// <summary>
+/// Optional runner capability for CLIs that can emit structured stdout
+/// streams suitable for persistent capture.
+/// </summary>
+public interface IStructuredStreamAgentRunner : IAgentRunner
+{
+    Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default);
 }
 
 public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);

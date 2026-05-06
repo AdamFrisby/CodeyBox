@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using Serilog.Core;
 using Serilog.Events;
 
@@ -23,11 +24,36 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
 {
     private static readonly HashSet<string> SensitiveKeyFragments = new(StringComparer.OrdinalIgnoreCase)
     {
-        "Token", "Secret", "Password", "Authorization", "ApiKey",
+        "Token", "Secret", "Password", "Authorization", "ApiKey", "AuthJson", "Credential",
     };
 
+    internal const string SecretValuePatternSource =
+        @"(?:"
+        + @"gh[opsur]_[A-Za-z0-9_]+"
+        + @"|github_pat_[A-Za-z0-9_]+"
+        + @"|sk-ant-[A-Za-z0-9_-]+"
+        + @"|sk-proj-[A-Za-z0-9_-]+"
+        + @"|sk-[A-Za-z0-9_-]{20,}"
+        + @"|sk_live_[A-Za-z0-9]{16,}"
+        + @"|rk_live_[A-Za-z0-9]{16,}"
+        + @"|whsec_[A-Za-z0-9]{16,}"
+        + @"|AIza[A-Za-z0-9_-]{35,}"
+        + @"|(?:A3T[A-Z0-9]|AKIA|ASIA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA)[A-Z0-9]{16}"
+        + @"|xox[baprs]-[A-Za-z0-9-]{10,}"
+        + @"|xapp-[A-Za-z0-9-]{10,}"
+        + @"|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+        + @")";
+
     private static readonly Regex SecretValuePattern = new(
-        @"(?:gho_[A-Za-z0-9]+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]{35,})",
+        SecretValuePatternSource,
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex JsonStringPropertyPattern = new(
+        "(?<prefix>\"(?<key>(?:\\\\.|[^\"\\\\])*)\"\\s*:\\s*)\"(?:\\\\.|[^\"\\\\])*\"",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex TextKeyValuePattern = new(
+        @"(?<prefix>\b(?<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)(?<value>[^\r\n]*)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     public void Enrich(LogEvent logEvent, ILogEventPropertyFactory propertyFactory)
@@ -49,6 +75,60 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
         }
     }
 
+    public static string RedactText(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value;
+
+        var redacted = JsonStringPropertyPattern.Replace(value, match =>
+        {
+            var key = UnescapeJsonString(match.Groups["key"].Value);
+            return IsSensitiveKey(key) ? match.Groups["prefix"].Value + "\"***\"" : match.Value;
+        });
+
+        if (!LooksLikeJson(redacted))
+        {
+            redacted = TextKeyValuePattern.Replace(redacted, match =>
+                IsSensitiveKey(match.Groups["key"].Value)
+                    ? match.Groups["prefix"].Value + "***"
+                    : match.Value);
+        }
+
+        return SecretValuePattern.Replace(redacted, "***");
+    }
+
     private static bool IsSensitiveKey(string key) =>
-        SensitiveKeyFragments.Any(f => key.Contains(f, StringComparison.OrdinalIgnoreCase));
+        SensitiveKeyFragments.Any(f => key.Contains(f, StringComparison.OrdinalIgnoreCase))
+        || SensitiveKeyFragments.Any(f => NormalizeKey(key).Contains(NormalizeKey(f), StringComparison.OrdinalIgnoreCase));
+
+    private static string NormalizeKey(string key)
+    {
+        Span<char> buffer = key.Length <= 256 ? stackalloc char[key.Length] : new char[key.Length];
+        var written = 0;
+        foreach (var ch in key)
+        {
+            if (char.IsLetterOrDigit(ch))
+                buffer[written++] = char.ToLowerInvariant(ch);
+        }
+
+        return new string(buffer[..written]);
+    }
+
+    private static string UnescapeJsonString(string value)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<string>($"\"{value}\"") ?? value;
+        }
+        catch (JsonException)
+        {
+            return value;
+        }
+    }
+
+    private static bool LooksLikeJson(string value)
+    {
+        var trimmed = value.AsSpan().TrimStart();
+        return trimmed.Length > 0 && (trimmed[0] == '{' || trimmed[0] == '[');
+    }
 }

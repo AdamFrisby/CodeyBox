@@ -74,7 +74,13 @@ public sealed record AuditContext(
     /// sandbox already receives these values in its environment, but some
     /// runners also need the bundle to materialise auth files before startup.
     /// </summary>
-    AgentCredential? AuditCredential = null);
+    AgentCredential? AuditCredential = null,
+    /// <summary>
+    /// When true, instructs the auditor's <see cref="AuditRunner"/> to capture
+    /// the structured (JSON / stream-json) output of the agent CLI in addition
+    /// to plain stdout, so the orchestrator can persist it for replay/audit.
+    /// </summary>
+    bool CaptureStructuredStream = false);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(bool Passed, IReadOnlyList<AuditFinding> Findings, string? RawOutput = null);

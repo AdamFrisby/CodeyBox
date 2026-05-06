@@ -54,7 +54,9 @@ internal static class ReleaseTestHelper
         ISandboxProvider? sandboxes = null,
         IGitHost? gitHost = null,
         IUpstreamRemoteFactory? upstreamFactory = null,
-        IChangelogGenerator? changelog = null)
+        IChangelogGenerator? changelog = null,
+        IAgentRegistry? agents = null,
+        IAgentStreamStore? agentStreams = null)
     {
         return new ReleaseService(
             releaseStore,
@@ -63,7 +65,7 @@ internal static class ReleaseTestHelper
             webhooks,
             sandboxes ?? new NullSandboxProvider(),
             gitHost ?? new NullGitHost(),
-            new EmptyAgentRegistry(),
+            agents ?? new EmptyAgentRegistry(),
             new StaticCredentialProvider(),
             upstreamFactory ?? new TestUpstreamFactory(),
             deepAuditors ?? [],
@@ -71,7 +73,8 @@ internal static class ReleaseTestHelper
             new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
             taskQueue ?? new InMemoryTaskQueue(),
             new NullHostApplicationLifetime(),
-            NullLogger<ReleaseService>.Instance);
+            NullLogger<ReleaseService>.Instance,
+            agentStreams);
     }
 
     public static Release SeedRelease(

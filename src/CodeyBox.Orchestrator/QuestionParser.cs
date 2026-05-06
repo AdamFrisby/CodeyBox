@@ -1,4 +1,6 @@
 using System.Text.RegularExpressions;
+using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 
@@ -28,10 +30,11 @@ public static partial class QuestionParser
     {
         if (string.IsNullOrEmpty(stdout)) return [];
 
+        var searchText = BuildQuestionSearchText(stdout);
         var results = new List<ParsedQuestion>();
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (Match m in BlockPattern().Matches(stdout))
+        foreach (Match m in BlockPattern().Matches(searchText))
         {
             var rawId = m.Groups[1].Value;
             var rawText = m.Groups[2].Value.Trim();
@@ -68,6 +71,101 @@ public static partial class QuestionParser
         }
 
         return results;
+    }
+
+    private static string BuildQuestionSearchText(string stdout)
+    {
+        var extractedJsonText = ExtractJsonStringValues(stdout);
+        return extractedJsonText.Length == 0
+            ? stdout
+            : stdout + "\n" + extractedJsonText;
+    }
+
+    private static string ExtractJsonStringValues(string stdout)
+    {
+        var builder = new StringBuilder();
+        foreach (var rawLine in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (rawLine.Length == 0 || rawLine[0] is not ('{' or '['))
+                continue;
+
+            try
+            {
+                using var document = JsonDocument.Parse(rawLine);
+                AppendAssistantTextValues(document.RootElement, builder);
+            }
+            catch (JsonException)
+            {
+                // Plain agent stdout and malformed stream lines are ignored here;
+                // the existing plain-text parser still handles literal blocks.
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private static void AppendAssistantTextValues(JsonElement element, StringBuilder builder)
+    {
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                AppendAssistantTextValues(item, builder);
+            return;
+        }
+
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty("type", out var type) ||
+            !StringEquals(type, "assistant"))
+            return;
+
+        if (element.TryGetProperty("message", out var message) &&
+            message.ValueKind == JsonValueKind.Object &&
+            (!message.TryGetProperty("role", out var role) || StringEquals(role, "assistant")) &&
+            message.TryGetProperty("content", out var content))
+        {
+            AppendTextContent(content, builder);
+            return;
+        }
+
+        if (element.TryGetProperty("content", out var directContent))
+            AppendTextContent(directContent, builder);
+
+        if (element.TryGetProperty("text", out var directText) &&
+            directText.ValueKind == JsonValueKind.String)
+            AppendString(directText, builder);
+    }
+
+    private static void AppendTextContent(JsonElement element, StringBuilder builder)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.String:
+                AppendString(element, builder);
+                break;
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                    AppendTextContent(item, builder);
+                break;
+            case JsonValueKind.Object:
+                if (element.TryGetProperty("type", out var type) &&
+                    !StringEquals(type, "text"))
+                    break;
+                if (element.TryGetProperty("text", out var text) &&
+                    text.ValueKind == JsonValueKind.String)
+                    AppendString(text, builder);
+                break;
+        }
+    }
+
+    private static bool StringEquals(JsonElement element, string value) =>
+        element.ValueKind == JsonValueKind.String &&
+        string.Equals(element.GetString(), value, StringComparison.OrdinalIgnoreCase);
+
+    private static void AppendString(JsonElement element, StringBuilder builder)
+    {
+        var value = element.GetString();
+        if (!string.IsNullOrEmpty(value))
+            builder.AppendLine(value);
     }
 }
 

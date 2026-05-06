@@ -10,7 +10,7 @@ namespace CodeyBox.Agents.Gemini;
 /// The agent is expected to be installed in the sandbox image; the host
 /// injects the API key via GEMINI_API_KEY.
 /// </summary>
-public sealed class GeminiAgentRunner : CliAgentRunnerBase
+public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
     // @google/gemini-cli emits ANSI colour codes and progress spinners to
     // stderr (and occasionally stdout) even in non-TTY mode. Strip them so
@@ -27,12 +27,33 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string Binary { get; init; } = "gemini";
 
-    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null)
+    public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
+    {
+        var help = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = [Binary, "--help"],
+        }, ct);
+
+        if (!help.Success)
+            return false;
+
+        var output = string.Concat(help.Stdout, "\n", help.Stderr);
+        return output.Contains("--json", StringComparison.Ordinal);
+    }
+
+    protected override AgentInvocation BuildInvocation(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
     {
         // gemini --yolo -p "<prompt>": sends a single non-interactive prompt and exits.
         // --yolo skips all tool-use confirmation prompts — appropriate inside the
         // sandbox where the VM boundary is the permission boundary.
         var argv = new List<string> { Binary, "--yolo" };
+        if (captureStructuredStream)
+            argv.Add("--json");
         if (!string.IsNullOrEmpty(modelId))
         {
             argv.Add("--model");
@@ -57,18 +78,43 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default,
-        Action<string>? stdoutChunkCallback = null)
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
     {
-        // Strip ANSI from each chunk before forwarding so live stream clients
-        // receive clean text, not raw escape sequences.
-        Action<string>? strippingCallback = stdoutChunkCallback is null
-            ? null
+        var structuredStreamSupported = !captureStructuredStream
+            || await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
+
+        var effectiveCaptureStructuredStream = captureStructuredStream && structuredStreamSupported;
+
+        // Preserve raw stdout chunks only when they are being persisted as the
+        // structured stream. Live stdout clients keep the historical ANSI-free
+        // Gemini output when capture is disabled or unavailable.
+        var effectiveStdoutCallback = effectiveCaptureStructuredStream || stdoutChunkCallback is null
+            ? stdoutChunkCallback
             : chunk => stdoutChunkCallback(Strip(chunk) ?? string.Empty);
-        var result = await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, strippingCallback);
+
+        var result = await base.RunAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct,
+            effectiveStdoutCallback,
+            effectiveCaptureStructuredStream);
+
+        var stderr = Strip(result.Stderr);
+        if (captureStructuredStream && !structuredStreamSupported)
+        {
+            var warning = $"Warning: Gemini CLI at '{Binary}' does not advertise --json; structured stream capture was disabled.";
+            stderr = string.IsNullOrEmpty(stderr) ? warning : $"{warning}\n{stderr}";
+        }
+
         return result with
         {
             Stdout = Strip(result.Stdout),
-            Stderr = Strip(result.Stderr),
+            Stderr = stderr,
         };
     }
 

@@ -155,6 +155,30 @@ Rolling file log configuration.
 
 ---
 
+## `AgentStreams`
+
+Structured stdout stream capture for agent invocations. See
+[docs/agent-streams.md](agent-streams.md) for file layout, CLI flags, retention,
+and API endpoints.
+
+```json
+"AgentStreams": {
+  "Enabled": true,
+  "Path": "logs/agents",
+  "MaxFileSizeMb": 32,
+  "RetainedDays": 14
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Enabled` | `true` | Request structured stream mode from supported agent CLIs and persist stdout JSONL. |
+| `Path` | `logs/agents` | Root directory for per-work-item stream files. Must be writable at startup. |
+| `MaxFileSizeMb` | `32` | Per-file cap. Must be ≥ 1. |
+| `RetainedDays` | `14` | Daily sweep deletes older files. `0` keeps forever. |
+
+---
+
 ## `Projects`
 
 See [docs/projects.md](projects.md).
