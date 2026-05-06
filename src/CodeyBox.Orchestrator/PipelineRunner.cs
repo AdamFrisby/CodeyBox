@@ -381,26 +381,19 @@ public sealed class PipelineRunner : IPipelineRunner
         sb.Append($"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
 
         // Pre-flight self-check: surface the project's mechanical (shell-kind)
-        // auditors so the agent runs them before declaring done. This avoids
-        // a wasted full audit/rework cycle for trivial findings (format,
-        // lint, build-WaE) that the agent could fix in-place. Only includes
-        // auditors that come from <see cref="IShellAuditorArgvProvider"/> —
-        // language-agnostic by construction (rust → cargo clippy, csharp →
-        // dotnet format, etc., whatever the project's audit catalog provides).
+        // auditors so the agent runs them before declaring done. Language-agnostic
+        // by construction — derived from whatever auditors the project's catalog
+        // composed (rust → cargo clippy, csharp → dotnet format, etc.).
         var shellChecks = (auditors ?? [])
             .OfType<IShellAuditorArgvProvider>()
-            .Select(a => (Name: ((IAuditor)a).Name, Argv: a.Argv))
-            .Where(x => x.Argv.Count > 0)
+            .Select(a => a.Argv)
+            .Where(argv => argv.Count > 0)
             .ToList();
         if (shellChecks.Count > 0)
         {
-            sb.Append("\n\n## Before committing, run these checks yourself and fix any output\n\nThese are the mechanical auditors the orchestrator will run after your work phase. Running them yourself first means the audit phase passes cleanly on iter 1 instead of bouncing through 3-6 rework iterations for findings you could have caught locally:\n");
-            foreach (var (name, argv) in shellChecks)
-            {
-                var cmd = string.Join(' ', argv);
-                sb.Append($"\n- `{cmd}` — {name}");
-            }
-            sb.Append("\n\nIf any check exits non-zero, fix the underlying issue and rerun until all pass. Then commit.");
+            sb.Append("\n\nThe orchestrator will audit your work after this phase. Run these checks first and fix any output before committing:\n");
+            foreach (var argv in shellChecks)
+                sb.Append($"\n- `{string.Join(' ', argv)}`");
         }
 
         if (allowAgentQuestions)

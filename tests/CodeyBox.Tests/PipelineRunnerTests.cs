@@ -189,9 +189,9 @@ public sealed class PipelineRunnerTests
     public void BuildInitialWorkPrompt_NoAuditors_OmitsPreflightSection()
     {
         var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: null);
-        Assert.DoesNotContain("Before committing, run these checks", prompt);
+        Assert.DoesNotContain("The orchestrator will audit", prompt);
         prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: []);
-        Assert.DoesNotContain("Before committing, run these checks", prompt);
+        Assert.DoesNotContain("The orchestrator will audit", prompt);
     }
 
     [Fact]
@@ -204,13 +204,12 @@ public sealed class PipelineRunnerTests
             new FakeNonShellAuditor("security:llm-review"),
         ];
         var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: auditors);
-        Assert.Contains("Before committing, run these checks", prompt);
+        Assert.Contains("The orchestrator will audit", prompt);
         Assert.Contains("`dotnet format --verify-no-changes`", prompt);
-        Assert.Contains("csharp:format-check", prompt);
         Assert.Contains("`dotnet build --no-incremental /warnaserror`", prompt);
-        Assert.Contains("csharp:build-WaE", prompt);
         // Non-shell auditors (LLM, diff-pattern) shouldn't surface as commands.
-        Assert.DoesNotContain("security:llm-review", prompt.Substring(prompt.IndexOf("Before committing")));
+        var preflightSection = prompt.Substring(prompt.IndexOf("The orchestrator will audit"));
+        Assert.DoesNotContain("security:llm-review", preflightSection);
     }
 
     private sealed class FakeShellAuditor : IAuditor, IShellAuditorArgvProvider
