@@ -24,6 +24,26 @@ POST /workitems
 
 `dependsOn` is an optional array of work item IDs (32-character no-hyphen UUIDs). Omitting it or passing `[]` is equivalent — the item is independent and queued immediately.
 
+Prompts can target any language used by the project. Examples:
+
+```json
+POST /workitems
+{
+  "projectId": "python-api",
+  "title": "Add request validation",
+  "prompt": "In the FastAPI user endpoint, validate email format before persistence and add pytest coverage for invalid input."
+}
+```
+
+```json
+POST /workitems
+{
+  "projectId": "node-web",
+  "title": "Handle expired sessions",
+  "prompt": "Update the Express session middleware to return 401 for expired sessions and add npm test coverage."
+}
+```
+
 ---
 
 ## Terminal states and the dependency gate

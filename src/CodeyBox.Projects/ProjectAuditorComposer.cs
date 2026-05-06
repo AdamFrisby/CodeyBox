@@ -62,7 +62,18 @@ public sealed class ProjectAuditorComposer
         var auditors = new List<IAuditor>();
 
         foreach (var lang in project.Audit.Languages)
+        {
+            if (!ProjectAuditLanguages.IsSupported(lang))
+            {
+                _logger.LogWarning(
+                    "Project '{ProjectId}' declares unsupported audit language '{Language}'; skipping",
+                    project.Id.Value,
+                    lang);
+                continue;
+            }
+
             auditors.AddRange(_catalog.ResolveLanguage(lang, ctx));
+        }
 
         foreach (var type in project.Audit.AuditTypes)
             auditors.AddRange(_catalog.ResolveAuditType(type, ctx));

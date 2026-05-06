@@ -74,4 +74,5 @@ public sealed record DeepAuditContext(
     ProjectId ProjectId,
     string BranchName,
     int Iteration,
-    IAgentRunner? AuditRunner = null);
+    IAgentRunner? AuditRunner = null,
+    IReadOnlyList<string>? Languages = null);

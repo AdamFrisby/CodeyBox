@@ -30,7 +30,7 @@ No arguments are required. The wizard is fully interactive.
 
 ### Audit language presets
 
-`python` · `typescript` · `javascript` · `go` · `rust` · `csharp` · `ruby` · `shell`
+`csharp` · `python` · `node` · `go` · `rust`
 
 ### Audit type presets
 
@@ -83,7 +83,7 @@ exiting. Example output:
     "TokenEnvVar": "MY_APP_GITHUB_TOKEN"
   },
   "Audit": {
-    "Languages": ["typescript"],
+    "Languages": ["node"],
     "AuditTypes": ["security", "architecture", "quality"]
   },
   "NetworkProfiles": {

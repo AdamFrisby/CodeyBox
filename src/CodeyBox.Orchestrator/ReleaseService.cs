@@ -527,7 +527,8 @@ public sealed class ReleaseService
                 ProjectId: project.Id,
                 BranchName: release.BranchName,
                 Iteration: iteration,
-                AuditRunner: runner);
+                AuditRunner: runner,
+                Languages: project.Audit.Languages);
 
             foreach (var auditor in group)
             {

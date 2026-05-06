@@ -215,6 +215,10 @@ shell/diff-pattern/llm entries:
 }
 ```
 
+Auditors are typically language-specific. Prefer scoping a plugin auditor to
+one language or ecosystem, detecting marker files before running, and emitting
+an Info finding when the target language is not present in the repository.
+
 ## Admin dashboard
 
 The admin dashboard **Settings → Plugins** page lists all loaded auditor plugins

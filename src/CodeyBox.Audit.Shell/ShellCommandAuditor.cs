@@ -52,8 +52,9 @@ public sealed class ShellCommandAuditor : IAuditor
         var severity = result.ExitCode == 127
             ? AuditSeverity.Info
             : AuditSeverity.Error;
+        var toolName = _opts.ToolName ?? _opts.Argv[0];
         var title = result.ExitCode == 127
-            ? $"tool not installed in sandbox: {_opts.Argv[0]} (auditor skipped — install the tool in MultipassExtraRuncmd)"
+            ? $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)"
             : $"command exited {result.ExitCode}: {string.Join(' ', _opts.Argv)}";
 
         var finding = new AuditFinding(
@@ -69,4 +70,5 @@ public sealed record ShellCommandAuditorOptions
 {
     public required string Name { get; init; }
     public required IReadOnlyList<string> Argv { get; init; }
+    public string? ToolName { get; init; }
 }

@@ -74,11 +74,13 @@ built-in auditors:
 |---|---|---|
 | `owasp-asvs` | llm | OWASP ASVS L1/L2 security review (V2, V3, V5, V7, V8, V9, V13) |
 | `arch-coherence` | llm | Architecture coherence: layer violations, circular deps, god objects, hardcoded config |
-| `deps-cve-scan` | shell | `dotnet list package --vulnerable --include-transitive`; Critical/High = Error, Moderate = Warning |
+| `deps-cve-scan` | shell | Dispatches by `Project.Audit.Languages`: C# `dotnet list package --vulnerable --include-transitive`, Python `pip-audit`/`safety`, Node `npm audit --json`, Go `govulncheck ./...`, Rust `cargo audit`. Critical/High = Error, Moderate/Medium = Warning |
 
 LLM auditors require agent credentials. The shell auditor (`deps-cve-scan`)
-requires the .NET SDK to be installed in the sandbox image; if the SDK is
-absent it emits an Info finding and passes rather than failing.
+requires the matching language scanner to be installed in the sandbox image;
+if a declared language's scanner is absent it emits an Info finding and passes
+rather than failing. Languages without marker files in the repository are
+skipped.
 
 Custom auditors can be registered via the plugin system (see `plugins.md`).
 
