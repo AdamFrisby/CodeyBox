@@ -150,7 +150,7 @@ public sealed class AgentClassRouter
             var member = entry.Member;
             if (member.Billing == AgentBilling.Subscription
                 && _quotaFailures is not null
-                && await _quotaFailures.HasRecentForProjectAsync(member.Agent, member.ModelId, item.ProjectId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct))
+                && await _quotaFailures.HasRecentAsync(member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct))
             {
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "recent quota-shaped failure"));
                 continue;
@@ -238,14 +238,14 @@ public sealed class AgentClassRouter
         {
             QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open"),
             QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
-            _ => await EvaluateObservedFailuresAsync(member, projectId, ct),
+            _ => await EvaluateObservedFailuresAsync(member, ct),
         };
     }
 
-    private async Task<QuotaGateDecision> EvaluateObservedFailuresAsync(AgentMembership member, ProjectId projectId, CancellationToken ct)
+    private async Task<QuotaGateDecision> EvaluateObservedFailuresAsync(AgentMembership member, CancellationToken ct)
     {
         if (_quotaFailures is not null
-            && await _quotaFailures.HasRecentForProjectAsync(member.Agent, member.ModelId, projectId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct))
+            && await _quotaFailures.HasRecentAsync(member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct))
             return new QuotaGateDecision(false, "quota unknown; recent quota-shaped failure");
 
         return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure");

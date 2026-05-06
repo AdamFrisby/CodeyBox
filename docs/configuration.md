@@ -134,7 +134,7 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a quota probe result (per probe instance). |
 | `UnknownPolicy` | `UseObservedFailures` | How to treat unknown probe snapshots: `UseObservedFailures`, `FailCautious`, or opt-in `FailOpen`. |
-| `ObservedFailureWindowMinutes` | `10` | Minutes a recent quota-shaped failure blocks the same project/agent/model. |
+| `ObservedFailureWindowMinutes` | `10` | Minutes a recent quota-shaped failure blocks the same agent/model across all projects. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed quota failures remain in `state.db`. |
 
 ---

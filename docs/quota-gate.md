@@ -41,10 +41,11 @@ Unexpected JSON fields are ignored. Missing fields make only that part unknown.
 
 When an agent exits unsuccessfully and stderr contains one of the documented
 quota patterns, CodeyBox records
-`(projectId, agent, modelId, failureKind, observedAt)` in `state.db`. Agent
-stderr is untrusted, so runtime observations are scoped to the triggering
-project; the router skips the same `(projectId, agent, modelId)` for
-`ObservedFailureWindowMinutes` even if the next probe is unknown or stale.
+`(agent, modelId, failureKind, observedAt)` in `state.db`, with `projectId`
+retained only as diagnostic metadata when available. Subscription quota walls
+are account-wide, so the router skips the same `(agent, modelId)` for
+`ObservedFailureWindowMinutes` across all projects even if the next probe is
+unknown or stale.
 
 Recognized patterns are intentionally conservative:
 
