@@ -55,6 +55,22 @@ Co-Authored-By: CodeyBox <noreply@codeybox.invalid>"
 git push origin codeybox/<id>:codeybox/<id>
 ```
 
+If the sandbox push of the work branch is rejected as non-fast-forward,
+the orchestrator performs exactly one in-sandbox reconcile attempt:
+
+```bash
+git fetch --no-tags origin +refs/heads/<workBranch>:refs/remotes/origin/<workBranch>
+git rebase origin/<workBranch>
+git push origin <workBranch>:<workBranch>
+```
+
+This is Approach B from the retry design: preserve the prior attempt's
+reachable commits and replay the new sandbox commits on top. The rejected
+pre-clean alternative would delete or rename the stale bare-repo ref before
+the retry; that is simpler, but it makes attempt history handling a separate
+observability concern and does not match the host-side upstream-push recovery.
+Rebase conflicts fail the work item with a clear manual-resolution error.
+
 ### Git identity propagation
 
 By default the orchestrator reads the host's global git config at startup
