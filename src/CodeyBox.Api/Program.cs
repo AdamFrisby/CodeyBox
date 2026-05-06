@@ -899,8 +899,15 @@ app.MapGet("/quota", async (
             QualityScore = 100,
         };
         var snapshot = await probe.GetAvailabilityAsync(member, ct);
-        var recentFailure = failureStore is not null &&
-            await failureStore.HasRecentAsync(probe.Kind, null, options.ObservedFailureWindow, now, ct);
+        var recentFailuresForProbe = failures
+            .Where(f => f.Agent == probe.Kind && f.ObservedAt >= now - options.ObservedFailureWindow)
+            .ToList();
+        var recentDefaultFailure = recentFailuresForProbe.Any(f => f.ModelId is null);
+        var recentFailure = recentFailuresForProbe.Count > 0;
+        var modelKeys = snapshot.PerModel.Keys
+            .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
         snapshots.Add(new
         {
             agent = probe.Kind.Value,
@@ -918,12 +925,15 @@ app.MapGet("/quota", async (
                 })
                 .ToList(),
             wouldAllow = WouldAllow(snapshot.AvailablePct, recentFailure, options),
-            perModelWouldAllow = snapshot.PerModel.ToDictionary(
-                kvp => kvp.Key,
-                kvp => WouldAllow(kvp.Value.AvailablePct, failures.Any(f =>
+            defaultModelWouldAllow = WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options),
+            perModelWouldAllow = modelKeys.ToDictionary(
+                modelId => modelId,
+                modelId => WouldAllow(
+                    snapshot.PerModel.TryGetValue(modelId, out var modelQuota) ? modelQuota.AvailablePct : snapshot.AvailablePct,
+                    recentFailuresForProbe.Any(f =>
                     f.Agent == probe.Kind &&
-                    string.Equals(f.ModelId, kvp.Key, StringComparison.OrdinalIgnoreCase) &&
-                    f.ObservedAt >= now - options.ObservedFailureWindow), options),
+                    string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase)),
+                    options),
                 StringComparer.OrdinalIgnoreCase),
         });
     }

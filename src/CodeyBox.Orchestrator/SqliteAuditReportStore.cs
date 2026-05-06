@@ -26,11 +26,7 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
 
         using (var pragmaCmd = _conn.CreateCommand())
         {
-            // Keep this store independently usable in tests and tools that only
-            // need audit reports. The table still declares the FK; work-item
-            // deletes from SqliteWorkItemStore run on a connection with FK
-            // enforcement enabled, so shared state.db cascade behavior remains.
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = OFF;";
+            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
             pragmaCmd.ExecuteNonQuery();
         }
 

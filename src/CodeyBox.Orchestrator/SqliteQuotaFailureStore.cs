@@ -78,22 +78,48 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
     }
 
     public async Task<bool> HasRecentAsync(AgentKind agent, string? modelId, TimeSpan window, DateTimeOffset now, CancellationToken ct = default)
+        => await HasRecentCoreAsync(agent, modelId, projectId: null, scopedToProject: false, window, now, ct);
+
+    public async Task<bool> HasRecentForProjectAsync(AgentKind agent, string? modelId, ProjectId projectId, TimeSpan window, DateTimeOffset now, CancellationToken ct = default)
+        => await HasRecentCoreAsync(agent, modelId, projectId, scopedToProject: true, window, now, ct);
+
+    private async Task<bool> HasRecentCoreAsync(
+        AgentKind agent,
+        string? modelId,
+        ProjectId? projectId,
+        bool scopedToProject,
+        TimeSpan window,
+        DateTimeOffset now,
+        CancellationToken ct)
     {
         await _lock.WaitAsync(ct);
         try
         {
             var cutoff = now.ToUniversalTime() - window;
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
+            cmd.CommandText = scopedToProject
+                ? """
                 SELECT 1
                 FROM quota_failures
                 WHERE agent = $agent
                   AND (($model_id IS NULL AND model_id IS NULL) OR model_id = $model_id)
+                  AND (project_id IS NULL OR project_id = $project_id)
+                  AND observed_at >= $cutoff
+                LIMIT 1;
+                """
+                : """
+                SELECT 1
+                FROM quota_failures
+                WHERE agent = $agent
+                  AND (($model_id IS NULL AND model_id IS NULL) OR model_id = $model_id)
+                  AND project_id IS NULL
                   AND observed_at >= $cutoff
                 LIMIT 1;
                 """;
             cmd.Parameters.AddWithValue("$agent", agent.Value);
             cmd.Parameters.AddWithValue("$model_id", modelId is null ? DBNull.Value : modelId);
+            if (scopedToProject)
+                cmd.Parameters.AddWithValue("$project_id", projectId!.Value.Value);
             cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
             var result = await cmd.ExecuteScalarAsync(ct);
             return result is not null;
