@@ -57,8 +57,11 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-rebase-*"));
     }
 
-    [Fact]
-    public async Task PushToUpstreamAsync_WhenRemoteTipIsStaleAndMergeConfigured_MergesAndRetries()
+    [Theory]
+    [InlineData("merge")]
+    [InlineData("squash")]
+    public async Task PushToUpstreamAsync_WhenRemoteTipIsStaleAndMergeStyleConfigured_MergesAndRetries(
+        string mergeMethod)
     {
         var upstream = await CreateBareUpstreamAsync();
         var host = NewHost();
@@ -68,7 +71,7 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         await CommitToRemoteBranchAsync(hostBare, "main", "agent.txt", "agent\n", "agent change");
         await CommitToRemoteBranchAsync(upstream, "main", "human.txt", "human\n", "human change");
 
-        await host.PushToUpstreamAsync(repoId, upstream, "main", new Dictionary<string, string>(), mergeMethod: "merge");
+        await host.PushToUpstreamAsync(repoId, upstream, "main", new Dictionary<string, string>(), mergeMethod: mergeMethod);
 
         var (_, agentBlob, _) = await TestSupport.RunGit(upstream, "show", "main:agent.txt");
         var (_, humanBlob, _) = await TestSupport.RunGit(upstream, "show", "main:human.txt");
@@ -80,6 +83,37 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         Assert.StartsWith("codeybox: merge latest upstream main\n", subjects, StringComparison.Ordinal);
         Assert.Equal(3, parents.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length);
         Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-merge-*"));
+    }
+
+    [Fact]
+    public async Task PushToUpstreamAsync_WhenRecoveryChecksOutAgentAttributes_DoesNotRunBareRepoFilters()
+    {
+        var upstream = await CreateBareUpstreamAsync();
+        var host = NewHost();
+        var repoId = await host.EnsureRepositoryAsync(WorkItemId.New(), upstream);
+        var hostBare = host.GetRepoPath(repoId);
+        var leakPath = Path.Combine(_workspace, "filter-leak.txt");
+
+        await CommitToRemoteBranchAsync(hostBare, "main", ".gitattributes", "*.txt filter=evil\n", "agent attributes");
+        await CommitToRemoteBranchAsync(hostBare, "main", "agent.txt", "agent\n", "agent change");
+        await CommitToRemoteBranchAsync(upstream, "main", "human.txt", "human\n", "human change");
+        await TestSupport.RunGit(
+            hostBare,
+            "config",
+            "filter.evil.smudge",
+            $"sh -c \"printf leaked > '{leakPath}'; cat\"");
+
+        await host.PushToUpstreamAsync(
+            repoId,
+            upstream,
+            "main",
+            new Dictionary<string, string> { ["CODEYBOX_GIT_PASS"] = "secret-token" });
+
+        Assert.False(File.Exists(leakPath));
+        var (_, agentBlob, _) = await TestSupport.RunGit(upstream, "show", "main:agent.txt");
+        var (_, humanBlob, _) = await TestSupport.RunGit(upstream, "show", "main:human.txt");
+        Assert.Equal("agent\n", agentBlob);
+        Assert.Equal("human\n", humanBlob);
     }
 
     [Fact]

@@ -80,6 +80,7 @@ public sealed class GitHubUpstreamRemoteTests
         // Work branch pushed
         Assert.Single(gitHost.Pushes);
         Assert.Equal(SampleRequest.WorkBranch, gitHost.Pushes[0].Branch);
+        Assert.Equal(SampleRequest.MergeMethod, gitHost.Pushes[0].MergeMethod);
 
         // POST /pulls called, not /merge
         Assert.Single(handler.Requests);
@@ -118,6 +119,22 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Equal("https://github.com/myorg/myrepo/pull/7", outcome.PullRequestUrl);
         Assert.Equal(7, outcome.PullRequestNumber);
         Assert.Equal("abc123sha", outcome.MergedSha);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_PassesRequestMergeMethodToPushRecovery()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(2, "https://github.com/myorg/myrepo/pull/2"));
+
+        var request = SampleRequest with { MergeMethod = "squash" };
+        var remote = BuildRemote(gitHost, handler);
+
+        await remote.CompleteAsync(request, CancellationToken.None);
+
+        Assert.Single(gitHost.Pushes);
+        Assert.Equal("squash", gitHost.Pushes[0].MergeMethod);
     }
 
     [Fact]

@@ -121,7 +121,7 @@ public sealed class LocalGitHost : IGitHost
         if (!IsNonFastForwardPushFailure(rc.Stderr))
             throw new InvalidOperationException($"git push to upstream failed: {rc.Stderr}");
 
-        if (string.Equals(mergeMethod, "merge", StringComparison.OrdinalIgnoreCase))
+        if (UsesMergeStyleRecovery(mergeMethod))
             await MergeBranchWithLatestUpstreamAsync(path, upstreamUrl, branch, upstreamEnv, ct);
         else
             await RebaseBranchOnLatestUpstreamAsync(path, upstreamUrl, branch, upstreamEnv, ct);
@@ -209,20 +209,20 @@ public sealed class LocalGitHost : IGitHost
                 $"git fetch of upstream branch '{branch}' failed after non-fast-forward rejection: {fetch.Stderr}");
 
         var worktreePath = Path.Combine(_opts.RootDirectory, ".upstream-rebase-" + Guid.NewGuid().ToString("N"));
-        var add = await RunGitWithHooksDisabledAsync(barePath, ct, null, "worktree", "add", worktreePath, branch);
-        if (add.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"git worktree setup for upstream rebase on '{branch}' failed: {add.Stderr}");
+        await CreateTrustedRecoveryCheckoutAsync(barePath, branch, remoteRef, worktreePath, ct);
 
         try
         {
-            var rebase = await RunGitWithHooksDisabledAsync(
+            var rebase = await RunGitWithTrustedHostConfigAsync(
                 workdir: worktreePath,
                 ct,
                 extraEnv: BuildRebaseEnvironment(),
                 "rebase", remoteRef);
             if (rebase.ExitCode == 0)
+            {
+                await UpdateBareBranchFromRecoveryCheckoutAsync(barePath, branch, worktreePath, ct);
                 return;
+            }
 
             await AbortRebaseAsync(worktreePath);
             throw new UpstreamRebaseConflictException(
@@ -230,7 +230,7 @@ public sealed class LocalGitHost : IGitHost
         }
         finally
         {
-            await RemoveWorktreeAsync(barePath, worktreePath);
+            RemoveRecoveryCheckout(worktreePath);
         }
     }
 
@@ -252,14 +252,11 @@ public sealed class LocalGitHost : IGitHost
                 $"git fetch of upstream branch '{branch}' failed after non-fast-forward rejection: {fetch.Stderr}");
 
         var worktreePath = Path.Combine(_opts.RootDirectory, ".upstream-merge-" + Guid.NewGuid().ToString("N"));
-        var add = await RunGitWithHooksDisabledAsync(barePath, ct, null, "worktree", "add", worktreePath, branch);
-        if (add.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"git worktree setup for upstream merge on '{branch}' failed: {add.Stderr}");
+        await CreateTrustedRecoveryCheckoutAsync(barePath, branch, remoteRef, worktreePath, ct);
 
         try
         {
-            var merge = await RunGitWithHooksDisabledAsync(
+            var merge = await RunGitWithTrustedHostConfigAsync(
                 workdir: worktreePath,
                 ct,
                 extraEnv: BuildMergeCommitEnvironment(),
@@ -267,7 +264,10 @@ public sealed class LocalGitHost : IGitHost
                 "-m", $"codeybox: merge latest upstream {branch}",
                 "-m", CodeyBoxTrailers.CoAuthoredBy);
             if (merge.ExitCode == 0)
+            {
+                await UpdateBareBranchFromRecoveryCheckoutAsync(barePath, branch, worktreePath, ct);
                 return;
+            }
 
             await AbortMergeAsync(worktreePath);
             throw new UpstreamRebaseConflictException(
@@ -275,15 +275,79 @@ public sealed class LocalGitHost : IGitHost
         }
         finally
         {
-            await RemoveWorktreeAsync(barePath, worktreePath);
+            RemoveRecoveryCheckout(worktreePath);
         }
+    }
+
+    private async Task CreateTrustedRecoveryCheckoutAsync(
+        string barePath,
+        string branch,
+        string remoteRef,
+        string worktreePath,
+        CancellationToken ct)
+    {
+        // Do not run `git worktree add` from the agent-writable bare repo:
+        // checkout would honor repo-local filter.* config. A no-checkout clone
+        // creates a fresh host-owned config first, then checkout/rebase/merge
+        // only consult that trusted local config.
+        var clone = await RunGitWithTrustedHostConfigAsync(
+            workdir: _opts.RootDirectory,
+            ct,
+            extraEnv: null,
+            "clone", "--no-checkout", "--local", "--no-hardlinks", "--", barePath, worktreePath);
+        if (clone.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git recovery clone setup for upstream reconciliation on '{branch}' failed: {clone.Stderr}");
+
+        var branchOid = await ResolveCommitAsync(barePath, $"refs/heads/{branch}", ct);
+        var upstreamOid = await ResolveCommitAsync(barePath, remoteRef, ct);
+
+        var updateBranch = await RunGitWithTrustedHostConfigAsync(
+            worktreePath, ct, null, "update-ref", $"refs/heads/{branch}", branchOid);
+        if (updateBranch.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git recovery branch setup for upstream reconciliation on '{branch}' failed: {updateBranch.Stderr}");
+
+        var updateRemote = await RunGitWithTrustedHostConfigAsync(
+            worktreePath, ct, null, "update-ref", remoteRef, upstreamOid);
+        if (updateRemote.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git recovery upstream ref setup for '{branch}' failed: {updateRemote.Stderr}");
+
+        var checkout = await RunGitWithTrustedHostConfigAsync(
+            worktreePath, ct, null, "checkout", branch);
+        if (checkout.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git recovery checkout for upstream reconciliation on '{branch}' failed: {checkout.Stderr}");
+    }
+
+    private async Task UpdateBareBranchFromRecoveryCheckoutAsync(
+        string barePath,
+        string branch,
+        string worktreePath,
+        CancellationToken ct)
+    {
+        var update = await RunGitWithHooksDisabledAsync(
+            barePath, ct, null, "fetch", "--no-tags", worktreePath, $"+HEAD:refs/heads/{branch}");
+        if (update.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git recovery failed to update host branch '{branch}': {update.Stderr}");
+    }
+
+    private async Task<string> ResolveCommitAsync(string barePath, string refName, CancellationToken ct)
+    {
+        var resolved = await RunGitWithHooksDisabledAsync(
+            barePath, ct, null, "rev-parse", "--verify", $"{refName}^{{commit}}");
+        if (resolved.ExitCode != 0)
+            throw new InvalidOperationException($"git recovery failed to resolve '{refName}': {resolved.Stderr}");
+        return resolved.Stdout.Trim();
     }
 
     private async Task AbortRebaseAsync(string worktreePath)
     {
         try
         {
-            var abort = await RunGitWithHooksDisabledAsync(worktreePath, CancellationToken.None, null, "rebase", "--abort");
+            var abort = await RunGitWithTrustedHostConfigAsync(worktreePath, CancellationToken.None, null, "rebase", "--abort");
             if (abort.ExitCode != 0)
                 _log.LogWarning("Failed to abort upstream rebase in {WorktreePath}: {Error}", worktreePath, abort.Stderr);
         }
@@ -297,7 +361,7 @@ public sealed class LocalGitHost : IGitHost
     {
         try
         {
-            var abort = await RunGitWithHooksDisabledAsync(worktreePath, CancellationToken.None, null, "merge", "--abort");
+            var abort = await RunGitWithTrustedHostConfigAsync(worktreePath, CancellationToken.None, null, "merge", "--abort");
             if (abort.ExitCode != 0)
                 _log.LogWarning("Failed to abort upstream merge in {WorktreePath}: {Error}", worktreePath, abort.Stderr);
         }
@@ -307,18 +371,16 @@ public sealed class LocalGitHost : IGitHost
         }
     }
 
-    private async Task RemoveWorktreeAsync(string barePath, string worktreePath)
+    private void RemoveRecoveryCheckout(string worktreePath)
     {
         try
         {
-            var remove = await RunGitWithHooksDisabledAsync(barePath, CancellationToken.None, null, "worktree", "remove", "--force", worktreePath);
-            if (remove.ExitCode != 0)
-                _log.LogWarning("Failed to remove upstream recovery worktree {WorktreePath}: {Error}", worktreePath, remove.Stderr);
-            _ = await RunGitWithHooksDisabledAsync(barePath, CancellationToken.None, null, "worktree", "prune");
+            if (Directory.Exists(worktreePath))
+                Directory.Delete(worktreePath, recursive: true);
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "Failed to remove upstream recovery worktree {WorktreePath}", worktreePath);
+            _log.LogWarning(ex, "Failed to remove upstream recovery checkout {WorktreePath}", worktreePath);
         }
     }
 
@@ -346,6 +408,10 @@ public sealed class LocalGitHost : IGitHost
         => stderr.Contains("non-fast-forward", StringComparison.OrdinalIgnoreCase)
            || stderr.Contains("(non-fast-forward)", StringComparison.OrdinalIgnoreCase)
            || stderr.Contains("! [rejected]", StringComparison.OrdinalIgnoreCase);
+
+    private static bool UsesMergeStyleRecovery(string mergeMethod)
+        => string.Equals(mergeMethod, "merge", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(mergeMethod, "squash", StringComparison.OrdinalIgnoreCase);
 
     private static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
         string workdir,
@@ -391,6 +457,28 @@ public sealed class LocalGitHost : IGitHost
         trustedArgs[1] = $"core.hooksPath={_trustedHooksPath}";
         Array.Copy(args, 0, trustedArgs, 2, args.Length);
         return RunGitAsync(workdir, ct, extraEnv, trustedArgs);
+    }
+
+    private Task<(int ExitCode, string Stdout, string Stderr)> RunGitWithTrustedHostConfigAsync(
+        string workdir,
+        CancellationToken ct,
+        IReadOnlyDictionary<string, string>? extraEnv,
+        params string[] args)
+        => RunGitWithHooksDisabledAsync(workdir, ct, BuildTrustedHostGitEnvironment(extraEnv), args);
+
+    private static IReadOnlyDictionary<string, string> BuildTrustedHostGitEnvironment(
+        IReadOnlyDictionary<string, string>? extraEnv)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (extraEnv is not null)
+            foreach (var (key, value) in extraEnv)
+                env[key] = value;
+
+        env["GIT_CONFIG_NOSYSTEM"] = "1";
+        env["GIT_CONFIG_SYSTEM"] = OperatingSystem.IsWindows() ? "NUL" : "/dev/null";
+        env["GIT_CONFIG_GLOBAL"] = OperatingSystem.IsWindows() ? "NUL" : "/dev/null";
+        env["GIT_ATTR_NOSYSTEM"] = "1";
+        return env;
     }
 }
 

@@ -128,7 +128,13 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         {
             try
             {
-                await _gitHost.PushToUpstreamAsync(request.RepositoryId, repoUrl, request.WorkBranch, askpass.Environment, ct);
+                await _gitHost.PushToUpstreamAsync(
+                    request.RepositoryId,
+                    repoUrl,
+                    request.WorkBranch,
+                    askpass.Environment,
+                    ct,
+                    mergeMethod: request.MergeMethod);
             }
             catch (UpstreamRebaseConflictException)
             {
