@@ -581,9 +581,23 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (OperationCanceledException) when (hostShutdownToken.IsCancellationRequested)
         {
-            await TryCheckpointPreemptAsync(item, sandbox, branch, CancellationToken.None);
+            Exception? checkpointFailure = null;
+            try
+            {
+                await CheckpointPreemptAsync(item, sandbox, branch, CancellationToken.None);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                checkpointFailure = ex;
+                _log.LogError(ex, "Preempt checkpoint failed for work item {Id}; preserving sandbox for operator recovery", item.Id);
+            }
+
             if (sandbox is IPreemptibleSandbox preemptible)
                 await preemptible.StopAndPreserveAsync(CancellationToken.None);
+
+            if (checkpointFailure is not null)
+                throw new OperationCanceledException("Host shutdown interrupted work, but the preempt checkpoint could not be created.", checkpointFailure, hostShutdownToken);
+
             throw;
         }
         CodeyBoxMeters.AgentDuration.Record(agentExecScope.ElapsedMs,
@@ -743,7 +757,7 @@ public sealed class PipelineRunner : IPipelineRunner
         }, ct);
     }
 
-    private async Task TryCheckpointPreemptAsync(WorkItem item, ISandbox sandbox, string branch, CancellationToken ct)
+    private async Task CheckpointPreemptAsync(WorkItem item, ISandbox sandbox, string branch, CancellationToken ct)
     {
         var checkpointRef = PreemptRefFor(item.Id);
         try
@@ -772,15 +786,20 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _log.LogWarning(ex, "Best-effort preempt checkpoint failed for work item {Id}", item.Id);
+            _log.LogWarning(ex, "Preempt checkpoint commit failed for work item {Id}; trying to publish current HEAD as checkpoint", item.Id);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{checkpointRef}");
+
             var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-            await _store.UpdateAsync(current with
+            var preempted = current with
             {
+                State = current.State is WorkItemState.Reworking ? WorkItemState.Reworking : WorkItemState.Working,
                 WorkBranch = branch,
                 PreemptedAt = DateTimeOffset.UtcNow,
-                PreemptCheckpoint = null,
+                PreemptCheckpoint = checkpointRef,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            }, CancellationToken.None);
+            };
+            await _store.UpdateAsync(preempted, CancellationToken.None);
+            _log.LogInformation("Work item {Id} checkpointed for restart preemption at current HEAD {Ref}", item.Id, checkpointRef);
         }
     }
 

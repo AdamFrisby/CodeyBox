@@ -76,6 +76,28 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
         };
     }
 
+    public override async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        Action<string>? strippingCallback = stdoutChunkCallback is null
+            ? null
+            : chunk => stdoutChunkCallback(Strip(chunk) ?? string.Empty);
+        var result = await base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, strippingCallback);
+        return result with
+        {
+            Stdout = Strip(result.Stdout),
+            Stderr = Strip(result.Stderr),
+        };
+    }
+
     private static string? Strip(string? s) =>
         s is null ? null : AnsiEscape.Replace(s, string.Empty);
 }

@@ -28,20 +28,18 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string? DefaultModelId { get; init; } = "gpt-5.5";
 
-    public override async Task<AgentResult> RunAsync(
+    protected override async Task<AgentResult?> PrepareSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
-        string prompt,
         AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        CancellationToken ct = default,
-        Action<string>? stdoutChunkCallback = null)
+        AgentResumeContext? resume,
+        CancellationToken ct = default)
     {
         // ChatGPT-subscription auth: write ~/.codex/auth.json into the sandbox
         // from the credential's CODEX_AUTH_JSON env var. The codex CLI reads
         // ONLY that file path; there's no env-var equivalent. API-key mode
-        // works via env var alone, so skip silently when absent.
+        // works via env var alone, so skip silently when absent. This hook is
+        // used for both fresh and preempt-resumed runs.
         if (credential is not null
             && credential.EnvironmentVariables.TryGetValue("CODEX_AUTH_JSON", out var authJson)
             && !string.IsNullOrEmpty(authJson))
@@ -61,7 +59,7 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
             }
         }
 
-        return await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback);
+        return null;
     }
 
     protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null)
