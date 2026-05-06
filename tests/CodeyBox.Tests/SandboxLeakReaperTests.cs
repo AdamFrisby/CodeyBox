@@ -85,6 +85,43 @@ public sealed class SandboxLeakReaperTests
     }
 
     [Fact]
+    public async Task InactiveSandbox_WithPreemptMarker_NotReportedAsLeak()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo(
+            "codeybox-preempt000000",
+            OldEnough(threshold),
+            DiskBytes: null,
+            IsTrackedActive: false,
+            HasPreemptMarker: true));
+
+        var reaper = BuildReaper(provider, leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
+    public async Task AutoDispose_WithPreemptMarker_DoesNotDispose()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo(
+            "codeybox-preempt111111",
+            OldEnough(threshold),
+            DiskBytes: null,
+            IsTrackedActive: false,
+            HasPreemptMarker: true));
+
+        var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Empty(provider.DisposedNames);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
     public async Task InactiveSandbox_YoungerThanThreshold_NotReportedAsLeak()
     {
         var threshold = TimeSpan.FromMinutes(30);

@@ -109,6 +109,9 @@ public sealed class SandboxLeakReaper : BackgroundService
                 if (info.IsTrackedActive)
                     continue;
 
+                if (info.HasPreemptMarker)
+                    continue;
+
                 // No creation timestamp → can't determine age → skip (conservative).
                 if (!info.CreatedAt.HasValue)
                     continue;

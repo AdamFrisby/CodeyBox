@@ -332,8 +332,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                     createdAt = new DateTimeOffset(created, TimeSpan.Zero);
             }
             var isActive = _activeSandboxNames.ContainsKey(name);
+            var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
             diskByName.TryGetValue(name, out var diskBytes);
-            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive));
+            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker));
         }
         return infos;
     }

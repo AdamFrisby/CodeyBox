@@ -60,11 +60,16 @@ public interface ISandboxProvider
 /// host but the current process has no record of creating it — the primary
 /// indicator of a leak.
 /// </param>
+/// <param name="HasPreemptMarker">
+/// True when the sandbox root carries the graceful-shutdown preempt marker.
+/// Such sandboxes are intentionally preserved and must not be treated as leaks.
+/// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
     DateTimeOffset? CreatedAt,
     long? DiskBytes,
-    bool IsTrackedActive);
+    bool IsTrackedActive,
+    bool HasPreemptMarker = false);
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable

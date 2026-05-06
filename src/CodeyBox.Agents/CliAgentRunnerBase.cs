@@ -8,7 +8,7 @@ namespace CodeyBox.Agents;
 /// inside the sandbox. Subclasses describe how to invoke their CLI; this base
 /// handles credential staging and result wrapping uniformly.
 /// </summary>
-public abstract class CliAgentRunnerBase : IAgentRunner
+public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner
 {
     public abstract AgentKind Kind { get; }
 
@@ -47,6 +47,28 @@ public abstract class CliAgentRunnerBase : IAgentRunner
             Summary: result.Success ? "ok" : $"agent exited {result.ExitCode}",
             Stdout: result.Stdout,
             Stderr: result.Stderr);
+    }
+
+    public virtual async Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                """
+                set -eu
+                mkdir -p .codeybox
+                printf '%s\n' "Preempt requested at $(date -u +%FT%TZ)." > .codeybox/preempt-scratchpad.md
+                printf '%s\n' "CLI-specific scratchpad export is unavailable; checkpointed git state is authoritative." >> .codeybox/preempt-scratchpad.md
+                pkill -TERM -f "$0" 2>/dev/null || true
+                """,
+                Kind.Value,
+            ],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        if (!result.Success)
+            throw new InvalidOperationException($"agent preempt signal failed (exit {result.ExitCode}): {result.Stderr}");
     }
 
     protected sealed record AgentInvocation(

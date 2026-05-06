@@ -24,6 +24,16 @@ public interface IAgentRunner
         Action<string>? stdoutChunkCallback = null);
 }
 
+/// <summary>
+/// Optional capability for runners that can receive a graceful preempt signal
+/// before the orchestrator cancels the sandbox exec process during host shutdown.
+/// Implementations must not trust repository contents while collecting state.
+/// </summary>
+public interface IPreemptibleAgentRunner : IAgentRunner
+{
+    Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default);
+}
+
 public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);
 
 /// <summary>Maps agent kinds to runners. Loose coupling: register new runners without recompiling consumers.</summary>

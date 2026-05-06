@@ -547,14 +547,12 @@ public sealed class OrchestratorService : BackgroundService
                     }
                     // Record first pickup time inside the lock so the count is visible
                     // to the next worker before it runs its own budget check.
-                    if (item.StartedAt is null || item.PreemptCheckpoint is not null)
+                    if (item.StartedAt is null)
                     {
                         var pipelineItem = item;
                         item = item with
                         {
                             StartedAt = DateTimeOffset.UtcNow,
-                            PreemptedAt = null,
-                            PreemptCheckpoint = null,
                         };
                         await _store.UpdateAsync(item, ct);
                         item = pipelineItem with { StartedAt = item.StartedAt };
@@ -568,14 +566,12 @@ public sealed class OrchestratorService : BackgroundService
             else
             {
                 // No project → no budget check; still record first pickup time.
-                if (item.StartedAt is null || item.PreemptCheckpoint is not null)
+                if (item.StartedAt is null)
                 {
                     var pipelineItem = item;
                     item = item with
                     {
                         StartedAt = DateTimeOffset.UtcNow,
-                        PreemptedAt = null,
-                        PreemptCheckpoint = null,
                     };
                     await _store.UpdateAsync(item, ct);
                     item = pipelineItem with { StartedAt = item.StartedAt };
@@ -586,11 +582,7 @@ public sealed class OrchestratorService : BackgroundService
             AuditLog.WorkItemPickedUp(workerIndex, item.Id);
             try
             {
-                // Link host shutdown explicitly into the per-item token so
-                // runner.RunAsync is cancelled promptly on SIGTERM even when the
-                // registry implementation is not rooted in the host token.
-                using var pipelineCts = CancellationTokenSource.CreateLinkedTokenSource(registration.Token, ct);
-                await _pipeline.RunAsync(item, pipelineCts.Token, ct);
+                await _pipeline.RunAsync(item, registration.Token, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
