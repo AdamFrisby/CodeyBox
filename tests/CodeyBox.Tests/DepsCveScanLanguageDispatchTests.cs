@@ -31,8 +31,8 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.True(result.Passed);
         Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
         Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal));
-        Assert.DoesNotContain(sandbox.Commands, c => c.Contains("pip-audit -f json .", StringComparison.Ordinal));
-        Assert.DoesNotContain(sandbox.Commands, c => c.Contains("safety scan", StringComparison.Ordinal));
+        Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json .", StringComparison.Ordinal));
+        Assert.Contains(sandbox.Commands, c => c.Contains("safety scan --target . --output json", StringComparison.Ordinal));
         Assert.Contains(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
         Assert.Contains(sandbox.ExtraEnvironments, e =>
             e.TryGetValue("NPM_CONFIG_REGISTRY", out var registry) &&
@@ -62,7 +62,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task UnsetLanguagesRunNoLanguageScanners()
+    public async Task UnsetLanguagesRunLegacyCSharpScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -75,12 +75,12 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.DoesNotContain(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
         Assert.Empty(result.Findings);
     }
 
     [Fact]
-    public async Task ExplicitEmptyLanguagesRunNoLanguageScanners()
+    public async Task ExplicitEmptyLanguagesRunLegacyCSharpScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -94,7 +94,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.DoesNotContain(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
         Assert.Empty(result.Findings);
     }
 

@@ -164,22 +164,20 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 | `typescript` | Compatibility alias for Node-style `package.json` projects |
 | `go` | `gofmt -l .` (non-empty output fails), `go vet ./...`, `go test ./...` |
 | `rust` | `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` |
-| `ruby` | `bundle exec rubocop`, `bundle exec rspec` |
-| `shell` | `shellcheck` over discovered `*.sh` files |
 
 Allowed built-in language values are `csharp`, `python`, `node`, `javascript`,
-`typescript`, `go`, `rust`, `ruby`, and `shell`. Unknown strings are logged at
-startup and skipped. If `Languages` is omitted and no default is configured, no
-language-specific auditors run; language-agnostic audit types and custom
-auditors still work.
+`typescript`, `go`, and `rust`. Unknown strings are logged at startup and
+skipped. If `Languages` is omitted and no default is configured, no
+language-specific PR auditors run; language-agnostic audit types and custom
+auditors still work. Release deep audits keep the legacy dependency CVE
+behavior and run the C# scanner when no languages are configured.
 
 Each language preset recursively checks for that language's marker files before running:
 `*.csproj`/`*.sln`/`*.slnx` for C#, `pyproject.toml`/`setup.py`/`setup.cfg`/
 `requirements.txt` for Python, `package.json` for Node, `go.mod` for Go, and
-`Cargo.toml` for Rust. Compatibility presets also detect `Gemfile`/`*.gemspec`
-for Ruby and `*.sh` for shell scripts. In side-by-side repositories, the tools
-run from the matched project directories. If a language is enabled but its
-markers are absent, the auditor emits an Info finding and skips.
+`Cargo.toml` for Rust. In side-by-side repositories, the tools run from the
+matched project directories. If a language is enabled but its markers are
+absent, the auditor emits an Info finding and skips.
 
 All language presets are tool-only (no agent credentials). A buggy linter
 cannot exfiltrate the agent's API key — the audit phase runs them in a

@@ -17,6 +17,16 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     private const int MaxProjectDirectories = 25;
     private const int MaxRawOutputChars = 1_000_000;
     private const string NpmAuditRegistry = "https://registry.npmjs.org/";
+    private static readonly IReadOnlyList<string> LegacyDefaultLanguages = ["csharp"];
+    private const string PythonScannerScript =
+        "if [ -f requirements.txt ]; then " +
+        "if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json -r requirements.txt; fi; " +
+        "if command -v safety >/dev/null 2>&1; then exec safety check -r requirements.txt --json; fi; " +
+        "else " +
+        "if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json .; fi; " +
+        "if command -v safety >/dev/null 2>&1; then exec safety scan --target . --output json; fi; " +
+        "fi; " +
+        "echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127";
 
     private static readonly IReadOnlyDictionary<string, string> NpmAuditEnvironment =
         new Dictionary<string, string>(StringComparer.Ordinal)
@@ -41,7 +51,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             ["python"] = new(
                 "python",
                 LanguageProjectDiscovery.PythonDiscoveryScript,
-                ["sh", "-c", "if [ ! -f requirements.txt ]; then echo 'No requirements.txt found; Python project-mode CVE scanning is disabled to avoid executing repository-controlled build backends.' >&2; exit 0; fi; if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json -r requirements.txt; fi; if command -v safety >/dev/null 2>&1; then exec safety check -r requirements.txt --json; fi; echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127"],
+                ["sh", "-c", PythonScannerScript],
                 "pip-audit or safety not installed in sandbox; CVE scan skipped",
                 "Install pip-audit or safety in the sandbox image to enable Python CVE scanning.",
                 ParsePythonFindings,
@@ -101,7 +111,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         DeepAuditContext context,
         CancellationToken ct = default)
     {
-        var languages = (context.Languages ?? ProjectAuditLanguages.Default)
+        var languages = ResolveLanguages(context.Languages)
             .Where(ProjectAuditLanguages.IsSupported)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -195,6 +205,9 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         var hasError = allFindings.Any(f => f.Severity == AuditSeverity.Error);
         return new AuditResult(!hasError, allFindings, RawOutput: string.Join("\n\n", rawParts));
     }
+
+    private static IReadOnlyList<string> ResolveLanguages(IReadOnlyList<string>? languages)
+        => languages is { Count: > 0 } ? languages : LegacyDefaultLanguages;
 
     private static IEnumerable<AuditFinding> ParseDotnetFindings(string output)
     {

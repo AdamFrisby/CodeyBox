@@ -134,8 +134,6 @@ tool-only and only run when their marker files are present in the work tree:
 | `typescript` | `package.json` | `typescript:format-check`, `typescript:lint`, `typescript:test-pass` |
 | `go` | `go.mod` | `go:format-check`, `go:vet`, `go:test-pass` |
 | `rust` | `Cargo.toml` | `rust:format-check`, `rust:lint`, `rust:test-pass` |
-| `ruby` | `Gemfile`, `*.gemspec` | `ruby:lint`, `ruby:test-pass` |
-| `shell` | `*.sh` | `shell:lint` |
 
 If a language is declared but its marker files are absent, the corresponding
 auditors emit Info findings and skip. Unknown language strings are logged at

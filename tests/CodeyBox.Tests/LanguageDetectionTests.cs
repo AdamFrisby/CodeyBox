@@ -54,8 +54,6 @@ public sealed class LanguageDetectionTests
     [InlineData("typescript", "typescript:lint")]
     [InlineData("go", "go:vet")]
     [InlineData("rust", "rust:lint")]
-    [InlineData("ruby", "ruby:lint")]
-    [InlineData("shell", "shell:lint")]
     public void SupportedLanguagePresetsResolveExpectedAuditors(string language, string auditorName)
     {
         var catalog = new PresetCatalog();

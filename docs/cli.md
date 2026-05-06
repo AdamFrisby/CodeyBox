@@ -30,7 +30,7 @@ No arguments are required. The wizard is fully interactive.
 
 ### Audit language presets
 
-`csharp` · `python` · `node` · `javascript` · `typescript` · `go` · `rust` · `ruby` · `shell`
+`csharp` · `python` · `node` · `javascript` · `typescript` · `go` · `rust`
 
 ### Audit type presets
 

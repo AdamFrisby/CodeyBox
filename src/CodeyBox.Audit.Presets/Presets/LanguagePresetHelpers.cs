@@ -10,8 +10,6 @@ internal static class LanguagePresetHelpers
     public const string NodeMarkerScript = LanguageProjectDiscovery.NodeDiscoveryScript;
     public const string GoMarkerScript = LanguageProjectDiscovery.GoDiscoveryScript;
     public const string RustMarkerScript = LanguageProjectDiscovery.RustDiscoveryScript;
-    public const string RubyMarkerScript = LanguageProjectDiscovery.RubyDiscoveryScript;
-    public const string ShellMarkerScript = LanguageProjectDiscovery.ShellDiscoveryScript;
 
     public static IAuditor Shell(
         string language,

@@ -15,7 +15,5 @@ internal static class LanguagePresets
         NodePresets.Register(catalog);
         GoPresets.Register(catalog);
         RustPresets.Register(catalog);
-        RubyPresets.Register(catalog);
-        ShellPresets.Register(catalog);
     }
 }

@@ -23,8 +23,8 @@ public sealed class PresetCatalogTests
         Assert.Contains("csharp", catalog.KnownLanguages);
         Assert.Contains("typescript", catalog.KnownLanguages);
         Assert.Contains("javascript", catalog.KnownLanguages);
-        Assert.Contains("ruby", catalog.KnownLanguages);
-        Assert.Contains("shell", catalog.KnownLanguages);
+        Assert.DoesNotContain("ruby", catalog.KnownLanguages);
+        Assert.DoesNotContain("shell", catalog.KnownLanguages);
     }
 
     [Fact]
