@@ -106,7 +106,8 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
             upstreamUrl,
             request.WorkBranch,
             BuildAuthEnv(token),
-            ct);
+            ct,
+            mergeMethod: request.MergeMethod);
 
         // Open a pull request.
         var prNumber = await OpenPullRequestAsync(
