@@ -506,12 +506,13 @@ builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     new ClaudeQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        ReadClaudeQuotaToken() ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY"),
+        ReadClaudeQuotaToken(sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.QuotaCredentials"))
+            ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY"),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<ClaudeQuotaProbe>()));
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
-    var codexAuth = ReadCodexQuotaAuth();
+    var codexAuth = ReadCodexQuotaAuth(sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.QuotaCredentials"));
     return
     new CodexQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
@@ -959,7 +960,7 @@ static bool WouldAllow(double availablePct, bool recentFailure, QuotaRouterOptio
     };
 }
 
-static string? ReadClaudeQuotaToken()
+static string? ReadClaudeQuotaToken(ILogger log)
 {
     var path = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -976,15 +977,26 @@ static string? ReadClaudeQuotaToken()
             token.ValueKind == JsonValueKind.String)
             return token.GetString();
     }
-    catch (Exception)
+    catch (JsonException ex)
     {
+        log.LogWarning(ex, "Claude quota OAuth file '{Path}' is malformed; falling back to environment token if configured", path);
+        return null;
+    }
+    catch (IOException ex)
+    {
+        log.LogWarning(ex, "Claude quota OAuth file '{Path}' could not be read; falling back to environment token if configured", path);
+        return null;
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        log.LogWarning(ex, "Claude quota OAuth file '{Path}' is not readable; falling back to environment token if configured", path);
         return null;
     }
 
     return null;
 }
 
-static (string? AccessToken, string? AccountId) ReadCodexQuotaAuth()
+static (string? AccessToken, string? AccountId) ReadCodexQuotaAuth(ILogger log)
 {
     var path = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -1009,8 +1021,19 @@ static (string? AccessToken, string? AccountId) ReadCodexQuotaAuth()
                 : null;
         return (accessToken, accountId);
     }
-    catch (Exception)
+    catch (JsonException ex)
     {
+        log.LogWarning(ex, "Codex quota auth file '{Path}' is malformed; falling back to environment token if configured", path);
+        return (null, null);
+    }
+    catch (IOException ex)
+    {
+        log.LogWarning(ex, "Codex quota auth file '{Path}' could not be read; falling back to environment token if configured", path);
+        return (null, null);
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        log.LogWarning(ex, "Codex quota auth file '{Path}' is not readable; falling back to environment token if configured", path);
         return (null, null);
     }
 }

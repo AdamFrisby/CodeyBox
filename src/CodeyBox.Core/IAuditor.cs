@@ -64,7 +64,11 @@ public sealed record AuditContext(
     IAgentRunner? AuditRunner = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
-public sealed record AuditResult(bool Passed, IReadOnlyList<AuditFinding> Findings, string? RawOutput = null);
+public sealed record AuditResult(
+    bool Passed,
+    IReadOnlyList<AuditFinding> Findings,
+    string? RawOutput = null,
+    string? AgentStderr = null);
 
 public sealed record AuditFinding(
     string AuditorName,

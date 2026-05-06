@@ -790,6 +790,18 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditContext ctx,
         CancellationToken ct)
     {
+        if (needsCreds && run.Result.AgentStderr is not null)
+        {
+            await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                run.Runner.Kind,
+                modelId: null,
+                run.Result.AgentStderr,
+                DateTimeOffset.UtcNow,
+                _auditQuotaOptions.ObservedFailureRetention,
+                ct);
+        }
+
         if (needsCreds)
         {
             await TryRecordCostAsync(run.Result.RawOutput, null,

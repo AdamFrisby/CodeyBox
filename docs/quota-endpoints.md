@@ -13,7 +13,8 @@ GET https://api.anthropic.com/api/oauth/usage
 Authorization: Bearer <redacted>
 ```
 
-Expected rollup structure:
+Captured redacted response structure, mirrored in
+`tests/CodeyBox.Tests/Fixtures/Quota/claude-oauth-usage.redacted.json`:
 
 ```json
 {
@@ -73,7 +74,8 @@ Authorization: Bearer <redacted>
 ChatGPT-Account-Id: <redacted>
 ```
 
-Captured redacted structure:
+Captured redacted response structure, mirrored in
+`tests/CodeyBox.Tests/Fixtures/Quota/codex-wham-usage.redacted.json`:
 
 ```json
 {

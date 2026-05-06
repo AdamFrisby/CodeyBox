@@ -4,64 +4,13 @@ namespace CodeyBox.Tests;
 
 public sealed class CodexQuotaProbeRealShapeTests
 {
-    private const string CapturedWhamUsageShape = """
-    {
-      "user_id": "user_REDACTED",
-      "account_id": "acct_REDACTED",
-      "email": "redacted@example.com",
-      "plan_type": "prolite",
-      "rate_limit": {
-        "allowed": true,
-        "limit_reached": false,
-        "primary_window": {
-          "used_percent": 34,
-          "limit_window_seconds": 18000,
-          "reset_after_seconds": 5865,
-          "reset_at": 1778091218
-        },
-        "secondary_window": {
-          "used_percent": 37,
-          "limit_window_seconds": 604800,
-          "reset_after_seconds": 520217,
-          "reset_at": 1778605571
-        }
-      },
-      "additional_rate_limits": [
-        {
-          "limit_name": "GPT-5.3-Codex-Spark",
-          "metered_feature": "codex_bengalfox",
-          "rate_limit": {
-            "allowed": true,
-            "limit_reached": false,
-            "primary_window": {
-              "used_percent": 0,
-              "limit_window_seconds": 18000,
-              "reset_after_seconds": 18000,
-              "reset_at": 1778103354
-            },
-            "secondary_window": {
-              "used_percent": 0,
-              "limit_window_seconds": 604800,
-              "reset_after_seconds": 519837,
-              "reset_at": 1778605191
-            }
-          }
-        }
-      ],
-      "credits": {
-        "has_credits": false,
-        "unlimited": false,
-        "overage_limit_reached": false,
-        "balance": "0"
-      },
-      "rate_limit_reached_type": null
-    }
-    """;
-
     [Fact]
-    public void CapturedWhamUsageShape_ParsesOverallAndPerModelLimits()
+    public async Task CapturedWhamUsageShape_ParsesOverallAndPerModelLimits()
     {
-        var snapshot = CodexQuotaProbe.ParseResponse(CapturedWhamUsageShape);
+        var capturedWhamUsageShape = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Quota", "codex-wham-usage.redacted.json"));
+
+        var snapshot = CodexQuotaProbe.ParseResponse(capturedWhamUsageShape);
 
         Assert.Equal(63, snapshot.AvailablePct);
         Assert.True(snapshot.PerModel.ContainsKey("GPT-5.3-Codex-Spark"));
