@@ -54,7 +54,7 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         Assert.Equal("agent\n", agentBlob);
         Assert.Equal("human\n", humanBlob);
         Assert.StartsWith("agent change\nhuman change\n", subjects, StringComparison.Ordinal);
-        Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-rebase-*"));
+        Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-push-*"));
     }
 
     [Fact]
@@ -79,7 +79,7 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         Assert.Equal("human\n", humanBlob);
         Assert.StartsWith("codeybox: merge latest upstream main\n", subjects, StringComparison.Ordinal);
         Assert.Equal(3, parents.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length);
-        Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-merge-*"));
+        Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-push-*"));
     }
 
     [Fact]
@@ -105,6 +105,48 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         Assert.StartsWith("agent change\nhuman change\n", subjects, StringComparison.Ordinal);
         Assert.Equal(2, parents.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length);
         Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-push-*"));
+    }
+
+    [Fact]
+    public async Task PushToUpstreamAsync_WhenBranchIsNotDefault_PushesRequestedBranch()
+    {
+        var upstream = await CreateBareUpstreamAsync();
+        var host = NewHost();
+        var repoId = await host.EnsureRepositoryAsync(WorkItemId.New(), upstream);
+        var hostBare = host.GetRepoPath(repoId);
+        var branch = "codeybox/work-123";
+
+        await CommitNewRemoteBranchAsync(hostBare, "main", branch, "agent.txt", "agent\n", "agent change");
+
+        await host.PushToUpstreamAsync(repoId, upstream, branch, new Dictionary<string, string>());
+
+        var (_, blob, _) = await TestSupport.RunGit(upstream, "show", $"{branch}:agent.txt");
+        Assert.Equal("agent\n", blob);
+    }
+
+    [Fact]
+    public async Task PushToUpstreamAsync_HonorsHostGitConfigForGenericUpstream()
+    {
+        var upstream = await CreateBareUpstreamAsync();
+        var host = NewHost();
+        var repoId = await host.EnsureRepositoryAsync(WorkItemId.New(), upstream);
+        var hostBare = host.GetRepoPath(repoId);
+        var hostConfig = Path.Combine(_workspace, "host-gitconfig");
+        var configuredUrl = "codeybox-test://generic-upstream";
+
+        await File.WriteAllTextAsync(
+            hostConfig,
+            $"[url \"{new Uri(upstream).AbsoluteUri}\"]\n\tinsteadOf = {configuredUrl}\n");
+        await CommitToRemoteBranchAsync(hostBare, "main", "agent.txt", "agent\n", "agent change");
+
+        await host.PushToUpstreamAsync(
+            repoId,
+            configuredUrl,
+            "main",
+            new Dictionary<string, string> { ["GIT_CONFIG_GLOBAL"] = hostConfig });
+
+        var (_, blob, _) = await TestSupport.RunGit(upstream, "show", "main:agent.txt");
+        Assert.Equal("agent\n", blob);
     }
 
     [Fact]
@@ -163,7 +205,12 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         }
 
         await TestSupport.RunGit(hostBare, "config", "protocol.ext.allow", "always");
-        await TestSupport.RunGit(hostBare, "config", "--add", $"url.ext::{helperPath}.insteadOf", upstream);
+        await TestSupport.RunGit(
+            hostBare,
+            "config",
+            "--add",
+            $"url.ext::{helperPath}.insteadOf",
+            Path.Combine(Path.GetDirectoryName(hostBare)!, ".upstream-push-"));
 
         await host.PushToUpstreamAsync(
             repoId,
@@ -246,7 +293,7 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         Assert.Contains("upstream rebase conflict on main; manual resolution required", ex.Message);
         var (_, upstreamBlob, _) = await TestSupport.RunGit(upstream, "show", "main:conflict.txt");
         Assert.Equal("human\n", upstreamBlob);
-        Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-rebase-*"));
+        Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-push-*"));
     }
 
     [Fact]
@@ -265,7 +312,7 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
 
         Assert.Contains("git push to upstream failed", ex.Message);
         Assert.DoesNotContain("non-fast-forward recovery", ex.Message);
-        Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-rebase-*"));
+        Assert.Empty(Directory.GetDirectories(Path.GetDirectoryName(hostBare)!, ".upstream-push-*"));
     }
 
     private LocalGitHost NewHost()
@@ -294,6 +341,25 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         await TestSupport.RunGit(workdir, "config", "user.email", "test@example.invalid");
         await TestSupport.RunGit(workdir, "config", "user.name", "Test User");
         await TestSupport.RunGit(workdir, "checkout", branch);
+        await File.WriteAllTextAsync(Path.Combine(workdir, fileName), contents);
+        await TestSupport.RunGit(workdir, "add", fileName);
+        await TestSupport.RunGit(workdir, "commit", "-m", message);
+        await TestSupport.RunGit(workdir, "push", "origin", $"HEAD:{branch}");
+    }
+
+    private async Task CommitNewRemoteBranchAsync(
+        string remote,
+        string startPoint,
+        string branch,
+        string fileName,
+        string contents,
+        string message)
+    {
+        var workdir = Path.Combine(_workspace, "commit-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", remote, workdir);
+        await TestSupport.RunGit(workdir, "config", "user.email", "test@example.invalid");
+        await TestSupport.RunGit(workdir, "config", "user.name", "Test User");
+        await TestSupport.RunGit(workdir, "checkout", "-b", branch, $"origin/{startPoint}");
         await File.WriteAllTextAsync(Path.Combine(workdir, fileName), contents);
         await TestSupport.RunGit(workdir, "add", fileName);
         await TestSupport.RunGit(workdir, "commit", "-m", message);

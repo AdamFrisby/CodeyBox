@@ -278,7 +278,7 @@ public sealed class LocalGitHost : IGitHost
             workdir: _opts.RootDirectory,
             ct,
             extraEnv: null,
-            "clone", "--no-checkout", "--local", "--no-hardlinks", "--", barePath, worktreePath);
+            "clone", "--no-checkout", "--branch", branch, "--local", "--no-hardlinks", "--", barePath, worktreePath);
         if (clone.ExitCode != 0)
             throw new InvalidOperationException(
                 $"git recovery clone setup for upstream reconciliation on '{branch}' failed: {clone.Stderr}");
@@ -323,11 +323,39 @@ public sealed class LocalGitHost : IGitHost
         string worktreePath,
         CancellationToken ct)
     {
+        var head = await RunGitWithTrustedHostConfigAsync(
+            worktreePath, ct, null, "rev-parse", "--verify", "HEAD^{commit}");
+        if (head.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git recovery failed to resolve reconciled branch '{branch}': {head.Stderr}");
+
+        CopyGitObjects(
+            sourceObjectsPath: Path.Combine(worktreePath, ".git", "objects"),
+            targetObjectsPath: Path.Combine(barePath, "objects"));
+
         var update = await RunGitWithHooksDisabledAsync(
-            barePath, ct, null, "fetch", "--no-tags", worktreePath, $"+HEAD:refs/heads/{branch}");
+            barePath, ct, null, "update-ref", $"refs/heads/{branch}", head.Stdout.Trim());
         if (update.ExitCode != 0)
             throw new InvalidOperationException(
                 $"git recovery failed to update host branch '{branch}': {update.Stderr}");
+    }
+
+    private static void CopyGitObjects(string sourceObjectsPath, string targetObjectsPath)
+    {
+        foreach (var sourceFile in Directory.EnumerateFiles(sourceObjectsPath, "*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(sourceObjectsPath, sourceFile);
+            if (relativePath.Equals(Path.Combine("info", "alternates"), StringComparison.Ordinal) ||
+                relativePath.EndsWith(".lock", StringComparison.Ordinal))
+                continue;
+
+            var targetFile = Path.Combine(targetObjectsPath, relativePath);
+            if (File.Exists(targetFile))
+                continue;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(targetFile)!);
+            File.Copy(sourceFile, targetFile);
+        }
     }
 
     private async Task AbortRebaseAsync(string worktreePath)
@@ -460,9 +488,6 @@ public sealed class LocalGitHost : IGitHost
             foreach (var (key, value) in extraEnv)
                 env[key] = value;
 
-        env["GIT_CONFIG_NOSYSTEM"] = "1";
-        env["GIT_CONFIG_SYSTEM"] = OperatingSystem.IsWindows() ? "NUL" : "/dev/null";
-        env["GIT_CONFIG_GLOBAL"] = OperatingSystem.IsWindows() ? "NUL" : "/dev/null";
         env["GIT_ATTR_NOSYSTEM"] = "1";
         return env;
     }
