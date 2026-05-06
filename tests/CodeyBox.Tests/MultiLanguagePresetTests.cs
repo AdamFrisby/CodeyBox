@@ -23,6 +23,7 @@ public sealed class MultiLanguagePresetTests
         var auditors = composer.Compose(project, new FakeAgent());
 
         Assert.Contains(auditors, a => a.Name == "csharp:build-WaE");
+        Assert.DoesNotContain(auditors, a => a.Name == "csharp:test-pass");
         Assert.Contains(auditors, a => a.Name == "python:test-pass");
         Assert.Contains(auditors, a => a.Name == "node:test-pass");
         Assert.DoesNotContain(auditors, a => a.Name.StartsWith("go:", StringComparison.Ordinal));
@@ -41,6 +42,18 @@ public sealed class MultiLanguagePresetTests
         Assert.Contains(logger.Entries, e =>
             e.Level == LogLevel.Warning &&
             e.Message.Contains("unsupported audit language 'zig'", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void JavaScriptAndTypeScriptLanguagesResolveCompatibilityAuditors()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithLanguages(["javascript", "typescript"]);
+
+        var auditors = composer.Compose(project, new FakeAgent());
+
+        Assert.Contains(auditors, a => a.Name == "javascript:lint");
+        Assert.Contains(auditors, a => a.Name == "typescript:test-pass");
     }
 
     private static Project ProjectWithLanguages(IReadOnlyList<string> languages) => new()

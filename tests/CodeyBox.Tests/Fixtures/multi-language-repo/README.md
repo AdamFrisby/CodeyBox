@@ -1,3 +1,3 @@
 # Multi-language Fixture
 
-Tiny marker-only fixture for language preset detection tests.
+Tiny C#, Python, and Node projects for language preset detection tests.

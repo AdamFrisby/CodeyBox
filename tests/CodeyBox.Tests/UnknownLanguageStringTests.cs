@@ -31,4 +31,29 @@ public sealed class UnknownLanguageStringTests
             e.Level == LogLevel.Warning &&
             e.Message.Contains("unsupported audit language 'zig'", StringComparison.Ordinal));
     }
+
+    [Fact]
+    public async Task ProjectRepositoryKeepsLegacyLanguageIds()
+    {
+        var logger = new CapturingLogger<ProjectRepository>();
+        var repo = new ProjectRepository(Options.Create(new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/alpha.git",
+                    Audit = new ProjectAuditConfig { Languages = ["typescript", "javascript", "ruby", "shell"] },
+                },
+            ],
+        }), logger);
+
+        var project = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(["typescript", "javascript", "ruby", "shell"], project!.Audit.Languages);
+        Assert.DoesNotContain(logger.Entries, e =>
+            e.Level == LogLevel.Warning &&
+            e.Message.Contains("unsupported audit language", StringComparison.Ordinal));
+    }
 }

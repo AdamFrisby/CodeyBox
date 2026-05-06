@@ -21,7 +21,7 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         Assert.True(result.Passed);
         Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
-        Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json", StringComparison.Ordinal));
+        Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal));
         Assert.Contains(sandbox.Commands, c => c == "npm audit --json");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/csharp");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/python");
@@ -82,6 +82,24 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.True(result.Passed);
         Assert.DoesNotContain(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
         Assert.Empty(result.Findings);
+    }
+
+    [Fact]
+    public async Task JavaScriptAndTypeScriptDispatchToNodeScanner()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["javascript", "typescript"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.True(result.Passed);
+        Assert.Single(sandbox.Commands, c => c == "npm audit --json");
     }
 
     [Fact]
@@ -219,6 +237,37 @@ public sealed class DepsCveScanLanguageDispatchTests
     public async Task PythonScannerParsesPipAuditJsonOutput()
     {
         var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
+            [
+              {
+                "name": "django",
+                "version": "1.2",
+                "vulns": [
+                  { "id": "PYSEC-2019-13", "severity": "high" }
+                ]
+              }
+            ]
+            """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["python"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("django", finding.Title);
+        Assert.Contains("PYSEC-2019-13", finding.Description);
+    }
+
+    [Fact]
+    public async Task PythonScannerParsesWrappedPipAuditJsonOutput()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
             {
               "dependencies": [
                 {
@@ -247,6 +296,28 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("django", finding.Title);
         Assert.Contains("PYSEC-2019-13", finding.Description);
+    }
+
+    [Fact]
+    public async Task ExcessiveProjectDirectories_AreCappedAndReportedAsError()
+    {
+        var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./python-{i}")) + "\n";
+        var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["python"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        Assert.Contains(result.Findings, f =>
+            f.Severity == AuditSeverity.Error &&
+            f.Title.Contains("too many project directories", StringComparison.Ordinal));
+        Assert.Equal(25, sandbox.Commands.Count(c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal)));
     }
 
     [Fact]
@@ -446,6 +517,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         private readonly string _scannerStderr;
         private readonly int _scannerExitCode;
         private readonly int _discoveryExitCode;
+        private readonly string? _discoveryStdout;
 
         public DispatchSandbox(
             bool markerPresent,
@@ -454,7 +526,8 @@ public sealed class DepsCveScanLanguageDispatchTests
             string scannerStdout = "{}",
             string scannerStderr = "",
             int scannerExitCode = 0,
-            int discoveryExitCode = 0)
+            int discoveryExitCode = 0,
+            string? discoveryStdout = null)
         {
             _markerPresent = markerPresent;
             _missingTool = missingTool;
@@ -463,6 +536,7 @@ public sealed class DepsCveScanLanguageDispatchTests
             _scannerStderr = scannerStderr;
             _scannerExitCode = scannerExitCode;
             _discoveryExitCode = discoveryExitCode;
+            _discoveryStdout = discoveryStdout;
         }
 
         public List<string> Commands { get; } = [];
@@ -482,7 +556,7 @@ public sealed class DepsCveScanLanguageDispatchTests
                 if (script.Contains("find .", StringComparison.Ordinal))
                     return Task.FromResult(new SandboxExecResult(
                         _discoveryExitCode,
-                        _markerPresent ? DiscoveryOutput(script) : "",
+                        _markerPresent ? _discoveryStdout ?? DiscoveryOutput(script) : "",
                         _discoveryExitCode == 0 ? "" : "find failed"));
             }
 

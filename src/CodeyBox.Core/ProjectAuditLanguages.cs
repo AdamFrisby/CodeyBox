@@ -12,6 +12,13 @@ public static class ProjectAuditLanguages
             "node",
             "go",
             "rust",
+            // Backward-compatible language IDs supported before the
+            // language-agnostic preset refactor. Keep them accepted so
+            // existing operator configs do not get filtered at startup.
+            "typescript",
+            "javascript",
+            "ruby",
+            "shell",
         };
 
     public static bool IsSupported(string language)

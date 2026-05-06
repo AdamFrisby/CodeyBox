@@ -4,6 +4,9 @@ namespace CodeyBox.Audit.Presets.Presets;
 
 internal sealed class LanguagePresetAuditor : IAuditor
 {
+    private const int MaxProjectDirectories = 25;
+    private const int MaxRawOutputChars = 1_000_000;
+
     private readonly string _language;
     private readonly string _markerDescription;
     private readonly string _markerScript;
@@ -65,8 +68,22 @@ internal sealed class LanguagePresetAuditor : IAuditor
         var allFindings = new List<AuditFinding>();
         var rawParts = new List<string>();
         var passed = true;
+        var rawOutputChars = 0;
+        var rawOutputTruncated = false;
+        var projectDirectoriesToRun = projectDirectories;
 
-        foreach (var projectDirectory in projectDirectories)
+        if (projectDirectories.Count > MaxProjectDirectories)
+        {
+            passed = false;
+            projectDirectoriesToRun = projectDirectories.Take(MaxProjectDirectories).ToList();
+            allFindings.Add(new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Error,
+                Title: $"{_language} preset discovered too many project directories",
+                Description: $"The {_language} preset found {projectDirectories.Count} project directories, which exceeds the maximum of {MaxProjectDirectories}. Only the first {MaxProjectDirectories} were audited to prevent repository-controlled auditor fan-out."));
+        }
+
+        foreach (var projectDirectory in projectDirectoriesToRun)
         {
             var result = await _inner.RunAsync(
                 sandbox,
@@ -77,8 +94,15 @@ internal sealed class LanguagePresetAuditor : IAuditor
             passed &= result.Passed;
             allFindings.AddRange(result.Findings);
             if (!string.IsNullOrWhiteSpace(result.RawOutput))
-                rawParts.Add($"## {projectDirectory}\n{result.RawOutput}");
+                AppendRawPart(rawParts, $"## {projectDirectory}\n{result.RawOutput}", ref rawOutputChars, ref rawOutputTruncated);
         }
+
+        if (rawOutputTruncated)
+            allFindings.Add(new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Info,
+                Title: $"{_language} preset raw output truncated",
+                Description: $"Combined raw output exceeded {MaxRawOutputChars} characters and was truncated before storage."));
 
         return new AuditResult(passed, allFindings, RawOutput: string.Join("\n\n", rawParts));
     }
@@ -88,6 +112,34 @@ internal sealed class LanguagePresetAuditor : IAuditor
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Distinct(StringComparer.Ordinal)
             .ToList();
+
+    private static void AppendRawPart(
+        List<string> rawParts,
+        string rawPart,
+        ref int rawOutputChars,
+        ref bool rawOutputTruncated)
+    {
+        if (rawOutputTruncated)
+            return;
+
+        var remaining = MaxRawOutputChars - rawOutputChars;
+        if (remaining <= 0)
+        {
+            rawOutputTruncated = true;
+            return;
+        }
+
+        if (rawPart.Length > remaining)
+        {
+            rawParts.Add(rawPart[..remaining]);
+            rawOutputChars += remaining;
+            rawOutputTruncated = true;
+            return;
+        }
+
+        rawParts.Add(rawPart);
+        rawOutputChars += rawPart.Length;
+    }
 
     private static string ResolveWorkingDirectory(string workingDirectory, string projectDirectory)
     {

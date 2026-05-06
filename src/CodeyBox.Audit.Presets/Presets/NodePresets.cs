@@ -3,25 +3,32 @@ namespace CodeyBox.Audit.Presets.Presets;
 internal static class NodePresets
 {
     public static void Register(PresetCatalog catalog)
-        => catalog.RegisterLanguage("node", _ =>
+    {
+        RegisterNodeLike(catalog, "node", "node");
+        RegisterNodeLike(catalog, "javascript", "javascript");
+        RegisterNodeLike(catalog, "typescript", "typescript");
+    }
+
+    private static void RegisterNodeLike(PresetCatalog catalog, string language, string auditorPrefix)
+        => catalog.RegisterLanguage(language, _ =>
         [
             LanguagePresetHelpers.Shell(
-                "node",
+                language,
                 "package.json",
                 LanguagePresetHelpers.NodeMarkerScript,
-                "node:format-check",
+                $"{auditorPrefix}:format-check",
                 "prettier", "--check", "."),
             LanguagePresetHelpers.Shell(
-                "node",
+                language,
                 "package.json",
                 LanguagePresetHelpers.NodeMarkerScript,
-                "node:lint",
+                $"{auditorPrefix}:lint",
                 "eslint", "."),
             LanguagePresetHelpers.Shell(
-                "node",
+                language,
                 "package.json",
                 LanguagePresetHelpers.NodeMarkerScript,
-                "node:test-pass",
+                $"{auditorPrefix}:test-pass",
                 "npm", "test"),
         ]);
 }

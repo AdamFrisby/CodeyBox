@@ -14,6 +14,8 @@ namespace CodeyBox.Audit.Shell;
 public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 {
     private const int MaxScannerOutputChars = 1_000_000;
+    private const int MaxProjectDirectories = 25;
+    private const int MaxRawOutputChars = 1_000_000;
 
     private static readonly IReadOnlyDictionary<string, Scanner> Scanners =
         new Dictionary<string, Scanner>(StringComparer.OrdinalIgnoreCase)
@@ -29,7 +31,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             ["python"] = new(
                 "python",
                 LanguageProjectDiscovery.PythonDiscoveryScript,
-                ["sh", "-c", "if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json; fi; if command -v safety >/dev/null 2>&1; then exec safety check --json; fi; echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127"],
+                ["sh", "-c", "if command -v pip-audit >/dev/null 2>&1; then if [ -f requirements.txt ]; then exec pip-audit -f json -r requirements.txt; fi; exec pip-audit -f json .; fi; if command -v safety >/dev/null 2>&1; then if [ -f requirements.txt ]; then exec safety check -r requirements.txt --json; fi; exec safety scan --output json; fi; echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127"],
                 "pip-audit or safety not installed in sandbox; CVE scan skipped",
                 "Install pip-audit or safety in the sandbox image to enable Python CVE scanning.",
                 ParsePythonFindings,
@@ -72,6 +74,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     {
         var languages = (context.Languages ?? ProjectAuditLanguages.Default)
             .Where(ProjectAuditLanguages.IsSupported)
+            .Select(NormalizeScannerLanguage)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (languages.Count == 0)
@@ -79,6 +82,9 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
         var allFindings = new List<AuditFinding>();
         var rawParts = new List<string>();
+        var rawOutputChars = 0;
+        var rawOutputTruncated = false;
+        var remainingProjectDirectories = MaxProjectDirectories;
 
         foreach (var language in languages)
         {
@@ -102,7 +108,13 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             }
 
             var projectDirectories = ParseProjectDirectories(discovery.Stdout);
-            foreach (var projectDirectory in projectDirectories)
+            var projectDirectoriesToRun = TakeProjectDirectoriesWithinBudget(
+                language,
+                projectDirectories,
+                ref remainingProjectDirectories,
+                allFindings);
+
+            foreach (var projectDirectory in projectDirectoriesToRun)
             {
                 var result = await sandbox.ExecAsync(new SandboxExec
                 {
@@ -112,7 +124,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
                 var rawOutput = CombinedOutput(result, out _);
                 var parserInput = TruncatedOutput(result.Stdout, out var parserInputWasTruncated);
-                rawParts.Add($"## {language}:{projectDirectory}\n{rawOutput}");
+                AppendRawPart(rawParts, $"## {language}:{projectDirectory}\n{rawOutput}", ref rawOutputChars, ref rawOutputTruncated);
 
                 if (IsMissingScannerTool(scanner, result))
                 {
@@ -144,6 +156,13 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             }
         }
 
+        if (rawOutputTruncated)
+            allFindings.Add(new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Info,
+                Title: "CVE scanner raw output truncated",
+                Description: $"Combined CVE scanner raw output exceeded {MaxRawOutputChars} characters and was truncated before storage."));
+
         var hasError = allFindings.Any(f => f.Severity == AuditSeverity.Error);
         return new AuditResult(!hasError, allFindings, RawOutput: string.Join("\n\n", rawParts));
     }
@@ -169,28 +188,32 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         }
     }
 
+    private static string NormalizeScannerLanguage(string language)
+        => language.ToLowerInvariant() switch
+        {
+            "javascript" or "typescript" => "node",
+            _ => language,
+        };
+
     private static IEnumerable<AuditFinding> ParsePythonFindings(string output)
     {
         using var doc = TryParseJson(output);
         if (doc is null) yield break;
 
-        foreach (var dep in EnumerateArraysNamed(doc.RootElement, "dependencies"))
+        foreach (var item in EnumeratePythonDependencyItems(doc.RootElement))
         {
-            foreach (var item in dep.EnumerateArray())
-            {
-                var package = GetString(item, "name") ?? "unknown";
-                var version = GetString(item, "version") ?? "?";
-                if (!item.TryGetProperty("vulns", out var vulns) && !item.TryGetProperty("vulnerabilities", out vulns))
-                    continue;
-                if (vulns.ValueKind != JsonValueKind.Array)
-                    continue;
+            var package = GetString(item, "name") ?? "unknown";
+            var version = GetString(item, "version") ?? "?";
+            if (!item.TryGetProperty("vulns", out var vulns) && !item.TryGetProperty("vulnerabilities", out vulns))
+                continue;
+            if (vulns.ValueKind != JsonValueKind.Array)
+                continue;
 
-                foreach (var vuln in vulns.EnumerateArray())
-                {
-                    var id = GetString(vuln, "id") ?? GetString(vuln, "vulnerability_id") ?? "vulnerability";
-                    var severity = GetSeverity(vuln, "severity") ?? "Unknown";
-                    yield return Finding(package, version, severity, id);
-                }
+            foreach (var vuln in vulns.EnumerateArray())
+            {
+                var id = GetString(vuln, "id") ?? GetString(vuln, "vulnerability_id") ?? "vulnerability";
+                var severity = GetSeverity(vuln, "severity") ?? "Unknown";
+                yield return Finding(package, version, severity, id);
             }
         }
 
@@ -201,6 +224,21 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             var id = GetString(vuln, "vulnerability_id") ?? GetString(vuln, "id") ?? "vulnerability";
             var severity = GetSeverity(vuln, "severity") ?? "Unknown";
             yield return Finding(package, version, severity, id);
+        }
+    }
+
+    private static IEnumerable<JsonElement> EnumeratePythonDependencyItems(JsonElement root)
+    {
+        if (root.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in root.EnumerateArray())
+                yield return item;
+        }
+
+        foreach (var dependencies in EnumerateArraysNamed(root, "dependencies"))
+        {
+            foreach (var item in dependencies.EnumerateArray())
+                yield return item;
         }
     }
 
@@ -710,6 +748,68 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Distinct(StringComparer.Ordinal)
             .ToList();
+
+    private static IReadOnlyList<string> TakeProjectDirectoriesWithinBudget(
+        string language,
+        IReadOnlyList<string> projectDirectories,
+        ref int remainingProjectDirectories,
+        List<AuditFinding> findings)
+    {
+        if (projectDirectories.Count == 0)
+            return [];
+
+        if (remainingProjectDirectories <= 0)
+        {
+            findings.Add(ProjectDirectoryLimitFinding(language, projectDirectories.Count, 0));
+            return [];
+        }
+
+        if (projectDirectories.Count <= remainingProjectDirectories)
+        {
+            remainingProjectDirectories -= projectDirectories.Count;
+            return projectDirectories;
+        }
+
+        var allowed = remainingProjectDirectories;
+        remainingProjectDirectories = 0;
+        findings.Add(ProjectDirectoryLimitFinding(language, projectDirectories.Count, allowed));
+        return projectDirectories.Take(allowed).ToList();
+    }
+
+    private static AuditFinding ProjectDirectoryLimitFinding(string language, int discoveredCount, int auditedCount)
+        => new(
+            AuditorName: "deps-cve-scan",
+            Severity: AuditSeverity.Error,
+            Title: $"{language} CVE scan discovered too many project directories",
+            Description: $"The {language} CVE scanner found {discoveredCount} project directories after the global CVE scanner budget was reached. Audited {auditedCount} of those directories and stopped to prevent repository-controlled scanner fan-out. The global maximum is {MaxProjectDirectories} project directories per run.");
+
+    private static void AppendRawPart(
+        List<string> rawParts,
+        string rawPart,
+        ref int rawOutputChars,
+        ref bool rawOutputTruncated)
+    {
+        if (rawOutputTruncated)
+            return;
+
+        var remaining = MaxRawOutputChars - rawOutputChars;
+        if (remaining <= 0)
+        {
+            rawOutputTruncated = true;
+            return;
+        }
+
+        if (rawPart.Length > remaining)
+        {
+            rawParts.Add(rawPart[..remaining]);
+            rawOutputChars += remaining;
+            rawOutputTruncated = true;
+            return;
+        }
+
+        rawParts.Add(rawPart);
+        rawOutputChars += rawPart.Length;
+    }
 
     private static string ResolveWorkingDirectory(string workingDirectory, string projectDirectory)
     {

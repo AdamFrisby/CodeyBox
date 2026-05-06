@@ -91,6 +91,23 @@ public sealed class LanguageDetectionTests
             i.WorkingDirectory.Contains($"{Path.DirectorySeparatorChar}node_modules{Path.DirectorySeparatorChar}", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task ExcessiveMarkerDirectories_AreCappedAndReportedAsError()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "python:test-pass");
+        var sandbox = new ManyMarkersSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.False(result.Passed);
+        Assert.Contains(result.Findings, f =>
+            f.Severity == AuditSeverity.Error &&
+            f.Title.Contains("too many project directories", StringComparison.Ordinal));
+        Assert.Equal(25, sandbox.Commands.Count(c => c == "pytest"));
+    }
+
     private static AuditContext FakeAuditContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
 
@@ -137,6 +154,27 @@ public sealed class LanguageDetectionTests
         {
             Commands.Add(string.Join(' ', exec.Argv));
             return Task.FromResult(new SandboxExecResult(2, "", "find failed"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class ManyMarkersSandbox : ISandbox
+    {
+        public List<string> Commands { get; } = [];
+        public string Id => "many-markers";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var command = string.Join(' ', exec.Argv);
+            Commands.Add(command);
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                var output = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./project-{i}")) + "\n";
+                return Task.FromResult(new SandboxExecResult(0, output, ""));
+            }
+
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
