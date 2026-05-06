@@ -54,7 +54,8 @@ internal static class ReleaseTestHelper
         ISandboxProvider? sandboxes = null,
         IGitHost? gitHost = null,
         IUpstreamRemoteFactory? upstreamFactory = null,
-        IChangelogGenerator? changelog = null)
+        IChangelogGenerator? changelog = null,
+        PipelineOptions? pipelineOptions = null)
     {
         return new ReleaseService(
             releaseStore,
@@ -68,7 +69,7 @@ internal static class ReleaseTestHelper
             upstreamFactory ?? new TestUpstreamFactory(),
             deepAuditors ?? [],
             changelog ?? new NullChangelogGenerator(),
-            new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
+            pipelineOptions ?? new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
             taskQueue ?? new InMemoryTaskQueue(),
             new NullHostApplicationLifetime(),
             NullLogger<ReleaseService>.Instance);
@@ -249,14 +250,21 @@ internal sealed class FixedUpstreamFactory : IUpstreamRemoteFactory
 internal sealed class ScriptedDeepAuditor : IDeepAuditor
 {
     private readonly Queue<AuditResult> _results;
+    private readonly AuditCapabilities _required;
 
     public string Name { get; }
     public string Kind => "test";
-    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditCapabilities Required => _required;
 
     public ScriptedDeepAuditor(string name, params AuditResult[] results)
+        : this(name, AuditCapabilities.None, results)
+    {
+    }
+
+    public ScriptedDeepAuditor(string name, AuditCapabilities required, params AuditResult[] results)
     {
         Name = name;
+        _required = required;
         _results = new Queue<AuditResult>(results);
     }
 

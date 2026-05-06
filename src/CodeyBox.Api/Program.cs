@@ -873,6 +873,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
     {
         SandboxImageReference = opts.SandboxImageReference,
         AgentAllowedHosts = opts.AgentAllowedHosts,
+        AuditToolAllowedHosts = opts.AuditToolAllowedHosts,
         UpstreamPushMaxAttempts = opts.UpstreamPushMaxAttempts,
         UpstreamPushBackoff = TimeSpan.FromSeconds(opts.UpstreamPushBackoffSeconds),
         HostGitIdentity = hostIdentity,
@@ -1036,6 +1037,21 @@ namespace CodeyBox.Api
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public string SandboxImageReference { get; set; } = "codeybox/agent:latest";
         public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com", "generativelanguage.googleapis.com"];
+        public string[] AuditToolAllowedHosts { get; set; } =
+        [
+            "api.nuget.org",
+            "www.nuget.org",
+            "pypi.org",
+            "files.pythonhosted.org",
+            "registry.npmjs.org",
+            "vuln.go.dev",
+            "proxy.golang.org",
+            "sum.golang.org",
+            "crates.io",
+            "index.crates.io",
+            "static.crates.io",
+            "github.com",
+        ];
         /// <summary>
         /// Legacy concurrency knob. If set, treated as
         /// <see cref="WorkerPool"/>.<see cref="WorkerPoolOptions.MaxConcurrentWorkers"/>

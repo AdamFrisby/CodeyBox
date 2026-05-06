@@ -45,15 +45,21 @@ public sealed class MultiLanguagePresetTests
     }
 
     [Fact]
-    public void JavaScriptAndTypeScriptLanguagesResolveCompatibilityAuditors()
+    public void JavaScriptAndTypeScriptLanguagesAreLoggedAndSkipped()
     {
-        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var logger = new CapturingLogger<ProjectAuditorComposer>();
+        var composer = new ProjectAuditorComposer(new PresetCatalog(), [], logger);
         var project = ProjectWithLanguages(["javascript", "typescript"]);
 
         var auditors = composer.Compose(project, new FakeAgent());
 
-        Assert.Contains(auditors, a => a.Name == "javascript:lint");
-        Assert.Contains(auditors, a => a.Name == "typescript:test-pass");
+        Assert.Empty(auditors);
+        Assert.Contains(logger.Entries, e =>
+            e.Level == LogLevel.Warning &&
+            e.Message.Contains("unsupported audit language 'javascript'", StringComparison.Ordinal));
+        Assert.Contains(logger.Entries, e =>
+            e.Level == LogLevel.Warning &&
+            e.Message.Contains("unsupported audit language 'typescript'", StringComparison.Ordinal));
     }
 
     private static Project ProjectWithLanguages(IReadOnlyList<string> languages) => new()

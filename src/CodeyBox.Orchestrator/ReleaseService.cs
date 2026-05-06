@@ -478,14 +478,12 @@ public sealed class ReleaseService
         var access = _gitHost.GetSandboxAccess(repoId);
 
         // Group auditors by capability (same pattern as per-PR audit).
-        var byGroup = auditors.GroupBy(a =>
-            a.Required.HasFlag(AuditCapabilities.AgentCredentials)
-                ? AuditCapabilities.AgentCredentials | AuditCapabilities.Network
-                : AuditCapabilities.None).ToList();
+        var byGroup = auditors.GroupBy(a => a.Required).ToList();
 
         foreach (var group in byGroup)
         {
             var needsCreds = group.Key.HasFlag(AuditCapabilities.AgentCredentials);
+            var needsNetwork = group.Key.HasFlag(AuditCapabilities.Network);
             AgentCredential? credential = null;
             IAgentRunner? runner = null;
 
@@ -509,7 +507,11 @@ public sealed class ReleaseService
                 Environment = env,
                 Network = new SandboxNetworkPolicy
                 {
-                    AllowedHosts = needsCreds ? _pipelineOpts.AgentAllowedHosts : [],
+                    AllowedHosts = needsNetwork
+                        ? needsCreds
+                            ? _pipelineOpts.AgentAllowedHosts
+                            : _pipelineOpts.AuditToolAllowedHosts
+                        : [],
                     HostGitEndpoint = access.Network.HostGitEndpoint,
                 },
                 WorkingDirectory = "/work",

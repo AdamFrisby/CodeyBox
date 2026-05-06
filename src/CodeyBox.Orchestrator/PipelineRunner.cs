@@ -1627,7 +1627,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 env[k] = v;
         }
 
-        var allowedHosts = allowAgentNetwork ? _opts.AgentAllowedHosts : Array.Empty<string>();
+        var allowedHosts = allowAgentNetwork
+            ? includeAgentCredential is null
+                ? _opts.AuditToolAllowedHosts
+                : _opts.AgentAllowedHosts
+            : Array.Empty<string>();
         var net = new SandboxNetworkPolicy
         {
             AllowedHosts = allowedHosts,
@@ -2151,6 +2155,7 @@ public sealed record PipelineOptions
 {
     public required string SandboxImageReference { get; init; }
     public IReadOnlyList<string> AgentAllowedHosts { get; init; } = [];
+    public IReadOnlyList<string> AuditToolAllowedHosts { get; init; } = [];
     public int UpstreamPushMaxAttempts { get; init; } = 5;
     public TimeSpan UpstreamPushBackoff { get; init; } = TimeSpan.FromSeconds(15);
     public HostGitIdentity? HostGitIdentity { get; init; }

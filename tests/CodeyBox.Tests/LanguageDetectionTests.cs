@@ -92,6 +92,49 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
+    public async Task CSharpDiscoveryIncludesStandaloneProjectWhenSolutionExistsElsewhere()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"cb-csharp-discovery-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "solution"));
+            Directory.CreateDirectory(Path.Combine(root, "standalone"));
+            await File.WriteAllTextAsync(Path.Combine(root, "solution", "App.sln"), "");
+            await File.WriteAllTextAsync(Path.Combine(root, "standalone", "Tool.csproj"), "<Project />");
+
+            using var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "sh",
+                    WorkingDirectory = root,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                },
+            };
+            process.StartInfo.ArgumentList.Add("-c");
+            process.StartInfo.ArgumentList.Add(LanguageProjectDiscovery.CSharpDiscoveryScript);
+
+            process.Start();
+            var stdout = await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            Assert.Equal(0, process.ExitCode);
+            Assert.Equal("", stderr);
+            var directories = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            Assert.Contains("./solution", directories);
+            Assert.Contains("./standalone", directories);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task ExcessiveMarkerDirectories_AreCappedAndReportedAsError()
     {
         var catalog = new PresetCatalog();

@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
 using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
@@ -136,6 +137,49 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         Assert.Contains(_webhooks.Events, e => e.Event == "release.failed");
     }
 
+    [Fact]
+    public async Task DeepAuditNetworkCapability_AllowsNetworkWithoutAgentCredentials()
+    {
+        var auditor = new ScriptedDeepAuditor(
+            AuditorName,
+            AuditCapabilities.Network,
+            new AuditResult(true, []));
+        var projects = new InMemoryProjectRepository(
+            ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1));
+        var autoCompleteQueue = new AutoCompleteTaskQueue(_workItemStore);
+        var sandboxes = new CapturingSandboxProvider();
+        var svc = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: autoCompleteQueue,
+            sandboxes: sandboxes,
+            gitHost: new DeepAuditTestGitHost(),
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "none",
+                AgentAllowedHosts = ["api.anthropic.com"],
+                AuditToolAllowedHosts = ["registry.npmjs.org"],
+            });
+
+        var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(rel);
+        var item = MakeWorkItem(rel.Id, WorkItemState.Done);
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+
+        var spec = Assert.Single(sandboxes.Specs);
+        Assert.Contains("registry.npmjs.org", spec.Network.AllowedHosts);
+        Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task<(ReleaseService svc, Release rel, WorkItem item)> SetupAsync(
@@ -187,4 +231,22 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         Agent = AgentKind.Claude,
         ReleaseId = releaseId,
     };
+
+    private sealed class CapturingSandboxProvider : ISandboxProvider
+    {
+        public List<SandboxSpec> Specs { get; } = [];
+        public string Name => "capturing";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            Specs.Add(spec);
+            return Task.FromResult<ISandbox>(new AlwaysSucceedSandbox());
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => Task.CompletedTask;
+    }
 }

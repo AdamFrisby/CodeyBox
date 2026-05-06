@@ -12,8 +12,6 @@ public static class ProjectAuditLanguages
             "node",
             "go",
             "rust",
-            "typescript",
-            "javascript",
         };
 
     public static bool IsSupported(string language)

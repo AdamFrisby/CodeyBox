@@ -6,6 +6,15 @@ namespace CodeyBox.Tests;
 public sealed class DepsCveScanLanguageDispatchTests
 {
     [Fact]
+    public void DeclaresNetworkCapability()
+    {
+        var auditor = new DepsCveScanDeepAuditor();
+
+        Assert.True(auditor.Required.HasFlag(AuditCapabilities.Network));
+        Assert.False(auditor.Required.HasFlag(AuditCapabilities.AgentCredentials));
+    }
+
+    [Fact]
     public async Task RunsScannerForEachDeclaredLanguageWithMarker()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
@@ -88,7 +97,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task JavaScriptAndTypeScriptDispatchToNodeScanner()
+    public async Task JavaScriptAndTypeScriptAreUnsupportedAndDoNotDispatchToNodeScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -102,7 +111,8 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Single(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
+        Assert.DoesNotContain(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
+        Assert.Empty(result.Findings);
     }
 
     [Fact]

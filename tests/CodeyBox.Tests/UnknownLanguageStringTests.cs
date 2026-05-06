@@ -33,7 +33,7 @@ public sealed class UnknownLanguageStringTests
     }
 
     [Fact]
-    public async Task ProjectRepositoryKeepsImplementedCompatibilityLanguageIds()
+    public async Task ProjectRepositoryLogsWarningAndSkipsUnsupportedCompatibilityLanguageIds()
     {
         var logger = new CapturingLogger<ProjectRepository>();
         var repo = new ProjectRepository(Options.Create(new ProjectsOptions
@@ -51,7 +51,13 @@ public sealed class UnknownLanguageStringTests
 
         var project = await repo.GetAsync(new ProjectId("alpha"));
 
-        Assert.Equal(["typescript", "javascript"], project!.Audit.Languages);
+        Assert.Empty(project!.Audit.Languages);
+        Assert.Contains(logger.Entries, e =>
+            e.Level == LogLevel.Warning &&
+            e.Message.Contains("unsupported audit language 'typescript'", StringComparison.Ordinal));
+        Assert.Contains(logger.Entries, e =>
+            e.Level == LogLevel.Warning &&
+            e.Message.Contains("unsupported audit language 'javascript'", StringComparison.Ordinal));
         Assert.Contains(logger.Entries, e =>
             e.Level == LogLevel.Warning &&
             e.Message.Contains("unsupported audit language 'ruby'", StringComparison.Ordinal));

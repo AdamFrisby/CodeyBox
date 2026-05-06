@@ -75,7 +75,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
     public string Name => "deps-cve-scan";
     public string Kind => "shell";
-    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditCapabilities Required => AuditCapabilities.Network;
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
@@ -85,7 +85,6 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     {
         var languages = (context.Languages ?? ProjectAuditLanguages.Default)
             .Where(ProjectAuditLanguages.IsSupported)
-            .Select(NormalizeScannerLanguage)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (languages.Count == 0)
@@ -199,13 +198,6 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             yield return Finding(package, resolved, severityText, advisoryUrl);
         }
     }
-
-    private static string NormalizeScannerLanguage(string language)
-        => language.ToLowerInvariant() switch
-        {
-            "javascript" or "typescript" => "node",
-            _ => language,
-        };
 
     private static IEnumerable<AuditFinding> ParsePythonFindings(string output)
     {
