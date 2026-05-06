@@ -37,12 +37,11 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 "dotnet SDK not installed in sandbox; CVE scan skipped",
                 "Install the .NET SDK in the sandbox image to enable C# CVE scanning.",
                 ParseDotnetFindings,
-                "'dotnet list package --vulnerable' exited with code {0}. Ensure a valid .NET solution or project file exists in the working directory.",
-                RunAtRepositoryRootWhenMarkersExist: true),
+                "'dotnet list package --vulnerable' exited with code {0}. Ensure a valid .NET solution or project file exists in the working directory."),
             ["python"] = new(
                 "python",
                 LanguageProjectDiscovery.PythonDiscoveryScript,
-                ["sh", "-c", "if command -v pip-audit >/dev/null 2>&1; then if [ -f requirements.txt ]; then exec pip-audit -f json -r requirements.txt; fi; exec pip-audit -f json .; fi; if command -v safety >/dev/null 2>&1; then if [ -f requirements.txt ]; then exec safety check -r requirements.txt --json; fi; exec safety scan --output json; fi; echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127"],
+                ["sh", "-c", "if [ ! -f requirements.txt ]; then echo 'No requirements.txt found; Python project-mode CVE scanning is disabled to avoid executing repository-controlled build backends.' >&2; exit 0; fi; if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json -r requirements.txt; fi; if command -v safety >/dev/null 2>&1; then exec safety check -r requirements.txt --json; fi; echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127"],
                 "pip-audit or safety not installed in sandbox; CVE scan skipped",
                 "Install pip-audit or safety in the sandbox image to enable Python CVE scanning.",
                 ParsePythonFindings,
@@ -53,6 +52,24 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 ["npm", "audit", "--json", "--registry", NpmAuditRegistry],
                 "npm not installed in sandbox; CVE scan skipped",
                 "Install Node.js/npm in the sandbox image to enable Node CVE scanning.",
+                ParseNpmFindings,
+                "npm audit exited with code {0} but no vulnerability records were parsed.",
+                NpmAuditEnvironment),
+            ["javascript"] = new(
+                "javascript",
+                LanguageProjectDiscovery.NodeDiscoveryScript,
+                ["npm", "audit", "--json", "--registry", NpmAuditRegistry],
+                "npm not installed in sandbox; CVE scan skipped",
+                "Install Node.js/npm in the sandbox image to enable JavaScript CVE scanning.",
+                ParseNpmFindings,
+                "npm audit exited with code {0} but no vulnerability records were parsed.",
+                NpmAuditEnvironment),
+            ["typescript"] = new(
+                "typescript",
+                LanguageProjectDiscovery.NodeDiscoveryScript,
+                ["npm", "audit", "--json", "--registry", NpmAuditRegistry],
+                "npm not installed in sandbox; CVE scan skipped",
+                "Install Node.js/npm in the sandbox image to enable TypeScript CVE scanning.",
                 ParseNpmFindings,
                 "npm audit exited with code {0} but no vulnerability records were parsed.",
                 NpmAuditEnvironment),
@@ -119,13 +136,11 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             }
 
             var projectDirectories = ParseProjectDirectories(discovery.Stdout);
-            var projectDirectoriesToRun = scanner.RunAtRepositoryRootWhenMarkersExist && projectDirectories.Count > 0
-                ? ["."]
-                : TakeProjectDirectoriesWithinBudget(
-                    language,
-                    projectDirectories,
-                    ref remainingProjectDirectories,
-                    allFindings);
+            var projectDirectoriesToRun = TakeProjectDirectoriesWithinBudget(
+                language,
+                projectDirectories,
+                ref remainingProjectDirectories,
+                allFindings);
 
             foreach (var projectDirectory in projectDirectoriesToRun)
             {
@@ -866,8 +881,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         string MissingToolDescription,
         Func<string, IEnumerable<AuditFinding>> Parse,
         string FailureDescription,
-        IReadOnlyDictionary<string, string>? ExtraEnvironment = null,
-        bool RunAtRepositoryRootWhenMarkersExist = false);
+        IReadOnlyDictionary<string, string>? ExtraEnvironment = null);
 
     private sealed record GoFindingRecord(string Package, string Id);
     private sealed record GoOsvRecord(string Id, string? Package, string? Severity);

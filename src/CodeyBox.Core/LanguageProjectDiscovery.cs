@@ -19,4 +19,10 @@ public static class LanguageProjectDiscovery
 
     public const string RustDiscoveryScript =
         "find . " + PruneExpression + " -name 'Cargo.toml' -exec dirname {} \\; | sort -u";
+
+    public const string RubyDiscoveryScript =
+        "find . " + PruneExpression + " \\( -name 'Gemfile' -o -name '*.gemspec' \\) -exec dirname {} \\; | sort -u";
+
+    public const string ShellDiscoveryScript =
+        "find . " + PruneExpression + " -name '*.sh' -exec dirname {} \\; | sort -u";
 }

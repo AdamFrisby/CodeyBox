@@ -32,8 +32,8 @@ at Warning level and does not affect the work item.
 | `work` | `git.push_back_to_bare_repo` | Pushing the work branch to the bare repo |
 | `rework` | same as `work` | Second (or later) work attempt after audit failure |
 | `audit` | `auditor.<name>` | Each auditor's full build + analysis run |
-| `audit` | `dotnet.build` | C# `dotnet build` phase parsed from auditor stdout |
-| `audit` | `dotnet.test_run` | C# `dotnet test` execution phase parsed from auditor stdout |
+| `audit` | `<language>.build` | Language build phase parsed from auditor stdout, for example `csharp.build` |
+| `audit` | `<language>.test_run` | Language test execution phase parsed from auditor stdout, for example `csharp.test_run` |
 | `audit` | `gitleaks.scan` | gitleaks scan phase parsed from auditor stdout |
 | `audit` | `semgrep.scan` | semgrep scan phase parsed from auditor stdout |
 | `merge` | `git.clone_into_sandbox` | Cloning the bare repo for the merge agent |

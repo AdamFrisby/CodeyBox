@@ -144,8 +144,11 @@ public sealed class DeepAuditConvergenceTests : IDisposable
             AuditorName,
             AuditCapabilities.Network,
             new AuditResult(true, []));
-        var projects = new InMemoryProjectRepository(
-            ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1));
+        var project = ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1) with
+        {
+            NetworkProfiles = new ProjectNetworkProfiles { AuditTool = "audit-tools" },
+        };
+        var projects = new InMemoryProjectRepository(project);
         var autoCompleteQueue = new AutoCompleteTaskQueue(_workItemStore);
         var sandboxes = new CapturingSandboxProvider();
         var svc = ReleaseTestHelper.BuildService(
@@ -177,6 +180,7 @@ public sealed class DeepAuditConvergenceTests : IDisposable
 
         var spec = Assert.Single(sandboxes.Specs);
         Assert.Contains("registry.npmjs.org", spec.Network.AllowedHosts);
+        Assert.Equal("audit-tools", spec.Network.ProfileName);
         Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
     }
 

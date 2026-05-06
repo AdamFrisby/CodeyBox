@@ -10,6 +10,8 @@ internal static class LanguagePresetHelpers
     public const string NodeMarkerScript = LanguageProjectDiscovery.NodeDiscoveryScript;
     public const string GoMarkerScript = LanguageProjectDiscovery.GoDiscoveryScript;
     public const string RustMarkerScript = LanguageProjectDiscovery.RustDiscoveryScript;
+    public const string RubyMarkerScript = LanguageProjectDiscovery.RubyDiscoveryScript;
+    public const string ShellMarkerScript = LanguageProjectDiscovery.ShellDiscoveryScript;
 
     public static IAuditor Shell(
         string language,
@@ -22,19 +24,6 @@ internal static class LanguagePresetHelpers
             markerDescription,
             markerScript,
             new ShellCommandAuditor(new ShellCommandAuditorOptions { Name = name, Argv = argv }));
-
-    public static IAuditor RepositoryRootShell(
-        string language,
-        string markerDescription,
-        string markerScript,
-        string name,
-        params string[] argv)
-        => new LanguagePresetAuditor(
-            language,
-            markerDescription,
-            markerScript,
-            new ShellCommandAuditor(new ShellCommandAuditorOptions { Name = name, Argv = argv }),
-            runAtRepositoryRootWhenMarkersExist: true);
 
     public static IAuditor ShellScript(
         string language,

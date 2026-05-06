@@ -50,8 +50,12 @@ public sealed class LanguageDetectionTests
     [InlineData("csharp", "csharp:format-check")]
     [InlineData("python", "python:format-check")]
     [InlineData("node", "node:lint")]
+    [InlineData("javascript", "javascript:lint")]
+    [InlineData("typescript", "typescript:lint")]
     [InlineData("go", "go:vet")]
     [InlineData("rust", "rust:lint")]
+    [InlineData("ruby", "ruby:lint")]
+    [InlineData("shell", "shell:lint")]
     public void SupportedLanguagePresetsResolveExpectedAuditors(string language, string auditorName)
     {
         var catalog = new PresetCatalog();
@@ -80,7 +84,7 @@ public sealed class LanguageDetectionTests
 
         Assert.Contains(sandbox.Invocations, i =>
             i.Command == "dotnet build --no-incremental /warnaserror" &&
-            i.WorkingDirectory == fixture);
+            i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}csharp", StringComparison.Ordinal));
         Assert.Contains(sandbox.Invocations, i =>
             i.Command == "pytest" &&
             i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}python", StringComparison.Ordinal));
@@ -152,7 +156,7 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
-    public async Task CSharpExcessiveMarkerDirectories_RunOnceAtRepositoryRoot()
+    public async Task CSharpExcessiveMarkerDirectories_AreCappedAndReportedAsError()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
@@ -161,11 +165,11 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.True(result.Passed);
-        Assert.DoesNotContain(result.Findings, f =>
+        Assert.False(result.Passed);
+        Assert.Contains(result.Findings, f =>
             f.Severity == AuditSeverity.Error &&
             f.Title.Contains("too many project directories", StringComparison.Ordinal));
-        Assert.Equal(1, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
+        Assert.Equal(25, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
     }
 
     private static AuditContext FakeAuditContext() =>

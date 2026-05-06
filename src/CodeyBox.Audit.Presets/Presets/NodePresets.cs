@@ -4,25 +4,32 @@ internal static class NodePresets
 {
     public static void Register(PresetCatalog catalog)
     {
-        catalog.RegisterLanguage("node", _ =>
+        RegisterNodeLike(catalog, "node");
+        RegisterNodeLike(catalog, "javascript");
+        RegisterNodeLike(catalog, "typescript");
+    }
+
+    private static void RegisterNodeLike(PresetCatalog catalog, string language)
+    {
+        catalog.RegisterLanguage(language, _ =>
         [
             LanguagePresetHelpers.Shell(
-                "node",
+                language,
                 "package.json",
                 LanguagePresetHelpers.NodeMarkerScript,
-                "node:format-check",
+                $"{language}:format-check",
                 "prettier", "--check", "."),
             LanguagePresetHelpers.Shell(
-                "node",
+                language,
                 "package.json",
                 LanguagePresetHelpers.NodeMarkerScript,
-                "node:lint",
+                $"{language}:lint",
                 "eslint", "."),
             LanguagePresetHelpers.Shell(
-                "node",
+                language,
                 "package.json",
                 LanguagePresetHelpers.NodeMarkerScript,
-                "node:test-pass",
+                $"{language}:test-pass",
                 "npm", "test"),
         ]);
     }

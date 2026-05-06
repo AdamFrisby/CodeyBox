@@ -172,9 +172,21 @@ internal static class WorkItemTimingsEndpoints
         || r.Step == "upstream.api_create_pr"
         || r.Step == "upstream.api_merge_pr"
         || r.Step.StartsWith("agent.tool_call.", StringComparison.Ordinal)
-        || r.Step.StartsWith("dotnet.", StringComparison.Ordinal)
+        || IsLanguageAuditSubStep(r.Step)
         || r.Step.StartsWith("gitleaks.", StringComparison.Ordinal)
         || r.Step.StartsWith("semgrep.", StringComparison.Ordinal);
+
+    private static bool IsLanguageAuditSubStep(string step)
+    {
+        var dot = step.IndexOf('.', StringComparison.Ordinal);
+        if (dot <= 0)
+            return false;
+
+        var language = step[..dot];
+        var subStep = step[(dot + 1)..];
+        return language is "csharp" or "python" or "node" or "javascript" or "typescript" or "go" or "rust" or "ruby" or "shell"
+            && subStep is "build" or "format" or "test_discovery" or "test_run";
+    }
 
     private static long Percentile(long[] sorted, double p)
     {

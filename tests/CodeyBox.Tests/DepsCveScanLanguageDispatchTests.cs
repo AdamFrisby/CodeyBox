@@ -31,11 +31,13 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.True(result.Passed);
         Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
         Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal));
+        Assert.DoesNotContain(sandbox.Commands, c => c.Contains("pip-audit -f json .", StringComparison.Ordinal));
+        Assert.DoesNotContain(sandbox.Commands, c => c.Contains("safety scan", StringComparison.Ordinal));
         Assert.Contains(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
         Assert.Contains(sandbox.ExtraEnvironments, e =>
             e.TryGetValue("NPM_CONFIG_REGISTRY", out var registry) &&
             registry == "https://registry.npmjs.org/");
-        Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo");
+        Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/csharp");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/python");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/node");
     }
@@ -60,7 +62,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task UnsetLanguagesDefaultToCSharpScanner()
+    public async Task UnsetLanguagesRunNoLanguageScanners()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -73,7 +75,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.DoesNotContain(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
         Assert.Empty(result.Findings);
     }
 
@@ -97,7 +99,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task JavaScriptAndTypeScriptAreUnsupportedAndDoNotDispatchToNodeScanner()
+    public async Task JavaScriptAndTypeScriptDispatchToNodeScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -111,7 +113,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.DoesNotContain(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
+        Assert.Equal(2, sandbox.Commands.Count(c => c == "npm audit --json --registry https://registry.npmjs.org/"));
         Assert.Empty(result.Findings);
     }
 
@@ -334,7 +336,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task CSharpExcessiveProjectDirectories_RunScannerOnceAtRepositoryRoot()
+    public async Task CSharpExcessiveProjectDirectories_AreCappedAndReportedAsError()
     {
         var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./csharp-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
@@ -348,12 +350,12 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
-        Assert.True(result.Passed);
-        Assert.DoesNotContain(result.Findings, f =>
+        Assert.False(result.Passed);
+        Assert.Contains(result.Findings, f =>
             f.Severity == AuditSeverity.Error &&
             f.Title.Contains("too many project directories", StringComparison.Ordinal));
-        Assert.Equal(1, sandbox.Commands.Count(c => c == "dotnet list package --vulnerable --include-transitive"));
-        Assert.Contains("/repo", sandbox.WorkingDirectories);
+        Assert.Equal(25, sandbox.Commands.Count(c => c == "dotnet list package --vulnerable --include-transitive"));
+        Assert.Contains("/repo/csharp-0", sandbox.WorkingDirectories);
     }
 
     [Fact]
