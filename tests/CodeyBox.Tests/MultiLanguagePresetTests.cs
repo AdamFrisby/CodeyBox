@@ -23,7 +23,7 @@ public sealed class MultiLanguagePresetTests
         var auditors = composer.Compose(project, new FakeAgent());
 
         Assert.Contains(auditors, a => a.Name == "csharp:build-WaE");
-        Assert.DoesNotContain(auditors, a => a.Name == "csharp:test-pass");
+        Assert.Contains(auditors, a => a.Name == "csharp:test-pass");
         Assert.Contains(auditors, a => a.Name == "python:test-pass");
         Assert.Contains(auditors, a => a.Name == "node:test-pass");
         Assert.DoesNotContain(auditors, a => a.Name.StartsWith("go:", StringComparison.Ordinal));

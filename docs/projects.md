@@ -708,8 +708,8 @@ release branch. Set to `0` to disable. Default: `720` (12 h).
 phase. Built-in values: `owasp-asvs`, `arch-coherence`, `deps-cve-scan`.
 `deps-cve-scan` dispatches by `Audit.Languages`: C# uses `dotnet list package
 --vulnerable --include-transitive`, Python uses `pip-audit` or `safety`, Node
-uses `npm audit --json`, Go uses `govulncheck -json ./...`, and Rust uses
-`cargo audit`.
+uses `npm audit --json --registry https://registry.npmjs.org/`, Go uses
+`govulncheck -json ./...`, and Rust uses `cargo audit`.
 Empty list = skip deep audit (transition directly to `released`).
 
 **`deepAuditMaxIterations`** — maximum number of deep audit iterations before

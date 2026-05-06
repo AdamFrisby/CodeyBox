@@ -17,5 +17,11 @@ internal static class CSharpPresets
                 LanguagePresetHelpers.CSharpMarkerScript,
                 "csharp:build-WaE",
                 "dotnet", "build", "--no-incremental", "/warnaserror"),
+            LanguagePresetHelpers.Shell(
+                "csharp",
+                "*.csproj/*.sln/*.slnx",
+                LanguagePresetHelpers.CSharpMarkerScript,
+                "csharp:test-pass",
+                "dotnet", "test", "--no-build"),
         ]);
 }

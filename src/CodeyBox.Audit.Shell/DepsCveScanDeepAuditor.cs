@@ -16,6 +16,16 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     private const int MaxScannerOutputChars = 1_000_000;
     private const int MaxProjectDirectories = 25;
     private const int MaxRawOutputChars = 1_000_000;
+    private const string NpmAuditRegistry = "https://registry.npmjs.org/";
+
+    private static readonly IReadOnlyDictionary<string, string> NpmAuditEnvironment =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["NPM_CONFIG_REGISTRY"] = NpmAuditRegistry,
+            ["NPM_CONFIG_AUDIT_REGISTRY"] = NpmAuditRegistry,
+            ["npm_config_registry"] = NpmAuditRegistry,
+            ["npm_config_audit_registry"] = NpmAuditRegistry,
+        };
 
     private static readonly IReadOnlyDictionary<string, Scanner> Scanners =
         new Dictionary<string, Scanner>(StringComparer.OrdinalIgnoreCase)
@@ -39,11 +49,12 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             ["node"] = new(
                 "node",
                 LanguageProjectDiscovery.NodeDiscoveryScript,
-                ["npm", "audit", "--json"],
+                ["npm", "audit", "--json", "--registry", NpmAuditRegistry],
                 "npm not installed in sandbox; CVE scan skipped",
                 "Install Node.js/npm in the sandbox image to enable Node CVE scanning.",
                 ParseNpmFindings,
-                "npm audit exited with code {0} but no vulnerability records were parsed."),
+                "npm audit exited with code {0} but no vulnerability records were parsed.",
+                NpmAuditEnvironment),
             ["go"] = new(
                 "go",
                 LanguageProjectDiscovery.GoDiscoveryScript,
@@ -120,6 +131,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 {
                     Argv = scanner.Argv,
                     WorkingDirectory = ResolveWorkingDirectory(workingDirectory, projectDirectory),
+                    ExtraEnvironment = scanner.ExtraEnvironment,
                 }, ct);
 
                 var rawOutput = CombinedOutput(result, out _);
@@ -858,7 +870,8 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         string MissingToolTitle,
         string MissingToolDescription,
         Func<string, IEnumerable<AuditFinding>> Parse,
-        string FailureDescription);
+        string FailureDescription,
+        IReadOnlyDictionary<string, string>? ExtraEnvironment = null);
 
     private sealed record GoFindingRecord(string Package, string Id);
     private sealed record GoOsvRecord(string Id, string? Package, string? Severity);

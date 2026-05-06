@@ -22,7 +22,10 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.True(result.Passed);
         Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
         Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal));
-        Assert.Contains(sandbox.Commands, c => c == "npm audit --json");
+        Assert.Contains(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
+        Assert.Contains(sandbox.ExtraEnvironments, e =>
+            e.TryGetValue("NPM_CONFIG_REGISTRY", out var registry) &&
+            registry == "https://registry.npmjs.org/");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/csharp");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/python");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/node");
@@ -99,7 +102,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Single(sandbox.Commands, c => c == "npm audit --json");
+        Assert.Single(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
     }
 
     [Fact]
@@ -120,7 +123,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("discovery failed", finding.Title);
-        Assert.DoesNotContain(sandbox.Commands, c => c == "npm audit --json");
+        Assert.DoesNotContain(sandbox.Commands, c => c.StartsWith("npm audit", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -541,6 +544,7 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         public List<string> Commands { get; } = [];
         public List<string> WorkingDirectories { get; } = [];
+        public List<IReadOnlyDictionary<string, string>> ExtraEnvironments { get; } = [];
         public string Id => "dispatch";
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
@@ -549,6 +553,8 @@ public sealed class DepsCveScanLanguageDispatchTests
             Commands.Add(command);
             if (exec.WorkingDirectory is not null)
                 WorkingDirectories.Add(exec.WorkingDirectory);
+            if (exec.ExtraEnvironment is not null)
+                ExtraEnvironments.Add(exec.ExtraEnvironment);
 
             if (exec.Argv.Count >= 2 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
             {
