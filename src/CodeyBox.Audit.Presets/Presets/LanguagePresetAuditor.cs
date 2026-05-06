@@ -4,7 +4,6 @@ namespace CodeyBox.Audit.Presets.Presets;
 
 internal sealed class LanguagePresetAuditor : IAuditor
 {
-    private const int MaxProjectDirectories = 25;
     private const int MaxRawOutputChars = 1_000_000;
 
     private readonly string _language;
@@ -70,20 +69,8 @@ internal sealed class LanguagePresetAuditor : IAuditor
         var passed = true;
         var rawOutputChars = 0;
         var rawOutputTruncated = false;
-        var projectDirectoriesToRun = projectDirectories;
 
-        if (projectDirectories.Count > MaxProjectDirectories)
-        {
-            passed = false;
-            projectDirectoriesToRun = projectDirectories.Take(MaxProjectDirectories).ToList();
-            allFindings.Add(new AuditFinding(
-                AuditorName: Name,
-                Severity: AuditSeverity.Error,
-                Title: $"{_language} preset discovered too many project directories",
-                Description: $"The {_language} preset found {projectDirectories.Count} project directories, which exceeds the maximum of {MaxProjectDirectories}. Only the first {MaxProjectDirectories} were audited to prevent repository-controlled auditor fan-out."));
-        }
-
-        foreach (var projectDirectory in projectDirectoriesToRun)
+        foreach (var projectDirectory in SelectProjectDirectoriesToRun(projectDirectories))
         {
             var result = await _inner.RunAsync(
                 sandbox,
@@ -112,6 +99,15 @@ internal sealed class LanguagePresetAuditor : IAuditor
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Distinct(StringComparer.Ordinal)
             .ToList();
+
+    private IReadOnlyList<string> SelectProjectDirectoriesToRun(IReadOnlyList<string> projectDirectories)
+    {
+        if (string.Equals(_language, "csharp", StringComparison.OrdinalIgnoreCase) &&
+            projectDirectories.Contains(".", StringComparer.Ordinal))
+            return ["."];
+
+        return projectDirectories;
+    }
 
     private static void AppendRawPart(
         List<string> rawParts,

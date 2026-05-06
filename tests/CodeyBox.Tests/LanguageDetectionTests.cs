@@ -137,7 +137,7 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
-    public async Task ExcessiveMarkerDirectories_AreCappedAndReportedAsError()
+    public async Task ManyMarkerDirectories_AreAllAudited()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
@@ -146,15 +146,13 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.False(result.Passed);
-        Assert.Contains(result.Findings, f =>
-            f.Severity == AuditSeverity.Error &&
-            f.Title.Contains("too many project directories", StringComparison.Ordinal));
-        Assert.Equal(25, sandbox.Commands.Count(c => c == "pytest"));
+        Assert.True(result.Passed);
+        Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
+        Assert.Equal(40, sandbox.Commands.Count(c => c == "pytest"));
     }
 
     [Fact]
-    public async Task CSharpExcessiveMarkerDirectories_AreCappedAndReportedAsError()
+    public async Task CSharpManyMarkerDirectories_AreAllAudited()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
@@ -163,11 +161,25 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.False(result.Passed);
-        Assert.Contains(result.Findings, f =>
-            f.Severity == AuditSeverity.Error &&
-            f.Title.Contains("too many project directories", StringComparison.Ordinal));
-        Assert.Equal(25, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
+        Assert.True(result.Passed);
+        Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
+        Assert.Equal(40, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
+    }
+
+    [Fact]
+    public async Task CSharpRootMarker_RunsOnceFromRepositoryRoot()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:build-WaE");
+        var sandbox = new ManyMarkersSandbox(includeRootMarker: true);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.True(result.Passed);
+        Assert.Equal(1, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
+        Assert.Contains("/repo", sandbox.WorkingDirectories);
+        Assert.DoesNotContain("/repo/project-0", sandbox.WorkingDirectories);
     }
 
     private static AuditContext FakeAuditContext() =>
@@ -223,16 +235,31 @@ public sealed class LanguageDetectionTests
 
     private sealed class ManyMarkersSandbox : ISandbox
     {
+        private readonly bool _includeRootMarker;
+
+        public ManyMarkersSandbox(bool includeRootMarker = false)
+        {
+            _includeRootMarker = includeRootMarker;
+        }
+
         public List<string> Commands { get; } = [];
+        public List<string> WorkingDirectories { get; } = [];
         public string Id => "many-markers";
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             var command = string.Join(' ', exec.Argv);
             Commands.Add(command);
+            if (exec.WorkingDirectory is not null)
+                WorkingDirectories.Add(exec.WorkingDirectory);
+
             if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
             {
-                var output = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./project-{i}")) + "\n";
+                var directories = Enumerable.Range(0, 40).Select(i => $"./project-{i}");
+                if (_includeRootMarker)
+                    directories = directories.Prepend(".");
+
+                var output = string.Join('\n', directories) + "\n";
                 return Task.FromResult(new SandboxExecResult(0, output, ""));
             }
 

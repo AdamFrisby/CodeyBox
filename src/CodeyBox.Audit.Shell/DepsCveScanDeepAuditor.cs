@@ -14,7 +14,6 @@ namespace CodeyBox.Audit.Shell;
 public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 {
     private const int MaxScannerOutputChars = 1_000_000;
-    private const int MaxProjectDirectories = 25;
     private const int MaxRawOutputChars = 1_000_000;
     private const string NuGetAuditSource = "https://api.nuget.org/v3/index.json";
     private const string CSharpUnsafeSourceMarker = "CODEYBOX_UNSAFE_NUGET_DEPENDENCY_SOURCE";
@@ -279,7 +278,6 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         var rawParts = new List<string>();
         var rawOutputChars = 0;
         var rawOutputTruncated = false;
-        var remainingProjectDirectories = MaxProjectDirectories;
 
         foreach (var language in languages)
         {
@@ -303,13 +301,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             }
 
             var projectDirectories = ParseProjectDirectories(discovery.Stdout);
-            var projectDirectoriesToRun = TakeProjectDirectoriesWithinBudget(
-                language,
-                projectDirectories,
-                ref remainingProjectDirectories,
-                allFindings);
-
-            foreach (var projectDirectory in projectDirectoriesToRun)
+            foreach (var projectDirectory in SelectProjectDirectoriesToRun(language, projectDirectories))
             {
                 var result = await sandbox.ExecAsync(new SandboxExec
                 {
@@ -384,7 +376,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     }
 
     private static IReadOnlyList<string> ResolveLanguages(IReadOnlyList<string>? languages)
-        => languages ?? [];
+        => languages ?? ProjectAuditLanguages.Default;
 
     private static IEnumerable<AuditFinding> ParseDotnetFindings(string output)
     {
@@ -961,39 +953,14 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
-    private static IReadOnlyList<string> TakeProjectDirectoriesWithinBudget(
-        string language,
-        IReadOnlyList<string> projectDirectories,
-        ref int remainingProjectDirectories,
-        List<AuditFinding> findings)
+    private static IReadOnlyList<string> SelectProjectDirectoriesToRun(string language, IReadOnlyList<string> projectDirectories)
     {
-        if (projectDirectories.Count == 0)
-            return [];
+        if (string.Equals(language, "csharp", StringComparison.OrdinalIgnoreCase) &&
+            projectDirectories.Contains(".", StringComparer.Ordinal))
+            return ["."];
 
-        if (remainingProjectDirectories <= 0)
-        {
-            findings.Add(ProjectDirectoryLimitFinding(language, projectDirectories.Count, 0));
-            return [];
-        }
-
-        if (projectDirectories.Count <= remainingProjectDirectories)
-        {
-            remainingProjectDirectories -= projectDirectories.Count;
-            return projectDirectories;
-        }
-
-        var allowed = remainingProjectDirectories;
-        remainingProjectDirectories = 0;
-        findings.Add(ProjectDirectoryLimitFinding(language, projectDirectories.Count, allowed));
-        return projectDirectories.Take(allowed).ToList();
+        return projectDirectories;
     }
-
-    private static AuditFinding ProjectDirectoryLimitFinding(string language, int discoveredCount, int auditedCount)
-        => new(
-            AuditorName: "deps-cve-scan",
-            Severity: AuditSeverity.Error,
-            Title: $"{language} CVE scan discovered too many project directories",
-            Description: $"The {language} CVE scanner found {discoveredCount} project directories after the global CVE scanner budget was reached. Audited {auditedCount} of those directories and stopped to prevent repository-controlled scanner fan-out. The global maximum is {MaxProjectDirectories} project directories per run.");
 
     private static void AppendRawPart(
         List<string> rawParts,
