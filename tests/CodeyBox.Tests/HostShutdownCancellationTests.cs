@@ -196,7 +196,7 @@ internal sealed class BlockingAgentRunner : IAgentRunner
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default,
-        Action<string>? stdoutChunkCallback = null)
+        Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
     {
         await Task.Delay(Timeout.Infinite, ct);
         return new AgentResult(false, "unreachable", null, null);

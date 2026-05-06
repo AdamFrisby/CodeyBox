@@ -263,7 +263,7 @@ internal sealed class RecordingAgent : IAgentRunner
     }
 
     public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt,
-        AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
+        AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
     {
         if (!prompt.StartsWith("# Merge task", StringComparison.Ordinal))
             WorkInvocations++;

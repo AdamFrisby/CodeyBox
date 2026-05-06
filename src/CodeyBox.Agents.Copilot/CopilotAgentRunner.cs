@@ -14,7 +14,12 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
 
     public string Binary { get; init; } = "copilot";
 
-    protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null)
+    protected override AgentInvocation BuildInvocation(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
     {
         // The Copilot CLI accepts a one-shot prompt with `-p`. Argument shape
         // may need adjusting per Copilot CLI version; centralised here so

@@ -72,7 +72,9 @@ internal static class TestSupport
         int maxLlmAuditorParallelism = 3,
         ProjectUpstream? upstream = null,
         IUpstreamRemoteFactory? upstreamFactory = null,
-        PipelineOptions? pipelineOptions = null)
+        PipelineOptions? pipelineOptions = null,
+        IAgentStreamStore? agentStreams = null,
+        ITimingStore? timingStore = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -125,7 +127,9 @@ internal static class TestSupport
             new NullWebhookDispatcher(),
             resolvedOptions,
             NullLogger<PipelineRunner>.Instance,
-            auditReports: auditReportStore);
+            timingStore: timingStore,
+            auditReports: auditReportStore,
+            agentStreams: agentStreams);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }
@@ -207,10 +211,15 @@ internal enum MergeStrategy
 /// File-write contents are consumed in order; provide one entry per
 /// expected work-phase (or rework-phase) invocation.
 /// </summary>
-internal sealed partial class ScriptedAgent : IAgentRunner
+internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
+    public Queue<string> StdoutChunks { get; } = new();
+    public Queue<IReadOnlyList<string>> StdoutChunkBatches { get; } = new();
+    public List<bool> CaptureStructuredStreamCalls { get; } = new();
+    public int StructuredStreamSupportProbeCount { get; private set; }
+    public string? ResultStdout { get; set; }
     public AgentKind Kind { get; init; } = AgentKind.Claude;
 
     public ScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
@@ -218,8 +227,27 @@ internal sealed partial class ScriptedAgent : IAgentRunner
         _mergeStrategies = new Queue<MergeStrategy>(mergeStrategies);
     }
 
-    public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null)
+    public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
+        StructuredStreamSupportProbeCount++;
+        return Task.FromResult(true);
+    }
+
+    public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
+    {
+        CaptureStructuredStreamCalls.Add(captureStructuredStream);
+
+        if (StdoutChunkBatches.Count > 0)
+        {
+            foreach (var chunk in StdoutChunkBatches.Dequeue())
+                stdoutChunkCallback?.Invoke(chunk);
+        }
+        else
+        {
+            while (StdoutChunks.Count > 0)
+                stdoutChunkCallback?.Invoke(StdoutChunks.Dequeue());
+        }
+
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
         {
             return await HandleMergeAsync(sandbox, workingDirectory, prompt, ct);
@@ -239,7 +267,7 @@ internal sealed partial class ScriptedAgent : IAgentRunner
             Stdin = fw.Contents,
         }, ct);
         return r.Success
-            ? new AgentResult(true, "ok", null, null)
+            ? new AgentResult(true, "ok", ResultStdout, null)
             : new AgentResult(false, "fail", r.Stdout, r.Stderr);
     }
 

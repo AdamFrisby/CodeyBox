@@ -270,6 +270,49 @@ suffix is appended when the original exceeded the cap.
 * Returns `404 Not Found` when the work item, iteration, or auditor row
   does not exist, or when `raw_output` is `NULL` for that row.
 
+### Agent Streams
+
+Structured agent stdout streams are captured when
+`CodeyBox:AgentStreams:Enabled=true`. See
+[`agent-streams.md`](agent-streams.md) for capture semantics and CLI flag
+support.
+
+#### `GET /workitems/{id}/agent-streams`
+
+Lists captured stream files for a work item. The endpoint returns at most 100
+files by default; pass `limit` to request fewer or up to 500 files. `lineCount`
+is `null` by default to avoid scanning every stream file; pass
+`includeLineCount=true` when the caller needs it.
+
+```json
+[
+  {
+    "fileName": "audit-llm-security:llm-review-3-d4e5f6.jsonl",
+    "phase": "audit-llm-security:llm-review",
+    "iteration": 3,
+    "sizeBytes": 18432,
+    "lineCount": null,
+    "capturedAt": "2026-05-06T02:15:30+00:00"
+  }
+]
+```
+
+Returns `404 Not Found` if the work item does not exist. Returns an empty array
+when no stream files have been captured.
+
+#### `GET /workitems/{id}/agent-streams/{fileName}`
+
+Streams a captured `.jsonl` file as `application/x-ndjson`.
+
+`{fileName}` must be one of the file names returned by the list endpoint, for
+example:
+
+```text
+GET /workitems/abc12345-0000-0000-0000-000000000000/agent-streams/work-1-a1b2c3.jsonl
+```
+
+Returns `404 Not Found` when the work item or file does not exist.
+
 ### `GET /workitems/{id}/costs`
 
 Returns token usage and estimated cost data for a single work item, aggregated

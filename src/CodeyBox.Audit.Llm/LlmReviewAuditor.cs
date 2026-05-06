@@ -47,7 +47,8 @@ public sealed class LlmReviewAuditor : IAuditor
         // falling back to the baked-in runner from options (backwards compat).
         var agent = context.AuditRunner ?? _opts.Agent;
         var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, context.AuditCredential, modelId: null, reasoningMode: null, ct,
-            stdoutChunkCallback: context.StdoutChunkCallback);
+            stdoutChunkCallback: context.StdoutChunkCallback,
+            captureStructuredStream: context.CaptureStructuredStream);
 
         // The pipeline already populates SandboxSpec.Environment with the
         // agent credential (set on the container at boot). Passing the same

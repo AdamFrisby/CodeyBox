@@ -54,6 +54,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? _costExtractors;
     private readonly AgentCostCalculator? _costCalculator;
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
+    private readonly IAgentStreamStore? _agentStreams;
     // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
     // Null when no probes were provided (fail-open: no quota gate on audit agent).
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
@@ -101,7 +102,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? costExtractors = null,
         AgentCostCalculator? costCalculator = null,
         IWorkItemQuestionStore? questionStore = null,
-        IStdoutBroadcaster? stdoutBroadcaster = null)
+        IStdoutBroadcaster? stdoutBroadcaster = null,
+        IAgentStreamStore? agentStreams = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -119,6 +121,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _costExtractors = costExtractors;
         _costCalculator = costCalculator;
         _stdoutBroadcaster = stdoutBroadcaster;
+        _agentStreams = agentStreams;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -503,15 +506,26 @@ public sealed class PipelineRunner : IPipelineRunner
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
             log: _log,
             activitySource: CodeyBoxActivities.Pipeline);
-        Action<string>? stdoutCallback = _stdoutBroadcaster is { } broadcaster
-            ? chunk => broadcaster.BroadcastChunk(item.Id, agentPhase, chunk)
+        var canCaptureStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, agentPhase, ct);
+        var streamCapture = canCaptureStructuredStream
+            ? await BeginAgentStreamCaptureAsync(item.Id, agentPhase, iteration ?? 1, ct)
             : null;
+        var stdoutCallback = BuildStdoutCallback(item.Id, agentPhase, streamCapture);
 
         AgentResult agentResult;
-        await using (agentExecScope)
+        try
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct,
-                stdoutChunkCallback: stdoutCallback);
+            await using (agentExecScope)
+            {
+                agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct,
+                    stdoutChunkCallback: stdoutCallback,
+                    captureStructuredStream: streamCapture is not null);
+            }
+        }
+        finally
+        {
+            if (streamCapture is not null)
+                await streamCapture.DisposeAsync();
         }
         CodeyBoxMeters.AgentDuration.Record(agentExecScope.ElapsedMs,
             new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
@@ -519,7 +533,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var agentEndedAt = DateTimeOffset.UtcNow;
         var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
-        await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
+        if (streamCapture is null)
+            await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt);
         agentSw.Stop();
@@ -636,6 +651,72 @@ public sealed class PipelineRunner : IPipelineRunner
         log.LogInformation(
             "Agent {Kind} finished: success={Success} exit={Summary}\nstdout-tail:\n{StdoutTail}\nstderr-tail:\n{StderrTail}",
             kind.Value, result.Success, result.Summary, Display(Tail(result.Stdout)), Display(Tail(result.Stderr)));
+    }
+
+    private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
+        WorkItemId workItemId,
+        string phase,
+        int iteration,
+        CancellationToken ct)
+    {
+        if (_agentStreams is null)
+            return null;
+        return await _agentStreams.BeginCaptureAsync(workItemId, phase, iteration, ct);
+    }
+
+    private async Task<bool> CanCaptureStructuredStreamAsync(
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string phase,
+        CancellationToken ct)
+    {
+        if (_agentStreams is null || !_agentStreams.Options.Enabled)
+            return false;
+
+        if (runner is not IStructuredStreamAgentRunner structuredRunner)
+        {
+            _log.LogWarning(
+                "Agent {AgentKind} does not support structured stream capture; skipping stream file for phase {Phase}",
+                runner.Kind.Value,
+                phase);
+            return false;
+        }
+
+        try
+        {
+            if (await structuredRunner.SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false))
+                return true;
+
+            _log.LogWarning(
+                "Agent {AgentKind} structured stream flag is unavailable; skipping stream file for phase {Phase}",
+                runner.Kind.Value,
+                phase);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _log.LogWarning(
+                ex,
+                "Failed to verify structured stream support for agent {AgentKind}; skipping stream file for phase {Phase}",
+                runner.Kind.Value,
+                phase);
+        }
+
+        return false;
+    }
+
+    private Action<string>? BuildStdoutCallback(
+        WorkItemId workItemId,
+        string phase,
+        AgentStreamCapture? streamCapture)
+    {
+        if (_stdoutBroadcaster is null && streamCapture is null)
+            return null;
+
+        return chunk =>
+        {
+            _stdoutBroadcaster?.BroadcastChunk(workItemId, phase, chunk);
+            streamCapture?.WriteChunk(chunk);
+        };
     }
 
     private async Task<bool> RunAuditLoopAsync(
@@ -865,21 +946,44 @@ public sealed class PipelineRunner : IPipelineRunner
         _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
         var startedAt = DateTimeOffset.UtcNow;
         var sw = Stopwatch.StartNew();
+        var auditPhase = $"audit-llm-{auditor.Name}";
+        var canCaptureStructuredStream = auditor.Kind == "llm"
+            && await CanCaptureStructuredStreamAsync(runner, sandbox, auditPhase, ct);
+        var streamCapture = canCaptureStructuredStream
+            ? await BeginAgentStreamCaptureAsync(ctx.WorkItemId, auditPhase, ctx.Iteration, ct)
+            : null;
+        var stdoutCallback = auditor.Kind == "llm"
+            ? BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture)
+            : null;
         // Thread the resolved runner into the context so LlmReviewAuditor
         // can use the cross-review agent instead of its baked-in default.
-        var auditorCtx = ctx with { AuditRunner = runner, AuditCredential = credential };
+        var auditorCtx = ctx with
+        {
+            AuditRunner = runner,
+            AuditCredential = credential,
+            StdoutChunkCallback = stdoutCallback,
+            CaptureStructuredStream = streamCapture is not null,
+        };
         var timingScope = await TimingScope.BeginAsync(
             _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
             iteration: ctx.Iteration,
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
             log: _log);
         AuditResult result;
-        await using (timingScope)
+        try
         {
-            result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+            await using (timingScope)
+            {
+                result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
+            }
+        }
+        finally
+        {
+            if (streamCapture is not null)
+                await streamCapture.DisposeAsync();
         }
         sw.Stop();
-        return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs);
+        return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs, streamCapture is not null);
     }
 
     /// <summary>
@@ -903,8 +1007,11 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         await EmitAuditorSubStepsAsync(run.Auditor.Name, run.Result.RawOutput,
             ctx.WorkItemId, ctx.Iteration, run.StartedAt);
-        await EmitToolCallCountsAsync(run.Result.RawOutput, ctx.WorkItemId, "audit",
-            run.ScopeElapsedMs, ct, iteration: ctx.Iteration);
+        if (!run.CapturedStructuredStream)
+        {
+            await EmitToolCallCountsAsync(run.Result.RawOutput, ctx.WorkItemId, "audit",
+                run.ScopeElapsedMs, ct, iteration: ctx.Iteration);
+        }
         var worstSeverity = run.Result.Findings.Count > 0
             ? ((AuditSeverity)run.Result.Findings.Max(f => (int)f.Severity)).ToString()
             : "none";
@@ -918,7 +1025,8 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditResult Result,
         DateTimeOffset StartedAt,
         TimeSpan Elapsed,
-        long ScopeElapsedMs);
+        long ScopeElapsedMs,
+        bool CapturedStructuredStream);
 
     private async Task PersistAuditReportAsync(
         AuditContext ctx,
@@ -1120,14 +1228,25 @@ public sealed class PipelineRunner : IPipelineRunner
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
             log: _log,
             activitySource: CodeyBoxActivities.Pipeline);
-        Action<string>? mergeStdoutCallback = _stdoutBroadcaster is { } mergeBroadcaster
-            ? chunk => mergeBroadcaster.BroadcastChunk(item.Id, "merge", chunk)
+        var canCaptureMergeStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "merge", ct);
+        var mergeStreamCapture = canCaptureMergeStructuredStream
+            ? await BeginAgentStreamCaptureAsync(item.Id, "merge", 1, ct)
             : null;
+        var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
         AgentResult agentResult;
-        await using (mergeExecScope)
+        try
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct,
-                stdoutChunkCallback: mergeStdoutCallback);
+            await using (mergeExecScope)
+            {
+                agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct,
+                    stdoutChunkCallback: mergeStdoutCallback,
+                    captureStructuredStream: mergeStreamCapture is not null);
+            }
+        }
+        finally
+        {
+            if (mergeStreamCapture is not null)
+                await mergeStreamCapture.DisposeAsync();
         }
         CodeyBoxMeters.AgentDuration.Record(mergeExecScope.ElapsedMs,
             new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
@@ -1135,7 +1254,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var mergeEndedAt = DateTimeOffset.UtcNow;
         var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecScope.ElapsedMs);
-        await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecScope.ElapsedMs, ct);
+        if (mergeStreamCapture is null)
+            await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecScope.ElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt);
         mergeSw.Stop();

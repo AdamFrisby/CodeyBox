@@ -61,6 +61,7 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
     var cbConf = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
         ?? new CodeyBoxOptions();
     var auditOpts = cbConf.AuditLog;
+    var agentStreamOpts = cbConf.AgentStreams;
 
     if (auditOpts.RetainedDays < 1)
         throw new InvalidOperationException("CodeyBox:AuditLog:RetainedDays must be >= 1");
@@ -89,6 +90,10 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
                 $"Audit log directory '{dir}' (from path '{logPath}') is not writable: {ex.Message}", ex);
         }
     }
+
+    AgentStreamsOptions.ValidateAtStartup(
+        agentStreamOpts,
+        LoggerFactory.Create(static b => b.AddSerilog(dispose: false)).CreateLogger("CodeyBox.AgentStreams"));
 
     Log.Logger = new LoggerConfiguration()
         .MinimumLevel.Information()
@@ -874,6 +879,18 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
     }
     return extractors;
 });
+builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentStreams;
+    AgentStreamsOptions.ValidateAtStartup(
+        opts,
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentStreams"));
+    return opts;
+});
+builder.Services.AddSingleton<IAgentStreamStore>(sp =>
+    new AgentStreamStore(
+        sp.GetRequiredService<AgentStreamsOptions>(),
+        sp.GetRequiredService<ILogger<AgentStreamStore>>()));
 
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
@@ -912,7 +929,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(),
     sp.GetRequiredService<AgentCostCalculator>(),
     sp.GetService<IWorkItemQuestionStore>(),
-    sp.GetRequiredService<IStdoutBroadcaster>()));
+    sp.GetRequiredService<IStdoutBroadcaster>(),
+    sp.GetService<IAgentStreamStore>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
@@ -938,7 +956,8 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     sp.GetRequiredService<PipelineOptions>(),
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IHostApplicationLifetime>(),
-    sp.GetRequiredService<ILogger<ReleaseService>>()));
+    sp.GetRequiredService<ILogger<ReleaseService>>(),
+    sp.GetService<IAgentStreamStore>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
@@ -978,6 +997,9 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
     sp.GetRequiredService<IAuditReportStore>(),
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog.RetainedDays,
     sp.GetRequiredService<ILogger<AuditReportRetentionService>>()));
+builder.Services.AddHostedService(sp => new AgentStreamRetentionService(
+    sp.GetRequiredService<IAgentStreamStore>(),
+    sp.GetRequiredService<ILogger<AgentStreamRetentionService>>()));
 builder.Services.AddHostedService(sp => new BudgetAlertService(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IWorkItemCostStore>(),
@@ -1015,6 +1037,7 @@ ProjectBudgetEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
+AgentStreamEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
 FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
@@ -1141,6 +1164,9 @@ namespace CodeyBox.Api
         /// Audit log configuration: rolling file paths, retention, and size caps.
         /// </summary>
         public AuditLogOptions AuditLog { get; set; } = new();
+
+        /// <summary>Structured agent stdout stream capture configuration.</summary>
+        public AgentStreamsOptions AgentStreams { get; set; } = new();
 
         /// <summary>
         /// Agent class definitions for quota-aware routing. Each class lists one or

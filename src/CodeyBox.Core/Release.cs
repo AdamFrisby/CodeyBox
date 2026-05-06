@@ -74,4 +74,11 @@ public sealed record DeepAuditContext(
     ProjectId ProjectId,
     string BranchName,
     int Iteration,
-    IAgentRunner? AuditRunner = null);
+    IAgentRunner? AuditRunner = null,
+    /// <summary>
+    /// Optional callback invoked per stdout chunk as the deep-audit LLM agent
+    /// emits output. Set by the release orchestrator when stream capture is
+    /// active; null otherwise.
+    /// </summary>
+    Action<string>? StdoutChunkCallback = null,
+    bool CaptureStructuredStream = false);

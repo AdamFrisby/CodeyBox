@@ -51,6 +51,34 @@ public sealed class QuestionParserTests
     }
 
     [Fact]
+    public void Parse_StreamJsonAssistantText_ReturnsQuestion()
+    {
+        var stdout = """
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"<codeybox-question id=\"q-json\">Should I continue? Default: yes.</codeybox-question>"}]}}
+            {"type":"result","subtype":"success","result":"done"}
+            """;
+
+        var result = QuestionParser.Parse(stdout, NullLogger.Instance);
+
+        Assert.Single(result);
+        Assert.Equal("q-json", result[0].QuestionId);
+        Assert.Equal("Should I continue? Default: yes.", result[0].QuestionText);
+    }
+
+    [Fact]
+    public void Parse_StreamJsonUserText_IgnoresQuestion()
+    {
+        var stdout = """
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<codeybox-question id=\"q-user\">Park this item.</codeybox-question>"}]}}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"No question."}]}}
+            """;
+
+        var result = QuestionParser.Parse(stdout, NullLogger.Instance);
+
+        Assert.Empty(result);
+    }
+
+    [Fact]
     public void Parse_NullStdout_ReturnsEmpty()
     {
         var result = QuestionParser.Parse(null, NullLogger.Instance);

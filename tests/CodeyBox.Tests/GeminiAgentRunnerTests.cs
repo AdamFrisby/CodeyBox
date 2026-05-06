@@ -274,12 +274,14 @@ internal sealed class CapturingSandbox : ISandbox
     private readonly int _exitCode;
     private readonly string _stdout;
     private readonly string _stderr;
+    private readonly string? _stdoutChunk;
 
-    public CapturingSandbox(int exitCode = 0, string stdout = "stdout", string stderr = "stderr")
+    public CapturingSandbox(int exitCode = 0, string stdout = "stdout", string stderr = "stderr", string? stdoutChunk = null)
     {
         _exitCode = exitCode;
         _stdout = stdout;
         _stderr = stderr;
+        _stdoutChunk = stdoutChunk;
     }
 
     public string Id => "fake";
@@ -288,6 +290,8 @@ internal sealed class CapturingSandbox : ISandbox
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
         CapturedExec = exec;
+        if (_stdoutChunk is not null)
+            exec.StdoutChunkCallback?.Invoke(_stdoutChunk);
         return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
     }
 

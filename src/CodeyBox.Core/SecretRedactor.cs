@@ -11,7 +11,7 @@ namespace CodeyBox.Core;
 public static class SecretRedactor
 {
     private static readonly Regex SecretPattern = new(
-        @"(?:gho_[A-Za-z0-9]+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]{35,})",
+        SensitiveDataRedactionEnricher.SecretValuePatternSource,
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     public static string Redact(string text) => SecretPattern.Replace(text, "***");
