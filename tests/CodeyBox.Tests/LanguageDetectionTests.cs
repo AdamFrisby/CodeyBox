@@ -29,6 +29,23 @@ public sealed class LanguageDetectionTests
         Assert.DoesNotContain(sandbox.Commands, c => c.Contains("pytest", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task DiscoveryFailure_ReportsErrorAndDoesNotRunTool()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "python:test-pass");
+        var sandbox = new DiscoveryFailureSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("discovery failed", finding.Title);
+        Assert.DoesNotContain(sandbox.Commands, c => c.Contains("pytest", StringComparison.Ordinal));
+    }
+
     [Theory]
     [InlineData("csharp", "csharp:format-check")]
     [InlineData("python", "python:format-check")]
@@ -70,6 +87,8 @@ public sealed class LanguageDetectionTests
         Assert.Contains(sandbox.Invocations, i =>
             i.Command == "npm test" &&
             i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}node", StringComparison.Ordinal));
+        Assert.DoesNotContain(sandbox.Invocations, i =>
+            i.WorkingDirectory.Contains($"{Path.DirectorySeparatorChar}node_modules{Path.DirectorySeparatorChar}", StringComparison.Ordinal));
     }
 
     private static AuditContext FakeAuditContext() =>
@@ -103,7 +122,21 @@ public sealed class LanguageDetectionTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Commands.Add(string.Join(' ', exec.Argv));
-            return Task.FromResult(new SandboxExecResult(1, "", ""));
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class DiscoveryFailureSandbox : ISandbox
+    {
+        public List<string> Commands { get; } = [];
+        public string Id => "discovery-failure";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            Commands.Add(string.Join(' ', exec.Argv));
+            return Task.FromResult(new SandboxExecResult(2, "", "find failed"));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

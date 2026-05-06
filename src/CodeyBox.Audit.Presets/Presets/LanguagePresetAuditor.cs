@@ -37,6 +37,13 @@ internal sealed class LanguagePresetAuditor : IAuditor
             WorkingDirectory = workingDirectory,
         }, ct);
 
+        if (discovery.ExitCode != 0)
+            return new AuditResult(false, [new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Error,
+                Title: $"{_language} preset discovery failed; treating as blocking",
+                Description: $"The {_language} preset could not discover project marker files. Discovery exited with code {discovery.ExitCode}. Stderr: {discovery.Stderr}")]);
+
         var projectDirectories = ParseProjectDirectories(discovery.Stdout);
         if (projectDirectories.Count > 0)
             return await RunInnerForProjectDirectoriesAsync(sandbox, workingDirectory, context, projectDirectories, ct);

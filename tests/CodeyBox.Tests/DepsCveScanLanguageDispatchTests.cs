@@ -48,7 +48,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task UnsetLanguagesRunNoLanguageScanners()
+    public async Task UnsetLanguagesDefaultToCSharpScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -61,8 +61,48 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
+        Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.Empty(result.Findings);
+    }
+
+    [Fact]
+    public async Task ExplicitEmptyLanguagesRunNoLanguageScanners()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: []);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.True(result.Passed);
         Assert.DoesNotContain(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
         Assert.Empty(result.Findings);
+    }
+
+    [Fact]
+    public async Task DiscoveryFailureReportsErrorAndDoesNotRunScanner()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, discoveryExitCode: 2);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["node"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("discovery failed", finding.Title);
+        Assert.DoesNotContain(sandbox.Commands, c => c == "npm audit --json");
     }
 
     [Fact]
@@ -319,17 +359,20 @@ public sealed class DepsCveScanLanguageDispatchTests
         private readonly bool _missingTool;
         private readonly bool _missingCargoAuditSubcommand;
         private readonly string _scannerStdout;
+        private readonly int _discoveryExitCode;
 
         public DispatchSandbox(
             bool markerPresent,
             bool missingTool = false,
             bool missingCargoAuditSubcommand = false,
-            string scannerStdout = "{}")
+            string scannerStdout = "{}",
+            int discoveryExitCode = 0)
         {
             _markerPresent = markerPresent;
             _missingTool = missingTool;
             _missingCargoAuditSubcommand = missingCargoAuditSubcommand;
             _scannerStdout = scannerStdout;
+            _discoveryExitCode = discoveryExitCode;
         }
 
         public List<string> Commands { get; } = [];
@@ -347,7 +390,10 @@ public sealed class DepsCveScanLanguageDispatchTests
             {
                 var script = exec.Argv[2];
                 if (script.Contains("find .", StringComparison.Ordinal))
-                    return Task.FromResult(new SandboxExecResult(0, _markerPresent ? DiscoveryOutput(script) : "", ""));
+                    return Task.FromResult(new SandboxExecResult(
+                        _discoveryExitCode,
+                        _markerPresent ? DiscoveryOutput(script) : "",
+                        _discoveryExitCode == 0 ? "" : "find failed"));
             }
 
             if (_missingTool)

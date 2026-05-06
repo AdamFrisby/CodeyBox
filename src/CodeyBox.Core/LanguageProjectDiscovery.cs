@@ -3,7 +3,7 @@ namespace CodeyBox.Core;
 public static class LanguageProjectDiscovery
 {
     private const string PruneExpression =
-        "-path './.git' -prune -o -path './node_modules' -prune -o -path './bin' -prune -o -path './obj' -prune -o";
+        "-type d \\( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \\) -prune -o";
 
     public const string CSharpDiscoveryScript =
         "solutionDirs=$(find . " + PruneExpression + " \\( -name '*.sln' -o -name '*.slnx' \\) -exec dirname {} \\; | sort -u); " +

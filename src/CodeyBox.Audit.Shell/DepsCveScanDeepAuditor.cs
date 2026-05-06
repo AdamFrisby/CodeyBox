@@ -70,7 +70,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         DeepAuditContext context,
         CancellationToken ct = default)
     {
-        var languages = (context.Languages ?? [])
+        var languages = (context.Languages ?? ProjectAuditLanguages.Default)
             .Where(ProjectAuditLanguages.IsSupported)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -90,6 +90,16 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 Argv = ["sh", "-c", scanner.MarkerScript],
                 WorkingDirectory = workingDirectory,
             }, ct);
+
+            if (discovery.ExitCode != 0)
+            {
+                allFindings.Add(new AuditFinding(
+                    AuditorName: Name,
+                    Severity: AuditSeverity.Error,
+                    Title: $"{language} CVE scan discovery failed; treating as blocking",
+                    Description: $"The {language} CVE scanner could not discover dependency project marker files. Discovery exited with code {discovery.ExitCode}. Stderr: {discovery.Stderr}"));
+                continue;
+            }
 
             var projectDirectories = ParseProjectDirectories(discovery.Stdout);
             foreach (var projectDirectory in projectDirectories)

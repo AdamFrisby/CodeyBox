@@ -141,7 +141,7 @@ foreach (var phase in pipelinePhases)
 // ── Assemble entry ────────────────────────────────────────────────────────────
 AuditEntry? auditEntry = null;
 {
-    IReadOnlyList<string>? langs = selectedLanguages;
+    IReadOnlyList<string>? langs = selectedLanguages.Count > 0 ? selectedLanguages : null;
     IReadOnlyList<string>? types = selectedAuditTypes.Count > 0 ? selectedAuditTypes : null;
     if (langs is not null || types is not null)
         auditEntry = new AuditEntry { Languages = langs, AuditTypes = types };
