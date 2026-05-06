@@ -184,6 +184,55 @@ public sealed class PipelineRunnerTests
         var prompt = PipelineRunner.BuildInitialWorkPrompt("do work");
         Assert.Contains("\n\n    Co-Authored-By:", prompt);
     }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_NoAuditors_OmitsPreflightSection()
+    {
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: null);
+        Assert.DoesNotContain("Before committing, run these checks", prompt);
+        prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: []);
+        Assert.DoesNotContain("Before committing, run these checks", prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_ShellAuditors_EmitsPreflightChecksWithArgv()
+    {
+        IReadOnlyList<IAuditor> auditors =
+        [
+            new FakeShellAuditor("csharp:format-check", ["dotnet", "format", "--verify-no-changes"]),
+            new FakeShellAuditor("csharp:build-WaE", ["dotnet", "build", "--no-incremental", "/warnaserror"]),
+            new FakeNonShellAuditor("security:llm-review"),
+        ];
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: auditors);
+        Assert.Contains("Before committing, run these checks", prompt);
+        Assert.Contains("`dotnet format --verify-no-changes`", prompt);
+        Assert.Contains("csharp:format-check", prompt);
+        Assert.Contains("`dotnet build --no-incremental /warnaserror`", prompt);
+        Assert.Contains("csharp:build-WaE", prompt);
+        // Non-shell auditors (LLM, diff-pattern) shouldn't surface as commands.
+        Assert.DoesNotContain("security:llm-review", prompt.Substring(prompt.IndexOf("Before committing")));
+    }
+
+    private sealed class FakeShellAuditor : IAuditor, IShellAuditorArgvProvider
+    {
+        public FakeShellAuditor(string name, IReadOnlyList<string> argv) { Name = name; Argv = argv; }
+        public string Name { get; }
+        public string Kind => "shell";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public IReadOnlyList<string> Argv { get; }
+        public Task<AuditResult> RunAsync(ISandbox _, string __, AuditContext ___, CancellationToken ____ = default)
+            => Task.FromResult(new AuditResult(true, []));
+    }
+
+    private sealed class FakeNonShellAuditor : IAuditor
+    {
+        public FakeNonShellAuditor(string name) { Name = name; }
+        public string Name { get; }
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
+        public Task<AuditResult> RunAsync(ISandbox _, string __, AuditContext ___, CancellationToken ____ = default)
+            => Task.FromResult(new AuditResult(true, []));
+    }
 }
 
 /// <summary>

@@ -12,7 +12,7 @@ namespace CodeyBox.Audit.Shell;
 /// sandbox. Operators concerned about a malicious build script reaching
 /// agent secrets should keep their checks in this auditor type.
 /// </summary>
-public sealed class ShellCommandAuditor : IAuditor
+public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 {
     private readonly ShellCommandAuditorOptions _opts;
 
@@ -25,6 +25,13 @@ public sealed class ShellCommandAuditor : IAuditor
     public string Name => _opts.Name;
     public string Kind => "shell";
     public AuditCapabilities Required => AuditCapabilities.None;
+
+    /// <summary>
+    /// The argv this auditor invokes. Exposed so the work-phase prompt builder
+    /// can advise the agent to run these checks itself before committing,
+    /// pre-empting iter-1 mechanical findings (format, lint, build-WaE).
+    /// </summary>
+    public IReadOnlyList<string> Argv => _opts.Argv;
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {

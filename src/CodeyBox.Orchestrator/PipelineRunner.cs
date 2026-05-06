@@ -223,6 +223,12 @@ public sealed class PipelineRunner : IPipelineRunner
             var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged;
             var skipMerge = entry is WorkItemState.Merged;
 
+            // Compose auditors up-front: the work-phase prompt advises the
+            // agent to run the mechanical (shell) auditors itself before
+            // committing, pre-empting iter-1 rework cycles for trivial
+            // findings (format, lint, build-WaE).
+            var auditors = _auditorComposer.Compose(project, agentRunner);
+
             // -------- Phase 1: Work --------
             if (!skipWork)
             {
@@ -233,7 +239,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     workCts.CancelAfter(item.WorkTimeout);
                     workAgentStdout = await RunWithStuckProbeAsync(item, project, agentKind, "work", workCts, ct, phaseCt =>
                         RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                            BuildInitialWorkPrompt(item.Prompt, project.AllowAgentQuestions), isInitial: true,
+                            BuildInitialWorkPrompt(item.Prompt, project.AllowAgentQuestions, auditors), isInitial: true,
                             networkProfile: project.NetworkProfiles.Work,
                             project: project,
                             phaseCt));
@@ -250,7 +256,6 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             // -------- Phase 1.5: Audit + rework loop --------
-            var auditors = _auditorComposer.Compose(project, agentRunner);
             if (auditors.Count > 0 && !skipAudit)
             {
                 var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct);
@@ -367,10 +372,36 @@ public sealed class PipelineRunner : IPipelineRunner
 
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
 
-    internal static string BuildInitialWorkPrompt(string userPrompt, bool allowAgentQuestions = false)
+    internal static string BuildInitialWorkPrompt(
+        string userPrompt,
+        bool allowAgentQuestions = false,
+        IReadOnlyList<IAuditor>? auditors = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.Append($"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
+
+        // Pre-flight self-check: surface the project's mechanical (shell-kind)
+        // auditors so the agent runs them before declaring done. This avoids
+        // a wasted full audit/rework cycle for trivial findings (format,
+        // lint, build-WaE) that the agent could fix in-place. Only includes
+        // auditors that come from <see cref="IShellAuditorArgvProvider"/> —
+        // language-agnostic by construction (rust → cargo clippy, csharp →
+        // dotnet format, etc., whatever the project's audit catalog provides).
+        var shellChecks = (auditors ?? [])
+            .OfType<IShellAuditorArgvProvider>()
+            .Select(a => (Name: ((IAuditor)a).Name, Argv: a.Argv))
+            .Where(x => x.Argv.Count > 0)
+            .ToList();
+        if (shellChecks.Count > 0)
+        {
+            sb.Append("\n\n## Before committing, run these checks yourself and fix any output\n\nThese are the mechanical auditors the orchestrator will run after your work phase. Running them yourself first means the audit phase passes cleanly on iter 1 instead of bouncing through 3-6 rework iterations for findings you could have caught locally:\n");
+            foreach (var (name, argv) in shellChecks)
+            {
+                var cmd = string.Join(' ', argv);
+                sb.Append($"\n- `{cmd}` — {name}");
+            }
+            sb.Append("\n\nIf any check exits non-zero, fix the underlying issue and rerun until all pass. Then commit.");
+        }
 
         if (allowAgentQuestions)
         {
