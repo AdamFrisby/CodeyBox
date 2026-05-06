@@ -1,4 +1,6 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -66,6 +68,20 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
             "claude-opus-4-7",
             TimeSpan.FromMinutes(10),
             DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void PipelineRunner_UsesConcreteRunnerDefaultForObservedFailureKey()
+    {
+        Assert.Equal(
+            "claude-opus-4-7",
+            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(), modelId: null));
+        Assert.Equal(
+            "gpt-5.5",
+            PipelineRunner.ResolveObservedModelId(new CodexAgentRunner(), modelId: null));
+        Assert.Equal(
+            "claude-sonnet-4-6",
+            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(), "claude-sonnet-4-6"));
     }
 
     [Fact]

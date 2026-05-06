@@ -7,7 +7,7 @@ namespace CodeyBox.Agents.Codex;
 /// Drives the OpenAI Codex CLI. Reads the API key from OPENAI_API_KEY which
 /// the orchestrator injects via the credential bundle.
 /// </summary>
-public sealed class CodexAgentRunner : CliAgentRunnerBase
+public sealed class CodexAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider
 {
     public override AgentKind Kind => AgentKind.Codex;
 

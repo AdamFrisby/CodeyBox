@@ -423,6 +423,7 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         var agentEndedAt = DateTimeOffset.UtcNow;
+        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
         var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
         await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
@@ -440,7 +441,7 @@ public sealed class PipelineRunner : IPipelineRunner
             await QuotaFailureDetector.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 runner.Kind,
-                item.ModelId,
+                observedModelId,
                 agentResult.Summary,
                 agentResult.Stderr,
                 agentEndedAt,
@@ -796,7 +797,7 @@ public sealed class PipelineRunner : IPipelineRunner
             await QuotaFailureDetector.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 run.Runner.Kind,
-                modelId: null,
+                ResolveObservedModelId(run.Runner, modelId: null),
                 run.Result.AgentSummary,
                 run.Result.AgentStderr,
                 DateTimeOffset.UtcNow,
@@ -949,7 +950,13 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_auditQuotaProbesByKind is not null
             && _auditQuotaProbesByKind.TryGetValue(kind.Value, out var probe))
         {
-            var auditMember = new AgentMembership { Agent = kind.Value, Billing = AgentBilling.Subscription, QualityScore = 100 };
+            var auditMember = new AgentMembership
+            {
+                Agent = kind.Value,
+                Billing = AgentBilling.Subscription,
+                ModelId = ResolveObservedModelId(auditRunner, modelId: null),
+                QualityScore = 100,
+            };
             if (_quotaFailures is not null
                 && await _quotaFailures.HasRecentAsync(kind.Value, auditMember.ModelId, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct))
             {
@@ -978,6 +985,17 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         return auditRunner;
+    }
+
+    internal static string? ResolveObservedModelId(IAgentRunner runner, string? modelId)
+    {
+        if (modelId is not null)
+            return string.IsNullOrWhiteSpace(modelId) ? null : modelId;
+
+        if (runner is IAgentDefaultModelProvider defaults)
+            return string.IsNullOrWhiteSpace(defaults.DefaultModelId) ? null : defaults.DefaultModelId;
+
+        return null;
     }
 
     /// <summary>
@@ -1043,6 +1061,7 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         var mergeEndedAt = DateTimeOffset.UtcNow;
+        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
         var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecScope.ElapsedMs);
         await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecScope.ElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
@@ -1056,7 +1075,7 @@ public sealed class PipelineRunner : IPipelineRunner
             await QuotaFailureDetector.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 runner.Kind,
-                item.ModelId,
+                observedModelId,
                 agentResult.Summary,
                 agentResult.Stderr,
                 mergeEndedAt,
