@@ -130,6 +130,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             {
                 await _gitHost.PushToUpstreamAsync(request.RepositoryId, repoUrl, request.WorkBranch, askpass.Environment, ct);
             }
+            catch (UpstreamRebaseConflictException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 // Log only the scrubbed message at Debug; the raw exception object is

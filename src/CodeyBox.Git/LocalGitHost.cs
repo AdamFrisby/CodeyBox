@@ -111,8 +111,21 @@ public sealed class LocalGitHost : IGitHost
             ct,
             extraEnv: upstreamEnv,
             "push", upstreamUrl, $"{branch}:{branch}");
-        if (rc.ExitCode != 0)
+        if (rc.ExitCode == 0)
+            return;
+
+        if (!IsNonFastForwardPushFailure(rc.Stderr))
             throw new InvalidOperationException($"git push to upstream failed: {rc.Stderr}");
+
+        await RebaseBranchOnLatestUpstreamAsync(path, upstreamUrl, branch, upstreamEnv, ct);
+
+        var retry = await RunGitAsync(
+            workdir: path,
+            ct,
+            extraEnv: upstreamEnv,
+            "push", upstreamUrl, $"{branch}:{branch}");
+        if (retry.ExitCode != 0)
+            throw new InvalidOperationException($"git push to upstream failed after non-fast-forward recovery: {retry.Stderr}");
     }
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
@@ -170,6 +183,91 @@ public sealed class LocalGitHost : IGitHost
         // determines what gets merged where. Hooks can be added later for
         // defence in depth (e.g. block direct pushes to main from work phase).
     }
+
+    private async Task RebaseBranchOnLatestUpstreamAsync(
+        string barePath,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct)
+    {
+        var remoteRef = $"refs/remotes/codeybox-upstream/{branch}";
+        var fetch = await RunGitAsync(
+            workdir: barePath,
+            ct,
+            extraEnv: upstreamEnv,
+            "fetch", upstreamUrl, $"+refs/heads/{branch}:{remoteRef}");
+        if (fetch.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git fetch of upstream branch '{branch}' failed after non-fast-forward rejection: {fetch.Stderr}");
+
+        var worktreePath = Path.Combine(_opts.RootDirectory, ".upstream-rebase-" + Guid.NewGuid().ToString("N"));
+        var add = await RunGitAsync(barePath, ct, "worktree", "add", worktreePath, branch);
+        if (add.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git worktree setup for upstream rebase on '{branch}' failed: {add.Stderr}");
+
+        try
+        {
+            var rebase = await RunGitAsync(
+                workdir: worktreePath,
+                ct,
+                extraEnv: BuildRebaseEnvironment(upstreamEnv),
+                "rebase", remoteRef);
+            if (rebase.ExitCode == 0)
+                return;
+
+            await AbortRebaseAsync(worktreePath);
+            throw new UpstreamRebaseConflictException(
+                $"upstream rebase conflict on {branch}; manual resolution required: {rebase.Stderr}");
+        }
+        finally
+        {
+            await RemoveWorktreeAsync(barePath, worktreePath);
+        }
+    }
+
+    private async Task AbortRebaseAsync(string worktreePath)
+    {
+        try
+        {
+            var abort = await RunGitAsync(worktreePath, CancellationToken.None, "rebase", "--abort");
+            if (abort.ExitCode != 0)
+                _log.LogWarning("Failed to abort upstream rebase in {WorktreePath}: {Error}", worktreePath, abort.Stderr);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to abort upstream rebase in {WorktreePath}", worktreePath);
+        }
+    }
+
+    private async Task RemoveWorktreeAsync(string barePath, string worktreePath)
+    {
+        try
+        {
+            var remove = await RunGitAsync(barePath, CancellationToken.None, "worktree", "remove", "--force", worktreePath);
+            if (remove.ExitCode != 0)
+                _log.LogWarning("Failed to remove upstream rebase worktree {WorktreePath}: {Error}", worktreePath, remove.Stderr);
+            _ = await RunGitAsync(barePath, CancellationToken.None, "worktree", "prune");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to remove upstream rebase worktree {WorktreePath}", worktreePath);
+        }
+    }
+
+    private static IReadOnlyDictionary<string, string> BuildRebaseEnvironment(IReadOnlyDictionary<string, string> upstreamEnv)
+    {
+        var env = new Dictionary<string, string>(upstreamEnv, StringComparer.Ordinal);
+        env.TryAdd("GIT_COMMITTER_NAME", "CodeyBox");
+        env.TryAdd("GIT_COMMITTER_EMAIL", "noreply@codeybox.invalid");
+        return env;
+    }
+
+    private static bool IsNonFastForwardPushFailure(string stderr)
+        => stderr.Contains("non-fast-forward", StringComparison.OrdinalIgnoreCase)
+           || stderr.Contains("(non-fast-forward)", StringComparison.OrdinalIgnoreCase)
+           || stderr.Contains("! [rejected]", StringComparison.OrdinalIgnoreCase);
 
     private static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
         string workdir,

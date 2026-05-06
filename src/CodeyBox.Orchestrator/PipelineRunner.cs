@@ -1361,6 +1361,13 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             catch (Exception ex)
             {
+                if (ContainsUpstreamRebaseConflict(ex))
+                {
+                    _log.LogWarning("Upstream complete failed due to rebase conflict: {Error}", ex.Message);
+                    await TransitionFailed(item, ex.Message, ct, project);
+                    break;
+                }
+
                 _log.LogWarning("Upstream complete attempt {Attempt} failed: {Error}", attempt, ex.Message);
                 if (attempt < _opts.UpstreamPushMaxAttempts)
                     await Task.Delay(_opts.UpstreamPushBackoff, ct);
@@ -1391,6 +1398,14 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             await Transition(item, WorkItemState.Done, ct, project);
         }
+    }
+
+    private static bool ContainsUpstreamRebaseConflict(Exception ex)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+            if (current is UpstreamRebaseConflictException)
+                return true;
+        return false;
     }
 
     /// <summary>

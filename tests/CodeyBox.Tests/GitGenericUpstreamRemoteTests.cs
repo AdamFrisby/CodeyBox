@@ -46,6 +46,20 @@ public sealed class GitGenericUpstreamRemoteTests
     }
 
     [Fact]
+    public async Task CompleteAsync_RebaseConflict_RethrowsTypedException()
+    {
+        var gitHost = new ThrowingGitHost(
+            new UpstreamRebaseConflictException("upstream rebase conflict on main; manual resolution required"));
+        var opts = new GitGenericUpstreamOptions { UpstreamUrl = "https://git.example.com/repo.git" };
+        var remote = new GitGenericUpstreamRemote(gitHost, opts);
+
+        var ex = await Assert.ThrowsAsync<UpstreamRebaseConflictException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("upstream rebase conflict on main", ex.Message);
+    }
+
+    [Fact]
     public async Task CompleteAsync_UrlWithEmbeddedCredentials_ScrubbedFromExceptionMessage()
     {
         // Verifies that an operator-supplied URL with embedded user:pass does not
@@ -65,6 +79,13 @@ public sealed class GitGenericUpstreamRemoteTests
 
 internal sealed class ThrowingGitHost : IGitHost
 {
+    private readonly Exception _ex;
+
+    public ThrowingGitHost(Exception? ex = null)
+    {
+        _ex = ex ?? new InvalidOperationException("simulated push failure");
+    }
+
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => throw new NotSupportedException();
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
@@ -73,7 +94,7 @@ internal sealed class ThrowingGitHost : IGitHost
         => throw new NotSupportedException();
     public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
         IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
-        => throw new InvalidOperationException("simulated push failure");
+        => throw _ex;
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;
     public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)

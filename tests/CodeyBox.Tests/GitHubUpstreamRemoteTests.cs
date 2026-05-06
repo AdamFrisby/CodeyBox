@@ -227,6 +227,22 @@ public sealed class GitHubUpstreamRemoteTests
 
         Assert.Empty(handler.Requests);
     }
+
+    [Fact]
+    public async Task CompleteAsync_RebaseConflict_RethrowsTypedExceptionWithoutCallingGitHubApi()
+    {
+        var gitHost = new ThrowingFakeGitHost(
+            new UpstreamRebaseConflictException("upstream rebase conflict on codeybox/abc123; manual resolution required"));
+        var handler = new FakeHttpMessageHandler();
+
+        var remote = BuildRemote(gitHost, handler);
+
+        var ex = await Assert.ThrowsAsync<UpstreamRebaseConflictException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("upstream rebase conflict on codeybox/abc123", ex.Message);
+        Assert.Empty(handler.Requests);
+    }
 }
 
 // -------------------------------------------------------------------------

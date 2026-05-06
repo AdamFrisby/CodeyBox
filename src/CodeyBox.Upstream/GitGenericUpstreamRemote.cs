@@ -42,6 +42,10 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
             AuditLog.UpstreamPush(request.BaseBranch, ScrubUrlCredentials(_opts.UpstreamUrl));
             return new UpstreamCompletionOutcome { BranchPushed = true };
         }
+        catch (UpstreamRebaseConflictException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             // Strip embedded credentials (e.g. https://user:pass@host/repo.git) from
