@@ -34,8 +34,6 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class PipelineRunner : IPipelineRunner
 {
-    private static readonly TimeSpan AuditShutdownDrain = TimeSpan.FromSeconds(60);
-    private static readonly TimeSpan AgentPreemptDrain = TimeSpan.FromSeconds(2);
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly IAgentRegistry _agents;
@@ -232,9 +230,6 @@ public sealed class PipelineRunner : IPipelineRunner
             var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged;
             var skipMerge = entry is WorkItemState.Merged;
 
-            if (resumingPreempt && entry is WorkItemState.Reworking)
-                await PromotePreemptCheckpointToBranchAsync(item, repoId, workBranch, project, ct);
-
             // -------- Phase 1: Work --------
             if (!skipWork)
             {
@@ -243,6 +238,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 using (var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
                     workCts.CancelAfter(item.WorkTimeout);
+                    using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, workCts);
                     workAgentStdout = await RunWithStuckProbeAsync(item, project, agentKind, "work", workCts, ct, phaseCt =>
                         RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
                             BuildInitialWorkPrompt(item.Prompt, project.AllowAgentQuestions), isInitial: true,
@@ -253,7 +249,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
                 if (resumingPreempt)
+                {
                     await ClearPreemptAsync(item, ct);
+                    item = item with { PreemptedAt = null, PreemptCheckpoint = null };
+                }
 
                 // When agent questions are enabled, parse stdout for <codeybox-question> blocks
                 // and park the work item at NeedsOperatorInput if any new questions were found.
@@ -261,6 +260,33 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     var parked = await TryParkForQuestionsAsync(item, project, workAgentStdout, ct);
                     if (parked) return; // Pipeline parked; resume when operator answers.
+                }
+            }
+            else if (resumingPreempt && entry is WorkItemState.Reworking)
+            {
+                await Transition(item, WorkItemState.Reworking, ct, project);
+                string? reworkStdout = null;
+                using (var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    reworkCts.CancelAfter(item.WorkTimeout);
+                    using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
+                    reworkStdout = await RunWithStuckProbeAsync(item, project, agentKind, "rework", reworkCts, ct,
+                        phaseCt => RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
+                            BuildInterruptedReworkResumePrompt(item.Prompt, item.PreemptCheckpoint!),
+                            isInitial: false,
+                            networkProfile: project.NetworkProfiles.Rework,
+                            project: project,
+                            phaseCt,
+                            hostShutdownToken));
+                }
+                await Transition(item, WorkItemState.WorkComplete, ct, project);
+                await ClearPreemptAsync(item, ct);
+                item = item with { PreemptedAt = null, PreemptCheckpoint = null };
+
+                if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
+                {
+                    var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
+                    if (parked) return;
                 }
             }
 
@@ -271,12 +297,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.
                 if (resumingPreempt)
+                {
                     await ClearPreemptAsync(item, ct);
+                    item = item with { PreemptedAt = null, PreemptCheckpoint = null };
+                }
                 await Transition(item, WorkItemState.AuditPassed, ct, project);
             }
             else if (resumingPreempt)
             {
                 await ClearPreemptAsync(item, ct);
+                item = item with { PreemptedAt = null, PreemptCheckpoint = null };
             }
 
             // Open PR record (local metadata) AFTER the audit converges.
@@ -301,11 +331,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
                     mergeCts.CancelAfter(item.MergeTimeout);
+                    using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, mergeCts);
                     (mergeSha, agentStdout) = await RunWithStuckProbeAsync(item, project, agentKind, "merge", mergeCts, ct, phaseCt =>
                         RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
                             networkProfile: project.NetworkProfiles.Merge,
                             project: project,
-                            phaseCt));
+                            phaseCt,
+                            hostShutdownToken));
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
                 await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
@@ -316,7 +348,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var upstream = _upstreamFactory.Create(project);
             if (item.PushUpstream && project.Upstream.Kind != "noop")
             {
-                await RunUpstreamPushPhaseAsync(item, project, upstream, repoId, baseBranch, workBranch, mergeSha, agentStdout, ct);
+                await RunUpstreamPushPhaseAsync(item, project, upstream, repoId, baseBranch, workBranch, mergeSha, agentStdout, ct, hostShutdownToken);
             }
             else
             {
@@ -505,7 +537,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var agentExecScope = await TimingScope.BeginAsync(
             _timings, item.Id, agentPhase, "agent.exec",
-            metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+            metadata: new Dictionary<string, object>
+            {
+                ["agent"] = runner.Kind.Value,
+                ["resuming_preempt"] = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint),
+            },
             log: _log,
             activitySource: CodeyBoxActivities.Pipeline);
         Action<string>? stdoutCallback = _stdoutBroadcaster is { } broadcaster
@@ -519,14 +555,21 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             await using (agentExecScope)
             {
-                var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
-                    stdoutChunkCallback: stdoutCallback);
+                var runTask = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+                    && runner is IResumableAgentRunner resumable
+                    ? resumable.RunResumedAsync(
+                        sandbox, SandboxConventions.WorkDir, prompt, credential,
+                        new AgentResumeContext(item.PreemptCheckpoint!),
+                        item.ModelId, item.ReasoningMode, runnerCts.Token,
+                        stdoutChunkCallback: stdoutCallback)
+                    : runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
+                        stdoutChunkCallback: stdoutCallback);
                 var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completed != runTask)
                 {
                     preemptRequested = true;
                     await RequestAgentPreemptAsync(runner, sandbox, SandboxConventions.WorkDir, CancellationToken.None);
-                    completed = await Task.WhenAny(runTask, Task.Delay(AgentPreemptDrain));
+                    completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain));
                     if (completed != runTask)
                         await runnerCts.CancelAsync();
                 }
@@ -671,26 +714,19 @@ public sealed class PipelineRunner : IPipelineRunner
             """;
     }
 
-    private async Task PromotePreemptCheckpointToBranchAsync(
-        WorkItem item,
-        string repoId,
-        string branch,
-        Project project,
-        CancellationToken ct)
+    internal static string BuildInterruptedReworkResumePrompt(string originalPrompt, string checkpointRef)
     {
-        if (string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
-            return;
+        return BuildResumePrompt($"""
+            # Interrupted Rework Resume
 
-        var checkpointBranch = ValidatePreemptCheckpoint(item, item.PreemptCheckpoint);
-        var access = _gitHost.GetSandboxAccess(repoId);
-        var spec = BuildSandboxSpec(access, includeAgentCredential: null, allowAgentNetwork: false,
-            hostNetworkProfile: project.NetworkProfiles.AuditTool, timingWorkItemId: item.Id, timingPhase: "resume");
+            The previous run was interrupted while addressing audit findings for this work item.
 
-        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", item.PreemptCheckpoint);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{branch}");
+            Original work item prompt:
+
+            {originalPrompt}
+
+            Continue the interrupted rework from the restored files and any CLI session state that was recovered by the runner. Make a commit for the resumed rework before exiting.
+            """, checkpointRef);
     }
 
     private async Task ClearPreemptAsync(WorkItem item, CancellationToken ct)
@@ -791,6 +827,25 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (OperationCanceledException) { }
     }
 
+    private IDisposable RegisterHostShutdownDeadline(CancellationToken hostShutdownToken, CancellationTokenSource phaseCts)
+    {
+        if (!hostShutdownToken.CanBeCanceled)
+            return NullDisposable.Instance;
+
+        return hostShutdownToken.Register(static state =>
+        {
+            var (cts, grace) = ((CancellationTokenSource Cts, TimeSpan Grace))state!;
+            try { cts.CancelAfter(grace); }
+            catch (ObjectDisposedException) { }
+        }, (phaseCts, _opts.ShutdownGrace));
+    }
+
+    private sealed class NullDisposable : IDisposable
+    {
+        public static readonly NullDisposable Instance = new();
+        public void Dispose() { }
+    }
+
     // Returns a 2 KB tail of agent output for inclusion in audit log events.
     private static string? Tail(string? s)
     {
@@ -830,13 +885,14 @@ public sealed class PipelineRunner : IPipelineRunner
             await Transition(item, WorkItemState.Auditing, ct, project);
             using var auditCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             auditCts.CancelAfter(project.Audit.PerIterationTimeout);
+            using var auditShutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, auditCts);
 
             var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt);
             var collectTask = CollectFindingsAsync(project, runner, auditors, repoId, ctx, auditCts.Token);
             var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
             if (completedAuditTask != collectTask)
             {
-                var drainTask = Task.Delay(AuditShutdownDrain);
+                var drainTask = Task.Delay(_opts.AuditShutdownDrain);
                 completedAuditTask = await Task.WhenAny(collectTask, drainTask);
                 if (completedAuditTask != collectTask)
                 {
@@ -898,6 +954,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions, project.AllowAgentQuestions);
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
+            using var reworkShutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
             var reworkStdout = await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct,
                 phaseCt => RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
                     reworkPrompt, isInitial: false,
@@ -1265,7 +1322,8 @@ public sealed class PipelineRunner : IPipelineRunner
         string workBranch,
         string? networkProfile,
         Project project,
-        CancellationToken ct)
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
     {
         var credential = _credentials is IProjectAwareCredentialProvider pac
             ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
@@ -1314,10 +1372,23 @@ public sealed class PipelineRunner : IPipelineRunner
             ? chunk => mergeBroadcaster.BroadcastChunk(item.Id, "merge", chunk)
             : null;
         AgentResult agentResult;
+        using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         await using (mergeExecScope)
         {
-            agentResult = await runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, ct,
+            var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                 stdoutChunkCallback: mergeStdoutCallback);
+            var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
+            if (completed != runTask)
+            {
+                await RequestAgentPreemptAsync(runner, sandbox, SandboxConventions.WorkDir, CancellationToken.None);
+                completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain));
+                if (completed != runTask)
+                    await runnerCts.CancelAsync();
+            }
+
+            agentResult = await runTask;
+            if (hostShutdownToken.IsCancellationRequested)
+                throw new OperationCanceledException(hostShutdownToken);
         }
         CodeyBoxMeters.AgentDuration.Record(mergeExecScope.ElapsedMs,
             new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
@@ -1487,8 +1558,13 @@ public sealed class PipelineRunner : IPipelineRunner
         string workBranch,
         string? mergeSha,
         string? agentStdout,
-        CancellationToken ct)
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
     {
+        using var upstreamCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, upstreamCts);
+        ct = upstreamCts.Token;
+
         await Transition(item, WorkItemState.UpstreamPushing, ct, project);
 
         // Best-effort: compute the diff for LLM-generated PR descriptions.
@@ -2369,6 +2445,9 @@ public sealed record PipelineOptions
     public int UpstreamPushMaxAttempts { get; init; } = 5;
     public TimeSpan UpstreamPushBackoff { get; init; } = TimeSpan.FromSeconds(15);
     public HostGitIdentity? HostGitIdentity { get; init; }
+    public TimeSpan ShutdownGrace { get; init; } = TimeSpan.FromSeconds(60);
+    public TimeSpan AuditShutdownDrain => Min(TimeSpan.FromSeconds(60), ShutdownGrace);
+    public TimeSpan AgentPreemptDrain => Min(TimeSpan.FromSeconds(2), ShutdownGrace);
 
     /// <summary>
     /// Global default for stuck-agent detection threshold, in minutes.
@@ -2377,4 +2456,6 @@ public sealed record PipelineOptions
     /// Must be ≥ 1 (or 0 to disable) when non-negative.
     /// </summary>
     public int StuckThresholdMinutes { get; init; } = 10;
+
+    private static TimeSpan Min(TimeSpan a, TimeSpan b) => a <= b ? a : b;
 }

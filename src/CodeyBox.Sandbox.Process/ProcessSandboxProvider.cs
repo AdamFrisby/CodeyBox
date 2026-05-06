@@ -141,6 +141,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox
     private readonly string[] _mountPaths; // longest-first
     private readonly ILogger _log;
     private bool _disposed;
+    private bool _preserved;
 
     public ProcessSandbox(string id, string root, SandboxSpec spec, string[] mountPaths, ILogger log)
     {
@@ -248,6 +249,8 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox
     {
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
+        if (_preserved)
+            return ValueTask.CompletedTask;
         try
         {
             // Clear read-only bits and remove symlinks (without following them)
@@ -266,6 +269,10 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox
 
     public Task StopAndPreserveAsync(CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(Path.Combine(_root, ".codeybox-preempt"), DateTimeOffset.UtcNow.ToString("O"));
+        _preserved = true;
         return Task.CompletedTask;
     }
 

@@ -19,6 +19,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
 
     public string Binary { get; init; } = "codex";
 
+    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".codex"];
+
+    protected override string PreemptProcessPattern => Binary;
+
     /// <summary>
     /// Default model passed to <c>--model</c> when no per-item override is provided.
     /// </summary>

@@ -24,11 +24,28 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string? DefaultModelId { get; init; } = "claude-opus-4-7";
 
+    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".claude"];
+
+    protected override string PreemptProcessPattern => Binary;
+
     protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null)
+        => BuildClaudeInvocation(prompt, modelId, resume: false);
+
+    protected override AgentInvocation BuildResumeInvocation(
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null)
+        => BuildClaudeInvocation(prompt, modelId, resume: true);
+
+    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, bool resume)
     {
         // claude --print sends a single prompt and exits. --dangerously-skip-permissions
         // is appropriate inside the sandbox: the VM boundary IS the permission boundary.
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+        if (resume)
+            argv.Add("--resume");
         var effectiveModel = modelId ?? DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))
         {

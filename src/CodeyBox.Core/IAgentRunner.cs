@@ -34,6 +34,30 @@ public interface IPreemptibleAgentRunner : IAgentRunner
     Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default);
 }
 
+/// <summary>
+/// Optional capability for runners that can restore CLI session state captured
+/// during graceful preemption and invoke the agent in that resumed context.
+/// Implementations may still fall back to a normal one-shot run after restoring
+/// the scratchpad archive when the underlying CLI has no true resume mode.
+/// </summary>
+public interface IResumableAgentRunner : IAgentRunner
+{
+    Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null);
+}
+
+public sealed record AgentResumeContext(
+    string CheckpointRef,
+    string ScratchpadArchivePath = ".codeybox/preempt-scratchpad.tgz");
+
 public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);
 
 /// <summary>Maps agent kinds to runners. Loose coupling: register new runners without recompiling consumers.</summary>

@@ -166,6 +166,92 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.DoesNotContain("ignore previous instructions", prompt);
     }
 
+    [Fact]
+    public async Task PreemptedRework_RunsResumeAgentBeforeAuditing()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var agent = new ReworkResumeRecordingAgent();
+        var registry = new AgentRegistry([agent]);
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        });
+        var pipeline = new PipelineRunner(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            gitHost, registry, new StaticCredentialProvider(), new InMemoryPullRequestService(),
+            projects, new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store, new NullWebhookDispatcher(),
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance);
+
+        var item = NewItem() with
+        {
+            State = WorkItemState.Reworking,
+            WorkBranch = "codeybox/rework-resume",
+            PreemptedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{WorkItemId.New()}",
+            PushUpstream = false,
+        };
+        item = item with { PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}" };
+        await store.CreateAsync(item);
+        await CreatePreemptCheckpointAsync(gitHost, item, seed);
+
+        await pipeline.RunAsync(item, CancellationToken.None, CancellationToken.None);
+
+        Assert.Equal(1, agent.ResumeCalls);
+        Assert.Contains("Interrupted Rework Resume", agent.LastResumePrompt);
+        Assert.True(agent.SawScratchpad);
+        var final = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Null(final.PreemptedAt);
+        Assert.Null(final.PreemptCheckpoint);
+    }
+
+    [Fact]
+    public async Task ProcessSandbox_StopAndPreserve_SkipsDisposeDeletion()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var pwd = await sandbox.ExecAsync(new SandboxExec { Argv = ["pwd"] });
+        Assert.True(pwd.Success);
+        var root = Directory.GetParent(pwd.Stdout.Trim())!.FullName;
+
+        await ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync();
+        await sandbox.DisposeAsync();
+
+        Assert.True(Directory.Exists(root));
+        Assert.True(File.Exists(Path.Combine(root, ".codeybox-preempt")));
+        try { Directory.Delete(root, recursive: true); } catch { }
+    }
+
+    private async Task CreatePreemptCheckpointAsync(LocalGitHost gitHost, WorkItem item, string seed)
+    {
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed);
+        var clone = Path.Combine(_workspace, "checkpoint-" + Guid.NewGuid().ToString("N")[..8]);
+        var bare = gitHost.GetRepoPath(repoId);
+        Assert.Equal(0, (await TestSupport.RunGit(_workspace, "clone", bare, clone)).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "config", "user.email", "test@example.invalid")).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "config", "user.name", "Test")).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "checkout", "-B", item.WorkBranch!)).code);
+        Directory.CreateDirectory(Path.Combine(clone, ".codeybox"));
+        await File.WriteAllTextAsync(Path.Combine(clone, ".codeybox", "preempt-scratchpad.md"), "resume scratchpad");
+        await File.WriteAllTextAsync(Path.Combine(clone, "partial-rework.txt"), "partial");
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "add", "-A")).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "commit", "-m", "checkpoint")).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{item.PreemptCheckpoint}")).code);
+    }
+
     private static async Task WaitForStateAsync(
         SqliteWorkItemStore store, WorkItemId id, WorkItemState target, TimeSpan timeout)
     {
@@ -222,5 +308,83 @@ internal sealed class BlockingAgentRunner : IAgentRunner
     {
         await Task.Delay(Timeout.Infinite, ct);
         return new AgentResult(false, "unreachable", null, null);
+    }
+}
+
+internal sealed class ReworkResumeRecordingAgent : IAgentRunner, IResumableAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+    public int ResumeCalls { get; private set; }
+    public string LastResumePrompt { get; private set; } = string.Empty;
+    public bool SawScratchpad { get; private set; }
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
+            return MergeAsync(sandbox, workingDirectory, prompt, ct);
+
+        throw new InvalidOperationException("preempted rework should use RunResumedAsync");
+    }
+
+    public async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        ResumeCalls++;
+        LastResumePrompt = prompt;
+        var scratchpad = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["test", "-f", ".codeybox/preempt-scratchpad.md"],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        SawScratchpad = scratchpad.Success;
+
+        await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "printf '%s\n' resumed > resumed-rework.txt"],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        return new AgentResult(true, "ok", "resumed", null);
+    }
+
+    private static async Task<AgentResult> MergeAsync(ISandbox sandbox, string workingDirectory, string prompt, CancellationToken ct)
+    {
+        var workBranch = ExtractBetween(prompt, "merge branch `", "` into branch `");
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                "set -e; git merge --no-ff \"$1\" -m 'codeybox: merge test\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>'",
+                "merge-test",
+                $"origin/{workBranch}",
+            ],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        return new AgentResult(result.Success, result.Success ? "ok" : "merge failed", result.Stdout, result.Stderr);
+    }
+
+    private static string ExtractBetween(string text, string left, string right)
+    {
+        var start = text.IndexOf(left, StringComparison.Ordinal);
+        if (start < 0) return "main";
+        start += left.Length;
+        var end = text.IndexOf(right, start, StringComparison.Ordinal);
+        return end < 0 ? text[start..].Trim() : text[start..end];
     }
 }

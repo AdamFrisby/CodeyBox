@@ -158,6 +158,12 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
 builder.Services.Configure<ProjectsOptions>(builder.Configuration.GetSection("CodeyBox"));
+builder.Services.Configure<HostOptions>(o =>
+{
+    var cbOpts = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
+        ?? new CodeyBoxOptions();
+    o.ShutdownTimeout = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
+});
 
 ApiKeyAuth.Configure(builder);
 
@@ -862,6 +868,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         AgentAllowedHosts = opts.AgentAllowedHosts,
         UpstreamPushMaxAttempts = opts.UpstreamPushMaxAttempts,
         UpstreamPushBackoff = TimeSpan.FromSeconds(opts.UpstreamPushBackoffSeconds),
+        ShutdownGrace = TimeSpan.FromSeconds(Math.Max(1, opts.Shutdown.GraceSeconds)),
         HostGitIdentity = hostIdentity,
     };
 });
@@ -896,8 +903,7 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.Orchestrator");
     return OrchestratorOptionsFactory.Build(cbOpts.Concurrency, cbOpts.WorkerPool, startupLog);
 });
-builder.Services.AddSingleton<CancellationRegistry>(sp =>
-    new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
+builder.Services.AddSingleton<CancellationRegistry>();
 builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService(
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -1005,6 +1011,9 @@ namespace CodeyBox.Api
 
         /// <summary>Worker pool sizing and spawn-pacing configuration.</summary>
         public WorkerPoolOptions WorkerPool { get; set; } = new();
+
+        /// <summary>Graceful shutdown drain and preemption timing.</summary>
+        public ShutdownOptions Shutdown { get; set; } = new();
 
         /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
         public DeadWorkerOptions DeadWorker { get; set; } = new();
@@ -1127,6 +1136,15 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+    }
+
+    public sealed class ShutdownOptions
+    {
+        /// <summary>
+        /// Maximum time the host waits for in-flight phases to preempt or drain
+        /// during SIGTERM/Ctrl-C. Defaults to 60 seconds.
+        /// </summary>
+        public int GraceSeconds { get; set; } = 60;
     }
 
     /// <summary>

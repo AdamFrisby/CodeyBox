@@ -5,18 +5,20 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Per-work-item cancellation tokens. The pipeline registers a CTS when it
-/// starts work; the API DELETE endpoint cancels it. The CTS is linked to
-/// the orchestrator's stopping token so process shutdown still cascades.
+/// starts work; the API DELETE endpoint cancels it.
+///
+/// Host shutdown is intentionally not linked here. The pipeline receives the
+/// host stopping token separately so it can preempt or drain the active phase
+/// instead of treating SIGTERM as an operator-requested item cancellation.
 /// </summary>
 public sealed class CancellationRegistry : IDisposable
 {
     private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _ctsById = new();
-    private readonly CancellationToken _root;
     private bool _disposed;
 
-    public CancellationRegistry(CancellationToken root)
+    public CancellationRegistry(CancellationToken root = default)
     {
-        _root = root;
+        _ = root;
     }
 
     /// <summary>
@@ -26,7 +28,7 @@ public sealed class CancellationRegistry : IDisposable
     public Registration Register(WorkItemId id)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(_root);
+        var cts = new CancellationTokenSource();
         if (!_ctsById.TryAdd(id.Value, cts))
         {
             cts.Dispose();

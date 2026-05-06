@@ -27,6 +27,10 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase
     /// </summary>
     public string Binary { get; init; } = "gemini";
 
+    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".gemini"];
+
+    protected override string PreemptProcessPattern => Binary;
+
     protected override AgentInvocation BuildInvocation(string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null)
     {
         // gemini --yolo -p "<prompt>": sends a single non-interactive prompt and exits.
