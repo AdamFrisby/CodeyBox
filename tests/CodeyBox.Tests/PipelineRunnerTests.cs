@@ -197,7 +197,7 @@ public sealed class PipelineRunnerSandboxIdentityTests : IDisposable
     private readonly string _workspace;
     public PipelineRunnerSandboxIdentityTests()
         => _workspace = Directory.CreateTempSubdirectory("codeybox-sboxid-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() => Directory.Delete(_workspace, recursive: true);
 
     private static WorkItem NewItem(string workBranch) => new()
     {
@@ -260,4 +260,66 @@ public sealed class PipelineRunnerSandboxIdentityTests : IDisposable
         Assert.Contains("Project Override Author|projectoverride@codeybox.test", authorLog);
         Assert.DoesNotContain("Host Author", authorLog);
     }
+
+    [Fact]
+    public async Task UpstreamReconcileConflict_FailsWithoutGenericRetryLoop()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var upstreamFactory = new ConflictUpstreamFactory();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            upstream: new ProjectUpstream { Kind = "test-upstream", MergeMethod = "rebase" },
+            upstreamFactory: upstreamFactory,
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                UpstreamPushMaxAttempts = 5,
+                UpstreamPushBackoff = TimeSpan.Zero,
+            });
+
+        var item = NewItem("feature/already-merged") with
+        {
+            State = WorkItemState.Merged,
+            PushUpstream = true,
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(1, final.UpstreamPushAttempts);
+        Assert.Contains("upstream rebase conflict on main; manual resolution required", final.LastError);
+        Assert.Equal(1, upstreamFactory.Remote.Attempts);
+    }
+}
+
+internal sealed class ConflictUpstreamFactory : IUpstreamRemoteFactory
+{
+    public ConflictUpstreamRemote Remote { get; } = new();
+
+    public IUpstreamRemote Create(Project project) => Remote;
+}
+
+internal sealed class ConflictUpstreamRemote : IUpstreamRemote
+{
+    public int Attempts { get; private set; }
+    public string Name => "test-upstream";
+
+    public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
+        => Task.FromResult(new UpstreamPushResult(false, "not used"));
+
+    public Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
+    {
+        Attempts++;
+        throw new InvalidOperationException(
+            "wrapped upstream push failure",
+            new UpstreamPushReconcileConflictException(request.BaseBranch, "rebase"));
+    }
+
+    public Task<bool> TryMergeUpstreamBranchAsync(
+        string targetBranch, string sourceBranch, CancellationToken ct = default)
+        => Task.FromResult(true);
 }

@@ -69,7 +69,10 @@ internal static class TestSupport
         HostGitIdentity? hostGitIdentity = null,
         (string Name, string Email)? projectGitAuthor = null,
         IAuditReportStore? auditReportStore = null,
-        int maxLlmAuditorParallelism = 3)
+        int maxLlmAuditorParallelism = 3,
+        ProjectUpstream? upstream = null,
+        IUpstreamRemoteFactory? upstreamFactory = null,
+        PipelineOptions? pipelineOptions = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -96,6 +99,7 @@ internal static class TestSupport
             DefaultAgent = AgentKind.Claude,
             GitAuthorName = projectGitAuthor?.Name,
             GitAuthorEmail = projectGitAuthor?.Email,
+            Upstream = upstream ?? ProjectUpstream.Noop,
             Audit = new ProjectAudit
             {
                 MaxIterations = maxAuditIterations,
@@ -106,14 +110,20 @@ internal static class TestSupport
 
         var presetCatalog = new ScriptedAuditorCatalog(auditorList);
         var composer = new ProjectAuditorComposer(presetCatalog);
-        var upstreamFactory = new TestUpstreamFactory();
+        var resolvedUpstreamFactory = upstreamFactory ?? new TestUpstreamFactory();
+        var resolvedOptions = pipelineOptions ?? new PipelineOptions
+        {
+            SandboxImageReference = "ignored",
+            AgentAllowedHosts = [],
+            HostGitIdentity = hostGitIdentity,
+        };
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
-            projects, upstreamFactory, composer,
+            projects, resolvedUpstreamFactory, composer,
             store,
             new NullWebhookDispatcher(),
-            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [], HostGitIdentity = hostGitIdentity },
+            resolvedOptions,
             NullLogger<PipelineRunner>.Instance,
             auditReports: auditReportStore);
 

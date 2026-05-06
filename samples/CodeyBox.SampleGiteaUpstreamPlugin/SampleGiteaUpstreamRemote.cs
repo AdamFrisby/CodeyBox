@@ -114,6 +114,7 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
             upstreamUrl,
             request.WorkBranch,
             BuildAuthEnv(token),
+            ToReconcileStrategy(request.MergeMethod),
             ct);
 
         // Open a pull request.
@@ -315,4 +316,9 @@ public sealed class SampleGiteaUpstreamRemote : IUpstreamRemote, IPluginInitiali
         var idx = baseUrl.IndexOf("/api/", StringComparison.OrdinalIgnoreCase);
         return idx >= 0 ? baseUrl[..idx] : baseUrl;
     }
+
+    private static UpstreamPushReconcileStrategy ToReconcileStrategy(string mergeMethod)
+        => mergeMethod.Equals("rebase", StringComparison.OrdinalIgnoreCase)
+            ? UpstreamPushReconcileStrategy.Rebase
+            : UpstreamPushReconcileStrategy.Merge;
 }
