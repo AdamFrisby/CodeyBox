@@ -165,9 +165,9 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 
 Allowed built-in language values are `csharp`, `python`, `node`, `go`, and
 `rust`. Unknown strings are logged at startup and skipped. If `Languages` is
-omitted, CodeyBox defaults to `["csharp"]` for backwards compatibility. An
-explicit empty list means no language-specific auditors run; language-agnostic
-audit types and custom auditors still work.
+omitted and no default is configured, CodeyBox uses an empty list. An explicit
+empty list also means no language-specific auditors run; language-agnostic audit
+types and custom auditors still work.
 
 Each language preset recursively checks for that language's marker files before running:
 `*.csproj`/`*.sln`/`*.slnx` for C#, `pyproject.toml`/`setup.py`/`setup.cfg`/

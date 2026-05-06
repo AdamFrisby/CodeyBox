@@ -70,7 +70,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         DeepAuditContext context,
         CancellationToken ct = default)
     {
-        var languages = (context.Languages is null ? ["csharp"] : context.Languages)
+        var languages = (context.Languages ?? [])
             .Where(ProjectAuditLanguages.IsSupported)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -177,7 +177,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 foreach (var vuln in vulns.EnumerateArray())
                 {
                     var id = GetString(vuln, "id") ?? GetString(vuln, "vulnerability_id") ?? "vulnerability";
-                    var severity = GetString(vuln, "severity") ?? "Unknown";
+                    var severity = GetSeverity(vuln, "severity") ?? "Unknown";
                     yield return Finding(package, version, severity, id);
                 }
             }
@@ -188,7 +188,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             var package = GetString(vuln, "package_name") ?? GetString(vuln, "package") ?? "unknown";
             var version = GetString(vuln, "analyzed_version") ?? GetString(vuln, "version") ?? "?";
             var id = GetString(vuln, "vulnerability_id") ?? GetString(vuln, "id") ?? "vulnerability";
-            var severity = GetString(vuln, "severity") ?? "Unknown";
+            var severity = GetSeverity(vuln, "severity") ?? "Unknown";
             yield return Finding(package, version, severity, id);
         }
     }
@@ -204,7 +204,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         foreach (var property in vulnerabilities.EnumerateObject())
         {
             var vuln = property.Value;
-            var severity = GetString(vuln, "severity") ?? "Unknown";
+            var severity = GetSeverity(vuln, "severity") ?? "Unknown";
             var version = GetString(vuln, "range") ?? "?";
             var advisory = FirstNpmAdvisory(vuln);
             yield return Finding(property.Name, version, severity, advisory);
@@ -299,6 +299,41 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
            property.ValueKind == JsonValueKind.String
             ? property.GetString()
             : null;
+
+    private static string? GetSeverity(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty(propertyName, out var property))
+            return null;
+
+        if (property.ValueKind == JsonValueKind.String)
+            return property.GetString();
+
+        if (property.ValueKind == JsonValueKind.Number && property.TryGetDouble(out var score))
+            return SeverityFromCvss(score);
+
+        if (property.ValueKind == JsonValueKind.Object)
+        {
+            var label = GetString(property, "severity") ?? GetString(property, "level");
+            if (!string.IsNullOrWhiteSpace(label))
+                return label;
+            if (property.TryGetProperty("score", out var scoreProperty) &&
+                scoreProperty.ValueKind == JsonValueKind.Number &&
+                scoreProperty.TryGetDouble(out var nestedScore))
+                return SeverityFromCvss(nestedScore);
+        }
+
+        return null;
+    }
+
+    private static string SeverityFromCvss(double score) => score switch
+    {
+        >= 9.0 => "Critical",
+        >= 7.0 => "High",
+        >= 4.0 => "Medium",
+        > 0.0 => "Low",
+        _ => "Unknown",
+    };
 
     private static string? FirstNpmAdvisory(JsonElement vulnerability)
     {
@@ -422,7 +457,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     [GeneratedRegex(@"ID:\s+(?<id>\S+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex CargoIdRegex();
 
-    [GeneratedRegex(@"Severity:\s+(?<severity>\S+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"Severity:\s+(?:\S+\s+\((?<severity>[^)]+)\)|(?<severity>\S+))", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex CargoSeverityRegex();
 
     private sealed record Scanner(

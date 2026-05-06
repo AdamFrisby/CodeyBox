@@ -48,7 +48,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task UnsetLanguagesDefaultToCSharpForBackwardsCompatibility()
+    public async Task UnsetLanguagesRunNoLanguageScanners()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -61,7 +61,8 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.DoesNotContain(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.Empty(result.Findings);
     }
 
     [Fact]
@@ -125,6 +126,144 @@ public sealed class DepsCveScanLanguageDispatchTests
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("example.com/app", finding.Title);
+    }
+
+    [Fact]
+    public async Task PythonScannerParsesPipAuditJsonOutput()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
+            {
+              "dependencies": [
+                {
+                  "name": "django",
+                  "version": "1.2",
+                  "vulns": [
+                    { "id": "PYSEC-2019-13", "severity": "high" }
+                  ]
+                }
+              ],
+              "fixes": []
+            }
+            """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["python"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("django", finding.Title);
+        Assert.Contains("PYSEC-2019-13", finding.Description);
+    }
+
+    [Fact]
+    public async Task PythonScannerParsesSafetyJsonOutput()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
+            {
+              "vulnerabilities": [
+                {
+                  "package_name": "jinja2",
+                  "analyzed_version": "2.10",
+                  "vulnerability_id": "CVE-2019-10906",
+                  "severity": { "score": 9.8 }
+                }
+              ]
+            }
+            """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["python"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("jinja2", finding.Title);
+        Assert.Contains("CVE-2019-10906", finding.Description);
+    }
+
+    [Fact]
+    public async Task NodeScannerParsesNpmAuditJsonOutput()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
+            {
+              "auditReportVersion": 2,
+              "vulnerabilities": {
+                "minimist": {
+                  "name": "minimist",
+                  "severity": "moderate",
+                  "range": "<0.2.1",
+                  "via": [
+                    {
+                      "source": 1096466,
+                      "title": "Prototype Pollution",
+                      "url": "https://github.com/advisories/GHSA-vh95-rmgr-6w4m",
+                      "severity": "moderate",
+                      "range": "<0.2.1"
+                    }
+                  ]
+                }
+              },
+              "metadata": {}
+            }
+            """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["node"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
+        Assert.Contains("minimist", finding.Title);
+        Assert.Contains("GHSA-vh95-rmgr-6w4m", finding.Description);
+    }
+
+    [Fact]
+    public async Task RustScannerParsesCargoAuditTextOutput()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
+            Crate:     atty
+            Version:   0.2.14
+            Title:     Potential unaligned read
+            Date:      2021-08-18
+            ID:        RUSTSEC-2021-0145
+            URL:       https://rustsec.org/advisories/RUSTSEC-2021-0145
+            Severity:  7.0 (high)
+            Solution:  Upgrade to >=0.2.15
+            """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["rust"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("atty", finding.Title);
+        Assert.Contains("RUSTSEC-2021-0145", finding.Description);
     }
 
     private sealed class DispatchSandbox : ISandbox
