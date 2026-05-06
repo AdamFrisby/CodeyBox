@@ -32,6 +32,7 @@ public sealed class GitGenericUpstreamRemoteTests
         Assert.Single(gitHost.Pushes);
         Assert.Equal(SampleRequest.BaseBranch, gitHost.Pushes[0].Branch);
         Assert.Equal(opts.UpstreamUrl, gitHost.Pushes[0].Url);
+        Assert.Equal(SampleRequest.MergeMethod, gitHost.Pushes[0].MergeMethod);
     }
 
     [Fact]
@@ -93,7 +94,7 @@ internal sealed class ThrowingGitHost : IGitHost
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
         => throw new NotSupportedException();
     public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
-        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default, string mergeMethod = "rebase")
         => throw _ex;
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;

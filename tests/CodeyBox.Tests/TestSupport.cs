@@ -69,7 +69,9 @@ internal static class TestSupport
         HostGitIdentity? hostGitIdentity = null,
         (string Name, string Email)? projectGitAuthor = null,
         IAuditReportStore? auditReportStore = null,
-        int maxLlmAuditorParallelism = 3)
+        int maxLlmAuditorParallelism = 3,
+        IUpstreamRemoteFactory? upstreamFactory = null,
+        ProjectUpstream? projectUpstream = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -96,6 +98,7 @@ internal static class TestSupport
             DefaultAgent = AgentKind.Claude,
             GitAuthorName = projectGitAuthor?.Name,
             GitAuthorEmail = projectGitAuthor?.Email,
+            Upstream = projectUpstream ?? ProjectUpstream.Noop,
             Audit = new ProjectAudit
             {
                 MaxIterations = maxAuditIterations,
@@ -106,7 +109,7 @@ internal static class TestSupport
 
         var presetCatalog = new ScriptedAuditorCatalog(auditorList);
         var composer = new ProjectAuditorComposer(presetCatalog);
-        var upstreamFactory = new TestUpstreamFactory();
+        upstreamFactory ??= new TestUpstreamFactory();
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,

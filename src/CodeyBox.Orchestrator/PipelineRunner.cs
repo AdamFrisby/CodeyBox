@@ -1361,10 +1361,11 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             catch (Exception ex)
             {
-                if (ContainsUpstreamRebaseConflict(ex))
+                var conflict = FindUpstreamRebaseConflict(ex);
+                if (conflict is not null)
                 {
-                    _log.LogWarning("Upstream complete failed due to rebase conflict: {Error}", ex.Message);
-                    await TransitionFailed(item, ex.Message, ct, project);
+                    _log.LogWarning("Upstream complete failed due to rebase conflict: {Error}", conflict.Message);
+                    await TransitionFailed(item, conflict.Message, ct, project);
                     break;
                 }
 
@@ -1400,12 +1401,12 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    private static bool ContainsUpstreamRebaseConflict(Exception ex)
+    private static UpstreamRebaseConflictException? FindUpstreamRebaseConflict(Exception ex)
     {
         for (var current = ex; current is not null; current = current.InnerException)
-            if (current is UpstreamRebaseConflictException)
-                return true;
-        return false;
+            if (current is UpstreamRebaseConflictException conflict)
+                return conflict;
+        return null;
     }
 
     /// <summary>

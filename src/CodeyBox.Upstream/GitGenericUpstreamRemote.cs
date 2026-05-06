@@ -38,7 +38,13 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
         // Generic git has no PR concept — push baseBranch and report done.
         try
         {
-            await _gitHost.PushToUpstreamAsync(request.RepositoryId, _opts.UpstreamUrl, request.BaseBranch, _opts.ExtraEnvironment, ct);
+            await _gitHost.PushToUpstreamAsync(
+                request.RepositoryId,
+                _opts.UpstreamUrl,
+                request.BaseBranch,
+                _opts.ExtraEnvironment,
+                ct,
+                mergeMethod: request.MergeMethod);
             AuditLog.UpstreamPush(request.BaseBranch, ScrubUrlCredentials(_opts.UpstreamUrl));
             return new UpstreamCompletionOutcome { BranchPushed = true };
         }

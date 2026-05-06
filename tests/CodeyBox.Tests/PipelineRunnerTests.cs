@@ -260,4 +260,55 @@ public sealed class PipelineRunnerSandboxIdentityTests : IDisposable
         Assert.Contains("Project Override Author|projectoverride@codeybox.test", authorLog);
         Assert.DoesNotContain("Host Author", authorLog);
     }
+
+    [Fact]
+    public async Task UpstreamRebaseConflictDuringCompletion_FailsWithManualResolutionMessage()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var conflict = new UpstreamRebaseConflictException(
+            "upstream rebase conflict on main; manual resolution required");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            upstreamFactory: new ThrowingUpstreamFactory(new InvalidOperationException("outer wrapper", conflict)),
+            projectUpstream: new ProjectUpstream { Kind = "git-generic", GenericUrl = seed });
+
+        var item = NewItem("feature/already-merged") with
+        {
+            State = WorkItemState.Merged,
+            PushUpstream = true,
+            MergeSha = "deadbeef",
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("upstream rebase conflict on main; manual resolution required", final.LastError);
+    }
+}
+
+internal sealed class ThrowingUpstreamFactory : IUpstreamRemoteFactory
+{
+    private readonly Exception _exception;
+
+    public ThrowingUpstreamFactory(Exception exception) => _exception = exception;
+
+    public IUpstreamRemote Create(Project project) => new ThrowingUpstreamRemote(_exception);
+}
+
+internal sealed class ThrowingUpstreamRemote : IUpstreamRemote
+{
+    private readonly Exception _exception;
+
+    public ThrowingUpstreamRemote(Exception exception) => _exception = exception;
+
+    public string Name => "throwing";
+
+    public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
+        => throw _exception;
+
+    public Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
+        => throw _exception;
 }
