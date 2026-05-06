@@ -961,7 +961,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 QualityScore = 100,
             };
             if (_quotaFailures is not null
-                && await _quotaFailures.HasRecentForProjectAsync(kind.Value, auditMember.ModelId, project.Id, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct))
+                && await _quotaFailures.HasRecentAsync(kind.Value, auditMember.ModelId, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct))
             {
                 AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);
                 _log.LogWarning(
@@ -976,7 +976,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 || (quota.AvailablePct < 0 && _auditQuotaOptions.UnknownPolicy == QuotaUnknownPolicy.FailOpen)
                 || (quota.AvailablePct < 0
                     && _auditQuotaOptions.UnknownPolicy == QuotaUnknownPolicy.UseObservedFailures
-                    && (_quotaFailures is null || !await _quotaFailures.HasRecentForProjectAsync(kind.Value, auditMember.ModelId, project.Id, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct)));
+                    && (_quotaFailures is null || !await _quotaFailures.HasRecentAsync(kind.Value, auditMember.ModelId, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct)));
             if (!quotaAllows)
             {
                 AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);

@@ -30,7 +30,7 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     }
 
     [Fact]
-    public async Task ProjectScopedQuotaFailure_DoesNotBlockDifferentProject()
+    public async Task ProjectTaggedQuotaFailure_BlocksDifferentProject()
     {
         var now = DateTimeOffset.UtcNow;
         await QuotaFailureDetector.RecordIfQuotaFailureAsync(
@@ -44,22 +44,18 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
             CancellationToken.None,
             projectId: new ProjectId("proj-a"));
 
-        Assert.True(await _failures.HasRecentForProjectAsync(
+        Assert.True(await _failures.HasRecentAsync(
             AgentKind.Claude,
             "claude-opus-4-7",
-            new ProjectId("proj-a"),
-            TimeSpan.FromMinutes(10),
-            now));
-        Assert.False(await _failures.HasRecentForProjectAsync(
-            AgentKind.Claude,
-            "claude-opus-4-7",
-            new ProjectId("proj-b"),
             TimeSpan.FromMinutes(10),
             now));
 
         var decision = await BuildRouter().ResolveAsync(Item(projectId: "proj-b"), null, CancellationToken.None);
 
-        Assert.Equal(AgentKind.Claude, decision.Chosen!.Agent);
+        Assert.Equal(AgentKind.Codex, decision.Chosen!.Agent);
+
+        var recent = await _failures.ListRecentAsync(TimeSpan.FromMinutes(10), now);
+        Assert.Equal(new ProjectId("proj-a"), recent.Single().ProjectId);
     }
 
     [Fact]
