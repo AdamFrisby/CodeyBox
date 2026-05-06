@@ -102,9 +102,10 @@ public sealed class StartupReaperTests : IDisposable
     }
 
     [Fact]
-    public async Task StartupReaper_WithNoStaleWorkers_OrchestratesNormally()
+    public async Task StartupReplay_QueuedItemInsertedBeforeBoot_IsPickedUpByWorker()
     {
-        // No stale workers — just a regular Queued item. Should run cleanly.
+        // No producer has touched the in-memory queue: this row simulates an
+        // out-of-band DB update or a Queued item left behind before process boot.
         var item = new WorkItem
         {
             Id = WorkItemId.New(),
@@ -116,7 +117,7 @@ public sealed class StartupReaperTests : IDisposable
         await _store.CreateAsync(item);
 
         var queue = new InMemoryTaskQueue();
-        await queue.EnqueueAsync(item.Id);
+        Assert.Equal(0, queue.Count);
 
         var pipeline = new ImmediateDonePipeline(_store);
         var cancellations = new CancellationRegistry(CancellationToken.None);
