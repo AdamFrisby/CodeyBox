@@ -34,27 +34,28 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null)
     {
-        // ChatGPT-subscription auth: write ~/.codex/auth.json into the sandbox
-        // from the credential's CODEX_AUTH_JSON env var. The codex CLI reads
-        // ONLY that file path; there's no env-var equivalent. API-key mode
-        // works via env var alone, so skip silently when absent.
-        if (credential is not null
-            && credential.EnvironmentVariables.TryGetValue("CODEX_AUTH_JSON", out var authJson)
-            && !string.IsNullOrEmpty(authJson))
+        // ChatGPT-subscription auth: write ~/.codex/auth.json into the sandbox.
+        // The codex CLI reads ONLY that file path; there's no env-var equivalent.
+        //
+        // We always materialise from the in-sandbox CODEX_AUTH_JSON env var
+        // (injected at sandbox boot from the agent credential) rather than from
+        // the credential parameter, because LlmReviewAuditor and similar
+        // call-sites pass credential=null on the assumption that env-var auth is
+        // sufficient — true for Claude (env-var-based), false for Codex
+        // (file-based). Reading from the in-sandbox env covers both code paths
+        // without requiring auditor changes; if the env var is absent, this is
+        // a no-op and codex falls back to OPENAI_API_KEY (api-key mode).
+        var write = await sandbox.ExecAsync(new SandboxExec
         {
-            var write = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["bash", "-c", "set -e; mkdir -p \"$HOME/.codex\"; umask 077; cat > \"$HOME/.codex/auth.json\""],
-                Stdin = authJson,
-            }, ct);
-            if (!write.Success)
-            {
-                return new AgentResult(
-                    Success: false,
-                    Summary: $"failed to materialise codex auth: exit {write.ExitCode}",
-                    Stdout: write.Stdout,
-                    Stderr: write.Stderr);
-            }
+            Argv = ["bash", "-c", "set -eu; if [ -n \"${CODEX_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.codex\"; umask 077; printf '%s' \"$CODEX_AUTH_JSON\" > \"$HOME/.codex/auth.json\"; fi"],
+        }, ct);
+        if (!write.Success)
+        {
+            return new AgentResult(
+                Success: false,
+                Summary: $"failed to materialise codex auth: exit {write.ExitCode}",
+                Stdout: write.Stdout,
+                Stderr: write.Stderr);
         }
 
         return await base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback);
