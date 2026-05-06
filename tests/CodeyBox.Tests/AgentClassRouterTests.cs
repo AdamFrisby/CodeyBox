@@ -174,7 +174,7 @@ public sealed class AgentClassRouterTests
         Assert.False(decision.ShouldWait);
     }
 
-    // ── No probe registered → fail-open ──────────────────────────────────────
+    // ── No probe registered → unknown policy ────────────────────────────────
 
     [Fact]
     public async Task NoProbeRegistered_ForSubscriptionMember_TreatedAsAvailable()
@@ -203,16 +203,21 @@ public sealed class AgentClassRouterTests
 /// <summary>Fake probe that always returns a fixed AvailablePct.</summary>
 internal sealed class FakeProbe : IAgentQuotaProbe
 {
-    private readonly double _availablePct;
+    private readonly AgentQuotaSnapshot _snapshot;
 
     public FakeProbe(AgentKind kind, double availablePct)
+        : this(kind, new AgentQuotaSnapshot { AvailablePct = availablePct })
+    {
+    }
+
+    public FakeProbe(AgentKind kind, AgentQuotaSnapshot snapshot)
     {
         Kind = kind;
-        _availablePct = availablePct;
+        _snapshot = snapshot;
     }
 
     public AgentKind Kind { get; }
 
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
+        => Task.FromResult(_snapshot);
 }

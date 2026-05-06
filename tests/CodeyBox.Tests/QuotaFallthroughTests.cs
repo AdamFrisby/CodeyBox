@@ -101,7 +101,7 @@ public sealed class QuotaFallthroughTests : IDisposable
     [Fact]
     public async Task NoQuotaProbesWired_AuditAgentUsedWithoutGating()
     {
-        // When no quota probes are injected, audit agent is always used (fail-open).
+        // When no quota probes are injected, the audit-agent quota gate is not active.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var llmAuditor = new ContextCapturingAuditor("security:llm-review",
             AuditCapabilities.AgentCredentials | AuditCapabilities.Network);

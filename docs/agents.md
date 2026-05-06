@@ -105,9 +105,9 @@ specific Gemini model:
 ```
 When `ModelId` is omitted the CLI uses its own default.
 
-**Quota probe:** no Gemini usage endpoint is currently registered; the router
-treats unknown quota as available (fail-open). Register Gemini as `PayPerApi`
-in agent-class config so the orchestrator never gates on it:
+**Quota probe:** no Gemini usage endpoint is currently registered. Register
+Gemini as `PayPerApi` in agent-class config so the orchestrator never gates on
+it:
 ```json
 { "Agent": "gemini", "Billing": "PayPerApi", "ModelId": "gemini-2.5-pro" }
 ```
