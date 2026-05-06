@@ -48,6 +48,12 @@ public sealed class HostShutdownCancellationTests : IDisposable
     };
 
     private ShutdownTestHarness BuildBlockingPipeline(string seedRepoUrl)
+        => BuildPipeline(seedRepoUrl, new BlockingAgentRunner());
+
+    private ShutdownTestHarness BuildPipeline(
+        string seedRepoUrl,
+        IAgentRunner agent,
+        PipelineOptions? options = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -58,7 +64,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
             NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
-        var registry = new AgentRegistry([new BlockingAgentRunner()]);
+        var registry = new AgentRegistry([agent]);
 
         var projects = new InMemoryProjectRepository(new Project
         {
@@ -78,7 +84,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, upstreamFactory, composer, store,
             new NullWebhookDispatcher(),
-            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            options ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance);
 
         return new ShutdownTestHarness(pipeline, store, gitHost);
@@ -115,6 +121,43 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(WorkItemState.Working, final!.State);
         Assert.Null(final.CancellationReason);
         Assert.NotNull(final.PreemptedAt);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+
+        var showRef = await TestSupport.RunGit(harness.GitHost.GetRepoPath(item.Id.ToString()),
+            "show-ref", "--verify", final.PreemptCheckpoint!);
+        Assert.Equal(0, showRef.code);
+    }
+
+    [Fact]
+    public async Task HostShutdown_PreemptHookTimeout_StillCreatesCheckpoint()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var harness = BuildPipeline(
+            seed,
+            new HangingPreemptAgentRunner(),
+            new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                ShutdownGrace = TimeSpan.FromSeconds(8),
+            });
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await hostShutdownCts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask.WaitAsync(TimeSpan.FromSeconds(10)));
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, final!.State);
         Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
 
         var showRef = await TestSupport.RunGit(harness.GitHost.GetRepoPath(item.Id.ToString()),
@@ -492,6 +535,28 @@ internal sealed class BlockingAgentRunner : IAgentRunner
         await Task.Delay(Timeout.Infinite, ct);
         return new AgentResult(false, "unreachable", null, null);
     }
+}
+
+internal sealed class HangingPreemptAgentRunner : IAgentRunner, IPreemptibleAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        return new AgentResult(false, "unreachable", null, null);
+    }
+
+    public Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default)
+        => Task.Delay(Timeout.InfiniteTimeSpan);
 }
 
 internal sealed class StartupResumeRecordingAgent : IAgentRunner, IResumableAgentRunner

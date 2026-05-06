@@ -570,8 +570,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (completed != runTask)
                 {
                     preemptRequested = true;
-                    await RequestAgentPreemptAsync(runner, sandbox, SandboxConventions.WorkDir, CancellationToken.None);
-                    completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain));
+                    await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
+                    completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
                     if (completed != runTask)
                         await runnerCts.CancelAsync();
                 }
@@ -586,9 +586,11 @@ public sealed class PipelineRunner : IPipelineRunner
             Exception? checkpointFailure = null;
             try
             {
-                await CheckpointPreemptAsync(item, sandbox, branch, CancellationToken.None);
+                using var checkpointCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                checkpointCts.CancelAfter(_opts.PreemptCheckpointDrain);
+                await CheckpointPreemptAsync(item, sandbox, branch, checkpointCts.Token);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex)
             {
                 checkpointFailure = ex;
                 _log.LogError(ex, "Preempt checkpoint failed for work item {Id}; preserving sandbox for operator recovery", item.Id);
@@ -808,12 +810,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 Argv = ["sh", "-c", "set -e; mkdir -p .codeybox; test -f .codeybox/preempt-scratchpad.md || printf '%s\n' 'No CLI scratchpad was captured before preemption.' > .codeybox/preempt-scratchpad.md"],
                 WorkingDirectory = SandboxConventions.WorkDir,
             }, ct);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m",
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m",
                 $"codeybox: preempt checkpoint {item.Title}{CoAuthoredByTrailer}");
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{checkpointRef}");
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{checkpointRef}");
 
-            var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
             var preempted = current with
             {
                 State = current.State is WorkItemState.Reworking ? WorkItemState.Reworking : WorkItemState.Working,
@@ -822,7 +824,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 PreemptCheckpoint = checkpointRef,
                 UpdatedAt = DateTimeOffset.UtcNow,
             };
-            await _store.UpdateAsync(preempted, CancellationToken.None);
+            await _store.UpdateAsync(preempted, ct);
             _log.LogInformation("Work item {Id} checkpointed for restart preemption at {Ref}", item.Id, checkpointRef);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -830,6 +832,49 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogError(ex, "Preempt checkpoint commit failed for work item {Id}; not marking checkpoint valid", item.Id);
             throw;
         }
+    }
+
+    private async Task RequestAgentPreemptWithDeadlineAsync(
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken shutdownDeadlineToken)
+    {
+        using var preemptCts = CancellationTokenSource.CreateLinkedTokenSource(shutdownDeadlineToken);
+        var preemptTask = RequestAgentPreemptAsync(runner, sandbox, workingDirectory, preemptCts.Token);
+        var timeoutTask = Task.Delay(_opts.AgentPreemptSignalTimeout, shutdownDeadlineToken);
+        var completed = await Task.WhenAny(preemptTask, timeoutTask);
+
+        if (completed == preemptTask)
+        {
+            try
+            {
+                await preemptTask;
+            }
+            catch (OperationCanceledException ex)
+            {
+                _log.LogWarning(ex, "Best-effort agent preempt signal was canceled");
+            }
+            return;
+        }
+
+        try { await preemptCts.CancelAsync(); } catch { }
+        _ = ObservePreemptFailureAsync(preemptTask);
+        _log.LogWarning("Best-effort agent preempt signal exceeded timeout {Timeout}", _opts.AgentPreemptSignalTimeout);
+    }
+
+    private async Task ObservePreemptFailureAsync(Task preemptTask)
+    {
+        var completed = await Task.WhenAny(preemptTask, Task.Delay(_opts.AgentPreemptSignalTimeout));
+        if (completed != preemptTask)
+            return;
+
+        try { await preemptTask; }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Best-effort agent preempt signal failed after timeout");
+        }
+        catch (OperationCanceledException) { }
     }
 
     private async Task RequestAgentPreemptAsync(
@@ -1430,8 +1475,8 @@ public sealed class PipelineRunner : IPipelineRunner
             var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
             if (completed != runTask)
             {
-                await RequestAgentPreemptAsync(runner, sandbox, SandboxConventions.WorkDir, CancellationToken.None);
-                completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain));
+                await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
+                completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
                 if (completed != runTask)
                     await runnerCts.CancelAsync();
             }
@@ -2014,6 +2059,13 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
     }
 
+    private static async Task RunWithCancellation(ISandbox sandbox, CancellationToken ct, params string[] argv)
+    {
+        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
+        if (!r.Success)
+            throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
+    }
+
     // Runs a command but replaces the last argv element with "***" in any exception message,
     // used when the last element is a sensitive value (e.g. user.email) that must not reach
     // audit-tier logs.
@@ -2497,7 +2549,9 @@ public sealed record PipelineOptions
     public HostGitIdentity? HostGitIdentity { get; init; }
     public TimeSpan ShutdownGrace { get; init; } = TimeSpan.FromSeconds(60);
     public TimeSpan AuditShutdownDrain => Min(TimeSpan.FromSeconds(60), ShutdownGrace);
+    public TimeSpan AgentPreemptSignalTimeout => Min(TimeSpan.FromSeconds(2), ShutdownGrace);
     public TimeSpan AgentPreemptDrain => Min(TimeSpan.FromSeconds(2), ShutdownGrace);
+    public TimeSpan PreemptCheckpointDrain => Min(TimeSpan.FromSeconds(30), ShutdownGrace);
     public TimeSpan SandboxPreserveDrain => Min(TimeSpan.FromSeconds(10), ShutdownGrace);
 
     /// <summary>

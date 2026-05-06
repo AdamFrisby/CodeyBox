@@ -93,6 +93,42 @@ public sealed class CliAgentPreemptTests
     }
 
     [Fact]
+    public async Task RequestPreempt_TargetsOnlyMatchingActiveRunnerExec()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox1 = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox2 = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new TermFlushRunner();
+        using var keepSecondRunning = new CancellationTokenSource();
+
+        var prompt =
+            ": codeybox-test-preempt-flush-marker; " +
+            "trap 'mkdir -p \"$HOME/.testagent/scratch\"; printf flushed > \"$HOME/.testagent/scratch/flushed.txt\"; exit 0' TERM; " +
+            "printf ready > preempt-ready; while true; do sleep 1; done";
+
+        var run1 = runner.RunAsync(sandbox1, "/work", prompt, credential: null);
+        var run2 = runner.RunAsync(sandbox2, "/work", prompt, credential: null, ct: keepSecondRunning.Token);
+
+        var ready1 = await WaitForAsync(
+            () => sandbox1.ExecAsync(new SandboxExec { Argv = ["test", "-f", "preempt-ready"], WorkingDirectory = "/work" }),
+            TimeSpan.FromSeconds(10));
+        var ready2 = await WaitForAsync(
+            () => sandbox2.ExecAsync(new SandboxExec { Argv = ["test", "-f", "preempt-ready"], WorkingDirectory = "/work" }),
+            TimeSpan.FromSeconds(10));
+        Assert.True(ready1.Success, ready1.Stderr);
+        Assert.True(ready2.Success, ready2.Stderr);
+
+        await runner.RequestPreemptAsync(sandbox1, "/work");
+
+        var stopped = await run1.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(stopped.Success, stopped.Stderr);
+        Assert.False(run2.IsCompleted);
+
+        await keepSecondRunning.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run2);
+    }
+
+    [Fact]
     public async Task RunResumed_RestoresCapturedScratchpad()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
@@ -147,6 +183,43 @@ public sealed class CliAgentPreemptTests
             "true",
             credential: null,
             new AgentResumeContext("refs/heads/codeybox/preempt/test")));
+    }
+
+    [Fact]
+    public async Task RunResumed_RejectsSymlinkedDestinationPath()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new TestCliRunner();
+
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "set -e; mkdir -p \"$HOME/.testagent/scratch\"; printf '%s\n' 'do not escape' > \"$HOME/.testagent/scratch/todo.txt\""],
+        });
+        Assert.True(write.Success, write.Stderr);
+
+        await runner.RequestPreemptAsync(sandbox, "/work");
+
+        var symlink = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "set -e; rm -rf \"$HOME/.testagent\" escape-target; mkdir -p escape-target; ln -s \"$PWD/escape-target\" \"$HOME/.testagent\""],
+            WorkingDirectory = "/work",
+        });
+        Assert.True(symlink.Success, symlink.Stderr);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "true",
+            credential: null,
+            new AgentResumeContext("refs/heads/codeybox/preempt/test")));
+
+        var escaped = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["test", "-f", "escape-target/scratch/todo.txt"],
+            WorkingDirectory = "/work",
+        });
+        Assert.False(escaped.Success);
     }
 
     [Fact]

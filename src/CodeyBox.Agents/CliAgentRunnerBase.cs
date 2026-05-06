@@ -10,6 +10,9 @@ namespace CodeyBox.Agents;
 /// </summary>
 public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner
 {
+    private const string AgentRunIdEnvironmentVariable = "CODEYBOX_AGENT_RUN_ID";
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ActiveAgentRunIds = new();
+
     public abstract AgentKind Kind { get; }
 
     /// <summary>
@@ -75,16 +78,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             return preparation;
 
         var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode);
+        var runKey = AgentRunKey(sandbox, workingDirectory);
+        var runId = Guid.NewGuid().ToString("N");
+        ActiveAgentRunIds[runKey] = runId;
         var exec = new SandboxExec
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = invocation.ExtraEnvironment,
+            ExtraEnvironment = WithAgentRunId(invocation.ExtraEnvironment, runId),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
         };
 
-        var result = await sandbox.ExecAsync(exec, ct);
+        SandboxExecResult result;
+        try
+        {
+            result = await sandbox.ExecAsync(exec, ct);
+        }
+        finally
+        {
+            RemoveActiveAgentRunId(runKey, runId);
+        }
+
         return new AgentResult(
             Success: result.Success,
             Summary: result.Success ? "ok" : $"agent exited {result.ExitCode}",
@@ -110,16 +125,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             return preparation;
 
         var invocation = BuildResumeInvocation(prompt, credential, resume, modelId, reasoningMode);
+        var runKey = AgentRunKey(sandbox, workingDirectory);
+        var runId = Guid.NewGuid().ToString("N");
+        ActiveAgentRunIds[runKey] = runId;
         var exec = new SandboxExec
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = invocation.ExtraEnvironment,
+            ExtraEnvironment = WithAgentRunId(invocation.ExtraEnvironment, runId),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
         };
 
-        var result = await sandbox.ExecAsync(exec, ct);
+        SandboxExecResult result;
+        try
+        {
+            result = await sandbox.ExecAsync(exec, ct);
+        }
+        finally
+        {
+            RemoveActiveAgentRunId(runKey, runId);
+        }
+
         return new AgentResult(
             Success: result.Success,
             Summary: result.Success ? "ok" : $"agent exited {result.ExitCode}",
@@ -131,6 +158,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     {
         var dirs = string.Join(" ", ScratchpadHomeDirectories.Select(ShellQuote));
         var pattern = PreemptProcessPattern;
+        ActiveAgentRunIds.TryGetValue(AgentRunKey(sandbox, workingDirectory), out var activeRunId);
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv =
@@ -139,10 +167,26 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 $$"""
                 set -euo pipefail
                 mkdir -p .codeybox
+                active_run_id="$2"
                 pids=""
-                for pid in $(pgrep -f "$1" 2>/dev/null || true); do
-                  [ "$pid" = "$$" ] && continue
-                  pids="$pids $pid"
+                if [ -d /proc ]; then
+                  for env_file in /proc/[0-9]*/environ; do
+                    [ -r "$env_file" ] || continue
+                    pid="${env_file#/proc/}"
+                    pid="${pid%/environ}"
+                    [ "$pid" = "$$" ] && continue
+                    if [ -n "$active_run_id" ]; then
+                      if tr '\0' '\n' < "$env_file" 2>/dev/null | grep -Fx -- "{{AgentRunIdEnvironmentVariable}}=$active_run_id" >/dev/null; then
+                        pids="$pids $pid"
+                      fi
+                    elif [ -r "/proc/$pid/cmdline" ] \
+                         && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -F -- "$1" >/dev/null \
+                         && tr '\0' '\n' < "$env_file" 2>/dev/null | grep -Fx -- "HOME=$HOME" >/dev/null; then
+                      pids="$pids $pid"
+                    fi
+                  done
+                fi
+                for pid in $pids; do
                   kill -TERM "$pid" 2>/dev/null || true
                 done
                 if [ -n "$pids" ]; then
@@ -290,6 +334,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 """,
                 "codeybox-preempt",
                 pattern,
+                activeRunId ?? string.Empty,
             ],
             WorkingDirectory = workingDirectory,
         }, ct);
@@ -404,6 +449,52 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
               allowed_roots+=("$root")
             done
 
+            ensure_destination() {
+              local dest_base="$1" rel="$2" kind="$3"
+              local dest_base_real dest parent rel_parent current
+              dest_base_real="$(realpath -e "$dest_base")"
+              dest="$dest_base/$rel"
+              if [ "$kind" = "file" ]; then
+                parent="$(dirname "$dest")"
+                rel_parent="$(dirname "$rel")"
+              else
+                parent="$dest"
+                rel_parent="$rel"
+              fi
+
+              current="$dest_base"
+              if [ "$rel_parent" != "." ]; then
+                IFS=/ read -r -a parts <<< "$rel_parent"
+                for part in "${parts[@]}"; do
+                  [ -n "$part" ] || continue
+                  current="$current/$part"
+                  if [ -L "$current" ]; then
+                    echo "scratchpad restore destination uses symlinked path: $scope/$rel" >&2
+                    exit 15
+                  fi
+                done
+              fi
+
+              mkdir -p "$parent"
+              parent_real="$(realpath -e "$parent")"
+              case "$parent_real/" in
+                "$dest_base_real"/*) ;;
+                *)
+                  echo "scratchpad restore destination escapes base: $scope/$rel" >&2
+                  exit 15
+                  ;;
+              esac
+
+              if [ -L "$dest" ]; then
+                echo "scratchpad restore destination is a symlink: $scope/$rel" >&2
+                exit 15
+              fi
+              if [ "$kind" = "file" ] && [ -e "$dest" ] && [ ! -f "$dest" ]; then
+                echo "scratchpad restore destination is not a regular file: $scope/$rel" >&2
+                exit 15
+              fi
+            }
+
             is_allowed_entry() {
               local kind="$1"
               local rel="$2"
@@ -477,7 +568,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
               dest="$dest_base/$rel"
               if [ "$kind" = "dir" ]; then
                 mkdir -p "$src"
-                mkdir -p "$dest"
+                ensure_destination "$dest_base" "$rel" dir
               elif [ "$kind" = "file" ]; then
                 member="$scope/$rel"
                 if ! grep -Fx -- "$member" "$members" >/dev/null; then
@@ -507,7 +598,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                   echo "scratchpad restore total byte limit exceeded" >&2
                   exit 14
                 }
-                mkdir -p "$(dirname "$dest")"
+                ensure_destination "$dest_base" "$rel" file
                 cp -p "$src" "$dest"
               else
                 exit 11
@@ -530,6 +621,26 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     private static string ShellQuote(string value) =>
         "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
+
+    private string AgentRunKey(ISandbox sandbox, string workingDirectory) =>
+        $"{Kind.Value}\n{sandbox.Id}\n{workingDirectory}";
+
+    private static IReadOnlyDictionary<string, string> WithAgentRunId(
+        IReadOnlyDictionary<string, string>? environment,
+        string runId)
+    {
+        var merged = environment is null
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : new Dictionary<string, string>(environment, StringComparer.Ordinal);
+        merged[AgentRunIdEnvironmentVariable] = runId;
+        return merged;
+    }
+
+    private static void RemoveActiveAgentRunId(string runKey, string runId)
+    {
+        ((ICollection<KeyValuePair<string, string>>)ActiveAgentRunIds)
+            .Remove(new KeyValuePair<string, string>(runKey, runId));
+    }
 
     protected sealed record AgentInvocation(
         IReadOnlyList<string> Argv,
