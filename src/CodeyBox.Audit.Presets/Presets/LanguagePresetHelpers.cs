@@ -23,6 +23,19 @@ internal static class LanguagePresetHelpers
             markerScript,
             new ShellCommandAuditor(new ShellCommandAuditorOptions { Name = name, Argv = argv }));
 
+    public static IAuditor RepositoryRootShell(
+        string language,
+        string markerDescription,
+        string markerScript,
+        string name,
+        params string[] argv)
+        => new LanguagePresetAuditor(
+            language,
+            markerDescription,
+            markerScript,
+            new ShellCommandAuditor(new ShellCommandAuditorOptions { Name = name, Argv = argv }),
+            runAtRepositoryRootWhenMarkersExist: true);
+
     public static IAuditor ShellScript(
         string language,
         string markerDescription,

@@ -11,17 +11,20 @@ internal sealed class LanguagePresetAuditor : IAuditor
     private readonly string _markerDescription;
     private readonly string _markerScript;
     private readonly IAuditor _inner;
+    private readonly bool _runAtRepositoryRootWhenMarkersExist;
 
     public LanguagePresetAuditor(
         string language,
         string markerDescription,
         string markerScript,
-        IAuditor inner)
+        IAuditor inner,
+        bool runAtRepositoryRootWhenMarkersExist = false)
     {
         _language = language;
         _markerDescription = markerDescription;
         _markerScript = markerScript;
         _inner = inner;
+        _runAtRepositoryRootWhenMarkersExist = runAtRepositoryRootWhenMarkersExist;
     }
 
     public string Name => _inner.Name;
@@ -49,7 +52,12 @@ internal sealed class LanguagePresetAuditor : IAuditor
 
         var projectDirectories = ParseProjectDirectories(discovery.Stdout);
         if (projectDirectories.Count > 0)
+        {
+            if (_runAtRepositoryRootWhenMarkersExist)
+                return await RunInnerForProjectDirectoriesAsync(sandbox, workingDirectory, context, ["."], ct);
+
             return await RunInnerForProjectDirectoriesAsync(sandbox, workingDirectory, context, projectDirectories, ct);
+        }
 
         return new AuditResult(true, [new AuditFinding(
             AuditorName: Name,

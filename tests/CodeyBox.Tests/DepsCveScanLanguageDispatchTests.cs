@@ -35,7 +35,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.Contains(sandbox.ExtraEnvironments, e =>
             e.TryGetValue("NPM_CONFIG_REGISTRY", out var registry) &&
             registry == "https://registry.npmjs.org/");
-        Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/csharp");
+        Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/python");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/node");
     }
@@ -331,6 +331,29 @@ public sealed class DepsCveScanLanguageDispatchTests
             f.Severity == AuditSeverity.Error &&
             f.Title.Contains("too many project directories", StringComparison.Ordinal));
         Assert.Equal(25, sandbox.Commands.Count(c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task CSharpExcessiveProjectDirectories_RunScannerOnceAtRepositoryRoot()
+    {
+        var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./csharp-{i}")) + "\n";
+        var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["csharp"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.True(result.Passed);
+        Assert.DoesNotContain(result.Findings, f =>
+            f.Severity == AuditSeverity.Error &&
+            f.Title.Contains("too many project directories", StringComparison.Ordinal));
+        Assert.Equal(1, sandbox.Commands.Count(c => c == "dotnet list package --vulnerable --include-transitive"));
+        Assert.Contains("/repo", sandbox.WorkingDirectories);
     }
 
     [Fact]

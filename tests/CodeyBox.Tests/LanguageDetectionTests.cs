@@ -80,7 +80,7 @@ public sealed class LanguageDetectionTests
 
         Assert.Contains(sandbox.Invocations, i =>
             i.Command == "dotnet build --no-incremental /warnaserror" &&
-            i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}csharp", StringComparison.Ordinal));
+            i.WorkingDirectory == fixture);
         Assert.Contains(sandbox.Invocations, i =>
             i.Command == "pytest" &&
             i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}python", StringComparison.Ordinal));
@@ -149,6 +149,23 @@ public sealed class LanguageDetectionTests
             f.Severity == AuditSeverity.Error &&
             f.Title.Contains("too many project directories", StringComparison.Ordinal));
         Assert.Equal(25, sandbox.Commands.Count(c => c == "pytest"));
+    }
+
+    [Fact]
+    public async Task CSharpExcessiveMarkerDirectories_RunOnceAtRepositoryRoot()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:build-WaE");
+        var sandbox = new ManyMarkersSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.True(result.Passed);
+        Assert.DoesNotContain(result.Findings, f =>
+            f.Severity == AuditSeverity.Error &&
+            f.Title.Contains("too many project directories", StringComparison.Ordinal));
+        Assert.Equal(1, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
     }
 
     private static AuditContext FakeAuditContext() =>
