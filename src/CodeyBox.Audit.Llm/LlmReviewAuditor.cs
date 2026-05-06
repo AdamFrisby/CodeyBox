@@ -46,12 +46,12 @@ public sealed class LlmReviewAuditor : IAuditor
         // Use the per-invocation override supplied by the pipeline for cross-review,
         // falling back to the baked-in runner from options (backwards compat).
         var agent = context.AuditRunner ?? _opts.Agent;
-        var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, credential: null, modelId: null, reasoningMode: null, ct,
+        var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, context.AuditCredential, modelId: null, reasoningMode: null, ct,
             stdoutChunkCallback: context.StdoutChunkCallback);
 
         // The pipeline already populates SandboxSpec.Environment with the
-        // agent credential (set on the container at boot), so we don't pass
-        // it here — the runner will read what it needs from the env.
+        // agent credential (set on the container at boot). Passing the same
+        // bundle here lets runners that need file-based setup materialise it.
 
         var rawOutput = agentResult.Stdout;
 

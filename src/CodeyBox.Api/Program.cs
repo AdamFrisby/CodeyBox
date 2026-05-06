@@ -466,20 +466,24 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
 
     // Codex (ChatGPT subscription) auth file. Default ~/.codex/auth.json — the
     // codex CLI hard-reads that path. CodexAgentRunner writes the file into
-    // the sandbox before invoking codex.
+    // the sandbox before invoking codex. Prefer an explicit CODEX_AUTH_JSON
+    // environment secret when the host process is already provisioned that way.
+    builtInFirst.Add(new CodexAuthJsonEnvironmentCredentialProvider(
+        sp.GetService<ILogger<CodexAuthJsonEnvironmentCredentialProvider>>()));
     var codexOauthFile =
         Environment.GetEnvironmentVariable("CODEYBOX_CODEX_OAUTH_FILE")
-        ?? builder.Configuration["CodeyBox:CodexOAuthFile"];
-    if (!string.IsNullOrWhiteSpace(codexOauthFile))
-    {
-        if (codexOauthFile.StartsWith("~/", StringComparison.Ordinal))
-            codexOauthFile = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                codexOauthFile[2..]);
-        builtInFirst.Add(new CodexOAuthFileCredentialProvider(
-            codexOauthFile,
-            sp.GetService<ILogger<CodexOAuthFileCredentialProvider>>()));
-    }
+        ?? builder.Configuration["CodeyBox:CodexOAuthFile"]
+        ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".codex",
+            "auth.json");
+    if (codexOauthFile.StartsWith("~/", StringComparison.Ordinal))
+        codexOauthFile = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            codexOauthFile[2..]);
+    builtInFirst.Add(new CodexOAuthFileCredentialProvider(
+        codexOauthFile,
+        sp.GetService<ILogger<CodexOAuthFileCredentialProvider>>()));
 
     // Enumerate plugin-registered ICredentialProvider types using the list captured
     // from AddCodeyBoxPlugins (called before builder.Build()). Each plugin type is
@@ -510,6 +514,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
+    }));
+    builtInLast.Add(new EnvironmentCredentialProvider(new[]
+    {
+        // Also accept the conventional OpenAI SDK variable. This keeps Codex
+        // audit runners authenticated in hosts that inject OPENAI_API_KEY
+        // directly instead of the CodeyBox-namespaced variant above.
+        new AgentCredentialMapping(AgentKind.Codex, "OPENAI_API_KEY", "OPENAI_API_KEY"),
     }));
 
     return new ChainedCredentialProvider(

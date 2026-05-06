@@ -720,17 +720,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private async Task<string> TransferEnvAsync(string name, IReadOnlyDictionary<string, string> env, string sandboxRoot, CancellationToken ct)
     {
         var envPath = Path.Combine(sandboxRoot, "env");
-        var sb = new StringBuilder();
-        foreach (var (k, v) in env)
-        {
-            if (k.Contains('=') || k.Contains('\n'))
-                throw new ArgumentException($"Invalid env key: {k}");
-            // Quote the value so shell sourcing handles spaces/special chars.
-            // Backslash-escape any embedded double quotes.
-            var escaped = v.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            sb.Append(k).Append("=\"").Append(escaped).Append("\"\n");
-        }
-        await File.WriteAllTextAsync(envPath, sb.ToString(), ct);
+        await File.WriteAllTextAsync(envPath, BuildEnvironmentFileContent(env), ct);
         if (!OperatingSystem.IsWindows())
             File.SetUnixFileMode(envPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
@@ -748,6 +738,22 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
         return "/home/ubuntu/.codeybox-env";
     }
+
+    internal static string BuildEnvironmentFileContent(IReadOnlyDictionary<string, string> env)
+    {
+        var sb = new StringBuilder();
+        foreach (var (k, v) in env)
+        {
+            if (k.Contains('=') || k.Contains('\n'))
+                throw new ArgumentException($"Invalid env key: {k}");
+            sb.Append(k).Append('=').Append(ShellSingleQuote(v)).Append('\n');
+        }
+
+        return sb.ToString();
+    }
+
+    private static string ShellSingleQuote(string value) =>
+        "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
 
     /// <summary>
     /// The exec wrapper script content. Sources the env file (if present),

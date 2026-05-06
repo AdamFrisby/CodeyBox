@@ -235,7 +235,7 @@ public sealed class GitHubUpstreamRemoteTests
 
 internal sealed class FakeGitHost : IGitHost
 {
-    public List<(string RepositoryId, string Url, string Branch)> Pushes { get; } = new();
+    public List<(string RepositoryId, string Url, string Branch, UpstreamPushReconcileStrategy ReconcileStrategy)> Pushes { get; } = new();
 
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
@@ -251,9 +251,10 @@ internal sealed class FakeGitHost : IGitHost
         string upstreamUrl,
         string branch,
         IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
         CancellationToken ct = default)
     {
-        Pushes.Add((repositoryId, upstreamUrl, branch));
+        Pushes.Add((repositoryId, upstreamUrl, branch, reconcileStrategy));
         return Task.CompletedTask;
     }
 
@@ -327,6 +328,7 @@ internal sealed class ThrowingFakeGitHost : IGitHost
         string upstreamUrl,
         string branch,
         IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
         CancellationToken ct = default)
         => throw _ex;
 

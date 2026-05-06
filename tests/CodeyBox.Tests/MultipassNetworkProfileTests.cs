@@ -1,6 +1,7 @@
-using Microsoft.Extensions.Logging.Abstractions;
+using System.Diagnostics;
 using CodeyBox.Core;
 using CodeyBox.Sandbox.Multipass;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -94,5 +95,48 @@ public sealed class MultipassNetworkProfileTests
         var imageIdx = list.IndexOf("24.04");
         Assert.True(networkIdx > 0);
         Assert.True(imageIdx > networkIdx, $"image {imageIdx} must come after --network {networkIdx}");
+    }
+
+    [Fact]
+    public async Task EnvironmentFileContent_ShellSourcesMultilineJsonLiterally()
+    {
+        var value = """
+            {
+              "tokens": {
+                "access_token": "tok$`'\value"
+              }
+            }
+            """;
+        var content = MultipassSandboxProvider.BuildEnvironmentFileContent(
+            new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = value });
+        var path = Path.Combine(Path.GetTempPath(), "codeybox-env-" + Guid.NewGuid().ToString("N"));
+        await File.WriteAllTextAsync(path, content);
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "/bin/sh",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add(". \"$1\"; printf %s \"$CODEX_AUTH_JSON\"");
+            psi.ArgumentList.Add("codeybox-env-test");
+            psi.ArgumentList.Add(path);
+
+            using var process = Process.Start(psi)!;
+            var stdout = await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            Assert.Equal(0, process.ExitCode);
+            Assert.Equal("", stderr);
+            Assert.Equal(value, stdout);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 }

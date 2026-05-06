@@ -32,6 +32,7 @@ public sealed class GitGenericUpstreamRemoteTests
         Assert.Single(gitHost.Pushes);
         Assert.Equal(SampleRequest.BaseBranch, gitHost.Pushes[0].Branch);
         Assert.Equal(opts.UpstreamUrl, gitHost.Pushes[0].Url);
+        Assert.Equal(UpstreamPushReconcileStrategy.Merge, gitHost.Pushes[0].ReconcileStrategy);
     }
 
     [Fact]
@@ -72,7 +73,9 @@ internal sealed class ThrowingGitHost : IGitHost
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
         => throw new NotSupportedException();
     public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
-        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+        CancellationToken ct = default)
         => throw new InvalidOperationException("simulated push failure");
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;

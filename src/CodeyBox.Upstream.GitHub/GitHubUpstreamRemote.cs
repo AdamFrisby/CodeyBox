@@ -81,7 +81,13 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         using var askpass = GitCredentialHelper.CreateAskPassFor(_opts.Token, "x-access-token");
         try
         {
-            await _gitHost.PushToUpstreamAsync(repositoryId, url, branch, askpass.Environment, ct);
+            await _gitHost.PushToUpstreamAsync(
+                repositoryId,
+                url,
+                branch,
+                askpass.Environment,
+                ToReconcileStrategy(_opts.MergeMethod),
+                ct);
             return new UpstreamPushResult(true, null);
         }
         catch (Exception ex)
@@ -128,7 +134,13 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         {
             try
             {
-                await _gitHost.PushToUpstreamAsync(request.RepositoryId, repoUrl, request.WorkBranch, askpass.Environment, ct);
+                await _gitHost.PushToUpstreamAsync(
+                    request.RepositoryId,
+                    repoUrl,
+                    request.WorkBranch,
+                    askpass.Environment,
+                    ToReconcileStrategy(request.MergeMethod),
+                    ct);
             }
             catch (Exception ex)
             {
@@ -437,6 +449,11 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             .Replace("{branch}", workBranch, StringComparison.Ordinal)
             .Replace("{title}", title, StringComparison.Ordinal);
     }
+
+    private static UpstreamPushReconcileStrategy ToReconcileStrategy(string mergeMethod)
+        => mergeMethod.Equals("rebase", StringComparison.OrdinalIgnoreCase)
+            ? UpstreamPushReconcileStrategy.Rebase
+            : UpstreamPushReconcileStrategy.Merge;
 }
 
 public sealed record GitHubUpstreamOptions

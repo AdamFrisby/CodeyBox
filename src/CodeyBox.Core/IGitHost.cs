@@ -25,7 +25,13 @@ public interface IGitHost
     Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default);
 
     /// <summary>Pushes a branch from the host bare repo to a configured upstream URL.</summary>
-    Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch, IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default);
+    Task PushToUpstreamAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+        CancellationToken ct = default);
 
     /// <summary>Discards the host-side state for a finished work item.</summary>
     Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default);
@@ -59,3 +65,13 @@ public sealed record SandboxRepositoryAccess(
     string CloneUrlInsideSandbox,
     IReadOnlyList<SandboxMount> Mounts,
     SandboxNetworkPolicy Network);
+
+/// <summary>How a stale local branch should be reconciled after an upstream non-fast-forward rejection.</summary>
+public enum UpstreamPushReconcileStrategy
+{
+    /// <summary>Replay local commits on top of the latest upstream tip before retrying the push.</summary>
+    Rebase,
+
+    /// <summary>Merge the latest upstream tip into the local branch before retrying the push.</summary>
+    Merge,
+}

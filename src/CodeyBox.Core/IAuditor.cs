@@ -68,7 +68,13 @@ public sealed record AuditContext(
     /// null otherwise. LLM auditors pass this through to IAgentRunner.RunAsync;
     /// tool auditors ignore it.
     /// </summary>
-    Action<string>? StdoutChunkCallback = null);
+    Action<string>? StdoutChunkCallback = null,
+    /// <summary>
+    /// The credential bundle resolved for <see cref="AuditRunner"/>. The
+    /// sandbox already receives these values in its environment, but some
+    /// runners also need the bundle to materialise auth files before startup.
+    /// </summary>
+    AgentCredential? AuditCredential = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(bool Passed, IReadOnlyList<AuditFinding> Findings, string? RawOutput = null);
