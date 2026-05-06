@@ -250,6 +250,44 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
+    public async Task PythonScannerParsesJsonStdoutWhenScannerWritesWarningsToStderr()
+    {
+        var sandbox = new DispatchSandbox(
+            markerPresent: true,
+            scannerStdout: """
+                {
+                  "dependencies": [
+                    {
+                      "name": "requests",
+                      "version": "2.19.0",
+                      "vulns": [
+                        { "id": "PYSEC-2018-28", "severity": "moderate" }
+                      ]
+                    }
+                  ]
+                }
+                """,
+            scannerStderr: "WARNING: pip-audit version check failed",
+            scannerExitCode: 1);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["python"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
+        Assert.Contains("requests", finding.Title);
+        Assert.Contains("PYSEC-2018-28", finding.Description);
+        Assert.Contains("pip-audit version check failed", result.RawOutput);
+    }
+
+    [Fact]
     public async Task PythonScannerParsesSafetyJsonOutput()
     {
         var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
@@ -324,6 +362,52 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
+    public async Task NodeScannerParsesJsonStdoutWhenNpmWritesNoticesToStderr()
+    {
+        var sandbox = new DispatchSandbox(
+            markerPresent: true,
+            scannerStdout: """
+                {
+                  "auditReportVersion": 2,
+                  "vulnerabilities": {
+                    "lodash": {
+                      "name": "lodash",
+                      "severity": "low",
+                      "range": "<4.17.21",
+                      "via": [
+                        {
+                          "source": 1106913,
+                          "title": "Command Injection",
+                          "url": "https://github.com/advisories/GHSA-35jh-r3h4-6jhm",
+                          "severity": "low",
+                          "range": "<4.17.21"
+                        }
+                      ]
+                    }
+                  }
+                }
+                """,
+            scannerStderr: "npm notice New minor version of npm available",
+            scannerExitCode: 1);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["node"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Contains("lodash", finding.Title);
+        Assert.Contains("GHSA-35jh-r3h4-6jhm", finding.Description);
+        Assert.Contains("npm notice", result.RawOutput);
+    }
+
+    [Fact]
     public async Task RustScannerParsesCargoAuditTextOutput()
     {
         var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
@@ -359,6 +443,8 @@ public sealed class DepsCveScanLanguageDispatchTests
         private readonly bool _missingTool;
         private readonly bool _missingCargoAuditSubcommand;
         private readonly string _scannerStdout;
+        private readonly string _scannerStderr;
+        private readonly int _scannerExitCode;
         private readonly int _discoveryExitCode;
 
         public DispatchSandbox(
@@ -366,12 +452,16 @@ public sealed class DepsCveScanLanguageDispatchTests
             bool missingTool = false,
             bool missingCargoAuditSubcommand = false,
             string scannerStdout = "{}",
+            string scannerStderr = "",
+            int scannerExitCode = 0,
             int discoveryExitCode = 0)
         {
             _markerPresent = markerPresent;
             _missingTool = missingTool;
             _missingCargoAuditSubcommand = missingCargoAuditSubcommand;
             _scannerStdout = scannerStdout;
+            _scannerStderr = scannerStderr;
+            _scannerExitCode = scannerExitCode;
             _discoveryExitCode = discoveryExitCode;
         }
 
@@ -402,7 +492,7 @@ public sealed class DepsCveScanLanguageDispatchTests
             if (_missingCargoAuditSubcommand)
                 return Task.FromResult(new SandboxExecResult(101, "", "error: no such command: `audit`"));
 
-            return Task.FromResult(new SandboxExecResult(0, _scannerStdout, ""));
+            return Task.FromResult(new SandboxExecResult(_scannerExitCode, _scannerStdout, _scannerStderr));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

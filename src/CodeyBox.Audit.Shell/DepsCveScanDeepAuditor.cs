@@ -110,7 +110,8 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                     WorkingDirectory = ResolveWorkingDirectory(workingDirectory, projectDirectory),
                 }, ct);
 
-                var rawOutput = CombinedOutput(result, out var wasTruncated);
+                var rawOutput = CombinedOutput(result, out _);
+                var parserInput = TruncatedOutput(result.Stdout, out var parserInputWasTruncated);
                 rawParts.Add($"## {language}:{projectDirectory}\n{rawOutput}");
 
                 if (IsMissingScannerTool(scanner, result))
@@ -123,7 +124,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                     continue;
                 }
 
-                var findings = scanner.Parse(rawOutput).ToList();
+                var findings = scanner.Parse(parserInput).ToList();
                 if (result.ExitCode != 0 && findings.Count == 0)
                 {
                     allFindings.Add(new AuditFinding(
@@ -134,7 +135,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                             System.Globalization.CultureInfo.InvariantCulture,
                             scanner.FailureDescription,
                             result.ExitCode) +
-                            (wasTruncated ? " Scanner output exceeded the parser limit and was truncated." : "") +
+                            (parserInputWasTruncated ? " Scanner stdout exceeded the parser limit and was truncated." : "") +
                             $" Stderr: {result.Stderr}"));
                     continue;
                 }
@@ -721,6 +722,11 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     private static string CombinedOutput(SandboxExecResult result, out bool wasTruncated)
     {
         var output = result.Stdout + (string.IsNullOrWhiteSpace(result.Stderr) ? "" : "\n" + result.Stderr);
+        return TruncatedOutput(output, out wasTruncated);
+    }
+
+    private static string TruncatedOutput(string output, out bool wasTruncated)
+    {
         wasTruncated = output.Length > MaxScannerOutputChars;
         return wasTruncated ? output[..MaxScannerOutputChars] : output;
     }
