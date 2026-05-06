@@ -504,12 +504,14 @@ public sealed class PipelineRunner : IPipelineRunner
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
         }
         CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
-        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
+        var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        if (resumingPreempt)
         {
-            var checkpointBranch = ValidatePreemptCheckpoint(item, item.PreemptCheckpoint);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", item.PreemptCheckpoint);
+            var preemptCheckpoint = item.PreemptCheckpoint!;
+            var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
-            prompt = BuildResumePrompt(prompt, item.PreemptCheckpoint);
+            prompt = BuildResumePrompt(prompt, preemptCheckpoint);
         }
         else if (isInitial)
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch);
@@ -540,7 +542,7 @@ public sealed class PipelineRunner : IPipelineRunner
             metadata: new Dictionary<string, object>
             {
                 ["agent"] = runner.Kind.Value,
-                ["resuming_preempt"] = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint),
+                ["resuming_preempt"] = resumingPreempt,
             },
             log: _log,
             activitySource: CodeyBoxActivities.Pipeline);
@@ -555,7 +557,7 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             await using (agentExecScope)
             {
-                var runTask = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+                var runTask = resumingPreempt
                     && runner is IResumableAgentRunner resumable
                     ? resumable.RunResumedAsync(
                         sandbox, SandboxConventions.WorkDir, prompt, credential,
@@ -646,6 +648,19 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException(detail);
         }
 
+        if (resumingPreempt)
+        {
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "rm -f .codeybox/preempt-scratchpad.tgz .codeybox/preempt-scratchpad.md"
+                ],
+                WorkingDirectory = SandboxConventions.WorkDir,
+            }, ct);
+        }
+
         // Stage anything the agent left dirty in the working tree. If the
         // agent already committed (per the rework prompt's instruction
         // to make new commits), `git add -A` is a no-op.
@@ -698,6 +713,20 @@ public sealed class PipelineRunner : IPipelineRunner
         var shaAfter = afterHead.Stdout.Trim();
         if (string.Equals(shaBefore, shaAfter, StringComparison.Ordinal))
         {
+            if (resumingPreempt)
+            {
+                await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_resumed_checkpoint_to_bare_repo",
+                    activitySource: CodeyBoxActivities.Sandbox, log: _log))
+                {
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{branch}");
+                }
+
+                if (isInitial && suggestionsJson is not null)
+                    await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
+
+                return agentResult.Stdout;
+            }
+
             var msg = isInitial
                 ? "Agent produced no changes to commit"
                 : "Rework agent produced no changes; cannot resolve audit findings";
@@ -798,20 +827,8 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _log.LogWarning(ex, "Preempt checkpoint commit failed for work item {Id}; trying to publish current HEAD as checkpoint", item.Id);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{checkpointRef}");
-
-            var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-            var preempted = current with
-            {
-                State = current.State is WorkItemState.Reworking ? WorkItemState.Reworking : WorkItemState.Working,
-                WorkBranch = branch,
-                PreemptedAt = DateTimeOffset.UtcNow,
-                PreemptCheckpoint = checkpointRef,
-                UpdatedAt = DateTimeOffset.UtcNow,
-            };
-            await _store.UpdateAsync(preempted, CancellationToken.None);
-            _log.LogInformation("Work item {Id} checkpointed for restart preemption at current HEAD {Ref}", item.Id, checkpointRef);
+            _log.LogError(ex, "Preempt checkpoint commit failed for work item {Id}; not marking checkpoint valid", item.Id);
+            throw;
         }
     }
 

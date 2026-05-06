@@ -57,6 +57,42 @@ public sealed class CliAgentPreemptTests
     }
 
     [Fact]
+    public async Task RequestPreempt_CapturesScratchpadAfterTermSignal()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new TermFlushRunner();
+
+        var runTask = sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                "trap 'mkdir -p \"$HOME/.testagent/scratch\"; printf flushed > \"$HOME/.testagent/scratch/flushed.txt\"; exit 0' TERM; printf ready > preempt-ready; while true; do sleep 1; done",
+                "codeybox-test-preempt-flush-marker",
+            ],
+            WorkingDirectory = "/work",
+        });
+
+        var ready = await WaitForAsync(
+            () => sandbox.ExecAsync(new SandboxExec { Argv = ["test", "-f", "preempt-ready"], WorkingDirectory = "/work" }),
+            TimeSpan.FromSeconds(10));
+        Assert.True(ready.Success, ready.Stderr);
+
+        await runner.RequestPreemptAsync(sandbox, "/work");
+        var stopped = await runTask.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(stopped.Success, stopped.Stderr);
+
+        var captured = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "tmp=$(mktemp -d); tar -xzf .codeybox/preempt-scratchpad.tgz -C \"$tmp\"; cat \"$tmp/home/.testagent/scratch/flushed.txt\""],
+            WorkingDirectory = "/work",
+        });
+        Assert.True(captured.Success, captured.Stderr);
+        Assert.Equal("flushed", captured.Stdout.Trim());
+    }
+
+    [Fact]
     public async Task RunResumed_RestoresCapturedScratchpad()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
@@ -113,7 +149,33 @@ public sealed class CliAgentPreemptTests
             new AgentResumeContext("refs/heads/codeybox/preempt/test")));
     }
 
-    private sealed class TestCliRunner : CliAgentRunnerBase
+    [Fact]
+    public async Task RunResumed_RejectsArchiveOverUncompressedFileLimit()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new TestCliRunner();
+
+        var archive = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "bash", "-c",
+                "set -euo pipefail; mkdir -p .codeybox/tmp/home/.testagent/scratch; printf '%s\n' 'dir\thome\t.testagent/scratch' 'file\thome\t.testagent/scratch/big.bin' > .codeybox/tmp/manifest.tsv; head -c 2097153 /dev/zero > .codeybox/tmp/home/.testagent/scratch/big.bin; tar -czf .codeybox/preempt-scratchpad.tgz -C .codeybox/tmp ."
+            ],
+            WorkingDirectory = "/work",
+        });
+        Assert.True(archive.Success, archive.Stderr);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "true",
+            credential: null,
+            new AgentResumeContext("refs/heads/codeybox/preempt/test")));
+    }
+
+    private class TestCliRunner : CliAgentRunnerBase
     {
         public override AgentKind Kind => new("testagent");
         protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".testagent/scratch"];
@@ -125,5 +187,27 @@ public sealed class CliAgentPreemptTests
             string? modelId = null,
             string? reasoningMode = null)
             => new(["sh", "-c", prompt]);
+    }
+
+    private sealed class TermFlushRunner : TestCliRunner
+    {
+        protected override string PreemptProcessPattern => "codeybox-test-preempt-flush-marker";
+    }
+
+    private static async Task<SandboxExecResult> WaitForAsync(
+        Func<Task<SandboxExecResult>> poll,
+        TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        SandboxExecResult result;
+        do
+        {
+            result = await poll();
+            if (result.Success)
+                return result;
+            await Task.Delay(25);
+        } while (DateTimeOffset.UtcNow < deadline);
+
+        return result;
     }
 }

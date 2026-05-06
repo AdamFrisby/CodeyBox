@@ -276,6 +276,83 @@ public sealed class HostShutdownCancellationTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupReplay_PreemptedWorkingItem_RemovesCheckpointScratchpadFromWorkBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var agent = new NoopResumeAgent();
+        var pipeline = BuildResumePipeline(seed, gitHost, store, agent);
+
+        var item = NewItem() with
+        {
+            State = WorkItemState.Working,
+            BaseBranch = "main",
+            WorkBranch = "codeybox/no-scratchpad-leak",
+            PreemptedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{WorkItemId.New()}",
+            PushUpstream = false,
+        };
+        item = item with { PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}" };
+        await store.CreateAsync(item);
+        await CreatePreemptCheckpointAsync(gitHost, item, seed);
+
+        await pipeline.RunAsync(item, CancellationToken.None, CancellationToken.None);
+
+        var tree = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
+            "ls-tree", "-r", "--name-only", item.WorkBranch!);
+        Assert.Equal(0, tree.code);
+        Assert.DoesNotContain(".codeybox/preempt-scratchpad.md", tree.stdout);
+        Assert.DoesNotContain(".codeybox/preempt-scratchpad.tgz", tree.stdout);
+    }
+
+    [Fact]
+    public async Task StartupReplay_PreemptedWorkingItem_WithNoNewDiff_PushesCheckpointWorkBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var agent = new NoopResumeAgent();
+        var pipeline = BuildResumePipeline(seed, gitHost, store, agent);
+
+        var item = NewItem() with
+        {
+            State = WorkItemState.Working,
+            BaseBranch = "main",
+            WorkBranch = "codeybox/no-new-diff-resume",
+            PreemptedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{WorkItemId.New()}",
+            PushUpstream = false,
+        };
+        item = item with { PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}" };
+        await store.CreateAsync(item);
+        await CreatePreemptCheckpointAsync(gitHost, item, seed, includeScratchpad: false);
+
+        await pipeline.RunAsync(item, CancellationToken.None, CancellationToken.None);
+
+        var final = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, agent.ResumeCalls);
+
+        var branch = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
+            "show-ref", "--verify", $"refs/heads/{item.WorkBranch}");
+        Assert.Equal(0, branch.code);
+
+        var tree = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
+            "ls-tree", "-r", "--name-only", item.WorkBranch!);
+        Assert.Equal(0, tree.code);
+        Assert.Contains("partial-rework.txt", tree.stdout);
+    }
+
+    [Fact]
     public async Task ProcessSandbox_StopAndPreserve_SkipsDisposeDeletion()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
@@ -292,7 +369,31 @@ public sealed class HostShutdownCancellationTests : IDisposable
         try { Directory.Delete(root, recursive: true); } catch { }
     }
 
-    private async Task CreatePreemptCheckpointAsync(LocalGitHost gitHost, WorkItem item, string seed)
+    private PipelineRunner BuildResumePipeline(
+        string seed,
+        LocalGitHost gitHost,
+        SqliteWorkItemStore store,
+        IAgentRunner agent)
+    {
+        return new PipelineRunner(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
+            new InMemoryPullRequestService(), new InMemoryProjectRepository(new Project
+            {
+                Id = new ProjectId("test-project"),
+                DisplayName = "Test Project",
+                RepositoryUrl = seed,
+                DefaultBaseBranch = "main",
+                DefaultAgent = AgentKind.Claude,
+                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+            }),
+            new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store, new NullWebhookDispatcher(),
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance);
+    }
+
+    private async Task CreatePreemptCheckpointAsync(LocalGitHost gitHost, WorkItem item, string seed, bool includeScratchpad = true)
     {
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed);
         var clone = Path.Combine(_workspace, "checkpoint-" + Guid.NewGuid().ToString("N")[..8]);
@@ -301,12 +402,15 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(0, (await TestSupport.RunGit(clone, "config", "user.email", "test@example.invalid")).code);
         Assert.Equal(0, (await TestSupport.RunGit(clone, "config", "user.name", "Test")).code);
         Assert.Equal(0, (await TestSupport.RunGit(clone, "checkout", "-B", item.WorkBranch!)).code);
-        Directory.CreateDirectory(Path.Combine(clone, ".codeybox"));
-        await File.WriteAllTextAsync(Path.Combine(clone, ".codeybox", "preempt-scratchpad.md"), "resume scratchpad");
-        var scratchRoot = Path.Combine(_workspace, "scratch-" + Guid.NewGuid().ToString("N")[..8]);
-        Directory.CreateDirectory(Path.Combine(scratchRoot, "home", ".testagent"));
-        await File.WriteAllTextAsync(Path.Combine(scratchRoot, "home", ".testagent", "session.txt"), "resume session");
-        await RunProcessAsync(clone, "tar", "-czf", Path.Combine(clone, ".codeybox", "preempt-scratchpad.tgz"), "-C", scratchRoot, ".");
+        if (includeScratchpad)
+        {
+            Directory.CreateDirectory(Path.Combine(clone, ".codeybox"));
+            await File.WriteAllTextAsync(Path.Combine(clone, ".codeybox", "preempt-scratchpad.md"), "resume scratchpad");
+            var scratchRoot = Path.Combine(_workspace, "scratch-" + Guid.NewGuid().ToString("N")[..8]);
+            Directory.CreateDirectory(Path.Combine(scratchRoot, "home", ".testagent"));
+            await File.WriteAllTextAsync(Path.Combine(scratchRoot, "home", ".testagent", "session.txt"), "resume session");
+            await RunProcessAsync(clone, "tar", "-czf", Path.Combine(clone, ".codeybox", "preempt-scratchpad.tgz"), "-C", scratchRoot, ".");
+        }
         await File.WriteAllTextAsync(Path.Combine(clone, "partial-rework.txt"), "partial");
         Assert.Equal(0, (await TestSupport.RunGit(clone, "add", "-A")).code);
         Assert.Equal(0, (await TestSupport.RunGit(clone, "commit", "-m", "checkpoint")).code);
@@ -526,6 +630,69 @@ internal sealed class ReworkResumeRecordingAgent : IAgentRunner, IResumableAgent
             [
                 "sh", "-c",
                 "set -e; git merge --no-ff \"$1\" -m 'codeybox: merge test\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>'",
+                "merge-test",
+                $"origin/{workBranch}",
+            ],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        return new AgentResult(result.Success, result.Success ? "ok" : "merge failed", result.Stdout, result.Stderr);
+    }
+
+    private static string ExtractBetween(string text, string left, string right)
+    {
+        var start = text.IndexOf(left, StringComparison.Ordinal);
+        if (start < 0) return "main";
+        start += left.Length;
+        var end = text.IndexOf(right, start, StringComparison.Ordinal);
+        return end < 0 ? text[start..].Trim() : text[start..end];
+    }
+}
+
+internal sealed class NoopResumeAgent : IAgentRunner, IResumableAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+    public int ResumeCalls { get; private set; }
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
+            return MergeAsync(sandbox, workingDirectory, prompt, ct);
+
+        return Task.FromResult(new AgentResult(true, "ok", null, null));
+    }
+
+    public Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        ResumeCalls++;
+        return Task.FromResult(new AgentResult(true, "ok", null, null));
+    }
+
+    private static async Task<AgentResult> MergeAsync(ISandbox sandbox, string workingDirectory, string prompt, CancellationToken ct)
+    {
+        var workBranch = ExtractBetween(prompt, "merge branch `", "` into branch `");
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                "set -e; git merge --no-ff \"$1\" -m 'codeybox: merge noop resume test\n\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>'",
                 "merge-test",
                 $"origin/{workBranch}",
             ],

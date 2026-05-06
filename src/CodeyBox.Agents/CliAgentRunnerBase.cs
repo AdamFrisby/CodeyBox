@@ -27,7 +27,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     protected virtual IReadOnlyList<string> ScratchpadHomeDirectories => [];
 
     /// <summary>
-    /// Pattern used only after scratchpad capture to ask the running CLI to stop.
+    /// Pattern used to ask the running CLI to stop before scratchpad capture.
     /// </summary>
     protected virtual string PreemptProcessPattern => Kind.Value;
 
@@ -139,6 +139,26 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 $$"""
                 set -euo pipefail
                 mkdir -p .codeybox
+                pids=""
+                for pid in $(pgrep -f "$1" 2>/dev/null || true); do
+                  [ "$pid" = "$$" ] && continue
+                  pids="$pids $pid"
+                  kill -TERM "$pid" 2>/dev/null || true
+                done
+                if [ -n "$pids" ]; then
+                  for _ in $(seq 1 20); do
+                    still_running=0
+                    for pid in $pids; do
+                      if kill -0 "$pid" 2>/dev/null; then
+                        still_running=1
+                        break
+                      fi
+                    done
+                    [ "$still_running" -eq 1 ] || break
+                    sleep 0.1
+                  done
+                fi
+
                 scratch_tmp="$(mktemp -d .codeybox/preempt-scratchpad.XXXXXX)"
                 manifest="$scratch_tmp/manifest.txt"
                 manifest_tsv="$scratch_tmp/manifest.tsv"
@@ -267,10 +287,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 tar -czf .codeybox/preempt-scratchpad.tgz -C "$scratch_tmp" .
                 cp "$manifest" .codeybox/preempt-scratchpad.md
                 rm -rf "$scratch_tmp"
-                for pid in $(pgrep -f "$1" 2>/dev/null || true); do
-                  [ "$pid" = "$$" ] && continue
-                  kill -TERM "$pid" 2>/dev/null || true
-                done
                 """,
                 "codeybox-preempt",
                 pattern,
@@ -307,13 +323,64 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             trap cleanup EXIT
 
             manifest="$scratch_tmp/manifest.tsv"
-            if ! tar -xOzf "$archive" ./manifest.tsv > "$manifest" 2>/dev/null \
-               && ! tar -xOzf "$archive" manifest.tsv > "$manifest" 2>/dev/null; then
+            max_manifest_bytes=262144
+            max_entries=2000
+            extract_bounded() {
+              local member="$1"
+              local dest="$2"
+              local limit="$3"
+              local tmp="$dest.tmp"
+              rm -f "$tmp"
+              set +e
+              tar -xOzf "$archive" "$member" 2>/dev/null | head -c "$limit" > "$tmp"
+              local tar_status="${PIPESTATUS[0]}"
+              set -e
+              local bytes
+              bytes="$(wc -c < "$tmp")"
+              if [ "$bytes" -ge "$limit" ]; then
+                rm -f "$tmp"
+                return 20
+              fi
+              if [ "$tar_status" -ne 0 ]; then
+                rm -f "$tmp"
+                return 21
+              fi
+              mv "$tmp" "$dest"
+              printf '%s\n' "$bytes"
+              return 0
+            }
+
+            members="$scratch_tmp/members.txt"
+            set +e
+            tar -tzf "$archive" 2>/dev/null | head -n $((max_entries + 1)) > "$members"
+            list_status="${PIPESTATUS[0]}"
+            set -e
+            member_count="$(wc -l < "$members")"
+            if [ "$member_count" -gt "$max_entries" ]; then
+              echo "scratchpad archive entry limit exceeded" >&2
+              exit 12
+            fi
+            if [ "$list_status" -ne 0 ]; then
+              echo "scratchpad archive cannot be listed" >&2
+              exit 12
+            fi
+            if grep -Fx -- "./manifest.tsv" "$members" >/dev/null; then
+              extract_bounded "./manifest.tsv" "$manifest" $((max_manifest_bytes + 1)) >/dev/null || {
+                echo "scratchpad manifest exceeds restore limit or cannot be read" >&2
+                exit 10
+              }
+            elif grep -Fx -- "manifest.tsv" "$members" >/dev/null; then
+              extract_bounded "manifest.tsv" "$manifest" $((max_manifest_bytes + 1)) >/dev/null || {
+                echo "scratchpad manifest exceeds restore limit or cannot be read" >&2
+                exit 10
+              }
+            else
               # Legacy checkpoints did not carry restorable scratchpad state.
               exit 0
             fi
 
-            max_entries=2000
+            max_file_bytes=2097152
+            max_total_bytes=26214400
             max_depth=16
             valid_rel() {
               local rel="$1"
@@ -369,8 +436,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
               done < "$manifest"
             } > "$allowed"
 
-            members="$scratch_tmp/members.txt"
-            tar -tzf "$archive" > "$members"
+            normalized_members="$scratch_tmp/normalized-members.txt"
+            : > "$normalized_members"
             entry_count=0
             while IFS= read -r member; do
               [ -n "$member" ] || continue
@@ -384,6 +451,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 echo "scratchpad archive contains unsafe path: $member" >&2
                 exit 12
               }
+              printf '%s\n' "$normalized" >> "$normalized_members"
               if ! grep -Fx -- "$member" "$allowed" >/dev/null \
                  && ! grep -Fx -- "$normalized" "$allowed" >/dev/null; then
                 echo "scratchpad archive contains unmanifested path: $member" >&2
@@ -391,17 +459,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
               fi
             done < "$members"
 
-            tar -xzf "$archive" -C "$scratch_tmp"
-            if find -P "$scratch_tmp" \( -type l -o \( ! -type f ! -type d \) \) -print -quit | grep -q .; then
-              echo "scratchpad archive contains unsupported file type" >&2
+            if sort "$normalized_members" | uniq -d | grep -q .; then
+              echo "scratchpad archive contains duplicate paths" >&2
               exit 13
             fi
 
+            restored_bytes=0
             while IFS=$'\t' read -r kind scope rel; do
               valid_rel "$rel" || exit 11
               is_allowed_entry "$kind" "$rel" || exit 11
               src="$scratch_tmp/$scope/$rel"
-              [ -e "$src" ] || continue
               case "$scope" in
                 home) dest_base="$HOME" ;;
                 work) dest_base="." ;;
@@ -409,9 +476,37 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
               esac
               dest="$dest_base/$rel"
               if [ "$kind" = "dir" ]; then
+                mkdir -p "$src"
                 mkdir -p "$dest"
               elif [ "$kind" = "file" ]; then
-                [ -f "$src" ] || exit 13
+                member="$scope/$rel"
+                if ! grep -Fx -- "$member" "$members" >/dev/null; then
+                  member="./$scope/$rel"
+                fi
+                grep -Fx -- "$member" "$members" >/dev/null || continue
+                mkdir -p "$(dirname "$src")"
+                remaining=$((max_total_bytes - restored_bytes))
+                [ "$remaining" -gt 0 ] || {
+                  echo "scratchpad restore total byte limit exceeded" >&2
+                  exit 14
+                }
+                limit=$((max_file_bytes + 1))
+                if [ "$remaining" -lt "$max_file_bytes" ]; then
+                  limit=$((remaining + 1))
+                fi
+                bytes="$(extract_bounded "$member" "$src" "$limit")" || {
+                  echo "scratchpad file exceeds restore limit or cannot be read: $member" >&2
+                  exit 14
+                }
+                [ "$bytes" -le "$max_file_bytes" ] || {
+                  echo "scratchpad file exceeds per-file restore limit: $member" >&2
+                  exit 14
+                }
+                restored_bytes=$((restored_bytes + bytes))
+                [ "$restored_bytes" -le "$max_total_bytes" ] || {
+                  echo "scratchpad restore total byte limit exceeded" >&2
+                  exit 14
+                }
                 mkdir -p "$(dirname "$dest")"
                 cp -p "$src" "$dest"
               else
