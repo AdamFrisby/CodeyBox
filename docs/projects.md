@@ -169,8 +169,8 @@ Allowed built-in language values are `csharp`, `python`, `node`, `javascript`,
 `typescript`, `go`, and `rust`. Unknown strings are logged at startup and
 skipped. If `Languages` is omitted and no default is configured, no
 language-specific PR auditors run; language-agnostic audit types and custom
-auditors still work. Release deep audits keep the legacy dependency CVE
-behavior and run the C# scanner when no languages are configured.
+auditors still work. Release dependency CVE scans follow the same language list:
+when no languages are configured, no language-specific CVE scanner runs.
 
 Each language preset recursively checks for that language's marker files before running:
 `*.csproj`/`*.sln`/`*.slnx` for C#, `pyproject.toml`/`setup.py`/`setup.cfg`/

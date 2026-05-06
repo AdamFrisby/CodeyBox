@@ -17,7 +17,6 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     private const int MaxProjectDirectories = 25;
     private const int MaxRawOutputChars = 1_000_000;
     private const string NpmAuditRegistry = "https://registry.npmjs.org/";
-    private static readonly IReadOnlyList<string> LegacyDefaultLanguages = ["csharp"];
     private const string PythonScannerScript =
         "if [ -f requirements.txt ]; then " +
         "if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json -r requirements.txt; fi; " +
@@ -207,7 +206,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     }
 
     private static IReadOnlyList<string> ResolveLanguages(IReadOnlyList<string>? languages)
-        => languages is { Count: > 0 } ? languages : LegacyDefaultLanguages;
+        => languages ?? [];
 
     private static IEnumerable<AuditFinding> ParseDotnetFindings(string output)
     {

@@ -62,7 +62,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task UnsetLanguagesRunLegacyCSharpScanner()
+    public async Task UnsetLanguagesRunNoLanguageSpecificScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -75,12 +75,12 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.Empty(sandbox.Commands);
         Assert.Empty(result.Findings);
     }
 
     [Fact]
-    public async Task ExplicitEmptyLanguagesRunLegacyCSharpScanner()
+    public async Task ExplicitEmptyLanguagesRunNoLanguageSpecificScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -94,7 +94,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.Empty(sandbox.Commands);
         Assert.Empty(result.Findings);
     }
 
