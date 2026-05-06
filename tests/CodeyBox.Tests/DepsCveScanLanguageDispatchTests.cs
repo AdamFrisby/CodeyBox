@@ -29,7 +29,13 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Contains(sandbox.Commands, c => c == "dotnet list package --vulnerable --include-transitive");
+        Assert.Contains(sandbox.Commands, c =>
+            c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal) &&
+            c.Contains("--config \"$config\"", StringComparison.Ordinal) &&
+            c.Contains("--source \"$trusted_source\"", StringComparison.Ordinal));
+        Assert.Contains(sandbox.ExtraEnvironments, e =>
+            e.TryGetValue("DOTNET_CLI_TELEMETRY_OPTOUT", out var telemetry) &&
+            telemetry == "1");
         Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal));
         Assert.Contains(sandbox.Commands, c => c.Contains("pip-audit -f json .", StringComparison.Ordinal));
         Assert.Contains(sandbox.Commands, c => c.Contains("safety scan --target . --output json", StringComparison.Ordinal));
@@ -387,8 +393,38 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.Contains(result.Findings, f =>
             f.Severity == AuditSeverity.Error &&
             f.Title.Contains("too many project directories", StringComparison.Ordinal));
-        Assert.Equal(25, sandbox.Commands.Count(c => c == "dotnet list package --vulnerable --include-transitive"));
+        Assert.Equal(25, sandbox.Commands.Count(c =>
+            c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal)));
         Assert.Contains("/repo/csharp-0", sandbox.WorkingDirectories);
+    }
+
+    [Fact]
+    public async Task CSharpScannerBlocksRepositoryControlledNuGetSourceUrls()
+    {
+        var sandbox = new DispatchSandbox(
+            markerPresent: true,
+            scannerExitCode: 126,
+            scannerStderr: """
+                CODEYBOX_UNSAFE_NUGET_DEPENDENCY_SOURCE
+                /repo/NuGet.config:4: http://169.254.169.254/nuget
+                ./Directory.Build.props:7: https://internal.example/nuget
+                """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["csharp"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("blocked repository-controlled NuGet source URLs", finding.Title);
+        Assert.Contains("169.254.169.254", finding.Description);
+        Assert.Contains("internal.example", finding.Description);
     }
 
     [Fact]
@@ -627,7 +663,8 @@ public sealed class DepsCveScanLanguageDispatchTests
             if (exec.Argv.Count >= 2 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
             {
                 var script = exec.Argv[2];
-                if (script.Contains("find .", StringComparison.Ordinal))
+                if (script.Contains("find .", StringComparison.Ordinal) &&
+                    !script.Contains("dotnet list package", StringComparison.Ordinal))
                     return Task.FromResult(new SandboxExecResult(
                         _discoveryExitCode,
                         _markerPresent ? _discoveryStdout ?? DiscoveryOutput(script) : "",

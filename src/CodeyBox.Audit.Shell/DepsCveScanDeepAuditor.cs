@@ -16,8 +16,109 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     private const int MaxScannerOutputChars = 1_000_000;
     private const int MaxProjectDirectories = 25;
     private const int MaxRawOutputChars = 1_000_000;
+    private const string NuGetAuditSource = "https://api.nuget.org/v3/index.json";
+    private const string CSharpUnsafeSourceMarker = "CODEYBOX_UNSAFE_NUGET_DEPENDENCY_SOURCE";
     private const string NpmAuditRegistry = "https://registry.npmjs.org/";
     private const string PythonUnsafeSourceMarker = "CODEYBOX_UNSAFE_PYTHON_DEPENDENCY_SOURCE";
+    private static readonly string CSharpScannerScript = $$"""
+        set -eu
+        trusted_source='{{NuGetAuditSource}}'
+        url_regex="[a-z][a-z0-9+.-]*://[^[:space:]\"'<>;]+"
+        blocked="${TMPDIR:-/tmp}/codeybox-unsafe-nuget-sources.$$"
+        config="${TMPDIR:-/tmp}/codeybox-nuget.$$".config
+        : > "$blocked"
+        cleanup() {
+            rm -f "$blocked" "$config"
+        }
+        trap cleanup EXIT HUP INT TERM
+
+        is_trusted_nuget_source() {
+            case "$1" in
+                https://api.nuget.org/*|https://www.nuget.org/*) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+
+        record_url_if_untrusted() {
+            source_file=$1
+            line_number=$2
+            url=$3
+            if ! is_trusted_nuget_source "$url"; then
+                printf '%s:%s: %s\n' "$source_file" "$line_number" "$url" >> "$blocked"
+            fi
+        }
+
+        scan_all_urls_in_file() {
+            source_file=$1
+            (grep -nEio "$url_regex" "$source_file" || true) |
+            while IFS= read -r hit; do
+                line_number=${hit%%:*}
+                url=${hit#*:}
+                record_url_if_untrusted "$source_file" "$line_number" "$url"
+            done
+        }
+
+        scan_restore_source_lines() {
+            source_file=$1
+            (grep -nEi 'Restore(Sources|AdditionalProjectSources|FallbackFolders|ConfigFile)|PackageSource' "$source_file" || true) |
+            while IFS= read -r line; do
+                line_number=${line%%:*}
+                text=${line#*:}
+                printf '%s\n' "$text" | (grep -Eio "$url_regex" || true) |
+                while IFS= read -r url; do
+                    record_url_if_untrusted "$source_file" "$line_number" "$url"
+                done
+            done
+        }
+
+        find_nuget_source_files() {
+            dir=$PWD
+            while :; do
+                for name in NuGet.config nuget.config NuGet.Config Directory.Build.props Directory.Build.targets Directory.Packages.props; do
+                    [ -f "$dir/$name" ] && printf '%s\n' "$dir/$name"
+                done
+                [ "$dir" = "/" ] && break
+                [ -d "$dir/.git" ] && break
+                parent=$(dirname "$dir")
+                [ "$parent" = "$dir" ] && break
+                dir=$parent
+            done
+
+            find . \( -path './.git' -o -path './bin' -o -path './obj' -o -path './node_modules' \) -prune -o \
+                \( -name '*.csproj' -o -name '*.fsproj' -o -name '*.vbproj' -o -name '*.props' -o -name '*.targets' \) \
+                -type f -print
+        }
+
+        find_nuget_source_files | sort -u |
+        while IFS= read -r source_file; do
+            [ -f "$source_file" ] || continue
+            case "$(basename "$source_file")" in
+                NuGet.config|nuget.config|NuGet.Config) scan_all_urls_in_file "$source_file" ;;
+                *) scan_restore_source_lines "$source_file" ;;
+            esac
+        done
+
+        if [ -s "$blocked" ]; then
+            echo '{{CSharpUnsafeSourceMarker}}' >&2
+            cat "$blocked" >&2
+            exit 126
+        fi
+
+        cat > "$config" <<EOF
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="nuget.org" value="$trusted_source" protocolVersion="3" />
+          </packageSources>
+          <disabledPackageSources>
+            <clear />
+          </disabledPackageSources>
+        </configuration>
+        EOF
+
+        exec dotnet list package --vulnerable --include-transitive --config "$config" --source "$trusted_source"
+        """;
     private const string PythonScannerScript =
         "validate_python_dependency_sources() { " +
         "\"$1\" - <<'PY'\n" +
@@ -83,17 +184,26 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             ["PIP_TRUSTED_HOST"] = "",
         };
 
+    private static readonly IReadOnlyDictionary<string, string> CSharpScannerEnvironment =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
+            ["DOTNET_NOLOGO"] = "1",
+            ["NUGET_XMLDOC_MODE"] = "skip",
+        };
+
     private static readonly IReadOnlyDictionary<string, Scanner> Scanners =
         new Dictionary<string, Scanner>(StringComparer.OrdinalIgnoreCase)
         {
             ["csharp"] = new(
                 "csharp",
                 LanguageProjectDiscovery.CSharpDiscoveryScript,
-                ["dotnet", "list", "package", "--vulnerable", "--include-transitive"],
+                ["sh", "-c", CSharpScannerScript],
                 "dotnet SDK not installed in sandbox; CVE scan skipped",
                 "Install the .NET SDK in the sandbox image to enable C# CVE scanning.",
                 ParseDotnetFindings,
-                "'dotnet list package --vulnerable' exited with code {0}. Ensure a valid .NET solution or project file exists in the working directory."),
+                "'dotnet list package --vulnerable' exited with code {0}. Ensure a valid .NET solution or project file exists in the working directory.",
+                CSharpScannerEnvironment),
             ["python"] = new(
                 "python",
                 LanguageProjectDiscovery.PythonDiscoveryScript,
@@ -219,6 +329,16 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                         Severity: AuditSeverity.Info,
                         Title: scanner.MissingToolTitle,
                         Description: scanner.MissingToolDescription));
+                    continue;
+                }
+
+                if (IsUnsafeCSharpDependencySource(scanner, result))
+                {
+                    allFindings.Add(new AuditFinding(
+                        AuditorName: Name,
+                        Severity: AuditSeverity.Error,
+                        Title: "C# CVE scan blocked repository-controlled NuGet source URLs",
+                        Description: "C# dependency metadata contains NuGet package-source URLs outside the allowed public NuGet hosts (api.nuget.org and www.nuget.org). The dependency CVE scanner was not run because those URLs could trigger SSRF from the network-enabled audit sandbox. Stderr: " + TruncatedOutput(result.Stderr, out _)));
                     continue;
                 }
 
@@ -933,6 +1053,11 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                result.Stderr.Contains("no such command", StringComparison.OrdinalIgnoreCase) &&
                result.Stderr.Contains("audit", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsUnsafeCSharpDependencySource(Scanner scanner, SandboxExecResult result)
+        => scanner.Language.Equals("csharp", StringComparison.OrdinalIgnoreCase) &&
+           result.ExitCode == 126 &&
+           result.Stderr.Contains(CSharpUnsafeSourceMarker, StringComparison.Ordinal);
 
     private static bool IsUnsafePythonDependencySource(Scanner scanner, SandboxExecResult result)
         => scanner.Language.Equals("python", StringComparison.OrdinalIgnoreCase) &&
