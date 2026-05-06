@@ -106,9 +106,10 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task GoScannerUsesStructuredJsonOutput()
+    public async Task GoScannerUsesOsvSeverityFromStructuredJsonOutput()
     {
         var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
+            {"osv":{"id":"GO-2024-0001","database_specific":{"severity":"MODERATE"},"affected":[{"package":{"ecosystem":"Go","name":"example.com/module"}}]}}
             {"finding":{"osv":"GO-2024-0001","trace":[{"package":"example.com/app"}]}}
             """);
         var auditor = new DepsCveScanDeepAuditor();
@@ -121,11 +122,57 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
-        Assert.False(result.Passed);
+        Assert.True(result.Passed);
         Assert.Contains(sandbox.Commands, c => c == "govulncheck -json ./...");
         var finding = Assert.Single(result.Findings);
-        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
         Assert.Contains("example.com/app", finding.Title);
+        Assert.Contains("Medium", finding.Title);
+    }
+
+    [Fact]
+    public async Task GoScannerNormalizesOsvCvssVectorSeverity()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
+            {"osv":{"id":"GO-2024-0002","severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],"affected":[{"package":{"ecosystem":"Go","name":"example.com/module"}}]}}
+            {"finding":{"osv":"GO-2024-0002","trace":[{"package":"example.com/app"}]}}
+            """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["go"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("Critical", finding.Title);
+    }
+
+    [Fact]
+    public async Task GoScannerDoesNotInventSeverityWhenOsvHasNoSeverity()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, scannerStdout: """
+            {"finding":{"osv":"GO-2024-0003","trace":[{"package":"example.com/app"}]}}
+            """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["go"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Contains("Unknown", finding.Title);
     }
 
     [Fact]

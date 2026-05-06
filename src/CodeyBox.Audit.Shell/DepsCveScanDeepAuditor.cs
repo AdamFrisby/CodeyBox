@@ -213,16 +213,61 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
     private static IEnumerable<AuditFinding> ParseGoFindings(string output)
     {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var osvById = new Dictionary<string, GoOsvRecord>(StringComparer.OrdinalIgnoreCase);
+        var findings = new List<GoFindingRecord>();
+
         foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            var parsed = TryParseGoJsonFinding(line);
-            if (parsed is null)
+            if (!line.StartsWith('{'))
                 continue;
 
-            var (package, id) = parsed.Value;
-            if (seen.Add(package + "\0" + id))
-                yield return Finding(package, "?", "High", id);
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+
+                if (TryParseGoOsvRecord(root) is { } osv)
+                    osvById[osv.Id] = osv;
+
+                if (TryParseGoFindingRecord(root) is { } finding)
+                    findings.Add(finding);
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var finding in findings)
+        {
+            var package = finding.Package;
+            var severity = "Unknown";
+            if (osvById.TryGetValue(finding.Id, out var osv))
+            {
+                severity = osv.Severity ?? severity;
+                if (string.Equals(package, "unknown", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(osv.Package))
+                    package = osv.Package;
+            }
+
+            if (seen.Add(package + "\0" + finding.Id))
+                yield return Finding(package, "?", severity, finding.Id);
+
+            seenIds.Add(finding.Id);
+        }
+
+        foreach (var osv in osvById.Values)
+        {
+            if (!seenIds.Add(osv.Id))
+                continue;
+
+            var package = osv.Package ?? "unknown";
+            var severity = osv.Severity ?? "Unknown";
+            if (seen.Add(package + "\0" + osv.Id))
+                yield return Finding(package, "?", severity, osv.Id);
         }
     }
 
@@ -244,6 +289,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
     private static AuditFinding Finding(string package, string version, string severityText, string? advisory)
     {
+        severityText = NormalizeSeverityText(severityText);
         var severity = severityText.ToLowerInvariant() switch
         {
             "critical" or "high" => AuditSeverity.Error,
@@ -261,6 +307,29 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             Severity: severity,
             Title: $"CVE in {package} ({severityText})",
             Description: description);
+    }
+
+    private static string NormalizeSeverityText(string severityText)
+    {
+        var trimmed = severityText.Trim();
+        if (double.TryParse(
+                trimmed,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var score))
+            return SeverityFromCvss(score);
+
+        if (TryGetCvssVectorScore(trimmed) is { } vectorScore)
+            return SeverityFromCvss(vectorScore);
+
+        return trimmed.ToLowerInvariant() switch
+        {
+            "critical" => "Critical",
+            "high" => "High",
+            "medium" or "moderate" => "Medium",
+            "low" => "Low",
+            _ => trimmed,
+        };
     }
 
     private static JsonDocument? TryParseJson(string output)
@@ -307,20 +376,50 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             return null;
 
         if (property.ValueKind == JsonValueKind.String)
-            return property.GetString();
+            return NormalizeSeverityText(property.GetString() ?? "Unknown");
 
         if (property.ValueKind == JsonValueKind.Number && property.TryGetDouble(out var score))
             return SeverityFromCvss(score);
+
+        if (property.ValueKind == JsonValueKind.Array)
+        {
+            var severities = new List<string>();
+            foreach (var item in property.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                {
+                    AddSeverity(severities, NormalizeSeverityText(item.GetString() ?? "Unknown"));
+                    continue;
+                }
+
+                if (item.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                AddSeverity(severities, GetSeverity(item, "severity"));
+                AddSeverity(severities, GetSeverity(item, "level"));
+                AddSeverity(severities, GetSeverity(item, "score"));
+            }
+
+            return severities
+                .OrderByDescending(SeverityRank)
+                .ThenBy(s => s, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault();
+        }
 
         if (property.ValueKind == JsonValueKind.Object)
         {
             var label = GetString(property, "severity") ?? GetString(property, "level");
             if (!string.IsNullOrWhiteSpace(label))
-                return label;
+                return NormalizeSeverityText(label);
+
             if (property.TryGetProperty("score", out var scoreProperty) &&
                 scoreProperty.ValueKind == JsonValueKind.Number &&
                 scoreProperty.TryGetDouble(out var nestedScore))
                 return SeverityFromCvss(nestedScore);
+
+            if (property.TryGetProperty("score", out scoreProperty) &&
+                scoreProperty.ValueKind == JsonValueKind.String)
+                return NormalizeSeverityText(scoreProperty.GetString() ?? "Unknown");
         }
 
         return null;
@@ -334,6 +433,133 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         > 0.0 => "Low",
         _ => "Unknown",
     };
+
+    private static int SeverityRank(string severityText)
+        => NormalizeSeverityText(severityText) switch
+        {
+            "Critical" => 4,
+            "High" => 3,
+            "Medium" => 2,
+            "Low" => 1,
+            _ => 0,
+        };
+
+    private static void AddSeverity(List<string> severities, string? severity)
+    {
+        if (!string.IsNullOrWhiteSpace(severity))
+            severities.Add(severity);
+    }
+
+    private static double? TryGetCvssVectorScore(string value)
+    {
+        if (value.StartsWith("CVSS:3.", StringComparison.OrdinalIgnoreCase))
+            return TryGetCvssV3Score(value);
+
+        if (value.Contains("/Au:", StringComparison.OrdinalIgnoreCase))
+            return TryGetCvssV2Score(value);
+
+        return null;
+    }
+
+    private static double? TryGetCvssV3Score(string vector)
+    {
+        var metrics = ParseCvssVector(vector);
+        if (!metrics.TryGetValue("AV", out var avText) ||
+            !metrics.TryGetValue("AC", out var acText) ||
+            !metrics.TryGetValue("PR", out var prText) ||
+            !metrics.TryGetValue("UI", out var uiText) ||
+            !metrics.TryGetValue("S", out var scope) ||
+            !metrics.TryGetValue("C", out var cText) ||
+            !metrics.TryGetValue("I", out var iText) ||
+            !metrics.TryGetValue("A", out var aText))
+            return null;
+
+        var av = CvssMetric(avText, ("N", 0.85), ("A", 0.62), ("L", 0.55), ("P", 0.2));
+        var ac = CvssMetric(acText, ("L", 0.77), ("H", 0.44));
+        var ui = CvssMetric(uiText, ("N", 0.85), ("R", 0.62));
+        var c = CvssMetric(cText, ("H", 0.56), ("L", 0.22), ("N", 0.0));
+        var i = CvssMetric(iText, ("H", 0.56), ("L", 0.22), ("N", 0.0));
+        var a = CvssMetric(aText, ("H", 0.56), ("L", 0.22), ("N", 0.0));
+        if (av is null || ac is null || ui is null || c is null || i is null || a is null)
+            return null;
+
+        var scopeChanged = scope.Equals("C", StringComparison.OrdinalIgnoreCase);
+        var pr = scopeChanged
+            ? CvssMetric(prText, ("N", 0.85), ("L", 0.68), ("H", 0.5))
+            : CvssMetric(prText, ("N", 0.85), ("L", 0.62), ("H", 0.27));
+        if (pr is null)
+            return null;
+
+        var impact = 1 - ((1 - c.Value) * (1 - i.Value) * (1 - a.Value));
+        if (impact <= 0)
+            return 0;
+
+        var impactSubScore = scopeChanged
+            ? 7.52 * (impact - 0.029) - 3.25 * Math.Pow(impact - 0.02, 15)
+            : 6.42 * impact;
+        var exploitability = 8.22 * av.Value * ac.Value * pr.Value * ui.Value;
+        var baseScore = scopeChanged
+            ? Math.Min(1.08 * (impactSubScore + exploitability), 10)
+            : Math.Min(impactSubScore + exploitability, 10);
+        return RoundUpCvssV3(baseScore);
+    }
+
+    private static double? TryGetCvssV2Score(string vector)
+    {
+        var metrics = ParseCvssVector(vector);
+        if (!metrics.TryGetValue("AV", out var avText) ||
+            !metrics.TryGetValue("AC", out var acText) ||
+            !metrics.TryGetValue("Au", out var auText) ||
+            !metrics.TryGetValue("C", out var cText) ||
+            !metrics.TryGetValue("I", out var iText) ||
+            !metrics.TryGetValue("A", out var aText))
+            return null;
+
+        var av = CvssMetric(avText, ("N", 1.0), ("A", 0.646), ("L", 0.395));
+        var ac = CvssMetric(acText, ("L", 0.71), ("M", 0.61), ("H", 0.35));
+        var au = CvssMetric(auText, ("N", 0.704), ("S", 0.56), ("M", 0.45));
+        var c = CvssMetric(cText, ("C", 0.66), ("P", 0.275), ("N", 0.0));
+        var i = CvssMetric(iText, ("C", 0.66), ("P", 0.275), ("N", 0.0));
+        var a = CvssMetric(aText, ("C", 0.66), ("P", 0.275), ("N", 0.0));
+        if (av is null || ac is null || au is null || c is null || i is null || a is null)
+            return null;
+
+        var impact = 10.41 * (1 - ((1 - c.Value) * (1 - i.Value) * (1 - a.Value)));
+        if (impact <= 0)
+            return 0;
+
+        var exploitability = 20 * av.Value * ac.Value * au.Value;
+        return Math.Round(((0.6 * impact) + (0.4 * exploitability) - 1.5) * 1.176, 1, MidpointRounding.AwayFromZero);
+    }
+
+    private static Dictionary<string, string> ParseCvssVector(string vector)
+    {
+        var metrics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var part in vector.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var separator = part.IndexOf(':');
+            if (separator <= 0 || separator == part.Length - 1)
+                continue;
+
+            metrics[part[..separator]] = part[(separator + 1)..];
+        }
+
+        return metrics;
+    }
+
+    private static double? CvssMetric(string value, params (string Key, double Value)[] options)
+    {
+        foreach (var option in options)
+        {
+            if (value.Equals(option.Key, StringComparison.OrdinalIgnoreCase))
+                return option.Value;
+        }
+
+        return null;
+    }
+
+    private static double RoundUpCvssV3(double value)
+        => Math.Ceiling((value - 0.000001) * 10.0) / 10.0;
 
     private static string? FirstNpmAdvisory(JsonElement vulnerability)
     {
@@ -349,38 +575,87 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         return null;
     }
 
-    private static (string Package, string Id)? TryParseGoJsonFinding(string line)
+    private static GoOsvRecord? TryParseGoOsvRecord(JsonElement root)
     {
-        if (!line.StartsWith('{'))
-            return null;
-
-        try
+        JsonElement osv;
+        if (root.TryGetProperty("osv", out var wrappedOsv) &&
+            wrappedOsv.ValueKind == JsonValueKind.Object)
         {
-            using var doc = JsonDocument.Parse(line);
-            var root = doc.RootElement;
-
-            if (root.TryGetProperty("finding", out var finding) &&
-                finding.ValueKind == JsonValueKind.Object)
-            {
-                var id = GetString(finding, "osv") ?? GetString(finding, "id");
-                if (!string.IsNullOrWhiteSpace(id))
-                    return (FirstGoTracePackage(finding) ?? "unknown", id);
-            }
-
-            if (root.TryGetProperty("osv", out var osv) &&
-                osv.ValueKind == JsonValueKind.Object)
-            {
-                var id = GetString(osv, "id");
-                if (!string.IsNullOrWhiteSpace(id))
-                    return (FirstGoAffectedPackage(osv) ?? "unknown", id);
-            }
+            osv = wrappedOsv;
         }
-        catch (JsonException)
+        else if (root.TryGetProperty("id", out _) &&
+                 root.TryGetProperty("affected", out _))
+        {
+            osv = root;
+        }
+        else
         {
             return null;
         }
 
-        return null;
+        var id = GetString(osv, "id");
+        if (string.IsNullOrWhiteSpace(id))
+            return null;
+
+        return new GoOsvRecord(
+            id,
+            FirstGoAffectedPackage(osv),
+            GetOsvSeverity(osv));
+    }
+
+    private static GoFindingRecord? TryParseGoFindingRecord(JsonElement root)
+    {
+        if (!root.TryGetProperty("finding", out var finding) ||
+            finding.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var id = GetString(finding, "osv") ?? GetString(finding, "id");
+        if (string.IsNullOrWhiteSpace(id))
+            return null;
+
+        return new GoFindingRecord(FirstGoTracePackage(finding) ?? "unknown", id);
+    }
+
+    private static string? GetOsvSeverity(JsonElement osv)
+    {
+        var severities = new List<string>();
+
+        AddSeverity(severities, GetSeverity(osv, "severity"));
+
+        if (osv.TryGetProperty("database_specific", out var databaseSpecific) &&
+            databaseSpecific.ValueKind == JsonValueKind.Object)
+        {
+            AddSeverity(severities, GetSeverity(databaseSpecific, "severity"));
+            AddSeverity(severities, GetSeverity(databaseSpecific, "level"));
+        }
+
+        if (osv.TryGetProperty("affected", out var affected) &&
+            affected.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in affected.EnumerateArray())
+            {
+                AddSeverity(severities, GetSeverity(item, "severity"));
+
+                if (item.TryGetProperty("database_specific", out var affectedDatabaseSpecific) &&
+                    affectedDatabaseSpecific.ValueKind == JsonValueKind.Object)
+                {
+                    AddSeverity(severities, GetSeverity(affectedDatabaseSpecific, "severity"));
+                    AddSeverity(severities, GetSeverity(affectedDatabaseSpecific, "level"));
+                }
+
+                if (item.TryGetProperty("ecosystem_specific", out var ecosystemSpecific) &&
+                    ecosystemSpecific.ValueKind == JsonValueKind.Object)
+                {
+                    AddSeverity(severities, GetSeverity(ecosystemSpecific, "severity"));
+                    AddSeverity(severities, GetSeverity(ecosystemSpecific, "level"));
+                }
+            }
+        }
+
+        return severities
+            .OrderByDescending(SeverityRank)
+            .ThenBy(s => s, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
     }
 
     private static string? FirstGoTracePackage(JsonElement finding)
@@ -468,4 +743,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         string MissingToolDescription,
         Func<string, IEnumerable<AuditFinding>> Parse,
         string FailureDescription);
+
+    private sealed record GoFindingRecord(string Package, string Id);
+    private sealed record GoOsvRecord(string Id, string? Package, string? Severity);
 }
