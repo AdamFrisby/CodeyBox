@@ -623,7 +623,7 @@ public sealed class PipelineRunner : IPipelineRunner
         await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo",
             activitySource: CodeyBoxActivities.Sandbox, log: _log))
         {
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}");
+            await PushSandboxWorkBranchWithReconcileAsync(sandbox, branch, ct);
         }
 
         // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
@@ -1840,6 +1840,62 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
     }
 
+    private async Task PushSandboxWorkBranchWithReconcileAsync(ISandbox sandbox, string branch, CancellationToken ct)
+    {
+        string[] pushArgv = ["git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}"];
+        var push = await sandbox.ExecAsync(new SandboxExec { Argv = pushArgv }, ct);
+        if (push.Success)
+            return;
+
+        if (!IsNonFastForwardRejection(push.Stdout, push.Stderr))
+            throw CommandFailed(push, pushArgv);
+
+        _log.LogWarning(
+            "Sandbox push of work branch {Branch} was rejected as non-fast-forward; fetching and rebasing once",
+            branch);
+
+        var fetch = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "fetch", "--no-tags", "origin",
+                $"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+        }, ct);
+        if (!fetch.Success)
+            throw new InvalidOperationException(
+                $"sandbox push reconcile fetch failed for branch '{branch}': {fetch.Stderr}");
+
+        var rebase = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir,
+                "-c", "user.name=CodeyBox",
+                "-c", "user.email=codeybox@localhost",
+                "rebase", $"origin/{branch}"],
+        }, ct);
+        if (!rebase.Success)
+        {
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
+            }, CancellationToken.None);
+            throw new SandboxPushReconcileConflictException(branch, "rebase");
+        }
+
+        push = await sandbox.ExecAsync(new SandboxExec { Argv = pushArgv }, ct);
+        if (!push.Success)
+            throw new InvalidOperationException(
+                $"sandbox push of work branch '{branch}' failed after reconcile: {push.Stderr}");
+    }
+
+    private static bool IsNonFastForwardRejection(string stdout, string stderr)
+    {
+        var output = stdout + "\n" + stderr;
+        return output.Contains("non-fast-forward", StringComparison.OrdinalIgnoreCase)
+            || output.Contains("! [rejected]", StringComparison.OrdinalIgnoreCase)
+            || output.Contains("fetch first", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static InvalidOperationException CommandFailed(SandboxExecResult result, IReadOnlyList<string> argv)
+        => new($"command failed (exit {result.ExitCode}): {string.Join(' ', argv)}\n{result.Stderr}");
+
     // Runs a command but replaces the last argv element with "***" in any exception message,
     // used when the last element is a sensitive value (e.g. user.email) that must not reach
     // audit-tier logs.
@@ -2272,6 +2328,19 @@ public sealed class PipelineRunner : IPipelineRunner
 internal sealed class AuditFailedException : Exception
 {
     public AuditFailedException(string message) : base(message) { }
+}
+
+internal sealed class SandboxPushReconcileConflictException : InvalidOperationException
+{
+    public SandboxPushReconcileConflictException(string branch, string strategy)
+        : base($"sandbox {strategy} conflict while reconciling push of work branch '{branch}'; manual resolution required")
+    {
+        Branch = branch;
+        Strategy = strategy;
+    }
+
+    public string Branch { get; }
+    public string Strategy { get; }
 }
 
 internal sealed record QuestionAskedDetails(
