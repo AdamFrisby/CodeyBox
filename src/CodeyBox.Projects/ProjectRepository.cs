@@ -119,7 +119,8 @@ public sealed class ProjectRepository : IProjectRepository
         var mergedSeverity = ParseSeverity(project?.FailingSeverity ?? defaults?.FailingSeverity);
         var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 10;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
-        var mergedLanguages = FilterSupportedLanguages(projectId, project?.Languages ?? defaults?.Languages ?? []);
+        var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ["csharp"];
+        var mergedLanguages = FilterSupportedLanguages(projectId, configuredLanguages);
         var mergedAuditTypes = project?.AuditTypes ?? defaults?.AuditTypes ?? [];
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
 

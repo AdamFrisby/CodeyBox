@@ -43,8 +43,57 @@ public sealed class LanguageDetectionTests
         Assert.All(auditors, a => Assert.Equal(AuditCapabilities.None, a.Required));
     }
 
+    [Fact]
+    public async Task SideBySideFixtureMarkers_RunAuditorsFromNestedProjectDirectories()
+    {
+        var catalog = new PresetCatalog();
+        var sandbox = new FixtureDispatchSandbox();
+        var fixture = MultiLanguageFixturePath();
+        var context = FakeAuditContext();
+
+        await catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:build-WaE")
+            .RunAsync(sandbox, fixture, context);
+        await catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "python:test-pass")
+            .RunAsync(sandbox, fixture, context);
+        await catalog.ResolveLanguage("node", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "node:test-pass")
+            .RunAsync(sandbox, fixture, context);
+
+        Assert.Contains(sandbox.Invocations, i =>
+            i.Command == "dotnet build --no-incremental /warnaserror" &&
+            i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}csharp", StringComparison.Ordinal));
+        Assert.Contains(sandbox.Invocations, i =>
+            i.Command == "pytest" &&
+            i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}python", StringComparison.Ordinal));
+        Assert.Contains(sandbox.Invocations, i =>
+            i.Command == "npm test" &&
+            i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}node", StringComparison.Ordinal));
+    }
+
     private static AuditContext FakeAuditContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
+
+    private static string MultiLanguageFixturePath()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current is not null)
+        {
+            var candidate = Path.Combine(
+                current.FullName,
+                "tests",
+                "CodeyBox.Tests",
+                "Fixtures",
+                "multi-language-repo");
+            if (Directory.Exists(candidate))
+                return candidate;
+
+            current = current.Parent;
+        }
+
+        throw new DirectoryNotFoundException("Could not locate multi-language fixture.");
+    }
 
     private sealed class MarkerlessSandbox : ISandbox
     {
@@ -58,5 +107,51 @@ public sealed class LanguageDetectionTests
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class FixtureDispatchSandbox : ISandbox
+    {
+        public List<(string Command, string WorkingDirectory)> Invocations { get; } = [];
+        public string Id => "fixture-dispatch";
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var command = string.Join(' ', exec.Argv);
+            var workingDirectory = exec.WorkingDirectory ?? Environment.CurrentDirectory;
+            Invocations.Add((command, workingDirectory));
+
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+                return await RunShellAsync(exec.Argv[2], workingDirectory, ct);
+
+            return new SandboxExecResult(0, "", "");
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private static async Task<SandboxExecResult> RunShellAsync(
+            string script,
+            string workingDirectory,
+            CancellationToken ct)
+        {
+            using var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "sh",
+                    WorkingDirectory = workingDirectory,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                },
+            };
+            process.StartInfo.ArgumentList.Add("-c");
+            process.StartInfo.ArgumentList.Add(script);
+
+            process.Start();
+            var stdout = await process.StandardOutput.ReadToEndAsync(ct);
+            var stderr = await process.StandardError.ReadToEndAsync(ct);
+            await process.WaitForExitAsync(ct);
+            return new SandboxExecResult(process.ExitCode, stdout, stderr);
+        }
     }
 }

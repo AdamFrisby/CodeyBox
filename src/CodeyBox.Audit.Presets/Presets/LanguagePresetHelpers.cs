@@ -5,13 +5,11 @@ namespace CodeyBox.Audit.Presets.Presets;
 
 internal static class LanguagePresetHelpers
 {
-    public const string CSharpMarkerScript =
-        "find . \\( -name '*.csproj' -o -name '*.sln' -o -name '*.slnx' \\) -print -quit | grep -q .";
-    public const string PythonMarkerScript =
-        "test -f pyproject.toml -o -f setup.py -o -f setup.cfg -o -f requirements.txt";
-    public const string NodeMarkerScript = "test -f package.json";
-    public const string GoMarkerScript = "test -f go.mod";
-    public const string RustMarkerScript = "test -f Cargo.toml";
+    public const string CSharpMarkerScript = LanguageProjectDiscovery.CSharpDiscoveryScript;
+    public const string PythonMarkerScript = LanguageProjectDiscovery.PythonDiscoveryScript;
+    public const string NodeMarkerScript = LanguageProjectDiscovery.NodeDiscoveryScript;
+    public const string GoMarkerScript = LanguageProjectDiscovery.GoDiscoveryScript;
+    public const string RustMarkerScript = LanguageProjectDiscovery.RustDiscoveryScript;
 
     public static IAuditor Shell(
         string language,

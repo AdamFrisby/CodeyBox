@@ -58,6 +58,49 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public async Task AuditLanguagesDefaultToCSharp_WhenOmitted()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal(["csharp"], p!.Audit.Languages);
+    }
+
+    [Fact]
+    public async Task AuditLanguagesCanBeExplicitlyEmpty()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Audit = new ProjectAuditConfig { Languages = ["csharp"] },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Audit = new ProjectAuditConfig { Languages = [] },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Empty(p!.Audit.Languages);
+    }
+
+    [Fact]
     public async Task ProjectAuditFieldsOverrideDefaults()
     {
         var opts = new ProjectsOptions

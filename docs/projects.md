@@ -164,15 +164,17 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 | `rust` | `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` |
 
 Allowed built-in language values are `csharp`, `python`, `node`, `go`, and
-`rust`. Unknown strings are logged at startup and skipped. An empty list means
-no language-specific auditors run; language-agnostic audit types and custom
-auditors still work.
+`rust`. Unknown strings are logged at startup and skipped. If `Languages` is
+omitted, CodeyBox defaults to `["csharp"]` for backwards compatibility. An
+explicit empty list means no language-specific auditors run; language-agnostic
+audit types and custom auditors still work.
 
-Each language preset checks for that language's marker files before running:
+Each language preset recursively checks for that language's marker files before running:
 `*.csproj`/`*.sln`/`*.slnx` for C#, `pyproject.toml`/`setup.py`/`setup.cfg`/
 `requirements.txt` for Python, `package.json` for Node, `go.mod` for Go, and
-`Cargo.toml` for Rust. If a language is enabled but its markers are absent,
-the auditor emits an Info finding and skips.
+`Cargo.toml` for Rust. In side-by-side repositories, the tools run from the
+matched project directories. If a language is enabled but its markers are
+absent, the auditor emits an Info finding and skips.
 
 All language presets are tool-only (no agent credentials). A buggy linter
 cannot exfiltrate the agent's API key — the audit phase runs them in a
@@ -705,7 +707,7 @@ release branch. Set to `0` to disable. Default: `720` (12 h).
 phase. Built-in values: `owasp-asvs`, `arch-coherence`, `deps-cve-scan`.
 `deps-cve-scan` dispatches by `Audit.Languages`: C# uses `dotnet list package
 --vulnerable --include-transitive`, Python uses `pip-audit` or `safety`, Node
-uses `npm audit --json`, Go uses `govulncheck ./...`, and Rust uses
+uses `npm audit --json`, Go uses `govulncheck -json ./...`, and Rust uses
 `cargo audit`.
 Empty list = skip deep audit (transition directly to `released`).
 
