@@ -482,8 +482,9 @@ builder.Services.AddHttpClient("agent-smoke", client =>
 
 // --- Quota probes ------------------------------------------------------------
 // Registered as IEnumerable<IAgentQuotaProbe>; the router resolves by Kind.
-// Tokens are read from host env vars here (not in the probes) to keep the
-// probe implementations independently testable.
+// OAuth files are reread by the provider delegate on each probe pickup because
+// local agent CLIs refresh those files in place. Probe results are still cached
+// per token by the probe implementations.
 builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -504,22 +505,32 @@ builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
     return new SqliteQuotaFailureStore(cbOpts.StateDatabasePath);
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
-    new ClaudeQuotaProbe(
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
+    return new ClaudeQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        ReadClaudeQuotaToken(sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.QuotaCredentials"))
-            ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY"),
+        () => new AgentQuotaCredentials(
+            ReadClaudeQuotaToken(credentialLog) ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        sp.GetRequiredService<ILoggerFactory>().CreateLogger<ClaudeQuotaProbe>()));
+        loggerFactory.CreateLogger<ClaudeQuotaProbe>());
+});
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
-    var codexAuth = ReadCodexQuotaAuth(sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.QuotaCredentials"));
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
     return
     new CodexQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        codexAuth.AccessToken ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
+        () =>
+        {
+            var codexAuth = ReadCodexQuotaAuth(credentialLog);
+            return new AgentQuotaCredentials(
+                codexAuth.AccessToken ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
+                codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
+        },
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CodexQuotaProbe>(),
-        codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
+        loggerFactory.CreateLogger<CodexQuotaProbe>());
 });
 // No GeminiQuotaProbe: Gemini uses PayPerApi billing (no subscription quota endpoint).
 // The router treats a missing probe as unlimited — intentional. See docs/agents.md.

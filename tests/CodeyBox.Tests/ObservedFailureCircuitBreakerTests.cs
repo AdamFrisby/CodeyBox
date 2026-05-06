@@ -28,6 +28,47 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     }
 
     [Fact]
+    public async Task ModelSpecificFailure_DoesNotBlockDifferentModel()
+    {
+        await _failures.RecordAsync(AgentKind.Claude, "claude-opus-4-7", QuotaFailureKind.LimitReached, DateTimeOffset.UtcNow);
+
+        Assert.False(await _failures.HasRecentAsync(
+            AgentKind.Claude,
+            "claude-sonnet-4-6",
+            TimeSpan.FromMinutes(10),
+            DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public async Task ModelSpecificFailure_DoesNotBlockDefaultModel()
+    {
+        await _failures.RecordAsync(AgentKind.Claude, "claude-opus-4-7", QuotaFailureKind.LimitReached, DateTimeOffset.UtcNow);
+
+        Assert.False(await _failures.HasRecentAsync(
+            AgentKind.Claude,
+            modelId: null,
+            TimeSpan.FromMinutes(10),
+            DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public async Task DefaultModelFailure_BlocksOnlyDefaultModel()
+    {
+        await _failures.RecordAsync(AgentKind.Claude, modelId: null, QuotaFailureKind.LimitReached, DateTimeOffset.UtcNow);
+
+        Assert.True(await _failures.HasRecentAsync(
+            AgentKind.Claude,
+            modelId: null,
+            TimeSpan.FromMinutes(10),
+            DateTimeOffset.UtcNow));
+        Assert.False(await _failures.HasRecentAsync(
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            TimeSpan.FromMinutes(10),
+            DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
     public async Task FailureOutsideWindow_DoesNotBlockPickup()
     {
         await _failures.RecordAsync(
@@ -49,6 +90,43 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     {
         Assert.Equal(expected, QuotaFailureDetector.Detect(stderr));
         Assert.Null(QuotaFailureDetector.Detect("ordinary model error"));
+    }
+
+    [Fact]
+    public async Task RecordIfQuotaFailure_RequiresAgentExitedOne()
+    {
+        var now = DateTimeOffset.UtcNow;
+        await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+            _failures,
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            summary: "agent exited 2",
+            stderr: "API Error: 401",
+            now,
+            TimeSpan.FromMinutes(30),
+            CancellationToken.None);
+
+        Assert.False(await _failures.HasRecentAsync(
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            TimeSpan.FromMinutes(10),
+            now));
+
+        await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+            _failures,
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            summary: "agent exited 1",
+            stderr: "API Error: 401",
+            now,
+            TimeSpan.FromMinutes(30),
+            CancellationToken.None);
+
+        Assert.True(await _failures.HasRecentAsync(
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            TimeSpan.FromMinutes(10),
+            now));
     }
 
     private AgentClassRouter BuildRouter()

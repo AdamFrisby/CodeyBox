@@ -91,6 +91,19 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
+    public async Task SubscriptionMember_InvokesRegisteredQuotaProbe()
+    {
+        var probe = new FakeProbe(Claude, 50.0);
+        var cls = FrontierClass(Sub(Claude));
+        var router = BuildRouter([cls], [probe]);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.Equal(1, probe.CallCount);
+    }
+
+    [Fact]
     public async Task FirstMember_Exhausted_FallsBackToSecond()
     {
         var cls = FrontierClass(Sub(Claude), Sub(Codex));
@@ -218,6 +231,11 @@ internal sealed class FakeProbe : IAgentQuotaProbe
 
     public AgentKind Kind { get; }
 
+    public int CallCount { get; private set; }
+
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-        => Task.FromResult(_snapshot);
+    {
+        CallCount++;
+        return Task.FromResult(_snapshot);
+    }
 }

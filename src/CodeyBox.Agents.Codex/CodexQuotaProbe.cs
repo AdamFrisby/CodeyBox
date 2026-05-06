@@ -9,9 +9,9 @@ namespace CodeyBox.Agents.Codex;
 /// Probes the ChatGPT backend usage endpoint used by Codex CLI to estimate
 /// subscription quota. Uses the <c>agent-quota</c> named HTTP client.
 ///
-/// Fail-open: any network error, unexpected status code, or unrecognised
-/// response shape returns <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1
-/// so a broken endpoint never blocks work items.
+/// Any network error, unexpected status code, or unrecognised response shape
+/// returns <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1; the router's
+/// unknown policy decides whether that blocks pickup.
 ///
 /// Thread-safe; results are cached for <c>cacheTtl</c> to avoid hammering
 /// the endpoint when several work items pick up close together.
@@ -23,13 +23,12 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
 
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly string? _token;
-    private readonly string? _accountId;
+    private readonly Func<AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<CodexQuotaProbe> _log;
 
-    // Single-entry cache: (snapshot, expiry). Protected by _lock.
-    private (AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
+    // Single-entry cache: (token, account, snapshot, expiry). Protected by _lock.
+    private (string AccessToken, string? AccountId, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public AgentKind Kind => AgentKind.Codex;
@@ -40,27 +39,40 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         TimeSpan cacheTtl,
         ILogger<CodexQuotaProbe> log,
         string? accountId = null)
+        : this(httpClientFactory, () => new AgentQuotaCredentials(token, accountId), cacheTtl, log)
+    {
+    }
+
+    public CodexQuotaProbe(
+        IHttpClientFactory httpClientFactory,
+        Func<AgentQuotaCredentials> credentialsProvider,
+        TimeSpan cacheTtl,
+        ILogger<CodexQuotaProbe> log)
     {
         _httpClientFactory = httpClientFactory;
-        _token = token;
-        _accountId = accountId;
+        _credentialsProvider = credentialsProvider;
         _cacheTtl = cacheTtl;
         _log = log;
     }
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(_token))
+        var credentials = _credentialsProvider();
+        var token = credentials.AccessToken;
+        if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
 
         await _lock.WaitAsync(ct);
         try
         {
-            if (_cache is { } entry && DateTimeOffset.UtcNow < entry.ExpiresAt)
+            if (_cache is { } entry
+                && string.Equals(entry.AccessToken, token, StringComparison.Ordinal)
+                && string.Equals(entry.AccountId, credentials.AccountId, StringComparison.Ordinal)
+                && DateTimeOffset.UtcNow < entry.ExpiresAt)
                 return entry.Snapshot;
 
-            var snapshot = await FetchAsync(ct);
-            _cache = (snapshot, DateTimeOffset.UtcNow + _cacheTtl);
+            var snapshot = await FetchAsync(token, credentials.AccountId, ct);
+            _cache = (token, credentials.AccountId, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
             return snapshot;
         }
         finally
@@ -69,7 +81,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         }
     }
 
-    private async Task<AgentQuotaSnapshot> FetchAsync(CancellationToken ct)
+    private async Task<AgentQuotaSnapshot> FetchAsync(string token, string? accountId, CancellationToken ct)
     {
         try
         {
@@ -77,9 +89,9 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
 
             // Do NOT log the Authorization header — it contains the ChatGPT token.
             using var request = new HttpRequestMessage(HttpMethod.Get, UsageEndpoint);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
-            if (!string.IsNullOrWhiteSpace(_accountId))
-                request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", _accountId);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            if (!string.IsNullOrWhiteSpace(accountId))
+                request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", accountId);
 
             using var response = await client.SendAsync(request, ct);
             if (!response.IsSuccessStatusCode)

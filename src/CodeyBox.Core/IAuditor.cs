@@ -68,7 +68,8 @@ public sealed record AuditResult(
     bool Passed,
     IReadOnlyList<AuditFinding> Findings,
     string? RawOutput = null,
-    string? AgentStderr = null);
+    string? AgentStderr = null,
+    string? AgentSummary = null);
 
 public sealed record AuditFinding(
     string AuditorName,

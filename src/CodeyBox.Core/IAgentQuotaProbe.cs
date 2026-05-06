@@ -19,6 +19,9 @@ public interface IAgentQuotaProbe
     Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct);
 }
 
+/// <summary>OAuth/subscription credentials used by quota probes.</summary>
+public sealed record AgentQuotaCredentials(string? AccessToken, string? AccountId = null);
+
 /// <summary>Point-in-time quota snapshot returned by an <see cref="IAgentQuotaProbe"/>.</summary>
 public sealed record AgentQuotaSnapshot
 {

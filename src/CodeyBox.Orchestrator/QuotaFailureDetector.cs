@@ -30,12 +30,16 @@ public static class QuotaFailureDetector
         IQuotaFailureStore? store,
         AgentKind agent,
         string? modelId,
+        string? summary,
         string? stderr,
         DateTimeOffset observedAt,
         TimeSpan retention,
         CancellationToken ct)
     {
         if (store is null)
+            return;
+
+        if (!string.Equals(summary?.Trim(), "agent exited 1", StringComparison.OrdinalIgnoreCase))
             return;
 
         var kind = Detect(stderr);

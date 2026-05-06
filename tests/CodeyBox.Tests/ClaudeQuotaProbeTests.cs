@@ -186,6 +186,28 @@ public sealed class ClaudeQuotaProbeTests
     }
 
     [Fact]
+    public async Task TokenChange_WithinTtl_HitsNetworkWithNewToken()
+    {
+        var token = "token-1";
+        var capturedAuths = new List<string?>();
+        var handler = new QuotaCapturingHandler(HttpStatusCode.OK,
+            Rollup(10),
+            req => capturedAuths.Add(req.Headers.Authorization?.ToString()));
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        var probe = new ClaudeQuotaProbe(
+            factory,
+            () => new AgentQuotaCredentials(token),
+            TimeSpan.FromMinutes(5),
+            NullLogger<ClaudeQuotaProbe>.Instance);
+
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        token = "token-2";
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.Equal(["Bearer token-1", "Bearer token-2"], capturedAuths);
+    }
+
+    [Fact]
     public async Task Call_AfterTtlExpires_HitsNetworkAgain()
     {
         int callCount = 0;

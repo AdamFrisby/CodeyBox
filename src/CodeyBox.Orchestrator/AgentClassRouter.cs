@@ -419,8 +419,8 @@ public sealed class PayPerApiQuotaProbe : IAgentQuotaProbe
 
 /// <summary>
 /// Fallback quota probe used when no probe is registered for an agent kind.
-/// Returns <c>AvailablePct = -1</c> (unknown) so the router fails open rather
-/// than blocking work items.
+/// Returns <c>AvailablePct = -1</c> (unknown); the configured
+/// <see cref="QuotaUnknownPolicy"/> decides whether pickup is allowed.
 /// </summary>
 public sealed class NullQuotaProbe : IAgentQuotaProbe
 {

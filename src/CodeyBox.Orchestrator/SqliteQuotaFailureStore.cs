@@ -72,7 +72,7 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
                 SELECT 1
                 FROM quota_failures
                 WHERE agent = $agent
-                  AND ($model_id IS NULL OR model_id = $model_id)
+                  AND (($model_id IS NULL AND model_id IS NULL) OR model_id = $model_id)
                   AND observed_at >= $cutoff
                 LIMIT 1;
                 """;

@@ -169,6 +169,49 @@ public sealed class CodexQuotaProbeTests
     }
 
     [Fact]
+    public async Task TokenChange_WithinTtl_HitsNetworkWithNewToken()
+    {
+        var token = "token-1";
+        var capturedAuths = new List<string?>();
+        var handler = UsageHandler(capture: req => capturedAuths.Add(req.Headers.Authorization?.ToString()));
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        var probe = new CodexQuotaProbe(
+            factory,
+            () => new AgentQuotaCredentials(token, "account-1"),
+            TimeSpan.FromMinutes(5),
+            NullLogger<CodexQuotaProbe>.Instance);
+
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        token = "token-2";
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.Equal(["Bearer token-1", "Bearer token-2"], capturedAuths);
+    }
+
+    [Fact]
+    public async Task AccountChange_WithinTtl_HitsNetworkWithNewAccountHeader()
+    {
+        var accountId = "account-1";
+        var capturedAccounts = new List<string?>();
+        var handler = UsageHandler(capture: req =>
+            capturedAccounts.Add(req.Headers.TryGetValues("ChatGPT-Account-Id", out var values)
+                ? values.Single()
+                : null));
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        var probe = new CodexQuotaProbe(
+            factory,
+            () => new AgentQuotaCredentials("token-1", accountId),
+            TimeSpan.FromMinutes(5),
+            NullLogger<CodexQuotaProbe>.Instance);
+
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        accountId = "account-2";
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.Equal(["account-1", "account-2"], capturedAccounts);
+    }
+
+    [Fact]
     public async Task Call_AfterTtlExpires_HitsNetworkAgain()
     {
         int callCount = 0;

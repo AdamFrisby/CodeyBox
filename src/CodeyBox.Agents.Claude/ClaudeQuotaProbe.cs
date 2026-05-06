@@ -21,12 +21,12 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
     internal const string UsageEndpoint = "https://api.anthropic.com/api/oauth/usage";
 
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly string? _token;
+    private readonly Func<AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<ClaudeQuotaProbe> _log;
 
-    // Single-entry cache: (snapshot, expiry). Protected by _lock.
-    private (AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
+    // Single-entry cache: (token, snapshot, expiry). Protected by _lock.
+    private (string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public AgentKind Kind => AgentKind.Claude;
@@ -36,26 +36,39 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         string? token,
         TimeSpan cacheTtl,
         ILogger<ClaudeQuotaProbe> log)
+        : this(httpClientFactory, () => new AgentQuotaCredentials(token), cacheTtl, log)
+    {
+    }
+
+    public ClaudeQuotaProbe(
+        IHttpClientFactory httpClientFactory,
+        Func<AgentQuotaCredentials> credentialsProvider,
+        TimeSpan cacheTtl,
+        ILogger<ClaudeQuotaProbe> log)
     {
         _httpClientFactory = httpClientFactory;
-        _token = token;
+        _credentialsProvider = credentialsProvider;
         _cacheTtl = cacheTtl;
         _log = log;
     }
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(_token))
+        var credentials = _credentialsProvider();
+        var token = credentials.AccessToken;
+        if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
 
         await _lock.WaitAsync(ct);
         try
         {
-            if (_cache is { } entry && DateTimeOffset.UtcNow < entry.ExpiresAt)
+            if (_cache is { } entry
+                && string.Equals(entry.AccessToken, token, StringComparison.Ordinal)
+                && DateTimeOffset.UtcNow < entry.ExpiresAt)
                 return entry.Snapshot;
 
-            var snapshot = await FetchAsync(ct);
-            _cache = (snapshot, DateTimeOffset.UtcNow + _cacheTtl);
+            var snapshot = await FetchAsync(token, ct);
+            _cache = (token, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
             return snapshot;
         }
         finally
@@ -66,14 +79,14 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
 
-    private async Task<AgentQuotaSnapshot> FetchAsync(CancellationToken ct)
+    private async Task<AgentQuotaSnapshot> FetchAsync(string token, CancellationToken ct)
     {
         try
         {
             var client = _httpClientFactory.CreateClient("agent-quota");
             using var request = new HttpRequestMessage(HttpMethod.Get, UsageEndpoint);
             // Do NOT log the Authorization header — it contains the OAuth token.
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
             using var response = await client.SendAsync(request, ct);
             if (!response.IsSuccessStatusCode)

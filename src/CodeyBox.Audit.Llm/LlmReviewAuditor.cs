@@ -62,7 +62,8 @@ public sealed class LlmReviewAuditor : IAuditor
                 Title: "review agent failed to run",
                 Description: agentResult.Stderr ?? agentResult.Summary)],
                 RawOutput: rawOutput,
-                AgentStderr: agentResult.Stderr);
+                AgentStderr: agentResult.Stderr,
+                AgentSummary: agentResult.Summary);
         }
 
         // Read the JSON result file from the sandbox.
