@@ -90,6 +90,7 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
         }
 
         Directory.CreateDirectory(MapToHostPath(root, spec.WorkingDirectory));
+        Directory.CreateDirectory(MapToHostPath(root, "home/codeybox"));
 
         // Build longest-first mount path table for argv translation. The
         // orchestrator addresses files by sandbox-absolute paths (e.g.
@@ -179,7 +180,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox
         // attempt to enforce the network policy at the OS level.
         psi.EnvironmentVariables.Clear();
         psi.EnvironmentVariables["PATH"] = Environment.GetEnvironmentVariable("PATH") ?? "/usr/bin:/bin";
-        psi.EnvironmentVariables["HOME"] = cwd;
+        psi.EnvironmentVariables["HOME"] = ProcessSandboxProvider.MapToHostPathInternal(_root, "/home/codeybox");
         foreach (var (k, v) in _spec.Environment) psi.EnvironmentVariables[k] = v;
         if (exec.ExtraEnvironment is not null)
             foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = v;

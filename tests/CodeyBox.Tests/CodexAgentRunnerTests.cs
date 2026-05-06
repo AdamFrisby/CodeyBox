@@ -68,7 +68,7 @@ public sealed class CodexAgentRunnerTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Execs.Add(exec);
-            if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "bash" && exec.Stdin is not null)
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
 
             return Task.FromResult(new SandboxExecResult(0, "ok", ""));

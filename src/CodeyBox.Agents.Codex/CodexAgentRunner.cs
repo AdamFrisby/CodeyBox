@@ -46,7 +46,20 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase
         {
             var write = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["bash", "-c", "set -e; mkdir -p \"$HOME/.codex\"; umask 077; cat > \"$HOME/.codex/auth.json\""],
+                Argv =
+                [
+                    "bash", "-c",
+                    """
+                    set -euo pipefail
+                    mkdir -p "$HOME/.codex"
+                    if [ "$(pwd -P)" = "$(cd "$HOME" && pwd -P)" ] && [ -d .git/info ]; then
+                      grep -qxF '/.codex/auth.json' .git/info/exclude 2>/dev/null \
+                        || printf '%s\n' '/.codex/auth.json' >> .git/info/exclude
+                    fi
+                    umask 077
+                    cat > "$HOME/.codex/auth.json"
+                    """
+                ],
                 Stdin = authJson,
             }, ct);
             if (!write.Success)

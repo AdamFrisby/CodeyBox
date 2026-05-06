@@ -593,7 +593,19 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             if (sandbox is IPreemptibleSandbox preemptible)
-                await preemptible.StopAndPreserveAsync(CancellationToken.None);
+            {
+                using var preserveCts = new CancellationTokenSource(_opts.SandboxPreserveDrain);
+                try
+                {
+                    await preemptible.StopAndPreserveAsync(preserveCts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    _log.LogWarning(
+                        "Timed out preserving sandbox {SandboxId} for work item {Id} after {Timeout}",
+                        sandbox.Id, item.Id, _opts.SandboxPreserveDrain);
+                }
+            }
 
             if (checkpointFailure is not null)
                 throw new OperationCanceledException("Host shutdown interrupted work, but the preempt checkpoint could not be created.", checkpointFailure, hostShutdownToken);
@@ -2469,6 +2481,7 @@ public sealed record PipelineOptions
     public TimeSpan ShutdownGrace { get; init; } = TimeSpan.FromSeconds(60);
     public TimeSpan AuditShutdownDrain => Min(TimeSpan.FromSeconds(60), ShutdownGrace);
     public TimeSpan AgentPreemptDrain => Min(TimeSpan.FromSeconds(2), ShutdownGrace);
+    public TimeSpan SandboxPreserveDrain => Min(TimeSpan.FromSeconds(10), ShutdownGrace);
 
     /// <summary>
     /// Global default for stuck-agent detection threshold, in minutes.
