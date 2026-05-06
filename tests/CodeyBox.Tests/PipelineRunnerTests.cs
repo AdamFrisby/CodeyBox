@@ -318,4 +318,8 @@ internal sealed class ConflictUpstreamRemote : IUpstreamRemote
             "wrapped upstream push failure",
             new UpstreamPushReconcileConflictException(request.BaseBranch, "rebase"));
     }
+
+    public Task<bool> TryMergeUpstreamBranchAsync(
+        string targetBranch, string sourceBranch, CancellationToken ct = default)
+        => Task.FromResult(true);
 }

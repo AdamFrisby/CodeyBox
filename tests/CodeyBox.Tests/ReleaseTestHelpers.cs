@@ -117,7 +117,9 @@ internal sealed class NullGitHost : IGitHost
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
         => throw new NotSupportedException();
     public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
-        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+        CancellationToken ct = default)
         => throw new NotSupportedException();
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;
@@ -200,7 +202,9 @@ internal sealed class StubGitHost : IGitHost
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
         => Task.FromResult("main");
     public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
-        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+        CancellationToken ct = default)
         => Task.CompletedTask;
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;
@@ -314,7 +318,9 @@ internal sealed class DeepAuditTestGitHost : IGitHost
         => Task.FromResult("main");
 
     public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
-        IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+        CancellationToken ct = default)
         => Task.CompletedTask;
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
