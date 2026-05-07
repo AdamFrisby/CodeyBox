@@ -75,7 +75,7 @@ internal static class TestSupport
         PipelineOptions? pipelineOptions = null,
         IAgentStreamStore? agentStreams = null,
         ITimingStore? timingStore = null,
-        string defaultBaseBranch = "main")
+        string? defaultBaseBranch = "main")
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");

@@ -284,11 +284,19 @@ public sealed class LocalGitHost : IGitHost
         CancellationToken ct)
     {
         Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
-        var branch = ResolveRefreshBranch(bareRepoPath, baseBranch);
-        Validation.ValidateBranchName(branch, nameof(baseBranch));
         var safeUpstream = ScrubCredentialMaterial(seedFromUrl);
 
         SanitizeBareRepositoryConfig(bareRepoPath);
+        var branch = await ResolveRefreshBranchAsync(bareRepoPath, seedFromUrl, baseBranch, ct);
+        if (branch is null)
+        {
+            _log.LogWarning(
+                "Skipped bare repo refresh for {Path}: no configured base branch and upstream {Upstream} did not advertise a default branch",
+                bareRepoPath, safeUpstream);
+            return;
+        }
+
+        Validation.ValidateBranchName(branch, nameof(baseBranch));
         var rc = await RunGitAsync(
             workdir: bareRepoPath,
             ct,
@@ -301,20 +309,45 @@ public sealed class LocalGitHost : IGitHost
         }
     }
 
-    private string ResolveRefreshBranch(string bareRepoPath, string? baseBranch)
+    private async Task<string?> ResolveRefreshBranchAsync(
+        string bareRepoPath,
+        string seedFromUrl,
+        string? baseBranch,
+        CancellationToken ct)
     {
         if (!string.IsNullOrWhiteSpace(baseBranch))
             return baseBranch;
 
         // HEAD lives inside the sandbox-writable bare repo, so do not use it
-        // to choose what host-side refresh should fetch. Callers that know the
-        // project base branch pass it explicitly; older callers get the host
-        // fallback rather than trusting repo metadata controlled by an agent.
+        // to choose what host-side refresh should fetch. Ask the upstream for
+        // its advertised default branch under the host-controlled git config.
+        var rc = await RunGitAsync(bareRepoPath, ct, "ls-remote", "--symref", seedFromUrl, "HEAD");
+        if (rc.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Failed to resolve upstream default branch for bare repo {Path} from {Upstream}: {Stderr}",
+                bareRepoPath,
+                ScrubCredentialMaterial(seedFromUrl),
+                ScrubCredentialMaterial(rc.Stderr));
+            return null;
+        }
+
+        foreach (var line in rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            const string prefix = "ref: refs/heads/";
+            if (!line.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+
+            var branch = line[prefix.Length..].Split('\t', 2)[0].Trim();
+            if (!string.IsNullOrWhiteSpace(branch))
+                return branch;
+        }
+
         _log.LogDebug(
-            "No configured base branch supplied for bare repo {Path}; refreshing fallback branch {Branch}",
-            bareRepoPath,
-            _opts.FallbackDefaultBranch);
-        return _opts.FallbackDefaultBranch;
+            "Upstream {Upstream} did not advertise a symbolic HEAD while refreshing bare repo {Path}",
+            ScrubCredentialMaterial(seedFromUrl),
+            bareRepoPath);
+        return null;
     }
 
     private static void SanitizeBareRepositoryConfig(string bareRepoPath)

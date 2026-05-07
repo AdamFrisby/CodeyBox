@@ -17,7 +17,8 @@ public interface IGitHost
     /// <summary>
     /// Ensures a host-side bare repo exists and, when already present, refreshes
     /// the configured base branch from <paramref name="seedFromUrl"/> without
-    /// overwriting work-item branches.
+    /// overwriting work-item branches. If no base branch is supplied, the
+    /// upstream's advertised default branch is refreshed.
     /// </summary>
     Task<string> EnsureRepositoryAsync(
         WorkItemId id,

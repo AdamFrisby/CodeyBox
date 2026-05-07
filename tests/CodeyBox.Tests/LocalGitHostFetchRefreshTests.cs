@@ -146,14 +146,14 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
             Path.Combine(barePath, "config"),
             $$"""
             [core]
-            	repositoryformatversion = 0
-            	filemode = true
-            	bare = true
-            	sshCommand = sh -c 'touch "{{marker}}"'
+                repositoryformatversion = 0
+                filemode = true
+                bare = true
+                sshCommand = sh -c 'touch "{{marker}}"'
             [credential]
-            	helper = !sh -c 'touch "{{marker}}"'
+                helper = !sh -c 'touch "{{marker}}"'
             [url "ssh://attacker.invalid/"]
-            	insteadOf = {{seed}}
+                insteadOf = {{seed}}
             """);
 
         await CommitToRepoAsync(seed, "after.txt", "after\n", "advance main");
@@ -257,6 +257,31 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         var developAfter = await RevParseAsync(seed, "develop");
 
         await gitHost.EnsureRepositoryAsync(id, seed, "develop");
+
+        Assert.Equal(developAfter, await RevParseAsync(barePath, "develop"));
+        Assert.Equal(mainBefore, await RevParseAsync(barePath, "main"));
+    }
+
+    [Fact]
+    public async Task ExistingBareRepo_NullBaseBranchRefreshesUpstreamDefaultBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
+        await CommitToRepoAsync(seed, "develop.txt", "develop\n", "create develop");
+
+        var gitHost = CreateGitHost();
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "develop");
+        var barePath = gitHost.GetRepoPath(repoId);
+        var mainBefore = await RevParseAsync(barePath, "main");
+
+        await TestSupport.RunGit(seed, "checkout", "main");
+        await CommitToRepoAsync(seed, "main-after.txt", "main after\n", "advance main");
+        await TestSupport.RunGit(seed, "checkout", "develop");
+        await CommitToRepoAsync(seed, "develop-after.txt", "develop after\n", "advance develop");
+        var developAfter = await RevParseAsync(seed, "develop");
+
+        await gitHost.EnsureRepositoryAsync(id, seed, baseBranch: null);
 
         Assert.Equal(developAfter, await RevParseAsync(barePath, "develop"));
         Assert.Equal(mainBefore, await RevParseAsync(barePath, "main"));

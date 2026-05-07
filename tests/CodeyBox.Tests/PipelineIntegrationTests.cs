@@ -146,6 +146,52 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task RetryPickup_UnconfiguredBaseBranchRefreshesUpstreamDefaultBeforeSandboxClone()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
+        await CommitToSeedAsync(seed, "develop.txt", "develop\n", "create develop");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, defaultBaseBranch: null);
+
+        var item = NewItem("feature/retry-refresh-default") with { BaseBranch = null };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, "develop");
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var staleDevelop = await RevParseAsync(barePath, "develop");
+
+        await CommitToSeedAsync(seed, "dependency.txt", "dependency landed\n", "dependency landed");
+        var latestDevelop = await RevParseAsync(seed, "develop");
+        Assert.NotEqual(staleDevelop, latestDevelop);
+
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var observed = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "git -C \"$1\" rev-parse origin/develop > \"$1/observed-origin-develop.txt\"",
+                    "sh",
+                    workingDirectory,
+                ],
+            }, ct);
+            if (!observed.Success)
+                throw new InvalidOperationException($"failed to capture sandbox origin/develop: {observed.Stderr}");
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent saw refreshed develop\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var (_, observedOriginDevelop, _) = await TestSupport.RunGit(barePath, "show", "develop:observed-origin-develop.txt");
+        var (_, dependency, _) = await TestSupport.RunGit(barePath, "show", "develop:dependency.txt");
+        Assert.Equal(latestDevelop + "\n", observedOriginDevelop);
+        Assert.Equal("dependency landed\n", dependency);
+    }
+
+    [Fact]
     public async Task InitialWorkPhase_ChecksOutWorkBranchFromConfiguredBaseBranch()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
