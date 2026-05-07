@@ -393,7 +393,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task ManyProjectDirectories_AreAllScanned()
+    public async Task ManyProjectDirectories_AreCapped()
     {
         var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./python-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
@@ -409,11 +409,16 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         Assert.True(result.Passed);
         Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.Equal(40, sandbox.Commands.Count(c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal)));
+        Assert.Contains(result.Findings, f =>
+            f.Severity == AuditSeverity.Info &&
+            f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
+        Assert.Equal(
+            LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage,
+            sandbox.Commands.Count(c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal)));
     }
 
     [Fact]
-    public async Task CSharpManyProjectDirectories_AreAllScanned()
+    public async Task CSharpManyProjectDirectories_AreCapped()
     {
         var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./csharp-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
@@ -429,10 +434,14 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         Assert.True(result.Passed);
         Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.Equal(40, sandbox.Commands.Count(c =>
+        Assert.Contains(result.Findings, f =>
+            f.Severity == AuditSeverity.Info &&
+            f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
+        Assert.Equal(LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage, sandbox.Commands.Count(c =>
             c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal)));
         Assert.Contains("/repo/csharp-0", sandbox.WorkingDirectories);
-        Assert.Contains("/repo/csharp-39", sandbox.WorkingDirectories);
+        Assert.Contains($"/repo/csharp-{LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage - 1}", sandbox.WorkingDirectories);
+        Assert.DoesNotContain($"/repo/csharp-{LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage}", sandbox.WorkingDirectories);
     }
 
     [Fact]

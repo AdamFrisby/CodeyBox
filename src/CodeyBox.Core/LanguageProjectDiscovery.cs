@@ -2,6 +2,8 @@ namespace CodeyBox.Core;
 
 public static class LanguageProjectDiscovery
 {
+    public const int MaxProjectDirectoriesPerLanguage = 20;
+
     private const string PruneExpression =
         "-type d \\( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \\) -prune -o";
 
@@ -19,4 +21,22 @@ public static class LanguageProjectDiscovery
 
     public const string RustDiscoveryScript =
         "find . " + PruneExpression + " -name 'Cargo.toml' -exec dirname {} \\; | sort -u";
+
+    public static IReadOnlyList<string> SelectProjectDirectoriesToRun(
+        string language,
+        IReadOnlyList<string> projectDirectories,
+        out int skippedDueToLimit)
+    {
+        skippedDueToLimit = 0;
+
+        if (string.Equals(language, "csharp", StringComparison.OrdinalIgnoreCase) &&
+            projectDirectories.Contains(".", StringComparer.Ordinal))
+            return ["."];
+
+        if (projectDirectories.Count <= MaxProjectDirectoriesPerLanguage)
+            return projectDirectories;
+
+        skippedDueToLimit = projectDirectories.Count - MaxProjectDirectoriesPerLanguage;
+        return projectDirectories.Take(MaxProjectDirectoriesPerLanguage).ToList();
+    }
 }

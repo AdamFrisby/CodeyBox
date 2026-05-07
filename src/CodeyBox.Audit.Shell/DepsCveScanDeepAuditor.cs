@@ -386,7 +386,19 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             }
 
             var projectDirectories = ParseProjectDirectories(discovery.Stdout);
-            foreach (var projectDirectory in SelectProjectDirectoriesToRun(language, projectDirectories))
+            var projectDirectoriesToRun = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
+                language,
+                projectDirectories,
+                out var skippedDueToLimit);
+
+            if (skippedDueToLimit > 0)
+                allFindings.Add(new AuditFinding(
+                    AuditorName: Name,
+                    Severity: AuditSeverity.Info,
+                    Title: $"{language} CVE scan project directory limit reached",
+                    Description: $"Discovered {projectDirectories.Count} {language} project directories; scanning the first {projectDirectoriesToRun.Count} to keep dependency scanning bounded. Skipped {skippedDueToLimit}."));
+
+            foreach (var projectDirectory in projectDirectoriesToRun)
             {
                 var result = await sandbox.ExecAsync(new SandboxExec
                 {
@@ -1037,15 +1049,6 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Distinct(StringComparer.Ordinal)
             .ToList();
-
-    private static IReadOnlyList<string> SelectProjectDirectoriesToRun(string language, IReadOnlyList<string> projectDirectories)
-    {
-        if (string.Equals(language, "csharp", StringComparison.OrdinalIgnoreCase) &&
-            projectDirectories.Contains(".", StringComparer.Ordinal))
-            return ["."];
-
-        return projectDirectories;
-    }
 
     private static void AppendRawPart(
         List<string> rawParts,

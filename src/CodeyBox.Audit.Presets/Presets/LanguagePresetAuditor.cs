@@ -70,7 +70,19 @@ internal sealed class LanguagePresetAuditor : IAuditor
         var rawOutputChars = 0;
         var rawOutputTruncated = false;
 
-        foreach (var projectDirectory in SelectProjectDirectoriesToRun(projectDirectories))
+        var projectDirectoriesToRun = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
+            _language,
+            projectDirectories,
+            out var skippedDueToLimit);
+
+        if (skippedDueToLimit > 0)
+            allFindings.Add(new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Info,
+                Title: $"{_language} preset project directory limit reached",
+                Description: $"Discovered {projectDirectories.Count} {_language} project directories; running the first {projectDirectoriesToRun.Count} to keep audit execution bounded. Skipped {skippedDueToLimit}."));
+
+        foreach (var projectDirectory in projectDirectoriesToRun)
         {
             var result = await _inner.RunAsync(
                 sandbox,
@@ -99,15 +111,6 @@ internal sealed class LanguagePresetAuditor : IAuditor
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Distinct(StringComparer.Ordinal)
             .ToList();
-
-    private IReadOnlyList<string> SelectProjectDirectoriesToRun(IReadOnlyList<string> projectDirectories)
-    {
-        if (string.Equals(_language, "csharp", StringComparison.OrdinalIgnoreCase) &&
-            projectDirectories.Contains(".", StringComparer.Ordinal))
-            return ["."];
-
-        return projectDirectories;
-    }
 
     private static void AppendRawPart(
         List<string> rawParts,
