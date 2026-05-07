@@ -130,7 +130,7 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_ParsesInstalledCommandExecutionAndAgentMessageEvents()
+    public async Task ParseAsync_ParsesInstalledCommandExecutionAndAgentMessageEventsWithCaptureClockFallback()
     {
         var parser = new CodexStreamParser();
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-codex-stream-{Guid.NewGuid():N}");
@@ -162,16 +162,19 @@ public sealed class CodexStreamParserTests
             var tool = Assert.Single(summary.ToolCalls);
             Assert.Equal("item_0", tool.ToolUseId);
             Assert.Equal("Bash", tool.ToolName);
-            Assert.Null(tool.StartedAt);
-            Assert.Null(tool.EndedAt);
-            Assert.Null(tool.Duration);
+            Assert.NotNull(tool.StartedAt);
+            Assert.NotNull(tool.EndedAt);
+            Assert.NotNull(tool.Duration);
+            Assert.True(tool.Duration > TimeSpan.Zero);
+            Assert.True(tool.Duration <= TimeSpan.FromSeconds(10));
             Assert.True(tool.Succeeded);
             Assert.Equal(6, tool.OutputBytes);
             Assert.Equal(29990, summary.InputTokens);
             Assert.Equal(44, summary.OutputTokens);
             Assert.Equal(18176, summary.CachedInputTokens);
             Assert.Equal("Done.", summary.FinalAssistantMessage);
-            Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+            Assert.True(summary.TotalDuration > TimeSpan.Zero);
+            Assert.True(summary.TotalDuration <= TimeSpan.FromSeconds(10));
         }
         finally
         {
