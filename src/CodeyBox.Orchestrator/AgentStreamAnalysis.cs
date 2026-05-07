@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Runtime.CompilerServices;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -67,6 +68,14 @@ public sealed record AgentStreamToolAggregate(
 public sealed class AgentStreamParserOptions
 {
     public TimeSpan StallThreshold { get; set; } = TimeSpan.FromSeconds(30);
+    public int MaxLineBytes { get; set; } = 1024 * 1024;
+    public int MaxJsonDepth { get; set; } = 64;
+}
+
+public interface IAgentStreamTimingSource
+{
+    DateTimeOffset? CapturedAt { get; }
+    DateTimeOffset? CompletedAt { get; }
 }
 
 public sealed class ClaudeStreamParser : FlexibleAgentStreamParser
@@ -98,10 +107,30 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
             var itemType = FirstString(item, "type", "kind") ?? type;
             isAssistant = string.Equals(FirstString(item, "role"), "assistant", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(itemType, "message", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(itemType, "agent_message", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(itemType, "function_call", StringComparison.OrdinalIgnoreCase);
 
-            if (string.Equals(itemType, "function_call", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(itemType, "tool_call", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(itemType, "command_execution", StringComparison.OrdinalIgnoreCase))
+            {
+                var id = FirstString(item, "id", "call_id", "tool_use_id") ?? Guid.NewGuid().ToString("N");
+                if (string.Equals(type, "item.started", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(FirstString(item, "status"), "in_progress", StringComparison.OrdinalIgnoreCase))
+                {
+                    starts.Add(new ToolBuilder(
+                        id,
+                        CommandToolName(FirstString(item, "command")),
+                        InputSummary(item),
+                        timestamp));
+                }
+
+                if (string.Equals(type, "item.completed", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(FirstString(item, "status"), "completed", StringComparison.OrdinalIgnoreCase))
+                {
+                    results.Add(new ToolResultBuilder(id, CommandSucceeded(item), OutputBytes(item)));
+                }
+            }
+            else if (string.Equals(itemType, "function_call", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(itemType, "tool_call", StringComparison.OrdinalIgnoreCase))
             {
                 var id = FirstString(item, "call_id", "id", "tool_use_id") ?? Guid.NewGuid().ToString("N");
                 var name = FirstString(item, "name", "tool_name") ?? "unknown";
@@ -114,6 +143,7 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
                 results.Add(new ToolResultBuilder(id, !Bool(item, "is_error", "error"), OutputBytes(item)));
             }
 
+            finalText = FirstString(item, "text", "final_message") ?? finalText;
             ParseContent(item, starts, results, ref finalText);
             ParseUsage(item, out var itemInput, out var itemOutput, out var itemCached);
             var parsed = ParseScalars(root, type, timestamp, starts, results, isAssistant, finalText);
@@ -126,6 +156,24 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
         }
 
         return base.ParseEvent(root);
+    }
+
+    private static bool? CommandSucceeded(JsonElement item)
+    {
+        if (!TryGet(item, out var exitCode, "exit_code") || exitCode.ValueKind == JsonValueKind.Null)
+            return null;
+        return exitCode.TryGetInt32(out var code) ? code == 0 : null;
+    }
+
+    private static string CommandToolName(string? command)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+            return "command_execution";
+        var fileName = Path.GetFileName(command.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? command);
+        return fileName.Equals("bash", StringComparison.OrdinalIgnoreCase)
+            || fileName.Equals("sh", StringComparison.OrdinalIgnoreCase)
+            ? "Bash"
+            : "command_execution";
     }
 }
 
@@ -220,24 +268,96 @@ public sealed class UnknownAgentStreamParser : IAgentStreamParser
         Task.FromResult(new AgentStreamSummary(TimeSpan.Zero, null, 0, 0, 0, null, [], [], null));
 }
 
+internal sealed record AgentStreamJsonLine(string Text, long StartOffset, long EndOffset);
+
+internal static class AgentStreamJsonLineReader
+{
+    public static async IAsyncEnumerable<AgentStreamJsonLine> ReadLinesAsync(
+        Stream stream,
+        int maxLineBytes,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        maxLineBytes = Math.Max(1, maxLineBytes);
+        var buffer = new byte[16 * 1024];
+        await using var line = new MemoryStream(capacity: Math.Min(maxLineBytes, 16 * 1024));
+        long offset = 0;
+        long lineStart = 0;
+        var discarding = false;
+
+        while (true)
+        {
+            var read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false);
+            if (read == 0)
+                break;
+
+            for (var i = 0; i < read; i++)
+            {
+                var b = buffer[i];
+                offset++;
+                if (discarding)
+                {
+                    if (b == (byte)'\n')
+                    {
+                        discarding = false;
+                        line.SetLength(0);
+                        lineStart = offset;
+                    }
+                    continue;
+                }
+
+                if (b == (byte)'\n')
+                {
+                    var text = DecodeLine(line);
+                    line.SetLength(0);
+                    yield return new AgentStreamJsonLine(text, lineStart, offset);
+                    lineStart = offset;
+                    continue;
+                }
+
+                if (line.Length >= maxLineBytes)
+                {
+                    discarding = true;
+                    line.SetLength(0);
+                    continue;
+                }
+
+                line.WriteByte(b);
+            }
+        }
+
+        if (!discarding && line.Length > 0)
+            yield return new AgentStreamJsonLine(DecodeLine(line), lineStart, offset);
+    }
+
+    private static string DecodeLine(MemoryStream line)
+    {
+        var span = line.GetBuffer().AsSpan(0, (int)line.Length);
+        if (span.Length > 0 && span[^1] == (byte)'\r')
+            span = span[..^1];
+        if (span.Length >= 3 && span[0] == 0xEF && span[1] == 0xBB && span[2] == 0xBF)
+            span = span[3..];
+        return Encoding.UTF8.GetString(span);
+    }
+}
+
 public static class AgentStreamParserSelection
 {
     private const int MaxSniffLines = 20;
 
     public static async Task<AgentKind?> SniffKindAsync(Stream jsonlFile, CancellationToken ct = default)
     {
-        using var reader = new StreamReader(jsonlFile, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 16 * 1024, leaveOpen: true);
-        for (var i = 0; i < MaxSniffLines; i++)
+        var read = 0;
+        await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, 1024 * 1024, ct).ConfigureAwait(false))
         {
-            var line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
-            if (line is null)
+            if (read++ >= MaxSniffLines)
                 break;
+            var line = jsonLine.Text;
             if (string.IsNullOrWhiteSpace(line) || !line.TrimStart().StartsWith('{'))
                 continue;
 
             try
             {
-                using var doc = JsonDocument.Parse(line);
+                using var doc = JsonDocument.Parse(line, new JsonDocumentOptions { MaxDepth = 64 });
                 if (SniffKind(doc.RootElement) is { } kind)
                     return kind;
             }
@@ -422,17 +542,21 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         decimal? estimatedUsd = null;
         string? finalText = null;
 
-        using var reader = new StreamReader(jsonlFile, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 64 * 1024, leaveOpen: true);
-        while (await reader.ReadLineAsync(ct).ConfigureAwait(false) is { } line)
+        var fallbackStart = (jsonlFile as IAgentStreamTimingSource)?.CapturedAt;
+        var fallbackEnd = (jsonlFile as IAgentStreamTimingSource)?.CompletedAt;
+        var streamLength = TryGetLength(jsonlFile);
+
+        await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, _options.MaxLineBytes, ct).ConfigureAwait(false))
         {
             ct.ThrowIfCancellationRequested();
+            var line = jsonLine.Text;
             if (string.IsNullOrWhiteSpace(line) || !line.TrimStart().StartsWith('{'))
                 continue;
 
             ParsedEvent parsed;
             try
             {
-                using var doc = JsonDocument.Parse(line);
+                using var doc = JsonDocument.Parse(line, new JsonDocumentOptions { MaxDepth = _options.MaxJsonDepth });
                 parsed = ParseEvent(doc.RootElement);
             }
             catch (JsonException)
@@ -444,7 +568,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 continue;
             }
 
-            var timestamp = parsed.Timestamp;
+            var timestamp = parsed.Timestamp ?? EstimateTimestamp(fallbackStart, fallbackEnd, streamLength, jsonLine.StartOffset);
             if (timestamp is { } eventTimestamp)
             {
                 firstTimestamp ??= eventTimestamp;
@@ -542,6 +666,39 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             || string.Equals(previousEventType, "tool_result", StringComparison.OrdinalIgnoreCase))
             return "llm";
         return "unknown";
+    }
+
+    private static long? TryGetLength(Stream stream)
+    {
+        try
+        {
+            return stream.Length > 0 ? stream.Length : null;
+        }
+        catch (NotSupportedException)
+        {
+            return null;
+        }
+        catch (ObjectDisposedException)
+        {
+            return null;
+        }
+    }
+
+    private static DateTimeOffset? EstimateTimestamp(
+        DateTimeOffset? fallbackStart,
+        DateTimeOffset? fallbackEnd,
+        long? streamLength,
+        long lineStartOffset)
+    {
+        if (!fallbackStart.HasValue || !fallbackEnd.HasValue || !streamLength.HasValue)
+            return null;
+
+        var span = fallbackEnd.Value - fallbackStart.Value;
+        if (span <= TimeSpan.Zero || streamLength.Value <= 1)
+            return null;
+
+        var ratio = Math.Clamp(lineStartOffset / (double)(streamLength.Value - 1), 0d, 1d);
+        return fallbackStart.Value + TimeSpan.FromTicks((long)Math.Round(span.Ticks * ratio));
     }
 
     protected virtual ParsedEvent ParseEvent(JsonElement root)
@@ -696,7 +853,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
 
     protected static int OutputBytes(JsonElement el)
     {
-        var content = FirstString(el, "content", "output", "result") ?? el.GetRawText();
+        var content = FirstString(el, "content", "output", "aggregated_output", "result") ?? el.GetRawText();
         return Encoding.UTF8.GetByteCount(content);
     }
 

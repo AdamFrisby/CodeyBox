@@ -27,7 +27,7 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. In that case the analyser still extracts tool frequency, token usage, cost, and final text where the schema exposes them, but it does not fabricate clock values: total duration is zero, time-to-first-token is null, tool durations are null, and stall detection is skipped.
+Captured CLI streams do not always include timestamps. When a parser is reading a persisted stream file, CodeyBox uses the capture file's creation-to-last-write window as a best-effort clock budget and maps untimestamped events onto that window by byte offset. That preserves duration, thinking/executing, and stall analytics for real captured streams without modifying the capture layer. Pure in-memory or externally supplied streams without either event timestamps or file timing metadata still report unknown clock values.
 
 ## Thinking Vs Executing
 
