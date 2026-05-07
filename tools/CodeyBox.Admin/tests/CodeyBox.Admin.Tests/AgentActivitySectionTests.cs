@@ -67,4 +67,25 @@ public sealed class AgentActivitySectionTests : TestContext
         Assert.Contains("dotnet test", cut.Markup);
         Assert.Contains("agent-stall", cut.Markup);
     }
+
+    [Fact]
+    public void WorkItemTimings_ShowsUnsupportedMessageWhenNoStreamSummariesExist()
+    {
+        var fake = new FakeApiClient([]);
+        fake.TimingsOverride[ItemId] = new WorkItemTimingsDto
+        {
+            WorkItemId = ItemId,
+            TotalDurationMs = 12_000,
+        };
+        fake.AgentStreamAggregateOverride[ItemId] = new AgentStreamAggregateDto
+        {
+            WorkItemId = ItemId,
+        };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+
+        Assert.Contains("Agent activity", cut.Markup);
+        Assert.Contains("stream-json not supported by this agent", cut.Markup);
+    }
 }

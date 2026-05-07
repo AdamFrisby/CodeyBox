@@ -58,75 +58,82 @@ else
         </section>
     }
 
-    @if (_agentActivity is { Invocations.Count: > 0 })
+    @if (_agentActivity is not null)
     {
         <section class="agent-activity">
             <h2>Agent activity</h2>
-            <table class="detail-table agent-activity-table">
-                <thead>
-                    <tr>
-                        <th>Invocation</th>
-                        <th>Total</th>
-                        <th>Tools</th>
-                        <th>Thinking / executing</th>
-                        <th>Stalls</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    @foreach (var invocation in _agentActivity.Invocations)
-                    {
-                        var executing = UnionToolDurationMs(invocation.ToolCalls);
-                        var thinking = Math.Max(0, invocation.TotalDurationMs - executing);
-                        var total = Math.Max(1, thinking + executing);
-                        var thinkingPct = thinking * 100.0 / total;
-                        <tr class="@(invocation.Stalls.Count > 0 ? "agent-activity-stalled" : "")">
-                            <td>
-                                <details>
-                                    <summary>
-                                        <code>@(invocation.Phase ?? "unknown")</code>
-                                        @if (invocation.Iteration.HasValue)
-                                        {
-                                            <span>iter @invocation.Iteration</span>
-                                        }
-                                    </summary>
-                                    @if (invocation.ToolCalls.Count > 0)
-                                    {
-                                        <table class="detail-table agent-tool-calls">
-                                            <thead>
-                                                <tr><th>Tool</th><th>Duration</th><th>Status</th><th>Input</th></tr>
-                                            </thead>
-                                            <tbody>
-                                                @foreach (var tool in invocation.ToolCalls.OrderByDescending(t => t.DurationMs ?? 0))
-                                                {
-                                                    <tr>
-                                                        <td><code>@tool.ToolName</code></td>
-                                                        <td>@(tool.DurationMs.HasValue ? FormatDuration(tool.DurationMs.Value) : "unfinished")</td>
-                                                        <td>@FormatToolStatus(tool.Succeeded)</td>
-                                                        <td><code>@tool.InputSummary</code></td>
-                                                    </tr>
-                                                }
-                                            </tbody>
-                                        </table>
-                                    }
-                                    @foreach (var stall in invocation.Stalls.OrderByDescending(s => s.GapDurationMs))
-                                    {
-                                        <p class="agent-stall">Stall @FormatDuration(stall.GapDurationMs) @stall.Classification</p>
-                                    }
-                                </details>
-                            </td>
-                            <td>@FormatDuration(invocation.TotalDurationMs)</td>
-                            <td>@invocation.ToolCalls.Count</td>
-                            <td>
-                                <div class="agent-split" title="thinking @FormatDuration(thinking), executing @FormatDuration(executing)">
-                                    <span class="agent-split-thinking" style="width:@(thinkingPct.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))%"></span>
-                                    <span class="agent-split-executing"></span>
-                                </div>
-                            </td>
-                            <td>@invocation.Stalls.Count</td>
+            @if (_agentActivity.Invocations.Count == 0)
+            {
+                <p class="agent-activity-empty">stream-json not supported by this agent's CLI version, stream capture is disabled, or no cached stream summary is available yet.</p>
+            }
+            else
+            {
+                <table class="detail-table agent-activity-table">
+                    <thead>
+                        <tr>
+                            <th>Invocation</th>
+                            <th>Total</th>
+                            <th>Tools</th>
+                            <th>Thinking / executing</th>
+                            <th>Stalls</th>
                         </tr>
-                    }
-                </tbody>
-            </table>
+                    </thead>
+                    <tbody>
+                        @foreach (var invocation in _agentActivity.Invocations)
+                        {
+                            var executing = UnionToolDurationMs(invocation.ToolCalls);
+                            var thinking = Math.Max(0, invocation.TotalDurationMs - executing);
+                            var total = Math.Max(1, thinking + executing);
+                            var thinkingPct = thinking * 100.0 / total;
+                            <tr class="@(invocation.Stalls.Count > 0 ? "agent-activity-stalled" : "")">
+                                <td>
+                                    <details>
+                                        <summary>
+                                            <code>@(invocation.Phase ?? "unknown")</code>
+                                            @if (invocation.Iteration.HasValue)
+                                            {
+                                                <span>iter @invocation.Iteration</span>
+                                            }
+                                        </summary>
+                                        @if (invocation.ToolCalls.Count > 0)
+                                        {
+                                            <table class="detail-table agent-tool-calls">
+                                                <thead>
+                                                    <tr><th>Tool</th><th>Duration</th><th>Status</th><th>Input</th></tr>
+                                                </thead>
+                                                <tbody>
+                                                    @foreach (var tool in invocation.ToolCalls.OrderByDescending(t => t.DurationMs ?? 0))
+                                                    {
+                                                        <tr>
+                                                            <td><code>@tool.ToolName</code></td>
+                                                            <td>@(tool.DurationMs.HasValue ? FormatDuration(tool.DurationMs.Value) : "unfinished")</td>
+                                                            <td>@FormatToolStatus(tool.Succeeded)</td>
+                                                            <td><code>@tool.InputSummary</code></td>
+                                                        </tr>
+                                                    }
+                                                </tbody>
+                                            </table>
+                                        }
+                                        @foreach (var stall in invocation.Stalls.OrderByDescending(s => s.GapDurationMs))
+                                        {
+                                            <p class="agent-stall">Stall @FormatDuration(stall.GapDurationMs) @stall.Classification</p>
+                                        }
+                                    </details>
+                                </td>
+                                <td>@FormatDuration(invocation.TotalDurationMs)</td>
+                                <td>@invocation.ToolCalls.Count</td>
+                                <td>
+                                    <div class="agent-split" title="thinking @FormatDuration(thinking), executing @FormatDuration(executing)">
+                                        <span class="agent-split-thinking" style="width:@(thinkingPct.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))%"></span>
+                                        <span class="agent-split-executing"></span>
+                                    </div>
+                                </td>
+                                <td>@invocation.Stalls.Count</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
         </section>
     }
 

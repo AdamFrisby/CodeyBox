@@ -349,8 +349,7 @@ does not write to the summary cache.
       "nextEventType": "tool_result",
       "classification": "tool_execution"
     }
-  ],
-  "finalAssistantMessage": "Done"
+  ]
 }
 ```
 
@@ -358,6 +357,10 @@ If the captured CLI stream has no event timestamps, CodeyBox uses capture-file
 creation and last-write times as a fallback clock when those values are
 available. `startedAt`, `endedAt`, and `durationMs` are `null` only when neither
 event timestamps nor capture-store timing are available.
+
+The analysis response omits final assistant text. Raw stream download remains
+available to authorized operators, but the structured analytics surface only
+returns numeric and redacted structural data.
 
 #### `GET /workitems/{id}/agent-streams/aggregate`
 

@@ -9,9 +9,12 @@ Each invocation summary includes:
 - total stream duration and time to first assistant token
 - input, output, and cached input token counts
 - authoritative cost from the agent result event when present
-- final assistant message text
 - tool calls with name, redacted input summary, start/end timestamps, duration, success flag, and output bytes
 - stall events
+
+Final assistant text is parsed only transiently for agent-specific bookkeeping.
+It is not retained in cached dashboard summaries and is omitted from analytics
+API DTOs.
 
 Claude, Codex, and Gemini parsers are registered separately because their CLI stream shapes differ. Unsupported agents produce an empty `unknown` summary so the dashboard can remain graceful when stream JSON is not available.
 

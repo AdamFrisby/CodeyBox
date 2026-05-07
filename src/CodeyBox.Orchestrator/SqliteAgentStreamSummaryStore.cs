@@ -210,8 +210,7 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
         cmd.Parameters.AddWithValue("$tools", JsonSerializer.Serialize(row.Summary.ToolCalls, JsonOptions));
         cmd.Parameters.AddWithValue("$stalls", JsonSerializer.Serialize(row.Summary.Stalls, JsonOptions));
         // Final assistant messages can contain arbitrary user or operational data.
-        // Keep persisted dashboard summaries numeric/structural; on-demand parsing can
-        // still return final text without extending its retention in SQLite.
+        // Keep persisted dashboard summaries numeric/structural.
         cmd.Parameters.AddWithValue("$final", DBNull.Value);
         cmd.Parameters.AddWithValue("$summarised", row.SummarisedAt.ToString("O"));
     }
