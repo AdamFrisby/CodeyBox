@@ -114,6 +114,31 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HostShutdownDuringAudit_StopsAfterAuditorDrains(bool blockingFinding)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new DrainingAuditor(blockingFinding);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        using var hostShutdown = new CancellationTokenSource();
+        var run = Task.Run(() => tp.Pipeline.RunAsync(item, CancellationToken.None, hostShutdown.Token));
+
+        await auditor.Started.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        await hostShutdown.CancelAsync();
+        auditor.Release.SetResult();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Auditing, final!.State);
+        Assert.Empty(tp.Agent.WorkPlan);
+    }
+
     private sealed record AuditOutcome(bool Passed, IReadOnlyList<AuditFinding> Findings);
 
     private sealed class ScriptedAuditor : IAuditor
@@ -128,6 +153,29 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             if (_plan.Count == 0) throw new InvalidOperationException("no plan entries left");
             var outcome = _plan.Dequeue();
             return Task.FromResult(new AuditResult(outcome.Passed, outcome.Findings));
+        }
+    }
+
+    private sealed class DrainingAuditor : IAuditor
+    {
+        private readonly bool _blockingFinding;
+
+        public DrainingAuditor(bool blockingFinding) => _blockingFinding = blockingFinding;
+
+        public string Name => "Draining";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        {
+            Started.TrySetResult();
+            await Release.Task.WaitAsync(ct);
+            var findings = _blockingFinding
+                ? (IReadOnlyList<AuditFinding>)[new AuditFinding("Draining", AuditSeverity.Error, "needs fix", "x")]
+                : [];
+            return new AuditResult(!_blockingFinding, findings);
         }
     }
 

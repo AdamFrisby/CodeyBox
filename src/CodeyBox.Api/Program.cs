@@ -166,6 +166,12 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
 builder.Services.Configure<ProjectsOptions>(builder.Configuration.GetSection("CodeyBox"));
+builder.Services.Configure<HostOptions>(o =>
+{
+    var cbOpts = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
+        ?? new CodeyBoxOptions();
+    o.ShutdownTimeout = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
+});
 
 ApiKeyAuth.Configure(builder);
 
@@ -426,7 +432,7 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 // canonical sandbox env var the agent CLI reads. Operators add new agents
 // by appending to this list (or registering a different ICredentialProvider).
 //
-// Chain order: BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV.
+// Chain order: BUILT-IN-FIRST → PLUGINS → BUILT-IN-LAST.
 //
 // 1. ClaudeOAuthFileCredentialProvider — reads Claude's token fresh from a
 //    JSON file (default ~/.claude/.credentials.json, the path the local
@@ -436,7 +442,10 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 //    (between OAuth-file and env-var). Vault-issued short-lived credentials
 //    are preferred over env-var fallbacks. Per-project ordering is expressed
 //    via Project.CredentialProviderPriority; see docs/credential-plugins.md.
-// 3. EnvironmentCredentialProvider — catch-all fallback reading host env vars.
+// 3. CodexOAuthFileCredentialProvider and EnvironmentCredentialProvider —
+//    fallback providers. Codex host auth is deliberately after plugins so a
+//    project-selected credential plugin can isolate Codex credentials from the
+//    operator's ~/.codex/auth.json.
 //
 // Operators with no credential plugins see zero behaviour change: the chain
 // is identical to the pre-plugin OAuth-file → env-var behaviour.
@@ -932,6 +941,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         AgentAllowedHosts = opts.AgentAllowedHosts,
         UpstreamPushMaxAttempts = opts.UpstreamPushMaxAttempts,
         UpstreamPushBackoff = TimeSpan.FromSeconds(opts.UpstreamPushBackoffSeconds),
+        ShutdownGrace = TimeSpan.FromSeconds(Math.Max(1, opts.Shutdown.GraceSeconds)),
         HostGitIdentity = hostIdentity,
     };
 });
@@ -1277,6 +1287,9 @@ namespace CodeyBox.Api
         /// <summary>Worker pool sizing and spawn-pacing configuration.</summary>
         public WorkerPoolOptions WorkerPool { get; set; } = new();
 
+        /// <summary>Graceful shutdown drain and preemption timing.</summary>
+        public ShutdownOptions Shutdown { get; set; } = new();
+
         /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
         public DeadWorkerOptions DeadWorker { get; set; } = new();
 
@@ -1401,6 +1414,15 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+    }
+
+    public sealed class ShutdownOptions
+    {
+        /// <summary>
+        /// Maximum time the host waits for in-flight phases to preempt or drain
+        /// during SIGTERM/Ctrl-C. Defaults to 60 seconds.
+        /// </summary>
+        public int GraceSeconds { get; set; } = 60;
     }
 
     /// <summary>

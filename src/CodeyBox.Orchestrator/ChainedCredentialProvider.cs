@@ -10,10 +10,9 @@ namespace CodeyBox.Orchestrator;
 /// is picked up without restarting the orchestrator.
 ///
 /// <para>Chain order for the default DI registration is:
-/// BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV. Plugins go between the Claude-
-/// specific OAuth-file provider and the catch-all env-var provider so vault
-/// credentials are preferred over plain env vars but never override an
-/// operator's explicitly configured OAuth token file.</para>
+/// BUILT-IN-FIRST → PLUGINS → BUILT-IN-LAST. Providers that would expose
+/// broad host credentials should live in the last segment so project-selected
+/// plugin credentials can preserve isolation.</para>
 ///
 /// <para>Time-bound credentials: if a provider returns an
 /// <see cref="AgentCredential"/> with <see cref="AgentCredential.ExpiresAt"/>

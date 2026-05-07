@@ -206,6 +206,23 @@ public sealed class GeminiAgentRunnerTests
         Assert.Equal("plain text", result.Stdout);
     }
 
+    [Fact]
+    public async Task RunResumedAsync_StripsAnsiFromStdoutAndStderr()
+    {
+        var sandbox = new CapturingSandbox(stdout: "\x1b[32mresumed\x1b[0m", stderr: "\x1b[1mProgress:\x1b[0m done");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "p",
+            null,
+            new AgentResumeContext("refs/heads/codeybox/preempt/wi"));
+
+        Assert.Equal("resumed", result.Stdout);
+        Assert.Equal("Progress: done", result.Stderr);
+    }
+
     // ── Credential provider ───────────────────────────────────────────────────
 
     [Fact]

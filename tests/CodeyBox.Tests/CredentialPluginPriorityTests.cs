@@ -204,6 +204,32 @@ public sealed class CredentialPluginPriorityTests
     }
 
     [Fact]
+    public async Task SegmentedConstructor_PluginCredentialWinsOverBuiltInLast()
+    {
+        var callLog = new List<string>();
+
+        var pluginCredential = MakeCredential();
+        var hostCredential = MakeCredential();
+        var plugin = new ReturningProvider("plugin", callLog, pluginCredential);
+        var builtInLast = new ReturningProvider("built-in-last", callLog, hostCredential);
+
+        IReadOnlyList<(string Id, ICredentialProvider Provider)> namedPlugins =
+        [
+            ("plugin", plugin),
+        ];
+
+        IProjectAwareCredentialProvider chain = new ChainedCredentialProvider(
+            builtInFirst: [],
+            namedPlugins: namedPlugins,
+            builtInLast: [builtInLast]);
+
+        var result = await chain.GetAsync(AgentKind.Codex, ["plugin"]);
+
+        Assert.Same(pluginCredential, result);
+        Assert.Equal(["plugin"], callLog);
+    }
+
+    [Fact]
     public async Task SegmentedConstructor_ExpiringCredentialCachedThenRefetchedAfterExpiry()
     {
         var callLog = new List<string>();
