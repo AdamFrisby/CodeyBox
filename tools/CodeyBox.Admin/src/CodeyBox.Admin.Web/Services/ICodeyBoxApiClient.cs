@@ -45,6 +45,7 @@ public interface ICodeyBoxApiClient
     // ── Timings ───────────────────────────────────────────────────────────────
     Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default);
     Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default);
+    Task<AgentStreamAggregateDto?> GetWorkItemAgentStreamAggregateAsync(string id, CancellationToken ct = default);
 
     // ── Costs ─────────────────────────────────────────────────────────────────
     Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default);

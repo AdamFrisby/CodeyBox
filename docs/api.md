@@ -313,6 +313,72 @@ GET /workitems/abc12345-0000-0000-0000-000000000000/agent-streams/work-1-a1b2c3.
 
 Returns `404 Not Found` when the work item or file does not exist.
 
+#### `GET /workitems/{id}/agent-streams/{fileName}/analysis`
+
+Parses one captured stream on demand and returns a per-invocation summary. This
+does not write to the summary cache.
+
+```json
+{
+  "fileName": "work-1-a1b2c3.jsonl",
+  "phase": "work",
+  "iteration": 1,
+  "agentKind": "claude",
+  "totalDurationMs": 720000,
+  "timeToFirstTokenMs": 1400,
+  "inputTokens": 50000,
+  "outputTokens": 3000,
+  "cachedInputTokens": 12000,
+  "estimatedUsd": 1.23,
+  "toolCalls": [
+    {
+      "toolUseId": "toolu_01",
+      "toolName": "Bash",
+      "inputSummary": "{\"command\":\"dotnet test\"}",
+      "durationMs": 480000,
+      "succeeded": true,
+      "outputBytes": 12000
+    }
+  ],
+  "stalls": [
+    {
+      "gapDurationMs": 45000,
+      "previousEventType": "tool_use",
+      "nextEventType": "tool_result",
+      "classification": "tool_execution"
+    }
+  ],
+  "finalAssistantMessage": "Done"
+}
+```
+
+#### `GET /workitems/{id}/agent-streams/aggregate`
+
+Returns cached aggregate agent-stream analytics for one work item. Missing
+streams return zeros and an empty `invocations` array.
+
+```json
+{
+  "workItemId": "abc12345-0000-0000-0000-000000000000",
+  "totalAgentDurationMs": 1834000,
+  "totalToolCalls": 47,
+  "byTool": [
+    { "tool": "Bash", "count": 23, "totalDurationMs": 542000, "medianMs": 14000 }
+  ],
+  "thinkingMs": 612000,
+  "executingMs": 549120,
+  "stallCount": 4,
+  "longestStallMs": 184000,
+  "estimatedUsdTotal": 4.27,
+  "invocations": []
+}
+```
+
+#### `GET /workitems/agent-streams/aggregate?n=50`
+
+Returns the same aggregate shape across the last `n` terminal work items with
+precomputed summaries. `n` is clamped to 1-500.
+
 ### `GET /workitems/{id}/costs`
 
 Returns token usage and estimated cost data for a single work item, aggregated
