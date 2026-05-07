@@ -187,6 +187,56 @@ public sealed class DeepAuditConvergenceTests : IDisposable
     }
 
     [Fact]
+    public async Task DeepAuditNetworkCapability_BlocksToolOnlyNetworkOnBubblewrap()
+    {
+        var auditor = new ScriptedDeepAuditor(
+            AuditorName,
+            AuditCapabilities.Network,
+            new AuditResult(true, []));
+        var project = ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1) with
+        {
+            NetworkProfiles = new ProjectNetworkProfiles { AuditTool = "audit-tools" },
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var autoCompleteQueue = new AutoCompleteTaskQueue(_workItemStore);
+        var sandboxes = new CapturingSandboxProvider("bubblewrap");
+        var svc = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: autoCompleteQueue,
+            sandboxes: sandboxes,
+            gitHost: new DeepAuditTestGitHost(),
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "none",
+                AgentAllowedHosts = ["api.anthropic.com"],
+                AuditToolAllowedHosts = ["registry.npmjs.org"],
+            });
+
+        var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(rel);
+        var item = MakeWorkItem(rel.Id, WorkItemState.Done);
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        var final = await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+
+        Assert.Equal(ReleaseState.Failed, final);
+        Assert.Empty(sandboxes.Specs);
+        var iteration = Assert.Single(await _releaseStore.ListAuditIterationsAsync(rel.Id));
+        var finding = Assert.Single(iteration.Findings);
+        Assert.Equal(AuditorName, finding.AuditorName);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("cannot enforce AuditToolAllowedHosts", finding.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task DeepAuditContextLanguagesAreNullWhenProjectAuditLanguagesAreOmitted()
     {
         var auditor = new ScriptedDeepAuditor(
@@ -338,8 +388,15 @@ public sealed class DeepAuditConvergenceTests : IDisposable
 
     private sealed class CapturingSandboxProvider : ISandboxProvider
     {
+        private readonly string _name;
+
+        public CapturingSandboxProvider(string name = "capturing")
+        {
+            _name = name;
+        }
+
         public List<SandboxSpec> Specs { get; } = [];
-        public string Name => "capturing";
+        public string Name => _name;
 
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {

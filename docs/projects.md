@@ -167,8 +167,9 @@ Allowed built-in language values are `csharp`, `python`, `node`, `go`, and
 `rust`. Unknown strings are logged at startup and skipped. If `Languages` is
 omitted and no default is configured, CodeyBox uses an empty language list and
 runs no language-specific PR auditors; language-agnostic audit types and
-custom auditors still work. Release dependency CVE scans follow the same
-effective language list.
+custom auditors still work. Release dependency CVE scans preserve the legacy
+default: omitted `Languages` runs the C# scanner, while an explicit empty list
+(`[]`) runs no language-specific dependency scanners.
 
 Each language preset recursively checks for that language's marker files before running:
 `*.csproj`/`*.sln`/`*.slnx` for C#, `pyproject.toml`/`setup.py`/`setup.cfg`/
@@ -711,6 +712,8 @@ phase. Built-in values: `owasp-asvs`, `arch-coherence`, `deps-cve-scan`.
 uses `npm audit --json` pinned to `https://registry.npmjs.org/` with
 repository npm proxy settings blocked, Go uses `govulncheck -json ./...`, and
 Rust uses `cargo audit`.
+For backward compatibility, omitted `Audit.Languages` runs the C# dependency
+scanner; an explicit empty list runs none.
 Empty list = skip deep audit (transition directly to `released`).
 
 **`deepAuditMaxIterations`** — maximum number of deep audit iterations before

@@ -487,6 +487,17 @@ public sealed class ReleaseService
             AgentCredential? credential = null;
             IAgentRunner? runner = null;
 
+            if (needsNetwork && !needsCreds && ToolAuditNetworkAllowlistUnsupported(_sandboxes.Name))
+            {
+                foreach (var auditor in group)
+                    allFindings.Add(new AuditFinding(
+                        AuditorName: auditor.Name,
+                        Severity: AuditSeverity.Error,
+                        Title: "Network-capable tool auditor requires an enforcing sandbox provider",
+                        Description: $"The {auditor.Name} deep auditor requests package-registry network access without agent credentials, but the configured sandbox provider '{_sandboxes.Name}' cannot enforce AuditToolAllowedHosts. Use the multipass provider with the audit-tool network profile, or disable this deep auditor for this deployment."));
+                continue;
+            }
+
             if (needsCreds)
             {
                 var agentKind = project.Audit.AuditAgent ?? project.DefaultAgent;
@@ -552,6 +563,9 @@ public sealed class ReleaseService
 
         return allFindings;
     }
+
+    private static bool ToolAuditNetworkAllowlistUnsupported(string providerName) =>
+        providerName.Equals("bubblewrap", StringComparison.OrdinalIgnoreCase);
 
     // ── Releasing ─────────────────────────────────────────────────────────────
 

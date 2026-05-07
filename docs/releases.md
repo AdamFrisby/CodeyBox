@@ -80,8 +80,15 @@ LLM auditors require agent credentials. The shell auditor (`deps-cve-scan`)
 requires the matching language scanner to be installed in the sandbox image;
 if a declared language's scanner is absent it emits an Info finding and passes
 rather than failing. Languages without marker files in the repository are
-skipped. If `Project.Audit.Languages` is omitted or explicitly empty,
-`deps-cve-scan` runs no language-specific scanners.
+skipped. For backward compatibility, if `Project.Audit.Languages` is omitted,
+`deps-cve-scan` uses the legacy C# default. Set `Project.Audit.Languages` to
+an explicit empty list (`[]`) to run no language-specific dependency scanners.
+
+Tool-only network deep auditors such as `deps-cve-scan` require a sandbox
+provider that can enforce `AuditToolAllowedHosts`. Multipass supports this via
+the audit-tool network profile. Bubblewrap cannot enforce per-host allowlists,
+so CodeyBox blocks these auditors on bubblewrap instead of granting unrestricted
+host network access.
 
 Custom auditors can be registered via the plugin system (see `plugins.md`).
 
