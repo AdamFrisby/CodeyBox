@@ -43,7 +43,9 @@ public sealed class LanguageDetectionTests
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Info, finding.Severity);
         Assert.Contains("tool not installed", finding.Title);
-        Assert.Contains(sandbox.Commands, c => c == "pytest");
+        Assert.Contains(sandbox.Commands, c =>
+            c.Contains("command -v", StringComparison.Ordinal) &&
+            c.Contains("pytest", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -123,6 +125,20 @@ public sealed class LanguageDetectionTests
             i.WorkingDirectory.EndsWith($"{Path.DirectorySeparatorChar}node", StringComparison.Ordinal));
         Assert.DoesNotContain(sandbox.Invocations, i =>
             i.WorkingDirectory.Contains($"{Path.DirectorySeparatorChar}node_modules{Path.DirectorySeparatorChar}", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task HiddenMarkerDirectory_PreservesLeadingDotInWorkingDirectory()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("node", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "node:lint");
+        var sandbox = new HiddenMarkerDirectorySandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.True(result.Passed);
+        Assert.Equal("/repo/.devcontainer", sandbox.ToolWorkingDirectory);
     }
 
     [Fact]
@@ -317,7 +333,12 @@ public sealed class LanguageDetectionTests
             var command = string.Join(' ', exec.Argv);
             Commands.Add(command);
             if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(1, "", ""));
+
                 return Task.FromResult(new SandboxExecResult(0, "./python\n", ""));
+            }
 
             return Task.FromResult(new SandboxExecResult(127, "", "pytest: not found"));
         }
@@ -332,12 +353,39 @@ public sealed class LanguageDetectionTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(0, "/usr/bin/npm\n", ""));
+
                 return Task.FromResult(new SandboxExecResult(0, "./node\n", ""));
+            }
 
             return Task.FromResult(new SandboxExecResult(
                 127,
                 "",
                 "sh: 1: definitely-not-a-real-test-command: not found"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class HiddenMarkerDirectorySandbox : ISandbox
+    {
+        public string Id => "hidden-marker-directory";
+        public string? ToolWorkingDirectory { get; private set; }
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(0, "/usr/bin/eslint\n", ""));
+
+                return Task.FromResult(new SandboxExecResult(0, "./.devcontainer\n", ""));
+            }
+
+            ToolWorkingDirectory = exec.WorkingDirectory;
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
@@ -376,7 +424,12 @@ public sealed class LanguageDetectionTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(1, "", ""));
+
                 return Task.FromResult(new SandboxExecResult(0, "./node\n", ""));
+            }
 
             return Task.FromResult(new SandboxExecResult(127, "", "npm: not found"));
         }
@@ -432,7 +485,12 @@ public sealed class LanguageDetectionTests
             Invocations.Add((command, workingDirectory));
 
             if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+                    return new SandboxExecResult(0, "/usr/bin/" + exec.Argv[^1] + "\n", "");
+
                 return await RunShellAsync(exec.Argv[2], workingDirectory, ct);
+            }
 
             return new SandboxExecResult(0, "", "");
         }

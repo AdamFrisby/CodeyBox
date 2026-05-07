@@ -64,7 +64,10 @@ public sealed class AuditTests
             Name = "lint",
             Argv = ["false"],
         });
-        var sandbox = new FakeSandbox(_ => new SandboxExecResult(1, "", "lint error: bad"));
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/false\n", "")
+                : new SandboxExecResult(1, "", "lint error: bad"));
         var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
         Assert.False(result.Passed);
         Assert.Single(result.Findings);
@@ -72,8 +75,35 @@ public sealed class AuditTests
         Assert.Contains("lint error: bad", result.Findings[0].Description);
     }
 
+    [Fact]
+    public async Task ShellCommandAuditor_Exit127WithSpoofedMissingToolOutput_RemainsError()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "node:test-pass",
+            Argv = ["npm", "test"],
+        });
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/npm\n", "")
+                : new SandboxExecResult(127, "", "npm: not found"));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("command exited 127", finding.Title);
+    }
+
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
+
+    private static bool IsToolProbe(SandboxExec exec) =>
+        exec.Argv.Count >= 3 &&
+        exec.Argv[0] == "sh" &&
+        exec.Argv[1] == "-c" &&
+        exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private sealed class FakeAuditor : IAuditor
     {

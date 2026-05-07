@@ -186,8 +186,10 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
     }
 
-    [Fact]
-    public async Task DeepAuditNetworkCapability_BlocksToolOnlyNetworkOnBubblewrap()
+    [Theory]
+    [InlineData("bubblewrap")]
+    [InlineData("process")]
+    public async Task DeepAuditNetworkCapability_BlocksToolOnlyNetworkWhenProviderCannotEnforceAuditToolAllowlist(string providerName)
     {
         var auditor = new ScriptedDeepAuditor(
             AuditorName,
@@ -199,7 +201,7 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         };
         var projects = new InMemoryProjectRepository(project);
         var autoCompleteQueue = new AutoCompleteTaskQueue(_workItemStore);
-        var sandboxes = new CapturingSandboxProvider("bubblewrap");
+        var sandboxes = new CapturingSandboxProvider(providerName);
         var svc = ReleaseTestHelper.BuildService(
             _releaseStore,
             _workItemStore,

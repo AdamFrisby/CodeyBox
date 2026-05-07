@@ -146,6 +146,12 @@ internal sealed class LanguagePresetAuditor : IAuditor
         if (projectDirectory == ".")
             return workingDirectory;
 
-        return workingDirectory.TrimEnd('/') + "/" + projectDirectory.TrimStart('.', '/');
+        var relativeProjectDirectory = projectDirectory.StartsWith("./", StringComparison.Ordinal)
+            ? projectDirectory[2..]
+            : projectDirectory.TrimStart('/');
+        if (relativeProjectDirectory.Length == 0 || relativeProjectDirectory == ".")
+            return workingDirectory;
+
+        return workingDirectory.TrimEnd('/') + "/" + relativeProjectDirectory;
     }
 }

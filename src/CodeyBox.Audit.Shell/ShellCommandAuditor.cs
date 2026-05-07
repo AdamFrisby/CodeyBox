@@ -5,8 +5,10 @@ namespace CodeyBox.Audit.Shell;
 /// <summary>
 /// Audits the working tree by running an arbitrary command inside the
 /// sandbox. Exit code 0 → pass; non-zero → fail with stdout/stderr captured
-/// as a single Error finding. Use for linters, formatters, type-checkers,
-/// SAST tools — anything with a shell-style "exit 0 = good" contract.
+/// as a single Error finding. If the top-level tool is confirmed missing
+/// before the command runs, the auditor emits a non-blocking Info finding
+/// instead. Use for linters, formatters, type-checkers, SAST tools — anything
+/// with a shell-style "exit 0 = good" contract.
 ///
 /// Does NOT need agent credentials, so it runs in the credential-free audit
 /// sandbox. Operators concerned about a malicious build script reaching
@@ -28,6 +30,10 @@ public sealed class ShellCommandAuditor : IAuditor
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
+        var toolName = _opts.ToolName ?? _opts.Argv[0];
+        if (await IsDirectToolMissingAsync(sandbox, workingDirectory, toolName, ct))
+            return MissingToolResult(toolName, string.Empty);
+
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = _opts.Argv,
@@ -44,14 +50,13 @@ public sealed class ShellCommandAuditor : IAuditor
         var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
 
         // Exit 127 is only non-blocking when it is confirmed to be the
-        // auditor's tool missing from the sandbox. Some tools, notably
-        // npm, propagate exit 127 from repository-controlled scripts; those
-        // remain blocking command failures.
-        var missingTool = IsConfirmedMissingTopLevelTool(result, combinedOutput);
+        // auditor's tool missing from the sandbox. Some tools, notably npm,
+        // propagate exit 127 from repository-controlled scripts; those remain
+        // blocking command failures.
+        var missingTool = IsConfirmedMissingTopLevelTool(result);
         var severity = missingTool
             ? AuditSeverity.Info
             : AuditSeverity.Error;
-        var toolName = _opts.ToolName ?? _opts.Argv[0];
         var title = missingTool
             ? $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)"
             : $"command exited {result.ExitCode}: {string.Join(' ', _opts.Argv)}";
@@ -64,23 +69,37 @@ public sealed class ShellCommandAuditor : IAuditor
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
 
-    private bool IsConfirmedMissingTopLevelTool(SandboxExecResult result, string combinedOutput)
+    private async Task<bool> IsDirectToolMissingAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string toolName,
+        CancellationToken ct)
     {
-        if (result.ExitCode != 127)
+        if (_opts.TreatExit127AsMissingTool is not null || string.IsNullOrWhiteSpace(toolName))
             return false;
 
-        if (_opts.TreatExit127AsMissingTool is not null)
-            return _opts.TreatExit127AsMissingTool.Value;
+        var probe = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", toolName],
+            WorkingDirectory = workingDirectory,
+        }, ct);
 
-        var toolName = _opts.ToolName ?? _opts.Argv[0];
-        if (string.IsNullOrWhiteSpace(toolName))
-            return false;
+        return probe.ExitCode != 0;
+    }
 
-        var output = combinedOutput.Trim();
-        return output.Contains($"{toolName}: not found", StringComparison.OrdinalIgnoreCase) ||
-               output.Contains($"{toolName}: command not found", StringComparison.OrdinalIgnoreCase) ||
-               output.Contains($"exec: \"{toolName}\"", StringComparison.OrdinalIgnoreCase) ||
-               output.Contains($"executable file not found", StringComparison.OrdinalIgnoreCase) && output.Contains(toolName, StringComparison.OrdinalIgnoreCase);
+    private bool IsConfirmedMissingTopLevelTool(SandboxExecResult result)
+    {
+        return result.ExitCode == 127 && _opts.TreatExit127AsMissingTool == true;
+    }
+
+    private AuditResult MissingToolResult(string toolName, string rawOutput)
+    {
+        var finding = new AuditFinding(
+            AuditorName: Name,
+            Severity: AuditSeverity.Info,
+            Title: $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)",
+            Description: $"The auditor command was not run because '{toolName}' is not available in the audit sandbox.");
+        return new AuditResult(false, [finding], RawOutput: rawOutput);
     }
 }
 

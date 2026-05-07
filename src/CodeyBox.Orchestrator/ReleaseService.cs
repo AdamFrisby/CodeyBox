@@ -565,7 +565,8 @@ public sealed class ReleaseService
     }
 
     private static bool ToolAuditNetworkAllowlistUnsupported(string providerName) =>
-        providerName.Equals("bubblewrap", StringComparison.OrdinalIgnoreCase);
+        providerName.Equals("bubblewrap", StringComparison.OrdinalIgnoreCase) ||
+        providerName.Equals("process", StringComparison.OrdinalIgnoreCase);
 
     // ── Releasing ─────────────────────────────────────────────────────────────
 

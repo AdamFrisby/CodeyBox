@@ -188,8 +188,8 @@ Replay the audit-log events for a work item as a structured timeline.
     {
       "occurredAt": "2026-05-01T10:03:15+00:00",
       "kind": "auditor_run",
-      "summary": "csharp:format-check (iter 1) — 0 findings",
-      "details": { "name": "csharp:format-check", "iteration": 1, "severity": "None", "durationMs": 4200 }
+      "summary": "python:test-pass (iter 1) — 0 findings",
+      "details": { "name": "python:test-pass", "iteration": 1, "severity": "None", "durationMs": 4200 }
     },
     {
       "occurredAt": "2026-05-01T10:03:16+00:00",
