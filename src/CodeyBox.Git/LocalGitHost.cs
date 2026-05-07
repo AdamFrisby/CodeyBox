@@ -252,18 +252,14 @@ public sealed class LocalGitHost : IGitHost
         if (!string.IsNullOrWhiteSpace(baseBranch))
             return baseBranch;
 
-        try
-        {
-            var head = File.ReadAllText(Path.Combine(bareRepoPath, "HEAD")).Trim();
-            const string HeadPrefix = "ref: refs/heads/";
-            if (head.StartsWith(HeadPrefix, StringComparison.Ordinal))
-                return head[HeadPrefix.Length..];
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _log.LogDebug(ex, "Could not resolve HEAD branch for bare repo {Path}; using fallback branch", bareRepoPath);
-        }
-
+        // HEAD lives inside the sandbox-writable bare repo, so do not use it
+        // to choose what host-side refresh should fetch. Callers that know the
+        // project base branch pass it explicitly; older callers get the host
+        // fallback rather than trusting repo metadata controlled by an agent.
+        _log.LogDebug(
+            "No configured base branch supplied for bare repo {Path}; refreshing fallback branch {Branch}",
+            bareRepoPath,
+            _opts.FallbackDefaultBranch);
         return _opts.FallbackDefaultBranch;
     }
 
