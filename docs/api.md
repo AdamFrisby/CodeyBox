@@ -358,9 +358,8 @@ creation and last-write times as a fallback clock when those values are
 available. `startedAt`, `endedAt`, and `durationMs` are `null` only when neither
 event timestamps nor capture-store timing are available.
 
-The analysis response omits final assistant text. Raw stream download remains
-available to authorized operators, but the structured analytics surface only
-returns numeric and redacted structural data.
+The analysis response includes `finalAssistantMessage` when the parser can
+derive it from the stream.
 
 #### `GET /workitems/{id}/agent-streams/aggregate`
 
@@ -381,6 +380,17 @@ an empty `invocations` array.
   "stallCount": 4,
   "longestStallMs": 184000,
   "estimatedUsdTotal": 4.27,
+  "slowestToolCalls": [
+    {
+      "workItemId": "abc12345-0000-0000-0000-000000000000",
+      "phase": "audit",
+      "iteration": 9,
+      "toolName": "Bash",
+      "durationMs": 184000,
+      "succeeded": true,
+      "outputBytes": 12000
+    }
+  ],
   "invocations": []
 }
 ```
@@ -389,8 +399,8 @@ an empty `invocations` array.
 
 Returns the same aggregate counters across the last `n` terminal work items
 with precomputed summaries. `n` is clamped to 1-500. Fleet aggregates keep
-`invocations` empty so per-call inputs are not exposed through the fleet-level
-analytics surface.
+`invocations` empty but include `slowestToolCalls` for the operator dashboard
+leaderboard.
 
 ### `GET /workitems/{id}/costs`
 

@@ -95,10 +95,49 @@ else
             }
         </tbody>
     </table>
+
+    @if (_agentActivity?.SlowestToolCalls.Count > 0)
+    {
+        <section class="fleet-tool-leaderboard">
+            <h2>Slowest tool calls</h2>
+            <table class="detail-table fleet-tool-leaderboard-table">
+                <thead>
+                    <tr>
+                        <th>Work item</th>
+                        <th>Invocation</th>
+                        <th>Tool</th>
+                        <th>Duration</th>
+                        <th>Status</th>
+                        <th>Input</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var tool in _agentActivity.SlowestToolCalls)
+                    {
+                        <tr>
+                            <td><a href="/work-items/@tool.WorkItemId/timings">@ShortId(tool.WorkItemId)</a></td>
+                            <td>
+                                <code>@(tool.Phase ?? "unknown")</code>
+                                @if (tool.Iteration.HasValue)
+                                {
+                                    <span>iter @tool.Iteration</span>
+                                }
+                            </td>
+                            <td><code>@tool.ToolName</code></td>
+                            <td>@(tool.DurationMs.HasValue ? FormatDuration(tool.DurationMs.Value) : "unfinished")</td>
+                            <td>@FormatToolStatus(tool.Succeeded)</td>
+                            <td><code>@tool.InputSummary</code></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </section>
+    }
 }
 
 @code {
     private List<FleetSummaryDto>? _summaries;
+    private AgentStreamAggregateDto? _agentActivity;
     private string? _error;
     private CancellationTokenSource? _cts;
 
@@ -127,7 +166,9 @@ else
     {
         try
         {
-            _summaries = await ApiClient.GetFleetSummaryAsync(_cts?.Token ?? default);
+            var ct = _cts?.Token ?? default;
+            _summaries = await ApiClient.GetFleetSummaryAsync(ct);
+            _agentActivity = await ApiClient.GetFleetAgentStreamAggregateAsync(50, ct);
             _error = null;
         }
         catch (Exception ex)
@@ -190,4 +231,20 @@ else
         state is "Done" ? "✓" :
         state is "Failed" or "AuditFailed" ? "✗" :
         "!";
+
+    private static string FormatToolStatus(bool? succeeded) => succeeded switch
+    {
+        true => "ok",
+        false => "error",
+        null => "unknown",
+    };
+
+    private static string FormatDuration(long ms)
+    {
+        if (ms < 1000) return $"{ms}ms";
+        if (ms < 60_000) return $"{ms / 1000.0:F1}s";
+        var min = ms / 60_000;
+        var sec = (ms % 60_000) / 1000;
+        return $"{min}m {sec}s";
+    }
 }

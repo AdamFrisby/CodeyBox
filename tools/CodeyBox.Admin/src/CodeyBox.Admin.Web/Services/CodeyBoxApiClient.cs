@@ -332,6 +332,14 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<AgentStreamAggregateDto>(JsonOptions, ct);
     }
 
+    public async Task<AgentStreamAggregateDto?> GetFleetAgentStreamAggregateAsync(int? n = null, CancellationToken ct = default)
+    {
+        var url = n.HasValue ? $"/workitems/agent-streams/aggregate?n={n}" : "/workitems/agent-streams/aggregate";
+        var resp = await _http.GetAsync(url, ct);
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<AgentStreamAggregateDto>(JsonOptions, ct);
+    }
+
     public async Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default)
     {
         var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/costs", ct);

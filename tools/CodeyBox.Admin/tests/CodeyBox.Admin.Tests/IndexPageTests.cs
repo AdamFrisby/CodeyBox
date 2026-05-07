@@ -461,9 +461,13 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         => Task.FromResult(AggregateTimingsOverride);
 
     public Dictionary<string, AgentStreamAggregateDto> AgentStreamAggregateOverride { get; } = [];
+    public AgentStreamAggregateDto? FleetAgentStreamAggregateOverride { get; set; }
 
     public Task<AgentStreamAggregateDto?> GetWorkItemAgentStreamAggregateAsync(string id, CancellationToken ct = default)
         => Task.FromResult(AgentStreamAggregateOverride.TryGetValue(id, out var a) ? (AgentStreamAggregateDto?)a : null);
+
+    public Task<AgentStreamAggregateDto?> GetFleetAgentStreamAggregateAsync(int? n = null, CancellationToken ct = default)
+        => Task.FromResult(FleetAgentStreamAggregateOverride);
 
     public Dictionary<string, WorkItemCostsDto> CostsOverride { get; } = [];
 

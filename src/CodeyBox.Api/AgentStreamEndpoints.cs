@@ -5,6 +5,9 @@ namespace CodeyBox.Api;
 
 internal static class AgentStreamEndpoints
 {
+    private static readonly SemaphoreSlim OnDemandAnalysisGate = new(2, 2);
+    private static readonly TimeSpan OnDemandAnalysisTimeout = TimeSpan.FromSeconds(30);
+
     public static void Map(WebApplication app)
     {
         var group = app.MapGroup("/workitems");
@@ -71,20 +74,37 @@ internal static class AgentStreamEndpoints
         var file = files.FirstOrDefault(f => string.Equals(f.FileName, fileName, StringComparison.Ordinal));
         if (file is null) return Results.NotFound();
 
-        await using var sniffStream = await streams.OpenReadAsync(item.Id, fileName, ct);
-        if (sniffStream is null) return Results.NotFound();
-        var sniffedKind = await AgentStreamParserSelection.SniffKindAsync(sniffStream, ct);
-        var costRows = await costs.GetByWorkItemAsync(item.Id.ToString(), ct);
-        var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows);
-        var parser = parsers.FirstOrDefault(p => p.Kind == kind)
-            ?? parsers.FirstOrDefault(p => p.Kind.Value == "unknown")
-            ?? new UnknownAgentStreamParser();
+        if (!(await OnDemandAnalysisGate.WaitAsync(TimeSpan.Zero, ct).ConfigureAwait(false)))
+            return Results.StatusCode(StatusCodes.Status429TooManyRequests);
 
-        await using var stream = await streams.OpenReadAsync(item.Id, fileName, ct);
-        if (stream is null) return Results.NotFound();
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(OnDemandAnalysisTimeout);
+        var analysisCt = timeoutCts.Token;
+        try
+        {
+            await using var sniffStream = await streams.OpenReadAsync(item.Id, fileName, analysisCt);
+            if (sniffStream is null) return Results.NotFound();
+            var sniffedKind = await AgentStreamParserSelection.SniffKindAsync(sniffStream, analysisCt);
+            var costRows = await costs.GetByWorkItemAsync(item.Id.ToString(), analysisCt);
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows);
+            var parser = parsers.FirstOrDefault(p => p.Kind == kind)
+                ?? parsers.FirstOrDefault(p => p.Kind.Value == "unknown")
+                ?? new UnknownAgentStreamParser();
 
-        var summary = await parser.ParseAsync(stream, ct);
-        return Results.Ok(ToSummaryDto(summary, fileName, file.Phase, file.Iteration, parser.Kind));
+            await using var stream = await streams.OpenReadAsync(item.Id, fileName, analysisCt);
+            if (stream is null) return Results.NotFound();
+
+            var summary = await parser.ParseAsync(stream, analysisCt);
+            return Results.Ok(ToSummaryDto(summary, fileName, file.Phase, file.Iteration, parser.Kind));
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return Results.StatusCode(StatusCodes.Status504GatewayTimeout);
+        }
+        finally
+        {
+            OnDemandAnalysisGate.Release();
+        }
     }
 
     private static async Task<IResult> GetAggregateAsync(
@@ -158,6 +178,25 @@ internal static class AgentStreamEndpoints
             stallCount = aggregate.StallCount,
             longestStallMs = aggregate.LongestStallMs,
             estimatedUsdTotal = aggregate.EstimatedUsdTotal,
+            slowestToolCalls = rows
+                .SelectMany(r => r.Summary.ToolCalls.Select(t => new
+                {
+                    workItemId = r.WorkItemId.ToString(),
+                    fileName = r.FileName,
+                    phase = r.Phase,
+                    iteration = r.Iteration,
+                    toolUseId = t.ToolUseId,
+                    toolName = t.ToolName,
+                    inputSummary = t.InputSummary,
+                    startedAt = t.StartedAt,
+                    endedAt = t.EndedAt,
+                    durationMs = t.Duration.HasValue ? ToMs(t.Duration.Value) : (long?)null,
+                    succeeded = t.Succeeded,
+                    outputBytes = t.OutputBytes,
+                }))
+                .Where(t => t.durationMs.HasValue)
+                .OrderByDescending(t => t.durationMs!.Value)
+                .Take(20),
             invocations = includeInvocations
             ? rows.Select(r => ToSummaryDto(r.Summary, r.FileName, r.Phase, r.Iteration, r.AgentKind))
             : Enumerable.Empty<object>(),
@@ -180,6 +219,7 @@ internal static class AgentStreamEndpoints
             outputTokens = summary.OutputTokens,
             cachedInputTokens = summary.CachedInputTokens,
             estimatedUsd = summary.EstimatedUsd,
+            finalAssistantMessage = summary.FinalAssistantMessage,
             toolCalls = summary.ToolCalls.Select(t => new
             {
                 toolUseId = t.ToolUseId,

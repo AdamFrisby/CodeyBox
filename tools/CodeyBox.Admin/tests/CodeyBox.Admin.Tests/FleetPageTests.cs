@@ -197,4 +197,35 @@ public sealed class FleetPageTests : TestContext
 
         Assert.Contains("budget-alerts work item", cut.Markup);
     }
+
+    [Fact]
+    public void Fleet_RendersSlowestToolCallLeaderboard()
+    {
+        var fake = new FakeApiClient([]);
+        fake.FleetSummaryOverride = [MakeSummary()];
+        fake.FleetAgentStreamAggregateOverride = new AgentStreamAggregateDto
+        {
+            SlowestToolCalls =
+            [
+                new AgentStreamSlowToolCallDto
+                {
+                    WorkItemId = "12345678-0000-0000-0000-000000000000",
+                    Phase = "audit",
+                    Iteration = 9,
+                    ToolName = "Bash",
+                    DurationMs = 184_000,
+                    Succeeded = true,
+                    InputSummary = "{\"command\":\"dotnet test\"}",
+                },
+            ],
+        };
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<FleetPage>();
+
+        Assert.Contains("fleet-tool-leaderboard-table", cut.Markup);
+        Assert.Contains("Bash", cut.Markup);
+        Assert.Contains("3m 4s", cut.Markup);
+        Assert.Contains("dotnet test", cut.Markup);
+    }
 }

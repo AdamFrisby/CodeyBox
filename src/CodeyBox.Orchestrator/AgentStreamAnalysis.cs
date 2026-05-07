@@ -503,6 +503,8 @@ public static class AgentStreamAnalytics
 
 public abstract class FlexibleAgentStreamParser : IAgentStreamParser
 {
+    private const int InputSummaryChars = 200;
+    private const int InputSummaryUtf8Bytes = 4096;
     private readonly AgentStreamParserOptions _options;
 
     protected FlexibleAgentStreamParser(AgentKind kind, AgentStreamParserOptions? options)
@@ -517,6 +519,8 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
     {
         var toolStarts = new Dictionary<string, ToolBuilder>(StringComparer.Ordinal);
         var completedTools = new List<ToolCallInvocation>();
+        var fallbackClock = FallbackClock.TryCreate(jsonlFile);
+        var usedFallbackClock = false;
         DateTimeOffset? firstTimestamp = null;
         DateTimeOffset? lastTimestamp = null;
         DateTimeOffset? firstAssistantTimestamp = null;
@@ -551,6 +555,13 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             }
 
             var timestamp = parsed.Timestamp;
+            if (timestamp is null && fallbackClock is not null)
+            {
+                timestamp = fallbackClock.Project(jsonLine.StartOffset);
+                usedFallbackClock = true;
+                parsed = parsed with { Timestamp = timestamp };
+            }
+
             if (timestamp is { } eventTimestamp)
             {
                 firstTimestamp ??= eventTimestamp;
@@ -618,9 +629,11 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 0));
         }
 
-        var total = firstTimestamp.HasValue && lastTimestamp.HasValue
-            ? lastTimestamp.Value - firstTimestamp.Value
-            : TimeSpan.Zero;
+        var total = usedFallbackClock && fallbackClock is not null
+            ? fallbackClock.Duration
+            : firstTimestamp.HasValue && lastTimestamp.HasValue
+                ? lastTimestamp.Value - firstTimestamp.Value
+                : TimeSpan.Zero;
         var ttft = firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
             ? firstAssistantTimestamp.Value - firstTimestamp.Value
             : (TimeSpan?)null;
@@ -799,7 +812,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         if (!TryGet(el, out input, "input", "arguments", "args"))
             input = el;
         var text = RedactInputSummary(input).ReplaceLineEndings(" ");
-        return text.Length <= 200 ? text : text[..200];
+        return text.Length <= InputSummaryChars ? text : text[..InputSummaryChars];
     }
 
     private static string RedactInputSummary(JsonElement input)
@@ -807,9 +820,17 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         if (input.ValueKind == JsonValueKind.String)
             return RedactStringInput(input.GetString() ?? "");
 
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
+        using var stream = new CappedMemoryStream(InputSummaryUtf8Bytes);
+        try
+        {
+            using var writer = new Utf8JsonWriter(stream);
             WriteRedactedJsonValue(writer, input, redactValue: false);
+            writer.Flush();
+        }
+        catch (InputSummaryTruncatedException)
+        {
+        }
+
         return Encoding.UTF8.GetString(stream.ToArray());
     }
 
@@ -965,4 +986,68 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
 
     protected sealed record ToolBuilder(string Id, string Name, string InputSummary, DateTimeOffset? StartedAt);
     protected sealed record ToolResultBuilder(string Id, bool? Succeeded, int OutputBytes);
+
+    private sealed record FallbackClock(DateTimeOffset StartedAt, DateTimeOffset EndedAt, long LengthBytes)
+    {
+        public TimeSpan Duration => EndedAt - StartedAt;
+
+        public DateTimeOffset Project(long byteOffset)
+        {
+            if (LengthBytes <= 0 || Duration <= TimeSpan.Zero)
+                return StartedAt;
+
+            var ratio = Math.Clamp(byteOffset / (double)LengthBytes, 0d, 1d);
+            var ticks = (long)Math.Round(Duration.Ticks * ratio);
+            return StartedAt.AddTicks(ticks);
+        }
+
+        public static FallbackClock? TryCreate(Stream stream)
+        {
+            if (stream is not AgentStreamStore.IAgentStreamTimingSource source)
+                return null;
+            if (source.CaptureEndedAt <= source.CaptureStartedAt || source.CaptureLengthBytes <= 0)
+                return null;
+            return new FallbackClock(source.CaptureStartedAt, source.CaptureEndedAt, source.CaptureLengthBytes);
+        }
+    }
+
+    private sealed class InputSummaryTruncatedException : Exception
+    {
+    }
+
+    private sealed class CappedMemoryStream : MemoryStream
+    {
+        private readonly int _maxBytes;
+
+        public CappedMemoryStream(int maxBytes)
+            : base(Math.Max(1, maxBytes))
+        {
+            _maxBytes = Math.Max(1, maxBytes);
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            var remaining = _maxBytes - (int)Length;
+            if (remaining <= 0)
+                throw new InputSummaryTruncatedException();
+
+            var allowed = Math.Min(count, remaining);
+            base.Write(buffer, offset, allowed);
+            if (allowed < count)
+                throw new InputSummaryTruncatedException();
+        }
+
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            var remaining = _maxBytes - (int)Length;
+            if (remaining <= 0)
+                throw new InputSummaryTruncatedException();
+
+            var allowed = Math.Min(buffer.Length, remaining);
+            var chunk = buffer[..allowed].ToArray();
+            base.Write(chunk, 0, chunk.Length);
+            if (allowed < buffer.Length)
+                throw new InputSummaryTruncatedException();
+        }
+    }
 }

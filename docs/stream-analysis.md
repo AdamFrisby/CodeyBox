@@ -11,10 +11,7 @@ Each invocation summary includes:
 - authoritative cost from the agent result event when present
 - tool calls with name, redacted input summary, start/end timestamps, duration, success flag, and output bytes
 - stall events
-
-Final assistant text is parsed only transiently for agent-specific bookkeeping.
-It is not retained in cached dashboard summaries and is omitted from analytics
-API DTOs.
+- final assistant text when the CLI stream exposes it during on-demand parsing
 
 Claude, Codex, and Gemini parsers are registered separately because their CLI stream shapes differ. Unsupported agents produce an empty `unknown` summary so the dashboard can remain graceful when stream JSON is not available.
 
@@ -66,3 +63,5 @@ Retrying a terminal work item invalidates cached stream summaries for that item.
 Cost in the agent `result` event is more authoritative than the pipeline cost extractor. On a summary pass, the SQLite cost store updates the newest matching `work_item_costs` row by work item, phase, iteration, and agent kind. If no row exists, it inserts a stream-sourced row with `raw_metadata_json.source = "agent_stream_analyser"`.
 
 Audit stream files use detailed phases such as `audit-llm-security:llm-review`; reconciliation also matches the canonical `audit` phase used by pipeline cost rows so stream result costs correct the existing row instead of adding a duplicate.
+
+Cached dashboard summaries keep final assistant text null so persisted rows stay numeric and structural; the on-demand analysis endpoint returns it from the live parse.

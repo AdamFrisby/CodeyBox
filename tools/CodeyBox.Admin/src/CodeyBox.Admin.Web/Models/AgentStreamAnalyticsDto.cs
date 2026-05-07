@@ -11,6 +11,7 @@ public sealed class AgentStreamAggregateDto
     public int StallCount { get; set; }
     public long LongestStallMs { get; set; }
     public decimal EstimatedUsdTotal { get; set; }
+    public List<AgentStreamSlowToolCallDto> SlowestToolCalls { get; set; } = [];
     public List<AgentStreamInvocationDto> Invocations { get; set; } = [];
 }
 
@@ -41,6 +42,22 @@ public sealed class AgentStreamInvocationDto
 
 public sealed class AgentStreamToolCallDto
 {
+    public string ToolUseId { get; set; } = "";
+    public string ToolName { get; set; } = "";
+    public string InputSummary { get; set; } = "";
+    public DateTimeOffset? StartedAt { get; set; }
+    public DateTimeOffset? EndedAt { get; set; }
+    public long? DurationMs { get; set; }
+    public bool? Succeeded { get; set; }
+    public int OutputBytes { get; set; }
+}
+
+public sealed class AgentStreamSlowToolCallDto
+{
+    public string WorkItemId { get; set; } = "";
+    public string FileName { get; set; } = "";
+    public string? Phase { get; set; }
+    public int? Iteration { get; set; }
     public string ToolUseId { get; set; } = "";
     public string ToolName { get; set; } = "";
     public string InputSummary { get; set; } = "";
