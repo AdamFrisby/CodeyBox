@@ -51,7 +51,7 @@ public sealed class StreamPersistenceTests : IDisposable
 
         var lines = await File.ReadAllLinesAsync(Path.Combine(_root, itemId.ToString(), file.FileName));
         Assert.Equal(["system", "assistant", "result"], lines.Select(ReadType).ToArray());
-        Assert.All(lines, AssertHasCreatedAt);
+        Assert.All(lines, AssertDoesNotHaveCreatedAt);
     }
 
     [Fact]
@@ -76,12 +76,10 @@ public sealed class StreamPersistenceTests : IDisposable
         return parsed.RootElement.GetProperty("type").GetString() ?? "";
     }
 
-    private static void AssertHasCreatedAt(string line)
+    private static void AssertDoesNotHaveCreatedAt(string line)
     {
         using var parsed = JsonDocument.Parse(line);
-        Assert.True(DateTimeOffset.TryParse(
-            parsed.RootElement.GetProperty("created_at").GetString(),
-            out _));
+        Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
     }
 }
 
@@ -129,7 +127,7 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         var workFile = Assert.Single(await streamStore.ListAsync(item.Id), f => f.Phase == "work");
         var lines = await File.ReadAllLinesAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), workFile.FileName));
         Assert.Equal(["system", "assistant", "result"], lines.Select(ReadType).ToArray());
-        Assert.All(lines, AssertHasCreatedAt);
+        Assert.All(lines, AssertDoesNotHaveCreatedAt);
         Assert.DoesNotContain(timingStore.CompletedRows, r => r.Step.StartsWith("agent.tool_call.", StringComparison.Ordinal));
         Assert.DoesNotContain(timingStore.CompletedRows, r => r.Step == "agent.thinking_aggregate");
     }
@@ -140,12 +138,10 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         return parsed.RootElement.GetProperty("type").GetString() ?? "";
     }
 
-    private static void AssertHasCreatedAt(string line)
+    private static void AssertDoesNotHaveCreatedAt(string line)
     {
         using var parsed = JsonDocument.Parse(line);
-        Assert.True(DateTimeOffset.TryParse(
-            parsed.RootElement.GetProperty("created_at").GetString(),
-            out _));
+        Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
     }
 
     [Fact]
@@ -395,7 +391,7 @@ public sealed class RedactionAppliedToStreamTests : IDisposable
         Assert.DoesNotContain("FAKE_REDACTION_TEST_BODY_LINE_TWO", contents);
         Assert.DoesNotContain("END OPENSSH PRIVATE KEY", contents);
         Assert.Contains("\"type\":\"result\"", contents);
-        Assert.Contains("\"created_at\":", contents);
+        Assert.DoesNotContain("\"created_at\":", contents);
     }
 
     [Fact]
@@ -519,7 +515,7 @@ public sealed class ReleaseDeepAuditAgentStreamPersistenceTests : IDisposable
         using var parsed = JsonDocument.Parse(line);
         Assert.Equal("result", parsed.RootElement.GetProperty("type").GetString());
         Assert.Equal("deep", parsed.RootElement.GetProperty("auditor").GetString());
-        Assert.True(DateTimeOffset.TryParse(parsed.RootElement.GetProperty("created_at").GetString(), out _));
+        Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
     }
 
     private static async Task<IReadOnlyList<AgentStreamFile>> PollForFilesAsync(
@@ -654,7 +650,7 @@ public sealed class MaxSizeTruncationTests : IDisposable
         using (var parsed = JsonDocument.Parse(lines[0]))
         {
             Assert.Equal("first", parsed.RootElement.GetProperty("type").GetString());
-            Assert.True(DateTimeOffset.TryParse(parsed.RootElement.GetProperty("created_at").GetString(), out _));
+            Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
         }
         Assert.Contains(lines, l => l.StartsWith("[...truncated by ", StringComparison.Ordinal));
     }
@@ -728,8 +724,8 @@ public sealed class StreamBackpressureTests : IDisposable
         {
             Assert.Equal(0, first.RootElement.GetProperty("i").GetInt32());
             Assert.Equal(255, last.RootElement.GetProperty("i").GetInt32());
-            Assert.True(DateTimeOffset.TryParse(first.RootElement.GetProperty("created_at").GetString(), out _));
-            Assert.True(DateTimeOffset.TryParse(last.RootElement.GetProperty("created_at").GetString(), out _));
+            Assert.False(first.RootElement.TryGetProperty("created_at", out _));
+            Assert.False(last.RootElement.TryGetProperty("created_at", out _));
         }
         Assert.DoesNotContain(lines, line => line.StartsWith("[...truncated by ", StringComparison.Ordinal));
     }
@@ -837,6 +833,6 @@ public sealed class AgentStreamEndpointTests : IDisposable
         var line = Assert.Single((await file.Content.ReadAsStringAsync()).Split('\n', StringSplitOptions.RemoveEmptyEntries));
         using var parsed = JsonDocument.Parse(line);
         Assert.Equal("result", parsed.RootElement.GetProperty("type").GetString());
-        Assert.True(DateTimeOffset.TryParse(parsed.RootElement.GetProperty("created_at").GetString(), out _));
+        Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
     }
 }

@@ -130,7 +130,7 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_ComputesInstalledCommandExecutionTimingFromCapturedTimestamps()
+    public async Task ParseAsync_LeavesTimingUnknownForUntimestampedCapturedCommandExecution()
     {
         var parser = new CodexStreamParser();
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-codex-stream-{Guid.NewGuid():N}");
@@ -159,18 +159,17 @@ public sealed class CodexStreamParserTests
             var tool = Assert.Single(summary.ToolCalls);
             Assert.Equal("item_0", tool.ToolUseId);
             Assert.Equal("Bash", tool.ToolName);
-            Assert.NotNull(tool.StartedAt);
-            Assert.NotNull(tool.EndedAt);
-            Assert.NotNull(tool.Duration);
-            Assert.True(tool.Duration >= TimeSpan.FromMilliseconds(10));
+            Assert.Null(tool.StartedAt);
+            Assert.Null(tool.EndedAt);
+            Assert.Null(tool.Duration);
             Assert.True(tool.Succeeded);
             Assert.Equal(6, tool.OutputBytes);
             Assert.Equal(29990, summary.InputTokens);
             Assert.Equal(44, summary.OutputTokens);
             Assert.Equal(18176, summary.CachedInputTokens);
             Assert.Equal("Done.", summary.FinalAssistantMessage);
-            Assert.True(summary.TotalDuration >= tool.Duration);
-            Assert.NotNull(summary.TimeToFirstToken);
+            Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+            Assert.Null(summary.TimeToFirstToken);
         }
         finally
         {
