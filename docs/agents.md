@@ -1,8 +1,10 @@
 # Agents
 
 CodeyBox treats coding agents as plug-in CLIs. The framework speaks to
-each agent through `IAgentRunner`. Registering a new agent is a small
-amount of code; nothing in the orchestrator changes.
+each agent through `IAgentRunner`. Agents are language-agnostic: they receive
+a prompt and a git working tree, then edit files in whatever stack the project
+uses. Language-specific behavior lives in auditors and operator-supplied
+tooling, not in the agent runner contract.
 
 ## Built-in agents
 

@@ -91,7 +91,7 @@ var selectedLanguages = AnsiConsole.Prompt(
         .NotRequired()
         .InstructionsText("[dim grey](Press [blue]<space>[/] to toggle, [green]<enter>[/] to accept)[/]")
         .HighlightStyle(new Style(Color.Cyan1))
-        .AddChoices("python", "typescript", "javascript", "go", "rust", "csharp", "ruby", "shell"));
+        .AddChoices("csharp", "python", "node", "go", "rust"));
 
 // ── Audit: AuditTypes ────────────────────────────────────────────────────────
 AnsiConsole.WriteLine();
@@ -141,7 +141,7 @@ foreach (var phase in pipelinePhases)
 // ── Assemble entry ────────────────────────────────────────────────────────────
 AuditEntry? auditEntry = null;
 {
-    IReadOnlyList<string>? langs = selectedLanguages.Count > 0 ? selectedLanguages : null;
+    IReadOnlyList<string>? langs = selectedLanguages;
     IReadOnlyList<string>? types = selectedAuditTypes.Count > 0 ? selectedAuditTypes : null;
     if (langs is not null || types is not null)
         auditEntry = new AuditEntry { Languages = langs, AuditTypes = types };

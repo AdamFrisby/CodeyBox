@@ -1,10 +1,12 @@
 # CodeyBox architecture
 
 CodeyBox is a C#/.NET orchestration framework that runs LLM coding agents
-(Claude Code, GitHub Copilot CLI, OpenAI Codex CLI, …) inside VM-isolated
-sandboxes and merges their output through a controlled git workflow. The
-parent orchestrator runs **no LLMs** — its only job is to schedule sandboxes
-and shepherd state.
+(Claude Code, GitHub Copilot CLI, OpenAI Codex CLI, ...) inside VM-isolated
+sandboxes and merges their output through a controlled git workflow. Managed
+projects are language-agnostic; Python, Node, Go, Rust, C#, and custom stacks
+all enter through the same project and auditor configuration. The parent
+orchestrator runs **no LLMs** - its only job is to schedule sandboxes and
+shepherd state.
 
 ## High-level flow
 

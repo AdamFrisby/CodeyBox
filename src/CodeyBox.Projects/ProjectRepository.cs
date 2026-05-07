@@ -1,5 +1,7 @@
 using Microsoft.Extensions.Options;
 using CodeyBox.Core;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Projects;
 
@@ -16,9 +18,14 @@ public sealed class ProjectRepository : IProjectRepository
 {
     private readonly Dictionary<string, Project> _byId;
     private readonly IReadOnlyList<Project> _list;
+    private readonly ILogger<ProjectRepository> _logger;
 
     public ProjectRepository(IOptions<ProjectsOptions> options)
+        : this(options, NullLogger<ProjectRepository>.Instance) { }
+
+    public ProjectRepository(IOptions<ProjectsOptions> options, ILogger<ProjectRepository> logger)
     {
+        _logger = logger;
         var opts = options.Value;
         var defaults = opts.Defaults ?? new ProjectDefaultsConfig();
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -40,7 +47,7 @@ public sealed class ProjectRepository : IProjectRepository
     public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
         => Task.FromResult(_list);
 
-    private static Project Resolve(ProjectConfig pc, ProjectDefaultsConfig defaults)
+    private Project Resolve(ProjectConfig pc, ProjectDefaultsConfig defaults)
     {
         if (string.IsNullOrWhiteSpace(pc.Id))
             throw new InvalidOperationException("Project entry missing 'Id'");
@@ -57,7 +64,7 @@ public sealed class ProjectRepository : IProjectRepository
             DefaultAgent = ParseAgent(pc.Agent ?? defaults.Agent),
             DefaultAgentClass = pc.DefaultAgentClass,
             Upstream = ResolveUpstream(pc.Upstream),
-            Audit = ResolveAudit(pc.Audit, defaults.Audit),
+            Audit = ResolveAudit(pc.Id, pc.Audit, defaults.Audit),
             NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),
             Budget = ResolveBudget(pc.Budget),
             ReleaseConfig = ResolveReleaseConfig(pc.Release),
@@ -103,7 +110,7 @@ public sealed class ProjectRepository : IProjectRepository
         };
     }
 
-    private static ProjectAudit ResolveAudit(ProjectAuditConfig? project, ProjectAuditConfig? defaults)
+    private ProjectAudit ResolveAudit(string? projectId, ProjectAuditConfig? project, ProjectAuditConfig? defaults)
     {
         // Shallow merge: project values win, defaults fill gaps. Lists are
         // taken whole from whichever side defines them — we don't try to
@@ -112,7 +119,9 @@ public sealed class ProjectRepository : IProjectRepository
         var mergedSeverity = ParseSeverity(project?.FailingSeverity ?? defaults?.FailingSeverity);
         var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 10;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
-        var mergedLanguages = project?.Languages ?? defaults?.Languages ?? [];
+        var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;
+        var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ProjectAuditLanguages.Default;
+        var mergedLanguages = FilterSupportedLanguages(projectId, configuredLanguages);
         var mergedAuditTypes = project?.AuditTypes ?? defaults?.AuditTypes ?? [];
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
 
@@ -147,12 +156,33 @@ public sealed class ProjectRepository : IProjectRepository
             AutoRetryOnStuck = mergedAutoRetry,
             MaxStuckRetries = mergedMaxRetries,
             Languages = mergedLanguages,
+            LanguagesConfigured = languagesConfigured,
             AuditTypes = mergedAuditTypes,
             Custom = mergedCustom,
             AuditAgent = mergedAuditAgent,
             PerAuditorAgent = mergedPerAuditorAgent,
             MaxLlmAuditorParallelism = mergedMaxLlmPar,
         };
+    }
+
+    private IReadOnlyList<string> FilterSupportedLanguages(string? projectId, IEnumerable<string> languages)
+    {
+        var filtered = new List<string>();
+        foreach (var language in languages)
+        {
+            if (string.IsNullOrWhiteSpace(language))
+                continue;
+            if (!ProjectAuditLanguages.IsSupported(language))
+            {
+                _logger.LogWarning(
+                    "Project '{ProjectId}' declares unsupported audit language '{Language}'; skipping",
+                    projectId ?? "(unknown)",
+                    language);
+                continue;
+            }
+            filtered.Add(language);
+        }
+        return filtered;
     }
 
     private static ProjectBudget ResolveBudget(ProjectBudgetConfig? c)

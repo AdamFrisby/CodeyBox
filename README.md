@@ -1,10 +1,11 @@
 # CodeyBox
 
 C#/.NET orchestration framework that runs LLM coding agents (Claude Code,
-GitHub Copilot CLI, OpenAI Codex CLI, …) inside VM-isolated sandboxes and
-merges their output through a controlled git workflow. The parent
-orchestrator runs **no LLMs** — its only job is to schedule sandboxes and
-shepherd state.
+GitHub Copilot CLI, OpenAI Codex CLI, ...) inside VM-isolated sandboxes and
+merges their output through a controlled git workflow. The framework itself
+is implemented in .NET, but the projects it works on can be Python, Node, Go,
+Rust, C#, or other stacks through custom auditors. The parent orchestrator
+runs **no LLMs** - its only job is to schedule sandboxes and shepherd state.
 
 ## Why
 
@@ -70,6 +71,10 @@ See [`docs/`](docs/README.md) for the full write-up. **Read
 ```bash
 dotnet build CodeyBox.slnx
 ```
+
+For managed projects, configure the audit language that matches the repo:
+`"Languages": ["python"]`, `"Languages": ["node"]`, or
+`"Languages": ["csharp"]` all use the same preset mechanism.
 
 ## Run (dev)
 

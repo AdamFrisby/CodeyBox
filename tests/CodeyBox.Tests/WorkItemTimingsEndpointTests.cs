@@ -82,6 +82,30 @@ public sealed class WorkItemTimingsEndpointTests : IClassFixture<TimingsApiFacto
     }
 
     [Fact]
+    public async Task GetTimings_LegacyDotnetSubSteps_AreExcludedFromTotals()
+    {
+        var item = CreateItem();
+        await _factory.Store.CreateAsync(item);
+
+        var startedAt = DateTimeOffset.UtcNow.AddSeconds(-10);
+        await AddCompletedTimingAsync(item.Id, "audit", "audit.phase", startedAt, 1_000);
+        await AddCompletedTimingAsync(item.Id, "audit", "dotnet.build", startedAt.AddMilliseconds(100), 400);
+        await AddCompletedTimingAsync(item.Id, "audit", "dotnet.test_run", startedAt.AddMilliseconds(200), 600);
+
+        var client = _factory.CreateClient();
+        var resp = await client.GetAsync($"/workitems/{item.Id}/timings");
+        resp.EnsureSuccessStatusCode();
+
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(1_000, body.GetProperty("totalDurationMs").GetInt64());
+        Assert.Equal(1_000, body.GetProperty("byPhase").GetProperty("audit").GetProperty("durationMs").GetInt64());
+
+        var topSteps = body.GetProperty("topSteps").EnumerateArray().ToList();
+        Assert.DoesNotContain(topSteps, step => step.GetProperty("step").GetString() == "dotnet.build");
+        Assert.DoesNotContain(topSteps, step => step.GetProperty("step").GetString() == "dotnet.test_run");
+    }
+
+    [Fact]
     public async Task GetTimings_InFlightRow_AppearsWithNullDuration()
     {
         var item = CreateItem();
@@ -104,6 +128,26 @@ public sealed class WorkItemTimingsEndpointTests : IClassFixture<TimingsApiFacto
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
         var byPhase = body.GetProperty("byPhase");
         Assert.True(byPhase.TryGetProperty("work", out _), "work phase must be present");
+    }
+
+    private async Task AddCompletedTimingAsync(
+        WorkItemId workItemId,
+        string phase,
+        string step,
+        DateTimeOffset startedAt,
+        long durationMs)
+    {
+        var rowId = Guid.NewGuid().ToString("N");
+        await _factory.TimingStore.BeginAsync(new TimingRecord
+        {
+            Id = rowId,
+            WorkItemId = workItemId,
+            Phase = phase,
+            Step = step,
+            StartedAt = startedAt,
+            MetadataJson = "{}",
+        });
+        await _factory.TimingStore.EndAsync(rowId, startedAt.AddMilliseconds(durationMs), durationMs);
     }
 
     private static WorkItem CreateItem() => new WorkItem

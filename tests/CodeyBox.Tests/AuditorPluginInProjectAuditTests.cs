@@ -155,7 +155,7 @@ public sealed class AuditorPluginInProjectAuditTests
 
         var auditors = composer.Compose(project, new FakeAgent());
 
-        // csharp preset (2 auditors) + shell custom + plugin
+        // csharp preset + shell custom + plugin
         Assert.True(auditors.Count >= 3, $"Expected at least 3 auditors, got {auditors.Count}");
         Assert.Contains(auditors, a => a.Name == "test:inline-plugin");
     }

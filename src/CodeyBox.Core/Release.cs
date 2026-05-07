@@ -81,4 +81,5 @@ public sealed record DeepAuditContext(
     /// active; null otherwise.
     /// </summary>
     Action<string>? StdoutChunkCallback = null,
-    bool CaptureStructuredStream = false);
+    bool CaptureStructuredStream = false,
+    IReadOnlyList<string>? Languages = null);

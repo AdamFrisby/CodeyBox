@@ -120,6 +120,23 @@ CodeyBox ships these audit-type presets, registered automatically with
 A project enables a preset by listing its name in
 `Audit.AuditTypes` (see `docs/projects.md`).
 
+### Built-in language presets
+
+Language presets are selected with `Project.Audit.Languages`. They are
+tool-only and only run when their marker files are present in the work tree:
+
+| Language | Marker files | Auditors |
+|---|---|---|
+| `csharp` | `*.csproj`, `*.sln`, `*.slnx` | `csharp:format-check`, `csharp:build-WaE`, `csharp:test-pass` |
+| `python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `python:format-check`, `python:typecheck`, `python:test-pass` |
+| `node` | `package.json` | `node:format-check`, `node:lint`, `node:test-pass` |
+| `go` | `go.mod` | `go:format-check`, `go:vet`, `go:test-pass` |
+| `rust` | `Cargo.toml` | `rust:format-check`, `rust:lint`, `rust:test-pass` |
+
+If a language is declared but its marker files are absent, the corresponding
+auditors emit Info findings and skip. Unknown language strings are logged at
+startup and skipped.
+
 ### `LlmReviewAuditor` (`CodeyBox.Audit.Llm`)
 
 Runs an `IAgentRunner` with a review-style prompt. The agent is
@@ -270,8 +287,9 @@ correlation, configure a different agent for the audit phase.
 
 `AuditAgent` applies to all LLM-based auditors (`security:llm-review`,
 `architecture`, `completeness:llm-review`, `cheating:llm-review`, etc.).
-Tool auditors (`csharp:build-WaE`, `security:gitleaks`, `security:semgrep`,
-`cheating:suppression-patterns`) do not invoke an LLM and are unaffected.
+Tool auditors (`python:test-pass`, `node:lint`, `csharp:build-WaE`,
+`security:gitleaks`, `security:semgrep`, `cheating:suppression-patterns`)
+do not invoke an LLM and are unaffected.
 
 For finer control, use `PerAuditorAgent` to route individual auditors to
 specific agents:

@@ -481,16 +481,25 @@ public sealed class ReleaseService
         var access = _gitHost.GetSandboxAccess(repoId);
 
         // Group auditors by capability (same pattern as per-PR audit).
-        var byGroup = auditors.GroupBy(a =>
-            a.Required.HasFlag(AuditCapabilities.AgentCredentials)
-                ? AuditCapabilities.AgentCredentials | AuditCapabilities.Network
-                : AuditCapabilities.None).ToList();
+        var byGroup = auditors.GroupBy(a => a.Required).ToList();
 
         foreach (var group in byGroup)
         {
             var needsCreds = group.Key.HasFlag(AuditCapabilities.AgentCredentials);
+            var needsNetwork = group.Key.HasFlag(AuditCapabilities.Network);
             AgentCredential? credential = null;
             IAgentRunner? runner = null;
+
+            if (needsNetwork && !needsCreds && ToolAuditNetworkAllowlistUnsupported(_sandboxes.Name))
+            {
+                foreach (var auditor in group)
+                    allFindings.Add(new AuditFinding(
+                        AuditorName: auditor.Name,
+                        Severity: AuditSeverity.Error,
+                        Title: "Network-capable tool auditor requires an enforcing sandbox provider",
+                        Description: $"The {auditor.Name} deep auditor requests package-registry network access without agent credentials, but the configured sandbox provider '{_sandboxes.Name}' cannot enforce AuditToolAllowedHosts. Use the multipass provider with the audit-tool network profile, or disable this deep auditor for this deployment."));
+                continue;
+            }
 
             if (needsCreds)
             {
@@ -505,6 +514,7 @@ public sealed class ReleaseService
             if (credential is not null)
                 foreach (var (k, v) in credential.EnvironmentVariables) env[k] = v;
 
+            var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
             var spec = new SandboxSpec
             {
                 ImageReference = _pipelineOpts.SandboxImageReference,
@@ -512,8 +522,13 @@ public sealed class ReleaseService
                 Environment = env,
                 Network = new SandboxNetworkPolicy
                 {
-                    AllowedHosts = needsCreds ? _pipelineOpts.AgentAllowedHosts : [],
+                    AllowedHosts = needsNetwork
+                        ? needsCreds
+                            ? _pipelineOpts.AgentAllowedHosts
+                            : _pipelineOpts.AuditToolAllowedHosts
+                        : [],
                     HostGitEndpoint = access.Network.HostGitEndpoint,
+                    ProfileName = profile,
                 },
                 WorkingDirectory = "/work",
             };
@@ -543,7 +558,8 @@ public sealed class ReleaseService
                     Iteration: iteration,
                     AuditRunner: runner,
                     StdoutChunkCallback: BuildStdoutCallback(streamCapture),
-                    CaptureStructuredStream: streamCapture is not null);
+                    CaptureStructuredStream: streamCapture is not null,
+                    Languages: project.Audit.LanguagesConfigured ? project.Audit.Languages : null);
 
                 try
                 {
@@ -623,6 +639,10 @@ public sealed class ReleaseService
 
         return streamCapture.WriteChunk;
     }
+
+    private static bool ToolAuditNetworkAllowlistUnsupported(string providerName) =>
+        providerName.Equals("bubblewrap", StringComparison.OrdinalIgnoreCase) ||
+        providerName.Equals("process", StringComparison.OrdinalIgnoreCase);
 
     // ── Releasing ─────────────────────────────────────────────────────────────
 

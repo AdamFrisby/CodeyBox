@@ -56,7 +56,8 @@ internal static class ReleaseTestHelper
         IUpstreamRemoteFactory? upstreamFactory = null,
         IChangelogGenerator? changelog = null,
         IAgentRegistry? agents = null,
-        IAgentStreamStore? agentStreams = null)
+        IAgentStreamStore? agentStreams = null,
+        PipelineOptions? pipelineOptions = null)
     {
         return new ReleaseService(
             releaseStore,
@@ -70,7 +71,7 @@ internal static class ReleaseTestHelper
             upstreamFactory ?? new TestUpstreamFactory(),
             deepAuditors ?? [],
             changelog ?? new NullChangelogGenerator(),
-            new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
+            pipelineOptions ?? new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
             taskQueue ?? new InMemoryTaskQueue(),
             new NullHostApplicationLifetime(),
             NullLogger<ReleaseService>.Instance,
@@ -256,14 +257,22 @@ internal sealed class FixedUpstreamFactory : IUpstreamRemoteFactory
 internal sealed class ScriptedDeepAuditor : IDeepAuditor
 {
     private readonly Queue<AuditResult> _results;
+    private readonly AuditCapabilities _required;
 
     public string Name { get; }
     public string Kind => "test";
-    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditCapabilities Required => _required;
+    public List<DeepAuditContext> Contexts { get; } = [];
 
     public ScriptedDeepAuditor(string name, params AuditResult[] results)
+        : this(name, AuditCapabilities.None, results)
+    {
+    }
+
+    public ScriptedDeepAuditor(string name, AuditCapabilities required, params AuditResult[] results)
     {
         Name = name;
+        _required = required;
         _results = new Queue<AuditResult>(results);
     }
 
@@ -273,6 +282,7 @@ internal sealed class ScriptedDeepAuditor : IDeepAuditor
         DeepAuditContext context,
         CancellationToken ct = default)
     {
+        Contexts.Add(context);
         var result = _results.Count > 0 ? _results.Dequeue() : new AuditResult(true, []);
         return Task.FromResult(result);
     }

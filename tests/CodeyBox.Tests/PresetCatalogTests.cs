@@ -17,12 +17,14 @@ public sealed class PresetCatalogTests
     {
         var catalog = new PresetCatalog();
         Assert.Contains("python", catalog.KnownLanguages);
-        Assert.Contains("typescript", catalog.KnownLanguages);
+        Assert.Contains("node", catalog.KnownLanguages);
         Assert.Contains("go", catalog.KnownLanguages);
         Assert.Contains("rust", catalog.KnownLanguages);
         Assert.Contains("csharp", catalog.KnownLanguages);
-        Assert.Contains("ruby", catalog.KnownLanguages);
-        Assert.Contains("shell", catalog.KnownLanguages);
+        Assert.DoesNotContain("typescript", catalog.KnownLanguages);
+        Assert.DoesNotContain("javascript", catalog.KnownLanguages);
+        Assert.DoesNotContain("ruby", catalog.KnownLanguages);
+        Assert.DoesNotContain("shell", catalog.KnownLanguages);
     }
 
     [Fact]
@@ -64,7 +66,9 @@ public sealed class PresetCatalogTests
         Assert.NotEmpty(auditors);
         // All language presets are tool-only by design.
         Assert.All(auditors, a => Assert.Equal(AuditCapabilities.None, a.Required));
-        Assert.Contains(auditors, a => a.Name == "python:ruff-check");
+        Assert.Contains(auditors, a => a.Name == "python:format-check");
+        Assert.Contains(auditors, a => a.Name == "python:typecheck");
+        Assert.Contains(auditors, a => a.Name == "python:test-pass");
     }
 
     [Fact]

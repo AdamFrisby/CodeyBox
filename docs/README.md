@@ -45,6 +45,9 @@ It speaks to the orchestrator over REST only — no shared code with the orchest
 A typed command-line client lives at [`tools/CodeyBox.Cli/`](../tools/CodeyBox.Cli/README.md).
 Run with `dotnet run --project tools/CodeyBox.Cli -- <command>`, or publish as a self-contained AOT binary.
 
+For sandbox tool installation examples across C#, Python, Node, Go, and Rust,
+see [`baseline-bake-examples.md`](baseline-bake-examples.md).
+
 ```bash
 codeybox configure                          # set API URL + token
 codeybox queue add --project myapp --title "healthz" --prompt-file ./prompt.md

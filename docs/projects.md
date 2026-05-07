@@ -13,10 +13,10 @@ pickup time and uses its config for every phase.
   tool, a CLI — without sharing config or credentials.
 * **Per-project tokens.** Each project's GitHub PAT is read from its own
   env var. A token leak from one project doesn't expose any other.
-* **Per-project audit policy.** A Python service might require ruff +
-  pyright + bandit + the architecture LLM review. A Rust binary might
-  want clippy + the cheating-detector. Both run side-by-side without
-  config interference.
+* **Per-project audit policy.** A Python service might require ruff,
+  mypy/pyright, pytest, and the architecture LLM review. A Rust binary
+  might want rustfmt, clippy, cargo test, and the cheating-detector.
+  Both run side-by-side without config interference.
 
 ## Configuration
 
@@ -50,7 +50,7 @@ provider). Everything sits under the `CodeyBox` section:
           "TokenEnvVar": "MY_APP_GITHUB_TOKEN"
         },
         "Audit": {
-          "Languages": ["typescript"],
+          "Languages": ["node"],
           "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"]
         }
       },
@@ -126,7 +126,7 @@ defaults expecting them to be replaced wholesale by per-project overrides.
   "PerIterationTimeoutMinutes": 10,
   "StopOnFirstFailure": false,
   "MaxLlmAuditorParallelism": 3,
-  "Languages": ["python", "typescript"],
+  "Languages": ["python", "node"],
   "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"],
   "Custom": [
     { "Kind": "shell", "Name": "tests", "Argv": ["npm", "test"] },
@@ -157,14 +157,26 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 
 | Preset       | Tools                                                              |
 |--------------|--------------------------------------------------------------------|
-| `python`     | `ruff check`, `ruff format --check`, `pyright`, `bandit`           |
-| `typescript` | `npx eslint`, `npx tsc --noEmit`, `npx prettier --check`           |
-| `javascript` | `npx eslint`, `npx prettier --check`                               |
-| `go`         | `golangci-lint run`, `go vet`                                      |
-| `rust`       | `cargo clippy --all-targets -- -D warnings`, `cargo fmt -- --check`|
-| `csharp`     | `dotnet format --verify-no-changes`, `dotnet build /warnaserror`   |
-| `ruby`       | `rubocop`, `brakeman`                                              |
-| `shell`      | `shellcheck` over tracked `*.sh` files                             |
+| `csharp` | `dotnet format --verify-no-changes`, `dotnet build --no-incremental /warnaserror`, `dotnet test --no-build` |
+| `python` | `ruff format --check .`, `mypy .` or `pyright --workdir .`, `pytest` |
+| `node` | `prettier --check .`, `eslint .`, `npm test` |
+| `go` | `gofmt -l .` (non-empty output fails), `go vet ./...`, `go test ./...` |
+| `rust` | `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` |
+
+Allowed built-in language values are `csharp`, `python`, `node`, `go`, and
+`rust`. Unknown strings are logged at startup and skipped. If `Languages` is
+omitted and no default is configured, CodeyBox uses an empty language list and
+runs no language-specific PR auditors; language-agnostic audit types and
+custom auditors still work. Release dependency CVE scans preserve the legacy
+default: omitted `Languages` runs the C# scanner, while an explicit empty list
+(`[]`) runs no language-specific dependency scanners.
+
+Each language preset recursively checks for that language's marker files before running:
+`*.csproj`/`*.sln`/`*.slnx` for C#, `pyproject.toml`/`setup.py`/`setup.cfg`/
+`requirements.txt` for Python, `package.json` for Node, `go.mod` for Go, and
+`Cargo.toml` for Rust. In side-by-side repositories, the tools run from the
+matched project directories. If a language is enabled but its markers are
+absent, the auditor emits an Info finding and skips.
 
 All language presets are tool-only (no agent credentials). A buggy linter
 cannot exfiltrate the agent's API key — the audit phase runs them in a
@@ -222,7 +234,8 @@ For per-auditor control (e.g. security on Claude, completeness on Gemini):
   If either is missing, the pipeline logs a warning and falls back to the
   work agent — no crash, no failed work items.
 
-Tool auditors (`security:gitleaks`, `csharp:build-WaE`, etc.) are never
+Tool auditors (`security:gitleaks`, `python:test-pass`, `csharp:build-WaE`,
+etc.) are never
 affected by these settings — they do not invoke an LLM.
 
 See [`docs/audit.md`](audit.md) for the full cross-review documentation
@@ -694,6 +707,13 @@ release branch. Set to `0` to disable. Default: `720` (12 h).
 
 **`deepAuditors`** — list of auditor names to run during the `in_review`
 phase. Built-in values: `owasp-asvs`, `arch-coherence`, `deps-cve-scan`.
+`deps-cve-scan` dispatches by `Audit.Languages`: C# uses `dotnet list package
+--vulnerable --include-transitive`, Python uses `pip-audit` or `safety`, Node
+uses `npm audit --json` pinned to `https://registry.npmjs.org/` with
+repository npm proxy settings blocked, Go uses `govulncheck -json ./...`, and
+Rust uses `cargo audit`.
+For backward compatibility, omitted `Audit.Languages` runs the C# dependency
+scanner; an explicit empty list runs none.
 Empty list = skip deep audit (transition directly to `released`).
 
 **`deepAuditMaxIterations`** — maximum number of deep audit iterations before

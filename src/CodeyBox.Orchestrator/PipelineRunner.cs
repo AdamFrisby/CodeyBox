@@ -2059,8 +2059,9 @@ public sealed class PipelineRunner : IPipelineRunner
     private static List<(string Step, long DurationMs, string MetadataJson)> ParseAuditorSubSteps(string auditorName, string stdout)
     {
         var result = new List<(string, long, string)>();
+        var auditStepPrefix = AuditTimingPrefix(auditorName);
 
-        // dotnet build: "Time Elapsed 00:00:01.234"
+        // Build tools such as dotnet emit: "Time Elapsed 00:00:01.234"
         if (auditorName.Contains("build", StringComparison.OrdinalIgnoreCase))
         {
             var m = Regex.Match(stdout, @"Time Elapsed (\d+):(\d+):(\d+)\.(\d+)");
@@ -2070,11 +2071,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 int.TryParse(m.Groups[3].Value, out var sec) &&
                 int.TryParse(m.Groups[4].Value.PadRight(3, '0')[..3], out var ms))
             {
-                result.Add(("dotnet.build", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
+                result.Add(($"{auditStepPrefix}.build", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
             }
         }
 
-        // dotnet format: "Time Elapsed" line (same marker as dotnet build but from dotnet format)
+        // Format tools may emit the same "Time Elapsed" marker as build tools.
         else if (auditorName.Contains("format", StringComparison.OrdinalIgnoreCase))
         {
             var m = Regex.Match(stdout, @"Time Elapsed (\d+):(\d+):(\d+)\.(\d+)");
@@ -2084,11 +2085,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 int.TryParse(m.Groups[3].Value, out var sec) &&
                 int.TryParse(m.Groups[4].Value.PadRight(3, '0')[..3], out var ms))
             {
-                result.Add(("dotnet.format", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
+                result.Add(($"{auditStepPrefix}.format", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
             }
         }
 
-        // dotnet test: "Time Elapsed" for total run; "A total of N test files matched" for discovery count;
+        // Test tools: "Time Elapsed" for total run; "A total of N test files matched" for discovery count;
         // "Duration: X s" in Passed!/Failed! line for execution time.
         else if (auditorName.Contains("test", StringComparison.OrdinalIgnoreCase))
         {
@@ -2097,7 +2098,7 @@ public sealed class PipelineRunner : IPipelineRunner
             if (discoveryMatch.Success && int.TryParse(discoveryMatch.Groups[1].Value, out var fileCount))
             {
                 // duration not separately measurable; count stored in metadata
-                result.Add(("dotnet.test_discovery", 0, $"{{\"count\":{fileCount}}}"));
+                result.Add(($"{auditStepPrefix}.test_discovery", 0, $"{{\"count\":{fileCount}}}"));
             }
 
             // Test run duration from "Duration: X s" in Passed!/Failed! line
@@ -2106,7 +2107,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out var runSecs))
             {
-                result.Add(("dotnet.test_run", (long)(runSecs * 1000), "{}"));
+                result.Add(($"{auditStepPrefix}.test_run", (long)(runSecs * 1000), "{}"));
             }
             else
             {
@@ -2118,7 +2119,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     int.TryParse(m.Groups[3].Value, out var sec) &&
                     int.TryParse(m.Groups[4].Value.PadRight(3, '0')[..3], out var ms))
                 {
-                    result.Add(("dotnet.test_run", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
+                    result.Add(($"{auditStepPrefix}.test_run", (long)((h * 3600 + min * 60 + sec) * 1000 + ms), "{}"));
                 }
             }
         }
@@ -2148,6 +2149,18 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         return result;
+    }
+
+    private static string AuditTimingPrefix(string auditorName)
+    {
+        var separator = auditorName.IndexOf(':', StringComparison.Ordinal);
+        if (separator <= 0)
+            return "audit";
+
+        var prefix = auditorName[..separator].ToLowerInvariant();
+        return Regex.IsMatch(prefix, "^[a-z0-9_-]+$", RegexOptions.CultureInvariant)
+            ? prefix
+            : "audit";
     }
 
     private async Task EmitToolCallCountsAsync(
@@ -2256,7 +2269,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 env[k] = v;
         }
 
-        var allowedHosts = allowAgentNetwork ? _opts.AgentAllowedHosts : Array.Empty<string>();
+        var allowedHosts = allowAgentNetwork
+            ? includeAgentCredential is null
+                ? _opts.AuditToolAllowedHosts
+                : _opts.AgentAllowedHosts
+            : Array.Empty<string>();
         var net = new SandboxNetworkPolicy
         {
             AllowedHosts = allowedHosts,
@@ -2857,6 +2874,7 @@ public sealed record PipelineOptions
 {
     public required string SandboxImageReference { get; init; }
     public IReadOnlyList<string> AgentAllowedHosts { get; init; } = [];
+    public IReadOnlyList<string> AuditToolAllowedHosts { get; init; } = [];
     public int UpstreamPushMaxAttempts { get; init; } = 5;
     public TimeSpan UpstreamPushBackoff { get; init; } = TimeSpan.FromSeconds(15);
     public HostGitIdentity? HostGitIdentity { get; init; }
