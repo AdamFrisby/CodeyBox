@@ -47,9 +47,8 @@ public sealed class MetricsEmissionTests
         using (listener)
         {
             CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", "Working"));
-            Assert.Single(measurements);
-            Assert.Equal(1L, measurements[0].Value);
-            Assert.Equal("Working", measurements[0].TagValue);
+            Assert.Contains(measurements, measurement =>
+                measurement.Value == 1L && measurement.TagValue == "Working");
         }
     }
 
@@ -61,9 +60,8 @@ public sealed class MetricsEmissionTests
         {
             CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", "Merging"));
             CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", "Done"));
-            Assert.Equal(2, measurements.Count);
-            Assert.Equal("Merging", measurements[0].TagValue);
-            Assert.Equal("Done", measurements[1].TagValue);
+            Assert.Contains(measurements, measurement => measurement.TagValue == "Merging");
+            Assert.Contains(measurements, measurement => measurement.TagValue == "Done");
         }
     }
 

@@ -28,13 +28,6 @@ public sealed record AgentStreamFile(
     long? LineCount,
     DateTimeOffset CapturedAt);
 
-internal interface IAgentStreamTimingSource
-{
-    DateTimeOffset CaptureStartedAt { get; }
-    DateTimeOffset CaptureEndedAt { get; }
-    long CaptureLengthBytes { get; }
-}
-
 public sealed class AgentStreamStore : IAgentStreamStore
 {
     public const int DefaultListLimit = 100;
@@ -141,14 +134,8 @@ public sealed class AgentStreamStore : IAgentStreamStore
         if (!File.Exists(path))
             return Task.FromResult<Stream?>(null);
 
-        var info = new FileInfo(path);
         var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 64 * 1024, FileOptions.Asynchronous);
-        Stream stream = new CappedReadStream(
-            file,
-            Options.MaxFileSizeMb * 1024L * 1024L,
-            new DateTimeOffset(info.CreationTimeUtc, TimeSpan.Zero),
-            new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero),
-            info.Length);
+        Stream stream = new CappedReadStream(file, Options.MaxFileSizeMb * 1024L * 1024L);
         return Task.FromResult<Stream?>(stream);
     }
 
@@ -283,31 +270,17 @@ public sealed class AgentStreamStore : IAgentStreamStore
         return count;
     }
 
-    private sealed class CappedReadStream : Stream, IAgentStreamTimingSource
+    private sealed class CappedReadStream : Stream
     {
         private readonly Stream _inner;
         private readonly long _maxBytes;
         private long _position;
 
-        public CappedReadStream(
-            Stream inner,
-            long maxBytes,
-            DateTimeOffset captureStartedAt,
-            DateTimeOffset captureEndedAt,
-            long captureLengthBytes)
+        public CappedReadStream(Stream inner, long maxBytes)
         {
             _inner = inner;
             _maxBytes = maxBytes;
-            CaptureStartedAt = captureStartedAt;
-            CaptureEndedAt = captureEndedAt > captureStartedAt
-                ? captureEndedAt
-                : captureStartedAt.AddTicks(1);
-            CaptureLengthBytes = Math.Min(captureLengthBytes, maxBytes);
         }
-
-        public DateTimeOffset CaptureStartedAt { get; }
-        public DateTimeOffset CaptureEndedAt { get; }
-        public long CaptureLengthBytes { get; }
 
         public override bool CanRead => _inner.CanRead;
         public override bool CanSeek => false;

@@ -130,7 +130,7 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_ComputesUntimestampedCapturedCommandExecutionTimingFromCaptureClock()
+    public async Task ParseAsync_DoesNotInferTimingFromCapturedFileMetadata()
     {
         var parser = new CodexStreamParser();
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-codex-stream-{Guid.NewGuid():N}");
@@ -145,7 +145,6 @@ public sealed class CodexStreamParserTests
                     "{\"type\":\"thread.started\",\"thread_id\":\"thread_1\"}\n" +
                     "{\"type\":\"turn.started\"}\n" +
                     "{\"type\":\"item.started\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n");
-                await Task.Delay(50);
                 capture.WriteChunk(
                     "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"/work\\n\",\"exit_code\":0,\"status\":\"completed\"}}\n" +
                     "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"Done.\"}}\n" +
@@ -159,19 +158,18 @@ public sealed class CodexStreamParserTests
             var tool = Assert.Single(summary.ToolCalls);
             Assert.Equal("item_0", tool.ToolUseId);
             Assert.Equal("Bash", tool.ToolName);
-            Assert.NotNull(tool.StartedAt);
-            Assert.NotNull(tool.EndedAt);
-            Assert.NotNull(tool.Duration);
-            Assert.True(tool.Duration > TimeSpan.Zero);
-            Assert.True(tool.Duration <= summary.TotalDuration);
+            Assert.Null(tool.StartedAt);
+            Assert.Null(tool.EndedAt);
+            Assert.Null(tool.Duration);
             Assert.True(tool.Succeeded);
             Assert.Equal(6, tool.OutputBytes);
             Assert.Equal(29990, summary.InputTokens);
             Assert.Equal(44, summary.OutputTokens);
             Assert.Equal(18176, summary.CachedInputTokens);
             Assert.Equal("Done.", summary.FinalAssistantMessage);
-            Assert.True(summary.TotalDuration > TimeSpan.Zero);
-            Assert.NotNull(summary.TimeToFirstToken);
+            Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+            Assert.Null(summary.TimeToFirstToken);
+            Assert.Empty(summary.Stalls);
         }
         finally
         {

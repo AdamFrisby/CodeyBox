@@ -265,7 +265,7 @@ public sealed class UnknownAgentStreamParser : IAgentStreamParser
         Task.FromResult(new AgentStreamSummary(TimeSpan.Zero, null, 0, 0, 0, null, [], [], null));
 }
 
-internal sealed record AgentStreamJsonLine(string Text, long StartOffset = 0, long EndOffset = 0);
+internal sealed record AgentStreamJsonLine(string Text);
 
 internal static class AgentStreamJsonLineReader
 {
@@ -277,8 +277,6 @@ internal static class AgentStreamJsonLineReader
         maxLineBytes = Math.Max(1, maxLineBytes);
         var buffer = new byte[16 * 1024];
         await using var line = new MemoryStream(capacity: Math.Min(maxLineBytes, 16 * 1024));
-        var offset = 0L;
-        var lineStartOffset = 0L;
         while (true)
         {
             var read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false);
@@ -292,11 +290,8 @@ internal static class AgentStreamJsonLineReader
                 if (b == (byte)'\n')
                 {
                     var text = DecodeLine(line);
-                    var lineEndOffset = offset + 1;
                     line.SetLength(0);
-                    yield return new AgentStreamJsonLine(text, lineStartOffset, lineEndOffset);
-                    lineStartOffset = lineEndOffset;
-                    offset++;
+                    yield return new AgentStreamJsonLine(text);
                     continue;
                 }
 
@@ -304,12 +299,11 @@ internal static class AgentStreamJsonLineReader
                     throw new InvalidDataException($"Agent stream JSONL line exceeded the configured limit of {maxLineBytes} bytes");
 
                 line.WriteByte(b);
-                offset++;
             }
         }
 
         if (line.Length > 0)
-            yield return new AgentStreamJsonLine(DecodeLine(line), lineStartOffset, offset);
+            yield return new AgentStreamJsonLine(DecodeLine(line));
     }
 
     private static string DecodeLine(MemoryStream line)
@@ -521,7 +515,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
 
     public async Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default)
     {
-        var fallbackClock = CaptureClock.TryCreate(jsonlFile);
         var toolStarts = new Dictionary<string, ToolBuilder>(StringComparer.Ordinal);
         var completedTools = new List<ToolCallInvocation>();
         DateTimeOffset? firstTimestamp = null;
@@ -559,9 +552,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             }
 
             eventCount++;
-            var timestamp = parsed.Timestamp ?? fallbackClock?.TimestampFor(jsonLine);
-            if (timestamp.HasValue && parsed.Timestamp is null)
-                parsed = parsed with { Timestamp = timestamp };
+            var timestamp = parsed.Timestamp;
 
             if (timestamp is { } eventTimestamp)
             {
@@ -1000,39 +991,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
 
     protected sealed record ToolBuilder(string Id, string Name, string InputSummary, DateTimeOffset? StartedAt);
     protected sealed record ToolResultBuilder(string Id, bool? Succeeded, int OutputBytes);
-
-    private sealed class CaptureClock
-    {
-        private readonly DateTimeOffset _startedAt;
-        private readonly TimeSpan _duration;
-        private readonly long _lengthBytes;
-
-        private CaptureClock(DateTimeOffset startedAt, DateTimeOffset endedAt, long lengthBytes)
-        {
-            _startedAt = startedAt;
-            _duration = endedAt - startedAt;
-            _lengthBytes = Math.Max(1, lengthBytes);
-        }
-
-        public static CaptureClock? TryCreate(Stream stream)
-        {
-            if (stream is not IAgentStreamTimingSource timing)
-                return null;
-            if (timing.CaptureEndedAt <= timing.CaptureStartedAt || timing.CaptureLengthBytes <= 0)
-                return null;
-            return new CaptureClock(timing.CaptureStartedAt, timing.CaptureEndedAt, timing.CaptureLengthBytes);
-        }
-
-        public DateTimeOffset TimestampFor(AgentStreamJsonLine line)
-        {
-            var position = line.StartOffset == 0
-                ? 0
-                : Math.Clamp(line.EndOffset, 0, _lengthBytes);
-            var ratio = (double)position / _lengthBytes;
-            var ticks = (long)Math.Round(_duration.Ticks * ratio, MidpointRounding.AwayFromZero);
-            return _startedAt.AddTicks(ticks);
-        }
-    }
 
     private sealed class InputSummaryTruncatedException : Exception
     {
