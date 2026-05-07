@@ -15,7 +15,7 @@ namespace CodeyBox.Git;
 /// </summary>
 public sealed class LocalGitHost : IGitHost
 {
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> RepositoryLocks = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, RepositoryLockState> RepositoryLocks = new(StringComparer.Ordinal);
     private static readonly Regex UrlUserInfoPattern = new(
         @"(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
@@ -41,8 +41,7 @@ public sealed class LocalGitHost : IGitHost
     {
         var repoId = id.ToString();
         var path = GetRepoPath(repoId);
-        var gate = RepositoryLocks.GetOrAdd(path, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(ct);
+        var gate = await AcquireRepositoryLockAsync(path, ct);
         try
         {
             if (Directory.Exists(path))
@@ -83,7 +82,7 @@ public sealed class LocalGitHost : IGitHost
         }
         finally
         {
-            gate.Release();
+            gate.Dispose();
         }
     }
 
@@ -156,15 +155,24 @@ public sealed class LocalGitHost : IGitHost
             throw new InvalidOperationException($"git push to upstream failed after reconcile: {rc.Stderr}");
     }
 
-    public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+    public async Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);
-        if (Directory.Exists(path))
+        var gate = await AcquireRepositoryLockAsync(path, ct);
+        try
         {
-            try { Directory.Delete(path, recursive: true); }
-            catch (Exception ex) { _log.LogWarning(ex, "Failed to delete bare repo at {Path}", path); }
+            if (Directory.Exists(path))
+            {
+                try { Directory.Delete(path, recursive: true); }
+                catch (Exception ex) { _log.LogWarning(ex, "Failed to delete bare repo at {Path}", path); }
+            }
+
+            MarkRepositoryLockForEviction(path, gate.State);
         }
-        return Task.CompletedTask;
+        finally
+        {
+            gate.Dispose();
+        }
     }
 
     public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
@@ -205,6 +213,62 @@ public sealed class LocalGitHost : IGitHost
 
     public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
 
+    private static async Task<RepositoryLockLease> AcquireRepositoryLockAsync(string path, CancellationToken ct)
+    {
+        while (true)
+        {
+            var state = RepositoryLocks.GetOrAdd(path, static _ => new RepositoryLockState());
+            Interlocked.Increment(ref state.References);
+            if (!RepositoryLocks.TryGetValue(path, out var current) ||
+                !ReferenceEquals(current, state) ||
+                Volatile.Read(ref state.EvictWhenIdle) != 0)
+            {
+                ReleaseRepositoryLockReference(path, state);
+                continue;
+            }
+
+            try
+            {
+                await state.Semaphore.WaitAsync(ct);
+            }
+            catch
+            {
+                ReleaseRepositoryLockReference(path, state);
+                throw;
+            }
+
+            if (Volatile.Read(ref state.EvictWhenIdle) == 0)
+                return new RepositoryLockLease(path, state);
+
+            state.Semaphore.Release();
+            ReleaseRepositoryLockReference(path, state);
+        }
+    }
+
+    private static void MarkRepositoryLockForEviction(string path, RepositoryLockState state)
+    {
+        Volatile.Write(ref state.EvictWhenIdle, 1);
+        RemoveRepositoryLockIfIdle(path, state);
+    }
+
+    private static void ReleaseRepositoryLockReference(string path, RepositoryLockState state)
+    {
+        if (Interlocked.Decrement(ref state.References) == 0)
+            RemoveRepositoryLockIfIdle(path, state);
+    }
+
+    private static void RemoveRepositoryLockIfIdle(string path, RepositoryLockState state)
+    {
+        if (Volatile.Read(ref state.EvictWhenIdle) == 0 ||
+            Volatile.Read(ref state.References) != 0)
+        {
+            return;
+        }
+
+        ((ICollection<KeyValuePair<string, RepositoryLockState>>)RepositoryLocks)
+            .Remove(new KeyValuePair<string, RepositoryLockState>(path, state));
+    }
+
     private static bool IsNonFastForwardRejection(string stdout, string stderr)
     {
         var output = stdout + "\n" + stderr;
@@ -224,26 +288,16 @@ public sealed class LocalGitHost : IGitHost
         Validation.ValidateBranchName(branch, nameof(baseBranch));
         var safeUpstream = ScrubCredentialMaterial(seedFromUrl);
 
-        try
-        {
-            SanitizeBareRepositoryConfig(bareRepoPath);
-            var rc = await RunGitAsync(
-                workdir: bareRepoPath,
-                ct,
-                "fetch", "--no-tags", "--prune", seedFromUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
-            if (rc.ExitCode != 0)
-            {
-                _log.LogWarning(
-                    "Failed to refresh bare repo {Path} branch {Branch} from upstream {Upstream}: {Stderr}",
-                    bareRepoPath, branch, safeUpstream, ScrubCredentialMaterial(rc.Stderr));
-            }
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        SanitizeBareRepositoryConfig(bareRepoPath);
+        var rc = await RunGitAsync(
+            workdir: bareRepoPath,
+            ct,
+            "fetch", "--no-tags", "--prune", seedFromUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+        if (rc.ExitCode != 0)
         {
             _log.LogWarning(
-                ex,
-                "Failed to refresh bare repo {Path} branch {Branch} from upstream {Upstream}",
-                bareRepoPath, branch, safeUpstream);
+                "Failed to refresh bare repo {Path} branch {Branch} from upstream {Upstream}: {Stderr}",
+                bareRepoPath, branch, safeUpstream, ScrubCredentialMaterial(rc.Stderr));
         }
     }
 
@@ -394,6 +448,39 @@ public sealed class LocalGitHost : IGitHost
         var stderr = await p.StandardError.ReadToEndAsync(ct);
         await p.WaitForExitAsync(ct);
         return (p.ExitCode, stdout, stderr);
+    }
+
+    private sealed class RepositoryLockState
+    {
+        public SemaphoreSlim Semaphore { get; } = new(1, 1);
+        public int References;
+        public int EvictWhenIdle;
+    }
+
+    private sealed class RepositoryLockLease : IDisposable
+    {
+        private readonly string _path;
+        private RepositoryLockState? _state;
+
+        public RepositoryLockLease(string path, RepositoryLockState state)
+        {
+            _path = path;
+            _state = state;
+        }
+
+        public RepositoryLockState State =>
+            _state ?? throw new ObjectDisposedException(nameof(RepositoryLockLease));
+
+        public void Dispose()
+        {
+            var state = _state;
+            if (state is null)
+                return;
+
+            _state = null;
+            state.Semaphore.Release();
+            ReleaseRepositoryLockReference(_path, state);
+        }
     }
 }
 

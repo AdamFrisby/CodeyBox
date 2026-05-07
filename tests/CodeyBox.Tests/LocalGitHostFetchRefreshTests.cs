@@ -77,6 +77,25 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
     }
 
     [Fact]
+    public async Task ExistingBareRepo_ConfigSanitizationFailureIsSurfaced()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<LocalGitHost>();
+        var gitHost = CreateGitHost(logger);
+        var id = WorkItemId.New();
+
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        var configPath = Path.Combine(barePath, "config");
+        File.Delete(configPath);
+        Directory.CreateDirectory(configPath);
+
+        await Assert.ThrowsAsync<IOException>(() => gitHost.EnsureRepositoryAsync(id, seed, "main"));
+        Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("Failed to refresh bare repo", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task ExistingBareRepo_RefreshWarningRedactsUpstreamCredentials()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

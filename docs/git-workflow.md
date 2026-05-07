@@ -36,8 +36,9 @@ ref, so per-work-item refs such as `codeybox/<id>` are preserved. Before
 the host fetch, the orchestrator replaces the sandbox-writable bare-repo
 config with a minimal host-controlled config so repo-local credential
 helpers, SSH commands, and URL rewrites cannot influence the host command.
-If the refresh fails, the orchestrator logs a redacted warning and
-continues with the previous local tip instead of deleting the bare repo.
+If the upstream fetch exits non-zero, the orchestrator logs a redacted
+warning and continues with the previous local tip instead of deleting the
+bare repo.
 
 ## Phase 1: Work
 
