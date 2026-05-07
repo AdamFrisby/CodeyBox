@@ -79,7 +79,7 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_DoesNotInventTimingsFromCaptureFileMetadata()
+    public async Task ParseAsync_LeavesDurationsUnknownWithoutEventTimestampsOrTimingSource()
     {
         var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.Zero });
         await using var stream = StreamOf("""
@@ -130,7 +130,7 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_LeavesTimingUnknownForUntimestampedCapturedCommandExecution()
+    public async Task ParseAsync_ComputesUntimestampedCapturedCommandExecutionTimingFromCaptureClock()
     {
         var parser = new CodexStreamParser();
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-codex-stream-{Guid.NewGuid():N}");
@@ -145,7 +145,7 @@ public sealed class CodexStreamParserTests
                     "{\"type\":\"thread.started\",\"thread_id\":\"thread_1\"}\n" +
                     "{\"type\":\"turn.started\"}\n" +
                     "{\"type\":\"item.started\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n");
-                await Task.Delay(20);
+                await Task.Delay(50);
                 capture.WriteChunk(
                     "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"/work\\n\",\"exit_code\":0,\"status\":\"completed\"}}\n" +
                     "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"Done.\"}}\n" +
@@ -159,17 +159,19 @@ public sealed class CodexStreamParserTests
             var tool = Assert.Single(summary.ToolCalls);
             Assert.Equal("item_0", tool.ToolUseId);
             Assert.Equal("Bash", tool.ToolName);
-            Assert.Null(tool.StartedAt);
-            Assert.Null(tool.EndedAt);
-            Assert.Null(tool.Duration);
+            Assert.NotNull(tool.StartedAt);
+            Assert.NotNull(tool.EndedAt);
+            Assert.NotNull(tool.Duration);
+            Assert.True(tool.Duration > TimeSpan.Zero);
+            Assert.True(tool.Duration <= summary.TotalDuration);
             Assert.True(tool.Succeeded);
             Assert.Equal(6, tool.OutputBytes);
             Assert.Equal(29990, summary.InputTokens);
             Assert.Equal(44, summary.OutputTokens);
             Assert.Equal(18176, summary.CachedInputTokens);
             Assert.Equal("Done.", summary.FinalAssistantMessage);
-            Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
-            Assert.Null(summary.TimeToFirstToken);
+            Assert.True(summary.TotalDuration > TimeSpan.Zero);
+            Assert.NotNull(summary.TimeToFirstToken);
         }
         finally
         {
@@ -706,7 +708,7 @@ public sealed class MissingFileTests : IClassFixture<AgentStreamAnalysisApiFacto
         Assert.Equal(45, body.GetProperty("outputTokens").GetInt32());
         Assert.Equal(6, body.GetProperty("cachedInputTokens").GetInt32());
         Assert.Equal(4_000, body.GetProperty("totalDurationMs").GetInt64());
-        Assert.False(body.TryGetProperty("finalAssistantMessage", out _));
+        Assert.Equal("fresh done", body.GetProperty("finalAssistantMessage").GetString());
         var tool = Assert.Single(body.GetProperty("toolCalls").EnumerateArray());
         Assert.Equal("fresh", tool.GetProperty("toolUseId").GetString());
         Assert.Equal("Read", tool.GetProperty("toolName").GetString());

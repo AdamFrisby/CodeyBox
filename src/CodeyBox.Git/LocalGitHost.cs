@@ -133,6 +133,7 @@ public sealed class LocalGitHost : IGitHost
         Validation.ValidateRepositoryUrl(upstreamUrl, nameof(upstreamUrl));
         Validation.ValidateBranchName(branch, nameof(branch));
         var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
         // git push [<repository> [<refspec>...]] — push doesn't support `--`
         // before <repository>, so we rely on URL validation above to ensure
         // the URL is well-formed and not option-like.
@@ -149,6 +150,7 @@ public sealed class LocalGitHost : IGitHost
 
         await ReconcileRejectedUpstreamPushAsync(path, upstreamUrl, branch, upstreamEnv, reconcileStrategy, ct);
 
+        SanitizeBareRepositoryConfig(path);
         rc = await RunGitAsync(
             workdir: path,
             ct,
@@ -202,6 +204,7 @@ public sealed class LocalGitHost : IGitHost
         if (!Directory.Exists(path))
             return (string.Empty, string.Empty);
 
+        SanitizeBareRepositoryConfig(path);
         // Use three-dot range so we diff the work branch tip against the
         // merge-base with base, not the current base tip — the same semantics
         // a GitHub PR diff uses.
@@ -300,6 +303,7 @@ public sealed class LocalGitHost : IGitHost
         }
 
         Validation.ValidateBranchName(branch, nameof(baseBranch));
+        SanitizeBareRepositoryConfig(bareRepoPath);
         var rc = await RunGitAsync(
             workdir: bareRepoPath,
             ct,
@@ -380,6 +384,7 @@ public sealed class LocalGitHost : IGitHost
         UpstreamPushReconcileStrategy reconcileStrategy,
         CancellationToken ct)
     {
+        SanitizeBareRepositoryConfig(bareRepoPath);
         var upstreamRef = $"refs/remotes/codeybox-upstream/{branch}";
         var fetch = await RunGitAsync(
             workdir: bareRepoPath,
@@ -393,6 +398,7 @@ public sealed class LocalGitHost : IGitHost
         var worktreeAdded = false;
         try
         {
+            SanitizeBareRepositoryConfig(bareRepoPath);
             var add = await RunGitAsync(bareRepoPath, ct, "worktree", "add", worktreePath, branch);
             if (add.ExitCode != 0)
                 throw new InvalidOperationException($"git worktree add for upstream reconcile failed: {add.Stderr}");
@@ -400,6 +406,7 @@ public sealed class LocalGitHost : IGitHost
 
             if (reconcileStrategy == UpstreamPushReconcileStrategy.Merge)
             {
+                SanitizeBareRepositoryConfig(bareRepoPath);
                 var pull = await RunGitAsync(
                     workdir: worktreePath,
                     ct,
@@ -409,12 +416,14 @@ public sealed class LocalGitHost : IGitHost
                     "pull", "--no-rebase", "--no-edit", upstreamUrl, branch);
                 if (pull.ExitCode != 0)
                 {
+                    SanitizeBareRepositoryConfig(bareRepoPath);
                     await RunGitAsync(worktreePath, CancellationToken.None, "merge", "--abort");
                     throw new UpstreamPushReconcileConflictException(branch, "merge");
                 }
                 return;
             }
 
+            SanitizeBareRepositoryConfig(bareRepoPath);
             var rebase = await RunGitAsync(
                 worktreePath,
                 ct,
@@ -423,6 +432,7 @@ public sealed class LocalGitHost : IGitHost
                 "rebase", upstreamRef);
             if (rebase.ExitCode != 0)
             {
+                SanitizeBareRepositoryConfig(bareRepoPath);
                 await RunGitAsync(worktreePath, CancellationToken.None, "rebase", "--abort");
                 throw new UpstreamPushReconcileConflictException(branch, "rebase");
             }
@@ -430,7 +440,10 @@ public sealed class LocalGitHost : IGitHost
         finally
         {
             if (worktreeAdded)
+            {
+                SanitizeBareRepositoryConfig(bareRepoPath);
                 await RunGitAsync(bareRepoPath, CancellationToken.None, "worktree", "remove", "--force", worktreePath);
+            }
             if (Directory.Exists(worktreePath))
             {
                 try
@@ -464,6 +477,10 @@ public sealed class LocalGitHost : IGitHost
         IReadOnlyDictionary<string, string>? extraEnv,
         params string[] args)
     {
+        var sandboxControlledRepository = ShouldSanitizeBareRepository(workdir);
+        if (sandboxControlledRepository)
+            SanitizeBareRepositoryConfig(workdir);
+
         var psi = new ProcessStartInfo
         {
             FileName = "git",
@@ -473,8 +490,7 @@ public sealed class LocalGitHost : IGitHost
             UseShellExecute = false,
             CreateNoWindow = true,
         };
-        psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add($"core.hooksPath={_disabledHooksPath}");
+        AddTrustedGitConfig(psi, sandboxControlledRepository);
         foreach (var a in args) psi.ArgumentList.Add(a);
         if (extraEnv is not null)
             foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;
@@ -485,6 +501,33 @@ public sealed class LocalGitHost : IGitHost
         var stderr = await p.StandardError.ReadToEndAsync(ct);
         await p.WaitForExitAsync(ct);
         return (p.ExitCode, stdout, stderr);
+    }
+
+    private bool ShouldSanitizeBareRepository(string workdir)
+    {
+        var fullWorkdir = Path.GetFullPath(workdir);
+        var fullRoot = Path.GetFullPath(_opts.RootDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        return fullWorkdir.StartsWith(fullRoot, StringComparison.Ordinal)
+            && fullWorkdir.EndsWith(".git", StringComparison.Ordinal)
+            && Directory.Exists(fullWorkdir);
+    }
+
+    private void AddTrustedGitConfig(ProcessStartInfo psi, bool sandboxControlledRepository)
+    {
+        AddConfig("core.hooksPath", _disabledHooksPath);
+        if (sandboxControlledRepository)
+        {
+            AddConfig("credential.helper", string.Empty);
+            AddConfig("core.fsmonitor", "false");
+        }
+
+        void AddConfig(string key, string value)
+        {
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add($"{key}={value}");
+        }
     }
 
     private sealed class RepositoryLockState

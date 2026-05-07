@@ -330,6 +330,7 @@ does not write to the summary cache.
   "outputTokens": 3000,
   "cachedInputTokens": 12000,
   "estimatedUsd": 1.23,
+  "finalAssistantMessage": "Done.",
   "toolCalls": [
     {
       "toolUseId": "toolu_01",
@@ -353,10 +354,11 @@ does not write to the summary cache.
 }
 ```
 
-If the captured CLI stream has no event timestamps, CodeyBox leaves timing
-fields unknown instead of inferring them from capture-file metadata. `startedAt`,
-`endedAt`, and `durationMs` are `null` whenever the relevant stream events do
-not include timestamps.
+If the captured CLI stream has no event timestamps, CodeyBox uses capture-file
+start/end metadata and line byte offsets as a best-effort fallback clock. The
+fallback does not modify the JSONL file. `startedAt`, `endedAt`, and
+`durationMs` are only `null` when neither event timestamps nor capture timing
+metadata are available.
 
 The analysis response includes `finalAssistantMessage` when the parser can
 derive it from the stream.
