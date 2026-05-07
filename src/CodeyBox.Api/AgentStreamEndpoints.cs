@@ -60,21 +60,31 @@ internal static class AgentStreamEndpoints
         string fileName,
         IWorkItemStore store,
         IAgentStreamStore streams,
+        IWorkItemCostStore costs,
         IEnumerable<IAgentStreamParser> parsers,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        await using var stream = await streams.OpenReadAsync(item!.Id, fileName, ct);
-        if (stream is null) return Results.NotFound();
+        var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: false, ct);
+        var file = files.FirstOrDefault(f => string.Equals(f.FileName, fileName, StringComparison.Ordinal));
+        if (file is null) return Results.NotFound();
 
-        var kind = item.Agent ?? new AgentKind("unknown");
+        await using var sniffStream = await streams.OpenReadAsync(item.Id, fileName, ct);
+        if (sniffStream is null) return Results.NotFound();
+        var sniffedKind = await AgentStreamParserSelection.SniffKindAsync(sniffStream, ct);
+        var costRows = await costs.GetByWorkItemAsync(item.Id.ToString(), ct);
+        var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows);
         var parser = parsers.FirstOrDefault(p => p.Kind == kind)
             ?? parsers.FirstOrDefault(p => p.Kind.Value == "unknown")
             ?? new UnknownAgentStreamParser();
+
+        await using var stream = await streams.OpenReadAsync(item.Id, fileName, ct);
+        if (stream is null) return Results.NotFound();
+
         var summary = await parser.ParseAsync(stream, ct);
-        return Results.Ok(ToSummaryDto(summary, fileName, null, null, parser.Kind));
+        return Results.Ok(ToSummaryDto(summary, fileName, file.Phase, file.Iteration, parser.Kind));
     }
 
     private static async Task<IResult> GetAggregateAsync(

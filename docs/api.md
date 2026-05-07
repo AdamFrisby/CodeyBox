@@ -335,6 +335,8 @@ does not write to the summary cache.
       "toolUseId": "toolu_01",
       "toolName": "Bash",
       "inputSummary": "{\"command\":\"dotnet test\"}",
+      "startedAt": "2026-01-01T00:00:02+00:00",
+      "endedAt": "2026-01-01T00:08:02+00:00",
       "durationMs": 480000,
       "succeeded": true,
       "outputBytes": 12000
@@ -351,6 +353,9 @@ does not write to the summary cache.
   "finalAssistantMessage": "Done"
 }
 ```
+
+If the captured CLI stream has no event timestamps, `startedAt`, `endedAt`, and
+`durationMs` are `null`; the analyser does not synthesize durations.
 
 #### `GET /workitems/{id}/agent-streams/aggregate`
 

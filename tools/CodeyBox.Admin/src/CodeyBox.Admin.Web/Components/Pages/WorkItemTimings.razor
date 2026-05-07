@@ -75,8 +75,8 @@ else
                 <tbody>
                     @foreach (var invocation in _agentActivity.Invocations)
                     {
-                        var thinking = Math.Max(0, invocation.TotalDurationMs - invocation.ToolCalls.Sum(t => t.DurationMs ?? 0));
-                        var executing = invocation.ToolCalls.Sum(t => t.DurationMs ?? 0);
+                        var executing = UnionToolDurationMs(invocation.ToolCalls);
+                        var thinking = Math.Max(0, invocation.TotalDurationMs - executing);
                         var total = Math.Max(1, thinking + executing);
                         var thinkingPct = thinking * 100.0 / total;
                         <tr class="@(invocation.Stalls.Count > 0 ? "agent-activity-stalled" : "")">
@@ -223,6 +223,37 @@ else
         false => "error",
         null => "unknown",
     };
+
+    private static long UnionToolDurationMs(IEnumerable<AgentStreamToolCallDto> toolCalls)
+    {
+        var intervals = toolCalls
+            .Where(t => t.StartedAt.HasValue && t.EndedAt.HasValue && t.EndedAt.Value >= t.StartedAt.Value)
+            .Select(t => (Start: t.StartedAt!.Value, End: t.EndedAt!.Value))
+            .OrderBy(t => t.Start)
+            .ToList();
+        if (intervals.Count == 0)
+            return 0;
+
+        var total = TimeSpan.Zero;
+        var currentStart = intervals[0].Start;
+        var currentEnd = intervals[0].End;
+        foreach (var interval in intervals.Skip(1))
+        {
+            if (interval.Start <= currentEnd)
+            {
+                if (interval.End > currentEnd)
+                    currentEnd = interval.End;
+                continue;
+            }
+
+            total += currentEnd - currentStart;
+            currentStart = interval.Start;
+            currentEnd = interval.End;
+        }
+
+        total += currentEnd - currentStart;
+        return Math.Max(0, (long)Math.Round(total.TotalMilliseconds));
+    }
 
     private static string FormatDuration(long ms)
     {

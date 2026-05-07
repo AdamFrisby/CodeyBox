@@ -44,7 +44,7 @@ public sealed class AgentStreamToolCallDto
     public string ToolUseId { get; set; } = "";
     public string ToolName { get; set; } = "";
     public string InputSummary { get; set; } = "";
-    public DateTimeOffset StartedAt { get; set; }
+    public DateTimeOffset? StartedAt { get; set; }
     public DateTimeOffset? EndedAt { get; set; }
     public long? DurationMs { get; set; }
     public bool? Succeeded { get; set; }

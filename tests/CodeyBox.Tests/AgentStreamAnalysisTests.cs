@@ -43,6 +43,84 @@ public sealed class ClaudeStreamParserTests
         Assert.Equal("done", summary.FinalAssistantMessage);
     }
 
+    [Fact]
+    public async Task ParseAsync_LeavesDurationsUnknownWhenTimestampsAreMissing()
+    {
+        var parser = new ClaudeStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
+            {"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}
+            {"type":"result","result":"done","usage":{"input_tokens":100,"output_tokens":20}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+        Assert.Null(summary.TimeToFirstToken);
+        Assert.Empty(summary.Stalls);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
+public sealed class CodexStreamParserTests
+{
+    [Fact]
+    public async Task ParseAsync_ParsesNestedItemCompletedEvents()
+    {
+        var parser = new CodexStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"thread.started","timestamp":"2026-01-01T00:00:00Z","thread_id":"thread_1"}
+            {"type":"turn.started","timestamp":"2026-01-01T00:00:01Z"}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:02Z","item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"dotnet test\"}"}}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:12Z","item":{"type":"function_call_output","call_id":"call_1","output":"ok"}}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:13Z","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+            {"type":"turn.completed","timestamp":"2026-01-01T00:00:15Z","usage":{"input_tokens":30,"output_tokens":4,"cached_input_tokens":2}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("call_1", tool.ToolUseId);
+        Assert.Equal("shell", tool.ToolName);
+        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
+        Assert.Equal(30, summary.InputTokens);
+        Assert.Equal(4, summary.OutputTokens);
+        Assert.Equal(2, summary.CachedInputTokens);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
+public sealed class GeminiStreamParserTests
+{
+    [Fact]
+    public async Task ParseAsync_ParsesFunctionCallPartsAndUsageMetadata()
+    {
+        var parser = new GeminiStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"response","timestamp":"2026-01-01T00:00:00Z","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"g1","name":"read_file","args":{"path":"a.txt"}}}]}}]}
+            {"type":"response","timestamp":"2026-01-01T00:00:03Z","candidates":[{"content":{"role":"model","parts":[{"functionResponse":{"id":"g1","name":"read_file","response":{"content":"ok"}}}]}}]}
+            {"type":"response","timestamp":"2026-01-01T00:00:05Z","candidates":[{"content":{"role":"model","parts":[{"text":"done"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"cachedContentTokenCount":1}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("read_file", tool.ToolName);
+        Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
+        Assert.Equal(10, summary.InputTokens);
+        Assert.Equal(3, summary.OutputTokens);
+        Assert.Equal(1, summary.CachedInputTokens);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
 }
 
@@ -88,6 +166,36 @@ public sealed class ThinkingVsExecutingSplitTests
         Assert.Equal(40_000, aggregate.TotalAgentDurationMs);
         Assert.Equal(15_000, aggregate.ExecutingMs);
         Assert.Equal(25_000, aggregate.ThinkingMs);
+    }
+
+    [Fact]
+    public void Aggregate_UsesWallClockUnionForOverlappingToolCalls()
+    {
+        var start = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var aggregate = AgentStreamAnalytics.Aggregate("wid", [new AgentStreamSummaryRow(
+            new WorkItemId(Guid.NewGuid()),
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Claude,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(30),
+                TimeSpan.Zero,
+                0,
+                0,
+                0,
+                null,
+                [
+                    new ToolCallInvocation("t1", "Bash", "{}", start, start.AddSeconds(10), TimeSpan.FromSeconds(10), true, 10),
+                    new ToolCallInvocation("t2", "Read", "{}", start.AddSeconds(5), start.AddSeconds(20), TimeSpan.FromSeconds(15), true, 10),
+                ],
+                [],
+                null),
+            DateTimeOffset.UtcNow)]);
+
+        Assert.Equal(25_000, aggregate.ByTool.Sum(t => t.TotalDurationMs));
+        Assert.Equal(20_000, aggregate.ExecutingMs);
+        Assert.Equal(10_000, aggregate.ThinkingMs);
     }
 }
 
@@ -148,6 +256,31 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         var cost = Assert.Single(costs);
         Assert.Equal(0.75, cost.EstimatedUsd);
         Assert.Equal(10, cost.InputTokens);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_UsesParserDetectedFromEachStreamFile()
+    {
+        var item = CreateItem(WorkItemState.Done);
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "audit-llm-security:llm-review-1-abcdef.jsonl", """
+            {"type":"thread.started","timestamp":"2026-01-01T00:00:00Z"}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:01Z","item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:02Z","item":{"type":"function_call_output","call_id":"call_1","output":"ok"}}
+            {"type":"turn.completed","timestamp":"2026-01-01T00:00:03Z","usage":{"input_tokens":5,"output_tokens":1}}
+            """);
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new CodexStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(AgentKind.Codex, row.AgentKind);
+        Assert.Equal("shell", Assert.Single(row.Summary.ToolCalls).ToolName);
     }
 
     private void WriteStreamFile(WorkItemId id, string fileName, string content)
@@ -214,8 +347,8 @@ public sealed class AggregateEndpointTests : IClassFixture<AgentStreamAnalysisAp
 
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal(2, body.GetProperty("totalToolCalls").GetInt32());
-        Assert.Equal(5_000, body.GetProperty("executingMs").GetInt64());
-        Assert.Equal(5_000, body.GetProperty("thinkingMs").GetInt64());
+        Assert.Equal(4_000, body.GetProperty("executingMs").GetInt64());
+        Assert.Equal(6_000, body.GetProperty("thinkingMs").GetInt64());
         var bash = body.GetProperty("byTool").EnumerateArray().Single(t => t.GetProperty("tool").GetString() == "Bash");
         Assert.Equal(4_000, bash.GetProperty("totalDurationMs").GetInt64());
     }

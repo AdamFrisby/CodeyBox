@@ -52,18 +52,23 @@ public sealed class StreamAnalysisService : BackgroundService
     {
         var files = await _streams.ListAsync(item.Id, AgentStreamStore.MaxListLimit, includeLineCount: false, ct).ConfigureAwait(false);
         var count = 0;
-        var kind = item.Agent ?? new AgentKind("unknown");
-        if (!_parsers.TryGetValue(kind, out var parser))
-            parser = _parsers.Values.FirstOrDefault(p => p.Kind.Value == "unknown") ?? new UnknownAgentStreamParser();
+        IReadOnlyList<WorkItemCost> costs = _costs is null
+            ? Array.Empty<WorkItemCost>()
+            : await _costs.GetByWorkItemAsync(item.Id.ToString(), ct).ConfigureAwait(false);
 
         foreach (var file in files)
         {
-            await using var stream = await _streams.OpenReadAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
-            if (stream is null)
-                continue;
-
             try
             {
+                var sniffedKind = await SniffKindAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
+                var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs);
+                if (!_parsers.TryGetValue(kind, out var parser))
+                    parser = _parsers.Values.FirstOrDefault(p => p.Kind.Value == "unknown") ?? new UnknownAgentStreamParser();
+
+                await using var stream = await _streams.OpenReadAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
+                if (stream is null)
+                    continue;
+
                 var summary = await parser.ParseAsync(stream, ct).ConfigureAwait(false);
                 var row = new AgentStreamSummaryRow(
                     item.Id,
@@ -87,6 +92,14 @@ public sealed class StreamAnalysisService : BackgroundService
         }
 
         return count;
+    }
+
+    private async Task<AgentKind?> SniffKindAsync(WorkItemId id, string fileName, CancellationToken ct)
+    {
+        await using var stream = await _streams.OpenReadAsync(id, fileName, ct).ConfigureAwait(false);
+        return stream is null
+            ? null
+            : await AgentStreamParserSelection.SniffKindAsync(stream, ct).ConfigureAwait(false);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

@@ -10,7 +10,7 @@ Each invocation summary includes:
 - input, output, and cached input token counts
 - authoritative cost from the agent result event when present
 - final assistant message text
-- tool calls with name, redacted input summary, start/end timestamps, duration, success flag, and output bytes
+- tool calls with name, redacted input summary, start/end timestamps when the CLI emits them, duration, success flag, and output bytes
 - stall events
 
 Claude, Codex, and Gemini parsers are registered separately because their CLI stream shapes differ. Unsupported agents produce an empty `unknown` summary so the dashboard can remain graceful when stream JSON is not available.
@@ -27,9 +27,11 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
+Captured CLI streams do not always include timestamps. In that case the analyser still extracts tool frequency, token usage, cost, and final text where the schema exposes them, but it does not fabricate clock values: total duration is zero, time-to-first-token is null, tool durations are null, and stall detection is skipped.
+
 ## Thinking Vs Executing
 
-`executingMs` is the sum of completed tool-call durations. `thinkingMs` is `totalAgentDurationMs - executingMs`, clamped at zero. This split identifies whether a slow invocation was mostly model-side waiting/thinking or tool execution.
+`executingMs` is the wall-clock union of completed tool-call intervals per invocation. Overlapping parallel tool calls are counted once. `thinkingMs` is `totalAgentDurationMs - executingMs`, clamped at zero. This split identifies whether a slow invocation was mostly model-side waiting/thinking or tool execution.
 
 ## Persistence
 
@@ -50,6 +52,7 @@ CREATE TABLE agent_stream_summaries (
     estimated_usd   REAL,
     tool_calls_json TEXT NOT NULL,
     stalls_json     TEXT NOT NULL,
+    final_assistant_message TEXT,
     summarised_at   TEXT NOT NULL,
     PRIMARY KEY (work_item_id, file_name)
 );

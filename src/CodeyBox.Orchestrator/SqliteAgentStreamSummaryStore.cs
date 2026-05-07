@@ -58,7 +58,7 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
             CREATE INDEX IF NOT EXISTS idx_summaries_work_item ON agent_stream_summaries(work_item_id);
             """;
         create.ExecuteNonQuery();
-        RunMigration("ALTER TABLE agent_stream_summaries ADD COLUMN final_assistant_message TEXT;");
+        AddFinalAssistantMessageColumn();
     }
 
     public async Task UpsertAsync(AgentStreamSummaryRow row, CancellationToken ct = default)
@@ -169,12 +169,12 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
         }
     }
 
-    private void RunMigration(string sql)
+    private void AddFinalAssistantMessageColumn()
     {
         try
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = sql;
+            cmd.CommandText = "ALTER TABLE agent_stream_summaries ADD COLUMN final_assistant_message TEXT;";
             cmd.ExecuteNonQuery();
         }
         catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
