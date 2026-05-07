@@ -170,6 +170,39 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
     }
 
     [Fact]
+    public async Task ExistingBareRepo_RefreshDisablesSandboxWritableHooks()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitHost = CreateGitHost();
+        var id = WorkItemId.New();
+
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        var marker = Path.Combine(_workspace, "host-refresh-hook-ran");
+        var hookPath = Path.Combine(barePath, "hooks", "reference-transaction");
+        await File.WriteAllTextAsync(
+            hookPath,
+            $"""
+            #!/bin/sh
+            touch '{marker}'
+            """);
+        File.SetUnixFileMode(
+            hookPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        await CommitToRepoAsync(seed, "after-hook.txt", "after hook\n", "advance main after hook");
+        var after = await RevParseAsync(seed, "main");
+
+        await gitHost.EnsureRepositoryAsync(id, seed, "main");
+
+        Assert.Equal(after, await RevParseAsync(barePath, "main"));
+        Assert.False(File.Exists(marker));
+    }
+
+    [Fact]
     public async Task ExistingBareRepo_RefreshReplacesConfigSymlinkWithoutReadingTarget()
     {
         if (OperatingSystem.IsWindows())

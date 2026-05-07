@@ -22,12 +22,15 @@ public sealed class LocalGitHost : IGitHost
 
     private readonly LocalGitHostOptions _opts;
     private readonly ILogger<LocalGitHost> _log;
+    private readonly string _disabledHooksPath;
 
     public LocalGitHost(LocalGitHostOptions opts, ILogger<LocalGitHost> log)
     {
         _opts = opts;
         _log = log;
         Directory.CreateDirectory(_opts.RootDirectory);
+        _disabledHooksPath = Path.Combine(_opts.RootDirectory, ".codeybox-disabled-hooks");
+        Directory.CreateDirectory(_disabledHooksPath);
     }
 
     public async Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
@@ -144,7 +147,7 @@ public sealed class LocalGitHost : IGitHost
         if (!IsNonFastForwardRejection(rc.Stdout, rc.Stderr))
             throw new InvalidOperationException($"git push to upstream failed: {rc.Stderr}");
 
-        await ReconcileRejectedUpstreamPushAsync(path, upstreamUrl, branch, upstreamEnv, reconcileStrategy, _log, ct);
+        await ReconcileRejectedUpstreamPushAsync(path, upstreamUrl, branch, upstreamEnv, reconcileStrategy, ct);
 
         rc = await RunGitAsync(
             workdir: path,
@@ -369,13 +372,12 @@ public sealed class LocalGitHost : IGitHost
     private static string ScrubCredentialMaterial(string value)
         => UrlUserInfoPattern.Replace(RawOutputRedactor.Redact(value), "${scheme}***@");
 
-    private static async Task ReconcileRejectedUpstreamPushAsync(
+    private async Task ReconcileRejectedUpstreamPushAsync(
         string bareRepoPath,
         string upstreamUrl,
         string branch,
         IReadOnlyDictionary<string, string> upstreamEnv,
         UpstreamPushReconcileStrategy reconcileStrategy,
-        ILogger<LocalGitHost> log,
         CancellationToken ct)
     {
         var upstreamRef = $"refs/remotes/codeybox-upstream/{branch}";
@@ -437,7 +439,7 @@ public sealed class LocalGitHost : IGitHost
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    log.LogWarning(ex, "Failed to remove upstream reconcile worktree at {Path}", worktreePath);
+                    _log.LogWarning(ex, "Failed to remove upstream reconcile worktree at {Path}", worktreePath);
                 }
             }
         }
@@ -450,13 +452,13 @@ public sealed class LocalGitHost : IGitHost
         // defence in depth (e.g. block direct pushes to main from work phase).
     }
 
-    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
         string workdir,
         CancellationToken ct,
         params string[] args)
         => await RunGitAsync(workdir, ct, extraEnv: null, args);
 
-    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
         string workdir,
         CancellationToken ct,
         IReadOnlyDictionary<string, string>? extraEnv,
@@ -471,6 +473,8 @@ public sealed class LocalGitHost : IGitHost
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add($"core.hooksPath={_disabledHooksPath}");
         foreach (var a in args) psi.ArgumentList.Add(a);
         if (extraEnv is not null)
             foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;

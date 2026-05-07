@@ -118,7 +118,9 @@ intent is that you can swap any of these without touching the orchestrator:
   rather than failing if the upstream fetch exits non-zero. It first
   replaces sandbox-writable bare-repo config with a minimal host-controlled
   config, so repo-local credential helpers, SSH commands, and URL rewrites
-  cannot influence host git.
+  cannot influence host git. Host git commands also set `core.hooksPath`
+  to an empty host-controlled directory, so sandbox-written bare-repo hooks
+  cannot run during ref updates.
 * **Credentials follow least privilege.** Each sandbox sees only the
   minimum it needs. Tool-only audit sandboxes see no agent secrets.
   Upstream creds live only in the orchestrator process and never cross

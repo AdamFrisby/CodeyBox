@@ -38,7 +38,9 @@ base branch ref, so per-work-item refs such as `codeybox/<id>` are
 preserved. Before the host fetch, the orchestrator replaces the
 sandbox-writable bare-repo config with a minimal host-controlled config
 so repo-local credential helpers, SSH commands, and URL rewrites cannot
-influence the host command.
+influence the host command. Host git commands set `core.hooksPath` to an
+empty host-controlled directory, so hooks written under the bare repo are
+not executed during ref updates.
 If the upstream fetch exits non-zero, the orchestrator logs a redacted
 warning and continues with the previous local tip instead of deleting the
 bare repo.
