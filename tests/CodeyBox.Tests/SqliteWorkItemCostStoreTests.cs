@@ -141,6 +141,48 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ReconcileFromAgentStreamSummaryAsync_UpdatesCanonicalAuditCostRow()
+    {
+        var itemId = Guid.NewGuid().ToString("N");
+        SeedWorkItem(itemId);
+        await _store.RecordAsync(MakeCost(itemId, "audit") with
+        {
+            AgentKind = "codex",
+            InputTokens = 1,
+            CachedInputTokens = 0,
+            OutputTokens = 1,
+            EstimatedUsd = 0.01,
+        });
+
+        await _store.ReconcileFromAgentStreamSummaryAsync(new AgentStreamSummaryRow(
+            new WorkItemId(Guid.Parse(itemId)),
+            "audit-llm-security:llm-review-1-abcdef.jsonl",
+            "audit-llm-security:llm-review",
+            1,
+            AgentKind.Codex,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.Zero,
+                100,
+                20,
+                10,
+                0.42m,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var rows = await _store.GetByWorkItemAsync(itemId);
+
+        var row = Assert.Single(rows);
+        Assert.Equal("audit", row.Phase);
+        Assert.Equal(100, row.InputTokens);
+        Assert.Equal(10, row.CachedInputTokens);
+        Assert.Equal(20, row.OutputTokens);
+        Assert.Equal(0.42, row.EstimatedUsd, precision: 5);
+    }
+
+    [Fact]
     public async Task GetByProjectAsync_DateRangeFilter_ExcludesOutsideRange()
     {
         var itemId = Guid.NewGuid().ToString();

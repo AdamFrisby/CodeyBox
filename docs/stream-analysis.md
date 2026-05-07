@@ -27,7 +27,7 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. When a parser is reading a persisted stream file, CodeyBox uses the capture file's creation-to-last-write window as a best-effort clock budget and maps untimestamped events onto that window by byte offset. That preserves duration, thinking/executing, and stall analytics for real captured streams without modifying the capture layer. Pure in-memory or externally supplied streams without either event timestamps or file timing metadata still report unknown clock values.
+Captured CLI streams do not always include timestamps. CodeyBox does not infer per-event timing from file metadata; untimestamped events report unknown tool durations, no stall gaps, and zero total stream duration. This avoids presenting fabricated timing data as invocation analytics.
 
 ## Thinking Vs Executing
 
@@ -61,3 +61,5 @@ CREATE TABLE agent_stream_summaries (
 Retrying a terminal work item invalidates cached stream summaries for that item. The next terminal transition causes a fresh summary pass.
 
 Cost in the agent `result` event is more authoritative than the pipeline cost extractor. On a summary pass, the SQLite cost store updates the newest matching `work_item_costs` row by work item, phase, iteration, and agent kind. If no row exists, it inserts a stream-sourced row with `raw_metadata_json.source = "agent_stream_analyser"`.
+
+Audit stream files use detailed phases such as `audit-llm-security:llm-review`; reconciliation also matches the canonical `audit` phase used by pipeline cost rows so stream result costs correct the existing row instead of adding a duplicate.

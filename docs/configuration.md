@@ -186,6 +186,26 @@ and API endpoints.
 
 ---
 
+## `AgentStreamAnalysis`
+
+Read-only parser settings for agent stream analytics.
+
+```json
+"AgentStreamAnalysis": {
+  "StallThreshold": "00:00:30",
+  "MaxLineBytes": 67108864,
+  "MaxJsonDepth": 64
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `StallThreshold` | `00:00:30` | Inter-event gap classified as a stall. Set to `00:00:00` to report every timestamped gap. |
+| `MaxLineBytes` | `67108864` | Maximum JSONL event size accepted by the parser. Defaults to 64 MiB so large tool-result events fit under the default stream file cap. |
+| `MaxJsonDepth` | `64` | Maximum JSON nesting depth accepted by the parser. |
+
+---
+
 ## `Projects`
 
 See [docs/projects.md](projects.md).

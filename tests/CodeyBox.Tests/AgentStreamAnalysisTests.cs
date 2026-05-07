@@ -66,7 +66,7 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_UsesCaptureFileTimingWhenEventsHaveNoTimestamps()
+    public async Task ParseAsync_IgnoresCaptureFileTimingWhenEventsHaveNoTimestamps()
     {
         var parser = new ClaudeStreamParser();
         await using var stream = TimedStreamOf(
@@ -81,11 +81,12 @@ public sealed class ClaudeStreamParserTests
         var summary = await parser.ParseAsync(stream);
 
         var tool = Assert.Single(summary.ToolCalls);
-        Assert.NotNull(tool.StartedAt);
-        Assert.NotNull(tool.EndedAt);
-        Assert.NotNull(tool.Duration);
-        Assert.True(summary.TotalDuration > TimeSpan.Zero);
-        Assert.NotNull(summary.TimeToFirstToken);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+        Assert.Null(summary.TimeToFirstToken);
+        Assert.Empty(summary.Stalls);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
@@ -141,14 +142,36 @@ public sealed class CodexStreamParserTests
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.True(tool.Duration > TimeSpan.Zero);
+        Assert.Null(tool.Duration);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
         Assert.True(tool.Succeeded);
         Assert.Equal(6, tool.OutputBytes);
         Assert.Equal(29990, summary.InputTokens);
         Assert.Equal(44, summary.OutputTokens);
         Assert.Equal(18176, summary.CachedInputTokens);
         Assert.Equal("Done.", summary.FinalAssistantMessage);
-        Assert.True(summary.TotalDuration > TimeSpan.Zero);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+    }
+
+    [Fact]
+    public async Task ParseAsync_ParsesToolResultsLargerThanOneMiB()
+    {
+        var parser = new CodexStreamParser();
+        var output = new string('x', 1024 * 1024 + 128);
+        await using var stream = StreamOf(
+            """
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:00Z","item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}}
+            """ + "\n" +
+            """
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:03Z","item":{"type":"function_call_output","call_id":"call_1","output":
+            """ + JsonSerializer.Serialize(output) + "}}\n");
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
+        Assert.Equal(Encoding.UTF8.GetByteCount(output), tool.OutputBytes);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));

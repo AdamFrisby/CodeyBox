@@ -934,7 +934,17 @@ builder.Services.AddSingleton<IAgentStreamStore>(sp =>
     new AgentStreamStore(
         sp.GetRequiredService<AgentStreamsOptions>(),
         sp.GetRequiredService<ILogger<AgentStreamStore>>()));
-builder.Services.AddSingleton(new AgentStreamParserOptions());
+builder.Services.AddSingleton(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentStreamAnalysis;
+    if (opts.StallThreshold < TimeSpan.Zero)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:StallThreshold must be non-negative");
+    if (opts.MaxLineBytes < 1024)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxLineBytes must be >= 1024");
+    if (opts.MaxJsonDepth < 1)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxJsonDepth must be >= 1");
+    return opts;
+});
 builder.Services.AddSingleton<IAgentStreamParser, ClaudeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CodexStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
@@ -1405,6 +1415,9 @@ namespace CodeyBox.Api
 
         /// <summary>Structured agent stdout stream capture configuration.</summary>
         public AgentStreamsOptions AgentStreams { get; set; } = new();
+
+        /// <summary>Read-only analytics parser configuration for captured agent streams.</summary>
+        public AgentStreamParserOptions AgentStreamAnalysis { get; set; } = new();
 
         /// <summary>
         /// Agent class definitions for quota-aware routing. Each class lists one or

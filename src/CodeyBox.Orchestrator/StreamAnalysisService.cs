@@ -52,6 +52,8 @@ public sealed class StreamAnalysisService : BackgroundService
     {
         var files = await _streams.ListAsync(item.Id, AgentStreamStore.MaxListLimit, includeLineCount: false, ct).ConfigureAwait(false);
         var count = 0;
+        var existingSummaries = (await _summaries.GetByWorkItemAsync(item.Id, ct).ConfigureAwait(false))
+            .ToDictionary(r => r.FileName, StringComparer.Ordinal);
         IReadOnlyList<WorkItemCost> costs = _costs is null
             ? Array.Empty<WorkItemCost>()
             : await _costs.GetByWorkItemAsync(item.Id.ToString(), ct).ConfigureAwait(false);
@@ -60,6 +62,13 @@ public sealed class StreamAnalysisService : BackgroundService
         {
             try
             {
+                if (existingSummaries.TryGetValue(file.FileName, out var existing))
+                {
+                    if (_costs is SqliteWorkItemCostStore cachedSummaryCosts)
+                        await cachedSummaryCosts.ReconcileFromAgentStreamSummaryAsync(existing, ct).ConfigureAwait(false);
+                    continue;
+                }
+
                 var sniffedKind = await SniffKindAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
                 var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs);
                 if (!_parsers.TryGetValue(kind, out var parser))

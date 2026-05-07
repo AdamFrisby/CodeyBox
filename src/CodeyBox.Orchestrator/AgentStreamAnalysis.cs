@@ -68,7 +68,7 @@ public sealed record AgentStreamToolAggregate(
 public sealed class AgentStreamParserOptions
 {
     public TimeSpan StallThreshold { get; set; } = TimeSpan.FromSeconds(30);
-    public int MaxLineBytes { get; set; } = 1024 * 1024;
+    public int MaxLineBytes { get; set; } = 64 * 1024 * 1024;
     public int MaxJsonDepth { get; set; } = 64;
 }
 
@@ -282,7 +282,6 @@ internal static class AgentStreamJsonLineReader
         await using var line = new MemoryStream(capacity: Math.Min(maxLineBytes, 16 * 1024));
         long offset = 0;
         long lineStart = 0;
-        var discarding = false;
 
         while (true)
         {
@@ -294,16 +293,6 @@ internal static class AgentStreamJsonLineReader
             {
                 var b = buffer[i];
                 offset++;
-                if (discarding)
-                {
-                    if (b == (byte)'\n')
-                    {
-                        discarding = false;
-                        line.SetLength(0);
-                        lineStart = offset;
-                    }
-                    continue;
-                }
 
                 if (b == (byte)'\n')
                 {
@@ -315,17 +304,13 @@ internal static class AgentStreamJsonLineReader
                 }
 
                 if (line.Length >= maxLineBytes)
-                {
-                    discarding = true;
-                    line.SetLength(0);
-                    continue;
-                }
+                    throw new InvalidDataException($"Agent stream JSONL line exceeded the configured limit of {maxLineBytes} bytes");
 
                 line.WriteByte(b);
             }
         }
 
-        if (!discarding && line.Length > 0)
+        if (line.Length > 0)
             yield return new AgentStreamJsonLine(DecodeLine(line), lineStart, offset);
     }
 
@@ -343,30 +328,37 @@ internal static class AgentStreamJsonLineReader
 public static class AgentStreamParserSelection
 {
     private const int MaxSniffLines = 20;
+    private const int MaxSniffLineBytes = 64 * 1024 * 1024;
 
     public static async Task<AgentKind?> SniffKindAsync(Stream jsonlFile, CancellationToken ct = default)
     {
         var read = 0;
-        await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, 1024 * 1024, ct).ConfigureAwait(false))
+        try
         {
-            if (read++ >= MaxSniffLines)
-                break;
-            var line = jsonLine.Text;
-            if (string.IsNullOrWhiteSpace(line) || !line.TrimStart().StartsWith('{'))
-                continue;
+            await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, MaxSniffLineBytes, ct).ConfigureAwait(false))
+            {
+                if (read++ >= MaxSniffLines)
+                    break;
+                var line = jsonLine.Text;
+                if (string.IsNullOrWhiteSpace(line) || !line.TrimStart().StartsWith('{'))
+                    continue;
 
-            try
-            {
-                using var doc = JsonDocument.Parse(line, new JsonDocumentOptions { MaxDepth = 64 });
-                if (SniffKind(doc.RootElement) is { } kind)
-                    return kind;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line, new JsonDocumentOptions { MaxDepth = 64 });
+                    if (SniffKind(doc.RootElement) is { } kind)
+                        return kind;
+                }
+                catch (JsonException)
+                {
+                }
+                catch (InvalidOperationException)
+                {
+                }
             }
-            catch (JsonException)
-            {
-            }
-            catch (InvalidOperationException)
-            {
-            }
+        }
+        catch (InvalidDataException)
+        {
         }
 
         return null;
@@ -542,10 +534,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         decimal? estimatedUsd = null;
         string? finalText = null;
 
-        var fallbackStart = (jsonlFile as IAgentStreamTimingSource)?.CapturedAt;
-        var fallbackEnd = (jsonlFile as IAgentStreamTimingSource)?.CompletedAt;
-        var streamLength = TryGetLength(jsonlFile);
-
         await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, _options.MaxLineBytes, ct).ConfigureAwait(false))
         {
             ct.ThrowIfCancellationRequested();
@@ -568,7 +556,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 continue;
             }
 
-            var timestamp = parsed.Timestamp ?? EstimateTimestamp(fallbackStart, fallbackEnd, streamLength, jsonLine.StartOffset);
+            var timestamp = parsed.Timestamp;
             if (timestamp is { } eventTimestamp)
             {
                 firstTimestamp ??= eventTimestamp;
@@ -666,39 +654,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             || string.Equals(previousEventType, "tool_result", StringComparison.OrdinalIgnoreCase))
             return "llm";
         return "unknown";
-    }
-
-    private static long? TryGetLength(Stream stream)
-    {
-        try
-        {
-            return stream.Length > 0 ? stream.Length : null;
-        }
-        catch (NotSupportedException)
-        {
-            return null;
-        }
-        catch (ObjectDisposedException)
-        {
-            return null;
-        }
-    }
-
-    private static DateTimeOffset? EstimateTimestamp(
-        DateTimeOffset? fallbackStart,
-        DateTimeOffset? fallbackEnd,
-        long? streamLength,
-        long lineStartOffset)
-    {
-        if (!fallbackStart.HasValue || !fallbackEnd.HasValue || !streamLength.HasValue)
-            return null;
-
-        var span = fallbackEnd.Value - fallbackStart.Value;
-        if (span <= TimeSpan.Zero || streamLength.Value <= 1)
-            return null;
-
-        var ratio = Math.Clamp(lineStartOffset / (double)(streamLength.Value - 1), 0d, 1d);
-        return fallbackStart.Value + TimeSpan.FromTicks((long)Math.Round(span.Ticks * ratio));
     }
 
     protected virtual ParsedEvent ParseEvent(JsonElement root)

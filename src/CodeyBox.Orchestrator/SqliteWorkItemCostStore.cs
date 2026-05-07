@@ -228,10 +228,15 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
                     WHERE id = (
                         SELECT id FROM work_item_costs
                         WHERE work_item_id = $wi
-                          AND phase = $phase
-                          AND (($iter IS NULL AND iteration IS NULL) OR iteration = $iter)
+                          AND phase IN ($phase, $canonicalPhase)
+                          AND (
+                              ($iter IS NULL AND iteration IS NULL)
+                              OR iteration = $iter
+                              OR ($iter <= 1 AND iteration IS NULL)
+                          )
                           AND agent_kind = $kind
-                        ORDER BY started_at DESC
+                        ORDER BY CASE WHEN phase = $canonicalPhase THEN 0 ELSE 1 END,
+                                 started_at DESC
                         LIMIT 1
                     )
                     """;
@@ -311,14 +316,20 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
     {
         cmd.Parameters.AddWithValue("$wi", row.WorkItemId.ToString());
         cmd.Parameters.AddWithValue("$phase", row.Phase);
+        cmd.Parameters.AddWithValue("$canonicalPhase", CanonicalCostPhase(row.Phase));
         cmd.Parameters.AddWithValue("$iter", row.Iteration.HasValue ? row.Iteration.Value : DBNull.Value);
         cmd.Parameters.AddWithValue("$kind", row.AgentKind.Value);
         cmd.Parameters.AddWithValue("$input", row.Summary.InputTokens);
         cmd.Parameters.AddWithValue("$cached", row.Summary.CachedInputTokens);
         cmd.Parameters.AddWithValue("$output", row.Summary.OutputTokens);
         cmd.Parameters.AddWithValue("$usd", (double)(row.Summary.EstimatedUsd ?? 0m));
-        cmd.Parameters.AddWithValue("$meta", $$"""{"source":"agent_stream_analyser","fileName":{{JsonSerializer.Serialize(row.FileName)}}}""");
+        cmd.Parameters.AddWithValue("$meta", $$"""{"source":"agent_stream_analyser","fileName":{{JsonSerializer.Serialize(row.FileName)}},"streamPhase":{{JsonSerializer.Serialize(row.Phase)}}}""");
     }
+
+    private static string CanonicalCostPhase(string phase) =>
+        phase.StartsWith("audit-llm-", StringComparison.OrdinalIgnoreCase)
+            ? "audit"
+            : phase;
 
     public void Dispose()
     {
