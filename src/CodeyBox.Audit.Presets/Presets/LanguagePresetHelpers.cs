@@ -29,7 +29,8 @@ internal static class LanguagePresetHelpers
         string markerScript,
         string name,
         string script,
-        string? toolName = null)
+        string? toolName = null,
+        bool? treatExit127AsMissingTool = null)
         => new LanguagePresetAuditor(
             language,
             markerDescription,
@@ -39,5 +40,6 @@ internal static class LanguagePresetHelpers
                 Name = name,
                 Argv = ["sh", "-c", script],
                 ToolName = toolName,
+                TreatExit127AsMissingTool = treatExit127AsMissingTool,
             }));
 }

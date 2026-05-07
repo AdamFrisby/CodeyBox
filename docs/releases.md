@@ -74,7 +74,7 @@ built-in auditors:
 |---|---|---|
 | `owasp-asvs` | llm | OWASP ASVS L1/L2 security review (V2, V3, V5, V7, V8, V9, V13) |
 | `arch-coherence` | llm | Architecture coherence: layer violations, circular deps, god objects, hardcoded config |
-| `deps-cve-scan` | shell | Dispatches by `Project.Audit.Languages`: C# `dotnet list package --vulnerable --include-transitive` with NuGet pinned to `https://api.nuget.org/v3/index.json`, Python `pip-audit`/`safety`, Node `npm audit --json --registry https://registry.npmjs.org/`, Go `govulncheck -json ./...`, Rust `cargo audit`. Critical/High = Error, Moderate/Medium = Warning |
+| `deps-cve-scan` | shell | Dispatches by `Project.Audit.Languages`: C# `dotnet list package --vulnerable --include-transitive` with NuGet pinned to `https://api.nuget.org/v3/index.json`, Python `pip-audit`/`safety`, Node `npm audit --json` pinned to `https://registry.npmjs.org/` with repository npm proxy settings blocked, Go `govulncheck -json ./...`, Rust `cargo audit`. Critical/High = Error, Moderate/Medium = Warning |
 
 LLM auditors require agent credentials. The shell auditor (`deps-cve-scan`)
 requires the matching language scanner to be installed in the sandbox image;

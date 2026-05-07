@@ -18,6 +18,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     private const string NuGetAuditSource = "https://api.nuget.org/v3/index.json";
     private const string CSharpUnsafeSourceMarker = "CODEYBOX_UNSAFE_NUGET_DEPENDENCY_SOURCE";
     private const string NpmAuditRegistry = "https://registry.npmjs.org/";
+    private const string NodeUnsafeNpmConfigMarker = "CODEYBOX_UNSAFE_NPM_AUDIT_CONFIG";
     private const string PythonUnsafeSourceMarker = "CODEYBOX_UNSAFE_PYTHON_DEPENDENCY_SOURCE";
     private static readonly string CSharpScannerScript = $$"""
         set -eu
@@ -263,14 +264,66 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         fi;
         echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127
         """;
+    private static readonly string NodeScannerScript = $$"""
+        set -eu
+        blocked="${TMPDIR:-/tmp}/codeybox-unsafe-npm-config.$$"
+        : > "$blocked"
+        cleanup() {
+            rm -f "$blocked"
+        }
+        trap cleanup EXIT HUP INT TERM
+
+        scan_npmrc() {
+            source_file=$1
+            awk '
+                {
+                    line = tolower($0)
+                    sub(/^[[:space:]]*/, "", line)
+                }
+                line ~ /^(proxy|https-proxy|http-proxy)[[:space:]]*=/ {
+                    print FILENAME ":" FNR ": " $0
+                }
+            ' "$source_file" >> "$blocked"
+        }
+
+        dir=$PWD
+        while :; do
+            [ -f "$dir/.npmrc" ] && scan_npmrc "$dir/.npmrc"
+            [ "$dir" = "/" ] && break
+            [ -d "$dir/.git" ] && break
+            parent=$(dirname "$dir")
+            [ "$parent" = "$dir" ] && break
+            dir=$parent
+        done
+
+        if [ -s "$blocked" ]; then
+            echo '{{NodeUnsafeNpmConfigMarker}}' >&2
+            cat "$blocked" >&2
+            exit 126
+        fi
+
+        exec npm audit --json --registry '{{NpmAuditRegistry}}' --audit-registry '{{NpmAuditRegistry}}' --proxy=false --https-proxy=false
+        """;
 
     private static readonly IReadOnlyDictionary<string, string> NpmAuditEnvironment =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["NPM_CONFIG_REGISTRY"] = NpmAuditRegistry,
             ["NPM_CONFIG_AUDIT_REGISTRY"] = NpmAuditRegistry,
+            ["NPM_CONFIG_PROXY"] = "false",
+            ["NPM_CONFIG_HTTPS_PROXY"] = "false",
+            ["NPM_CONFIG_USERCONFIG"] = "/dev/null",
+            ["NPM_CONFIG_GLOBALCONFIG"] = "/dev/null",
             ["npm_config_registry"] = NpmAuditRegistry,
             ["npm_config_audit_registry"] = NpmAuditRegistry,
+            ["npm_config_proxy"] = "false",
+            ["npm_config_https_proxy"] = "false",
+            ["npm_config_userconfig"] = "/dev/null",
+            ["npm_config_globalconfig"] = "/dev/null",
+            ["HTTP_PROXY"] = "",
+            ["HTTPS_PROXY"] = "",
+            ["http_proxy"] = "",
+            ["https_proxy"] = "",
         };
 
     private static readonly IReadOnlyDictionary<string, string> PythonScannerEnvironment =
@@ -329,7 +382,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             ["node"] = new(
                 "node",
                 LanguageProjectDiscovery.NodeDiscoveryScript,
-                ["npm", "audit", "--json", "--registry", NpmAuditRegistry],
+                ["sh", "-c", NodeScannerScript],
                 "npm not installed in sandbox; CVE scan skipped",
                 "Install Node.js/npm in the sandbox image to enable Node CVE scanning.",
                 ParseNpmFindings,
@@ -453,6 +506,16 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                     continue;
                 }
 
+                if (IsUnsafeNodeNpmConfig(scanner, result))
+                {
+                    allFindings.Add(new AuditFinding(
+                        AuditorName: Name,
+                        Severity: AuditSeverity.Error,
+                        Title: "Node CVE scan blocked repository-controlled npm proxy settings",
+                        Description: "Node dependency metadata contains .npmrc proxy settings. The dependency CVE scanner was not run because npm could use those repository-controlled proxy URLs to reach internal services if the audit sandbox has egress. Stderr: " + TruncatedOutput(result.Stderr, out _)));
+                    continue;
+                }
+
                 var findings = scanner.Parse(parserInput).ToList();
                 if (result.ExitCode != 0 && findings.Count == 0)
                 {
@@ -485,7 +548,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     }
 
     private static IReadOnlyList<string> ResolveLanguages(IReadOnlyList<string>? languages)
-        => languages ?? ProjectAuditLanguages.Default;
+        => languages is { Count: > 0 } ? languages : ["csharp"];
 
     private static IEnumerable<AuditFinding> ParseDotnetFindings(string output)
     {
@@ -1130,6 +1193,11 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         => scanner.Language.Equals("python", StringComparison.OrdinalIgnoreCase) &&
            result.ExitCode == 126 &&
            result.Stderr.Contains(PythonUnsafeSourceMarker, StringComparison.Ordinal);
+
+    private static bool IsUnsafeNodeNpmConfig(Scanner scanner, SandboxExecResult result)
+        => scanner.Language.Equals("node", StringComparison.OrdinalIgnoreCase) &&
+           result.ExitCode == 126 &&
+           result.Stderr.Contains(NodeUnsafeNpmConfigMarker, StringComparison.Ordinal);
 
     [GeneratedRegex(@"Crate:\s+(?<crate>\S+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex CargoCrateRegex();

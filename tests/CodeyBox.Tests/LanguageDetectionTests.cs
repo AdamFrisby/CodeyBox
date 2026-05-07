@@ -47,6 +47,23 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
+    public async Task PythonTypecheckMissingMypyAndPyright_ReportsInfoAndPasses()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "python:typecheck");
+        var sandbox = new PythonTypecheckMissingToolsSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Contains("tool not installed", finding.Title);
+        Assert.Contains("mypy or pyright", finding.Title);
+    }
+
+    [Fact]
     public async Task DiscoveryFailure_ReportsErrorAndDoesNotRunTool()
     {
         var catalog = new PresetCatalog();
@@ -321,6 +338,32 @@ public sealed class LanguageDetectionTests
                 127,
                 "",
                 "sh: 1: definitely-not-a-real-test-command: not found"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class PythonTypecheckMissingToolsSandbox : ISandbox
+    {
+        public string Id => "python-typecheck-missing-tools";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                var script = exec.Argv[2];
+                if (script.Contains("find .", StringComparison.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(0, "./python\n", ""));
+
+                if (script.Contains("command -v mypy", StringComparison.Ordinal) &&
+                    script.Contains("command -v pyright", StringComparison.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(
+                        127,
+                        "",
+                        "mypy or pyright: not found in sandbox"));
+            }
+
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

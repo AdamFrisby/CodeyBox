@@ -45,10 +45,16 @@ public sealed class DepsCveScanLanguageDispatchTests
             indexUrl == "https://pypi.org/simple" &&
             e.TryGetValue("PIP_CONFIG_FILE", out var pipConfigFile) &&
             pipConfigFile == "/dev/null");
-        Assert.Contains(sandbox.Commands, c => c == "npm audit --json --registry https://registry.npmjs.org/");
+        Assert.Contains(sandbox.Commands, c => c.Contains("npm audit --json --registry 'https://registry.npmjs.org/' --audit-registry 'https://registry.npmjs.org/' --proxy=false --https-proxy=false", StringComparison.Ordinal));
         Assert.Contains(sandbox.ExtraEnvironments, e =>
             e.TryGetValue("NPM_CONFIG_REGISTRY", out var registry) &&
-            registry == "https://registry.npmjs.org/");
+            registry == "https://registry.npmjs.org/" &&
+            e.TryGetValue("NPM_CONFIG_PROXY", out var proxy) &&
+            proxy == "false" &&
+            e.TryGetValue("NPM_CONFIG_HTTPS_PROXY", out var httpsProxy) &&
+            httpsProxy == "false" &&
+            e.TryGetValue("NPM_CONFIG_USERCONFIG", out var userConfig) &&
+            userConfig == "/dev/null");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/csharp");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/python");
         Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/node");
@@ -74,7 +80,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task UnsetLanguagesRunNoLanguageSpecificScanner()
+    public async Task UnsetLanguagesPreserveLegacyCSharpCveScan()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -87,12 +93,13 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Empty(sandbox.Commands);
+        Assert.Contains(sandbox.Commands, c =>
+            c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal));
         Assert.Empty(result.Findings);
     }
 
     [Fact]
-    public async Task ExplicitEmptyLanguagesRunNoLanguageSpecificScanner()
+    public async Task ExplicitEmptyLanguagesPreserveLegacyCSharpCveScan()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -106,7 +113,8 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Empty(sandbox.Commands);
+        Assert.Contains(sandbox.Commands, c =>
+            c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal));
         Assert.Empty(result.Findings);
     }
 
@@ -616,6 +624,75 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
+    public async Task NodeScannerBlocksRepositoryControlledNpmProxyConfig()
+    {
+        var sandbox = new DispatchSandbox(
+            markerPresent: true,
+            scannerExitCode: 126,
+            scannerStderr: """
+                CODEYBOX_UNSAFE_NPM_AUDIT_CONFIG
+                /repo/.npmrc:1: proxy=http://169.254.169.254:80
+                /repo/.npmrc:2: https-proxy=http://internal.example:8080
+                """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["node"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("blocked repository-controlled npm proxy settings", finding.Title);
+        Assert.Contains("169.254.169.254", finding.Description);
+        Assert.Contains("internal.example", finding.Description);
+    }
+
+    [Fact]
+    public async Task NodePreflightBlocksNpmrcProxyBeforeNpmRuns()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"cb-node-cve-preflight-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(root, ".npmrc"),
+                "https-proxy=http://169.254.169.254:80\n");
+
+            using var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "sh",
+                    WorkingDirectory = root,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                },
+            };
+            process.StartInfo.ArgumentList.Add("-c");
+            process.StartInfo.ArgumentList.Add(NodeScannerScript());
+
+            process.Start();
+            await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            Assert.Equal(126, process.ExitCode);
+            Assert.Contains("CODEYBOX_UNSAFE_NPM_AUDIT_CONFIG", stderr);
+            Assert.Contains("169.254.169.254", stderr);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task NodeScannerParsesJsonStdoutWhenNpmWritesNoticesToStderr()
     {
         var sandbox = new DispatchSandbox(
@@ -777,5 +854,10 @@ public sealed class DepsCveScanLanguageDispatchTests
     private static string PythonScannerScript()
         => (string)typeof(DepsCveScanDeepAuditor)
             .GetField("PythonScannerScript", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(null)!;
+
+    private static string NodeScannerScript()
+        => (string)typeof(DepsCveScanDeepAuditor)
+            .GetField("NodeScannerScript", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
             .GetValue(null)!;
 }
