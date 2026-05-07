@@ -69,7 +69,7 @@ public sealed class RecoveryAttemptCapTests : IDisposable
             ProjectId = new ProjectId("p"),
             Title = "t",
             Prompt = "p",
-            State = WorkItemState.Working,
+            State = WorkItemState.Auditing,
             RecoveryAttempts = MaxAttempts,
         };
         await _store.CreateAsync(item);
@@ -93,7 +93,7 @@ public sealed class RecoveryAttemptCapTests : IDisposable
             ProjectId = new ProjectId("p"),
             Title = "t",
             Prompt = "p",
-            State = WorkItemState.Working,
+            State = WorkItemState.Auditing,
             RecoveryAttempts = MaxAttempts,
         };
         await _store.CreateAsync(item);
@@ -113,7 +113,7 @@ public sealed class RecoveryAttemptCapTests : IDisposable
             ProjectId = new ProjectId("p"),
             Title = "t",
             Prompt = "p",
-            State = WorkItemState.Working,
+            State = WorkItemState.Auditing,
             RecoveryAttempts = MaxAttempts - 1,
         };
         await _store.CreateAsync(item);
@@ -122,7 +122,7 @@ public sealed class RecoveryAttemptCapTests : IDisposable
         await _reaper.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(WorkItemState.WorkComplete, after!.State);
         Assert.Equal(MaxAttempts, after.RecoveryAttempts);
         Assert.Equal(1, _queue.Count);
     }
@@ -136,7 +136,7 @@ public sealed class RecoveryAttemptCapTests : IDisposable
             ProjectId = new ProjectId("p"),
             Title = "t",
             Prompt = "p",
-            State = WorkItemState.Working,
+            State = WorkItemState.Auditing,
             RecoveryAttempts = 0,
         };
         await _store.CreateAsync(item);
@@ -152,10 +152,10 @@ public sealed class RecoveryAttemptCapTests : IDisposable
 
             item = (await _store.GetAsync(item.Id))!;
 
-            // Back-simulate: re-put the item in Working state for the next crash,
+            // Back-simulate: re-put the item in Auditing state for the next crash,
             // unless it's already Failed.
-            if (item.State == WorkItemState.Queued)
-                await _store.UpdateAsync(item with { State = WorkItemState.Working });
+            if (item.State == WorkItemState.WorkComplete)
+                await _store.UpdateAsync(item with { State = WorkItemState.Auditing });
         }
 
         // After MaxAttempts+1 reaper runs the item should be Failed.

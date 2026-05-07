@@ -27,6 +27,10 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// </summary>
     public string Binary { get; init; } = "gemini";
 
+    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".gemini/tmp", ".gemini/history"];
+
+    protected override string PreemptProcessPattern => Binary;
+
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
         var help = await sandbox.ExecAsync(new SandboxExec
@@ -115,6 +119,28 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         {
             Stdout = Strip(result.Stdout),
             Stderr = stderr,
+        };
+    }
+
+    public override async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        Action<string>? strippingCallback = stdoutChunkCallback is null
+            ? null
+            : chunk => stdoutChunkCallback(Strip(chunk) ?? string.Empty);
+        var result = await base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, strippingCallback);
+        return result with
+        {
+            Stdout = Strip(result.Stdout),
+            Stderr = Strip(result.Stderr),
         };
     }
 

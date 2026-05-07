@@ -131,6 +131,18 @@ public sealed record WorkItem
     public DateTimeOffset? StartedAt { get; init; }
 
     /// <summary>
+    /// UTC timestamp when a graceful host shutdown preempted this item while an
+    /// agent was running. Null for normal and crash-recovered work.
+    /// </summary>
+    public DateTimeOffset? PreemptedAt { get; init; }
+
+    /// <summary>
+    /// Host-side git ref containing the best-effort checkpoint captured during
+    /// graceful shutdown. Null means there is no clean preemption checkpoint.
+    /// </summary>
+    public string? PreemptCheckpoint { get; init; }
+
+    /// <summary>
     /// Caller-supplied identifier unique within the project (e.g. "JIRA-1234", "GH-#456").
     /// Null when not provided. Allows API callers to reference work items by a familiar
     /// external ID and to batch-queue dependent work items without a round-trip for UUIDs.
@@ -175,5 +187,7 @@ public sealed record WorkItem
             // Clear WorkBranch when re-queuing from Working: the in-flight branch is
             // gone; the next pickup generates a fresh one.
             WorkBranch = state == WorkItemState.Queued ? null : WorkBranch,
+            PreemptedAt = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptedAt : null,
+            PreemptCheckpoint = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptCheckpoint : null,
         };
 }

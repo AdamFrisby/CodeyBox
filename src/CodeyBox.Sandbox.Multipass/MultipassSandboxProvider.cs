@@ -332,8 +332,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                     createdAt = new DateTimeOffset(created, TimeSpan.Zero);
             }
             var isActive = _activeSandboxNames.ContainsKey(name);
+            var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
             diskByName.TryGetValue(name, out var diskBytes);
-            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive));
+            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker));
         }
         return infos;
     }
@@ -1069,7 +1070,7 @@ public sealed record MultipassSandboxOptions
     public int BaselineCpus { get; init; } = 6;
 }
 
-internal sealed class MultipassSandbox : ISandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox
 {
     private readonly string _name;
     private readonly string _sandboxRoot;
@@ -1082,6 +1083,7 @@ internal sealed class MultipassSandbox : ISandbox
     private readonly Action<string>? _onDisposed;
     private int _firstExecEmitted;
     private bool _disposed;
+    private bool _preserveOnDispose;
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
@@ -1198,6 +1200,7 @@ internal sealed class MultipassSandbox : ISandbox
     {
         if (_disposed) return;
         _disposed = true;
+        if (_preserveOnDispose) return;
         // Notify provider immediately so it removes the name from the active set and
         // invalidates the list cache before any subsequent leak scan runs.
         _onDisposed?.Invoke(_name);
@@ -1227,5 +1230,42 @@ internal sealed class MultipassSandbox : ISandbox
         }
         try { Directory.Delete(_sandboxRoot, recursive: true); }
         catch (Exception ex) { _log.LogWarning(ex, "Failed to clean sandbox root {Root}", _sandboxRoot); }
+    }
+
+    public async Task StopAndPreserveAsync(CancellationToken ct = default)
+    {
+        if (_disposed) return;
+        _preserveOnDispose = true;
+        var markerPath = Path.Combine(_sandboxRoot, ".codeybox-preempt");
+        try
+        {
+            await File.WriteAllTextAsync(markerPath, DateTimeOffset.UtcNow.ToString("O"), ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to write preempt marker for multipass VM {Name}", _name);
+        }
+
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo
+            {
+                FileName = _opts.MultipassBinary,
+                ArgumentList = { "stop", _name },
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            });
+            if (p is not null)
+            {
+                _ = await p.StandardOutput.ReadToEndAsync(ct);
+                _ = await p.StandardError.ReadToEndAsync(ct);
+                await p.WaitForExitAsync(ct);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Failed to stop multipass VM {Name} for preemption", _name);
+        }
     }
 }

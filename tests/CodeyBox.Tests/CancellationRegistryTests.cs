@@ -33,14 +33,14 @@ public sealed class CancellationRegistryTests
     }
 
     [Fact]
-    public void RootCancellation_PropagatesToAllRegistered()
+    public void RootCancellation_DoesNotCancelRegisteredItem()
     {
         using var rootCts = new CancellationTokenSource();
         using var reg = new CancellationRegistry(rootCts.Token);
         var id = WorkItemId.New();
         using var registration = reg.Register(id);
         rootCts.Cancel();
-        Assert.True(registration.Token.IsCancellationRequested);
+        Assert.False(registration.Token.IsCancellationRequested);
     }
 
     [Fact]

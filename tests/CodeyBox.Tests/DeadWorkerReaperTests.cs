@@ -71,7 +71,6 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Theory]
-    [InlineData(WorkItemState.Working, WorkItemState.Queued)]
     [InlineData(WorkItemState.Reworking, WorkItemState.Queued)]
     [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed)]
@@ -92,6 +91,23 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_WorkingWithoutPreempt_MarksFailed()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Failed, after.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Contains("without a preempt checkpoint", after.LastError);
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
     public async Task Reaper_WorkItemIdNull_DeletesRowWithoutTouchingAnyItem()
     {
         var workerId = Guid.NewGuid().ToString();
@@ -108,7 +124,7 @@ public sealed class DeadWorkerReaperTests : IDisposable
     [Fact]
     public async Task Reaper_FiresWebhookEvent_OnRecovery()
     {
-        var item = MakeItem(WorkItemState.Working);
+        var item = MakeItem(WorkItemState.Auditing);
         await _store.CreateAsync(item);
         await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
 
@@ -123,7 +139,7 @@ public sealed class DeadWorkerReaperTests : IDisposable
     [Fact]
     public async Task Reaper_RequeuesItem_AfterRecovery()
     {
-        var item = MakeItem(WorkItemState.Working);
+        var item = MakeItem(WorkItemState.Auditing);
         await _store.CreateAsync(item);
         await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
 

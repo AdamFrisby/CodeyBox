@@ -90,6 +90,7 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
         }
 
         Directory.CreateDirectory(MapToHostPath(root, spec.WorkingDirectory));
+        Directory.CreateDirectory(MapToHostPath(root, "home/codeybox"));
 
         // Build longest-first mount path table for argv translation. The
         // orchestrator addresses files by sandbox-absolute paths (e.g.
@@ -134,13 +135,14 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
     internal static string MapToHostPathInternal(string root, string sandboxPath) => MapToHostPath(root, sandboxPath);
 }
 
-internal sealed class ProcessSandbox : ISandbox
+internal sealed class ProcessSandbox : IPreemptibleSandbox
 {
     private readonly string _root;
     private readonly SandboxSpec _spec;
     private readonly string[] _mountPaths; // longest-first
     private readonly ILogger _log;
     private bool _disposed;
+    private bool _preserved;
 
     public ProcessSandbox(string id, string root, SandboxSpec spec, string[] mountPaths, ILogger log)
     {
@@ -178,7 +180,7 @@ internal sealed class ProcessSandbox : ISandbox
         // attempt to enforce the network policy at the OS level.
         psi.EnvironmentVariables.Clear();
         psi.EnvironmentVariables["PATH"] = Environment.GetEnvironmentVariable("PATH") ?? "/usr/bin:/bin";
-        psi.EnvironmentVariables["HOME"] = cwd;
+        psi.EnvironmentVariables["HOME"] = ProcessSandboxProvider.MapToHostPathInternal(_root, "/home/codeybox");
         foreach (var (k, v) in _spec.Environment) psi.EnvironmentVariables[k] = v;
         if (exec.ExtraEnvironment is not null)
             foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = v;
@@ -248,6 +250,8 @@ internal sealed class ProcessSandbox : ISandbox
     {
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
+        if (_preserved)
+            return ValueTask.CompletedTask;
         try
         {
             // Clear read-only bits and remove symlinks (without following them)
@@ -262,6 +266,15 @@ internal sealed class ProcessSandbox : ISandbox
             _log.LogWarning(ex, "Failed to clean up ProcessSandbox {Id} root {Root}", Id, _root);
         }
         return ValueTask.CompletedTask;
+    }
+
+    public Task StopAndPreserveAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(Path.Combine(_root, ".codeybox-preempt"), DateTimeOffset.UtcNow.ToString("O"));
+        _preserved = true;
+        return Task.CompletedTask;
     }
 
     private static void RemoveTreeSafely(string path)

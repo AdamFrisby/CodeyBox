@@ -53,7 +53,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
     // ── State reset mapping ───────────────────────────────────────────────────
 
     [Fact]
-    public async Task Working_ResetsTo_Queued()
+    public async Task WorkingWithoutPreempt_TransitionsToFailed()
     {
         var item = Item(WorkItemState.Working);
         await _store.CreateAsync(item);
@@ -62,10 +62,31 @@ public sealed class WorkItemRecoveryTests : IDisposable
         await svc.ReplayPendingForTestAsync(CancellationToken.None);
 
         var recovered = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(WorkItemState.Failed, recovered!.State);
         Assert.Equal(1, recovered.RecoveryAttempts);
         Assert.Null(recovered.StartedAt);
-        Assert.Null(recovered.WorkBranch);
+        Assert.Equal("codeybox/in-flight", recovered.WorkBranch);
+        Assert.Contains("without a preempt checkpoint", recovered.LastError);
+    }
+
+    [Fact]
+    public async Task PreemptedWorking_ReenqueuesWithoutRecoveryReset()
+    {
+        var item = Item(WorkItemState.Working) with
+        {
+            PreemptedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{Guid.NewGuid()}",
+        };
+        await _store.CreateAsync(item);
+
+        var svc = BuildOrchestrator();
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, recovered!.State);
+        Assert.Equal(0, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
     }
 
     [Fact]
@@ -185,7 +206,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
     public async Task AtMaxRecoveryAttempts_TransitionsToAbandoned()
     {
         // Item already at max (3); next recovery should abandon it.
-        var item = Item(WorkItemState.Working, recoveryAttempts: 3);
+        var item = Item(WorkItemState.Auditing, recoveryAttempts: 3);
         await _store.CreateAsync(item);
 
         var queue = new InMemoryTaskQueue();
@@ -205,7 +226,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
     [Fact]
     public async Task BelowMaxRecoveryAttempts_StillRecovered()
     {
-        var item = Item(WorkItemState.Working, recoveryAttempts: 2);
+        var item = Item(WorkItemState.Auditing, recoveryAttempts: 2);
         await _store.CreateAsync(item);
 
         var queue = new InMemoryTaskQueue();
@@ -217,7 +238,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
         await svc.ReplayPendingForTestAsync(CancellationToken.None);
 
         var readBack = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Queued, readBack!.State);
+        Assert.Equal(WorkItemState.WorkComplete, readBack!.State);
         Assert.Equal(3, readBack.RecoveryAttempts);
         Assert.Equal(1, queue.Count);
     }

@@ -112,6 +112,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
         // Index for release state machine queries (all items for a release).
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_release ON work_items(release_id) WHERE release_id IS NOT NULL;");
+
+        // Additive migration: graceful-shutdown preemption metadata. Nullable so
+        // existing rows are treated as not preempted.
+        RunMigration("ALTER TABLE work_items ADD COLUMN preempted_at TEXT;");
+        RunMigration("ALTER TABLE work_items ADD COLUMN preempt_checkpoint TEXT;");
     }
 
     private void RunMigration(string sql)
@@ -140,10 +145,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                     stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
-                    min_model_score, cancellation_reason, recovery_attempts, release_id)
+                    min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                     $sretries, $started_at, $external_id, $replay_of, $merge_sha,
-                    $min_model_score, $cancellation_reason, $recovery_attempts, $release_id);
+                    $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -179,7 +184,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
-                    release_id = $release_id
+                    release_id = $release_id,
+                    preempted_at = $preempted_at,
+                    preempt_checkpoint = $preempt_checkpoint
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -210,7 +217,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
-                    release_id = $release_id
+                    release_id = $release_id,
+                    preempted_at = $preempted_at,
+                    preempt_checkpoint = $preempt_checkpoint
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -327,8 +336,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             SELECT COUNT(*) FROM work_items
             WHERE project_id = $pid
               AND started_at IS NOT NULL
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.NeedsOperatorInput});
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
+              AND preempt_checkpoint IS NULL
+              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);
@@ -486,6 +495,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             item.CancellationReason.HasValue ? (object)item.CancellationReason.Value.ToString() : DBNull.Value);
         cmd.Parameters.AddWithValue("$recovery_attempts", item.RecoveryAttempts);
         cmd.Parameters.AddWithValue("$release_id", (object?)item.ReleaseId?.ToString() ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$preempted_at", (object?)item.PreemptedAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$preempt_checkpoint", (object?)item.PreemptCheckpoint ?? DBNull.Value);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -517,6 +528,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         CancellationReason = ReadCancellationReason(r),
         RecoveryAttempts = ReadInt32OrDefault(r, "recovery_attempts", defaultValue: 0),
         ReleaseId = ReadNullableReleaseId(r, "release_id"),
+        PreemptedAt = ReadNullableDateTimeOffset(r, "preempted_at"),
+        PreemptCheckpoint = r.IsDBNull(r.GetOrdinal("preempt_checkpoint")) ? null : r.GetString(r.GetOrdinal("preempt_checkpoint")),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)

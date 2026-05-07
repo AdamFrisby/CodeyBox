@@ -239,7 +239,7 @@ public sealed class OrchestratorService : BackgroundService
     /// complete.
     ///
     /// Recovery state mapping:
-    ///   Working         → Queued      (redo from scratch; in-flight branch is gone)
+    ///   Working         → Failed      (crashed work phase without a preempt checkpoint)
     ///   Auditing        → WorkComplete (work commit is real; re-run the audit suite)
     ///   Reworking       → WorkComplete (re-run audit to confirm or re-rework)
     ///   Merging         → AuditPassed  (audit verdict is real; retry the merge)
@@ -289,6 +289,13 @@ public sealed class OrchestratorService : BackgroundService
                         "Work item {Id} has been abandoned after {Max} recovery attempts; operator intervention required",
                         item.Id, _opts.MaxRecoveryAttempts);
                 }
+                else if (recovered.State == WorkItemState.Failed)
+                {
+                    await _store.UpdateAsync(recovered, ct);
+                    _log.LogWarning(
+                        "Work item {Id} was left Working without a preempt checkpoint; marked Failed as a crash case",
+                        item.Id);
+                }
                 else
                 {
                     await _store.UpdateAsync(recovered, ct);
@@ -335,9 +342,32 @@ public sealed class OrchestratorService : BackgroundService
     /// </summary>
     private WorkItem? TryBuildRecoveredState(WorkItem item)
     {
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && item.State is WorkItemState.Working or WorkItemState.Reworking)
+        {
+            return item with
+            {
+                StartedAt = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+        }
+
+        if (item.State == WorkItemState.Working)
+        {
+            return item with
+            {
+                State = WorkItemState.Failed,
+                LastError = "worker died while work phase was running without a preempt checkpoint",
+                RecoveryAttempts = item.RecoveryAttempts + 1,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+        }
+
         WorkItemState? targetState = item.State switch
         {
-            WorkItemState.Working => WorkItemState.Queued,
             WorkItemState.Auditing => WorkItemState.WorkComplete,
             WorkItemState.Reworking => WorkItemState.WorkComplete,
             WorkItemState.Merging => WorkItemState.AuditPassed,
@@ -355,7 +385,7 @@ public sealed class OrchestratorService : BackgroundService
 
         if (targetState is null) return null;
 
-        // Only backward-reset transitions (Working→Queued, Auditing→WorkComplete, etc.) and
+        // Only backward-reset transitions (Auditing→WorkComplete, etc.) and
         // UpstreamPushing→Merged represent genuinely interrupted in-flight work and count
         // against the recovery cap. Passthrough re-enqueues (WorkComplete/AuditPassed/Merged
         // left as-is) are natural resting points — a routine rolling restart should not burn
@@ -562,8 +592,13 @@ public sealed class OrchestratorService : BackgroundService
                     // to the next worker before it runs its own budget check.
                     if (item.StartedAt is null)
                     {
-                        item = item with { StartedAt = DateTimeOffset.UtcNow };
+                        var pipelineItem = item;
+                        item = item with
+                        {
+                            StartedAt = DateTimeOffset.UtcNow,
+                        };
                         await _store.UpdateAsync(item, ct);
+                        item = pipelineItem with { StartedAt = item.StartedAt };
                     }
                 }
                 finally
@@ -576,8 +611,13 @@ public sealed class OrchestratorService : BackgroundService
                 // No project → no budget check; still record first pickup time.
                 if (item.StartedAt is null)
                 {
-                    item = item with { StartedAt = DateTimeOffset.UtcNow };
+                    var pipelineItem = item;
+                    item = item with
+                    {
+                        StartedAt = DateTimeOffset.UtcNow,
+                    };
                     await _store.UpdateAsync(item, ct);
+                    item = pipelineItem with { StartedAt = item.StartedAt };
                 }
             }
 
@@ -585,8 +625,6 @@ public sealed class OrchestratorService : BackgroundService
             AuditLog.WorkItemPickedUp(workerIndex, item.Id);
             try
             {
-                // Pass ct (the host stoppingToken) as hostShutdownToken so the pipeline
-                // can distinguish "host is shutting down" from "operator cancelled".
                 await _pipeline.RunAsync(item, registration.Token, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

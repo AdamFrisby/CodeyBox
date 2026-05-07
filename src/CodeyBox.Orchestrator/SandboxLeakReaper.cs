@@ -114,6 +114,9 @@ public sealed class SandboxLeakReaper : BackgroundService
                     continue;
 
                 var age = now - info.CreatedAt.Value;
+                if (info.HasPreemptMarker && age < _opts.PreemptRetention)
+                    continue;
+
                 if (age < _opts.LeakAgeThreshold)
                     continue;
 
@@ -249,6 +252,13 @@ public sealed class SandboxLeakOptions
     /// that is mid-way through work-phase clone.
     /// </summary>
     public TimeSpan LeakAgeThreshold { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Maximum time to exempt gracefully preempted sandboxes from leak reporting
+    /// and auto-disposal. After this bound they are treated like ordinary leaks.
+    /// Default 24 hours.
+    /// </summary>
+    public TimeSpan PreemptRetention { get; set; } = TimeSpan.FromHours(24);
 
     /// <summary>
     /// When true, automatically dispose each detected leak after logging it.
