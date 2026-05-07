@@ -73,7 +73,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task UnsetLanguagesRunDefaultCSharpScanner()
+    public async Task UnsetLanguagesRunNoLanguageSpecificScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -86,9 +86,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Contains(sandbox.Commands, c =>
-            c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal));
-        Assert.Contains("/repo/csharp", sandbox.WorkingDirectories);
+        Assert.Empty(sandbox.Commands);
         Assert.Empty(result.Findings);
     }
 
@@ -112,7 +110,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task JavaScriptAndTypeScriptDispatchToNodeScanner()
+    public async Task JavaScriptAndTypeScriptAreSkippedAsUnsupported()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -126,7 +124,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Equal(2, sandbox.Commands.Count(c => c == "npm audit --json --registry https://registry.npmjs.org/"));
+        Assert.Empty(sandbox.Commands);
         Assert.Empty(result.Findings);
     }
 
@@ -318,6 +316,46 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Contains("blocked repository-controlled package source URLs", finding.Title);
         Assert.Contains("169.254.169.254", finding.Description);
+    }
+
+    [Fact]
+    public async Task PythonPreflightRecursesRequirementIncludesBeforeScannerRuns()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"cb-python-cve-preflight-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(root, "requirements.txt"), "-r requirements-extra.txt\n");
+            await File.WriteAllTextAsync(Path.Combine(root, "requirements-extra.txt"), "evil @ http://169.254.169.254/latest/meta-data\n");
+
+            using var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "sh",
+                    WorkingDirectory = root,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                },
+            };
+            process.StartInfo.ArgumentList.Add("-c");
+            process.StartInfo.ArgumentList.Add(PythonScannerScript());
+
+            process.Start();
+            await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            Assert.Equal(126, process.ExitCode);
+            Assert.Contains("CODEYBOX_UNSAFE_PYTHON_DEPENDENCY_SOURCE", stderr);
+            Assert.Contains("requirements-extra.txt:1", stderr);
+            Assert.Contains("169.254.169.254", stderr);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
     }
 
     [Fact]
@@ -718,4 +756,9 @@ public sealed class DepsCveScanLanguageDispatchTests
             return ".\n";
         }
     }
+
+    private static string PythonScannerScript()
+        => (string)typeof(DepsCveScanDeepAuditor)
+            .GetField("PythonScannerScript", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(null)!;
 }

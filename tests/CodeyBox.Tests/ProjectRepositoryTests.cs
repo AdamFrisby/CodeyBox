@@ -58,7 +58,7 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
-    public async Task AuditLanguagesDefaultToCSharp_WhenOmitted()
+    public async Task AuditLanguagesDefaultToEmpty_WhenOmitted()
     {
         var opts = new ProjectsOptions
         {
@@ -73,7 +73,7 @@ public sealed class ProjectRepositoryTests
         };
         var repo = new ProjectRepository(Options.Create(opts));
         var p = await repo.GetAsync(new ProjectId("alpha"));
-        Assert.Equal(["csharp"], p!.Audit.Languages);
+        Assert.Empty(p!.Audit.Languages);
     }
 
     [Fact]

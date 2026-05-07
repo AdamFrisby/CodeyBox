@@ -5,8 +5,6 @@ internal static class NodePresets
     public static void Register(PresetCatalog catalog)
     {
         RegisterNodeLike(catalog, "node");
-        RegisterNodeLike(catalog, "javascript");
-        RegisterNodeLike(catalog, "typescript");
     }
 
     private static void RegisterNodeLike(PresetCatalog catalog, string language)

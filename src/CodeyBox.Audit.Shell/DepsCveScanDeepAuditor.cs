@@ -118,48 +118,151 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
         exec dotnet list package --vulnerable --include-transitive --config "$config" --source "$trusted_source"
         """;
-    private const string PythonScannerScript =
-        "validate_python_dependency_sources() { " +
-        "\"$1\" - <<'PY'\n" +
-        "import pathlib, re, sys\n" +
-        "from urllib.parse import urlparse\n" +
-        "allowed_hosts = {'pypi.org', 'files.pythonhosted.org'}\n" +
-        "url_re = re.compile(r'(?i)(?:https?|ftp|file)://[^\\s\\]})>,\"\\']+|(?:git|hg|svn|bzr)\\+[^\\s\\]})>,\"\\']+')\n" +
-        "manifest_names = {'pyproject.toml', 'setup.py', 'setup.cfg'}\n" +
-        "manifests = [p for p in pathlib.Path('.').iterdir() if p.name in manifest_names or p.name.startswith('requirements') and p.suffix == '.txt']\n" +
-        "blocked = []\n" +
-        "for manifest in manifests:\n" +
-        "    try:\n" +
-        "        text = manifest.read_text(encoding='utf-8', errors='ignore')\n" +
-        "    except OSError:\n" +
-        "        continue\n" +
-        "    for line_number, line in enumerate(text.splitlines(), 1):\n" +
-        "        stripped = line.strip()\n" +
-        "        if not stripped or stripped.startswith('#'):\n" +
-        "            continue\n" +
-        "        for match in url_re.finditer(line):\n" +
-        "            raw_url = match.group(0)\n" +
-        "            parsed = urlparse(raw_url.split('+', 1)[1] if '+' in raw_url and '://' in raw_url.split('+', 1)[1] else raw_url)\n" +
-        "            host = (parsed.hostname or '').lower().rstrip('.')\n" +
-        "            if parsed.scheme not in {'https'} or host not in allowed_hosts:\n" +
-        "                blocked.append(f'{manifest}:{line_number}: {raw_url}')\n" +
-        "if blocked:\n" +
-        "    print('" + PythonUnsafeSourceMarker + "', file=sys.stderr)\n" +
-        "    for item in blocked:\n" +
-        "        print(item, file=sys.stderr)\n" +
-        "    sys.exit(126)\n" +
-        "PY\n" +
-        "}; " +
-        "if command -v python3 >/dev/null 2>&1; then validate_python_dependency_sources python3 || exit $?; " +
-        "elif command -v python >/dev/null 2>&1; then validate_python_dependency_sources python || exit $?; fi; " +
-        "if [ -f requirements.txt ]; then " +
-        "if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json -r requirements.txt; fi; " +
-        "if command -v safety >/dev/null 2>&1; then exec safety check -r requirements.txt --json; fi; " +
-        "else " +
-        "if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json .; fi; " +
-        "if command -v safety >/dev/null 2>&1; then exec safety scan --target . --output json; fi; " +
-        "fi; " +
-        "echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127";
+    private static readonly string PythonScannerScript = $$"""
+        validate_python_dependency_sources() {
+        "$1" - <<'PY'
+        import pathlib, re, shlex, sys
+        from urllib.parse import urlparse
+
+        allowed_hosts = {'pypi.org', 'files.pythonhosted.org'}
+        include_options = {'-r', '--requirement', '-c', '--constraint'}
+        manifest_names = {'pyproject.toml', 'setup.py', 'setup.cfg'}
+        root = pathlib.Path('.').resolve()
+        url_re = re.compile(r'''(?i)(?:https?|ftp|file)://[^\s\]})>,"']+|(?:git|hg|svn|bzr)\+[^\s\]})>,"']+''')
+        blocked = []
+        unsupported = []
+        seen_requirements = set()
+
+        def display(path):
+            try:
+                rel = path.resolve().relative_to(root)
+                return rel.as_posix() or '.'
+            except (OSError, ValueError):
+                return str(path)
+
+        def scan_urls(path, text):
+            for line_number, line in enumerate(text.splitlines(), 1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    continue
+                for match in url_re.finditer(line):
+                    raw_url = match.group(0)
+                    parsed_url = raw_url.split('+', 1)[1] if '+' in raw_url and '://' in raw_url.split('+', 1)[1] else raw_url
+                    parsed = urlparse(parsed_url)
+                    host = (parsed.hostname or '').lower().rstrip('.')
+                    if parsed.scheme != 'https' or host not in allowed_hosts:
+                        blocked.append(f'{display(path)}:{line_number}: {raw_url}')
+
+        def include_targets(line):
+            try:
+                tokens = shlex.split(line, comments=True, posix=True)
+            except ValueError:
+                return []
+
+            targets = []
+            i = 0
+            while i < len(tokens):
+                token = tokens[i]
+                if token in include_options:
+                    if i + 1 >= len(tokens):
+                        targets.append((None, f'{token} without a path'))
+                    else:
+                        targets.append((tokens[i + 1], None))
+                        i += 1
+                elif token.startswith('-r') and token != '-r':
+                    targets.append((token[2:], None))
+                elif token.startswith('--requirement='):
+                    targets.append((token.split('=', 1)[1], None))
+                elif token.startswith('-c') and token != '-c':
+                    targets.append((token[2:], None))
+                elif token.startswith('--constraint='):
+                    targets.append((token.split('=', 1)[1], None))
+                i += 1
+            return targets
+
+        def resolve_include(current, target, problem):
+            if problem is not None:
+                return None, problem
+            if not target:
+                return None, 'empty include path'
+            parsed = urlparse(target)
+            if parsed.scheme or re.match(r'(?i)^(git|hg|svn|bzr)\+', target):
+                return None, f'URL include path is not supported: {target}'
+
+            target_path = pathlib.Path(target)
+            if target_path.is_absolute():
+                return None, f'absolute include path is not supported: {target}'
+
+            candidate = (current.parent / target_path).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                return None, f'include path escapes the project directory: {target}'
+            if not candidate.is_file():
+                return None, f'included requirements file was not found: {target}'
+            return candidate, None
+
+        def scan_requirements(path, stack):
+            try:
+                resolved = path.resolve()
+            except OSError as exc:
+                unsupported.append(f'{display(path)}: {exc}')
+                return
+            if resolved in stack:
+                unsupported.append(f'{display(path)}: recursive requirements include')
+                return
+            if resolved in seen_requirements:
+                return
+            seen_requirements.add(resolved)
+
+            try:
+                text = resolved.read_text(encoding='utf-8', errors='ignore')
+            except OSError as exc:
+                unsupported.append(f'{display(path)}: {exc}')
+                return
+
+            scan_urls(resolved, text)
+            next_stack = stack | {resolved}
+            for line_number, line in enumerate(text.splitlines(), 1):
+                for target, problem in include_targets(line):
+                    included, include_problem = resolve_include(resolved, target, problem)
+                    if include_problem is not None:
+                        unsupported.append(f'{display(resolved)}:{line_number}: {include_problem}')
+                    elif included is not None:
+                        scan_requirements(included, next_stack)
+
+        for manifest in pathlib.Path('.').iterdir():
+            if not manifest.is_file():
+                continue
+            if manifest.name in manifest_names:
+                try:
+                    scan_urls(manifest, manifest.read_text(encoding='utf-8', errors='ignore'))
+                except OSError:
+                    continue
+            elif manifest.name.startswith('requirements') and manifest.suffix == '.txt':
+                scan_requirements(manifest, set())
+
+        if blocked or unsupported:
+            print('{{PythonUnsafeSourceMarker}}', file=sys.stderr)
+            for item in blocked:
+                print(item, file=sys.stderr)
+            for item in unsupported:
+                print(item, file=sys.stderr)
+            sys.exit(126)
+        PY
+        }
+        if command -v python3 >/dev/null 2>&1; then validate_python_dependency_sources python3 || exit $?;
+        elif command -v python >/dev/null 2>&1; then validate_python_dependency_sources python || exit $?;
+        else echo 'python interpreter is not installed in sandbox' >&2; exit 127; fi;
+        if [ -f requirements.txt ]; then
+        if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json -r requirements.txt; fi;
+        if command -v safety >/dev/null 2>&1; then exec safety check -r requirements.txt --json; fi;
+        else
+        if command -v pip-audit >/dev/null 2>&1; then exec pip-audit -f json .; fi;
+        if command -v safety >/dev/null 2>&1; then exec safety scan --target . --output json; fi;
+        fi;
+        echo 'pip-audit or safety is not installed in sandbox' >&2; exit 127
+        """;
 
     private static readonly IReadOnlyDictionary<string, string> NpmAuditEnvironment =
         new Dictionary<string, string>(StringComparer.Ordinal)
@@ -218,24 +321,6 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 ["npm", "audit", "--json", "--registry", NpmAuditRegistry],
                 "npm not installed in sandbox; CVE scan skipped",
                 "Install Node.js/npm in the sandbox image to enable Node CVE scanning.",
-                ParseNpmFindings,
-                "npm audit exited with code {0} but no vulnerability records were parsed.",
-                NpmAuditEnvironment),
-            ["javascript"] = new(
-                "javascript",
-                LanguageProjectDiscovery.NodeDiscoveryScript,
-                ["npm", "audit", "--json", "--registry", NpmAuditRegistry],
-                "npm not installed in sandbox; CVE scan skipped",
-                "Install Node.js/npm in the sandbox image to enable JavaScript CVE scanning.",
-                ParseNpmFindings,
-                "npm audit exited with code {0} but no vulnerability records were parsed.",
-                NpmAuditEnvironment),
-            ["typescript"] = new(
-                "typescript",
-                LanguageProjectDiscovery.NodeDiscoveryScript,
-                ["npm", "audit", "--json", "--registry", NpmAuditRegistry],
-                "npm not installed in sandbox; CVE scan skipped",
-                "Install Node.js/npm in the sandbox image to enable TypeScript CVE scanning.",
                 ParseNpmFindings,
                 "npm audit exited with code {0} but no vulnerability records were parsed.",
                 NpmAuditEnvironment),

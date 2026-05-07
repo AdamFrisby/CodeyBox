@@ -160,17 +160,15 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 | `csharp` | `dotnet format --verify-no-changes`, `dotnet build --no-incremental /warnaserror`, `dotnet test --no-build` |
 | `python` | `ruff format --check .`, `mypy .` or `pyright --workdir .`, `pytest` |
 | `node` | `prettier --check .`, `eslint .`, `npm test` |
-| `javascript` | Compatibility alias for Node-style `package.json` projects |
-| `typescript` | Compatibility alias for Node-style `package.json` projects |
 | `go` | `gofmt -l .` (non-empty output fails), `go vet ./...`, `go test ./...` |
 | `rust` | `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` |
 
-Allowed built-in language values are `csharp`, `python`, `node`, `javascript`,
-`typescript`, `go`, and `rust`. Unknown strings are logged at startup and
-skipped. If `Languages` is omitted and no default is configured, no
-language-specific PR auditors run; language-agnostic audit types and custom
-auditors still work. Release dependency CVE scans follow the same language list:
-when no languages are configured, no language-specific CVE scanner runs.
+Allowed built-in language values are `csharp`, `python`, `node`, `go`, and
+`rust`. Unknown strings are logged at startup and skipped. If `Languages` is
+omitted and no default is configured, no language-specific PR auditors run;
+language-agnostic audit types and custom auditors still work. Release
+dependency CVE scans follow the same language list: when no languages are
+configured, no language-specific CVE scanner runs.
 
 Each language preset recursively checks for that language's marker files before running:
 `*.csproj`/`*.sln`/`*.slnx` for C#, `pyproject.toml`/`setup.py`/`setup.cfg`/

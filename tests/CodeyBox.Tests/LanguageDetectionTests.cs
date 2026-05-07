@@ -50,8 +50,6 @@ public sealed class LanguageDetectionTests
     [InlineData("csharp", "csharp:format-check")]
     [InlineData("python", "python:format-check")]
     [InlineData("node", "node:lint")]
-    [InlineData("javascript", "javascript:lint")]
-    [InlineData("typescript", "typescript:lint")]
     [InlineData("go", "go:vet")]
     [InlineData("rust", "rust:lint")]
     public void SupportedLanguagePresetsResolveExpectedAuditors(string language, string auditorName)

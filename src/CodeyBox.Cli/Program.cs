@@ -91,7 +91,7 @@ var selectedLanguages = AnsiConsole.Prompt(
         .NotRequired()
         .InstructionsText("[dim grey](Press [blue]<space>[/] to toggle, [green]<enter>[/] to accept)[/]")
         .HighlightStyle(new Style(Color.Cyan1))
-        .AddChoices("csharp", "python", "node", "javascript", "typescript", "go", "rust"));
+        .AddChoices("csharp", "python", "node", "go", "rust"));
 
 // ── Audit: AuditTypes ────────────────────────────────────────────────────────
 AnsiConsole.WriteLine();

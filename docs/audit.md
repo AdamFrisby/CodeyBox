@@ -130,8 +130,6 @@ tool-only and only run when their marker files are present in the work tree:
 | `csharp` | `*.csproj`, `*.sln`, `*.slnx` | `csharp:format-check`, `csharp:build-WaE`, `csharp:test-pass` |
 | `python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `python:format-check`, `python:typecheck`, `python:test-pass` |
 | `node` | `package.json` | `node:format-check`, `node:lint`, `node:test-pass` |
-| `javascript` | `package.json` | `javascript:format-check`, `javascript:lint`, `javascript:test-pass` |
-| `typescript` | `package.json` | `typescript:format-check`, `typescript:lint`, `typescript:test-pass` |
 | `go` | `go.mod` | `go:format-check`, `go:vet`, `go:test-pass` |
 | `rust` | `Cargo.toml` | `rust:format-check`, `rust:lint`, `rust:test-pass` |
 
