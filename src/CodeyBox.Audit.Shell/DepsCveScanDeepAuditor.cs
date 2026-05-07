@@ -356,7 +356,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
     public string Name => "deps-cve-scan";
     public string Kind => "shell";
-    public AuditCapabilities Required => AuditCapabilities.Network;
+    public AuditCapabilities Required => AuditCapabilities.None;
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
@@ -439,7 +439,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                         AuditorName: Name,
                         Severity: AuditSeverity.Error,
                         Title: "C# CVE scan blocked repository-controlled NuGet source URLs",
-                        Description: "C# dependency metadata contains NuGet package-source URLs outside the allowed public NuGet hosts (api.nuget.org and www.nuget.org). The dependency CVE scanner was not run because those URLs could trigger SSRF from the network-enabled audit sandbox. Stderr: " + TruncatedOutput(result.Stderr, out _)));
+                        Description: "C# dependency metadata contains NuGet package-source URLs outside the allowed public NuGet hosts (api.nuget.org and www.nuget.org). The dependency CVE scanner was not run because those URLs could trigger SSRF if the audit sandbox has egress. Stderr: " + TruncatedOutput(result.Stderr, out _)));
                     continue;
                 }
 
@@ -449,7 +449,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                         AuditorName: Name,
                         Severity: AuditSeverity.Error,
                         Title: "Python CVE scan blocked repository-controlled package source URLs",
-                        Description: "Python dependency metadata contains direct package URLs or alternate package-source URLs outside the allowed public package hosts (pypi.org and files.pythonhosted.org). The dependency CVE scanner was not run because those URLs could trigger SSRF from the network-enabled audit sandbox. Stderr: " + TruncatedOutput(result.Stderr, out _)));
+                        Description: "Python dependency metadata contains direct package URLs or alternate package-source URLs outside the allowed public package hosts (pypi.org and files.pythonhosted.org). The dependency CVE scanner was not run because those URLs could trigger SSRF if the audit sandbox has egress. Stderr: " + TruncatedOutput(result.Stderr, out _)));
                     continue;
                 }
 

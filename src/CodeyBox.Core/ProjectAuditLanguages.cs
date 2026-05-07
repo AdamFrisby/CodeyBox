@@ -2,7 +2,7 @@ namespace CodeyBox.Core;
 
 public static class ProjectAuditLanguages
 {
-    public static readonly IReadOnlyList<string> Default = [];
+    public static readonly IReadOnlyList<string> Default = ["csharp"];
 
     public static readonly IReadOnlySet<string> Supported =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase)
