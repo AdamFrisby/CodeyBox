@@ -217,7 +217,7 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
-    public async Task ManyMarkerDirectories_AllRun()
+    public async Task ManyMarkerDirectories_AreCapped()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
@@ -226,15 +226,15 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.True(result.Passed);
-        Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.DoesNotContain(result.Findings, f =>
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings, f =>
             f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(40, sandbox.Commands.Count(c => c == "pytest"));
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal(LanguageProjectDiscovery.MaxProjectDirectoriesToRun, sandbox.Commands.Count(c => c == "pytest"));
     }
 
     [Fact]
-    public async Task CSharpManyMarkerDirectories_AllRunWhenNoRootMarker()
+    public async Task CSharpManyMarkerDirectories_AreCappedWhenNoRootMarker()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
@@ -243,11 +243,13 @@ public sealed class LanguageDetectionTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
 
-        Assert.True(result.Passed);
-        Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.DoesNotContain(result.Findings, f =>
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings, f =>
             f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(40, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal(
+            LanguageProjectDiscovery.MaxProjectDirectoriesToRun,
+            sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
     }
 
     [Fact]

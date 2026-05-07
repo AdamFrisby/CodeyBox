@@ -408,7 +408,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task ManyProjectDirectories_AllRun()
+    public async Task ManyProjectDirectories_AreCapped()
     {
         var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./python-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
@@ -422,15 +422,17 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
-        Assert.True(result.Passed);
-        Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.DoesNotContain(result.Findings, f =>
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings, f =>
             f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(40, sandbox.Commands.Count(c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal)));
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal(
+            LanguageProjectDiscovery.MaxProjectDirectoriesToRun,
+            sandbox.Commands.Count(c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal)));
     }
 
     [Fact]
-    public async Task CSharpManyProjectDirectories_AllRunWhenNoRootMarker()
+    public async Task CSharpManyProjectDirectories_AreCappedWhenNoRootMarker()
     {
         var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./csharp-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
@@ -444,14 +446,15 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
-        Assert.True(result.Passed);
-        Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.DoesNotContain(result.Findings, f =>
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings, f =>
             f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(40, sandbox.Commands.Count(c =>
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal(LanguageProjectDiscovery.MaxProjectDirectoriesToRun, sandbox.Commands.Count(c =>
             c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal)));
         Assert.Contains("/repo/csharp-0", sandbox.WorkingDirectories);
-        Assert.Contains("/repo/csharp-39", sandbox.WorkingDirectories);
+        Assert.Contains("/repo/csharp-31", sandbox.WorkingDirectories);
+        Assert.DoesNotContain("/repo/csharp-32", sandbox.WorkingDirectories);
     }
 
     [Fact]
@@ -474,6 +477,25 @@ public sealed class DepsCveScanLanguageDispatchTests
             c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal)));
         Assert.Contains("/repo", sandbox.WorkingDirectories);
         Assert.DoesNotContain("/repo/csharp-0", sandbox.WorkingDirectories);
+    }
+
+    [Fact]
+    public async Task HiddenMarkerDirectory_PreservesLeadingDotInCveScannerWorkingDirectory()
+    {
+        var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: "./.devcontainer\n");
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["node"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.True(result.Passed);
+        Assert.Contains("/repo/.devcontainer", sandbox.WorkingDirectories);
+        Assert.DoesNotContain("/repo/devcontainer", sandbox.WorkingDirectories);
     }
 
     [Fact]

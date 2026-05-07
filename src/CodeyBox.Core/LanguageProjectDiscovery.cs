@@ -2,6 +2,8 @@ namespace CodeyBox.Core;
 
 public static class LanguageProjectDiscovery
 {
+    public const int MaxProjectDirectoriesToRun = 32;
+
     private const string PruneExpression =
         "-type d \\( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \\) -prune -o";
 
@@ -37,6 +39,11 @@ public static class LanguageProjectDiscovery
         out int skippedDueToLimit)
     {
         skippedDueToLimit = 0;
-        return SelectProjectDirectoriesToRun(language, projectDirectories);
+        var selected = SelectProjectDirectoriesToRun(language, projectDirectories);
+        if (selected.Count <= MaxProjectDirectoriesToRun)
+            return selected;
+
+        skippedDueToLimit = selected.Count - MaxProjectDirectoriesToRun;
+        return selected.Take(MaxProjectDirectoriesToRun).ToList();
     }
 }

@@ -72,7 +72,8 @@ internal sealed class LanguagePresetAuditor : IAuditor
 
         var projectDirectoriesToRun = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
             _language,
-            projectDirectories);
+            projectDirectories,
+            out var skippedDueToLimit);
 
         foreach (var projectDirectory in projectDirectoriesToRun)
         {
@@ -87,6 +88,16 @@ internal sealed class LanguagePresetAuditor : IAuditor
             allFindings.AddRange(result.Findings);
             if (!string.IsNullOrWhiteSpace(result.RawOutput))
                 AppendRawPart(rawParts, $"## {projectDirectory}\n{result.RawOutput}", ref rawOutputChars, ref rawOutputTruncated);
+        }
+
+        if (skippedDueToLimit > 0)
+        {
+            passed = false;
+            allFindings.Add(new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Error,
+                Title: $"{_language} project directory limit reached",
+                Description: $"Discovery found {projectDirectories.Count} {_language} project directories. Only the first {LanguageProjectDiscovery.MaxProjectDirectoriesToRun} were audited and {skippedDueToLimit} were skipped to prevent repository-controlled marker files from exhausting audit workers."));
         }
 
         if (rawOutputTruncated)

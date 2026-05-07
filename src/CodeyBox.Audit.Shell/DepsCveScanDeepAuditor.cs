@@ -554,7 +554,8 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             var projectDirectories = ParseProjectDirectories(discovery.Stdout);
             var projectDirectoriesToRun = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
                 language,
-                projectDirectories);
+                projectDirectories,
+                out var skippedDueToLimit);
 
             foreach (var projectDirectory in projectDirectoriesToRun)
             {
@@ -636,6 +637,15 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 }
 
                 allFindings.AddRange(findings);
+            }
+
+            if (skippedDueToLimit > 0)
+            {
+                allFindings.Add(new AuditFinding(
+                    AuditorName: Name,
+                    Severity: AuditSeverity.Error,
+                    Title: $"{language} CVE scan project directory limit reached",
+                    Description: $"Discovery found {projectDirectories.Count} {language} dependency project directories. Only the first {LanguageProjectDiscovery.MaxProjectDirectoriesToRun} were scanned and {skippedDueToLimit} were skipped to prevent repository-controlled marker files from exhausting audit workers."));
             }
         }
 
@@ -1261,7 +1271,13 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         if (projectDirectory == ".")
             return workingDirectory;
 
-        return workingDirectory.TrimEnd('/') + "/" + projectDirectory.TrimStart('.', '/');
+        var relativeProjectDirectory = projectDirectory.StartsWith("./", StringComparison.Ordinal)
+            ? projectDirectory[2..]
+            : projectDirectory.TrimStart('/');
+        if (relativeProjectDirectory.Length == 0 || relativeProjectDirectory == ".")
+            return workingDirectory;
+
+        return workingDirectory.TrimEnd('/') + "/" + relativeProjectDirectory;
     }
 
     private static string CombinedOutput(SandboxExecResult result, out bool wasTruncated)
