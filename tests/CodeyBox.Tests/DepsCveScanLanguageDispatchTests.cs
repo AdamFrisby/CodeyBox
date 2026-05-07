@@ -6,12 +6,12 @@ namespace CodeyBox.Tests;
 public sealed class DepsCveScanLanguageDispatchTests
 {
     [Fact]
-    public void RunsWithoutNetworkCapability()
+    public void RequiresNetworkCapability()
     {
         var auditor = new DepsCveScanDeepAuditor();
 
-        Assert.Equal(AuditCapabilities.None, auditor.Required);
-        Assert.False(auditor.Required.HasFlag(AuditCapabilities.Network));
+        Assert.Equal(AuditCapabilities.Network, auditor.Required);
+        Assert.True(auditor.Required.HasFlag(AuditCapabilities.Network));
         Assert.False(auditor.Required.HasFlag(AuditCapabilities.AgentCredentials));
     }
 
@@ -74,7 +74,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task UnsetLanguagesRunLegacyCSharpScanner()
+    public async Task UnsetLanguagesRunNoLanguageSpecificScanner()
     {
         var sandbox = new DispatchSandbox(markerPresent: true);
         var auditor = new DepsCveScanDeepAuditor();
@@ -87,9 +87,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         var result = await auditor.RunAsync(sandbox, "/repo", ctx);
 
         Assert.True(result.Passed);
-        Assert.Contains(sandbox.Commands, c =>
-            c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal));
-        Assert.Contains(sandbox.WorkingDirectories, d => d == "/repo/csharp");
+        Assert.Empty(sandbox.Commands);
         Assert.Empty(result.Findings);
     }
 

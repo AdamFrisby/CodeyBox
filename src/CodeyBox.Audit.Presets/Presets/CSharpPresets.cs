@@ -10,7 +10,7 @@ internal static class CSharpPresets
                 "*.csproj/*.sln/*.slnx",
                 LanguagePresetHelpers.CSharpMarkerScript,
                 "csharp:format-check",
-                "dotnet", "format", "--verify-no-changes", "--no-restore"),
+                "dotnet", "format", "--verify-no-changes"),
             LanguagePresetHelpers.Shell(
                 "csharp",
                 "*.csproj/*.sln/*.slnx",

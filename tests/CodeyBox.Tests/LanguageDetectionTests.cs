@@ -109,6 +109,38 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
+    public async Task NodeTestPass_Exit127FromRepositoryScript_RemainsBlocking()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("node", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "node:test-pass");
+        var sandbox = new NodeScriptExit127Sandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("command exited 127", finding.Title);
+    }
+
+    [Fact]
+    public async Task NodeTestPass_MissingNpmTool_ReportsInfo()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("node", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "node:test-pass");
+        var sandbox = new MissingNpmSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Contains("tool not installed", finding.Title);
+    }
+
+    [Fact]
     public async Task CSharpDiscoveryIncludesStandaloneProjectWhenSolutionExistsElsewhere()
     {
         var root = Path.Combine(Path.GetTempPath(), $"cb-csharp-discovery-{Guid.NewGuid():N}");
@@ -271,6 +303,39 @@ public sealed class LanguageDetectionTests
                 return Task.FromResult(new SandboxExecResult(0, "./python\n", ""));
 
             return Task.FromResult(new SandboxExecResult(127, "", "pytest: not found"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class NodeScriptExit127Sandbox : ISandbox
+    {
+        public string Id => "node-script-exit-127";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+                return Task.FromResult(new SandboxExecResult(0, "./node\n", ""));
+
+            return Task.FromResult(new SandboxExecResult(
+                127,
+                "",
+                "sh: 1: definitely-not-a-real-test-command: not found"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class MissingNpmSandbox : ISandbox
+    {
+        public string Id => "missing-npm";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+                return Task.FromResult(new SandboxExecResult(0, "./node\n", ""));
+
+            return Task.FromResult(new SandboxExecResult(127, "", "npm: not found"));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

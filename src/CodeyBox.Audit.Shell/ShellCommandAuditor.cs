@@ -43,17 +43,16 @@ public sealed class ShellCommandAuditor : IAuditor
 
         var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
 
-        // Exit 127 means the shell couldn't find the command — i.e. the tool
-        // isn't installed in the audit sandbox. That's an operator-level
-        // configuration gap, not something the agent can fix by editing
-        // code. Emit it as an INFO finding so it shows up in the report
-        // (operator should install the tool and re-run audit) but doesn't
-        // gate merge or trigger an unfixable rework loop.
-        var severity = result.ExitCode == 127
+        // Exit 127 is only non-blocking when it is confirmed to be the
+        // auditor's tool missing from the sandbox. Some tools, notably
+        // npm, propagate exit 127 from repository-controlled scripts; those
+        // remain blocking command failures.
+        var missingTool = IsConfirmedMissingTopLevelTool(result, combinedOutput);
+        var severity = missingTool
             ? AuditSeverity.Info
             : AuditSeverity.Error;
         var toolName = _opts.ToolName ?? _opts.Argv[0];
-        var title = result.ExitCode == 127
+        var title = missingTool
             ? $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)"
             : $"command exited {result.ExitCode}: {string.Join(' ', _opts.Argv)}";
 
@@ -64,6 +63,25 @@ public sealed class ShellCommandAuditor : IAuditor
             Description: description.TrimEnd());
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
+
+    private bool IsConfirmedMissingTopLevelTool(SandboxExecResult result, string combinedOutput)
+    {
+        if (result.ExitCode != 127)
+            return false;
+
+        if (_opts.TreatExit127AsMissingTool is not null)
+            return _opts.TreatExit127AsMissingTool.Value;
+
+        var toolName = _opts.ToolName ?? _opts.Argv[0];
+        if (string.IsNullOrWhiteSpace(toolName))
+            return false;
+
+        var output = combinedOutput.Trim();
+        return output.Contains($"{toolName}: not found", StringComparison.OrdinalIgnoreCase) ||
+               output.Contains($"{toolName}: command not found", StringComparison.OrdinalIgnoreCase) ||
+               output.Contains($"exec: \"{toolName}\"", StringComparison.OrdinalIgnoreCase) ||
+               output.Contains($"executable file not found", StringComparison.OrdinalIgnoreCase) && output.Contains(toolName, StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 public sealed record ShellCommandAuditorOptions
@@ -71,4 +89,5 @@ public sealed record ShellCommandAuditorOptions
     public required string Name { get; init; }
     public required IReadOnlyList<string> Argv { get; init; }
     public string? ToolName { get; init; }
+    public bool? TreatExit127AsMissingTool { get; init; }
 }

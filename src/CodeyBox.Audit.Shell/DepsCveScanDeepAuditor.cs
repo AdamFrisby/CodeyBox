@@ -356,7 +356,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
     public string Name => "deps-cve-scan";
     public string Kind => "shell";
-    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditCapabilities Required => AuditCapabilities.Network;
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,

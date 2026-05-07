@@ -16,7 +16,7 @@ internal static class PythonPresets
                 "pyproject.toml/setup.py/setup.cfg/requirements.txt",
                 LanguagePresetHelpers.PythonMarkerScript,
                 "python:typecheck",
-                "if command -v mypy >/dev/null 2>&1; then exec mypy .; fi; if command -v pyright >/dev/null 2>&1; then exec pyright --workdir .; fi; echo 'mypy or pyright is not installed in sandbox' >&2; exit 127",
+                "if command -v mypy >/dev/null 2>&1; then exec mypy .; fi; if command -v pyright >/dev/null 2>&1; then exec pyright --workdir .; fi; echo 'mypy or pyright: not found in sandbox' >&2; exit 127",
                 "mypy or pyright"),
             LanguagePresetHelpers.Shell(
                 "python",
