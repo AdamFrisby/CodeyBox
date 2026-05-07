@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -13,51 +15,78 @@ namespace CodeyBox.Git;
 /// </summary>
 public sealed class LocalGitHost : IGitHost
 {
+    private static readonly ConcurrentDictionary<string, RepositoryLockState> RepositoryLocks = new(StringComparer.Ordinal);
+    private static readonly Regex UrlUserInfoPattern = new(
+        @"(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
     private readonly LocalGitHostOptions _opts;
     private readonly ILogger<LocalGitHost> _log;
+    private readonly string _disabledHooksPath;
 
     public LocalGitHost(LocalGitHostOptions opts, ILogger<LocalGitHost> log)
     {
         _opts = opts;
         _log = log;
         Directory.CreateDirectory(_opts.RootDirectory);
+        _disabledHooksPath = Path.Combine(_opts.RootDirectory, ".codeybox-disabled-hooks");
+        Directory.CreateDirectory(_disabledHooksPath);
     }
 
     public async Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+        => await EnsureRepositoryAsync(id, seedFromUrl, baseBranch: null, ct);
+
+    public async Task<string> EnsureRepositoryAsync(
+        WorkItemId id,
+        string? seedFromUrl,
+        string? baseBranch,
+        CancellationToken ct = default)
     {
         var repoId = id.ToString();
         var path = GetRepoPath(repoId);
-        if (Directory.Exists(path))
-            return repoId;
-
-        if (seedFromUrl is not null)
-            Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
-
-        Directory.CreateDirectory(path);
-        if (seedFromUrl is not null)
+        var gate = await AcquireRepositoryLockAsync(path, ct);
+        try
         {
-            // git clone --bare -- <url> <path>
-            //
-            // The `--` separator stops git treating a URL like
-            // "--upload-pack=evil-cmd" as an option. ArgumentList.Add already
-            // prevents shell injection; the `--` defends against git's own
-            // option parser.
-            var rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
-            if (rc.ExitCode != 0)
+            if (Directory.Exists(path))
             {
-                Directory.Delete(path, recursive: true);
-                throw new InvalidOperationException($"Failed to seed bare repo from {seedFromUrl}: {rc.Stderr}");
+                if (seedFromUrl is not null)
+                    await FetchUpstreamAsync(path, seedFromUrl, baseBranch, ct);
+                return repoId;
             }
-        }
-        else
-        {
-            Repository.Init(path, isBare: true);
-        }
 
-        // Allow non-fast-forward pushes from the work sandbox to its branch.
-        // The receive hook is conservative: protect the default/target branch.
-        ApplyReceivePolicy(path);
-        return repoId;
+            if (seedFromUrl is not null)
+                Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
+
+            Directory.CreateDirectory(path);
+            if (seedFromUrl is not null)
+            {
+                // git clone --bare -- <url> <path>
+                //
+                // The `--` separator stops git treating a URL like
+                // "--upload-pack=evil-cmd" as an option. ArgumentList.Add already
+                // prevents shell injection; the `--` defends against git's own
+                // option parser.
+                var rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
+                if (rc.ExitCode != 0)
+                {
+                    Directory.Delete(path, recursive: true);
+                    throw new InvalidOperationException($"Failed to seed bare repo from {seedFromUrl}: {rc.Stderr}");
+                }
+            }
+            else
+            {
+                Repository.Init(path, isBare: true);
+            }
+
+            // Allow non-fast-forward pushes from the work sandbox to its branch.
+            // The receive hook is conservative: protect the default/target branch.
+            ApplyReceivePolicy(path);
+            return repoId;
+        }
+        finally
+        {
+            gate.Dispose();
+        }
     }
 
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
@@ -118,7 +147,7 @@ public sealed class LocalGitHost : IGitHost
         if (!IsNonFastForwardRejection(rc.Stdout, rc.Stderr))
             throw new InvalidOperationException($"git push to upstream failed: {rc.Stderr}");
 
-        await ReconcileRejectedUpstreamPushAsync(path, upstreamUrl, branch, upstreamEnv, reconcileStrategy, _log, ct);
+        await ReconcileRejectedUpstreamPushAsync(path, upstreamUrl, branch, upstreamEnv, reconcileStrategy, ct);
 
         rc = await RunGitAsync(
             workdir: path,
@@ -129,15 +158,24 @@ public sealed class LocalGitHost : IGitHost
             throw new InvalidOperationException($"git push to upstream failed after reconcile: {rc.Stderr}");
     }
 
-    public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+    public async Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);
-        if (Directory.Exists(path))
+        var gate = await AcquireRepositoryLockAsync(path, ct);
+        try
         {
-            try { Directory.Delete(path, recursive: true); }
-            catch (Exception ex) { _log.LogWarning(ex, "Failed to delete bare repo at {Path}", path); }
+            if (Directory.Exists(path))
+            {
+                try { Directory.Delete(path, recursive: true); }
+                catch (Exception ex) { _log.LogWarning(ex, "Failed to delete bare repo at {Path}", path); }
+            }
+
+            MarkRepositoryLockForEviction(path, gate.State);
         }
-        return Task.CompletedTask;
+        finally
+        {
+            gate.Dispose();
+        }
     }
 
     public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
@@ -178,6 +216,62 @@ public sealed class LocalGitHost : IGitHost
 
     public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
 
+    private static async Task<RepositoryLockLease> AcquireRepositoryLockAsync(string path, CancellationToken ct)
+    {
+        while (true)
+        {
+            var state = RepositoryLocks.GetOrAdd(path, static _ => new RepositoryLockState());
+            Interlocked.Increment(ref state.References);
+            if (!RepositoryLocks.TryGetValue(path, out var current) ||
+                !ReferenceEquals(current, state) ||
+                Volatile.Read(ref state.EvictWhenIdle) != 0)
+            {
+                ReleaseRepositoryLockReference(path, state);
+                continue;
+            }
+
+            try
+            {
+                await state.Semaphore.WaitAsync(ct);
+            }
+            catch
+            {
+                ReleaseRepositoryLockReference(path, state);
+                throw;
+            }
+
+            if (Volatile.Read(ref state.EvictWhenIdle) == 0)
+                return new RepositoryLockLease(path, state);
+
+            state.Semaphore.Release();
+            ReleaseRepositoryLockReference(path, state);
+        }
+    }
+
+    private static void MarkRepositoryLockForEviction(string path, RepositoryLockState state)
+    {
+        Volatile.Write(ref state.EvictWhenIdle, 1);
+        RemoveRepositoryLockIfIdle(path, state);
+    }
+
+    private static void ReleaseRepositoryLockReference(string path, RepositoryLockState state)
+    {
+        if (Interlocked.Decrement(ref state.References) == 0)
+            RemoveRepositoryLockIfIdle(path, state);
+    }
+
+    private static void RemoveRepositoryLockIfIdle(string path, RepositoryLockState state)
+    {
+        if (Volatile.Read(ref state.EvictWhenIdle) == 0 ||
+            Volatile.Read(ref state.References) != 0)
+        {
+            return;
+        }
+
+        ((ICollection<KeyValuePair<string, RepositoryLockState>>)RepositoryLocks)
+            .Remove(new KeyValuePair<string, RepositoryLockState>(path, state));
+    }
+
     private static bool IsNonFastForwardRejection(string stdout, string stderr)
     {
         var output = stdout + "\n" + stderr;
@@ -186,13 +280,104 @@ public sealed class LocalGitHost : IGitHost
             || output.Contains("fetch first", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static async Task ReconcileRejectedUpstreamPushAsync(
+    private async Task FetchUpstreamAsync(
+        string bareRepoPath,
+        string seedFromUrl,
+        string? baseBranch,
+        CancellationToken ct)
+    {
+        Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
+        var safeUpstream = ScrubCredentialMaterial(seedFromUrl);
+
+        SanitizeBareRepositoryConfig(bareRepoPath);
+        var branch = await ResolveRefreshBranchAsync(bareRepoPath, seedFromUrl, baseBranch, ct);
+        if (branch is null)
+        {
+            _log.LogWarning(
+                "Skipped bare repo refresh for {Path}: no configured base branch and upstream {Upstream} did not advertise a default branch",
+                bareRepoPath, safeUpstream);
+            return;
+        }
+
+        Validation.ValidateBranchName(branch, nameof(baseBranch));
+        var rc = await RunGitAsync(
+            workdir: bareRepoPath,
+            ct,
+            "fetch", "--no-tags", "--prune", seedFromUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+        if (rc.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Failed to refresh bare repo {Path} branch {Branch} from upstream {Upstream}: {Stderr}",
+                bareRepoPath, branch, safeUpstream, ScrubCredentialMaterial(rc.Stderr));
+        }
+    }
+
+    private async Task<string?> ResolveRefreshBranchAsync(
+        string bareRepoPath,
+        string seedFromUrl,
+        string? baseBranch,
+        CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(baseBranch))
+            return baseBranch;
+
+        // HEAD lives inside the sandbox-writable bare repo, so do not use it
+        // to choose what host-side refresh should fetch. Ask the upstream for
+        // its advertised default branch under the host-controlled git config.
+        var rc = await RunGitAsync(bareRepoPath, ct, "ls-remote", "--symref", seedFromUrl, "HEAD");
+        if (rc.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Failed to resolve upstream default branch for bare repo {Path} from {Upstream}: {Stderr}",
+                bareRepoPath,
+                ScrubCredentialMaterial(seedFromUrl),
+                ScrubCredentialMaterial(rc.Stderr));
+            return null;
+        }
+
+        foreach (var line in rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            const string prefix = "ref: refs/heads/";
+            if (!line.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+
+            var branch = line[prefix.Length..].Split('\t', 2)[0].Trim();
+            if (!string.IsNullOrWhiteSpace(branch))
+                return branch;
+        }
+
+        _log.LogDebug(
+            "Upstream {Upstream} did not advertise a symbolic HEAD while refreshing bare repo {Path}",
+            ScrubCredentialMaterial(seedFromUrl),
+            bareRepoPath);
+        return null;
+    }
+
+    private static void SanitizeBareRepositoryConfig(string bareRepoPath)
+    {
+        var configPath = Path.Combine(bareRepoPath, "config");
+        var tempPath = Path.Combine(bareRepoPath, "config.codeybox-" + Guid.NewGuid().ToString("N") + ".tmp");
+        File.WriteAllText(
+            tempPath,
+            """
+            [core]
+                repositoryformatversion = 0
+                filemode = true
+                bare = true
+
+            """);
+        File.Move(tempPath, configPath, overwrite: true);
+    }
+
+    private static string ScrubCredentialMaterial(string value)
+        => UrlUserInfoPattern.Replace(RawOutputRedactor.Redact(value), "${scheme}***@");
+
+    private async Task ReconcileRejectedUpstreamPushAsync(
         string bareRepoPath,
         string upstreamUrl,
         string branch,
         IReadOnlyDictionary<string, string> upstreamEnv,
         UpstreamPushReconcileStrategy reconcileStrategy,
-        ILogger<LocalGitHost> log,
         CancellationToken ct)
     {
         var upstreamRef = $"refs/remotes/codeybox-upstream/{branch}";
@@ -254,7 +439,7 @@ public sealed class LocalGitHost : IGitHost
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    log.LogWarning(ex, "Failed to remove upstream reconcile worktree at {Path}", worktreePath);
+                    _log.LogWarning(ex, "Failed to remove upstream reconcile worktree at {Path}", worktreePath);
                 }
             }
         }
@@ -267,13 +452,13 @@ public sealed class LocalGitHost : IGitHost
         // defence in depth (e.g. block direct pushes to main from work phase).
     }
 
-    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
         string workdir,
         CancellationToken ct,
         params string[] args)
         => await RunGitAsync(workdir, ct, extraEnv: null, args);
 
-    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunGitAsync(
         string workdir,
         CancellationToken ct,
         IReadOnlyDictionary<string, string>? extraEnv,
@@ -288,6 +473,8 @@ public sealed class LocalGitHost : IGitHost
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add($"core.hooksPath={_disabledHooksPath}");
         foreach (var a in args) psi.ArgumentList.Add(a);
         if (extraEnv is not null)
             foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;
@@ -298,6 +485,39 @@ public sealed class LocalGitHost : IGitHost
         var stderr = await p.StandardError.ReadToEndAsync(ct);
         await p.WaitForExitAsync(ct);
         return (p.ExitCode, stdout, stderr);
+    }
+
+    private sealed class RepositoryLockState
+    {
+        public SemaphoreSlim Semaphore { get; } = new(1, 1);
+        public int References;
+        public int EvictWhenIdle;
+    }
+
+    private sealed class RepositoryLockLease : IDisposable
+    {
+        private readonly string _path;
+        private RepositoryLockState? _state;
+
+        public RepositoryLockLease(string path, RepositoryLockState state)
+        {
+            _path = path;
+            _state = state;
+        }
+
+        public RepositoryLockState State =>
+            _state ?? throw new ObjectDisposedException(nameof(RepositoryLockLease));
+
+        public void Dispose()
+        {
+            var state = _state;
+            if (state is null)
+                return;
+
+            _state = null;
+            state.Semaphore.Release();
+            ReleaseRepositoryLockReference(_path, state);
+        }
     }
 }
 

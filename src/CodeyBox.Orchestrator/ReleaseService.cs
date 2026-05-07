@@ -120,11 +120,11 @@ public sealed class ReleaseService
 
         var branchName = project.ReleaseConfig.BranchNameTemplate.Replace("{name}", release.Name);
 
-        // Create a temporary bare repo to discover origin/main SHA and create the branch.
+        // Create a temporary bare repo to discover the configured base SHA and create the branch.
         // We reuse the WorkItemId slot with the release GUID so LocalGitHost gives us a stable directory.
         var fakeItemId = new WorkItemId(release.Id.Value);
-        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, ct);
-        var defaultBranch = await _gitHost.GetDefaultBranchAsync(repoId, ct);
+        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, project.DefaultBaseBranch, ct);
+        var baseBranch = project.DefaultBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
 
         // Spin up a sandbox to run git commands against the bare repo.
@@ -145,19 +145,19 @@ public sealed class ReleaseService
 
         await RunSandboxCmd(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, "/work/repo");
 
-        // Capture base_commit_sha = origin/main
+        // Capture base_commit_sha from the configured base branch.
         var headResult = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["git", "-C", "/work/repo", "rev-parse", $"origin/{defaultBranch}"],
+            Argv = ["git", "-C", "/work/repo", "rev-parse", $"origin/{baseBranch}"],
         }, ct);
         if (!headResult.Success)
-            throw new InvalidOperationException($"Could not resolve origin/{defaultBranch}: {headResult.Stderr}");
+            throw new InvalidOperationException($"Could not resolve origin/{baseBranch}: {headResult.Stderr}");
         var baseCommitSha = headResult.Stdout.Trim();
 
         // Create branch locally and push to remote BEFORE writing to DB, so that any
         // concurrent worker that loses the DB race reads a branch that already exists.
         // Two workers may race on the push; "already exists" is a safe non-fatal outcome.
-        await RunSandboxCmd(sandbox, ct, "git", "-C", "/work/repo", "checkout", "-b", branchName);
+        await RunSandboxCmd(sandbox, ct, "git", "-C", "/work/repo", "checkout", "-b", branchName, baseCommitSha);
         var pushResult = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["git", "-C", "/work/repo", "push", "origin", $"{branchName}:{branchName}"],
@@ -477,7 +477,7 @@ public sealed class ReleaseService
         if (release.BranchName is null) return allFindings;
 
         var fakeItemId = new WorkItemId(release.Id.Value);
-        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, ct);
+        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, release.BranchName, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
 
         // Group auditors by capability (same pattern as per-PR audit).
@@ -657,8 +657,8 @@ public sealed class ReleaseService
         // Merge the release branch into main via upstream.
         var upstream = _upstreamFactory.Create(project);
         var fakeItemId = new WorkItemId(release.Id.Value);
-        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, ct);
-        var defaultBranch = await _gitHost.GetDefaultBranchAsync(repoId, ct);
+        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, project.DefaultBaseBranch, ct);
+        var baseBranch = project.DefaultBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
 
         var request = new UpstreamCompletionRequest
         {
@@ -666,7 +666,7 @@ public sealed class ReleaseService
             WorkItemId = fakeItemId,
             ProjectId = project.Id,
             WorkBranch = release.BranchName,
-            BaseBranch = defaultBranch,
+            BaseBranch = baseBranch,
             Title = $"Release {release.Name}",
             Description = $"Automated release merge for release '{release.Name}' via CodeyBox.",
         };

@@ -29,6 +29,22 @@ The host bare repo is the *source of truth*. Work, audit, rework, and
 merge sandboxes each clone and push to it. The orchestrator pushes from
 it to upstream. Sandboxes never see the upstream URL or creds.
 
+On every `EnsureRepositoryAsync` call with a non-null upstream seed URL,
+an existing host bare repo refreshes the configured base branch from that
+upstream before the sandbox clone. If no base branch is configured, the
+host resolves the upstream-advertised default branch and refreshes that
+branch instead of assuming `main`. The fetch updates only the selected
+base branch ref, so per-work-item refs such as `codeybox/<id>` are
+preserved. Before the host fetch, the orchestrator replaces the
+sandbox-writable bare-repo config with a minimal host-controlled config
+so repo-local credential helpers, SSH commands, and URL rewrites cannot
+influence the host command. Host git commands set `core.hooksPath` to an
+empty host-controlled directory, so hooks written under the bare repo are
+not executed during ref updates.
+If the upstream fetch exits non-zero, the orchestrator logs a redacted
+warning and continues with the previous local tip instead of deleting the
+bare repo.
+
 ## Phase 1: Work
 
 ```bash

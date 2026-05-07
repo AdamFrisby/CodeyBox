@@ -68,6 +68,8 @@ internal sealed class ThrowingGitHost : IGitHost
 {
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => throw new NotSupportedException();
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => throw new NotSupportedException();
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
