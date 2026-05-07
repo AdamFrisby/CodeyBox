@@ -49,8 +49,39 @@ public sealed class StreamPersistenceTests : IDisposable
         Assert.Equal(3L, file.LineCount);
         Assert.Matches(@"^work-1-[0-9a-f]{6}\.jsonl$", file.FileName);
 
-        var contents = await File.ReadAllTextAsync(Path.Combine(_root, itemId.ToString(), file.FileName));
-        Assert.Equal("{\"type\":\"system\"}\n{\"type\":\"assistant\"}\n{\"type\":\"result\"}\n", contents);
+        var lines = await File.ReadAllLinesAsync(Path.Combine(_root, itemId.ToString(), file.FileName));
+        Assert.Equal(["system", "assistant", "result"], lines.Select(ReadType).ToArray());
+        Assert.All(lines, AssertHasCreatedAt);
+    }
+
+    [Fact]
+    public async Task ExistingEventTimestamps_ArePreservedWithoutDuplicateCaptureTimestamp()
+    {
+        var itemId = WorkItemId.New();
+        var store = Store();
+
+        await using (var capture = await store.BeginCaptureAsync(itemId, "work", 1))
+            capture!.WriteChunk("{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n");
+
+        var file = Assert.Single(await store.ListAsync(itemId));
+        var line = Assert.Single(await File.ReadAllLinesAsync(Path.Combine(_root, itemId.ToString(), file.FileName)));
+        using var parsed = JsonDocument.Parse(line);
+        Assert.Equal("2026-01-01T00:00:00Z", parsed.RootElement.GetProperty("timestamp").GetString());
+        Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
+    }
+
+    private static string ReadType(string line)
+    {
+        using var parsed = JsonDocument.Parse(line);
+        return parsed.RootElement.GetProperty("type").GetString() ?? "";
+    }
+
+    private static void AssertHasCreatedAt(string line)
+    {
+        using var parsed = JsonDocument.Parse(line);
+        Assert.True(DateTimeOffset.TryParse(
+            parsed.RootElement.GetProperty("created_at").GetString(),
+            out _));
     }
 }
 
@@ -96,10 +127,25 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         var workFile = Assert.Single(await streamStore.ListAsync(item.Id), f => f.Phase == "work");
-        var contents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), workFile.FileName));
-        Assert.Equal("{\"type\":\"system\"}\n{\"type\":\"assistant\",\"delta\":\"hello\"}\n{\"type\":\"result\"}\n", contents);
+        var lines = await File.ReadAllLinesAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), workFile.FileName));
+        Assert.Equal(["system", "assistant", "result"], lines.Select(ReadType).ToArray());
+        Assert.All(lines, AssertHasCreatedAt);
         Assert.DoesNotContain(timingStore.CompletedRows, r => r.Step.StartsWith("agent.tool_call.", StringComparison.Ordinal));
         Assert.DoesNotContain(timingStore.CompletedRows, r => r.Step == "agent.thinking_aggregate");
+    }
+
+    private static string ReadType(string line)
+    {
+        using var parsed = JsonDocument.Parse(line);
+        return parsed.RootElement.GetProperty("type").GetString() ?? "";
+    }
+
+    private static void AssertHasCreatedAt(string line)
+    {
+        using var parsed = JsonDocument.Parse(line);
+        Assert.True(DateTimeOffset.TryParse(
+            parsed.RootElement.GetProperty("created_at").GetString(),
+            out _));
     }
 
     [Fact]
@@ -348,7 +394,8 @@ public sealed class RedactionAppliedToStreamTests : IDisposable
         Assert.DoesNotContain("FAKE_REDACTION_TEST_BODY_LINE_ONE", contents);
         Assert.DoesNotContain("FAKE_REDACTION_TEST_BODY_LINE_TWO", contents);
         Assert.DoesNotContain("END OPENSSH PRIVATE KEY", contents);
-        Assert.Contains("{\"type\":\"result\"}", contents);
+        Assert.Contains("\"type\":\"result\"", contents);
+        Assert.Contains("\"created_at\":", contents);
     }
 
     [Fact]
@@ -468,8 +515,11 @@ public sealed class ReleaseDeepAuditAgentStreamPersistenceTests : IDisposable
         Assert.Equal($"audit-llm-{AuditorName}", file.Phase);
         Assert.Equal(1, file.Iteration);
         Assert.Equal([true], agent.CaptureStructuredStreamCalls);
-        var contents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, release.Id.ToString(), file.FileName));
-        Assert.Equal("{\"type\":\"result\",\"auditor\":\"deep\"}\n", contents);
+        var line = Assert.Single(await File.ReadAllLinesAsync(Path.Combine(streamStore.Options.Path, release.Id.ToString(), file.FileName)));
+        using var parsed = JsonDocument.Parse(line);
+        Assert.Equal("result", parsed.RootElement.GetProperty("type").GetString());
+        Assert.Equal("deep", parsed.RootElement.GetProperty("auditor").GetString());
+        Assert.True(DateTimeOffset.TryParse(parsed.RootElement.GetProperty("created_at").GetString(), out _));
     }
 
     private static async Task<IReadOnlyList<AgentStreamFile>> PollForFilesAsync(
@@ -601,7 +651,11 @@ public sealed class MaxSizeTruncationTests : IDisposable
 
         var file = Assert.Single(await store.ListAsync(itemId));
         var lines = await File.ReadAllLinesAsync(Path.Combine(_root, itemId.ToString(), file.FileName));
-        Assert.Equal("{\"type\":\"first\"}", lines[0]);
+        using (var parsed = JsonDocument.Parse(lines[0]))
+        {
+            Assert.Equal("first", parsed.RootElement.GetProperty("type").GetString());
+            Assert.True(DateTimeOffset.TryParse(parsed.RootElement.GetProperty("created_at").GetString(), out _));
+        }
         Assert.Contains(lines, l => l.StartsWith("[...truncated by ", StringComparison.Ordinal));
     }
 
@@ -669,8 +723,14 @@ public sealed class StreamBackpressureTests : IDisposable
         var file = Assert.Single(await store.ListAsync(itemId));
         var lines = await File.ReadAllLinesAsync(Path.Combine(_root, itemId.ToString(), file.FileName));
         Assert.Equal(256, lines.Length);
-        Assert.Equal("{\"i\":0}", lines[0]);
-        Assert.Equal("{\"i\":255}", lines[^1]);
+        using (var first = JsonDocument.Parse(lines[0]))
+        using (var last = JsonDocument.Parse(lines[^1]))
+        {
+            Assert.Equal(0, first.RootElement.GetProperty("i").GetInt32());
+            Assert.Equal(255, last.RootElement.GetProperty("i").GetInt32());
+            Assert.True(DateTimeOffset.TryParse(first.RootElement.GetProperty("created_at").GetString(), out _));
+            Assert.True(DateTimeOffset.TryParse(last.RootElement.GetProperty("created_at").GetString(), out _));
+        }
         Assert.DoesNotContain(lines, line => line.StartsWith("[...truncated by ", StringComparison.Ordinal));
     }
 }
@@ -774,6 +834,9 @@ public sealed class AgentStreamEndpointTests : IDisposable
         var file = await client.GetAsync($"/workitems/{id}/agent-streams/{fileName}");
         Assert.Equal(HttpStatusCode.OK, file.StatusCode);
         Assert.Equal("application/x-ndjson", file.Content.Headers.ContentType!.MediaType);
-        Assert.Equal("{\"type\":\"result\"}\n", await file.Content.ReadAsStringAsync());
+        var line = Assert.Single((await file.Content.ReadAsStringAsync()).Split('\n', StringSplitOptions.RemoveEmptyEntries));
+        using var parsed = JsonDocument.Parse(line);
+        Assert.Equal("result", parsed.RootElement.GetProperty("type").GetString());
+        Assert.True(DateTimeOffset.TryParse(parsed.RootElement.GetProperty("created_at").GetString(), out _));
     }
 }

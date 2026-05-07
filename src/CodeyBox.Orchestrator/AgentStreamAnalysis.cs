@@ -719,7 +719,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         var finalText = FirstString(root, "result", "final", "final_message", "text", "content") ?? contentText;
         var cost = FirstDecimal(root, "total_cost_usd", "cost_usd", "estimated_usd");
         return new ParsedEvent(
-            NormalizeType(type, starts, results),
+            NormalizeType(type, starts, results, isAssistant),
             timestamp,
             isAssistant,
             starts,
@@ -731,10 +731,15 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             string.Equals(type, "result", StringComparison.OrdinalIgnoreCase) ? finalText : contentText);
     }
 
-    protected static string NormalizeType(string type, IReadOnlyList<ToolBuilder> starts, IReadOnlyList<ToolResultBuilder> results)
+    protected static string NormalizeType(
+        string type,
+        IReadOnlyList<ToolBuilder> starts,
+        IReadOnlyList<ToolResultBuilder> results,
+        bool isAssistant)
     {
         if (starts.Count > 0) return "tool_use";
         if (results.Count > 0) return "tool_result";
+        if (isAssistant) return "assistant";
         return type;
     }
 

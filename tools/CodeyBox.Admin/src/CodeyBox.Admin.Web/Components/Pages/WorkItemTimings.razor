@@ -62,12 +62,22 @@ else
     {
         <section class="agent-activity">
             <h2>Agent activity</h2>
-            @if (_agentActivity.Invocations.Count == 0)
+            @{
+                var supportedInvocations = _agentActivity.Invocations
+                    .Where(i => !IsUnsupportedInvocation(i))
+                    .ToList();
+                var unsupportedInvocationCount = _agentActivity.Invocations.Count - supportedInvocations.Count;
+            }
+            @if (supportedInvocations.Count == 0)
             {
                 <p class="agent-activity-empty">stream-json not supported by this agent's CLI version, stream capture is disabled, or no cached stream summary is available yet.</p>
             }
             else
             {
+                @if (unsupportedInvocationCount > 0)
+                {
+                    <p class="agent-activity-empty">@unsupportedInvocationCount stream capture file(s) could not be analysed because stream-json is not supported by this agent's CLI version.</p>
+                }
                 <table class="detail-table agent-activity-table">
                     <thead>
                         <tr>
@@ -79,7 +89,7 @@ else
                         </tr>
                     </thead>
                     <tbody>
-                        @foreach (var invocation in _agentActivity.Invocations)
+                        @foreach (var invocation in supportedInvocations)
                         {
                             var executing = UnionToolDurationMs(invocation.ToolCalls);
                             var thinking = Math.Max(0, invocation.TotalDurationMs - executing);
@@ -230,6 +240,18 @@ else
         false => "error",
         null => "unknown",
     };
+
+    private static bool IsUnsupportedInvocation(AgentStreamInvocationDto invocation) =>
+        string.Equals(invocation.AgentKind, "unknown", StringComparison.OrdinalIgnoreCase)
+        && invocation.TotalDurationMs == 0
+        && invocation.TimeToFirstTokenMs is null
+        && invocation.InputTokens == 0
+        && invocation.OutputTokens == 0
+        && invocation.CachedInputTokens == 0
+        && invocation.EstimatedUsd is null
+        && invocation.ToolCalls.Count == 0
+        && invocation.Stalls.Count == 0
+        && string.IsNullOrWhiteSpace(invocation.FinalAssistantMessage);
 
     private static long UnionToolDurationMs(IEnumerable<AgentStreamToolCallDto> toolCalls)
     {

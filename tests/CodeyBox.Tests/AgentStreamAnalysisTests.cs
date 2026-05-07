@@ -130,35 +130,52 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_LeavesInstalledCommandExecutionTimingUnknownWhenEventsHaveNoTimestamps()
+    public async Task ParseAsync_ComputesInstalledCommandExecutionTimingFromCapturedTimestamps()
     {
         var parser = new CodexStreamParser();
-        await using var stream = StreamOf("""
-            {"type":"thread.started","thread_id":"thread_1"}
-            {"type":"turn.started"}
-            {"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"","exit_code":null,"status":"in_progress"}}
-            {"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"/work\n","exit_code":0,"status":"completed"}}
-            {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Done."}}
-            {"type":"turn.completed","usage":{"input_tokens":29990,"cached_input_tokens":18176,"output_tokens":44,"reasoning_output_tokens":0}}
-            """);
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-codex-stream-{Guid.NewGuid():N}");
+        var itemId = WorkItemId.New();
+        var store = new AgentStreamStore(new AgentStreamsOptions { Path = root }, NullLogger<AgentStreamStore>.Instance);
 
-        var summary = await parser.ParseAsync(stream);
+        try
+        {
+            await using (var capture = await store.BeginCaptureAsync(itemId, "work", 1))
+            {
+                capture!.WriteChunk(
+                    "{\"type\":\"thread.started\",\"thread_id\":\"thread_1\"}\n" +
+                    "{\"type\":\"turn.started\"}\n" +
+                    "{\"type\":\"item.started\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n");
+                await Task.Delay(20);
+                capture.WriteChunk(
+                    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"/work\\n\",\"exit_code\":0,\"status\":\"completed\"}}\n" +
+                    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"Done.\"}}\n" +
+                    "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":29990,\"cached_input_tokens\":18176,\"output_tokens\":44,\"reasoning_output_tokens\":0}}\n");
+            }
 
-        var tool = Assert.Single(summary.ToolCalls);
-        Assert.Equal("item_0", tool.ToolUseId);
-        Assert.Equal("Bash", tool.ToolName);
-        Assert.Null(tool.StartedAt);
-        Assert.Null(tool.EndedAt);
-        Assert.Null(tool.Duration);
-        Assert.True(tool.Succeeded);
-        Assert.Equal(6, tool.OutputBytes);
-        Assert.Equal(29990, summary.InputTokens);
-        Assert.Equal(44, summary.OutputTokens);
-        Assert.Equal(18176, summary.CachedInputTokens);
-        Assert.Equal("Done.", summary.FinalAssistantMessage);
-        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
-        Assert.Null(summary.TimeToFirstToken);
-        Assert.Empty(summary.Stalls);
+            var file = Assert.Single(await store.ListAsync(itemId));
+            await using var stream = await store.OpenReadAsync(itemId, file.FileName);
+            var summary = await parser.ParseAsync(stream!);
+
+            var tool = Assert.Single(summary.ToolCalls);
+            Assert.Equal("item_0", tool.ToolUseId);
+            Assert.Equal("Bash", tool.ToolName);
+            Assert.NotNull(tool.StartedAt);
+            Assert.NotNull(tool.EndedAt);
+            Assert.NotNull(tool.Duration);
+            Assert.True(tool.Duration >= TimeSpan.FromMilliseconds(10));
+            Assert.True(tool.Succeeded);
+            Assert.Equal(6, tool.OutputBytes);
+            Assert.Equal(29990, summary.InputTokens);
+            Assert.Equal(44, summary.OutputTokens);
+            Assert.Equal(18176, summary.CachedInputTokens);
+            Assert.Equal("Done.", summary.FinalAssistantMessage);
+            Assert.True(summary.TotalDuration >= tool.Duration);
+            Assert.NotNull(summary.TimeToFirstToken);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
     }
 
     [Fact]
@@ -282,6 +299,32 @@ public sealed class StallDetectionTests
         Assert.Equal("tool_execution", stall.Classification);
         Assert.Equal("tool_use", stall.PreviousEventType);
         Assert.Equal("tool_result", stall.NextEventType);
+    }
+
+    [Fact]
+    public async Task ParseAsync_RecordsLlmStallsAfterAssistantOrToolResult()
+    {
+        var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(30) });
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"thinking"}}
+            {"type":"assistant","timestamp":"2026-01-01T00:00:45Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"a"}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:46Z","tool_use_id":"t1","content":"ok"}
+            {"type":"assistant","timestamp":"2026-01-01T00:01:31Z","message":{"role":"assistant","content":"done"}}
+            {"type":"result","timestamp":"2026-01-01T00:01:32Z","result":"done"}
+            """));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.Equal(2, summary.Stalls.Count);
+        Assert.All(summary.Stalls, stall => Assert.Equal("llm", stall.Classification));
+        Assert.Contains(summary.Stalls, stall =>
+            stall.PreviousEventType == "assistant"
+            && stall.NextEventType == "tool_use"
+            && stall.GapDuration == TimeSpan.FromSeconds(45));
+        Assert.Contains(summary.Stalls, stall =>
+            stall.PreviousEventType == "tool_result"
+            && stall.NextEventType == "assistant"
+            && stall.GapDuration == TimeSpan.FromSeconds(45));
     }
 }
 

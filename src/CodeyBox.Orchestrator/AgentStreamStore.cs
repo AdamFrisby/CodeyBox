@@ -340,7 +340,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
     private readonly long _maxBytes;
     private readonly long _directWriteLimitBytes;
     private readonly ILogger _log;
-    private readonly Channel<string> _chunks;
+    private readonly Channel<AgentStreamChunk> _chunks;
     private readonly Task _worker;
     private long _enqueueDroppedBytes;
     private int _enqueueTruncated;
@@ -352,7 +352,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         _maxBytes = maxBytes;
         _directWriteLimitBytes = Math.Max(0, maxBytes - TruncationMarkerReserveBytes);
         _log = log;
-        _chunks = Channel.CreateBounded<string>(
+        _chunks = Channel.CreateBounded<AgentStreamChunk>(
             new BoundedChannelOptions(MaxQueuedChunks)
             {
                 SingleReader = true,
@@ -387,7 +387,9 @@ public sealed class AgentStreamCapture : IAsyncDisposable
             for (var offset = 0; offset < chunk.Length; offset += MaxQueuedChunkChars)
             {
                 var length = Math.Min(MaxQueuedChunkChars, chunk.Length - offset);
-                if (!WriteQueuedChunk(chunk.Substring(offset, length)))
+                if (!WriteQueuedChunk(new AgentStreamChunk(
+                        chunk.Substring(offset, length),
+                        DateTimeOffset.UtcNow)))
                 {
                     Interlocked.Add(ref _enqueueDroppedBytes, Encoding.UTF8.GetByteCount(chunk.AsSpan(offset)));
                     break;
@@ -412,7 +414,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         }
     }
 
-    private bool WriteQueuedChunk(string chunk)
+    private bool WriteQueuedChunk(AgentStreamChunk chunk)
     {
         while (true)
         {
@@ -488,14 +490,18 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         var pendingTailBytes = 0L;
         var pendingTailRawBytes = 0L;
 
+        DateTimeOffset? bufferedLineStartedAt = null;
+
         await foreach (var chunk in _chunks.Reader.ReadAllAsync().ConfigureAwait(false))
         {
             DrainChunk(
-                chunk,
+                chunk.Text,
+                chunk.ReceivedAt,
                 writer,
                 buffer,
                 redactor,
                 pendingTail,
+                ref bufferedLineStartedAt,
                 ref bufferBytes,
                 ref pendingTailBytes,
                 ref pendingTailRawBytes,
@@ -512,6 +518,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
                 writer,
                 redactor,
                 pendingTail,
+                bufferedLineStartedAt ?? DateTimeOffset.UtcNow,
                 ref pendingTailBytes,
                 ref pendingTailRawBytes,
                 ref bytesWritten,
@@ -546,10 +553,12 @@ public sealed class AgentStreamCapture : IAsyncDisposable
 
     private void DrainChunk(
         string chunk,
+        DateTimeOffset receivedAt,
         StreamWriter writer,
         StringBuilder buffer,
         AgentStreamLineRedactor redactor,
         StringBuilder pendingTail,
+        ref DateTimeOffset? bufferedLineStartedAt,
         ref long bufferBytes,
         ref long pendingTailBytes,
         ref long pendingTailRawBytes,
@@ -574,6 +583,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
                     writer,
                     redactor,
                     pendingTail,
+                    bufferedLineStartedAt ?? receivedAt,
                     ref pendingTailBytes,
                     ref pendingTailRawBytes,
                     ref bytesWritten,
@@ -581,6 +591,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
                     ref truncated);
                 buffer.Clear();
                 bufferBytes = 0;
+                bufferedLineStartedAt = null;
                 if (truncated && i + 1 < chunk.Length)
                     droppedBytes += Encoding.UTF8.GetByteCount(chunk.AsSpan(i + 1));
                 if (truncated)
@@ -602,9 +613,11 @@ public sealed class AgentStreamCapture : IAsyncDisposable
                 pendingTailRawBytes = 0;
                 buffer.Clear();
                 bufferBytes = 0;
+                bufferedLineStartedAt = null;
                 return;
             }
 
+            bufferedLineStartedAt ??= receivedAt;
             buffer.Append(ch);
             bufferBytes += chBytes;
         }
@@ -616,13 +629,16 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         StreamWriter writer,
         AgentStreamLineRedactor redactor,
         StringBuilder pendingTail,
+        DateTimeOffset receivedAt,
         ref long pendingTailBytes,
         ref long pendingTailRawBytes,
         ref long bytesWritten,
         ref long droppedBytes,
         ref bool truncated)
     {
-        var redacted = redactor.RedactLine(line);
+        var redacted = AgentStreamLineTimestamper.AddTimestampIfMissing(
+            redactor.RedactLine(line),
+            receivedAt);
         var lineBytes = Encoding.UTF8.GetByteCount(redacted) + 1;
         if (truncated || bytesWritten + pendingTailBytes + lineBytes > _maxBytes)
         {
@@ -672,6 +688,49 @@ public sealed class AgentStreamCapture : IAsyncDisposable
 
         writer.WriteLine(marker);
         bytesWritten += markerBytes;
+    }
+
+    private sealed record AgentStreamChunk(string Text, DateTimeOffset ReceivedAt);
+
+    private static class AgentStreamLineTimestamper
+    {
+        public static string AddTimestampIfMissing(string line, DateTimeOffset receivedAt)
+        {
+            if (string.IsNullOrWhiteSpace(line) || !line.TrimStart().StartsWith('{'))
+                return line;
+
+            try
+            {
+                using var document = JsonDocument.Parse(line);
+                if (document.RootElement.ValueKind != JsonValueKind.Object
+                    || HasTimestamp(document.RootElement))
+                    return line;
+
+                using var stream = new MemoryStream();
+                using (var writer = new Utf8JsonWriter(stream))
+                {
+                    writer.WriteStartObject();
+                    foreach (var property in document.RootElement.EnumerateObject())
+                        property.WriteTo(writer);
+                    writer.WriteString("created_at", receivedAt.ToUniversalTime().ToString("O"));
+                    writer.WriteEndObject();
+                }
+
+                return Encoding.UTF8.GetString(stream.ToArray());
+            }
+            catch (JsonException)
+            {
+                return line;
+            }
+        }
+
+        private static bool HasTimestamp(JsonElement root) =>
+            root.TryGetProperty("timestamp", out _)
+            || root.TryGetProperty("created_at", out _)
+            || root.TryGetProperty("time", out _)
+            || root.TryGetProperty("timestamp_ms", out _)
+            || root.TryGetProperty("created_at_ms", out _)
+            || root.TryGetProperty("created", out _);
     }
 
     private sealed class AgentStreamLineRedactor
