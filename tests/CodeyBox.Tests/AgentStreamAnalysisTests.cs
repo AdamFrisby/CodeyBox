@@ -66,7 +66,7 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_UsesCaptureFileTimingWhenEventsHaveNoTimestamps()
+    public async Task ParseAsync_DoesNotInferTimingsFromCaptureFileMetadata()
     {
         var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.Zero });
         await using var stream = TimedStreamOf(
@@ -81,13 +81,12 @@ public sealed class ClaudeStreamParserTests
         var summary = await parser.ParseAsync(stream);
 
         var tool = Assert.Single(summary.ToolCalls);
-        Assert.NotNull(tool.StartedAt);
-        Assert.NotNull(tool.EndedAt);
-        Assert.NotNull(tool.Duration);
-        Assert.True(tool.Duration > TimeSpan.Zero);
-        Assert.Equal(TimeSpan.FromSeconds(30), summary.TotalDuration);
-        Assert.NotNull(summary.TimeToFirstToken);
-        Assert.Contains(summary.Stalls, s => s.Classification == "tool_execution");
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+        Assert.Null(summary.TimeToFirstToken);
+        Assert.Empty(summary.Stalls);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
@@ -143,17 +142,35 @@ public sealed class CodexStreamParserTests
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.NotNull(tool.StartedAt);
-        Assert.NotNull(tool.EndedAt);
-        Assert.NotNull(tool.Duration);
-        Assert.True(tool.Duration > TimeSpan.Zero);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
         Assert.True(tool.Succeeded);
         Assert.Equal(6, tool.OutputBytes);
         Assert.Equal(29990, summary.InputTokens);
         Assert.Equal(44, summary.OutputTokens);
         Assert.Equal(18176, summary.CachedInputTokens);
         Assert.Equal("Done.", summary.FinalAssistantMessage);
-        Assert.Equal(TimeSpan.FromSeconds(12), summary.TotalDuration);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+    }
+
+    [Fact]
+    public async Task ParseAsync_RedactsSensitiveKeysInsideJsonArgumentStrings()
+    {
+        var parser = new CodexStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:00Z","item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"password\":\"hunter2\",\"headers\":{\"Authorization\":\"Bearer plain-value\"},\"cmd\":\"echo ok\"}"}}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:01Z","item":{"type":"function_call_output","call_id":"call_1","output":"ok"}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.DoesNotContain("hunter2", tool.InputSummary);
+        Assert.DoesNotContain("plain-value", tool.InputSummary);
+        Assert.Contains("\"password\":\"***\"", tool.InputSummary);
+        Assert.Contains("\"Authorization\":\"***\"", tool.InputSummary);
+        Assert.Contains("\"cmd\":\"echo ok\"", tool.InputSummary);
     }
 
     [Fact]
@@ -379,6 +396,25 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         Assert.Equal("shell", Assert.Single(row.Summary.ToolCalls).ToolName);
     }
 
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_PropagatesStreamAnalysisFailures()
+    {
+        var item = CreateItem(WorkItemState.Done);
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl", """
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z"}
+            """);
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ThrowingAgentStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1)));
+        Assert.Empty(await _summaries.GetByWorkItemAsync(item.Id));
+    }
+
     private void WriteStreamFile(WorkItemId id, string fileName, string content)
     {
         var dir = Path.Combine(_streamRoot, id.ToString());
@@ -408,6 +444,14 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         try { File.Delete(_dbPath); } catch { }
         try { Directory.Delete(_streamRoot, recursive: true); } catch { }
     }
+}
+
+public sealed class ThrowingAgentStreamParser : IAgentStreamParser
+{
+    public AgentKind Kind => AgentKind.Claude;
+
+    public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
+        throw new InvalidOperationException("stream parser failed");
 }
 
 public sealed class AggregateEndpointTests : IClassFixture<AgentStreamAnalysisApiFactory>

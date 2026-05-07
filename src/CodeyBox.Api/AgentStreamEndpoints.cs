@@ -142,26 +142,26 @@ internal static class AgentStreamEndpoints
         AgentStreamAggregate aggregate,
         IReadOnlyList<AgentStreamSummaryRow> rows,
         bool includeInvocations) => new
-    {
-        workItemId = aggregate.WorkItemId,
-        totalAgentDurationMs = aggregate.TotalAgentDurationMs,
-        totalToolCalls = aggregate.TotalToolCalls,
-        byTool = aggregate.ByTool.Select(t => new
         {
-            tool = t.Tool,
-            count = t.Count,
-            totalDurationMs = t.TotalDurationMs,
-            medianMs = t.MedianMs,
-        }),
-        thinkingMs = aggregate.ThinkingMs,
-        executingMs = aggregate.ExecutingMs,
-        stallCount = aggregate.StallCount,
-        longestStallMs = aggregate.LongestStallMs,
-        estimatedUsdTotal = aggregate.EstimatedUsdTotal,
-        invocations = includeInvocations
+            workItemId = aggregate.WorkItemId,
+            totalAgentDurationMs = aggregate.TotalAgentDurationMs,
+            totalToolCalls = aggregate.TotalToolCalls,
+            byTool = aggregate.ByTool.Select(t => new
+            {
+                tool = t.Tool,
+                count = t.Count,
+                totalDurationMs = t.TotalDurationMs,
+                medianMs = t.MedianMs,
+            }),
+            thinkingMs = aggregate.ThinkingMs,
+            executingMs = aggregate.ExecutingMs,
+            stallCount = aggregate.StallCount,
+            longestStallMs = aggregate.LongestStallMs,
+            estimatedUsdTotal = aggregate.EstimatedUsdTotal,
+            invocations = includeInvocations
             ? rows.Select(r => ToSummaryDto(r.Summary, r.FileName, r.Phase, r.Iteration, r.AgentKind))
             : Enumerable.Empty<object>(),
-    };
+        };
 
     private static object ToSummaryDto(
         AgentStreamSummary summary,

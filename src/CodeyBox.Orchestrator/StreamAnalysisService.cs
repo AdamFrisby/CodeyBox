@@ -60,44 +60,35 @@ public sealed class StreamAnalysisService : BackgroundService
 
         foreach (var file in files)
         {
-            try
+            if (existingSummaries.TryGetValue(file.FileName, out var existing))
             {
-                if (existingSummaries.TryGetValue(file.FileName, out var existing))
-                {
-                    if (_costs is SqliteWorkItemCostStore cachedSummaryCosts)
-                        await cachedSummaryCosts.ReconcileFromAgentStreamSummaryAsync(existing, ct).ConfigureAwait(false);
-                    continue;
-                }
-
-                var sniffedKind = await SniffKindAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
-                var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs);
-                if (!_parsers.TryGetValue(kind, out var parser))
-                    parser = _parsers.Values.FirstOrDefault(p => p.Kind.Value == "unknown") ?? new UnknownAgentStreamParser();
-
-                await using var stream = await _streams.OpenReadAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
-                if (stream is null)
-                    continue;
-
-                var summary = await parser.ParseAsync(stream, ct).ConfigureAwait(false);
-                var row = new AgentStreamSummaryRow(
-                    item.Id,
-                    file.FileName,
-                    file.Phase,
-                    file.Iteration,
-                    parser.Kind,
-                    summary,
-                    DateTimeOffset.UtcNow);
-                await _summaries.UpsertAsync(row, ct).ConfigureAwait(false);
-                if (_costs is SqliteWorkItemCostStore sqliteCosts)
-                    await sqliteCosts.ReconcileFromAgentStreamSummaryAsync(row, ct).ConfigureAwait(false);
-                count++;
+                if (_costs is SqliteWorkItemCostStore cachedSummaryCosts)
+                    await cachedSummaryCosts.ReconcileFromAgentStreamSummaryAsync(existing, ct).ConfigureAwait(false);
+                continue;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-            {
-                _log.LogWarning(ex,
-                    "Failed to analyse agent stream {FileName} for work item {WorkItemId}",
-                    file.FileName, item.Id);
-            }
+
+            var sniffedKind = await SniffKindAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs);
+            if (!_parsers.TryGetValue(kind, out var parser))
+                parser = _parsers.Values.FirstOrDefault(p => p.Kind.Value == "unknown") ?? new UnknownAgentStreamParser();
+
+            await using var stream = await _streams.OpenReadAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
+            if (stream is null)
+                continue;
+
+            var summary = await parser.ParseAsync(stream, ct).ConfigureAwait(false);
+            var row = new AgentStreamSummaryRow(
+                item.Id,
+                file.FileName,
+                file.Phase,
+                file.Iteration,
+                parser.Kind,
+                summary,
+                DateTimeOffset.UtcNow);
+            await _summaries.UpsertAsync(row, ct).ConfigureAwait(false);
+            if (_costs is SqliteWorkItemCostStore sqliteCosts)
+                await sqliteCosts.ReconcileFromAgentStreamSummaryAsync(row, ct).ConfigureAwait(false);
+            count++;
         }
 
         return count;

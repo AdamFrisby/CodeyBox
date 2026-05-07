@@ -523,12 +523,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
     {
         var toolStarts = new Dictionary<string, ToolBuilder>(StringComparer.Ordinal);
         var completedTools = new List<ToolCallInvocation>();
-        var fallbackClock = FallbackClock.TryCreate(jsonlFile);
         DateTimeOffset? firstTimestamp = null;
         DateTimeOffset? lastTimestamp = null;
         DateTimeOffset? firstAssistantTimestamp = null;
-        var sawEventTimestamp = false;
-        var sawFallbackTimestamp = false;
         string? lastEventType = null;
         var stalls = new List<StallEvent>();
         var inputTokens = 0;
@@ -559,9 +556,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 continue;
             }
 
-            sawEventTimestamp |= parsed.Timestamp.HasValue;
-            var timestamp = parsed.Timestamp ?? fallbackClock?.TimestampFor(jsonLine);
-            sawFallbackTimestamp |= !parsed.Timestamp.HasValue && timestamp.HasValue;
+            var timestamp = parsed.Timestamp;
             if (timestamp is { } eventTimestamp)
             {
                 firstTimestamp ??= eventTimestamp;
@@ -629,19 +624,11 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 0));
         }
 
-        var durationStart = firstTimestamp;
-        var durationEnd = lastTimestamp;
-        if (!sawEventTimestamp && sawFallbackTimestamp && fallbackClock is not null)
-        {
-            durationStart = fallbackClock.StartedAt;
-            durationEnd = fallbackClock.EndedAt;
-        }
-
-        var total = durationStart.HasValue && durationEnd.HasValue
-            ? durationEnd.Value - durationStart.Value
+        var total = firstTimestamp.HasValue && lastTimestamp.HasValue
+            ? lastTimestamp.Value - firstTimestamp.Value
             : TimeSpan.Zero;
-        var ttft = durationStart.HasValue && firstAssistantTimestamp.HasValue
-            ? firstAssistantTimestamp.Value - durationStart.Value
+        var ttft = firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
+            ? firstAssistantTimestamp.Value - firstTimestamp.Value
             : (TimeSpan?)null;
 
         return new AgentStreamSummary(
@@ -657,65 +644,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 .ToList(),
             stalls,
             finalText);
-    }
-
-    private sealed class FallbackClock
-    {
-        private readonly long _length;
-        private readonly TimeSpan _duration;
-
-        private FallbackClock(DateTimeOffset startedAt, DateTimeOffset endedAt, long length)
-        {
-            StartedAt = startedAt;
-            EndedAt = endedAt;
-            _length = Math.Max(1, length);
-            _duration = endedAt - startedAt;
-        }
-
-        public DateTimeOffset StartedAt { get; }
-        public DateTimeOffset EndedAt { get; }
-
-        public static FallbackClock? TryCreate(Stream stream)
-        {
-            if (stream is not IAgentStreamTimingSource timing
-                || timing.CapturedAt is not { } capturedAt
-                || timing.CompletedAt is not { } completedAt
-                || completedAt <= capturedAt
-                || !TryGetLength(stream, out var length)
-                || length <= 0)
-            {
-                return null;
-            }
-
-            return new FallbackClock(capturedAt, completedAt, length);
-        }
-
-        public DateTimeOffset TimestampFor(AgentStreamJsonLine line)
-        {
-            var offset = Math.Clamp(line.EndOffset, 0, _length);
-            var ratio = (double)offset / _length;
-            var ticks = (long)Math.Round(_duration.Ticks * ratio);
-            return StartedAt + TimeSpan.FromTicks(ticks);
-        }
-
-        private static bool TryGetLength(Stream stream, out long length)
-        {
-            try
-            {
-                length = stream.Length;
-                return true;
-            }
-            catch (NotSupportedException)
-            {
-                length = 0;
-                return false;
-            }
-            catch (ObjectDisposedException)
-            {
-                length = 0;
-                return false;
-            }
-        }
     }
 
     private static string ClassifyStall(string? previousEventType, int openToolCount)
@@ -873,10 +801,94 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         JsonElement input;
         if (!TryGet(el, out input, "input", "arguments", "args"))
             input = el;
-        var text = input.ValueKind == JsonValueKind.String ? input.GetString() ?? "" : input.GetRawText();
-        text = SecretRedactor.Redact(text).ReplaceLineEndings(" ");
+        var text = RedactInputSummary(input).ReplaceLineEndings(" ");
         return text.Length <= 200 ? text : text[..200];
     }
+
+    private static string RedactInputSummary(JsonElement input)
+    {
+        if (input.ValueKind == JsonValueKind.String)
+            return RedactStringInput(input.GetString() ?? "");
+
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+            WriteRedactedJsonValue(writer, input, redactValue: false);
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private static string RedactStringInput(string value)
+    {
+        var trimmed = value.AsSpan().TrimStart();
+        if (trimmed.Length > 0 && (trimmed[0] == '{' || trimmed[0] == '['))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(value);
+                return RedactInputSummary(doc.RootElement);
+            }
+            catch (JsonException)
+            {
+            }
+        }
+
+        return SensitiveDataRedactionEnricher.RedactText(value);
+    }
+
+    private static void WriteRedactedJsonValue(Utf8JsonWriter writer, JsonElement value, bool redactValue)
+    {
+        if (redactValue)
+        {
+            writer.WriteStringValue("***");
+            return;
+        }
+
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in value.EnumerateObject())
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteRedactedJsonValue(writer, property.Value, IsSensitiveInputKey(property.Name));
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in value.EnumerateArray())
+                    WriteRedactedJsonValue(writer, item, redactValue: false);
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.String:
+                writer.WriteStringValue(RedactStringInput(value.GetString() ?? ""));
+                break;
+            default:
+                value.WriteTo(writer);
+                break;
+        }
+    }
+
+    private static bool IsSensitiveInputKey(string key) =>
+        SensitiveKeyFragments.Any(f => key.Contains(f, StringComparison.OrdinalIgnoreCase))
+        || SensitiveKeyFragments.Any(f => NormalizeKey(key).Contains(NormalizeKey(f), StringComparison.OrdinalIgnoreCase));
+
+    private static string NormalizeKey(string key)
+    {
+        Span<char> buffer = key.Length <= 256 ? stackalloc char[key.Length] : new char[key.Length];
+        var written = 0;
+        foreach (var ch in key)
+        {
+            if (char.IsLetterOrDigit(ch))
+                buffer[written++] = char.ToLowerInvariant(ch);
+        }
+
+        return new string(buffer[..written]);
+    }
+
+    private static readonly HashSet<string> SensitiveKeyFragments = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Token", "Secret", "Password", "Authorization", "ApiKey", "AuthJson", "Credential",
+    };
 
     protected static int OutputBytes(JsonElement el)
     {
