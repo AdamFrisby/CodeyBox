@@ -353,10 +353,10 @@ does not write to the summary cache.
 }
 ```
 
-If the captured CLI stream has no event timestamps, CodeyBox uses capture-file
-creation and last-write times as a fallback clock when those values are
-available. `startedAt`, `endedAt`, and `durationMs` are `null` only when neither
-event timestamps nor capture-store timing are available.
+If the captured CLI stream has no event timestamps, CodeyBox leaves timing
+fields unknown instead of inferring them from capture-file metadata. `startedAt`,
+`endedAt`, and `durationMs` are `null` whenever the relevant stream events do
+not include timestamps.
 
 The analysis response includes `finalAssistantMessage` when the parser can
 derive it from the stream.

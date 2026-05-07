@@ -130,15 +130,10 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_ParsesInstalledCommandExecutionAndAgentMessageEventsWithCaptureClockFallback()
+    public async Task ParseAsync_LeavesInstalledCommandExecutionTimingUnknownWhenEventsHaveNoTimestamps()
     {
         var parser = new CodexStreamParser();
-        var root = Path.Combine(Path.GetTempPath(), $"codeybox-codex-stream-{Guid.NewGuid():N}");
-        var workItemId = new WorkItemId(Guid.NewGuid());
-        const string fileName = "work-1-abcdef.jsonl";
-        var path = Path.Combine(root, workItemId.ToString(), fileName);
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        await File.WriteAllTextAsync(path, """
+        await using var stream = StreamOf("""
             {"type":"thread.started","thread_id":"thread_1"}
             {"type":"turn.started"}
             {"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"","exit_code":null,"status":"in_progress"}}
@@ -146,40 +141,24 @@ public sealed class CodexStreamParserTests
             {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Done."}}
             {"type":"turn.completed","usage":{"input_tokens":29990,"cached_input_tokens":18176,"output_tokens":44,"reasoning_output_tokens":0}}
             """);
-        var captureStart = DateTimeOffset.UtcNow;
-        File.SetCreationTimeUtc(path, captureStart.UtcDateTime);
-        File.SetLastWriteTimeUtc(path, captureStart.AddSeconds(6).UtcDateTime);
 
-        try
-        {
-            var store = new AgentStreamStore(
-                new AgentStreamsOptions { Enabled = true, Path = root },
-                NullLogger<AgentStreamStore>.Instance);
-            await using var stream = await store.OpenReadAsync(workItemId, fileName)
-                ?? throw new InvalidOperationException("Expected captured stream");
-            var summary = await parser.ParseAsync(stream);
+        var summary = await parser.ParseAsync(stream);
 
-            var tool = Assert.Single(summary.ToolCalls);
-            Assert.Equal("item_0", tool.ToolUseId);
-            Assert.Equal("Bash", tool.ToolName);
-            Assert.NotNull(tool.StartedAt);
-            Assert.NotNull(tool.EndedAt);
-            Assert.NotNull(tool.Duration);
-            Assert.True(tool.Duration > TimeSpan.Zero);
-            Assert.True(tool.Duration <= TimeSpan.FromSeconds(10));
-            Assert.True(tool.Succeeded);
-            Assert.Equal(6, tool.OutputBytes);
-            Assert.Equal(29990, summary.InputTokens);
-            Assert.Equal(44, summary.OutputTokens);
-            Assert.Equal(18176, summary.CachedInputTokens);
-            Assert.Equal("Done.", summary.FinalAssistantMessage);
-            Assert.True(summary.TotalDuration > TimeSpan.Zero);
-            Assert.True(summary.TotalDuration <= TimeSpan.FromSeconds(10));
-        }
-        finally
-        {
-            try { Directory.Delete(root, recursive: true); } catch { }
-        }
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("item_0", tool.ToolUseId);
+        Assert.Equal("Bash", tool.ToolName);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
+        Assert.True(tool.Succeeded);
+        Assert.Equal(6, tool.OutputBytes);
+        Assert.Equal(29990, summary.InputTokens);
+        Assert.Equal(44, summary.OutputTokens);
+        Assert.Equal(18176, summary.CachedInputTokens);
+        Assert.Equal("Done.", summary.FinalAssistantMessage);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+        Assert.Null(summary.TimeToFirstToken);
+        Assert.Empty(summary.Stalls);
     }
 
     [Fact]

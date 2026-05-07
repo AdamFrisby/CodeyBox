@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -101,24 +102,36 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task InitialWorkPhase_RefreshesExistingBareRepoAndChecksOutConfiguredBaseBranch()
+    public async Task RetryPickup_RefreshesExistingBareRepoBeforeSandboxClone()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
-        await File.WriteAllTextAsync(Path.Combine(seed, "base.txt"), "base v1\n");
-        await TestSupport.RunGit(seed, "add", "base.txt");
-        await TestSupport.RunGit(seed, "commit", "-m", "develop base v1");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
 
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, defaultBaseBranch: "develop");
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "fresh work\n"));
-
-        var item = NewItem("feature/configured-base", baseBranch: null);
-        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, "develop");
+        var item = NewItem("feature/retry-refresh");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
+        var staleMain = await RevParseAsync(barePath, "main");
 
-        await File.WriteAllTextAsync(Path.Combine(seed, "base.txt"), "base v2\n");
-        await TestSupport.RunGit(seed, "add", "base.txt");
-        await TestSupport.RunGit(seed, "commit", "-m", "develop base v2");
+        await CommitToSeedAsync(seed, "dependency.txt", "dependency landed\n", "dependency landed");
+        var latestMain = await RevParseAsync(seed, "main");
+        Assert.NotEqual(staleMain, latestMain);
+
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var observed = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "git -C \"$1\" rev-parse origin/main > \"$1/observed-origin-main.txt\"",
+                    "sh",
+                    workingDirectory,
+                ],
+            }, ct);
+            if (!observed.Success)
+                throw new InvalidOperationException($"failed to capture sandbox origin/main: {observed.Stderr}");
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent saw refreshed main\n"));
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
@@ -126,10 +139,97 @@ public sealed class PipelineIntegrationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
 
-        var (_, baseBlob, _) = await TestSupport.RunGit(barePath, "show", "develop:base.txt");
-        var (_, workBlob, _) = await TestSupport.RunGit(barePath, "show", "develop:work.txt");
-        Assert.Equal("base v2\n", baseBlob);
-        Assert.Equal("fresh work\n", workBlob);
+        var (_, observedOriginMain, _) = await TestSupport.RunGit(barePath, "show", "main:observed-origin-main.txt");
+        var (_, dependency, _) = await TestSupport.RunGit(barePath, "show", "main:dependency.txt");
+        Assert.Equal(latestMain + "\n", observedOriginMain);
+        Assert.Equal("dependency landed\n", dependency);
+    }
+
+    [Fact]
+    public async Task RetryPickup_UnconfiguredBaseBranchRefreshesUpstreamDefaultBeforeSandboxClone()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
+        await CommitToSeedAsync(seed, "develop.txt", "develop\n", "create develop");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, defaultBaseBranch: null);
+
+        var item = NewItem("feature/retry-refresh-default") with { BaseBranch = null };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, "develop");
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var staleDevelop = await RevParseAsync(barePath, "develop");
+
+        await CommitToSeedAsync(seed, "dependency.txt", "dependency landed\n", "dependency landed");
+        var latestDevelop = await RevParseAsync(seed, "develop");
+        Assert.NotEqual(staleDevelop, latestDevelop);
+
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var observed = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "git -C \"$1\" rev-parse origin/develop > \"$1/observed-origin-develop.txt\"",
+                    "sh",
+                    workingDirectory,
+                ],
+            }, ct);
+            if (!observed.Success)
+                throw new InvalidOperationException($"failed to capture sandbox origin/develop: {observed.Stderr}");
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent saw refreshed develop\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var (_, observedOriginDevelop, _) = await TestSupport.RunGit(barePath, "show", "develop:observed-origin-develop.txt");
+        var (_, dependency, _) = await TestSupport.RunGit(barePath, "show", "develop:dependency.txt");
+        Assert.Equal(latestDevelop + "\n", observedOriginDevelop);
+        Assert.Equal("dependency landed\n", dependency);
+    }
+
+    [Fact]
+    public async Task InitialWorkPhase_ChecksOutWorkBranchFromConfiguredBaseBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
+        await CommitToSeedAsync(seed, "develop-only.txt", "develop base\n", "develop base");
+        await TestSupport.RunGit(seed, "checkout", "main");
+
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, defaultBaseBranch: "develop");
+        var item = NewItem("feature/develop-work") with { BaseBranch = null };
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var observed = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "git -C \"$1\" rev-parse HEAD > \"$1/observed-head.txt\" && git -C \"$1\" show HEAD:develop-only.txt > \"$1/observed-develop-file.txt\"",
+                    "sh",
+                    workingDirectory,
+                ],
+            }, ct);
+            if (!observed.Success)
+                throw new InvalidOperationException($"failed to capture initial checkout state: {observed.Stderr}");
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent started on develop\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var developTip = await RevParseAsync(seed, "develop");
+        var (_, observedHead, _) = await TestSupport.RunGit(barePath, "show", "develop:observed-head.txt");
+        var (_, observedDevelopFile, _) = await TestSupport.RunGit(barePath, "show", "develop:observed-develop-file.txt");
+        Assert.Equal(developTip + "\n", observedHead);
+        Assert.Equal("develop base\n", observedDevelopFile);
     }
 
     [Fact]
@@ -222,13 +322,28 @@ public sealed class PipelineIntegrationTests : IDisposable
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
     }
 
-    private static WorkItem NewItem(string workBranch, string? baseBranch = "main") => new()
+    private static async Task CommitToSeedAsync(string repoPath, string path, string content, string message)
+    {
+        await TestSupport.RunGit(repoPath, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(repoPath, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoPath, path), content);
+        await TestSupport.RunGit(repoPath, "add", path);
+        await TestSupport.RunGit(repoPath, "commit", "-m", message);
+    }
+
+    private static async Task<string> RevParseAsync(string repoPath, string rev)
+    {
+        var (_, stdout, _) = await TestSupport.RunGit(repoPath, "rev-parse", rev);
+        return stdout.Trim();
+    }
+
+    private static WorkItem NewItem(string workBranch) => new()
     {
         Id = WorkItemId.New(),
         ProjectId = new ProjectId("test-project"),
         Title = "test",
         Prompt = "do thing",
-        BaseBranch = baseBranch,
+        BaseBranch = "main",
         WorkBranch = workBranch,
         PushUpstream = false,
     };

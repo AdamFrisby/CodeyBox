@@ -75,7 +75,7 @@ internal static class TestSupport
         PipelineOptions? pipelineOptions = null,
         IAgentStreamStore? agentStreams = null,
         ITimingStore? timingStore = null,
-        string defaultBaseBranch = "main")
+        string? defaultBaseBranch = "main")
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -219,6 +219,7 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
     public Queue<string> StdoutChunks { get; } = new();
     public Queue<IReadOnlyList<string>> StdoutChunkBatches { get; } = new();
     public List<bool> CaptureStructuredStreamCalls { get; } = new();
+    public Func<ISandbox, string, CancellationToken, Task>? BeforeWorkAsync { get; set; }
     public int StructuredStreamSupportProbeCount { get; private set; }
     public string? ResultStdout { get; set; }
     public AgentKind Kind { get; init; } = AgentKind.Claude;
@@ -258,6 +259,9 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
 
     private async Task<AgentResult> HandleWorkAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct)
     {
+        if (BeforeWorkAsync is not null)
+            await BeforeWorkAsync(sandbox, workingDirectory, ct);
+
         if (WorkPlan.Count == 0)
             throw new InvalidOperationException("ScriptedAgent: ran out of work-phase plan entries");
         var fw = WorkPlan.Dequeue();

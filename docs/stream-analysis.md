@@ -27,7 +27,7 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. When event timestamps are absent but the stream comes from CodeyBox's capture store, the analyser uses the capture file's creation and last-write times as a fallback clock and projects event times across the captured byte offsets. CLI-emitted timestamps remain authoritative when present. Streams without either event timestamps or capture-store timing still report unknown tool durations, no stall gaps, and zero total stream duration.
+Captured CLI streams do not always include timestamps. The analyser only uses timestamps emitted by the stream events themselves. When events are untimestamped, tool start/end times, tool durations, stall gaps, total stream duration, and time to first token remain unknown or zero instead of being inferred from capture file metadata.
 
 ## Thinking Vs Executing
 

@@ -116,6 +116,8 @@ internal sealed class NullGitHost : IGitHost
 {
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => throw new NotSupportedException();
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => throw new NotSupportedException();
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
@@ -201,6 +203,8 @@ internal sealed class StubGitHost : IGitHost
 {
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult($"stub-repo-{id}");
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => throw new NotSupportedException();
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
@@ -224,12 +228,16 @@ internal sealed class CapturingUpstreamRemote : IUpstreamRemote
 {
     public string Name => "capturing";
     public List<(string Tag, string Sha, string? Notes)> TagAndReleaseRequests { get; } = [];
+    public List<UpstreamCompletionRequest> CompletionRequests { get; } = [];
 
     public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
         => Task.FromResult(new UpstreamPushResult(true, null));
 
     public Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest req, CancellationToken ct = default)
-        => Task.FromResult(new UpstreamCompletionOutcome { BranchPushed = true, MergedSha = "abc123" });
+    {
+        CompletionRequests.Add(req);
+        return Task.FromResult(new UpstreamCompletionOutcome { BranchPushed = true, MergedSha = "abc123" });
+    }
 
     public Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)
         => Task.FromResult(true);
@@ -320,6 +328,8 @@ internal sealed class DeepAuditTestGitHost : IGitHost
 {
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult($"stub-repo-{id}");
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
 
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => new(

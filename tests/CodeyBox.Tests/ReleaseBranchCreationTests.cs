@@ -146,24 +146,56 @@ public sealed class ReleaseBranchCreationTests : IDisposable
     }
 
     [Fact]
-    public async Task EnsureReleaseBranch_FirstWorkItem_UsesConfiguredBaseBranch()
+    public async Task EnsureReleaseBranch_UsesConfiguredBaseBranchInsteadOfBareHead()
     {
         var rel = await SeedAsync();
         var project = ReleaseTestHelper.EnabledProject() with { DefaultBaseBranch = "develop" };
-        var sandbox = new CapturingReleaseSandbox("develop-sha\n");
-        var gitHost = new CapturingReleaseGitHost(defaultBranch: "main");
+        var sandbox = new CapturingReleaseSandbox(
+            new SandboxExecResult(0, "", ""),
+            new SandboxExecResult(0, "develop-sha\n", ""),
+            new SandboxExecResult(0, "", ""),
+            new SandboxExecResult(0, "", ""));
         var svc = BuildBranchService(
-            sandboxes: new CapturingReleaseSandboxProvider(sandbox),
-            gitHost: gitHost,
-            project: project);
+            sandboxes: new SingleSandboxProvider(sandbox),
+            gitHost: new DeepAuditTestGitHost());
 
         var (branchName, baseCommitSha) = await svc.EnsureReleaseBranchAsync(rel, project, default);
 
         Assert.Equal($"release/{rel.Name}", branchName);
         Assert.Equal("develop-sha", baseCommitSha);
-        Assert.Contains(("stub-repo-" + rel.Id.Value.ToString("N"), "develop"), gitHost.EnsureCalls);
-        Assert.Contains(sandbox.Commands, c => c.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/develop"]));
-        Assert.Contains(sandbox.Commands, c => c.SequenceEqual(["git", "-C", "/work/repo", "checkout", "-b", branchName, "origin/develop"]));
+        Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/develop"]));
+        Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "checkout", "-b", branchName, "origin/develop"]));
+        Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "push", "origin", $"{branchName}:{branchName}"]));
+        Assert.DoesNotContain(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/main"]));
+        Assert.DoesNotContain(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "checkout", "-b", branchName]));
+    }
+
+    [Fact]
+    public async Task ReleaseTransition_CompletesIntoConfiguredBaseBranchInsteadOfBareHead()
+    {
+        var project = ReleaseTestHelper.EnabledProject() with { DefaultBaseBranch = "develop" };
+        var rel = await SeedAsync();
+        await _store.TryTransitionStateAsync(rel with { State = ReleaseState.Closed }, ReleaseState.Open);
+        await _store.TrySetBranchAsync(rel.Id, $"release/{rel.Name}", "release-base");
+        var upstream = new CapturingUpstreamRemote();
+        var svc = ReleaseTestHelper.BuildService(
+            _store,
+            _workItemStore,
+            new InMemoryProjectRepository(project),
+            new NullWebhookDispatcher(),
+            gitHost: new DeepAuditTestGitHost(),
+            upstreamFactory: new FixedUpstreamFactory(upstream));
+
+        var (ok, error) = await svc.ForceBeginReviewAsync(rel.Id, default);
+
+        Assert.True(ok, error);
+        await WaitUntilAsync(async () =>
+        {
+            var current = await _store.GetAsync(rel.Id);
+            return current?.State == ReleaseState.Released;
+        });
+        var request = Assert.Single(upstream.CompletionRequests);
+        Assert.Equal("develop", request.BaseBranch);
     }
 
     [Fact]
@@ -213,9 +245,9 @@ public sealed class ReleaseBranchCreationTests : IDisposable
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private ReleaseService BuildBranchService(ISandboxProvider sandboxes, IGitHost gitHost, Project? project = null)
+    private ReleaseService BuildBranchService(ISandboxProvider sandboxes, IGitHost gitHost)
     {
-        project ??= ReleaseTestHelper.EnabledProject();
+        var project = ReleaseTestHelper.EnabledProject();
         return ReleaseTestHelper.BuildService(
             _store,
             _workItemStore,
@@ -234,79 +266,46 @@ public sealed class ReleaseBranchCreationTests : IDisposable
         return rel;
     }
 
-    private sealed class CapturingReleaseGitHost : IGitHost
+    private static async Task WaitUntilAsync(Func<Task<bool>> predicate)
     {
-        private readonly string _defaultBranch;
-        public List<(string RepositoryId, string? BaseBranch)> EnsureCalls { get; } = [];
-
-        public CapturingReleaseGitHost(string defaultBranch) => _defaultBranch = defaultBranch;
-
-        public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline)
         {
-            var repoId = "stub-repo-" + id;
-            EnsureCalls.Add((repoId, null));
-            return Task.FromResult(repoId);
+            if (await predicate())
+                return;
+            await Task.Delay(25);
         }
 
-        public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
-        {
-            var repoId = "stub-repo-" + id;
-            EnsureCalls.Add((repoId, baseBranch));
-            return Task.FromResult(repoId);
-        }
-
-        public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
-            => new("file:///dev/null", [], SandboxNetworkPolicy.Denied);
-
-        public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
-            => Task.FromResult(_defaultBranch);
-
-        public Task PushToUpstreamAsync(
-            string repositoryId,
-            string upstreamUrl,
-            string branch,
-            IReadOnlyDictionary<string, string> upstreamEnv,
-            UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
-            CancellationToken ct = default)
-            => Task.CompletedTask;
-
-        public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
-            => Task.CompletedTask;
-
-        public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
-            => Task.FromResult(false);
-
-        public Task<(string DiffStat, string FullDiff)> GetDiffAsync(
-            string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
-            => Task.FromResult(("", ""));
+        throw new TimeoutException("Timed out waiting for release transition");
     }
 
-    private sealed class CapturingReleaseSandboxProvider : ISandboxProvider
+    private sealed class SingleSandboxProvider : ISandboxProvider
     {
-        private readonly CapturingReleaseSandbox _sandbox;
-        public CapturingReleaseSandboxProvider(CapturingReleaseSandbox sandbox) => _sandbox = sandbox;
-        public string Name => "capturing-release";
-        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => Task.FromResult<ISandbox>(_sandbox);
+        private readonly ISandbox _sandbox;
+
+        public SingleSandboxProvider(ISandbox sandbox) => _sandbox = sandbox;
+
+        public string Name => "single";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) => Task.FromResult(_sandbox);
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
-        public Task DisposeLeakedAsync(string name, CancellationToken ct)
-            => Task.CompletedTask;
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
     private sealed class CapturingReleaseSandbox : ISandbox
     {
-        private readonly string _revParseStdout;
-        public CapturingReleaseSandbox(string revParseStdout) => _revParseStdout = revParseStdout;
+        private readonly Queue<SandboxExecResult> _results;
+
+        public CapturingReleaseSandbox(params SandboxExecResult[] results) => _results = new Queue<SandboxExecResult>(results);
+
         public string Id => "capturing-release";
-        public List<IReadOnlyList<string>> Commands { get; } = [];
+        public List<IReadOnlyList<string>> Argv { get; } = [];
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            Commands.Add(exec.Argv);
-            if (exec.Argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/develop"]))
-                return Task.FromResult(new SandboxExecResult(0, _revParseStdout, ""));
-            return Task.FromResult(new SandboxExecResult(0, "", ""));
+            Argv.Add([.. exec.Argv]);
+            var result = _results.Count > 0 ? _results.Dequeue() : new SandboxExecResult(0, "", "");
+            return Task.FromResult(result);
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
