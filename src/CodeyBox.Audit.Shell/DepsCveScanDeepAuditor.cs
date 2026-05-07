@@ -60,7 +60,21 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
 
         scan_restore_source_lines() {
             source_file=$1
-            (grep -nEi 'Restore(Sources|AdditionalProjectSources|FallbackFolders|ConfigFile)|PackageSource' "$source_file" || true) |
+            (awk '
+                {
+                    lower = tolower($0)
+                    source_token = "restore(sources|additionalprojectsources|fallbackfolders|configfile)|packagesource"
+                    starts_source_block = lower ~ ("<[[:space:]]*(" source_token ")[^>]*>")
+                    ends_source_block = lower ~ ("</[[:space:]]*(" source_token ")[^>]*>")
+                    mentions_source_token = lower ~ source_token
+                    if (in_source_block || mentions_source_token || starts_source_block)
+                        print NR ":" $0
+                    if (starts_source_block && !ends_source_block)
+                        in_source_block = 1
+                    if (in_source_block && ends_source_block)
+                        in_source_block = 0
+                }
+            ' "$source_file" || true) |
             while IFS= read -r line; do
                 line_number=${line%%:*}
                 text=${line#*:}

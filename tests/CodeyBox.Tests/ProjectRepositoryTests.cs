@@ -74,6 +74,7 @@ public sealed class ProjectRepositoryTests
         var repo = new ProjectRepository(Options.Create(opts));
         var p = await repo.GetAsync(new ProjectId("alpha"));
         Assert.Empty(p!.Audit.Languages);
+        Assert.False(p.Audit.LanguagesConfigured);
     }
 
     [Fact]
@@ -98,6 +99,7 @@ public sealed class ProjectRepositoryTests
         var repo = new ProjectRepository(Options.Create(opts));
         var p = await repo.GetAsync(new ProjectId("alpha"));
         Assert.Empty(p!.Audit.Languages);
+        Assert.True(p.Audit.LanguagesConfigured);
     }
 
     [Fact]

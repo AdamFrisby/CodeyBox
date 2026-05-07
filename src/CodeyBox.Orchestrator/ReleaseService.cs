@@ -532,7 +532,7 @@ public sealed class ReleaseService
                 BranchName: release.BranchName,
                 Iteration: iteration,
                 AuditRunner: runner,
-                Languages: project.Audit.Languages);
+                Languages: project.Audit.LanguagesConfigured ? project.Audit.Languages : null);
 
             foreach (var auditor in group)
             {

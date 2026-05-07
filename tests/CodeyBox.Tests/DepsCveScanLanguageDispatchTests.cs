@@ -511,6 +511,55 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
+    public async Task CSharpPreflightBlocksMultilineRestoreSourceUrlsBeforeDotnetRuns()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"cb-csharp-cve-preflight-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(root, "App.csproj"),
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net8.0</TargetFramework>
+                    <RestoreSources>
+                      https://169.254.169.254/nuget
+                    </RestoreSources>
+                  </PropertyGroup>
+                </Project>
+                """);
+
+            using var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "sh",
+                    WorkingDirectory = root,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                },
+            };
+            process.StartInfo.ArgumentList.Add("-c");
+            process.StartInfo.ArgumentList.Add(CSharpScannerScript());
+
+            process.Start();
+            await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            Assert.Equal(126, process.ExitCode);
+            Assert.Contains("CODEYBOX_UNSAFE_NUGET_DEPENDENCY_SOURCE", stderr);
+            Assert.Contains("169.254.169.254", stderr);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task PythonScannerParsesJsonStdoutWhenScannerWritesWarningsToStderr()
     {
         var sandbox = new DispatchSandbox(
@@ -853,6 +902,11 @@ public sealed class DepsCveScanLanguageDispatchTests
     private static string PythonScannerScript()
         => (string)typeof(DepsCveScanDeepAuditor)
             .GetField("PythonScannerScript", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(null)!;
+
+    private static string CSharpScannerScript()
+        => (string)typeof(DepsCveScanDeepAuditor)
+            .GetField("CSharpScannerScript", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
             .GetValue(null)!;
 
     private static string NodeScannerScript()

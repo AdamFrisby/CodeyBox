@@ -1,5 +1,7 @@
+using Microsoft.Extensions.Options;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Webhooks;
 
@@ -182,6 +184,104 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         Assert.Contains("registry.npmjs.org", spec.Network.AllowedHosts);
         Assert.Equal("audit-tools", spec.Network.ProfileName);
         Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
+    }
+
+    [Fact]
+    public async Task DeepAuditContextLanguagesAreNullWhenProjectAuditLanguagesAreOmitted()
+    {
+        var auditor = new ScriptedDeepAuditor(
+            AuditorName,
+            new AuditResult(true, []));
+        var projects = new ProjectRepository(Options.Create(new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "test-project",
+                    RepositoryUrl = "https://example.com/test-project.git",
+                    Release = new ProjectReleaseConfigOptions
+                    {
+                        Enabled = true,
+                        DeepAuditors = [AuditorName],
+                        DeepAuditMaxIterations = 1,
+                    },
+                },
+            ],
+        }));
+        var svc = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: new AutoCompleteTaskQueue(_workItemStore),
+            sandboxes: new AlwaysSucceedSandboxProvider(),
+            gitHost: new DeepAuditTestGitHost());
+
+        var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(rel);
+        var item = MakeWorkItem(rel.Id, WorkItemState.Done);
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+
+        var context = Assert.Single(auditor.Contexts);
+        Assert.Null(context.Languages);
+    }
+
+    [Fact]
+    public async Task DeepAuditContextLanguagesRemainEmptyWhenProjectAuditLanguagesAreExplicitlyEmpty()
+    {
+        var auditor = new ScriptedDeepAuditor(
+            AuditorName,
+            new AuditResult(true, []));
+        var projects = new ProjectRepository(Options.Create(new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "test-project",
+                    RepositoryUrl = "https://example.com/test-project.git",
+                    Audit = new ProjectAuditConfig { Languages = [] },
+                    Release = new ProjectReleaseConfigOptions
+                    {
+                        Enabled = true,
+                        DeepAuditors = [AuditorName],
+                        DeepAuditMaxIterations = 1,
+                    },
+                },
+            ],
+        }));
+        var svc = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: new AutoCompleteTaskQueue(_workItemStore),
+            sandboxes: new AlwaysSucceedSandboxProvider(),
+            gitHost: new DeepAuditTestGitHost());
+
+        var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(rel);
+        var item = MakeWorkItem(rel.Id, WorkItemState.Done);
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+
+        var context = Assert.Single(auditor.Contexts);
+        Assert.NotNull(context.Languages);
+        Assert.Empty(context.Languages);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

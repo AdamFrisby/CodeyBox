@@ -255,6 +255,7 @@ internal sealed class ScriptedDeepAuditor : IDeepAuditor
     public string Name { get; }
     public string Kind => "test";
     public AuditCapabilities Required => _required;
+    public List<DeepAuditContext> Contexts { get; } = [];
 
     public ScriptedDeepAuditor(string name, params AuditResult[] results)
         : this(name, AuditCapabilities.None, results)
@@ -274,6 +275,7 @@ internal sealed class ScriptedDeepAuditor : IDeepAuditor
         DeepAuditContext context,
         CancellationToken ct = default)
     {
+        Contexts.Add(context);
         var result = _results.Count > 0 ? _results.Dequeue() : new AuditResult(true, []);
         return Task.FromResult(result);
     }

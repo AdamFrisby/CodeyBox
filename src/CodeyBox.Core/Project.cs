@@ -322,6 +322,7 @@ public sealed record ProjectAudit
     public int MaxStuckRetries { get; init; } = 2;
 
     public IReadOnlyList<string> Languages { get; init; } = [];
+    public bool LanguagesConfigured { get; init; }
     public IReadOnlyList<string> AuditTypes { get; init; } = [];
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
 
