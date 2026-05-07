@@ -91,6 +91,19 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
+    public async Task SubscriptionMember_InvokesRegisteredQuotaProbe()
+    {
+        var probe = new FakeProbe(Claude, 50.0);
+        var cls = FrontierClass(Sub(Claude));
+        var router = BuildRouter([cls], [probe]);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.Equal(1, probe.CallCount);
+    }
+
+    [Fact]
     public async Task FirstMember_Exhausted_FallsBackToSecond()
     {
         var cls = FrontierClass(Sub(Claude), Sub(Codex));
@@ -174,7 +187,7 @@ public sealed class AgentClassRouterTests
         Assert.False(decision.ShouldWait);
     }
 
-    // ── No probe registered → fail-open ──────────────────────────────────────
+    // ── No probe registered → unknown policy ────────────────────────────────
 
     [Fact]
     public async Task NoProbeRegistered_ForSubscriptionMember_TreatedAsAvailable()
@@ -203,16 +216,26 @@ public sealed class AgentClassRouterTests
 /// <summary>Fake probe that always returns a fixed AvailablePct.</summary>
 internal sealed class FakeProbe : IAgentQuotaProbe
 {
-    private readonly double _availablePct;
+    private readonly AgentQuotaSnapshot _snapshot;
 
     public FakeProbe(AgentKind kind, double availablePct)
+        : this(kind, new AgentQuotaSnapshot { AvailablePct = availablePct })
+    {
+    }
+
+    public FakeProbe(AgentKind kind, AgentQuotaSnapshot snapshot)
     {
         Kind = kind;
-        _availablePct = availablePct;
+        _snapshot = snapshot;
     }
 
     public AgentKind Kind { get; }
 
+    public int CallCount { get; private set; }
+
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
+    {
+        CallCount++;
+        return Task.FromResult(_snapshot);
+    }
 }

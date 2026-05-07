@@ -3,6 +3,7 @@ using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
+using System.Text.Json;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
@@ -566,8 +567,9 @@ builder.Services.AddHttpClient("agent-smoke", client =>
 
 // --- Quota probes ------------------------------------------------------------
 // Registered as IEnumerable<IAgentQuotaProbe>; the router resolves by Kind.
-// Tokens are read from host env vars here (not in the probes) to keep the
-// probe implementations independently testable.
+// OAuth files are reread by the provider delegate on each probe pickup because
+// local agent CLIs refresh those files in place. Probe results are still cached
+// per token by the probe implementations.
 builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -577,20 +579,44 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         MinQuotaPct = qr.MinQuotaPct,
         QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
         QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
+        UnknownPolicy = qr.UnknownPolicy,
+        ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
+        ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
     };
 });
+builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteQuotaFailureStore(cbOpts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
-    new ClaudeQuotaProbe(
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
+    return new ClaudeQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY"),
+        () => new AgentQuotaCredentials(
+            ReadClaudeQuotaToken(credentialLog) ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        sp.GetRequiredService<ILoggerFactory>().CreateLogger<ClaudeQuotaProbe>()));
+        loggerFactory.CreateLogger<ClaudeQuotaProbe>());
+});
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
+    return
     new CodexQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
+        () =>
+        {
+            var codexAuth = ReadCodexQuotaAuth(credentialLog);
+            return new AgentQuotaCredentials(
+                codexAuth.AccessToken ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
+                codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
+        },
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CodexQuotaProbe>()));
+        loggerFactory.CreateLogger<CodexQuotaProbe>());
+});
 // No GeminiQuotaProbe: Gemini uses PayPerApi billing (no subscription quota endpoint).
 // The router treats a missing probe as unlimited — intentional. See docs/agents.md.
 
@@ -602,6 +628,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
 
     // Build and validate the catalog.
     var catalog = BuildAndValidateAgentClasses(cbOpts.AgentClasses, startupLog);
+    var subscriptionMembers = catalog.Sum(c => c.Members.Count(m => m.Billing == AgentBilling.Subscription));
+    startupLog.LogInformation("Quota gate enabled for {Count} subscription members", subscriptionMembers);
 
     // Build and validate time-of-day score modifiers.
     var todModifiers = BuildAndValidateTodModifiers(cbOpts.AgentScoreModifiers, startupLog);
@@ -612,7 +640,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetRequiredService<QuotaRouterOptions>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentClassRouter>(),
         TimeProvider.System,
-        todModifiers);
+        todModifiers,
+        sp.GetService<IQuotaFailureStore>());
 });
 
 // --- Credential smoke probes -------------------------------------------------
@@ -930,7 +959,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<AgentCostCalculator>(),
     sp.GetService<IWorkItemQuestionStore>(),
     sp.GetRequiredService<IStdoutBroadcaster>(),
-    sp.GetService<IAgentStreamStore>()));
+    sp.GetService<IAgentStreamStore>(),
+    sp.GetService<IQuotaFailureStore>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
@@ -1046,6 +1076,78 @@ SandboxEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 
 app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
+
+app.MapGet("/quota", async (
+    IEnumerable<IAgentQuotaProbe> probes,
+    IQuotaFailureStore? failureStore,
+    QuotaRouterOptions options,
+    CancellationToken ct) =>
+{
+    var now = DateTimeOffset.UtcNow;
+    IReadOnlyList<QuotaFailureObservation> failures = failureStore is null
+        ? Array.Empty<QuotaFailureObservation>()
+        : await failureStore.ListRecentAsync(TimeSpan.FromMinutes(60), now, ct);
+
+    var snapshots = new List<object>();
+    foreach (var probe in probes.Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe))
+    {
+        var member = new AgentMembership
+        {
+            Agent = probe.Kind,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var snapshot = await probe.GetAvailabilityAsync(member, ct);
+        var recentFailuresForProbe = failures
+            .Where(f => f.Agent == probe.Kind && f.ObservedAt >= now - options.ObservedFailureWindow)
+            .ToList();
+        var recentDefaultFailure = recentFailuresForProbe.Any(f => f.ModelId is null);
+        var recentFailure = recentFailuresForProbe.Count > 0;
+        var modelKeys = snapshot.PerModel.Keys
+            .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        snapshots.Add(new
+        {
+            agent = probe.Kind.Value,
+            latestSnapshot = snapshot,
+            observedFailuresLast60m = failures
+                .Where(f => f.Agent == probe.Kind)
+                .GroupBy(f => new { f.ProjectId, f.ModelId, f.FailureKind })
+                .Select(g => new
+                {
+                    projectId = g.Key.ProjectId?.Value,
+                    modelId = g.Key.ModelId,
+                    failureKind = g.Key.FailureKind.ToString(),
+                    count = g.Count(),
+                    latestObservedAt = g.Max(x => x.ObservedAt),
+                })
+                .ToList(),
+            wouldAllow = WouldAllow(snapshot.AvailablePct, recentFailure, options),
+            defaultModelWouldAllow = WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options),
+            perModelWouldAllow = modelKeys.ToDictionary(
+                modelId => modelId,
+                modelId => WouldAllow(
+                    snapshot.PerModel.TryGetValue(modelId, out var modelQuota) ? modelQuota.AvailablePct : snapshot.AvailablePct,
+                    recentFailuresForProbe.Any(f =>
+                    f.Agent == probe.Kind &&
+                    string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase)),
+                    options),
+                StringComparer.OrdinalIgnoreCase),
+        });
+    }
+
+    return Results.Ok(new
+    {
+        generatedAt = now,
+        minQuotaPct = options.MinQuotaPct,
+        unknownPolicy = options.UnknownPolicy.ToString(),
+        observedFailureWindowMinutes = options.ObservedFailureWindow.TotalMinutes,
+        probes = snapshots,
+        observedFailuresLast60m = failures,
+    });
+});
+
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
 try
@@ -1060,6 +1162,101 @@ catch (Exception ex)
 finally
 {
     Log.CloseAndFlush();
+}
+
+static bool WouldAllow(double availablePct, bool recentFailure, QuotaRouterOptions options)
+{
+    if (recentFailure)
+        return false;
+    if (availablePct >= options.MinQuotaPct)
+        return true;
+    if (availablePct >= 0)
+        return false;
+
+    return options.UnknownPolicy switch
+    {
+        QuotaUnknownPolicy.FailOpen => true,
+        QuotaUnknownPolicy.FailCautious => false,
+        _ => !recentFailure,
+    };
+}
+
+static string? ReadClaudeQuotaToken(ILogger log)
+{
+    var path = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".claude",
+        ".credentials.json");
+    if (!File.Exists(path))
+        return null;
+
+    try
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        if (doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth) &&
+            oauth.TryGetProperty("accessToken", out var token) &&
+            token.ValueKind == JsonValueKind.String)
+            return token.GetString();
+    }
+    catch (JsonException ex)
+    {
+        log.LogWarning(ex, "Claude quota OAuth file '{Path}' is malformed; falling back to environment token if configured", path);
+        return null;
+    }
+    catch (IOException ex)
+    {
+        log.LogWarning(ex, "Claude quota OAuth file '{Path}' could not be read; falling back to environment token if configured", path);
+        return null;
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        log.LogWarning(ex, "Claude quota OAuth file '{Path}' is not readable; falling back to environment token if configured", path);
+        return null;
+    }
+
+    return null;
+}
+
+static (string? AccessToken, string? AccountId) ReadCodexQuotaAuth(ILogger log)
+{
+    var path = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".codex",
+        "auth.json");
+    if (!File.Exists(path))
+        return (null, null);
+
+    try
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        if (!doc.RootElement.TryGetProperty("tokens", out var tokens))
+            return (null, null);
+
+        var accessToken = tokens.TryGetProperty("access_token", out var token) &&
+            token.ValueKind == JsonValueKind.String
+                ? token.GetString()
+                : null;
+        var accountId = tokens.TryGetProperty("account_id", out var account) &&
+            account.ValueKind == JsonValueKind.String
+                ? account.GetString()
+                : null;
+        return (accessToken, accountId);
+    }
+    catch (JsonException ex)
+    {
+        log.LogWarning(ex, "Codex quota auth file '{Path}' is malformed; falling back to environment token if configured", path);
+        return (null, null);
+    }
+    catch (IOException ex)
+    {
+        log.LogWarning(ex, "Codex quota auth file '{Path}' could not be read; falling back to environment token if configured", path);
+        return (null, null);
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        log.LogWarning(ex, "Codex quota auth file '{Path}' is not readable; falling back to environment token if configured", path);
+        return (null, null);
+    }
 }
 
 namespace CodeyBox.Api
@@ -1354,6 +1551,12 @@ namespace CodeyBox.Api
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
         public int QuotaCacheTtlSeconds { get; set; } = 60;
+        /// <summary>How the router treats unknown probe snapshots. Default UseObservedFailures.</summary>
+        public QuotaUnknownPolicy UnknownPolicy { get; set; } = QuotaUnknownPolicy.UseObservedFailures;
+        /// <summary>Minutes a recent quota-shaped failure blocks the same agent/model. Default 10.</summary>
+        public int ObservedFailureWindowMinutes { get; set; } = 10;
+        /// <summary>Minutes observed quota failures are retained in state.db. Default 30.</summary>
+        public int ObservedFailureRetentionMinutes { get; set; } = 30;
     }
 
     /// <summary>

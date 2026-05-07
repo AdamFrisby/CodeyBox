@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Data.Sqlite;
 
 namespace CodeyBox.Tests;
 
@@ -9,7 +10,11 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         Path.GetTempPath(), $"codeybox-audit-store-{Guid.NewGuid():N}.db");
     private readonly SqliteAuditReportStore _store;
 
-    public SqliteAuditReportStoreTests() => _store = new SqliteAuditReportStore(_dbPath);
+    public SqliteAuditReportStoreTests()
+    {
+        using var workItems = new SqliteWorkItemStore(_dbPath);
+        _store = new SqliteAuditReportStore(_dbPath);
+    }
 
     public void Dispose()
     {
@@ -65,7 +70,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
             rawOutput: "Some raw output text",
             findings: [finding]);
 
-        await _store.CreateAsync(report);
+        await CreateAsync(report);
         var results = await _store.GetByWorkItemAsync("wi-roundtrip");
 
         Assert.Single(results);
@@ -92,10 +97,10 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
     public async Task GetByWorkItem_OrderedByIterationThenAuditorName()
     {
         var wi = "wi-order";
-        await _store.CreateAsync(Make(wi, iteration: 2, auditorName: "Zebra"));
-        await _store.CreateAsync(Make(wi, iteration: 1, auditorName: "Beta"));
-        await _store.CreateAsync(Make(wi, iteration: 2, auditorName: "Alpha"));
-        await _store.CreateAsync(Make(wi, iteration: 1, auditorName: "Alpha"));
+        await CreateAsync(Make(wi, iteration: 2, auditorName: "Zebra"));
+        await CreateAsync(Make(wi, iteration: 1, auditorName: "Beta"));
+        await CreateAsync(Make(wi, iteration: 2, auditorName: "Alpha"));
+        await CreateAsync(Make(wi, iteration: 1, auditorName: "Alpha"));
 
         var results = await _store.GetByWorkItemAsync(wi);
 
@@ -109,8 +114,8 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
     [Fact]
     public async Task GetByWorkItem_OnlyReturnsMatchingWorkItem()
     {
-        await _store.CreateAsync(Make("wi-A"));
-        await _store.CreateAsync(Make("wi-B"));
+        await CreateAsync(Make("wi-A"));
+        await CreateAsync(Make("wi-B"));
 
         var results = await _store.GetByWorkItemAsync("wi-A");
 
@@ -129,7 +134,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
     public async Task RawOutput_IsNullByDefault()
     {
         var report = Make("wi-null-raw");
-        await _store.CreateAsync(report);
+        await CreateAsync(report);
 
         var raw = await _store.GetRawOutputAsync("wi-null-raw", 1, "Lint");
 
@@ -140,7 +145,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
     public async Task GetRawOutput_ReturnsStoredValue()
     {
         var report = Make("wi-raw", rawOutput: "stdout goes here");
-        await _store.CreateAsync(report);
+        await CreateAsync(report);
 
         var raw = await _store.GetRawOutputAsync("wi-raw", 1, "Lint");
 
@@ -163,8 +168,8 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         // StartedAt is immutable on record; reconstruct with correct EndedAt too
         old = old with { EndedAt = old.StartedAt.AddSeconds(1) };
         fresh = fresh with { EndedAt = fresh.StartedAt.AddSeconds(1) };
-        await _store.CreateAsync(old);
-        await _store.CreateAsync(fresh);
+        await CreateAsync(old);
+        await CreateAsync(fresh);
 
         var cutoff = DateTimeOffset.UtcNow.AddDays(-30);
         var deleted = await _store.DeleteOlderThanAsync(cutoff);
@@ -181,7 +186,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         var wi = "wi-keep";
         var cutoff = DateTimeOffset.UtcNow.AddDays(-30);
         var atCutoff = Make(wi) with { StartedAt = cutoff, EndedAt = cutoff.AddSeconds(1) };
-        await _store.CreateAsync(atCutoff);
+        await CreateAsync(atCutoff);
 
         var deleted = await _store.DeleteOlderThanAsync(cutoff);
 
@@ -200,7 +205,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
             new("f-cc", "Info", "Unused var", "Desc3", [], []),
         };
         var report = Make("wi-multi", findings: findings);
-        await _store.CreateAsync(report);
+        await CreateAsync(report);
 
         var results = await _store.GetByWorkItemAsync("wi-multi");
         Assert.Single(results);
@@ -209,5 +214,41 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         Assert.Equal("f-bb", results[0].Findings[1].Id);
         Assert.Equal("f-cc", results[0].Findings[2].Id);
         Assert.Equal(["src/B.cs", "src/C.cs"], results[0].Findings[1].Files);
+    }
+
+    [Fact]
+    public async Task CreateAsync_RejectsMissingWorkItem()
+    {
+        await Assert.ThrowsAsync<SqliteException>(() => _store.CreateAsync(Make("wi-missing-parent")));
+    }
+
+    private async Task CreateAsync(AuditReport report)
+    {
+        await SeedWorkItemAsync(report.WorkItemId);
+        await _store.CreateAsync(report);
+    }
+
+    private async Task SeedWorkItemAsync(string workItemId)
+    {
+        await using var conn = new SqliteConnection($"Data Source={_dbPath}");
+        await conn.OpenAsync();
+        await using var pragma = conn.CreateCommand();
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+        await pragma.ExecuteNonQueryAsync();
+
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT OR IGNORE INTO work_items
+                (id, project_id, title, prompt, work_timeout_ticks, merge_timeout_ticks,
+                 push_upstream, state, created_at, updated_at)
+            VALUES
+                ($id, 'test-project', 'test', 'test', $workTimeout, $mergeTimeout,
+                 1, 0, $now, $now);
+            """;
+        cmd.Parameters.AddWithValue("$id", workItemId);
+        cmd.Parameters.AddWithValue("$workTimeout", TimeSpan.FromMinutes(30).Ticks);
+        cmd.Parameters.AddWithValue("$mergeTimeout", TimeSpan.FromMinutes(15).Ticks);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        await cmd.ExecuteNonQueryAsync();
     }
 }

@@ -34,6 +34,15 @@ public interface IStructuredStreamAgentRunner : IAgentRunner
     Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default);
 }
 
+/// <summary>
+/// Optional runner capability for CLIs where CodeyBox pins a default model
+/// even when the work item does not carry an explicit ModelId.
+/// </summary>
+public interface IAgentDefaultModelProvider
+{
+    string? DefaultModelId { get; }
+}
+
 public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);
 
 /// <summary>Maps agent kinds to runners. Loose coupling: register new runners without recompiling consumers.</summary>

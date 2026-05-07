@@ -16,7 +16,7 @@ namespace CodeyBox.Orchestrator;
 ///   <item>Sort descending by effective score; ties broken by Subscription before PayPerApi, then original config order.</item>
 ///   <item>Probe quota in sorted order; pick the first member at or above <see cref="QuotaRouterOptions.MinQuotaPct"/>.</item>
 ///   <item>PayPerApi members use <see cref="PayPerApiQuotaProbe"/> (always 100%).</item>
-///   <item>Subscription members with no registered probe fall back to <see cref="NullQuotaProbe"/> (unknown → fail-open).</item>
+///   <item>Subscription members with no registered probe fall back to <see cref="NullQuotaProbe"/> and follow the configured unknown policy.</item>
 ///   <item>If all eligible subscription members are exhausted → ShouldWait=true, re-enqueue later.</item>
 ///   <item>If only PayPerApi eligible members remain → fire the first regardless (costs money; never hard-fails).</item>
 /// </list>
@@ -35,6 +35,7 @@ public sealed class AgentClassRouter
     private readonly QuotaRouterOptions _opts;
     private readonly ILogger<AgentClassRouter> _log;
     private readonly TimeProvider _time;
+    private readonly IQuotaFailureStore? _quotaFailures;
     // Pre-parsed TOD modifiers: evaluated on every pickup, zero-alloc.
     private readonly IReadOnlyList<ParsedTodModifier> _todModifiers;
 
@@ -44,7 +45,8 @@ public sealed class AgentClassRouter
         QuotaRouterOptions opts,
         ILogger<AgentClassRouter> log,
         TimeProvider? timeProvider = null,
-        IReadOnlyList<ParsedTodModifier>? todModifiers = null)
+        IReadOnlyList<ParsedTodModifier>? todModifiers = null,
+        IQuotaFailureStore? quotaFailures = null)
     {
         _catalog = catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
         var probeList = probes.ToList();
@@ -59,6 +61,7 @@ public sealed class AgentClassRouter
         _log = log;
         _time = timeProvider ?? TimeProvider.System;
         _todModifiers = todModifiers ?? [];
+        _quotaFailures = quotaFailures;
     }
 
     /// <summary>
@@ -145,12 +148,21 @@ public sealed class AgentClassRouter
         foreach (var entry in sorted)
         {
             var member = entry.Member;
+            if (member.Billing == AgentBilling.Subscription
+                && _quotaFailures is not null
+                && await _quotaFailures.HasRecentAsync(member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct))
+            {
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "recent quota-shaped failure"));
+                continue;
+            }
+
             var snapshot = await ProbeAsync(member, ct);
+            var quota = ResolveMemberQuota(snapshot, member);
 
-            AuditLog.QuotaProbed(member.Agent, classId, snapshot.AvailablePct, snapshot.ResetAt, snapshot.Notes);
+            AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
-            // AvailablePct < 0 means unknown → fail-open (treat as available).
-            if (snapshot.AvailablePct < 0 || snapshot.AvailablePct >= _opts.MinQuotaPct)
+            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, ct);
+            if (gate.Allow)
             {
                 // Mark all remaining sorted entries as "ranked lower" for the audit event.
                 foreach (var other in sorted.Where(x => x != entry))
@@ -168,16 +180,16 @@ public sealed class AgentClassRouter
                     "baseScore={Base} effectiveScore={Eff} (available={Avail:F1}%)",
                     item.Id, member.Agent, member.Billing,
                     member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
-                    snapshot.AvailablePct);
+                    quota.AvailablePct);
 
                 return new AgentRoutingDecision
                 {
                     Chosen = member,
-                    Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {snapshot.AvailablePct:F1}% available",
+                    Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {quota.AvailablePct:F1}% available",
                 };
             }
 
-            rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "quota exhausted"));
+            rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
         // No member is above the threshold.
@@ -212,6 +224,42 @@ public sealed class AgentClassRouter
         if (_probesByKind.TryGetValue(member.Agent, out var probe))
             return probe.GetAvailabilityAsync(member, ct);
         return _nullProbe.GetAvailabilityAsync(member, ct);
+    }
+
+    private async Task<QuotaGateDecision> EvaluateGateAsync(AgentMembership member, ProjectId projectId, double availablePct, CancellationToken ct)
+    {
+        if (availablePct >= _opts.MinQuotaPct)
+            return new QuotaGateDecision(true, "quota available");
+
+        if (availablePct >= 0)
+            return new QuotaGateDecision(false, "quota exhausted");
+
+        return _opts.UnknownPolicy switch
+        {
+            QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open"),
+            QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
+            _ => await EvaluateObservedFailuresAsync(member, ct),
+        };
+    }
+
+    private async Task<QuotaGateDecision> EvaluateObservedFailuresAsync(AgentMembership member, CancellationToken ct)
+    {
+        if (_quotaFailures is not null
+            && await _quotaFailures.HasRecentAsync(member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct))
+            return new QuotaGateDecision(false, "quota unknown; recent quota-shaped failure");
+
+        return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure");
+    }
+
+    internal static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member)
+    {
+        if (!string.IsNullOrWhiteSpace(member.ModelId)
+            && snapshot.PerModel.TryGetValue(member.ModelId, out var modelQuota))
+        {
+            return new EffectiveQuota(modelQuota.AvailablePct, modelQuota.ResetAt, modelQuota.Window);
+        }
+
+        return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null);
     }
 
     private int ComputeTodModifier(AgentKind agent, DateTimeOffset nowUtc)
@@ -259,7 +307,11 @@ public sealed class AgentClassRouter
         int BaseScore,
         int EffectiveScore,
         int ConfigIndex);
+
+    private sealed record QuotaGateDecision(bool Allow, string Reason);
 }
+
+public sealed record EffectiveQuota(double AvailablePct, DateTimeOffset? ResetAt, string? Window);
 
 /// <summary>
 /// A pre-parsed time-of-day modifier entry, built once at startup from
@@ -333,6 +385,19 @@ public sealed class QuotaRouterOptions
     /// Default 60 seconds.
     /// </summary>
     public TimeSpan QuotaCacheTtl { get; set; } = TimeSpan.FromSeconds(60);
+
+    public QuotaUnknownPolicy UnknownPolicy { get; set; } = QuotaUnknownPolicy.UseObservedFailures;
+
+    public TimeSpan ObservedFailureWindow { get; set; } = TimeSpan.FromMinutes(10);
+
+    public TimeSpan ObservedFailureRetention { get; set; } = TimeSpan.FromMinutes(30);
+}
+
+public enum QuotaUnknownPolicy
+{
+    FailOpen,
+    FailCautious,
+    UseObservedFailures,
 }
 
 /// <summary>
@@ -354,8 +419,8 @@ public sealed class PayPerApiQuotaProbe : IAgentQuotaProbe
 
 /// <summary>
 /// Fallback quota probe used when no probe is registered for an agent kind.
-/// Returns <c>AvailablePct = -1</c> (unknown) so the router fails open rather
-/// than blocking work items.
+/// Returns <c>AvailablePct = -1</c> (unknown); the configured
+/// <see cref="QuotaUnknownPolicy"/> decides whether pickup is allowed.
 /// </summary>
 public sealed class NullQuotaProbe : IAgentQuotaProbe
 {

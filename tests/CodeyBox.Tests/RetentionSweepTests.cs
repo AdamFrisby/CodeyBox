@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Data.Sqlite;
 
 namespace CodeyBox.Tests;
 
@@ -14,7 +15,12 @@ public sealed class RetentionSweepTests : IDisposable
         Path.GetTempPath(), $"codeybox-retention-{Guid.NewGuid():N}.db");
     private readonly SqliteAuditReportStore _store;
 
-    public RetentionSweepTests() => _store = new SqliteAuditReportStore(_dbPath);
+    public RetentionSweepTests()
+    {
+        using var workItems = new SqliteWorkItemStore(_dbPath);
+        SeedWorkItem("wi-retain");
+        _store = new SqliteAuditReportStore(_dbPath);
+    }
 
     public void Dispose()
     {
@@ -99,5 +105,29 @@ public sealed class RetentionSweepTests : IDisposable
         var deleted = await _store.DeleteOlderThanAsync(cutoff);
 
         Assert.Equal(5, deleted);
+    }
+
+    private void SeedWorkItem(string workItemId)
+    {
+        using var conn = new SqliteConnection($"Data Source={_dbPath}");
+        conn.Open();
+        using var pragma = conn.CreateCommand();
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+        pragma.ExecuteNonQuery();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT OR IGNORE INTO work_items
+                (id, project_id, title, prompt, work_timeout_ticks, merge_timeout_ticks,
+                 push_upstream, state, created_at, updated_at)
+            VALUES
+                ($id, 'test-project', 'test', 'test', $workTimeout, $mergeTimeout,
+                 1, 0, $now, $now);
+            """;
+        cmd.Parameters.AddWithValue("$id", workItemId);
+        cmd.Parameters.AddWithValue("$workTimeout", TimeSpan.FromMinutes(30).Ticks);
+        cmd.Parameters.AddWithValue("$mergeTimeout", TimeSpan.FromMinutes(15).Ticks);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.ExecuteNonQuery();
     }
 }

@@ -20,6 +20,9 @@ public sealed class ClaudeQuotaProbeTests
         QualityScore = 100,
     };
 
+    private static string Rollup(double usedPercent, string resetAt = "1778091218") =>
+        $"{{\"rate_limit\":{{\"primary_window\":{{\"used_percent\":{usedPercent},\"reset_at\":{resetAt}}}}}}}";
+
     private static ClaudeQuotaProbe BuildProbe(
         HttpMessageHandler handler,
         string token = "test-token",
@@ -40,7 +43,7 @@ public sealed class ClaudeQuotaProbeTests
     {
         Uri? capturedUri = null;
         var handler = new QuotaCapturingHandler(HttpStatusCode.OK,
-            """{"usedTokens":100000,"quotaTokens":1000000}""",
+            Rollup(10),
             req => capturedUri = req.RequestUri);
 
         var probe = BuildProbe(handler);
@@ -54,7 +57,7 @@ public sealed class ClaudeQuotaProbeTests
     {
         string? capturedAuth = null;
         var handler = new QuotaCapturingHandler(HttpStatusCode.OK,
-            """{"usedTokens":0,"quotaTokens":1000000}""",
+            Rollup(0),
             req => capturedAuth = req.Headers.Authorization?.ToString());
 
         var probe = BuildProbe(handler, token: "my-secret-token");
@@ -68,32 +71,28 @@ public sealed class ClaudeQuotaProbeTests
     [Fact]
     public void ParseResponse_FullyUsed_Returns0Pct()
     {
-        var snap = ClaudeQuotaProbe.ParseResponse(
-            """{"usedTokens":1000000,"quotaTokens":1000000}""");
+        var snap = ClaudeQuotaProbe.ParseResponse(Rollup(100));
         Assert.Equal(0.0, snap.AvailablePct);
     }
 
     [Fact]
     public void ParseResponse_HalfUsed_Returns50Pct()
     {
-        var snap = ClaudeQuotaProbe.ParseResponse(
-            """{"usedTokens":500000,"quotaTokens":1000000}""");
+        var snap = ClaudeQuotaProbe.ParseResponse(Rollup(50));
         Assert.Equal(50.0, snap.AvailablePct, precision: 5);
     }
 
     [Fact]
-    public void ParseResponse_UnusedTokens_Returns100Pct()
+    public void ParseResponse_UnusedWindow_Returns100Pct()
     {
-        var snap = ClaudeQuotaProbe.ParseResponse(
-            """{"usedTokens":0,"quotaTokens":1000000}""");
+        var snap = ClaudeQuotaProbe.ParseResponse(Rollup(0));
         Assert.Equal(100.0, snap.AvailablePct, precision: 5);
     }
 
     [Fact]
     public void ParseResponse_WithResetAt_PopulatesResetAt()
     {
-        var snap = ClaudeQuotaProbe.ParseResponse(
-            """{"usedTokens":100000,"quotaTokens":1000000,"resetAt":"2026-05-01T00:00:00Z"}""");
+        var snap = ClaudeQuotaProbe.ParseResponse(Rollup(10, "\"2026-05-01T00:00:00Z\""));
         Assert.NotNull(snap.ResetAt);
         Assert.Equal(2026, snap.ResetAt!.Value.Year);
     }
@@ -116,8 +115,7 @@ public sealed class ClaudeQuotaProbeTests
     public void ParseResponse_NeverNegative_WhenOverQuota()
     {
         // Sanity-check: over-quota usage floors at 0, not negative.
-        var snap = ClaudeQuotaProbe.ParseResponse(
-            """{"usedTokens":1500000,"quotaTokens":1000000}""");
+        var snap = ClaudeQuotaProbe.ParseResponse(Rollup(150));
         Assert.Equal(0.0, snap.AvailablePct);
     }
 
@@ -160,7 +158,7 @@ public sealed class ClaudeQuotaProbeTests
     {
         int callCount = 0;
         var handler = new QuotaCapturingHandler(HttpStatusCode.OK,
-            """{"usedTokens":0,"quotaTokens":1000000}""",
+            Rollup(0),
             _ => callCount++);
 
         var probe = BuildProbe(handler, token: "");
@@ -177,7 +175,7 @@ public sealed class ClaudeQuotaProbeTests
     {
         int callCount = 0;
         var handler = new QuotaCapturingHandler(HttpStatusCode.OK,
-            """{"usedTokens":100000,"quotaTokens":1000000}""",
+            Rollup(10),
             _ => callCount++);
 
         var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromMinutes(5));
@@ -188,11 +186,33 @@ public sealed class ClaudeQuotaProbeTests
     }
 
     [Fact]
+    public async Task TokenChange_WithinTtl_HitsNetworkWithNewToken()
+    {
+        var token = "token-1";
+        var capturedAuths = new List<string?>();
+        var handler = new QuotaCapturingHandler(HttpStatusCode.OK,
+            Rollup(10),
+            req => capturedAuths.Add(req.Headers.Authorization?.ToString()));
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        var probe = new ClaudeQuotaProbe(
+            factory,
+            () => new AgentQuotaCredentials(token),
+            TimeSpan.FromMinutes(5),
+            NullLogger<ClaudeQuotaProbe>.Instance);
+
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        token = "token-2";
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.Equal(["Bearer token-1", "Bearer token-2"], capturedAuths);
+    }
+
+    [Fact]
     public async Task Call_AfterTtlExpires_HitsNetworkAgain()
     {
         int callCount = 0;
         var handler = new QuotaCapturingHandler(HttpStatusCode.OK,
-            """{"usedTokens":100000,"quotaTokens":1000000}""",
+            Rollup(10),
             _ => callCount++);
 
         // Zero TTL → cache expires immediately.

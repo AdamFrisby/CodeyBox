@@ -9,7 +9,7 @@ namespace CodeyBox.Agents.Claude;
 /// is expected to be installed in the sandbox image; the host injects only
 /// the API token via tmpfs/env.
 /// </summary>
-public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
+public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider
 {
     public override AgentKind Kind => AgentKind.Claude;
 

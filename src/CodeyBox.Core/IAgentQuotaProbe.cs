@@ -6,9 +6,9 @@ namespace CodeyBox.Core;
 /// resolves by <see cref="Kind"/>.
 ///
 /// Implementations MUST be thread-safe (the router may call concurrently from
-/// multiple worker threads) and MUST be fail-open: any error returns
-/// <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1 so that a broken
-/// endpoint never blocks work items.
+/// multiple worker threads). Any probe error returns
+/// <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1; the router's
+/// configured unknown policy decides whether that fails open or falls through.
 /// </summary>
 public interface IAgentQuotaProbe
 {
@@ -19,13 +19,15 @@ public interface IAgentQuotaProbe
     Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct);
 }
 
+/// <summary>OAuth/subscription credentials used by quota probes.</summary>
+public sealed record AgentQuotaCredentials(string? AccessToken, string? AccountId = null);
+
 /// <summary>Point-in-time quota snapshot returned by an <see cref="IAgentQuotaProbe"/>.</summary>
 public sealed record AgentQuotaSnapshot
 {
     /// <summary>
-    /// 0.0–100.0 percentage of quota remaining. Negative means unknown — treat
-    /// as available (fail-open). The router gates on
-    /// <c>AvailablePct &lt; 0 || AvailablePct &gt;= MinQuotaPct</c>.
+    /// 0.0-100.0 percentage of overall quota remaining. Negative means unknown;
+    /// the router's <c>QuotaUnknownPolicy</c> decides how to gate it.
     /// </summary>
     public required double AvailablePct { get; init; }
 
@@ -34,4 +36,18 @@ public sealed record AgentQuotaSnapshot
 
     /// <summary>Human-readable notes, e.g. "endpoint returned 404".</summary>
     public string? Notes { get; init; }
+
+    /// <summary>
+    /// Per-model quota breakdown. Empty when the probe has no model-specific
+    /// information. Key = model id; value = available percentage and reset.
+    /// </summary>
+    public IReadOnlyDictionary<string, ModelQuota> PerModel { get; init; } =
+        new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
+}
+
+public sealed record ModelQuota
+{
+    public required double AvailablePct { get; init; }
+    public DateTimeOffset? ResetAt { get; init; }
+    public string? Window { get; init; }
 }
