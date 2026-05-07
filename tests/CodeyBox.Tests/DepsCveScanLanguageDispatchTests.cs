@@ -408,7 +408,7 @@ public sealed class DepsCveScanLanguageDispatchTests
     }
 
     [Fact]
-    public async Task ManyProjectDirectories_AreCapped()
+    public async Task ManyProjectDirectories_AllRun()
     {
         var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./python-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
@@ -424,16 +424,13 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         Assert.True(result.Passed);
         Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.Contains(result.Findings, f =>
-            f.Severity == AuditSeverity.Info &&
+        Assert.DoesNotContain(result.Findings, f =>
             f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(
-            LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage,
-            sandbox.Commands.Count(c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal)));
+        Assert.Equal(40, sandbox.Commands.Count(c => c.Contains("pip-audit -f json -r requirements.txt", StringComparison.Ordinal)));
     }
 
     [Fact]
-    public async Task CSharpManyProjectDirectories_AreCapped()
+    public async Task CSharpManyProjectDirectories_AllRunWhenNoRootMarker()
     {
         var discoveryStdout = string.Join('\n', Enumerable.Range(0, 40).Select(i => $"./csharp-{i}")) + "\n";
         var sandbox = new DispatchSandbox(markerPresent: true, discoveryStdout: discoveryStdout);
@@ -449,14 +446,12 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         Assert.True(result.Passed);
         Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.Contains(result.Findings, f =>
-            f.Severity == AuditSeverity.Info &&
+        Assert.DoesNotContain(result.Findings, f =>
             f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage, sandbox.Commands.Count(c =>
+        Assert.Equal(40, sandbox.Commands.Count(c =>
             c.Contains("dotnet list package --vulnerable --include-transitive", StringComparison.Ordinal)));
         Assert.Contains("/repo/csharp-0", sandbox.WorkingDirectories);
-        Assert.Contains($"/repo/csharp-{LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage - 1}", sandbox.WorkingDirectories);
-        Assert.DoesNotContain($"/repo/csharp-{LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage}", sandbox.WorkingDirectories);
+        Assert.Contains("/repo/csharp-39", sandbox.WorkingDirectories);
     }
 
     [Fact]
@@ -816,6 +811,76 @@ public sealed class DepsCveScanLanguageDispatchTests
         Assert.Contains("RUSTSEC-2021-0145", finding.Description);
     }
 
+    [Fact]
+    public async Task RustScannerBlocksRepositoryControlledCargoAuditDatabaseSettings()
+    {
+        var sandbox = new DispatchSandbox(
+            markerPresent: true,
+            scannerExitCode: 126,
+            scannerStderr: """
+                CODEYBOX_UNSAFE_CARGO_AUDIT_CONFIG
+                /repo/.cargo/audit.toml:2: url = "https://github.com/attacker/empty-db"
+                """);
+        var auditor = new DepsCveScanDeepAuditor();
+        var ctx = new DeepAuditContext(
+            ReleaseId.New(),
+            new ProjectId("test-project"),
+            "release/v1",
+            1,
+            Languages: ["rust"]);
+
+        var result = await auditor.RunAsync(sandbox, "/repo", ctx);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("blocked repository-controlled cargo-audit database settings", finding.Title);
+        Assert.Contains("attacker/empty-db", finding.Description);
+    }
+
+    [Fact]
+    public async Task RustPreflightBlocksCargoAuditDatabaseSettingsBeforeCargoRuns()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"cb-rust-cve-preflight-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(root, ".cargo"));
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(root, ".cargo", "audit.toml"),
+                """
+                [database]
+                url = "https://github.com/attacker/empty-db"
+                """);
+
+            using var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "sh",
+                    WorkingDirectory = root,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                },
+            };
+            process.StartInfo.ArgumentList.Add("-c");
+            process.StartInfo.ArgumentList.Add(RustScannerScript());
+
+            process.Start();
+            await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            Assert.Equal(126, process.ExitCode);
+            Assert.Contains("CODEYBOX_UNSAFE_CARGO_AUDIT_CONFIG", stderr);
+            Assert.Contains("attacker/empty-db", stderr);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
     private sealed class DispatchSandbox : ISandbox
     {
         private readonly bool _markerPresent;
@@ -912,5 +977,10 @@ public sealed class DepsCveScanLanguageDispatchTests
     private static string NodeScannerScript()
         => (string)typeof(DepsCveScanDeepAuditor)
             .GetField("NodeScannerScript", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(null)!;
+
+    private static string RustScannerScript()
+        => (string)typeof(DepsCveScanDeepAuditor)
+            .GetField("RustScannerScript", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
             .GetValue(null)!;
 }

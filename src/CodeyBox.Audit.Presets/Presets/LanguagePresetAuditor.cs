@@ -72,15 +72,7 @@ internal sealed class LanguagePresetAuditor : IAuditor
 
         var projectDirectoriesToRun = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
             _language,
-            projectDirectories,
-            out var skippedDueToLimit);
-
-        if (skippedDueToLimit > 0)
-            allFindings.Add(new AuditFinding(
-                AuditorName: Name,
-                Severity: AuditSeverity.Info,
-                Title: $"{_language} preset project directory limit reached",
-                Description: $"Discovered {projectDirectories.Count} {_language} project directories; running the first {projectDirectoriesToRun.Count} to keep audit execution bounded. Skipped {skippedDueToLimit}."));
+            projectDirectories);
 
         foreach (var projectDirectory in projectDirectoriesToRun)
         {

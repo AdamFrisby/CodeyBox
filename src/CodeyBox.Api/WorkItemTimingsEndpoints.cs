@@ -184,7 +184,7 @@ internal static class WorkItemTimingsEndpoints
 
         var language = step[..dot];
         var subStep = step[(dot + 1)..];
-        return language is "csharp" or "python" or "node" or "go" or "rust"
+        return language is "csharp" or "dotnet" or "python" or "node" or "go" or "rust"
             && subStep is "build" or "format" or "test_discovery" or "test_run";
     }
 

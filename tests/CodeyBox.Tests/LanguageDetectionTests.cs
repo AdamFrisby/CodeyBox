@@ -217,7 +217,7 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
-    public async Task ManyMarkerDirectories_AreCapped()
+    public async Task ManyMarkerDirectories_AllRun()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
@@ -228,16 +228,13 @@ public sealed class LanguageDetectionTests
 
         Assert.True(result.Passed);
         Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.Contains(result.Findings, f =>
-            f.Severity == AuditSeverity.Info &&
+        Assert.DoesNotContain(result.Findings, f =>
             f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(
-            LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage,
-            sandbox.Commands.Count(c => c == "pytest"));
+        Assert.Equal(40, sandbox.Commands.Count(c => c == "pytest"));
     }
 
     [Fact]
-    public async Task CSharpManyMarkerDirectories_AreCapped()
+    public async Task CSharpManyMarkerDirectories_AllRunWhenNoRootMarker()
     {
         var catalog = new PresetCatalog();
         var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
@@ -248,12 +245,9 @@ public sealed class LanguageDetectionTests
 
         Assert.True(result.Passed);
         Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
-        Assert.Contains(result.Findings, f =>
-            f.Severity == AuditSeverity.Info &&
+        Assert.DoesNotContain(result.Findings, f =>
             f.Title.Contains("project directory limit reached", StringComparison.Ordinal));
-        Assert.Equal(
-            LanguageProjectDiscovery.MaxProjectDirectoriesPerLanguage,
-            sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
+        Assert.Equal(40, sandbox.Commands.Count(c => c == "dotnet build --no-incremental /warnaserror"));
     }
 
     [Fact]

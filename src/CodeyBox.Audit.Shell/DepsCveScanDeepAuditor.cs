@@ -20,6 +20,8 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     private const string NpmAuditRegistry = "https://registry.npmjs.org/";
     private const string NodeUnsafeNpmConfigMarker = "CODEYBOX_UNSAFE_NPM_AUDIT_CONFIG";
     private const string PythonUnsafeSourceMarker = "CODEYBOX_UNSAFE_PYTHON_DEPENDENCY_SOURCE";
+    private const string RustSecAdvisoryDatabaseUrl = "https://github.com/RustSec/advisory-db";
+    private const string RustUnsafeCargoAuditConfigMarker = "CODEYBOX_UNSAFE_CARGO_AUDIT_CONFIG";
     private static readonly string CSharpScannerScript = $$"""
         set -eu
         trusted_source='{{NuGetAuditSource}}'
@@ -319,6 +321,91 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         exec npm audit --json --registry '{{NpmAuditRegistry}}' --audit-registry '{{NpmAuditRegistry}}' --proxy=false --https-proxy=false
         """;
 
+    private static readonly string RustScannerScript = $$"""
+        set -eu
+        blocked="${TMPDIR:-/tmp}/codeybox-unsafe-cargo-audit-config.$$"
+        trusted_config="${TMPDIR:-/tmp}/codeybox-cargo-audit.$$".toml
+        : > "$blocked"
+        cleanup() {
+            rm -f "$blocked" "$trusted_config"
+        }
+        trap cleanup EXIT HUP INT TERM
+
+        cargo_audit_config_has_database_override() {
+            awk '
+                function trim(s) {
+                    sub(/^[ \t\r\n]+/, "", s)
+                    sub(/[ \t\r\n]+$/, "", s)
+                    return s
+                }
+                {
+                    line = trim($0)
+                    if (line == "" || substr(line, 1, 1) == "#")
+                        next
+
+                    lower = tolower(line)
+                    if (lower ~ /^\[[[:space:]]*database[[:space:]]*\]/) {
+                        in_database = 1
+                        next
+                    }
+                    if (lower ~ /^\[/) {
+                        in_database = 0
+                        next
+                    }
+
+                    if (in_database && lower ~ /^(url|path|fetch)[[:space:]]*=/) {
+                        print FILENAME ":" FNR ": " line
+                        found = 1
+                    }
+                    if (lower ~ /^database[[:space:]]*\.[[:space:]]*(url|path|fetch)[[:space:]]*=/) {
+                        print FILENAME ":" FNR ": " line
+                        found = 1
+                    }
+                    if (lower ~ /^database[[:space:]]*=/ && lower ~ /(url|path|fetch)[[:space:]]*=/) {
+                        print FILENAME ":" FNR ": " line
+                        found = 1
+                    }
+                }
+                END { exit found ? 0 : 1 }
+            ' "$1"
+        }
+
+        find_repository_cargo_audit_configs() {
+            dir=$PWD
+            while :; do
+                [ -f "$dir/.cargo/audit.toml" ] && printf '%s\n' "$dir/.cargo/audit.toml"
+                [ "$dir" = "/" ] && break
+                [ -d "$dir/.git" ] && break
+                parent=$(dirname "$dir")
+                [ "$parent" = "$dir" ] && break
+                dir=$parent
+            done
+
+            find "$PWD" \( -path '*/.git' -o -path '*/target' -o -path '*/node_modules' \) -prune -o \
+                -path '*/.cargo/audit.toml' -type f -print
+        }
+
+        find_repository_cargo_audit_configs | sort -u |
+        while IFS= read -r source_file; do
+            [ -f "$source_file" ] || continue
+            cargo_audit_config_has_database_override "$source_file" >> "$blocked" || true
+        done
+
+        if [ -s "$blocked" ]; then
+            echo '{{RustUnsafeCargoAuditConfigMarker}}' >&2
+            cat "$blocked" >&2
+            exit 126
+        fi
+
+        cat > "$trusted_config" <<EOF
+        [database]
+        url = "{{RustSecAdvisoryDatabaseUrl}}"
+        fetch = true
+        EOF
+
+        exec cargo audit --config "$trusted_config"
+        """;
+
     private static readonly IReadOnlyDictionary<string, string> NpmAuditEnvironment =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -414,7 +501,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             ["rust"] = new(
                 "rust",
                 LanguageProjectDiscovery.RustDiscoveryScript,
-                ["cargo", "audit"],
+                ["sh", "-c", RustScannerScript],
                 "cargo-audit not installed in sandbox; CVE scan skipped",
                 "Install cargo-audit in the sandbox image to enable Rust CVE scanning.",
                 ParseCargoAuditFindings,
@@ -467,15 +554,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             var projectDirectories = ParseProjectDirectories(discovery.Stdout);
             var projectDirectoriesToRun = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
                 language,
-                projectDirectories,
-                out var skippedDueToLimit);
-
-            if (skippedDueToLimit > 0)
-                allFindings.Add(new AuditFinding(
-                    AuditorName: Name,
-                    Severity: AuditSeverity.Info,
-                    Title: $"{language} CVE scan project directory limit reached",
-                    Description: $"Discovered {projectDirectories.Count} {language} project directories; scanning the first {projectDirectoriesToRun.Count} to keep dependency scanning bounded. Skipped {skippedDueToLimit}."));
+                projectDirectories);
 
             foreach (var projectDirectory in projectDirectoriesToRun)
             {
@@ -527,6 +606,16 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                         Severity: AuditSeverity.Error,
                         Title: "Node CVE scan blocked repository-controlled npm proxy settings",
                         Description: "Node dependency metadata contains .npmrc proxy settings. The dependency CVE scanner was not run because npm could use those repository-controlled proxy URLs to reach internal services if the audit sandbox has egress. Stderr: " + TruncatedOutput(result.Stderr, out _)));
+                    continue;
+                }
+
+                if (IsUnsafeRustCargoAuditConfig(scanner, result))
+                {
+                    allFindings.Add(new AuditFinding(
+                        AuditorName: Name,
+                        Severity: AuditSeverity.Error,
+                        Title: "Rust CVE scan blocked repository-controlled cargo-audit database settings",
+                        Description: "Rust dependency metadata contains .cargo/audit.toml database settings. The dependency CVE scanner was not run because those repository-controlled settings can replace or disable the trusted RustSec advisory database. Stderr: " + TruncatedOutput(result.Stderr, out _)));
                     continue;
                 }
 
@@ -1212,6 +1301,11 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
         => scanner.Language.Equals("node", StringComparison.OrdinalIgnoreCase) &&
            result.ExitCode == 126 &&
            result.Stderr.Contains(NodeUnsafeNpmConfigMarker, StringComparison.Ordinal);
+
+    private static bool IsUnsafeRustCargoAuditConfig(Scanner scanner, SandboxExecResult result)
+        => scanner.Language.Equals("rust", StringComparison.OrdinalIgnoreCase) &&
+           result.ExitCode == 126 &&
+           result.Stderr.Contains(RustUnsafeCargoAuditConfigMarker, StringComparison.Ordinal);
 
     [GeneratedRegex(@"Crate:\s+(?<crate>\S+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex CargoCrateRegex();
