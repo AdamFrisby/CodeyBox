@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -101,6 +102,50 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task RetryPickup_RefreshesExistingBareRepoBeforeSandboxClone()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+
+        var item = NewItem("feature/retry-refresh");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var staleMain = await RevParseAsync(barePath, "main");
+
+        await CommitToSeedAsync(seed, "dependency.txt", "dependency landed\n", "dependency landed");
+        var latestMain = await RevParseAsync(seed, "main");
+        Assert.NotEqual(staleMain, latestMain);
+
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var observed = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "git -C \"$1\" rev-parse origin/main > \"$1/observed-origin-main.txt\"",
+                    "sh",
+                    workingDirectory,
+                ],
+            }, ct);
+            if (!observed.Success)
+                throw new InvalidOperationException($"failed to capture sandbox origin/main: {observed.Stderr}");
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent saw refreshed main\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var (_, observedOriginMain, _) = await TestSupport.RunGit(barePath, "show", "main:observed-origin-main.txt");
+        var (_, dependency, _) = await TestSupport.RunGit(barePath, "show", "main:dependency.txt");
+        Assert.Equal(latestMain + "\n", observedOriginMain);
+        Assert.Equal("dependency landed\n", dependency);
+    }
+
+    [Fact]
     public async Task AgentNoChange_FailsWorkItem()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -188,6 +233,21 @@ public sealed class PipelineIntegrationTests : IDisposable
         await TestSupport.RunGit(clone, "add", fileName);
         await TestSupport.RunGit(clone, "commit", "-m", $"{subject}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
+    }
+
+    private static async Task CommitToSeedAsync(string repoPath, string path, string content, string message)
+    {
+        await TestSupport.RunGit(repoPath, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(repoPath, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoPath, path), content);
+        await TestSupport.RunGit(repoPath, "add", path);
+        await TestSupport.RunGit(repoPath, "commit", "-m", message);
+    }
+
+    private static async Task<string> RevParseAsync(string repoPath, string rev)
+    {
+        var (_, stdout, _) = await TestSupport.RunGit(repoPath, "rev-parse", rev);
+        return stdout.Trim();
     }
 
     private static WorkItem NewItem(string workBranch) => new()

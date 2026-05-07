@@ -110,7 +110,10 @@ intent is that you can swap any of these without touching the orchestrator:
   state is the worst of all worlds.
 * **Upstream is a second tier.** Pushing to GitHub failing shouldn't poison
   the local result. The local bare repo is the source of truth; upstream is
-  replication.
+  replication. When a per-work-item bare repo already exists,
+  `EnsureRepositoryAsync` refreshes the configured base branch from a
+  non-null upstream seed URL before reuse, preserving work-branch refs and
+  warning rather than failing if the refresh cannot reach upstream.
 * **Credentials follow least privilege.** Each sandbox sees only the
   minimum it needs. Tool-only audit sandboxes see no agent secrets.
   Upstream creds live only in the orchestrator process and never cross

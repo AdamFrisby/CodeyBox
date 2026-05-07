@@ -212,8 +212,9 @@ public sealed class PipelineRunner : IPipelineRunner
 
         try
         {
-            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, ct);
-            var baseBranch = item.BaseBranch ?? project.DefaultBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
+            var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
+            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
+            var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
             var workBranch = item.WorkBranch ?? $"codeybox/{item.Id.ToString()[..8]}";
             if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
                 throw new InvalidOperationException(

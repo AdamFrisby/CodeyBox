@@ -29,6 +29,13 @@ The host bare repo is the *source of truth*. Work, audit, rework, and
 merge sandboxes each clone and push to it. The orchestrator pushes from
 it to upstream. Sandboxes never see the upstream URL or creds.
 
+On every `EnsureRepositoryAsync` call with a non-null upstream seed URL,
+an existing host bare repo refreshes the configured base branch from that
+upstream before the sandbox clone. The fetch updates only the base branch
+ref, so per-work-item refs such as `codeybox/<id>` are preserved. If the
+refresh fails, the orchestrator logs a warning and continues with the
+previous local tip instead of deleting the bare repo.
+
 ## Phase 1: Work
 
 ```bash

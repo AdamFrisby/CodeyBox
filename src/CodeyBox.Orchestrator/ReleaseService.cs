@@ -123,7 +123,7 @@ public sealed class ReleaseService
         // Create a temporary bare repo to discover origin/main SHA and create the branch.
         // We reuse the WorkItemId slot with the release GUID so LocalGitHost gives us a stable directory.
         var fakeItemId = new WorkItemId(release.Id.Value);
-        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, ct);
+        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, project.DefaultBaseBranch, ct);
         var defaultBranch = await _gitHost.GetDefaultBranchAsync(repoId, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
 
@@ -477,7 +477,7 @@ public sealed class ReleaseService
         if (release.BranchName is null) return allFindings;
 
         var fakeItemId = new WorkItemId(release.Id.Value);
-        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, ct);
+        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, release.BranchName, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
 
         // Group auditors by capability (same pattern as per-PR audit).
@@ -657,7 +657,7 @@ public sealed class ReleaseService
         // Merge the release branch into main via upstream.
         var upstream = _upstreamFactory.Create(project);
         var fakeItemId = new WorkItemId(release.Id.Value);
-        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, ct);
+        var repoId = await _gitHost.EnsureRepositoryAsync(fakeItemId, project.RepositoryUrl, project.DefaultBaseBranch, ct);
         var defaultBranch = await _gitHost.GetDefaultBranchAsync(repoId, ct);
 
         var request = new UpstreamCompletionRequest

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -13,6 +14,8 @@ namespace CodeyBox.Git;
 /// </summary>
 public sealed class LocalGitHost : IGitHost
 {
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> RepositoryLocks = new(StringComparer.Ordinal);
+
     private readonly LocalGitHostOptions _opts;
     private readonly ILogger<LocalGitHost> _log;
 
@@ -24,40 +27,60 @@ public sealed class LocalGitHost : IGitHost
     }
 
     public async Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+        => await EnsureRepositoryAsync(id, seedFromUrl, baseBranch: null, ct);
+
+    public async Task<string> EnsureRepositoryAsync(
+        WorkItemId id,
+        string? seedFromUrl,
+        string? baseBranch,
+        CancellationToken ct = default)
     {
         var repoId = id.ToString();
         var path = GetRepoPath(repoId);
-        if (Directory.Exists(path))
-            return repoId;
-
-        if (seedFromUrl is not null)
-            Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
-
-        Directory.CreateDirectory(path);
-        if (seedFromUrl is not null)
+        var gate = RepositoryLocks.GetOrAdd(path, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
         {
-            // git clone --bare -- <url> <path>
-            //
-            // The `--` separator stops git treating a URL like
-            // "--upload-pack=evil-cmd" as an option. ArgumentList.Add already
-            // prevents shell injection; the `--` defends against git's own
-            // option parser.
-            var rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
-            if (rc.ExitCode != 0)
+            if (Directory.Exists(path))
             {
-                Directory.Delete(path, recursive: true);
-                throw new InvalidOperationException($"Failed to seed bare repo from {seedFromUrl}: {rc.Stderr}");
+                if (seedFromUrl is not null)
+                    await FetchUpstreamAsync(path, seedFromUrl, baseBranch, ct);
+                return repoId;
             }
-        }
-        else
-        {
-            Repository.Init(path, isBare: true);
-        }
 
-        // Allow non-fast-forward pushes from the work sandbox to its branch.
-        // The receive hook is conservative: protect the default/target branch.
-        ApplyReceivePolicy(path);
-        return repoId;
+            if (seedFromUrl is not null)
+                Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
+
+            Directory.CreateDirectory(path);
+            if (seedFromUrl is not null)
+            {
+                // git clone --bare -- <url> <path>
+                //
+                // The `--` separator stops git treating a URL like
+                // "--upload-pack=evil-cmd" as an option. ArgumentList.Add already
+                // prevents shell injection; the `--` defends against git's own
+                // option parser.
+                var rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
+                if (rc.ExitCode != 0)
+                {
+                    Directory.Delete(path, recursive: true);
+                    throw new InvalidOperationException($"Failed to seed bare repo from {seedFromUrl}: {rc.Stderr}");
+                }
+            }
+            else
+            {
+                Repository.Init(path, isBare: true);
+            }
+
+            // Allow non-fast-forward pushes from the work sandbox to its branch.
+            // The receive hook is conservative: protect the default/target branch.
+            ApplyReceivePolicy(path);
+            return repoId;
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
@@ -184,6 +207,58 @@ public sealed class LocalGitHost : IGitHost
         return output.Contains("non-fast-forward", StringComparison.OrdinalIgnoreCase)
             || output.Contains("! [rejected]", StringComparison.OrdinalIgnoreCase)
             || output.Contains("fetch first", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task FetchUpstreamAsync(
+        string bareRepoPath,
+        string seedFromUrl,
+        string? baseBranch,
+        CancellationToken ct)
+    {
+        Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
+        var branch = ResolveRefreshBranch(bareRepoPath, baseBranch);
+        Validation.ValidateBranchName(branch, nameof(baseBranch));
+
+        try
+        {
+            var rc = await RunGitAsync(
+                workdir: bareRepoPath,
+                ct,
+                "fetch", "--no-tags", "--prune", seedFromUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+            if (rc.ExitCode != 0)
+            {
+                _log.LogWarning(
+                    "Failed to refresh bare repo {Path} branch {Branch} from upstream {Upstream}: {Stderr}",
+                    bareRepoPath, branch, seedFromUrl, rc.Stderr);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(
+                ex,
+                "Failed to refresh bare repo {Path} branch {Branch} from upstream {Upstream}",
+                bareRepoPath, branch, seedFromUrl);
+        }
+    }
+
+    private string ResolveRefreshBranch(string bareRepoPath, string? baseBranch)
+    {
+        if (!string.IsNullOrWhiteSpace(baseBranch))
+            return baseBranch;
+
+        try
+        {
+            using var repo = new Repository(bareRepoPath);
+            var head = repo.Refs["HEAD"] as SymbolicReference;
+            if (head?.Target?.CanonicalName is { } target && target.StartsWith("refs/heads/", StringComparison.Ordinal))
+                return target["refs/heads/".Length..];
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "Could not resolve HEAD branch for bare repo {Path}; using fallback branch", bareRepoPath);
+        }
+
+        return _opts.FallbackDefaultBranch;
     }
 
     private static async Task ReconcileRejectedUpstreamPushAsync(
