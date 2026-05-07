@@ -162,17 +162,16 @@ public sealed class CodexStreamParserTests
             var tool = Assert.Single(summary.ToolCalls);
             Assert.Equal("item_0", tool.ToolUseId);
             Assert.Equal("Bash", tool.ToolName);
-            Assert.NotNull(tool.StartedAt);
-            Assert.NotNull(tool.EndedAt);
-            Assert.NotNull(tool.Duration);
-            Assert.True(tool.Duration > TimeSpan.Zero);
+            Assert.Null(tool.StartedAt);
+            Assert.Null(tool.EndedAt);
+            Assert.Null(tool.Duration);
             Assert.True(tool.Succeeded);
             Assert.Equal(6, tool.OutputBytes);
             Assert.Equal(29990, summary.InputTokens);
             Assert.Equal(44, summary.OutputTokens);
             Assert.Equal(18176, summary.CachedInputTokens);
             Assert.Equal("Done.", summary.FinalAssistantMessage);
-            Assert.InRange(summary.TotalDuration.TotalSeconds, 5.9, 6.1);
+            Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
         }
         finally
         {
@@ -217,6 +216,40 @@ public sealed class CodexStreamParserTests
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
         Assert.Equal(Encoding.UTF8.GetByteCount(output), tool.OutputBytes);
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
+public sealed class StreamSummaryCapTests
+{
+    [Fact]
+    public async Task ParseAsync_TruncatesEventsToolCallsAndStallsAtConfiguredCaps()
+    {
+        var parser = new ClaudeStreamParser(new AgentStreamParserOptions
+        {
+            StallThreshold = TimeSpan.FromSeconds(1),
+            MaxEvents = 5,
+            MaxToolCalls = 2,
+            MaxStalls = 1,
+        });
+        await using var stream = StreamOf("""
+            {"type":"system","timestamp":"2026-01-01T00:00:00Z"}
+            {"type":"assistant","timestamp":"2026-01-01T00:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}},{"type":"tool_use","id":"t3","name":"Write","input":{}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:06Z","tool_use_id":"t1","content":"ok","is_error":false}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:07Z","tool_use_id":"t2","content":"ok","is_error":false}
+            {"type":"assistant","timestamp":"2026-01-01T00:00:08Z","message":{"role":"assistant","content":"still working"}}
+            {"type":"result","timestamp":"2026-01-01T00:00:09Z","result":"ignored after event cap","usage":{"input_tokens":100,"output_tokens":20}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.Equal(2, summary.ToolCalls.Count);
+        Assert.DoesNotContain(summary.ToolCalls, t => t.ToolUseId == "t3");
+        Assert.Single(summary.Stalls);
+        Assert.Equal("still working", summary.FinalAssistantMessage);
+        Assert.Equal(0, summary.InputTokens);
+        Assert.Equal(TimeSpan.FromSeconds(8), summary.TotalDuration);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));

@@ -70,6 +70,9 @@ public sealed class AgentStreamParserOptions
     public TimeSpan StallThreshold { get; set; } = TimeSpan.FromSeconds(30);
     public int MaxLineBytes { get; set; } = 64 * 1024 * 1024;
     public int MaxJsonDepth { get; set; } = 64;
+    public int MaxEvents { get; set; } = 50_000;
+    public int MaxToolCalls { get; set; } = 2_000;
+    public int MaxStalls { get; set; } = 2_000;
 }
 
 public sealed class ClaudeStreamParser : FlexibleAgentStreamParser
@@ -519,13 +522,12 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
     {
         var toolStarts = new Dictionary<string, ToolBuilder>(StringComparer.Ordinal);
         var completedTools = new List<ToolCallInvocation>();
-        var fallbackClock = FallbackClock.TryCreate(jsonlFile);
-        var usedFallbackClock = false;
         DateTimeOffset? firstTimestamp = null;
         DateTimeOffset? lastTimestamp = null;
         DateTimeOffset? firstAssistantTimestamp = null;
         string? lastEventType = null;
         var stalls = new List<StallEvent>();
+        var eventCount = 0;
         var inputTokens = 0;
         var outputTokens = 0;
         var cachedInputTokens = 0;
@@ -554,20 +556,16 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 continue;
             }
 
+            eventCount++;
             var timestamp = parsed.Timestamp;
-            if (timestamp is null && fallbackClock is not null)
-            {
-                timestamp = fallbackClock.Project(jsonLine.StartOffset);
-                usedFallbackClock = true;
-                parsed = parsed with { Timestamp = timestamp };
-            }
 
             if (timestamp is { } eventTimestamp)
             {
                 firstTimestamp ??= eventTimestamp;
                 if (lastTimestamp is { } previous
                     && eventTimestamp - previous > _options.StallThreshold
-                    && !string.Equals(lastEventType, "result", StringComparison.OrdinalIgnoreCase))
+                    && !string.Equals(lastEventType, "result", StringComparison.OrdinalIgnoreCase)
+                    && stalls.Count < _options.MaxStalls)
                 {
                     stalls.Add(new StallEvent(
                         previous,
@@ -585,7 +583,13 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             lastEventType = parsed.EventType;
 
             foreach (var tool in parsed.ToolStarts)
-                toolStarts[tool.Id] = tool with { StartedAt = tool.StartedAt ?? timestamp };
+            {
+                if (toolStarts.ContainsKey(tool.Id)
+                    || completedTools.Count + toolStarts.Count < _options.MaxToolCalls)
+                {
+                    toolStarts[tool.Id] = tool with { StartedAt = tool.StartedAt ?? timestamp };
+                }
+            }
 
             foreach (var result in parsed.ToolResults)
             {
@@ -614,6 +618,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             if (parsed.CachedInputTokens.HasValue) cachedInputTokens = parsed.CachedInputTokens.Value;
             if (parsed.EstimatedUsd.HasValue) estimatedUsd = parsed.EstimatedUsd.Value;
             if (!string.IsNullOrWhiteSpace(parsed.FinalText)) finalText = parsed.FinalText;
+
+            if (eventCount >= _options.MaxEvents)
+                break;
         }
 
         foreach (var unfinished in toolStarts.Values.OrderBy(t => t.StartedAt ?? DateTimeOffset.MaxValue))
@@ -629,11 +636,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 0));
         }
 
-        var total = usedFallbackClock && fallbackClock is not null
-            ? fallbackClock.Duration
-            : firstTimestamp.HasValue && lastTimestamp.HasValue
-                ? lastTimestamp.Value - firstTimestamp.Value
-                : TimeSpan.Zero;
+        var total = firstTimestamp.HasValue && lastTimestamp.HasValue
+            ? lastTimestamp.Value - firstTimestamp.Value
+            : TimeSpan.Zero;
         var ttft = firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
             ? firstAssistantTimestamp.Value - firstTimestamp.Value
             : (TimeSpan?)null;
@@ -986,30 +991,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
 
     protected sealed record ToolBuilder(string Id, string Name, string InputSummary, DateTimeOffset? StartedAt);
     protected sealed record ToolResultBuilder(string Id, bool? Succeeded, int OutputBytes);
-
-    private sealed record FallbackClock(DateTimeOffset StartedAt, DateTimeOffset EndedAt, long LengthBytes)
-    {
-        public TimeSpan Duration => EndedAt - StartedAt;
-
-        public DateTimeOffset Project(long byteOffset)
-        {
-            if (LengthBytes <= 0 || Duration <= TimeSpan.Zero)
-                return StartedAt;
-
-            var ratio = Math.Clamp(byteOffset / (double)LengthBytes, 0d, 1d);
-            var ticks = (long)Math.Round(Duration.Ticks * ratio);
-            return StartedAt.AddTicks(ticks);
-        }
-
-        public static FallbackClock? TryCreate(Stream stream)
-        {
-            if (stream is not AgentStreamStore.IAgentStreamTimingSource source)
-                return null;
-            if (source.CaptureEndedAt <= source.CaptureStartedAt || source.CaptureLengthBytes <= 0)
-                return null;
-            return new FallbackClock(source.CaptureStartedAt, source.CaptureEndedAt, source.CaptureLengthBytes);
-        }
-    }
 
     private sealed class InputSummaryTruncatedException : Exception
     {

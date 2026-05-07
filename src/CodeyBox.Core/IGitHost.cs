@@ -15,6 +15,17 @@ public interface IGitHost
     Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default);
 
     /// <summary>
+    /// Ensures the host-side repo exists, then refreshes the configured base
+    /// branch from <paramref name="seedFromUrl"/> when both are provided.
+    /// </summary>
+    Task<string> EnsureRepositoryAsync(
+        WorkItemId id,
+        string? seedFromUrl,
+        string? baseBranch,
+        CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
+
+    /// <summary>
     /// Describes how a sandbox should be wired up to reach this repository.
     /// Encapsulates whichever transport the host has chosen (path bind-mount,
     /// git-daemon over network, etc.) so callers stay provider-agnostic.

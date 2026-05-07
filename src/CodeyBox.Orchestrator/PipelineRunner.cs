@@ -212,8 +212,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
         try
         {
-            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, ct);
-            var baseBranch = item.BaseBranch ?? project.DefaultBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
+            var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
+            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
+            var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
+            if (configuredBaseBranch is null)
+                repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, baseBranch, ct);
             var workBranch = item.WorkBranch ?? $"codeybox/{item.Id.ToString()[..8]}";
             if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
                 throw new InvalidOperationException(
@@ -544,7 +547,7 @@ public sealed class PipelineRunner : IPipelineRunner
             prompt = BuildResumePrompt(prompt, preemptCheckpoint);
         }
         else if (isInitial)
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
         else
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", branch);
         var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);

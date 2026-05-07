@@ -943,6 +943,12 @@ builder.Services.AddSingleton(sp =>
         throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxLineBytes must be >= 1024");
     if (opts.MaxJsonDepth < 1)
         throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxJsonDepth must be >= 1");
+    if (opts.MaxEvents < 1)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxEvents must be >= 1");
+    if (opts.MaxToolCalls < 0)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxToolCalls must be non-negative");
+    if (opts.MaxStalls < 0)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxStalls must be non-negative");
     return opts;
 });
 builder.Services.AddSingleton<IAgentStreamParser, ClaudeStreamParser>();

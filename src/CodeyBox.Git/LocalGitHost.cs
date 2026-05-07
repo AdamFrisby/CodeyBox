@@ -60,6 +60,30 @@ public sealed class LocalGitHost : IGitHost
         return repoId;
     }
 
+    public async Task<string> EnsureRepositoryAsync(
+        WorkItemId id,
+        string? seedFromUrl,
+        string? baseBranch,
+        CancellationToken ct = default)
+    {
+        var repoId = await EnsureRepositoryAsync(id, seedFromUrl, ct);
+        if (string.IsNullOrWhiteSpace(seedFromUrl) || string.IsNullOrWhiteSpace(baseBranch))
+            return repoId;
+
+        Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+
+        var path = GetRepoPath(repoId);
+        var rc = await RunGitAsync(
+            workdir: path,
+            ct,
+            "fetch", "--no-tags", "--", seedFromUrl, $"+refs/heads/{baseBranch}:refs/heads/{baseBranch}");
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException($"Failed to refresh base branch '{baseBranch}' from {seedFromUrl}: {rc.Stderr}");
+
+        return repoId;
+    }
+
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
     {
         // Bind-mount ONLY this work item's bare repo into the sandbox. A

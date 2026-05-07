@@ -101,6 +101,38 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task InitialWorkPhase_RefreshesExistingBareRepoAndChecksOutConfiguredBaseBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
+        await File.WriteAllTextAsync(Path.Combine(seed, "base.txt"), "base v1\n");
+        await TestSupport.RunGit(seed, "add", "base.txt");
+        await TestSupport.RunGit(seed, "commit", "-m", "develop base v1");
+
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, defaultBaseBranch: "develop");
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "fresh work\n"));
+
+        var item = NewItem("feature/configured-base", baseBranch: null);
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, "develop");
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+
+        await File.WriteAllTextAsync(Path.Combine(seed, "base.txt"), "base v2\n");
+        await TestSupport.RunGit(seed, "add", "base.txt");
+        await TestSupport.RunGit(seed, "commit", "-m", "develop base v2");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var (_, baseBlob, _) = await TestSupport.RunGit(barePath, "show", "develop:base.txt");
+        var (_, workBlob, _) = await TestSupport.RunGit(barePath, "show", "develop:work.txt");
+        Assert.Equal("base v2\n", baseBlob);
+        Assert.Equal("fresh work\n", workBlob);
+    }
+
+    [Fact]
     public async Task AgentNoChange_FailsWorkItem()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -190,13 +222,13 @@ public sealed class PipelineIntegrationTests : IDisposable
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
     }
 
-    private static WorkItem NewItem(string workBranch) => new()
+    private static WorkItem NewItem(string workBranch, string? baseBranch = "main") => new()
     {
         Id = WorkItemId.New(),
         ProjectId = new ProjectId("test-project"),
         Title = "test",
         Prompt = "do thing",
-        BaseBranch = "main",
+        BaseBranch = baseBranch,
         WorkBranch = workBranch,
         PushUpstream = false,
     };
