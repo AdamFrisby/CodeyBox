@@ -548,7 +548,7 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
     }
 
     private static IReadOnlyList<string> ResolveLanguages(IReadOnlyList<string>? languages)
-        => languages is { Count: > 0 } ? languages : ["csharp"];
+        => languages ?? ["csharp"];
 
     private static IEnumerable<AuditFinding> ParseDotnetFindings(string output)
     {
