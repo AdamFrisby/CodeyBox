@@ -10,7 +10,7 @@ Each invocation summary includes:
 - input, output, and cached input token counts
 - authoritative cost from the agent result event when present
 - final assistant message text
-- tool calls with name, redacted input summary, start/end timestamps when the CLI emits them, duration, success flag, and output bytes
+- tool calls with name, redacted input summary, start/end timestamps, duration, success flag, and output bytes
 - stall events
 
 Claude, Codex, and Gemini parsers are registered separately because their CLI stream shapes differ. Unsupported agents produce an empty `unknown` summary so the dashboard can remain graceful when stream JSON is not available.
@@ -27,7 +27,7 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. CodeyBox does not infer per-event timing from file metadata; untimestamped events report unknown tool durations, no stall gaps, and zero total stream duration. This avoids presenting fabricated timing data as invocation analytics.
+Captured CLI streams do not always include timestamps. When event timestamps are absent but the stream comes from CodeyBox's capture store, the analyser uses the capture file's creation and last-write times as a fallback clock and projects event times across the captured byte offsets. CLI-emitted timestamps remain authoritative when present. Streams without either event timestamps or capture-store timing still report unknown tool durations, no stall gaps, and zero total stream duration.
 
 ## Thinking Vs Executing
 

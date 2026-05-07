@@ -206,7 +206,7 @@ else
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (firstRender && _item is { IsTerminal: false })
+        if (firstRender && _item is not null)
             await ConnectToHubAsync();
     }
 
@@ -250,7 +250,7 @@ else
             Logger.LogDebug(ex, "Could not fetch stdout tail for {Id}", _item!.Id);
         }
 
-        if (string.IsNullOrEmpty(HubSettings.HubUrl)) return;
+        if (_item.IsTerminal || string.IsNullOrEmpty(HubSettings.HubUrl)) return;
 
         var builder = new Microsoft.AspNetCore.SignalR.Client.HubConnectionBuilder()
             .WithUrl(HubSettings.HubUrl, opts =>

@@ -1223,7 +1223,7 @@ internal static class WorkItemEndpoints
 
         var tail = broadcaster.GetTail(item!.Id);
         if (tail is null)
-            return Results.Ok("");  // Work item exists but no live stream data yet.
+            return Results.Text("", "text/plain");  // Work item exists but no live stream data yet.
 
         return Results.Text(tail, "text/plain");
     }

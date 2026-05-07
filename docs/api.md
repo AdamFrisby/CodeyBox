@@ -354,13 +354,16 @@ does not write to the summary cache.
 }
 ```
 
-If the captured CLI stream has no event timestamps, `startedAt`, `endedAt`, and
-`durationMs` are `null`; the analyser does not synthesize durations.
+If the captured CLI stream has no event timestamps, CodeyBox uses capture-file
+creation and last-write times as a fallback clock when those values are
+available. `startedAt`, `endedAt`, and `durationMs` are `null` only when neither
+event timestamps nor capture-store timing are available.
 
 #### `GET /workitems/{id}/agent-streams/aggregate`
 
-Returns cached aggregate agent-stream analytics for one work item. Missing
-streams return zeros and an empty `invocations` array.
+Returns cached aggregate agent-stream analytics for one work item, including
+per-invocation summaries for the Timings tab. Missing streams return zeros and
+an empty `invocations` array.
 
 ```json
 {
@@ -381,8 +384,10 @@ streams return zeros and an empty `invocations` array.
 
 #### `GET /workitems/agent-streams/aggregate?n=50`
 
-Returns the same aggregate shape across the last `n` terminal work items with
-precomputed summaries. `n` is clamped to 1-500.
+Returns the same aggregate counters across the last `n` terminal work items
+with precomputed summaries. `n` is clamped to 1-500. Fleet aggregates keep
+`invocations` empty so per-call inputs are not exposed through the fleet-level
+analytics surface.
 
 ### `GET /workitems/{id}/costs`
 

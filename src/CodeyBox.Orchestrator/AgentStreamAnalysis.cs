@@ -523,9 +523,12 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
     {
         var toolStarts = new Dictionary<string, ToolBuilder>(StringComparer.Ordinal);
         var completedTools = new List<ToolCallInvocation>();
+        var fallbackClock = FallbackClock.TryCreate(jsonlFile);
         DateTimeOffset? firstTimestamp = null;
         DateTimeOffset? lastTimestamp = null;
         DateTimeOffset? firstAssistantTimestamp = null;
+        var sawEventTimestamp = false;
+        var sawFallbackTimestamp = false;
         string? lastEventType = null;
         var stalls = new List<StallEvent>();
         var inputTokens = 0;
@@ -556,7 +559,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 continue;
             }
 
-            var timestamp = parsed.Timestamp;
+            sawEventTimestamp |= parsed.Timestamp.HasValue;
+            var timestamp = parsed.Timestamp ?? fallbackClock?.TimestampFor(jsonLine);
+            sawFallbackTimestamp |= !parsed.Timestamp.HasValue && timestamp.HasValue;
             if (timestamp is { } eventTimestamp)
             {
                 firstTimestamp ??= eventTimestamp;
@@ -624,11 +629,19 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 0));
         }
 
-        var total = firstTimestamp.HasValue && lastTimestamp.HasValue
-            ? lastTimestamp.Value - firstTimestamp.Value
+        var durationStart = firstTimestamp;
+        var durationEnd = lastTimestamp;
+        if (!sawEventTimestamp && sawFallbackTimestamp && fallbackClock is not null)
+        {
+            durationStart = fallbackClock.StartedAt;
+            durationEnd = fallbackClock.EndedAt;
+        }
+
+        var total = durationStart.HasValue && durationEnd.HasValue
+            ? durationEnd.Value - durationStart.Value
             : TimeSpan.Zero;
-        var ttft = firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
-            ? firstAssistantTimestamp.Value - firstTimestamp.Value
+        var ttft = durationStart.HasValue && firstAssistantTimestamp.HasValue
+            ? firstAssistantTimestamp.Value - durationStart.Value
             : (TimeSpan?)null;
 
         return new AgentStreamSummary(
@@ -644,6 +657,65 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 .ToList(),
             stalls,
             finalText);
+    }
+
+    private sealed class FallbackClock
+    {
+        private readonly long _length;
+        private readonly TimeSpan _duration;
+
+        private FallbackClock(DateTimeOffset startedAt, DateTimeOffset endedAt, long length)
+        {
+            StartedAt = startedAt;
+            EndedAt = endedAt;
+            _length = Math.Max(1, length);
+            _duration = endedAt - startedAt;
+        }
+
+        public DateTimeOffset StartedAt { get; }
+        public DateTimeOffset EndedAt { get; }
+
+        public static FallbackClock? TryCreate(Stream stream)
+        {
+            if (stream is not IAgentStreamTimingSource timing
+                || timing.CapturedAt is not { } capturedAt
+                || timing.CompletedAt is not { } completedAt
+                || completedAt <= capturedAt
+                || !TryGetLength(stream, out var length)
+                || length <= 0)
+            {
+                return null;
+            }
+
+            return new FallbackClock(capturedAt, completedAt, length);
+        }
+
+        public DateTimeOffset TimestampFor(AgentStreamJsonLine line)
+        {
+            var offset = Math.Clamp(line.EndOffset, 0, _length);
+            var ratio = (double)offset / _length;
+            var ticks = (long)Math.Round(_duration.Ticks * ratio);
+            return StartedAt + TimeSpan.FromTicks(ticks);
+        }
+
+        private static bool TryGetLength(Stream stream, out long length)
+        {
+            try
+            {
+                length = stream.Length;
+                return true;
+            }
+            catch (NotSupportedException)
+            {
+                length = 0;
+                return false;
+            }
+            catch (ObjectDisposedException)
+            {
+                length = 0;
+                return false;
+            }
+        }
     }
 
     private static string ClassifyStall(string? previousEventType, int openToolCount)

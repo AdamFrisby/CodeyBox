@@ -97,7 +97,7 @@ internal static class AgentStreamEndpoints
         if (err is not null) return err;
 
         var rows = await summaries.GetByWorkItemAsync(item!.Id, ct);
-        return Results.Ok(ToAggregateDto(AgentStreamAnalytics.Aggregate(item.Id.ToString(), rows), rows));
+        return Results.Ok(ToAggregateDto(AgentStreamAnalytics.Aggregate(item.Id.ToString(), rows), rows, includeInvocations: true));
     }
 
     private static async Task<IResult> GetFleetAggregateAsync(
@@ -108,7 +108,7 @@ internal static class AgentStreamEndpoints
         var rows = new List<AgentStreamSummaryRow>();
         await foreach (var row in summaries.StreamRecentCompletedAsync(Math.Clamp(n ?? 50, 1, 500), ct))
             rows.Add(row);
-        return Results.Ok(ToAggregateDto(AgentStreamAnalytics.Aggregate(null, rows), rows));
+        return Results.Ok(ToAggregateDto(AgentStreamAnalytics.Aggregate(null, rows), rows, includeInvocations: false));
     }
 
     private static async Task<(WorkItem? item, IResult? error)> ResolveWorkItemAsync(
@@ -138,7 +138,10 @@ internal static class AgentStreamEndpoints
         return byId is null ? (null, Results.NotFound()) : (byId, null);
     }
 
-    private static object ToAggregateDto(AgentStreamAggregate aggregate, IReadOnlyList<AgentStreamSummaryRow> rows) => new
+    private static object ToAggregateDto(
+        AgentStreamAggregate aggregate,
+        IReadOnlyList<AgentStreamSummaryRow> rows,
+        bool includeInvocations) => new
     {
         workItemId = aggregate.WorkItemId,
         totalAgentDurationMs = aggregate.TotalAgentDurationMs,
@@ -155,7 +158,9 @@ internal static class AgentStreamEndpoints
         stallCount = aggregate.StallCount,
         longestStallMs = aggregate.LongestStallMs,
         estimatedUsdTotal = aggregate.EstimatedUsdTotal,
-        invocations = rows.Select(r => ToSummaryDto(r.Summary, r.FileName, r.Phase, r.Iteration, r.AgentKind)),
+        invocations = includeInvocations
+            ? rows.Select(r => ToSummaryDto(r.Summary, r.FileName, r.Phase, r.Iteration, r.AgentKind))
+            : Enumerable.Empty<object>(),
     };
 
     private static object ToSummaryDto(

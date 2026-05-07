@@ -66,9 +66,9 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_IgnoresCaptureFileTimingWhenEventsHaveNoTimestamps()
+    public async Task ParseAsync_UsesCaptureFileTimingWhenEventsHaveNoTimestamps()
     {
-        var parser = new ClaudeStreamParser();
+        var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.Zero });
         await using var stream = TimedStreamOf(
             """
             {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
@@ -81,12 +81,13 @@ public sealed class ClaudeStreamParserTests
         var summary = await parser.ParseAsync(stream);
 
         var tool = Assert.Single(summary.ToolCalls);
-        Assert.Null(tool.StartedAt);
-        Assert.Null(tool.EndedAt);
-        Assert.Null(tool.Duration);
-        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
-        Assert.Null(summary.TimeToFirstToken);
-        Assert.Empty(summary.Stalls);
+        Assert.NotNull(tool.StartedAt);
+        Assert.NotNull(tool.EndedAt);
+        Assert.NotNull(tool.Duration);
+        Assert.True(tool.Duration > TimeSpan.Zero);
+        Assert.Equal(TimeSpan.FromSeconds(30), summary.TotalDuration);
+        Assert.NotNull(summary.TimeToFirstToken);
+        Assert.Contains(summary.Stalls, s => s.Classification == "tool_execution");
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
@@ -142,16 +143,17 @@ public sealed class CodexStreamParserTests
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Null(tool.Duration);
-        Assert.Null(tool.StartedAt);
-        Assert.Null(tool.EndedAt);
+        Assert.NotNull(tool.StartedAt);
+        Assert.NotNull(tool.EndedAt);
+        Assert.NotNull(tool.Duration);
+        Assert.True(tool.Duration > TimeSpan.Zero);
         Assert.True(tool.Succeeded);
         Assert.Equal(6, tool.OutputBytes);
         Assert.Equal(29990, summary.InputTokens);
         Assert.Equal(44, summary.OutputTokens);
         Assert.Equal(18176, summary.CachedInputTokens);
         Assert.Equal("Done.", summary.FinalAssistantMessage);
-        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+        Assert.Equal(TimeSpan.FromSeconds(12), summary.TotalDuration);
     }
 
     [Fact]
@@ -485,6 +487,7 @@ public sealed class FleetAggregateEndpointTests : IClassFixture<AgentStreamAnaly
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal(2, body.GetProperty("totalToolCalls").GetInt32());
         Assert.Equal(4_000, body.GetProperty("executingMs").GetInt64());
+        Assert.Empty(body.GetProperty("invocations").EnumerateArray());
         Assert.DoesNotContain(
             body.GetProperty("byTool").EnumerateArray(),
             t => t.GetProperty("tool").GetString() == "Write");
