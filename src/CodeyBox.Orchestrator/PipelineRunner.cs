@@ -545,7 +545,7 @@ public sealed class PipelineRunner : IPipelineRunner
             prompt = BuildResumePrompt(prompt, preemptCheckpoint);
         }
         else if (isInitial)
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
         else
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", branch);
         var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);

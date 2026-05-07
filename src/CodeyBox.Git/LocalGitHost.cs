@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Collections.Concurrent;
-using System.Text;
 using System.Text.RegularExpressions;
 using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
@@ -271,66 +270,18 @@ public sealed class LocalGitHost : IGitHost
     private static void SanitizeBareRepositoryConfig(string bareRepoPath)
     {
         var configPath = Path.Combine(bareRepoPath, "config");
-        var existingConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : string.Empty;
-        var repositoryFormatVersion = TryReadSafeConfigValue(existingConfig, "core", "repositoryformatversion") ?? "0";
-        var objectFormat = TryReadSafeConfigValue(existingConfig, "extensions", "objectformat");
-
-        var builder = new StringBuilder()
-            .AppendLine("[core]")
-            .AppendLine($"\trepositoryformatversion = {repositoryFormatVersion}")
-            .AppendLine("\tfilemode = true")
-            .AppendLine("\tbare = true");
-
-        if (!string.IsNullOrEmpty(objectFormat))
-        {
-            builder
-                .AppendLine("[extensions]")
-                .AppendLine($"\tobjectformat = {objectFormat}");
-        }
-
         var tempPath = Path.Combine(bareRepoPath, "config.codeybox-" + Guid.NewGuid().ToString("N") + ".tmp");
-        File.WriteAllText(tempPath, builder.ToString(), Encoding.UTF8);
+        File.WriteAllText(
+            tempPath,
+            """
+            [core]
+                repositoryformatversion = 0
+                filemode = true
+                bare = true
+
+            """);
         File.Move(tempPath, configPath, overwrite: true);
     }
-
-    private static string? TryReadSafeConfigValue(string config, string section, string key)
-    {
-        string? currentSection = null;
-        foreach (var rawLine in config.Split('\n'))
-        {
-            var line = rawLine.Trim();
-            if (line.Length == 0 || line[0] is '#' or ';')
-                continue;
-
-            if (line.StartsWith('[') && line.EndsWith(']'))
-            {
-                var sectionName = line[1..^1].Trim();
-                var subsectionStart = sectionName.IndexOfAny([' ', '\t']);
-                currentSection = subsectionStart >= 0 ? sectionName[..subsectionStart] : sectionName;
-                continue;
-            }
-
-            if (!string.Equals(currentSection, section, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            var equalsIndex = line.IndexOf('=');
-            if (equalsIndex < 0)
-                continue;
-
-            var parsedKey = line[..equalsIndex].Trim();
-            if (!string.Equals(parsedKey, key, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            var value = line[(equalsIndex + 1)..].Trim().Trim('"');
-            return IsSafeConfigAtom(value) ? value : null;
-        }
-
-        return null;
-    }
-
-    private static bool IsSafeConfigAtom(string value)
-        => value.Length is > 0 and <= 64
-            && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-');
 
     private static string ScrubCredentialMaterial(string value)
         => UrlUserInfoPattern.Replace(RawOutputRedactor.Redact(value), "${scheme}***@");

@@ -146,6 +146,56 @@ public sealed class ReleaseBranchCreationTests : IDisposable
     }
 
     [Fact]
+    public async Task EnsureReleaseBranch_UsesConfiguredBaseBranchInsteadOfBareHead()
+    {
+        var rel = await SeedAsync();
+        var project = ReleaseTestHelper.EnabledProject() with { DefaultBaseBranch = "develop" };
+        var sandbox = new CapturingReleaseSandbox(
+            new SandboxExecResult(0, "", ""),
+            new SandboxExecResult(0, "develop-sha\n", ""),
+            new SandboxExecResult(0, "", ""),
+            new SandboxExecResult(0, "", ""));
+        var svc = BuildBranchService(
+            sandboxes: new SingleSandboxProvider(sandbox),
+            gitHost: new DeepAuditTestGitHost());
+
+        var (branchName, baseCommitSha) = await svc.EnsureReleaseBranchAsync(rel, project, default);
+
+        Assert.Equal($"release/{rel.Name}", branchName);
+        Assert.Equal("develop-sha", baseCommitSha);
+        Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/develop"]));
+        Assert.DoesNotContain(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/main"]));
+    }
+
+    [Fact]
+    public async Task ReleaseTransition_CompletesIntoConfiguredBaseBranchInsteadOfBareHead()
+    {
+        var project = ReleaseTestHelper.EnabledProject() with { DefaultBaseBranch = "develop" };
+        var rel = await SeedAsync();
+        await _store.TryTransitionStateAsync(rel with { State = ReleaseState.Closed }, ReleaseState.Open);
+        await _store.TrySetBranchAsync(rel.Id, $"release/{rel.Name}", "release-base");
+        var upstream = new CapturingUpstreamRemote();
+        var svc = ReleaseTestHelper.BuildService(
+            _store,
+            _workItemStore,
+            new InMemoryProjectRepository(project),
+            new NullWebhookDispatcher(),
+            gitHost: new DeepAuditTestGitHost(),
+            upstreamFactory: new FixedUpstreamFactory(upstream));
+
+        var (ok, error) = await svc.ForceBeginReviewAsync(rel.Id, default);
+
+        Assert.True(ok, error);
+        await WaitUntilAsync(async () =>
+        {
+            var current = await _store.GetAsync(rel.Id);
+            return current?.State == ReleaseState.Released;
+        });
+        var request = Assert.Single(upstream.CompletionRequests);
+        Assert.Equal("develop", request.BaseBranch);
+    }
+
+    [Fact]
     public async Task EnsureReleaseBranch_SubsequentWorkItem_ReturnsPreviousBranchWithoutSandbox()
     {
         // Arrange: branch already set, simulating a second (or later) work item pickup.
@@ -211,5 +261,50 @@ public sealed class ReleaseBranchCreationTests : IDisposable
             rel = rel with { Name = name };
         await _store.CreateAsync(rel);
         return rel;
+    }
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> predicate)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await predicate())
+                return;
+            await Task.Delay(25);
+        }
+
+        throw new TimeoutException("Timed out waiting for release transition");
+    }
+
+    private sealed class SingleSandboxProvider : ISandboxProvider
+    {
+        private readonly ISandbox _sandbox;
+
+        public SingleSandboxProvider(ISandbox sandbox) => _sandbox = sandbox;
+
+        public string Name => "single";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) => Task.FromResult(_sandbox);
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class CapturingReleaseSandbox : ISandbox
+    {
+        private readonly Queue<SandboxExecResult> _results;
+
+        public CapturingReleaseSandbox(params SandboxExecResult[] results) => _results = new Queue<SandboxExecResult>(results);
+
+        public string Id => "capturing-release";
+        public List<IReadOnlyList<string>> Argv { get; } = [];
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            Argv.Add([.. exec.Argv]);
+            var result = _results.Count > 0 ? _results.Dequeue() : new SandboxExecResult(0, "", "");
+            return Task.FromResult(result);
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

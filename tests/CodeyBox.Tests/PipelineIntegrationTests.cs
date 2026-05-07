@@ -146,6 +146,47 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task InitialWorkPhase_ChecksOutWorkBranchFromConfiguredBaseBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
+        await CommitToSeedAsync(seed, "develop-only.txt", "develop base\n", "develop base");
+        await TestSupport.RunGit(seed, "checkout", "main");
+
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, defaultBaseBranch: "develop");
+        var item = NewItem("feature/develop-work") with { BaseBranch = null };
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var observed = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "git -C \"$1\" rev-parse HEAD > \"$1/observed-head.txt\" && git -C \"$1\" show HEAD:develop-only.txt > \"$1/observed-develop-file.txt\"",
+                    "sh",
+                    workingDirectory,
+                ],
+            }, ct);
+            if (!observed.Success)
+                throw new InvalidOperationException($"failed to capture initial checkout state: {observed.Stderr}");
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent started on develop\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var developTip = await RevParseAsync(seed, "develop");
+        var (_, observedHead, _) = await TestSupport.RunGit(barePath, "show", "develop:observed-head.txt");
+        var (_, observedDevelopFile, _) = await TestSupport.RunGit(barePath, "show", "develop:observed-develop-file.txt");
+        Assert.Equal(developTip + "\n", observedHead);
+        Assert.Equal("develop base\n", observedDevelopFile);
+    }
+
+    [Fact]
     public async Task AgentNoChange_FailsWorkItem()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

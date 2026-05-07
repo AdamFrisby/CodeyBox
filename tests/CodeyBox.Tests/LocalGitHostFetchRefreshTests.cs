@@ -133,6 +133,57 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
     }
 
     [Fact]
+    public async Task ExistingBareRepo_RefreshReplacesConfigSymlinkWithoutReadingTarget()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitHost = CreateGitHost();
+        var id = WorkItemId.New();
+
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        var configPath = Path.Combine(barePath, "config");
+        var hostileTarget = Path.Combine(_workspace, "hostile-config");
+        await File.WriteAllTextAsync(
+            hostileTarget,
+            """
+            [core]
+                repositoryformatversion = 999
+                filemode = true
+                bare = true
+
+            """);
+        File.Delete(configPath);
+        try
+        {
+            File.CreateSymbolicLink(configPath, hostileTarget);
+        }
+        catch (IOException)
+        {
+            return;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return;
+        }
+        catch (PlatformNotSupportedException)
+        {
+            return;
+        }
+
+        await CommitToRepoAsync(seed, "after-symlink.txt", "after symlink\n", "advance main after symlink");
+        var after = await RevParseAsync(seed, "main");
+
+        await gitHost.EnsureRepositoryAsync(id, seed, "main");
+
+        Assert.Equal(after, await RevParseAsync(barePath, "main"));
+        Assert.False(File.GetAttributes(configPath).HasFlag(FileAttributes.ReparsePoint));
+        Assert.Contains("repositoryformatversion = 0", await File.ReadAllTextAsync(configPath), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ExistingBareRepo_NullSeedUrlIsNoOp()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

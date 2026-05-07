@@ -74,7 +74,8 @@ internal static class TestSupport
         IUpstreamRemoteFactory? upstreamFactory = null,
         PipelineOptions? pipelineOptions = null,
         IAgentStreamStore? agentStreams = null,
-        ITimingStore? timingStore = null)
+        ITimingStore? timingStore = null,
+        string defaultBaseBranch = "main")
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -97,7 +98,7 @@ internal static class TestSupport
             Id = new ProjectId("test-project"),
             DisplayName = "Test Project",
             RepositoryUrl = seedRepoUrl,
-            DefaultBaseBranch = "main",
+            DefaultBaseBranch = defaultBaseBranch,
             DefaultAgent = AgentKind.Claude,
             GitAuthorName = projectGitAuthor?.Name,
             GitAuthorEmail = projectGitAuthor?.Email,

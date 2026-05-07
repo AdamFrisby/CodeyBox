@@ -228,12 +228,16 @@ internal sealed class CapturingUpstreamRemote : IUpstreamRemote
 {
     public string Name => "capturing";
     public List<(string Tag, string Sha, string? Notes)> TagAndReleaseRequests { get; } = [];
+    public List<UpstreamCompletionRequest> CompletionRequests { get; } = [];
 
     public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
         => Task.FromResult(new UpstreamPushResult(true, null));
 
     public Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest req, CancellationToken ct = default)
-        => Task.FromResult(new UpstreamCompletionOutcome { BranchPushed = true, MergedSha = "abc123" });
+    {
+        CompletionRequests.Add(req);
+        return Task.FromResult(new UpstreamCompletionOutcome { BranchPushed = true, MergedSha = "abc123" });
+    }
 
     public Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)
         => Task.FromResult(true);
