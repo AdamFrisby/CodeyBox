@@ -164,7 +164,10 @@ public sealed class ReleaseBranchCreationTests : IDisposable
         Assert.Equal($"release/{rel.Name}", branchName);
         Assert.Equal("develop-sha", baseCommitSha);
         Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/develop"]));
+        Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "checkout", "-b", branchName, "develop-sha"]));
+        Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "push", "origin", $"{branchName}:{branchName}"]));
         Assert.DoesNotContain(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/main"]));
+        Assert.DoesNotContain(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "checkout", "-b", branchName]));
     }
 
     [Fact]

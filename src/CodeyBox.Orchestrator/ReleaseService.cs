@@ -157,7 +157,7 @@ public sealed class ReleaseService
         // Create branch locally and push to remote BEFORE writing to DB, so that any
         // concurrent worker that loses the DB race reads a branch that already exists.
         // Two workers may race on the push; "already exists" is a safe non-fatal outcome.
-        await RunSandboxCmd(sandbox, ct, "git", "-C", "/work/repo", "checkout", "-b", branchName);
+        await RunSandboxCmd(sandbox, ct, "git", "-C", "/work/repo", "checkout", "-b", branchName, baseCommitSha);
         var pushResult = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["git", "-C", "/work/repo", "push", "origin", $"{branchName}:{branchName}"],
