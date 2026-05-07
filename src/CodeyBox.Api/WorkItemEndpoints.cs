@@ -702,6 +702,7 @@ internal static class WorkItemEndpoints
         string id,
         IWorkItemStore store,
         ITaskQueue queue,
+        IAgentStreamSummaryStore? streamSummaries,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -723,6 +724,8 @@ internal static class WorkItemEndpoints
         var updated = await store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
         if (!updated)
             return Results.Conflict(new { error = "concurrent uncancel request already processed this item" });
+        if (streamSummaries is not null)
+            await streamSummaries.DeleteByWorkItemAsync(requeued.Id, ct);
         await queue.EnqueueAsync(requeued.Id, ct);
         AuditLog.WorkItemRetried(requeued.Id, "uncancel");
 
