@@ -113,7 +113,10 @@ intent is that you can swap any of these without touching the orchestrator:
   replication. When a per-work-item bare repo already exists,
   `EnsureRepositoryAsync` refreshes the configured base branch from a
   non-null upstream seed URL before reuse, preserving work-branch refs and
-  warning rather than failing if the refresh cannot reach upstream.
+  warning rather than failing if the refresh cannot reach upstream. The
+  refresh first replaces sandbox-writable bare-repo config with a minimal
+  host-controlled config, so repo-local credential helpers, SSH commands,
+  and URL rewrites cannot influence host git.
 * **Credentials follow least privilege.** Each sandbox sees only the
   minimum it needs. Tool-only audit sandboxes see no agent secrets.
   Upstream creds live only in the orchestrator process and never cross

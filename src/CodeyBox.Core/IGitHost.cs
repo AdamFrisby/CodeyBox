@@ -23,8 +23,7 @@ public interface IGitHost
         WorkItemId id,
         string? seedFromUrl,
         string? baseBranch,
-        CancellationToken ct = default)
-        => EnsureRepositoryAsync(id, seedFromUrl, ct);
+        CancellationToken ct = default);
 
     /// <summary>
     /// Describes how a sandbox should be wired up to reach this repository.

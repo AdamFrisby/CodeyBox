@@ -239,6 +239,8 @@ internal sealed class FakeGitHost : IGitHost
 
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
 
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => throw new NotSupportedException();
@@ -316,6 +318,8 @@ internal sealed class ThrowingFakeGitHost : IGitHost
 
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
 
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => throw new NotSupportedException();

@@ -116,6 +116,8 @@ internal sealed class NullGitHost : IGitHost
 {
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => throw new NotSupportedException();
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => throw new NotSupportedException();
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
@@ -201,6 +203,8 @@ internal sealed class StubGitHost : IGitHost
 {
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult($"stub-repo-{id}");
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => throw new NotSupportedException();
     public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
@@ -320,6 +324,8 @@ internal sealed class DeepAuditTestGitHost : IGitHost
 {
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult($"stub-repo-{id}");
+    public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+        => EnsureRepositoryAsync(id, seedFromUrl, ct);
 
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
         => new(

@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.Text;
+using System.Text.RegularExpressions;
 using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -15,6 +17,9 @@ namespace CodeyBox.Git;
 public sealed class LocalGitHost : IGitHost
 {
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> RepositoryLocks = new(StringComparer.Ordinal);
+    private static readonly Regex UrlUserInfoPattern = new(
+        @"(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly LocalGitHostOptions _opts;
     private readonly ILogger<LocalGitHost> _log;
@@ -218,9 +223,11 @@ public sealed class LocalGitHost : IGitHost
         Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
         var branch = ResolveRefreshBranch(bareRepoPath, baseBranch);
         Validation.ValidateBranchName(branch, nameof(baseBranch));
+        var safeUpstream = ScrubCredentialMaterial(seedFromUrl);
 
         try
         {
+            SanitizeBareRepositoryConfig(bareRepoPath);
             var rc = await RunGitAsync(
                 workdir: bareRepoPath,
                 ct,
@@ -229,7 +236,7 @@ public sealed class LocalGitHost : IGitHost
             {
                 _log.LogWarning(
                     "Failed to refresh bare repo {Path} branch {Branch} from upstream {Upstream}: {Stderr}",
-                    bareRepoPath, branch, seedFromUrl, rc.Stderr);
+                    bareRepoPath, branch, safeUpstream, ScrubCredentialMaterial(rc.Stderr));
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -237,7 +244,7 @@ public sealed class LocalGitHost : IGitHost
             _log.LogWarning(
                 ex,
                 "Failed to refresh bare repo {Path} branch {Branch} from upstream {Upstream}",
-                bareRepoPath, branch, seedFromUrl);
+                bareRepoPath, branch, safeUpstream);
         }
     }
 
@@ -248,10 +255,10 @@ public sealed class LocalGitHost : IGitHost
 
         try
         {
-            using var repo = new Repository(bareRepoPath);
-            var head = repo.Refs["HEAD"] as SymbolicReference;
-            if (head?.Target?.CanonicalName is { } target && target.StartsWith("refs/heads/", StringComparison.Ordinal))
-                return target["refs/heads/".Length..];
+            var head = File.ReadAllText(Path.Combine(bareRepoPath, "HEAD")).Trim();
+            const string HeadPrefix = "ref: refs/heads/";
+            if (head.StartsWith(HeadPrefix, StringComparison.Ordinal))
+                return head[HeadPrefix.Length..];
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -260,6 +267,73 @@ public sealed class LocalGitHost : IGitHost
 
         return _opts.FallbackDefaultBranch;
     }
+
+    private static void SanitizeBareRepositoryConfig(string bareRepoPath)
+    {
+        var configPath = Path.Combine(bareRepoPath, "config");
+        var existingConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : string.Empty;
+        var repositoryFormatVersion = TryReadSafeConfigValue(existingConfig, "core", "repositoryformatversion") ?? "0";
+        var objectFormat = TryReadSafeConfigValue(existingConfig, "extensions", "objectformat");
+
+        var builder = new StringBuilder()
+            .AppendLine("[core]")
+            .AppendLine($"\trepositoryformatversion = {repositoryFormatVersion}")
+            .AppendLine("\tfilemode = true")
+            .AppendLine("\tbare = true");
+
+        if (!string.IsNullOrEmpty(objectFormat))
+        {
+            builder
+                .AppendLine("[extensions]")
+                .AppendLine($"\tobjectformat = {objectFormat}");
+        }
+
+        var tempPath = Path.Combine(bareRepoPath, "config.codeybox-" + Guid.NewGuid().ToString("N") + ".tmp");
+        File.WriteAllText(tempPath, builder.ToString(), Encoding.UTF8);
+        File.Move(tempPath, configPath, overwrite: true);
+    }
+
+    private static string? TryReadSafeConfigValue(string config, string section, string key)
+    {
+        string? currentSection = null;
+        foreach (var rawLine in config.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line[0] is '#' or ';')
+                continue;
+
+            if (line.StartsWith('[') && line.EndsWith(']'))
+            {
+                var sectionName = line[1..^1].Trim();
+                var subsectionStart = sectionName.IndexOfAny([' ', '\t']);
+                currentSection = subsectionStart >= 0 ? sectionName[..subsectionStart] : sectionName;
+                continue;
+            }
+
+            if (!string.Equals(currentSection, section, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var equalsIndex = line.IndexOf('=');
+            if (equalsIndex < 0)
+                continue;
+
+            var parsedKey = line[..equalsIndex].Trim();
+            if (!string.Equals(parsedKey, key, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var value = line[(equalsIndex + 1)..].Trim().Trim('"');
+            return IsSafeConfigAtom(value) ? value : null;
+        }
+
+        return null;
+    }
+
+    private static bool IsSafeConfigAtom(string value)
+        => value.Length is > 0 and <= 64
+            && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-');
+
+    private static string ScrubCredentialMaterial(string value)
+        => UrlUserInfoPattern.Replace(RawOutputRedactor.Redact(value), "${scheme}***@");
 
     private static async Task ReconcileRejectedUpstreamPushAsync(
         string bareRepoPath,

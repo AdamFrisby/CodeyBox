@@ -32,9 +32,12 @@ it to upstream. Sandboxes never see the upstream URL or creds.
 On every `EnsureRepositoryAsync` call with a non-null upstream seed URL,
 an existing host bare repo refreshes the configured base branch from that
 upstream before the sandbox clone. The fetch updates only the base branch
-ref, so per-work-item refs such as `codeybox/<id>` are preserved. If the
-refresh fails, the orchestrator logs a warning and continues with the
-previous local tip instead of deleting the bare repo.
+ref, so per-work-item refs such as `codeybox/<id>` are preserved. Before
+the host fetch, the orchestrator replaces the sandbox-writable bare-repo
+config with a minimal host-controlled config so repo-local credential
+helpers, SSH commands, and URL rewrites cannot influence the host command.
+If the refresh fails, the orchestrator logs a redacted warning and
+continues with the previous local tip instead of deleting the bare repo.
 
 ## Phase 1: Work
 
