@@ -72,12 +72,6 @@ public sealed class AgentStreamParserOptions
     public int MaxJsonDepth { get; set; } = 64;
 }
 
-public interface IAgentStreamTimingSource
-{
-    DateTimeOffset? CapturedAt { get; }
-    DateTimeOffset? CompletedAt { get; }
-}
-
 public sealed class ClaudeStreamParser : FlexibleAgentStreamParser
 {
     public ClaudeStreamParser(AgentStreamParserOptions? options = null)
@@ -523,7 +517,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
     {
         var toolStarts = new Dictionary<string, ToolBuilder>(StringComparer.Ordinal);
         var completedTools = new List<ToolCallInvocation>();
-        var fallbackClock = FallbackClock.TryCreate(jsonlFile);
         DateTimeOffset? firstTimestamp = null;
         DateTimeOffset? lastTimestamp = null;
         DateTimeOffset? firstAssistantTimestamp = null;
@@ -557,7 +550,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 continue;
             }
 
-            var timestamp = parsed.Timestamp ?? fallbackClock?.TimestampFor(jsonLine);
+            var timestamp = parsed.Timestamp;
             if (timestamp is { } eventTimestamp)
             {
                 firstTimestamp ??= eventTimestamp;
@@ -645,60 +638,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 .ToList(),
             stalls,
             finalText);
-    }
-
-    private sealed class FallbackClock
-    {
-        private readonly DateTimeOffset _capturedAt;
-        private readonly TimeSpan _duration;
-        private readonly long _length;
-
-        private FallbackClock(DateTimeOffset capturedAt, DateTimeOffset completedAt, long length)
-        {
-            _capturedAt = capturedAt;
-            _duration = completedAt - capturedAt;
-            _length = length;
-        }
-
-        public static FallbackClock? TryCreate(Stream stream)
-        {
-            if (stream is not IAgentStreamTimingSource
-                {
-                    CapturedAt: { } capturedAt,
-                    CompletedAt: { } completedAt,
-                }
-                || completedAt <= capturedAt)
-            {
-                return null;
-            }
-
-            long length;
-            try
-            {
-                length = stream.Length;
-            }
-            catch (NotSupportedException)
-            {
-                return null;
-            }
-            catch (ObjectDisposedException)
-            {
-                return null;
-            }
-
-            return length > 0 ? new FallbackClock(capturedAt, completedAt, length) : null;
-        }
-
-        public DateTimeOffset TimestampFor(AgentStreamJsonLine line)
-        {
-            if (line.StartOffset <= 0)
-                return _capturedAt;
-
-            var offset = Math.Clamp(line.EndOffset, 0, _length);
-            var ratio = (double)offset / _length;
-            var ticks = (long)Math.Round(_duration.Ticks * ratio);
-            return _capturedAt + TimeSpan.FromTicks(ticks);
-        }
     }
 
     private static string ClassifyStall(string? previousEventType, int openToolCount)
@@ -830,14 +769,17 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
     {
         input = FirstInt(root, "input_tokens", "prompt_tokens");
         output = FirstInt(root, "output_tokens", "completion_tokens");
-        cached = FirstInt(root, "cache_creation_input_tokens", "cache_read_input_tokens", "cached_input_tokens", "cached_tokens");
+        cached = FirstCachedInputTokens(root);
         if (TryGet(root, out var usage, "usage", "token_usage"))
         {
             input ??= FirstInt(usage, "input_tokens", "prompt_tokens");
             output ??= FirstInt(usage, "output_tokens", "completion_tokens");
-            cached ??= FirstInt(usage, "cache_creation_input_tokens", "cache_read_input_tokens", "cached_input_tokens", "cached_tokens");
+            cached ??= FirstCachedInputTokens(usage);
         }
     }
+
+    private static int? FirstCachedInputTokens(JsonElement root) =>
+        FirstInt(root, "cache_read_input_tokens", "cached_input_tokens", "cached_tokens", "cache_creation_input_tokens");
 
     protected static DateTimeOffset? TryTimestamp(JsonElement root)
     {

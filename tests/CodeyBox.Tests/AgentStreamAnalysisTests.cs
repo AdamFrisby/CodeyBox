@@ -44,6 +44,19 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
+    public async Task ParseAsync_UsesClaudeCacheReadTokensBeforeCacheCreationTokens()
+    {
+        var parser = new ClaudeStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"result","timestamp":"2026-01-01T00:00:00Z","result":"done","usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":77}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.Equal(77, summary.CachedInputTokens);
+    }
+
+    [Fact]
     public async Task ParseAsync_LeavesDurationsUnknownWhenTimestampsAreMissing()
     {
         var parser = new ClaudeStreamParser();
@@ -66,33 +79,27 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_UsesCaptureFileMetadataAsFallbackClock()
+    public async Task ParseAsync_DoesNotInventTimingsFromCaptureFileMetadata()
     {
         var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.Zero });
-        await using var stream = TimedStreamOf(
-            """
+        await using var stream = StreamOf("""
             {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
             {"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}
             {"type":"result","result":"done","usage":{"input_tokens":100,"output_tokens":20}}
-            """,
-            DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
-            DateTimeOffset.Parse("2026-01-01T00:00:30Z"));
+            """);
 
         var summary = await parser.ParseAsync(stream);
 
         var tool = Assert.Single(summary.ToolCalls);
-        Assert.Equal(DateTimeOffset.Parse("2026-01-01T00:00:00Z"), tool.StartedAt);
-        Assert.NotNull(tool.EndedAt);
-        Assert.NotNull(tool.Duration);
-        Assert.True(tool.Duration > TimeSpan.Zero);
-        Assert.Equal(TimeSpan.FromSeconds(30), summary.TotalDuration);
-        Assert.Equal(TimeSpan.Zero, summary.TimeToFirstToken);
-        Assert.NotEmpty(summary.Stalls);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+        Assert.Null(summary.TimeToFirstToken);
+        Assert.Empty(summary.Stalls);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
-    private static TimedMemoryStream TimedStreamOf(string text, DateTimeOffset capturedAt, DateTimeOffset completedAt) =>
-        new(Encoding.UTF8.GetBytes(text), capturedAt, completedAt);
 }
 
 public sealed class CodexStreamParserTests
@@ -126,34 +133,30 @@ public sealed class CodexStreamParserTests
     public async Task ParseAsync_ParsesInstalledCommandExecutionAndAgentMessageEvents()
     {
         var parser = new CodexStreamParser();
-        await using var stream = TimedStreamOf(
-            """
+        await using var stream = StreamOf("""
             {"type":"thread.started","thread_id":"thread_1"}
             {"type":"turn.started"}
             {"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"","exit_code":null,"status":"in_progress"}}
             {"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"/work\n","exit_code":0,"status":"completed"}}
             {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Done."}}
             {"type":"turn.completed","usage":{"input_tokens":29990,"cached_input_tokens":18176,"output_tokens":44,"reasoning_output_tokens":0}}
-            """,
-            DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
-            DateTimeOffset.Parse("2026-01-01T00:00:12Z"));
+            """);
 
         var summary = await parser.ParseAsync(stream);
 
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.NotNull(tool.StartedAt);
-        Assert.NotNull(tool.EndedAt);
-        Assert.NotNull(tool.Duration);
-        Assert.True(tool.Duration > TimeSpan.Zero);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
         Assert.True(tool.Succeeded);
         Assert.Equal(6, tool.OutputBytes);
         Assert.Equal(29990, summary.InputTokens);
         Assert.Equal(44, summary.OutputTokens);
         Assert.Equal(18176, summary.CachedInputTokens);
         Assert.Equal("Done.", summary.FinalAssistantMessage);
-        Assert.Equal(TimeSpan.FromSeconds(12), summary.TotalDuration);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
     }
 
     [Fact]
@@ -196,21 +199,6 @@ public sealed class CodexStreamParserTests
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
-    private static TimedMemoryStream TimedStreamOf(string text, DateTimeOffset capturedAt, DateTimeOffset completedAt) =>
-        new(Encoding.UTF8.GetBytes(text), capturedAt, completedAt);
-}
-
-public sealed class TimedMemoryStream : MemoryStream, IAgentStreamTimingSource
-{
-    public TimedMemoryStream(byte[] buffer, DateTimeOffset capturedAt, DateTimeOffset completedAt)
-        : base(buffer)
-    {
-        CapturedAt = capturedAt;
-        CompletedAt = completedAt;
-    }
-
-    public DateTimeOffset? CapturedAt { get; }
-    public DateTimeOffset? CompletedAt { get; }
 }
 
 public sealed class GeminiStreamParserTests
@@ -598,6 +586,49 @@ public sealed class MissingFileTests : IClassFixture<AgentStreamAnalysisApiFacto
 
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
+
+    [Fact]
+    public async Task AnalyzeFile_ParsesStreamOnDemandEvenWhenCachedSummaryExists()
+    {
+        var item = AgentStreamAnalysisApiFactory.CreateItem(WorkItemState.Done);
+        await _factory.Store.CreateAsync(item);
+        const string fileName = "work-1-abcdef.jsonl";
+        _factory.WriteStreamFile(item.Id, fileName, """
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"fresh","name":"Read","input":{"path":"fresh.txt"}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:03Z","tool_use_id":"fresh","content":"ok"}
+            {"type":"result","timestamp":"2026-01-01T00:00:04Z","result":"fresh done","usage":{"input_tokens":123,"output_tokens":45,"cached_input_tokens":6}}
+            """);
+        await _factory.Summaries.UpsertAsync(new AgentStreamSummaryRow(
+            item.Id,
+            fileName,
+            "work",
+            1,
+            AgentKind.Claude,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(99),
+                TimeSpan.Zero,
+                1,
+                2,
+                3,
+                null,
+                [new ToolCallInvocation("stale", "Bash", "{}", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddSeconds(99), TimeSpan.FromSeconds(99), true, 1)],
+                [],
+                "stale"),
+            DateTimeOffset.UtcNow));
+
+        var client = _factory.CreateClient();
+        var resp = await client.GetAsync($"/workitems/{item.Id}/agent-streams/{fileName}/analysis");
+        resp.EnsureSuccessStatusCode();
+
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(123, body.GetProperty("inputTokens").GetInt32());
+        Assert.Equal(45, body.GetProperty("outputTokens").GetInt32());
+        Assert.Equal(6, body.GetProperty("cachedInputTokens").GetInt32());
+        Assert.Equal(4_000, body.GetProperty("totalDurationMs").GetInt64());
+        var tool = Assert.Single(body.GetProperty("toolCalls").EnumerateArray());
+        Assert.Equal("fresh", tool.GetProperty("toolUseId").GetString());
+        Assert.Equal("Read", tool.GetProperty("toolName").GetString());
+    }
 }
 
 public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Program>
@@ -654,6 +685,13 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
         WorkTimeout = TimeSpan.FromHours(1),
         MergeTimeout = TimeSpan.FromMinutes(30),
     };
+
+    public void WriteStreamFile(WorkItemId id, string fileName, string content)
+    {
+        var dir = Path.Combine(_streamRoot, id.ToString());
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, fileName), content);
+    }
 
     protected override void Dispose(bool disposing)
     {

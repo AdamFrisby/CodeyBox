@@ -137,9 +137,7 @@ public sealed class AgentStreamStore : IAgentStreamStore
         var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 64 * 1024, FileOptions.Asynchronous);
         Stream stream = new CappedReadStream(
             file,
-            Options.MaxFileSizeMb * 1024L * 1024L,
-            new DateTimeOffset(File.GetCreationTimeUtc(path), TimeSpan.Zero),
-            new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero));
+            Options.MaxFileSizeMb * 1024L * 1024L);
         return Task.FromResult<Stream?>(stream);
     }
 
@@ -274,7 +272,7 @@ public sealed class AgentStreamStore : IAgentStreamStore
         return count;
     }
 
-    private sealed class CappedReadStream : Stream, IAgentStreamTimingSource
+    private sealed class CappedReadStream : Stream
     {
         private readonly Stream _inner;
         private readonly long _maxBytes;
@@ -282,18 +280,11 @@ public sealed class AgentStreamStore : IAgentStreamStore
 
         public CappedReadStream(
             Stream inner,
-            long maxBytes,
-            DateTimeOffset? capturedAt,
-            DateTimeOffset? completedAt)
+            long maxBytes)
         {
             _inner = inner;
             _maxBytes = maxBytes;
-            CapturedAt = capturedAt;
-            CompletedAt = completedAt;
         }
-
-        public DateTimeOffset? CapturedAt { get; }
-        public DateTimeOffset? CompletedAt { get; }
 
         public override bool CanRead => _inner.CanRead;
         public override bool CanSeek => false;

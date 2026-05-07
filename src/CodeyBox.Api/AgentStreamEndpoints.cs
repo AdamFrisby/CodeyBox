@@ -60,7 +60,6 @@ internal static class AgentStreamEndpoints
         string fileName,
         IWorkItemStore store,
         IAgentStreamStore streams,
-        IAgentStreamSummaryStore summaries,
         IWorkItemCostStore costs,
         IEnumerable<IAgentStreamParser> parsers,
         CancellationToken ct)
@@ -71,11 +70,6 @@ internal static class AgentStreamEndpoints
         var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: false, ct);
         var file = files.FirstOrDefault(f => string.Equals(f.FileName, fileName, StringComparison.Ordinal));
         if (file is null) return Results.NotFound();
-
-        var cached = (await summaries.GetByWorkItemAsync(item.Id, ct))
-            .FirstOrDefault(r => string.Equals(r.FileName, fileName, StringComparison.Ordinal));
-        if (cached is not null)
-            return Results.Ok(ToSummaryDto(cached.Summary, cached.FileName, cached.Phase, cached.Iteration, cached.AgentKind));
 
         await using var sniffStream = await streams.OpenReadAsync(item.Id, fileName, ct);
         if (sniffStream is null) return Results.NotFound();
