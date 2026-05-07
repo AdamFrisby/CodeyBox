@@ -808,6 +808,13 @@ Operator-triggered dispose of a leaked sandbox by name. The name must start with
 
 Liveness probe. Returns `{ "status": "ok" }`.
 
+### `GET /quota`
+
+Returns the orchestrator's current quota view for registered subscription
+probes: latest snapshots, per-model buckets, observed quota-shaped failures in
+the last 60 minutes, and `wouldAllow` decisions. See
+[`quota-gate.md`](quota-gate.md).
+
 ### `POST /projects/{id}/release`
 
 Generate a CHANGELOG.md entry for a release. Enumerates merged PRs between

@@ -26,7 +26,7 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
 
         using (var pragmaCmd = _conn.CreateCommand())
         {
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;";
+            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
             pragmaCmd.ExecuteNonQuery();
         }
 

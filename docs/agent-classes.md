@@ -167,8 +167,11 @@ On every pickup attempt for a work item with an `AgentClassId`:
    - `PayPerApi` → treat as available (no HTTP call).
    - `Subscription` → call the registered `IAgentQuotaProbe`, cache result for
      `QuotaCacheTtl` (default 60 s).
-   - Unknown (`AvailablePct < 0`) → fail-open, treat as available.
-   - Pick the first member where `AvailablePct ≥ MinQuotaPct` (or unknown).
+   - If `ModelId` is set and the snapshot includes `PerModel[ModelId]`, gate
+     on the model bucket instead of the overall quota.
+   - Unknown (`AvailablePct < 0`) follows `UnknownPolicy` (`UseObservedFailures`
+     by default).
+   - Pick the first member that the quota gate allows.
 6. If no member qualifies (all exhausted):
    - Class has at least one Subscription member → `ShouldWait = true`,
      schedule re-enqueue after `QuotaRecheckInterval`.
@@ -188,32 +191,32 @@ Two probes are bundled:
 ### `ClaudeQuotaProbe`
 
 Calls `https://api.anthropic.com/api/oauth/usage` with
-`Authorization: Bearer <CODEYBOX_CLAUDE_API_KEY>`.
+`Authorization: Bearer <Claude OAuth access token>`.
 
-Expected response shape:
-```json
-{ "usedTokens": 500000, "quotaTokens": 1000000, "resetAt": "2026-05-01T00:00:00Z" }
-```
-
-`AvailablePct = 100 × (1 − usedTokens / quotaTokens)`
+Parses overall `rate_limit` plus per-model `additional_rate_limits`; see
+[`quota-endpoints.md`](quota-endpoints.md).
 
 ### `CodexQuotaProbe`
 
-Calls `https://api.openai.com/v1/usage` with
-`Authorization: Bearer <CODEYBOX_CODEX_API_KEY>`.
+Calls `https://chatgpt.com/backend-api/wham/usage` with
+`Authorization: Bearer <ChatGPT access token>` and, when available,
+`ChatGPT-Account-Id`.
 
-Same response shape and normalisation formula.
+Parses overall `rate_limit` plus per-model `additional_rate_limits`.
+The WHAM response can use display bucket names such as
+`GPT-5.3-Codex-Spark`; the parser also stores known buckets under their routed
+CLI model id, including `gpt-5.5`.
 
-### Fail-open guarantee
+### Unknown snapshots
 
 Both probes return `AvailablePct = -1` on:
 - HTTP 4xx / 5xx
 - Network error
 - Unrecognised JSON shape
-- Token not configured (`CODEYBOX_*_API_KEY` not set)
+- Token not configured
 
-`AvailablePct = -1` is treated as "unknown → available", so a broken endpoint
-never blocks work items.
+`AvailablePct = -1` follows `UnknownPolicy`. The default is
+`UseObservedFailures`, not blind fail-open.
 
 ---
 
@@ -227,7 +230,10 @@ Configured under `CodeyBox:QuotaRouter`:
     "QuotaRouter": {
       "MinQuotaPct": 10,
       "QuotaRecheckIntervalSeconds": 300,
-      "QuotaCacheTtlSeconds": 60
+      "QuotaCacheTtlSeconds": 60,
+      "UnknownPolicy": "UseObservedFailures",
+      "ObservedFailureWindowMinutes": 10,
+      "ObservedFailureRetentionMinutes": 30
     }
   }
 }
@@ -238,6 +244,9 @@ Configured under `CodeyBox:QuotaRouter`:
 | `MinQuotaPct` | `10` | Minimum available percentage before a Subscription member is skipped. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a probe result. Keeps the pickup loop cheap under load. |
+| `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. |
+| `ObservedFailureWindowMinutes` | `10` | Minutes a quota-shaped stderr failure blocks the same agent/model. |
+| `ObservedFailureRetentionMinutes` | `30` | Minutes observed failures are retained in `state.db`. |
 
 ---
 

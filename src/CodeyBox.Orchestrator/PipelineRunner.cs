@@ -56,10 +56,11 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     private readonly IAgentStreamStore? _agentStreams;
     // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
-    // Null when no probes were provided (fail-open: no quota gate on audit agent).
+    // Null when no probes were provided: no quota gate on audit agent.
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
     private readonly QuotaRouterOptions _auditQuotaOptions;
     private readonly IWorkItemQuestionStore? _questionStore;
+    private readonly IQuotaFailureStore? _quotaFailures;
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -103,7 +104,8 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentCostCalculator? costCalculator = null,
         IWorkItemQuestionStore? questionStore = null,
         IStdoutBroadcaster? stdoutBroadcaster = null,
-        IAgentStreamStore? agentStreams = null)
+        IAgentStreamStore? agentStreams = null,
+        IQuotaFailureStore? quotaFailures = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -122,6 +124,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _costCalculator = costCalculator;
         _stdoutBroadcaster = stdoutBroadcaster;
         _agentStreams = agentStreams;
+        _quotaFailures = quotaFailures;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -532,6 +535,7 @@ public sealed class PipelineRunner : IPipelineRunner
             new KeyValuePair<string, object?>("phase", agentPhase));
 
         var agentEndedAt = DateTimeOffset.UtcNow;
+        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
         var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
         if (streamCapture is null)
             await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
@@ -547,6 +551,17 @@ public sealed class PipelineRunner : IPipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
+            await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                runner.Kind,
+                observedModelId,
+                agentResult.Summary,
+                agentResult.Stderr,
+                agentEndedAt,
+                _auditQuotaOptions.ObservedFailureRetention,
+                ct,
+                projectId: item.ProjectId);
+
             // Truncate agent-controlled output to prevent unbounded content from
             // reaching the audit log via the exception message chain.
             const int MaxOutputBytes = 4096;
@@ -880,7 +895,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 foreach (var (auditor, runner) in toolPairs)
                 {
                     var run = await ExecAuditorAsync(sandbox, auditor, runner, credential, ctx, ct);
-                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                     if (needsCreds && runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= runner.Kind;
                     findings.AddRange(run.Result.Findings);
@@ -917,7 +932,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // Post-process in stable auditor order (same as llmPairs).
                 foreach (var run in llmRuns)
                 {
-                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, ctx, ct);
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                     if (needsCreds && run.Runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= run.Runner.Kind;
                     findings.AddRange(run.Result.Findings);
@@ -996,9 +1011,24 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditorRunRecord run,
         IAgentRunner workRunner,
         bool needsCreds,
+        ProjectId projectId,
         AuditContext ctx,
         CancellationToken ct)
     {
+        if (needsCreds && run.Result.AgentStderr is not null)
+        {
+            await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                run.Runner.Kind,
+                ResolveObservedModelId(run.Runner, modelId: null),
+                run.Result.AgentSummary,
+                run.Result.AgentStderr,
+                DateTimeOffset.UtcNow,
+                _auditQuotaOptions.ObservedFailureRetention,
+                ct,
+                projectId: projectId);
+        }
+
         if (needsCreds)
         {
             await TryRecordCostAsync(run.Result.RawOutput, null,
@@ -1148,19 +1178,52 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_auditQuotaProbesByKind is not null
             && _auditQuotaProbesByKind.TryGetValue(kind.Value, out var probe))
         {
-            var snapshot = await probe.GetAvailabilityAsync(
-                new AgentMembership { Agent = kind.Value, Billing = AgentBilling.Subscription, QualityScore = 100 }, ct);
-            if (snapshot.AvailablePct >= 0 && snapshot.AvailablePct < _auditQuotaOptions.MinQuotaPct)
+            var auditMember = new AgentMembership
+            {
+                Agent = kind.Value,
+                Billing = AgentBilling.Subscription,
+                ModelId = ResolveObservedModelId(auditRunner, modelId: null),
+                QualityScore = 100,
+            };
+            if (_quotaFailures is not null
+                && await _quotaFailures.HasRecentAsync(kind.Value, auditMember.ModelId, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct))
+            {
+                AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);
+                _log.LogWarning(
+                    "Audit agent '{AuditKind}' skipped due to recent quota-shaped failure; falling through to work agent for auditor '{Auditor}'",
+                    kind.Value.Value, auditorName);
+                return workRunner;
+            }
+
+            var snapshot = await probe.GetAvailabilityAsync(auditMember, ct);
+            var quota = AgentClassRouter.ResolveMemberQuota(snapshot, auditMember);
+            var quotaAllows = quota.AvailablePct >= _auditQuotaOptions.MinQuotaPct
+                || (quota.AvailablePct < 0 && _auditQuotaOptions.UnknownPolicy == QuotaUnknownPolicy.FailOpen)
+                || (quota.AvailablePct < 0
+                    && _auditQuotaOptions.UnknownPolicy == QuotaUnknownPolicy.UseObservedFailures
+                    && (_quotaFailures is null || !await _quotaFailures.HasRecentAsync(kind.Value, auditMember.ModelId, _auditQuotaOptions.ObservedFailureWindow, DateTimeOffset.UtcNow, ct)));
+            if (!quotaAllows)
             {
                 AuditLog.QuotaAuditFallthrough(kind.Value, workRunner.Kind, auditorName);
                 _log.LogWarning(
                     "Audit agent '{AuditKind}' quota exhausted ({Pct:F1}%); falling through to work agent for auditor '{Auditor}'",
-                    kind.Value.Value, snapshot.AvailablePct, auditorName);
+                    kind.Value.Value, quota.AvailablePct, auditorName);
                 return workRunner;
             }
         }
 
         return auditRunner;
+    }
+
+    internal static string? ResolveObservedModelId(IAgentRunner runner, string? modelId)
+    {
+        if (modelId is not null)
+            return string.IsNullOrWhiteSpace(modelId) ? null : modelId;
+
+        if (runner is IAgentDefaultModelProvider defaults)
+            return string.IsNullOrWhiteSpace(defaults.DefaultModelId) ? null : defaults.DefaultModelId;
+
+        return null;
     }
 
     /// <summary>
@@ -1253,6 +1316,7 @@ public sealed class PipelineRunner : IPipelineRunner
             new KeyValuePair<string, object?>("phase", "merge"));
 
         var mergeEndedAt = DateTimeOffset.UtcNow;
+        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
         var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecScope.ElapsedMs);
         if (mergeStreamCapture is null)
             await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecScope.ElapsedMs, ct);
@@ -1263,7 +1327,19 @@ public sealed class PipelineRunner : IPipelineRunner
             stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
+        {
+            await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                runner.Kind,
+                observedModelId,
+                agentResult.Summary,
+                agentResult.Stderr,
+                mergeEndedAt,
+                _auditQuotaOptions.ObservedFailureRetention,
+                ct,
+                projectId: item.ProjectId);
             throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
+        }
 
         // Read suggestions.json before cleaning the working tree, then remove it
         // so VerifyMergeStateAsync's `git status --porcelain` check sees a clean tree.

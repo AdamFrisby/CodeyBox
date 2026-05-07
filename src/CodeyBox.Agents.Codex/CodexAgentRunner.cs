@@ -13,7 +13,7 @@ namespace CodeyBox.Agents.Codex;
 ///         <c>CODEX_AUTH_JSON</c> credential env var before invoking codex.</item>
 /// </list>
 /// </summary>
-public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
+public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider
 {
     private static readonly AsyncLocal<string?> CurrentStructuredStreamFlag = new();
 

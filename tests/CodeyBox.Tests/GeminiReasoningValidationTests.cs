@@ -179,6 +179,7 @@ internal sealed class ValidationTestFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
+            cfg.Sources.Clear();
             var tmp = Path.GetTempPath();
             var baseConfig = new Dictionary<string, string?>
             {
