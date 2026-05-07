@@ -294,6 +294,17 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
             ["NUGET_XMLDOC_MODE"] = "skip",
         };
 
+    private static readonly IReadOnlyDictionary<string, string> GoScannerEnvironment =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["GOINSECURE"] = "",
+            ["GONOPROXY"] = "",
+            ["GONOSUMDB"] = "",
+            ["GOPRIVATE"] = "",
+            ["GOPROXY"] = "https://proxy.golang.org",
+            ["GOSUMDB"] = "sum.golang.org",
+        };
+
     private static readonly IReadOnlyDictionary<string, Scanner> Scanners =
         new Dictionary<string, Scanner>(StringComparer.OrdinalIgnoreCase)
         {
@@ -331,7 +342,8 @@ public sealed partial class DepsCveScanDeepAuditor : IDeepAuditor
                 "govulncheck not installed in sandbox; CVE scan skipped",
                 "Install govulncheck in the sandbox image to enable Go CVE scanning.",
                 ParseGoFindings,
-                "govulncheck exited with code {0} but no vulnerability records were parsed."),
+                "govulncheck exited with code {0} but no vulnerability records were parsed.",
+                GoScannerEnvironment),
             ["rust"] = new(
                 "rust",
                 LanguageProjectDiscovery.RustDiscoveryScript,

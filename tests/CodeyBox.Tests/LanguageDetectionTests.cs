@@ -30,6 +30,23 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
+    public async Task EnabledLanguageWithMissingTool_ReportsInfoAndPasses()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("python", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "python:test-pass");
+        var sandbox = new MarkerWithMissingToolSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/repo", FakeAuditContext());
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Info, finding.Severity);
+        Assert.Contains("tool not installed", finding.Title);
+        Assert.Contains(sandbox.Commands, c => c == "pytest");
+    }
+
+    [Fact]
     public async Task DiscoveryFailure_ReportsErrorAndDoesNotRunTool()
     {
         var catalog = new PresetCatalog();
@@ -236,6 +253,24 @@ public sealed class LanguageDetectionTests
         {
             Commands.Add(string.Join(' ', exec.Argv));
             return Task.FromResult(new SandboxExecResult(2, "", "find failed"));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class MarkerWithMissingToolSandbox : ISandbox
+    {
+        public List<string> Commands { get; } = [];
+        public string Id => "marker-with-missing-tool";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var command = string.Join(' ', exec.Argv);
+            Commands.Add(command);
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+                return Task.FromResult(new SandboxExecResult(0, "./python\n", ""));
+
+            return Task.FromResult(new SandboxExecResult(127, "", "pytest: not found"));
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

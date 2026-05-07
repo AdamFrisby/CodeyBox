@@ -90,7 +90,8 @@ internal sealed class LanguagePresetAuditor : IAuditor
                 context,
                 ct);
 
-            passed &= result.Passed;
+            passed &= result.Passed ||
+                (result.Findings.Count > 0 && result.Findings.All(f => f.Severity != AuditSeverity.Error));
             allFindings.AddRange(result.Findings);
             if (!string.IsNullOrWhiteSpace(result.RawOutput))
                 AppendRawPart(rawParts, $"## {projectDirectory}\n{result.RawOutput}", ref rawOutputChars, ref rawOutputTruncated);

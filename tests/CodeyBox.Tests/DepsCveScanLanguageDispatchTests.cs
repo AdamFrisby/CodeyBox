@@ -208,6 +208,13 @@ public sealed class DepsCveScanLanguageDispatchTests
 
         Assert.True(result.Passed);
         Assert.Contains(sandbox.Commands, c => c == "govulncheck -json ./...");
+        Assert.Contains(sandbox.ExtraEnvironments, e =>
+            e.TryGetValue("GOPROXY", out var goProxy) &&
+            goProxy == "https://proxy.golang.org" &&
+            e.TryGetValue("GONOPROXY", out var goNoProxy) &&
+            goNoProxy == "" &&
+            e.TryGetValue("GOPRIVATE", out var goPrivate) &&
+            goPrivate == "");
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Warning, finding.Severity);
         Assert.Contains("example.com/app", finding.Title);
