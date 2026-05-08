@@ -465,7 +465,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task AnalyzeRecentTerminalWorkItemsAsync_TreatsTiminglessCodexStreamAsUnsupported()
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_PreservesTiminglessCodexPartialSummary()
     {
         var item = CreateItem(WorkItemState.Done);
         await _workItems.CreateAsync(item);
@@ -486,10 +486,20 @@ public sealed class StreamAnalysisServiceTests : IDisposable
 
         Assert.Equal(1, count);
         var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
-        Assert.Equal(new AgentKind("unknown"), row.AgentKind);
+        Assert.Equal(AgentKind.Codex, row.AgentKind);
         Assert.Equal(TimeSpan.Zero, row.Summary.TotalDuration);
-        Assert.Empty(row.Summary.ToolCalls);
-        Assert.Equal(0, row.Summary.InputTokens);
+        Assert.Null(row.Summary.TimeToFirstToken);
+        Assert.Equal(10, row.Summary.InputTokens);
+        Assert.Equal(2, row.Summary.OutputTokens);
+
+        var tool = Assert.Single(row.Summary.ToolCalls);
+        Assert.Equal("item_0", tool.ToolUseId);
+        Assert.Equal("Bash", tool.ToolName);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
+        Assert.True(tool.Succeeded);
+        Assert.Equal(6, tool.OutputBytes);
     }
 
     [Fact]

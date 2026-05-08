@@ -354,11 +354,11 @@ does not write to the summary cache.
 }
 ```
 
-If the captured CLI stream has no event timestamps, CodeyBox uses capture-file
-start/end metadata and line byte offsets as a best-effort fallback clock. The
-fallback does not modify the JSONL file. `startedAt`, `endedAt`, and
-`durationMs` are only `null` when neither event timestamps nor capture timing
-metadata are available.
+If the captured CLI stream has no event timestamps or duration fields,
+CodeyBox reports timing fields as `null` or zero. Non-timing analytics such as
+token counts, tool-call frequency, redacted tool inputs, output byte counts,
+and unfinished tool calls are still returned when the stream contains enough
+structured data to derive them.
 
 The analysis response includes `finalAssistantMessage` when the parser can
 derive it from the stream.

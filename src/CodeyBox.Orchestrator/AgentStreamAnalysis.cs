@@ -378,13 +378,7 @@ public static class AgentStreamParserSelection
         if (string.Equals(kind.Value, "unknown", StringComparison.OrdinalIgnoreCase))
             return true;
 
-        // Codex 0.128 emits thread/item/turn JSONL without timestamps. Unless
-        // the stream contains explicit duration/timestamp fields, persisting
-        // token/tool counts as a normal invocation would hide that the primary
-        // timing analytics cannot be computed from this CLI shape.
-        return kind == AgentKind.Codex
-            && ((summary.TotalDuration == TimeSpan.Zero || summary.TimeToFirstToken is null)
-                || summary.ToolCalls.Any(t => t.Duration is null));
+        return false;
     }
 
     public static AgentStreamSummary UnsupportedSummary() =>

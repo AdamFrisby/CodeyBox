@@ -27,7 +27,7 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. The analyser prefers timestamps emitted by the stream events themselves. When a captured file has no event timestamps, the read path exposes the file's capture start/end metadata and byte offsets so the parser can assign a best-effort monotonic clock without modifying the JSONL. Those fallback timings are approximate, but they keep tool durations, stall gaps, total stream duration, and the thinking-vs-executing split available for real Codex and Claude captures that omit per-event timestamps.
+Captured CLI streams do not always include timestamps. The analyser uses timestamps and duration fields emitted by the stream events themselves. When neither is present, timing fields are reported as `null` or zero while non-timing analytics such as token counts, tool-call frequency, redacted tool inputs, output byte counts, and unfinished tool calls are still preserved.
 
 ## Thinking Vs Executing
 
