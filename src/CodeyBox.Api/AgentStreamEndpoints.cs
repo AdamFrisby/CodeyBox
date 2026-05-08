@@ -70,10 +70,6 @@ internal static class AgentStreamEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: true, ct);
-        var file = files.FirstOrDefault(f => string.Equals(f.FileName, fileName, StringComparison.Ordinal));
-        if (file is null) return Results.NotFound();
-
         if (!(await OnDemandAnalysisGate.WaitAsync(TimeSpan.Zero, ct).ConfigureAwait(false)))
             return Results.StatusCode(StatusCodes.Status429TooManyRequests);
 
@@ -82,6 +78,10 @@ internal static class AgentStreamEndpoints
         var analysisCt = timeoutCts.Token;
         try
         {
+            var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: false, analysisCt);
+            var file = files.FirstOrDefault(f => string.Equals(f.FileName, fileName, StringComparison.Ordinal));
+            if (file is null) return Results.NotFound();
+
             await using var sniffStream = await streams.OpenReadAsync(item.Id, fileName, analysisCt);
             if (sniffStream is null) return Results.NotFound();
             var sniffedKind = await AgentStreamParserSelection.SniffKindAsync(sniffStream, analysisCt);

@@ -100,7 +100,7 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_InfersTimingsFromInvocationContextForInstalledClaudeStreamShape()
+    public async Task ParseAsync_UsesInvocationContextOnlyForTotalDurationWithoutEventTimestamps()
     {
         var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(30) });
         var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
@@ -118,15 +118,12 @@ public sealed class ClaudeStreamParserTests
             SizeBytes: stream.Length));
 
         var tool = Assert.Single(summary.ToolCalls);
-        Assert.Equal(started.AddSeconds(40), tool.StartedAt);
-        Assert.Equal(started.AddSeconds(80), tool.EndedAt);
-        Assert.Equal(TimeSpan.FromSeconds(40), tool.Duration);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
         Assert.Equal(TimeSpan.FromMinutes(2), summary.TotalDuration);
-        Assert.Equal(TimeSpan.FromSeconds(40), summary.TimeToFirstToken);
-        Assert.Contains(summary.Stalls, stall =>
-            stall.PreviousEventType == "tool_use"
-            && stall.NextEventType == "tool_result"
-            && stall.Classification == "tool_execution");
+        Assert.Null(summary.TimeToFirstToken);
+        Assert.Empty(summary.Stalls);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
@@ -208,7 +205,7 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_InfersTimingsFromInvocationContextForInstalledCodexCommandExecutionShape()
+    public async Task ParseAsync_DoesNotInferPerEventTimingsFromInvocationContext()
     {
         var parser = new CodexStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(15) });
         var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
@@ -230,11 +227,11 @@ public sealed class CodexStreamParserTests
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Equal(started.AddSeconds(20), tool.StartedAt);
-        Assert.Equal(started.AddSeconds(30), tool.EndedAt);
-        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
         Assert.Equal(TimeSpan.FromSeconds(50), summary.TotalDuration);
-        Assert.Equal(TimeSpan.FromSeconds(40), summary.TimeToFirstToken);
+        Assert.Null(summary.TimeToFirstToken);
         Assert.Empty(summary.Stalls);
     }
 
@@ -356,6 +353,7 @@ public sealed class StallDetectionTests
 
         var stall = Assert.Single(summary.Stalls);
         Assert.Equal(TimeSpan.FromSeconds(45), stall.GapDuration);
+        Assert.Equal(DateTimeOffset.Parse("2026-01-01T00:00:45Z"), stall.DetectedAt);
         Assert.Equal("tool_execution", stall.Classification);
         Assert.Equal("tool_use", stall.PreviousEventType);
         Assert.Equal("tool_result", stall.NextEventType);
@@ -380,10 +378,12 @@ public sealed class StallDetectionTests
         Assert.Contains(summary.Stalls, stall =>
             stall.PreviousEventType == "assistant"
             && stall.NextEventType == "tool_use"
+            && stall.DetectedAt == DateTimeOffset.Parse("2026-01-01T00:00:45Z")
             && stall.GapDuration == TimeSpan.FromSeconds(45));
         Assert.Contains(summary.Stalls, stall =>
             stall.PreviousEventType == "tool_result"
             && stall.NextEventType == "assistant"
+            && stall.DetectedAt == DateTimeOffset.Parse("2026-01-01T00:01:31Z")
             && stall.GapDuration == TimeSpan.FromSeconds(45));
     }
 }
@@ -569,9 +569,9 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         var tool = Assert.Single(row.Summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Equal(started.AddSeconds(30), tool.StartedAt);
-        Assert.Equal(started.AddSeconds(45), tool.EndedAt);
-        Assert.Equal(TimeSpan.FromSeconds(15), tool.Duration);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
         Assert.True(tool.Succeeded);
         Assert.Equal(6, tool.OutputBytes);
     }
@@ -955,6 +955,28 @@ public sealed class MissingFileTests : IClassFixture<AgentStreamAnalysisApiFacto
     }
 }
 
+public sealed class OnDemandAnalysisEndpointTests
+{
+    [Fact]
+    public async Task AnalyzeFile_DoesNotRequestLineCounts()
+    {
+        using var factory = new AgentStreamAnalysisApiFactory();
+        var item = AgentStreamAnalysisApiFactory.CreateItem(WorkItemState.Done);
+        await factory.Store.CreateAsync(item);
+        const string fileName = "work-1-abcdef.jsonl";
+        factory.WriteStreamFile(item.Id, fileName, """
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"done"}}
+            {"type":"result","timestamp":"2026-01-01T00:00:01Z","result":"done"}
+            """);
+
+        var client = factory.CreateClient();
+        var resp = await client.GetAsync($"/workitems/{item.Id}/agent-streams/{fileName}/analysis");
+        resp.EnsureSuccessStatusCode();
+
+        Assert.DoesNotContain(true, factory.Streams.IncludeLineCountRequests);
+    }
+}
+
 public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Program>
 {
     private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-api-{Guid.NewGuid():N}.db");
@@ -962,11 +984,15 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
 
     public SqliteWorkItemStore Store { get; }
     public SqliteAgentStreamSummaryStore Summaries { get; }
+    public RecordingAgentStreamStore Streams { get; }
 
     public AgentStreamAnalysisApiFactory()
     {
         Store = new SqliteWorkItemStore(_dbPath);
         Summaries = new SqliteAgentStreamSummaryStore(_dbPath);
+        Streams = new RecordingAgentStreamStore(new AgentStreamStore(
+            new AgentStreamsOptions { Path = _streamRoot },
+            NullLogger<AgentStreamStore>.Instance));
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -991,6 +1017,8 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
             services.AddSingleton<IWorkItemStore>(Store);
             services.RemoveAll<IAgentStreamSummaryStore>();
             services.AddSingleton<IAgentStreamSummaryStore>(Summaries);
+            services.RemoveAll<IAgentStreamStore>();
+            services.AddSingleton<IAgentStreamStore>(Streams);
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository());
         });
@@ -1028,4 +1056,43 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
         }
         base.Dispose(disposing);
     }
+}
+
+public sealed class RecordingAgentStreamStore : IAgentStreamStore
+{
+    private readonly IAgentStreamStore _inner;
+    private readonly List<bool> _includeLineCountRequests = [];
+
+    public RecordingAgentStreamStore(IAgentStreamStore inner) => _inner = inner;
+
+    public AgentStreamsOptions Options => _inner.Options;
+
+    public IReadOnlyList<bool> IncludeLineCountRequests
+    {
+        get
+        {
+            lock (_includeLineCountRequests)
+                return _includeLineCountRequests.ToArray();
+        }
+    }
+
+    public Task<AgentStreamCapture?> BeginCaptureAsync(WorkItemId workItemId, string phase, int iteration, CancellationToken ct = default) =>
+        _inner.BeginCaptureAsync(workItemId, phase, iteration, ct);
+
+    public Task<IReadOnlyList<AgentStreamFile>> ListAsync(
+        WorkItemId workItemId,
+        int limit = AgentStreamStore.DefaultListLimit,
+        bool includeLineCount = false,
+        CancellationToken ct = default)
+    {
+        lock (_includeLineCountRequests)
+            _includeLineCountRequests.Add(includeLineCount);
+        return _inner.ListAsync(workItemId, limit, includeLineCount, ct);
+    }
+
+    public Task<Stream?> OpenReadAsync(WorkItemId workItemId, string fileName, CancellationToken ct = default) =>
+        _inner.OpenReadAsync(workItemId, fileName, ct);
+
+    public Task<int> SweepAsync(DateTimeOffset now, CancellationToken ct = default) =>
+        _inner.SweepAsync(now, ct);
 }

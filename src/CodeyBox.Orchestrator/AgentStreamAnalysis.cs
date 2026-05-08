@@ -607,7 +607,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         DateTimeOffset? firstTimestamp = null;
         DateTimeOffset? lastTimestamp = null;
         DateTimeOffset? firstAssistantTimestamp = null;
-        var hasObservedTimestamp = false;
         string? lastEventType = null;
         var stalls = new List<StallEvent>();
         var eventCount = 0;
@@ -642,9 +641,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             }
 
             eventCount++;
-            if (parsed.Timestamp.HasValue)
-                hasObservedTimestamp = true;
-            var timestamp = parsed.Timestamp ?? InferTimestamp(context, jsonLine);
+            var timestamp = parsed.Timestamp;
 
             if (timestamp is { } eventTimestamp)
             {
@@ -655,7 +652,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                     && stalls.Count < _options.MaxStalls)
                 {
                     stalls.Add(new StallEvent(
-                        previous,
+                        eventTimestamp,
                         eventTimestamp - previous,
                         lastEventType,
                         parsed.EventType,
@@ -731,11 +728,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
 
         var contextDuration = ContextDuration(context);
         var total = observedTotalDuration
-            ?? (!hasObservedTimestamp && contextDuration.HasValue
-                ? contextDuration.Value
-                : (firstTimestamp.HasValue && lastTimestamp.HasValue
-                    ? lastTimestamp.Value - firstTimestamp.Value
-                    : contextDuration ?? TimeSpan.Zero));
+            ?? (firstTimestamp.HasValue && lastTimestamp.HasValue
+                ? lastTimestamp.Value - firstTimestamp.Value
+                : contextDuration ?? TimeSpan.Zero);
         var ttft = observedTimeToFirstToken
             ?? (firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
                 ? firstAssistantTimestamp.Value - firstTimestamp.Value
@@ -754,31 +749,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                 .ToList(),
             stalls,
             finalText);
-    }
-
-    private static DateTimeOffset? InferTimestamp(AgentStreamParserContext? context, AgentStreamJsonLine line)
-    {
-        if (context is null || context.InvocationEndedAt < context.InvocationStartedAt)
-            return null;
-
-        var duration = context.InvocationEndedAt - context.InvocationStartedAt;
-        if (duration <= TimeSpan.Zero)
-            return context.InvocationStartedAt;
-
-        var ratio = InferProgressRatio(context, line);
-        var ticks = (long)Math.Round(duration.Ticks * ratio, MidpointRounding.AwayFromZero);
-        return context.InvocationStartedAt.AddTicks(Math.Clamp(ticks, 0, duration.Ticks));
-    }
-
-    private static double InferProgressRatio(AgentStreamParserContext context, AgentStreamJsonLine line)
-    {
-        if (context.LineCount is > 1)
-            return Math.Clamp((double)line.LineNumber / (context.LineCount.Value - 1), 0d, 1d);
-
-        if (context.SizeBytes is > 0)
-            return Math.Clamp((double)line.StartOffset / context.SizeBytes.Value, 0d, 1d);
-
-        return 0d;
     }
 
     private static TimeSpan? ContextDuration(AgentStreamParserContext? context)
