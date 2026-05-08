@@ -57,13 +57,16 @@ git rebase --keep-empty origin/<baseBranch>
 git push --force-with-lease=refs/heads/<workBranch>:<oldTip> origin HEAD:refs/heads/<workBranch>
 ```
 
-First pickup is a no-op because there is no work-branch ref yet. The same
-pickup rebase applies to default `codeybox/<short-id>` branches and explicit
-work branches created by the API or replay flow, as long as the work branch is
-not the base branch. Rebase conflicts are read through bounded, canonical
-in-worktree file reads, abort the in-sandbox rebase before any push on failure,
-and move the work item to `MergeConflictResolutionFailed`, the same
-operator-facing failure state used by scope-fenced merge conflict resolution.
+First pickup is a no-op because there is no work-branch ref yet. Pickup rebase
+is only allowed to force-push the server-owned per-item
+`codeybox/<work-item-id-prefix>` branch. Explicit work branches created by the
+API or replay flow, including other `codeybox/*` names, are not rewritten by
+pickup rebase. Items resumed from `Merged` for upstream-push recovery also skip
+pickup rebase because they will not enter work, audit, or merge. Rebase
+conflicts are read through bounded, canonical in-worktree file reads, abort the
+in-sandbox rebase before any push on failure, and move the work item to
+`MergeConflictResolutionFailed`, the same operator-facing failure state used by
+scope-fenced merge conflict resolution.
 
 ## Phase 1: Work
 

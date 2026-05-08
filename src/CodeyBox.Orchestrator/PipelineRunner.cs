@@ -232,8 +232,6 @@ public sealed class PipelineRunner : IPipelineRunner
                 await _store.UpdateAsync((await _store.GetAsync(item.Id, ct) ?? item) with { WorkBranch = workBranch }, ct);
             }
 
-            await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
-
             // The retry endpoint sets the entry state to a pre-phase marker
             // (Queued / WorkComplete / AuditPassed / Merged) so we resume at
             // the matching phase. Read once at the top so we don't re-fetch
@@ -245,6 +243,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 || (resumingPreempt && entry is WorkItemState.Reworking);
             var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged;
             var skipMerge = entry is WorkItemState.Merged;
+
+            if (!skipWork || !skipAudit || !skipMerge)
+                await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
 
             // Compose auditors up-front: the work-phase prompt advises the
             // agent to run the mechanical (shell) auditors itself before
@@ -467,6 +468,16 @@ public sealed class PipelineRunner : IPipelineRunner
         Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
         Validation.ValidateBranchName(workBranch, nameof(workBranch));
 
+        if (!IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+        {
+            _log.LogInformation(
+                "Skipping pickup-time rebase for work item {WorkItemId} branch {WorkBranch}; only {OwnedWorkBranch} is eligible for sandbox force-push",
+                item.Id,
+                workBranch,
+                DefaultWorkBranchFor(item.Id));
+            return;
+        }
+
         var lockKey = $"{repoId}:{workBranch}";
         var gate = RetainPickupRebaseLock(lockKey);
         var lockEntered = false;
@@ -621,14 +632,17 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private static string DefaultWorkBranchFor(WorkItemId id) => $"codeybox/{id.ToString()[..8]}";
 
+    private static bool IsPickupRebaseOwnedWorkBranch(WorkItemId id, string workBranch)
+        => string.Equals(workBranch, DefaultWorkBranchFor(id), StringComparison.Ordinal);
+
     private static void ValidatePickupRebaseWorkBranch(WorkItem item, string baseBranch, string workBranch)
     {
-        var configured = item.WorkBranch ?? DefaultWorkBranchFor(item.Id);
-        if (!string.Equals(workBranch, configured, StringComparison.Ordinal)
+        var owned = DefaultWorkBranchFor(item.Id);
+        if (!IsPickupRebaseOwnedWorkBranch(item.Id, workBranch)
             || string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
-                $"pickup-time rebase may force-push only work item {item.Id}'s configured work branch '{configured}', not '{workBranch}'");
+                $"pickup-time rebase may force-push only work item {item.Id}'s server-owned work branch '{owned}', not '{workBranch}'");
         }
     }
 

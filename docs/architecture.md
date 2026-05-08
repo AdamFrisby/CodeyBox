@@ -163,8 +163,12 @@ intent is that you can swap any of these without touching the orchestrator:
   contract as merge conflicts: conflict hunks are extracted from bounded,
   canonicalized in-worktree file reads, the +/- buffer scope fence is verified
   deterministically, and advisory security review is reused when audit
-  reporting is configured. If resolution fails, the rebase is aborted before
-  pushing and the item transitions to `MergeConflictResolutionFailed`.
+  reporting is configured. The rebase force-push is limited to the
+  server-owned per-item `codeybox/<work-item-id-prefix>` branch; explicit API
+  or replay branches outside that exact ref are left untouched. Items resumed
+  from `Merged` for upstream-push recovery skip pickup rebase because no work,
+  audit, or merge phase will run. If resolution fails, the rebase is aborted
+  before pushing and the item transitions to `MergeConflictResolutionFailed`.
 * **Credentials follow least privilege.** Each sandbox sees only the
   minimum it needs. Tool-only audit sandboxes see no agent secrets.
   Upstream creds live only in the orchestrator process and never cross

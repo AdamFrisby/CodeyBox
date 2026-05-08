@@ -20,7 +20,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
 
@@ -70,7 +70,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var originalTip = await CommitToBareBranchAsync(
@@ -109,7 +109,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var originalTip = await CommitToBareBranchAsync(
@@ -136,7 +136,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var (_, originalTip) = await CommitTwoWorkBranchCommitsAsync(barePath, item.WorkBranch!);
@@ -154,7 +154,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         await CommitToBareBranchAsync(
@@ -217,7 +217,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     }
 
     [Fact]
-    public async Task ExplicitExistingWorkBranchIsRebased()
+    public async Task ExplicitExistingWorkBranchOutsidePerItemNamespaceIsNotRebased()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
@@ -231,17 +231,44 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
             "work\n",
             "work");
         var originalBase = await RevParseAsync(barePath, "main");
+        var originalTip = await RevParseAsync(barePath, item.WorkBranch!);
         await CommitToSeedAsync(seed, "main.txt", "main advanced\n", "main advanced");
-        var advancedMain = await RevParseAsync(seed, "main");
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.NotEqual(originalBase, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
-        Assert.Equal(advancedMain, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal(originalTip, await RevParseAsync(barePath, item.WorkBranch!));
+        Assert.Equal(originalBase, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
         Assert.Equal("work\n", await ShowAsync(barePath, $"{item.WorkBranch}:work.txt"));
+    }
+
+    [Fact]
+    public async Task MergedResumeDoesNotRebaseWorkBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem() with { State = WorkItemState.Merged };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "work.txt",
+            "work\n",
+            "work");
+        var originalBase = await RevParseAsync(barePath, "main");
+        var originalTip = await RevParseAsync(barePath, item.WorkBranch!);
+        await CommitToSeedAsync(seed, "main.txt", "main advanced\n", "main advanced");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(originalTip, await RevParseAsync(barePath, item.WorkBranch!));
+        Assert.Equal(originalBase, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
     }
 
     [Fact]
@@ -249,7 +276,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var originalTip = await CommitToBareBranchAsync(
@@ -281,18 +308,19 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         await CommitWorkBranchCommitsAsync(barePath, item.WorkBranch!, workCommitCount);
         for (var i = 0; i < mainAdvanceCount; i++)
             await CommitToSeedAsync(seed, $"main-{i}.txt", $"main {i}\n", $"main {i}");
+        var refreshedBase = await RevParseAsync(seed, "main");
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        await TestSupport.RunGit(barePath, "merge-base", "--is-ancestor", "main", item.WorkBranch!);
-        Assert.Equal(await RevParseAsync(barePath, "main"), await GitStdoutTrimAsync(barePath, "merge-base", "main", item.WorkBranch!));
+        await TestSupport.RunGit(barePath, "merge-base", "--is-ancestor", refreshedBase, item.WorkBranch!);
+        Assert.Equal(refreshedBase, await GitStdoutTrimAsync(barePath, "merge-base", refreshedBase, item.WorkBranch!));
     }
 
     [Theory]
@@ -303,7 +331,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var preRebaseBase = await RevParseAsync(barePath, "main");
@@ -314,11 +342,12 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
             await CommitToSeedAsync(seed, "work-0.txt", "work 0\n", "main independently landed work 0");
         for (var i = 0; i < mainAdvanceCount; i++)
             await CommitToSeedAsync(seed, $"advance-{i}.txt", $"advance {i}\n", $"advance {i}");
+        var refreshedBase = await RevParseAsync(seed, "main");
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        var postRebaseCommits = await CommitSnapshotsAsync(barePath, $"main..{item.WorkBranch}");
+        var postRebaseCommits = await CommitSnapshotsAsync(barePath, $"{refreshedBase}..{item.WorkBranch}");
         Assert.Equal(preRebaseCommits.Count, postRebaseCommits.Count);
         foreach (var before in preRebaseCommits)
         {
@@ -335,7 +364,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem() with { State = WorkItemState.Merged };
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var preRebaseBase = await RevParseAsync(barePath, "main");
@@ -350,6 +379,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         var before = Assert.Single(await CommitSnapshotsAsync(barePath, $"{preRebaseBase}..{item.WorkBranch}"));
 
         await CommitToSeedAsync(seed, "duplicate.txt", "already upstream\n", "main landed equivalent change");
+        var refreshedBase = await RevParseAsync(seed, "main");
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
@@ -357,7 +387,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
 
-        var after = Assert.Single(await CommitSnapshotsAsync(barePath, $"main..{item.WorkBranch}"));
+        var after = Assert.Single(await CommitSnapshotsAsync(barePath, $"{refreshedBase}..{item.WorkBranch}"));
         Assert.NotEqual(before.Sha, after.Sha);
         Assert.Equal(before.Tree, after.Tree);
         Assert.Equal(before.Subject, after.Subject);
