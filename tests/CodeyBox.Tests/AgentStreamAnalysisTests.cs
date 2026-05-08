@@ -503,6 +503,68 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_UsesMatchingCostAgentWhenSniffingIsInconclusive()
+    {
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Claude };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "audit-llm-security:llm-review-1-abcdef.jsonl",
+            string.Join("\n", Enumerable.Repeat("""{"type":"metadata","source":"capture"}""", 20)) + "\n" + """
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:01Z","item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:02Z","item":{"type":"function_call_output","call_id":"call_1","output":"ok"}}
+            {"type":"turn.completed","timestamp":"2026-01-01T00:00:03Z","usage":{"input_tokens":5,"output_tokens":1}}
+            """);
+        await _costs.RecordAsync(new WorkItemCost
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = item.Id.ToString(),
+            Phase = "audit",
+            Iteration = 1,
+            AgentKind = "codex",
+            InputTokens = 1,
+            OutputTokens = 1,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            EndedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        });
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new CodexStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(AgentKind.Codex, row.AgentKind);
+        Assert.Equal("shell", Assert.Single(row.Summary.ToolCalls).ToolName);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_UsesWorkItemAgentWhenSniffingIsInconclusive()
+    {
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Claude };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
+            string.Join("\n", Enumerable.Repeat("""{"type":"metadata","source":"capture"}""", 20)) + "\n" + """
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"a"}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:01Z","tool_use_id":"t1","content":"ok"}
+            {"type":"result","timestamp":"2026-01-01T00:00:02Z","usage":{"input_tokens":10,"output_tokens":2}}
+            """);
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(AgentKind.Claude, row.AgentKind);
+        Assert.Equal("Read", Assert.Single(row.Summary.ToolCalls).ToolName);
+    }
+
+    [Fact]
     public async Task AnalyzeRecentTerminalWorkItemsAsync_PropagatesStreamAnalysisFailures()
     {
         var item = CreateItem(WorkItemState.Done);
@@ -555,7 +617,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
 public sealed class AgentStreamParserSelectionTests
 {
     [Fact]
-    public void ResolveKind_WhenSniffingFails_DoesNotFallBackToWorkItemOrCostAgent()
+    public void ResolveKind_WhenSniffingFails_UsesMatchingCostAgentBeforeWorkItemAgent()
     {
         var item = new WorkItem
         {
@@ -591,7 +653,32 @@ public sealed class AgentStreamParserSelectionTests
 
         var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind: null, costs);
 
-        Assert.Equal(new AgentKind("unknown"), kind);
+        Assert.Equal(AgentKind.Claude, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_WhenSniffingFails_UsesSupportedWorkItemAgent()
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "stream",
+            Prompt = "stream",
+            Agent = AgentKind.Gemini,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            12,
+            null,
+            DateTimeOffset.UtcNow);
+
+        var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind: null, []);
+
+        Assert.Equal(AgentKind.Gemini, kind);
     }
 }
 

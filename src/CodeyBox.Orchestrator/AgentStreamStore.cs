@@ -340,7 +340,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
     private readonly long _maxBytes;
     private readonly long _directWriteLimitBytes;
     private readonly ILogger _log;
-    private readonly Channel<AgentStreamChunk> _chunks;
+    private readonly Channel<string> _chunks;
     private readonly Task _worker;
     private long _enqueueDroppedBytes;
     private int _enqueueTruncated;
@@ -352,7 +352,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         _maxBytes = maxBytes;
         _directWriteLimitBytes = Math.Max(0, maxBytes - TruncationMarkerReserveBytes);
         _log = log;
-        _chunks = Channel.CreateBounded<AgentStreamChunk>(
+        _chunks = Channel.CreateBounded<string>(
             new BoundedChannelOptions(MaxQueuedChunks)
             {
                 SingleReader = true,
@@ -387,7 +387,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
             for (var offset = 0; offset < chunk.Length; offset += MaxQueuedChunkChars)
             {
                 var length = Math.Min(MaxQueuedChunkChars, chunk.Length - offset);
-                if (!WriteQueuedChunk(new AgentStreamChunk(chunk.Substring(offset, length))))
+                if (!WriteQueuedChunk(chunk.Substring(offset, length)))
                 {
                     Interlocked.Add(ref _enqueueDroppedBytes, Encoding.UTF8.GetByteCount(chunk.AsSpan(offset)));
                     break;
@@ -412,7 +412,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         }
     }
 
-    private bool WriteQueuedChunk(AgentStreamChunk chunk)
+    private bool WriteQueuedChunk(string chunk)
     {
         while (true)
         {
@@ -491,7 +491,7 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         await foreach (var chunk in _chunks.Reader.ReadAllAsync().ConfigureAwait(false))
         {
             DrainChunk(
-                chunk.Text,
+                chunk,
                 writer,
                 buffer,
                 redactor,
@@ -673,8 +673,6 @@ public sealed class AgentStreamCapture : IAsyncDisposable
         writer.WriteLine(marker);
         bytesWritten += markerBytes;
     }
-
-    private sealed record AgentStreamChunk(string Text);
 
     private sealed class AgentStreamLineRedactor
     {

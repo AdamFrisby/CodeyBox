@@ -369,7 +369,22 @@ public static class AgentStreamParserSelection
         IReadOnlyList<WorkItemCost> costs)
     {
         if (sniffedKind is not null)
-            return sniffedKind.Value;
+            return Canonicalize(sniffedKind.Value) ?? sniffedKind.Value;
+
+        foreach (var cost in costs
+                     .Where(c => string.Equals(c.WorkItemId, item.Id.ToString(), StringComparison.OrdinalIgnoreCase))
+                     .Where(c => PhaseMatches(file.Phase, c.Phase))
+                     .Where(c => c.Iteration is null || c.Iteration == file.Iteration)
+                     .OrderByDescending(c => string.Equals(c.Phase, file.Phase, StringComparison.OrdinalIgnoreCase))
+                     .ThenByDescending(c => c.StartedAt))
+        {
+            if (Canonicalize(cost.AgentKind) is { } costKind)
+                return costKind;
+        }
+
+        if (item.Agent.HasValue && Canonicalize(item.Agent.Value) is { } itemKind)
+            return itemKind;
+
         return new AgentKind("unknown");
     }
 
@@ -404,6 +419,27 @@ public static class AgentStreamParserSelection
 
         return null;
     }
+
+    private static AgentKind? Canonicalize(AgentKind kind) => Canonicalize(kind.Value);
+
+    private static AgentKind? Canonicalize(string? value)
+    {
+        if (value is null)
+            return null;
+
+        if (value.Equals(AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase))
+            return AgentKind.Claude;
+        if (value.Equals(AgentKind.Codex.Value, StringComparison.OrdinalIgnoreCase))
+            return AgentKind.Codex;
+        if (value.Equals(AgentKind.Gemini.Value, StringComparison.OrdinalIgnoreCase))
+            return AgentKind.Gemini;
+
+        return null;
+    }
+
+    private static bool PhaseMatches(string filePhase, string costPhase) =>
+        string.Equals(filePhase, costPhase, StringComparison.OrdinalIgnoreCase)
+        || filePhase.StartsWith(costPhase + "-", StringComparison.OrdinalIgnoreCase);
 
     private static string? FirstString(JsonElement el, params string[] names)
     {
