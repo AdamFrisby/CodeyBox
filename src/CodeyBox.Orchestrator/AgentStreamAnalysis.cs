@@ -11,6 +11,20 @@ public interface IAgentStreamParser
     Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default);
 }
 
+public interface IAgentStreamParserWithContext : IAgentStreamParser
+{
+    Task<AgentStreamSummary> ParseAsync(
+        Stream jsonlFile,
+        AgentStreamParserContext? context,
+        CancellationToken ct = default);
+}
+
+public sealed record AgentStreamParserContext(
+    DateTimeOffset InvocationStartedAt,
+    DateTimeOffset InvocationEndedAt,
+    long? LineCount,
+    long? SizeBytes);
+
 public sealed record AgentStreamSummary(
     TimeSpan TotalDuration,
     TimeSpan? TimeToFirstToken,
@@ -271,7 +285,7 @@ public sealed class UnknownAgentStreamParser : IAgentStreamParser
         Task.FromResult(new AgentStreamSummary(TimeSpan.Zero, null, 0, 0, 0, null, [], [], null));
 }
 
-internal sealed record AgentStreamJsonLine(string Text);
+internal sealed record AgentStreamJsonLine(string Text, long LineNumber, long StartOffset, long EndOffset);
 
 internal static class AgentStreamJsonLineReader
 {
@@ -283,6 +297,9 @@ internal static class AgentStreamJsonLineReader
         maxLineBytes = Math.Max(1, maxLineBytes);
         var buffer = new byte[16 * 1024];
         await using var line = new MemoryStream(capacity: Math.Min(maxLineBytes, 16 * 1024));
+        long lineNumber = 0;
+        long lineStartOffset = 0;
+        long offset = 0;
         while (true)
         {
             var read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false);
@@ -297,7 +314,9 @@ internal static class AgentStreamJsonLineReader
                 {
                     var text = DecodeLine(line);
                     line.SetLength(0);
-                    yield return new AgentStreamJsonLine(text);
+                    yield return new AgentStreamJsonLine(text, lineNumber++, lineStartOffset, offset + 1);
+                    offset++;
+                    lineStartOffset = offset;
                     continue;
                 }
 
@@ -305,11 +324,12 @@ internal static class AgentStreamJsonLineReader
                     throw new InvalidDataException($"Agent stream JSONL line exceeded the configured limit of {maxLineBytes} bytes");
 
                 line.WriteByte(b);
+                offset++;
             }
         }
 
         if (line.Length > 0)
-            yield return new AgentStreamJsonLine(DecodeLine(line));
+            yield return new AgentStreamJsonLine(DecodeLine(line), lineNumber, lineStartOffset, offset);
     }
 
     private static string DecodeLine(MemoryStream line)
@@ -394,6 +414,28 @@ public static class AgentStreamParserSelection
             return true;
 
         return false;
+    }
+
+    public static AgentStreamParserContext? ResolveTimingContext(
+        WorkItem item,
+        AgentStreamFile file,
+        AgentKind kind,
+        IReadOnlyList<WorkItemCost> costs)
+    {
+        var cost = costs
+            .Where(c => string.Equals(c.WorkItemId, item.Id.ToString(), StringComparison.OrdinalIgnoreCase))
+            .Where(c => c.EndedAt >= c.StartedAt)
+            .Where(c => PhaseMatches(file.Phase, c.Phase))
+            .Where(c => c.Iteration is null || c.Iteration == file.Iteration)
+            .OrderByDescending(c => string.Equals(c.AgentKind, kind.Value, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(c => string.Equals(c.Phase, file.Phase, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(c => c.Iteration == file.Iteration)
+            .ThenByDescending(c => c.StartedAt)
+            .FirstOrDefault();
+
+        return cost is null
+            ? null
+            : new AgentStreamParserContext(cost.StartedAt, cost.EndedAt, file.LineCount, file.SizeBytes);
     }
 
     public static AgentStreamSummary UnsupportedSummary() =>
@@ -538,7 +580,7 @@ public static class AgentStreamAnalytics
     }
 }
 
-public abstract class FlexibleAgentStreamParser : IAgentStreamParser
+public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
 {
     private const int InputSummaryChars = 200;
     private const int InputSummaryUtf8Bytes = 4096;
@@ -552,13 +594,20 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
 
     public AgentKind Kind { get; }
 
-    public async Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default)
+    public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
+        ParseAsync(jsonlFile, context: null, ct);
+
+    public async Task<AgentStreamSummary> ParseAsync(
+        Stream jsonlFile,
+        AgentStreamParserContext? context,
+        CancellationToken ct = default)
     {
         var toolStarts = new Dictionary<string, ToolBuilder>(StringComparer.Ordinal);
         var completedTools = new List<ToolCallInvocation>();
         DateTimeOffset? firstTimestamp = null;
         DateTimeOffset? lastTimestamp = null;
         DateTimeOffset? firstAssistantTimestamp = null;
+        var hasObservedTimestamp = false;
         string? lastEventType = null;
         var stalls = new List<StallEvent>();
         var eventCount = 0;
@@ -593,7 +642,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             }
 
             eventCount++;
-            var timestamp = parsed.Timestamp;
+            if (parsed.Timestamp.HasValue)
+                hasObservedTimestamp = true;
+            var timestamp = parsed.Timestamp ?? InferTimestamp(context, jsonLine);
 
             if (timestamp is { } eventTimestamp)
             {
@@ -678,10 +729,13 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 0));
         }
 
+        var contextDuration = ContextDuration(context);
         var total = observedTotalDuration
-            ?? (firstTimestamp.HasValue && lastTimestamp.HasValue
-                ? lastTimestamp.Value - firstTimestamp.Value
-                : TimeSpan.Zero);
+            ?? (!hasObservedTimestamp && contextDuration.HasValue
+                ? contextDuration.Value
+                : (firstTimestamp.HasValue && lastTimestamp.HasValue
+                    ? lastTimestamp.Value - firstTimestamp.Value
+                    : contextDuration ?? TimeSpan.Zero));
         var ttft = observedTimeToFirstToken
             ?? (firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
                 ? firstAssistantTimestamp.Value - firstTimestamp.Value
@@ -700,6 +754,38 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 .ToList(),
             stalls,
             finalText);
+    }
+
+    private static DateTimeOffset? InferTimestamp(AgentStreamParserContext? context, AgentStreamJsonLine line)
+    {
+        if (context is null || context.InvocationEndedAt < context.InvocationStartedAt)
+            return null;
+
+        var duration = context.InvocationEndedAt - context.InvocationStartedAt;
+        if (duration <= TimeSpan.Zero)
+            return context.InvocationStartedAt;
+
+        var ratio = InferProgressRatio(context, line);
+        var ticks = (long)Math.Round(duration.Ticks * ratio, MidpointRounding.AwayFromZero);
+        return context.InvocationStartedAt.AddTicks(Math.Clamp(ticks, 0, duration.Ticks));
+    }
+
+    private static double InferProgressRatio(AgentStreamParserContext context, AgentStreamJsonLine line)
+    {
+        if (context.LineCount is > 1)
+            return Math.Clamp((double)line.LineNumber / (context.LineCount.Value - 1), 0d, 1d);
+
+        if (context.SizeBytes is > 0)
+            return Math.Clamp((double)line.StartOffset / context.SizeBytes.Value, 0d, 1d);
+
+        return 0d;
+    }
+
+    private static TimeSpan? ContextDuration(AgentStreamParserContext? context)
+    {
+        if (context is null || context.InvocationEndedAt < context.InvocationStartedAt)
+            return null;
+        return context.InvocationEndedAt - context.InvocationStartedAt;
     }
 
     private static string ClassifyStall(string? previousEventType, int openToolCount)

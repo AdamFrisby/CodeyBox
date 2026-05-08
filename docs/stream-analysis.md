@@ -27,7 +27,7 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. The analyser uses timestamps and duration fields emitted by the stream events themselves. When neither is present, timing fields are reported as `null` or zero while non-timing analytics such as token counts, tool-call frequency, redacted tool inputs, output byte counts, and unfinished tool calls are still preserved.
+Captured CLI streams do not always include timestamps. Claude Code 2.1 stream-json and Codex CLI 0.128 command-execution events can omit per-event `timestamp`, `started_at`, `completed_at`, and duration fields. In that case the analyser keeps the capture file read-only and uses the matching `work_item_costs` invocation window (`started_at` to `ended_at`) as the wall-clock timing source. Events are placed within that window by JSONL line position, so total duration, TTFT, tool-call duration, stalls, and thinking-vs-executing split remain populated for the installed stream shapes. Event-emitted timestamps and duration fields still win whenever the CLI provides them.
 
 ## Thinking Vs Executing
 

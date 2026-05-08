@@ -70,7 +70,7 @@ internal static class AgentStreamEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: false, ct);
+        var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: true, ct);
         var file = files.FirstOrDefault(f => string.Equals(f.FileName, fileName, StringComparison.Ordinal));
         if (file is null) return Results.NotFound();
 
@@ -94,7 +94,10 @@ internal static class AgentStreamEndpoints
             await using var stream = await streams.OpenReadAsync(item.Id, fileName, analysisCt);
             if (stream is null) return Results.NotFound();
 
-            var summary = await parser.ParseAsync(stream, analysisCt);
+            var parserContext = AgentStreamParserSelection.ResolveTimingContext(item, file, kind, costRows);
+            var summary = parser is IAgentStreamParserWithContext contextualParser
+                ? await contextualParser.ParseAsync(stream, parserContext, analysisCt)
+                : await parser.ParseAsync(stream, analysisCt);
             var rowKind = parser.Kind;
             if (AgentStreamParserSelection.ShouldTreatAsUnsupported(rowKind, summary))
             {

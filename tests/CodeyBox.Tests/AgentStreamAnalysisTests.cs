@@ -99,6 +99,36 @@ public sealed class ClaudeStreamParserTests
         Assert.Empty(summary.Stalls);
     }
 
+    [Fact]
+    public async Task ParseAsync_InfersTimingsFromInvocationContextForInstalledClaudeStreamShape()
+    {
+        var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(30) });
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        await using var stream = StreamOf("""
+            {"type":"system","subtype":"init"}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
+            {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}]}}
+            {"type":"result","result":"done","total_cost_usd":0.42,"usage":{"input_tokens":100,"output_tokens":20}}
+            """);
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started,
+            started.AddMinutes(2),
+            LineCount: 4,
+            SizeBytes: stream.Length));
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal(started.AddSeconds(40), tool.StartedAt);
+        Assert.Equal(started.AddSeconds(80), tool.EndedAt);
+        Assert.Equal(TimeSpan.FromSeconds(40), tool.Duration);
+        Assert.Equal(TimeSpan.FromMinutes(2), summary.TotalDuration);
+        Assert.Equal(TimeSpan.FromSeconds(40), summary.TimeToFirstToken);
+        Assert.Contains(summary.Stalls, stall =>
+            stall.PreviousEventType == "tool_use"
+            && stall.NextEventType == "tool_result"
+            && stall.Classification == "tool_execution");
+    }
+
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
 }
 
@@ -175,6 +205,37 @@ public sealed class CodexStreamParserTests
         {
             try { Directory.Delete(root, recursive: true); } catch { }
         }
+    }
+
+    [Fact]
+    public async Task ParseAsync_InfersTimingsFromInvocationContextForInstalledCodexCommandExecutionShape()
+    {
+        var parser = new CodexStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(15) });
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        await using var stream = StreamOf("""
+            {"type":"thread.started","thread_id":"thread_1"}
+            {"type":"turn.started"}
+            {"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+            {"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"/work\n","exit_code":0,"status":"completed"}}
+            {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Done."}}
+            {"type":"turn.completed","usage":{"input_tokens":29990,"cached_input_tokens":18176,"output_tokens":44}}
+            """);
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started,
+            started.AddSeconds(50),
+            LineCount: 6,
+            SizeBytes: stream.Length));
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("item_0", tool.ToolUseId);
+        Assert.Equal("Bash", tool.ToolName);
+        Assert.Equal(started.AddSeconds(20), tool.StartedAt);
+        Assert.Equal(started.AddSeconds(30), tool.EndedAt);
+        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
+        Assert.Equal(TimeSpan.FromSeconds(50), summary.TotalDuration);
+        Assert.Equal(TimeSpan.FromSeconds(40), summary.TimeToFirstToken);
+        Assert.Empty(summary.Stalls);
     }
 
     [Fact]
@@ -469,6 +530,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     {
         var item = CreateItem(WorkItemState.Done);
         await _workItems.CreateAsync(item);
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
         WriteStreamFile(item.Id, "work-1-abcdef.jsonl", """
             {"type":"thread.started","thread_id":"thread_1"}
             {"type":"turn.started"}
@@ -476,6 +538,18 @@ public sealed class StreamAnalysisServiceTests : IDisposable
             {"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"/work\n","exit_code":0,"status":"completed"}}
             {"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}
             """);
+        await _costs.RecordAsync(new WorkItemCost
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = item.Id.ToString(),
+            Phase = "work",
+            Iteration = 1,
+            AgentKind = "codex",
+            InputTokens = 10,
+            OutputTokens = 2,
+            StartedAt = started,
+            EndedAt = started.AddSeconds(60),
+        });
 
         var service = new StreamAnalysisService(_workItems, _streams, _summaries,
             [new CodexStreamParser(), new UnknownAgentStreamParser()],
@@ -487,7 +561,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         Assert.Equal(1, count);
         var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
         Assert.Equal(AgentKind.Codex, row.AgentKind);
-        Assert.Equal(TimeSpan.Zero, row.Summary.TotalDuration);
+        Assert.Equal(TimeSpan.FromSeconds(60), row.Summary.TotalDuration);
         Assert.Null(row.Summary.TimeToFirstToken);
         Assert.Equal(10, row.Summary.InputTokens);
         Assert.Equal(2, row.Summary.OutputTokens);
@@ -495,9 +569,9 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         var tool = Assert.Single(row.Summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Null(tool.StartedAt);
-        Assert.Null(tool.EndedAt);
-        Assert.Null(tool.Duration);
+        Assert.Equal(started.AddSeconds(30), tool.StartedAt);
+        Assert.Equal(started.AddSeconds(45), tool.EndedAt);
+        Assert.Equal(TimeSpan.FromSeconds(15), tool.Duration);
         Assert.True(tool.Succeeded);
         Assert.Equal(6, tool.OutputBytes);
     }
