@@ -752,13 +752,19 @@ public static class AgentStreamAnalytics
 
     private static long UnionToolDurationMs(IEnumerable<ToolCallInvocation> toolCalls)
     {
-        var intervals = toolCalls
-            .Where(t => t.StartedAt.HasValue && t.EndedAt.HasValue && t.EndedAt.Value >= t.StartedAt.Value)
+        var materialized = toolCalls.ToList();
+        var intervals = materialized
+            .Where(HasValidInterval)
             .Select(t => (Start: t.StartedAt!.Value, End: t.EndedAt!.Value))
             .OrderBy(t => t.Start)
             .ToList();
+
+        var durationOnlyMs = materialized
+            .Where(t => !HasValidInterval(t))
+            .Sum(t => ToMs(t.Duration));
+
         if (intervals.Count == 0)
-            return toolCalls.Sum(t => ToMs(t.Duration));
+            return durationOnlyMs;
 
         var total = TimeSpan.Zero;
         var currentStart = intervals[0].Start;
@@ -778,8 +784,13 @@ public static class AgentStreamAnalytics
         }
 
         total += currentEnd - currentStart;
-        return ToMs(total);
+        return ToMs(total) + durationOnlyMs;
     }
+
+    private static bool HasValidInterval(ToolCallInvocation toolCall) =>
+        toolCall.StartedAt.HasValue
+        && toolCall.EndedAt.HasValue
+        && toolCall.EndedAt.Value >= toolCall.StartedAt.Value;
 }
 
 public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext

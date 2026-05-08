@@ -59,7 +59,6 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
             """;
         create.ExecuteNonQuery();
         AddFinalAssistantMessageColumn();
-        ClearPersistedFinalAssistantMessages();
     }
 
     public async Task UpsertAsync(AgentStreamSummaryRow row, CancellationToken ct = default)
@@ -183,17 +182,6 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
         }
     }
 
-    private void ClearPersistedFinalAssistantMessages()
-    {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            UPDATE agent_stream_summaries
-            SET final_assistant_message = NULL
-            WHERE final_assistant_message IS NOT NULL
-            """;
-        cmd.ExecuteNonQuery();
-    }
-
     private static void Bind(SqliteCommand cmd, AgentStreamSummaryRow row)
     {
         cmd.Parameters.AddWithValue("$wid", row.WorkItemId.ToString());
@@ -209,9 +197,7 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
         cmd.Parameters.AddWithValue("$usd", row.Summary.EstimatedUsd.HasValue ? (double)row.Summary.EstimatedUsd.Value : DBNull.Value);
         cmd.Parameters.AddWithValue("$tools", JsonSerializer.Serialize(row.Summary.ToolCalls, JsonOptions));
         cmd.Parameters.AddWithValue("$stalls", JsonSerializer.Serialize(row.Summary.Stalls, JsonOptions));
-        // Final assistant messages can contain arbitrary user or operational data.
-        // Keep persisted dashboard summaries numeric/structural.
-        cmd.Parameters.AddWithValue("$final", DBNull.Value);
+        cmd.Parameters.AddWithValue("$final", row.Summary.FinalAssistantMessage is null ? DBNull.Value : row.Summary.FinalAssistantMessage);
         cmd.Parameters.AddWithValue("$summarised", row.SummarisedAt.ToString("O"));
     }
 
@@ -228,7 +214,7 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
             r.IsDBNull(10) ? null : Convert.ToDecimal(r.GetDouble(10)),
             tools,
             stalls,
-            null);
+            r.IsDBNull(13) ? null : r.GetString(13));
 
         return new AgentStreamSummaryRow(
             new WorkItemId(Guid.Parse(r.GetString(0))),

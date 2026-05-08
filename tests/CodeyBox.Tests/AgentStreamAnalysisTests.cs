@@ -486,6 +486,61 @@ public sealed class ThinkingVsExecutingSplitTests
     }
 
     [Fact]
+    public void Aggregate_AddsDurationOnlyToolCallsToTimestampedUnion()
+    {
+        var start = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var aggregate = AgentStreamAnalytics.Aggregate("wid", [new AgentStreamSummaryRow(
+            new WorkItemId(Guid.NewGuid()),
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Claude,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(30),
+                TimeSpan.Zero,
+                0,
+                0,
+                0,
+                null,
+                [
+                    new ToolCallInvocation("t1", "Bash", "{}", start, start.AddSeconds(10), TimeSpan.FromSeconds(10), true, 10),
+                    new ToolCallInvocation("t2", "Read", "{}", null, null, TimeSpan.FromSeconds(7), true, 10),
+                ],
+                [],
+                null),
+            DateTimeOffset.UtcNow)]);
+
+        Assert.Equal(17_000, aggregate.ExecutingMs);
+        Assert.Equal(13_000, aggregate.ThinkingMs);
+    }
+
+    [Fact]
+    public void Aggregate_UsesDurationForToolCallsWithInvalidIntervals()
+    {
+        var start = DateTimeOffset.Parse("2026-01-01T00:00:10Z");
+        var aggregate = AgentStreamAnalytics.Aggregate("wid", [new AgentStreamSummaryRow(
+            new WorkItemId(Guid.NewGuid()),
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Claude,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(30),
+                TimeSpan.Zero,
+                0,
+                0,
+                0,
+                null,
+                [new ToolCallInvocation("t1", "Bash", "{}", start, start.AddSeconds(-5), TimeSpan.FromSeconds(8), true, 10)],
+                [],
+                null),
+            DateTimeOffset.UtcNow)]);
+
+        Assert.Equal(8_000, aggregate.ExecutingMs);
+        Assert.Equal(22_000, aggregate.ThinkingMs);
+    }
+
+    [Fact]
     public void Aggregate_UsesStatisticalMedianForEvenToolCallCounts()
     {
         var start = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
@@ -898,6 +953,8 @@ public sealed class AggregateEndpointTests : IClassFixture<AgentStreamAnalysisAp
         Assert.Equal(6_000, body.GetProperty("thinkingMs").GetInt64());
         var bash = body.GetProperty("byTool").EnumerateArray().Single(t => t.GetProperty("tool").GetString() == "Bash");
         Assert.Equal(4_000, bash.GetProperty("totalDurationMs").GetInt64());
+        var invocation = Assert.Single(body.GetProperty("invocations").EnumerateArray());
+        Assert.Equal("done", invocation.GetProperty("finalAssistantMessage").GetString());
     }
 }
 
@@ -1045,7 +1102,7 @@ public sealed class MissingFileTests : IClassFixture<AgentStreamAnalysisApiFacto
         Assert.Equal(45, body.GetProperty("outputTokens").GetInt32());
         Assert.Equal(6, body.GetProperty("cachedInputTokens").GetInt32());
         Assert.Equal(4_000, body.GetProperty("totalDurationMs").GetInt64());
-        Assert.Equal(JsonValueKind.Null, body.GetProperty("finalAssistantMessage").ValueKind);
+        Assert.Equal("fresh done", body.GetProperty("finalAssistantMessage").GetString());
         var tool = Assert.Single(body.GetProperty("toolCalls").EnumerateArray());
         Assert.Equal("fresh", tool.GetProperty("toolUseId").GetString());
         Assert.Equal("Read", tool.GetProperty("toolName").GetString());

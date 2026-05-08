@@ -255,13 +255,19 @@ else
 
     private static long UnionToolDurationMs(IEnumerable<AgentStreamToolCallDto> toolCalls)
     {
-        var intervals = toolCalls
-            .Where(t => t.StartedAt.HasValue && t.EndedAt.HasValue && t.EndedAt.Value >= t.StartedAt.Value)
+        var materialized = toolCalls.ToList();
+        var intervals = materialized
+            .Where(HasValidInterval)
             .Select(t => (Start: t.StartedAt!.Value, End: t.EndedAt!.Value))
             .OrderBy(t => t.Start)
             .ToList();
+
+        var durationOnlyMs = materialized
+            .Where(t => !HasValidInterval(t))
+            .Sum(t => t.DurationMs ?? 0);
+
         if (intervals.Count == 0)
-            return toolCalls.Sum(t => t.DurationMs ?? 0);
+            return durationOnlyMs;
 
         var total = TimeSpan.Zero;
         var currentStart = intervals[0].Start;
@@ -281,8 +287,13 @@ else
         }
 
         total += currentEnd - currentStart;
-        return Math.Max(0, (long)Math.Round(total.TotalMilliseconds));
+        return Math.Max(0, (long)Math.Round(total.TotalMilliseconds)) + durationOnlyMs;
     }
+
+    private static bool HasValidInterval(AgentStreamToolCallDto toolCall) =>
+        toolCall.StartedAt.HasValue
+        && toolCall.EndedAt.HasValue
+        && toolCall.EndedAt.Value >= toolCall.StartedAt.Value;
 
     private static string FormatDuration(long ms)
     {
