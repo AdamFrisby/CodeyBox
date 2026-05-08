@@ -87,7 +87,6 @@ internal static partial class MergeScopeFence
         int bufferLines,
         CancellationToken ct)
     {
-        _ = mainTreeish;
         if (bufferLines < 0)
             throw new ArgumentOutOfRangeException(nameof(bufferLines), "buffer must be non-negative");
 
@@ -97,7 +96,7 @@ internal static partial class MergeScopeFence
         var conflictFiles = hunksByPath.Keys.ToHashSet(StringComparer.Ordinal);
         var violations = new List<string>();
 
-        var resolvedChanges = await gitHost.GetChangedPathsAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, ct);
+        var resolvedChanges = await gitHost.GetChangedPathsAsync(repositoryId, mainTreeish, resolvedTreeish, ct);
         var changedFiles = resolvedChanges.Select(c => c.Path).ToHashSet(StringComparer.Ordinal);
         foreach (var missing in conflictFiles.Except(changedFiles, StringComparer.Ordinal))
             violations.Add($"{missing}:1 conflicted file was not part of the resolved diff");
@@ -127,7 +126,7 @@ internal static partial class MergeScopeFence
 
         foreach (var (path, fileHunks) in hunksByPath)
         {
-            var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, path, ct);
+            var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, mainTreeish, resolvedTreeish, path, ct);
             foreach (var lineNumber in ChangedOldLineCoordinates(diff))
             {
                 if (!IsInsideAnyHunk(lineNumber, fileHunks, bufferLines))

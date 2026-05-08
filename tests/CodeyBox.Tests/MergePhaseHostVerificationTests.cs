@@ -28,7 +28,7 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
         var badMerge = await CommitOneSidedConflictResolutionAsync(gitHost, repoId);
         var pipeline = CreateVerifier(gitHost);
 
-        var ex = await Assert.ThrowsAsync<MergeConflictResolutionFailedException>(() =>
+        var ex = await Assert.ThrowsAsync<MergePhaseInconsistentResultException>(() =>
             pipeline.VerifyMergeResultAgainstHostAsync(
                 WorkItemId.New(),
                 repoId,
@@ -39,7 +39,7 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
                 bufferLines: 5,
                 ct: CancellationToken.None));
 
-        Assert.Contains("file.txt:1", ex.Message);
+        Assert.Contains("host git merge-tree reported conflicts", ex.Message);
     }
 
     [Fact]
@@ -60,7 +60,8 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
             oneSidedMerge,
             hostMerge,
             bufferLines: 5,
-            ct: CancellationToken.None);
+            ct: CancellationToken.None,
+            conflictsResolvedByConstrainedResolver: true);
     }
 
     [Fact]
@@ -383,7 +384,8 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             bufferLines: 5,
             ct: CancellationToken.None,
             project: project,
-            securityReviewRunner: reviewAgent);
+            securityReviewRunner: reviewAgent,
+            conflictsResolvedByConstrainedResolver: true);
 
         var reports = await auditStore.GetByWorkItemAsync(workItemId.ToString());
         var report = Assert.Single(reports);
@@ -430,7 +432,8 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             bufferLines: 5,
             ct: CancellationToken.None,
             project: project,
-            securityReviewRunner: reviewAgent);
+            securityReviewRunner: reviewAgent,
+            conflictsResolvedByConstrainedResolver: true);
     }
 
     private async Task<(LocalGitHost GitHost, string RepoId)> CreateConflictingRepoAsync()

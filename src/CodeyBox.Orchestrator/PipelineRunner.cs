@@ -61,6 +61,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly QuotaRouterOptions _auditQuotaOptions;
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
+    private readonly string _disabledHostHooksPath;
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -137,6 +138,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 .ToDictionary(p => p.Kind);
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
         _questionStore = questionStore;
+        _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_disabledHostHooksPath);
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
@@ -1833,13 +1836,13 @@ public sealed class PipelineRunner : IPipelineRunner
                         ct,
                         project,
                         runner,
-                        credential);
+                        credential,
+                        conflictsResolvedByConstrainedResolver: true);
                     await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
                 }
-                catch
+                finally
                 {
                     await DeleteHostRefBestEffortAsync(repoId, verificationRef, CancellationToken.None);
-                    throw;
                 }
             }
             catch (ScopeFenceViolation ex)
@@ -1855,21 +1858,20 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
-            await VerifyMergeResultAgainstHostAsync(
-                item.Id,
-                repoId,
-                preMergeSha,
-                workTipSha,
-                mergeSha,
-                hostMerge,
-                project.Audit.MergeScopeBufferLines,
-                ct,
-                project,
-                runner,
-                credential);
-
             try
             {
+                await VerifyMergeResultAgainstHostAsync(
+                    item.Id,
+                    repoId,
+                    preMergeSha,
+                    workTipSha,
+                    mergeSha,
+                    hostMerge,
+                    project.Audit.MergeScopeBufferLines,
+                    ct,
+                    project,
+                    runner,
+                    credential);
                 await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
             }
             finally
@@ -2197,7 +2199,8 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         Project? project = null,
         IAgentRunner? securityReviewRunner = null,
-        AgentCredential? securityReviewCredential = null)
+        AgentCredential? securityReviewCredential = null,
+        bool conflictsResolvedByConstrainedResolver = false)
     {
         await VerifyMergeAncestryAsync(repoId, preMergeSha, workTipSha, mergeSha, ct);
 
@@ -2219,6 +2222,12 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             await RecordMergeSecurityReviewAsync(workItemId, repoId, preMergeSha, mergeSha, [], project, securityReviewRunner, securityReviewCredential, ct);
             return;
+        }
+
+        if (!conflictsResolvedByConstrainedResolver)
+        {
+            throw new MergePhaseInconsistentResultException(
+                "host git merge-tree reported conflicts, but the merge agent produced a successful merge commit without constrained conflict resolution");
         }
 
         var hunks = await ExtractHostConflictHunksAsync(repoId, hostMerge, ct);
@@ -3028,8 +3037,9 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
     }
 
-    private static async Task RunHostGitAsync(string workdir, CancellationToken ct, params string[] args)
+    private async Task RunHostGitAsync(string workdir, CancellationToken ct, params string[] args)
     {
+        SanitizeBareRepositoryConfigIfPresent(workdir);
         var psi = new ProcessStartInfo
         {
             FileName = "git",
@@ -3039,6 +3049,8 @@ public sealed class PipelineRunner : IPipelineRunner
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add($"core.hooksPath={_disabledHostHooksPath}");
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 
@@ -3049,6 +3061,30 @@ public sealed class PipelineRunner : IPipelineRunner
         await process.WaitForExitAsync(ct);
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"host git command failed (exit {process.ExitCode}): git {string.Join(' ', args)}\n{stderr}{stdout}");
+    }
+
+    private static void SanitizeBareRepositoryConfigIfPresent(string workdir)
+    {
+        if (!Directory.Exists(workdir)
+            || !File.Exists(Path.Combine(workdir, "HEAD"))
+            || !Directory.Exists(Path.Combine(workdir, "objects"))
+            || !File.Exists(Path.Combine(workdir, "config")))
+        {
+            return;
+        }
+
+        var configPath = Path.Combine(workdir, "config");
+        var tempPath = Path.Combine(workdir, "config.codeybox-" + Guid.NewGuid().ToString("N") + ".tmp");
+        File.WriteAllText(
+            tempPath,
+            """
+            [core]
+                repositoryformatversion = 0
+                filemode = true
+                bare = true
+
+            """);
+        File.Move(tempPath, configPath, overwrite: true);
     }
 
     private async Task PushSandboxWorkBranchWithReconcileAsync(ISandbox sandbox, string branch, CancellationToken ct)
