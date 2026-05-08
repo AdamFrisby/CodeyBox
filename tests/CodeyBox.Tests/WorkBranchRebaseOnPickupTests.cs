@@ -217,27 +217,58 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     }
 
     [Fact]
-    public async Task ExistingNonIsolatedWorkBranchIsNotForcePushed()
+    public async Task ExplicitExistingWorkBranchIsRebased()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
         var item = NewItem("feature/not-isolated") with { State = WorkItemState.WorkComplete };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
-        var originalTip = await CommitToBareBranchAsync(
+        await CommitToBareBranchAsync(
             barePath,
             item.WorkBranch!,
             "work.txt",
             "work\n",
             "work");
+        var originalBase = await RevParseAsync(barePath, "main");
         await CommitToSeedAsync(seed, "main.txt", "main advanced\n", "main advanced");
+        var advancedMain = await RevParseAsync(seed, "main");
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("pickup-time rebase may force-push only", final.LastError);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotEqual(originalBase, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal(advancedMain, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("work\n", await ShowAsync(barePath, $"{item.WorkBranch}:work.txt"));
+    }
+
+    [Fact]
+    public async Task OversizedRebaseConflictFileFailsBeforeResolver()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem() with { State = WorkItemState.Merged };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var originalTip = await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            new string('w', 90_000) + "\n",
+            "work changes readme");
+
+        await CommitToSeedAsync(seed, "README.md", new string('m', 90_000) + "\n", "main changes readme");
+        tp.Agent.ConflictResolutionPlan.Enqueue(_ => throw new InvalidOperationException("resolver should not receive oversized content"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Contains("exceeds the 131072 byte resolver input limit", final.LastError);
+        Assert.Single(tp.Agent.ConflictResolutionPlan);
         Assert.Equal(originalTip, await RevParseAsync(barePath, item.WorkBranch!));
     }
 

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
@@ -64,6 +65,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly string _disabledHostHooksPath;
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
+    private const int MaxConflictResolverFileBytes = 128 * 1024;
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -505,7 +507,7 @@ public sealed class PipelineRunner : IPipelineRunner
             if (baseAlreadyAncestor.Success)
                 return;
 
-            ValidatePickupRebaseWorkBranch(item, workBranch);
+            ValidatePickupRebaseWorkBranch(item, baseBranch, workBranch);
 
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
             await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
@@ -619,13 +621,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private static string DefaultWorkBranchFor(WorkItemId id) => $"codeybox/{id.ToString()[..8]}";
 
-    private static void ValidatePickupRebaseWorkBranch(WorkItem item, string workBranch)
+    private static void ValidatePickupRebaseWorkBranch(WorkItem item, string baseBranch, string workBranch)
     {
-        var expected = DefaultWorkBranchFor(item.Id);
-        if (!string.Equals(workBranch, expected, StringComparison.Ordinal))
+        var configured = item.WorkBranch ?? DefaultWorkBranchFor(item.Id);
+        if (!string.Equals(workBranch, configured, StringComparison.Ordinal)
+            || string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
-                $"pickup-time rebase may force-push only the isolated per-work-item branch '{expected}', not '{workBranch}'");
+                $"pickup-time rebase may force-push only work item {item.Id}'s configured work branch '{configured}', not '{workBranch}'");
         }
     }
 
@@ -738,13 +741,8 @@ public sealed class PipelineRunner : IPipelineRunner
         foreach (var file in unmerged.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             ValidateConflictResolverPath(file);
-            var read = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "cat \"$1\"", "codeybox-read-rebase-conflict", $"{SandboxConventions.WorkDir}/{file}"],
-            }, ct);
-            if (!read.Success)
-                throw new MergeConflictResolutionFailedException($"failed to read pickup-time rebase conflict file '{file}': {read.Stderr}");
-            hunks.AddRange(MergeScopeFence.ExtractConflictHunks(file, read.Stdout));
+            var content = await ReadSandboxConflictFileAsync(sandbox, file, "pickup-time rebase conflict file", ct);
+            hunks.AddRange(MergeScopeFence.ExtractConflictHunks(file, content));
         }
 
         return hunks;
@@ -758,15 +756,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var files = hunks.Select(static h => h.Path).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
         var contents = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var file in files)
-        {
-            var read = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "cat \"$1\"", "codeybox-read-rebase-baseline", $"{SandboxConventions.WorkDir}/{file}"],
-            }, ct);
-            if (!read.Success)
-                throw new MergeConflictResolutionFailedException($"failed to read pickup-time rebase conflict baseline '{file}': {read.Stderr}");
-            contents[file] = read.Stdout;
-        }
+            contents[file] = await ReadSandboxConflictFileAsync(sandbox, file, "pickup-time rebase conflict baseline", ct);
 
         return contents;
     }
@@ -780,15 +770,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var resolved = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var path in baselines.Keys)
-        {
-            var read = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "cat \"$1\"", "codeybox-read-rebase-resolved", $"{SandboxConventions.WorkDir}/{path}"],
-            }, ct);
-            if (!read.Success)
-                throw new MergeConflictResolutionFailedException($"failed to read pickup-time rebase resolution '{path}': {read.Stderr}");
-            resolved[path] = read.Stdout;
-        }
+            resolved[path] = await ReadSandboxConflictFileAsync(sandbox, path, "pickup-time rebase resolution", ct);
 
         MergeScopeFence.VerifyResolvedContents(baselines, resolved, hunks, bufferLines);
     }
@@ -2387,13 +2369,17 @@ public sealed class PipelineRunner : IPipelineRunner
         var resolverFiles = new List<ConflictResolverFile>(files.Length);
         foreach (var file in files)
         {
-            var read = await sandbox.ExecAsync(new SandboxExec
+            string content;
+            try
             {
-                Argv = ["sh", "-c", "cat \"$1\"", "codeybox-read-conflict-file", $"{SandboxConventions.WorkDir}/{file}"],
-            }, ct);
-            if (!read.Success)
-                return new AgentResult(false, $"failed to read conflicted file '{file}'", read.Stdout, read.Stderr);
-            resolverFiles.Add(new ConflictResolverFile(file, read.Stdout));
+                content = await ReadSandboxConflictFileAsync(sandbox, file, "conflicted file", ct);
+            }
+            catch (MergeConflictResolutionFailedException ex)
+            {
+                return new AgentResult(false, $"failed to read conflicted file '{file}': {ex.Message}", null, null);
+            }
+
+            resolverFiles.Add(new ConflictResolverFile(file, content));
         }
 
         var resolverPrompt = BuildConflictResolverTextOnlyPrompt(prompt, resolverFiles);
@@ -2433,16 +2419,78 @@ public sealed class PipelineRunner : IPipelineRunner
         foreach (var (path, content) in resolvedFiles)
         {
             ValidateConflictResolverPath(path);
-            var write = await sandbox.ExecAsync(new SandboxExec
+            try
             {
-                Argv = ["sh", "-c", "cat > \"$1\"", "codeybox-write-conflict-file", $"{SandboxConventions.WorkDir}/{path}"],
-                Stdin = content,
-            }, ct);
-            if (!write.Success)
-                return new AgentResult(false, $"failed to write resolved file '{path}'", write.Stdout, write.Stderr);
+                await WriteSandboxConflictFileAsync(sandbox, path, content, ct);
+            }
+            catch (MergeConflictResolutionFailedException ex)
+            {
+                return new AgentResult(false, $"failed to write resolved file '{path}': {ex.Message}", null, null);
+            }
         }
 
         return new AgentResult(true, textResult.Summary, textResult.Output, textResult.Error);
+    }
+
+    private static async Task<string> ReadSandboxConflictFileAsync(
+        ISandbox sandbox,
+        string path,
+        string description,
+        CancellationToken ct)
+    {
+        ValidateConflictResolverPath(path);
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c", SafeReadSandboxFileScript, "codeybox-safe-read-conflict-file",
+                SandboxConventions.WorkDir,
+                path,
+                (MaxConflictResolverFileBytes + 1).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ],
+        }, ct);
+        if (!read.Success)
+            throw new MergeConflictResolutionFailedException(
+                $"failed to read {description} '{path}' safely: {read.Stderr.Trim()}");
+
+        byte[] bytes;
+        try
+        {
+            bytes = Convert.FromBase64String(read.Stdout);
+        }
+        catch (FormatException ex)
+        {
+            throw new MergeConflictResolutionFailedException(
+                $"failed to decode {description} '{path}'", ex);
+        }
+
+        if (bytes.Length > MaxConflictResolverFileBytes)
+            throw new MergeConflictResolutionFailedException(
+                $"{description} '{path}' exceeds the {MaxConflictResolverFileBytes} byte resolver input limit");
+
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    private static async Task WriteSandboxConflictFileAsync(
+        ISandbox sandbox,
+        string path,
+        string content,
+        CancellationToken ct)
+    {
+        ValidateConflictResolverPath(path);
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c", SafeWriteSandboxFileScript, "codeybox-safe-write-conflict-file",
+                SandboxConventions.WorkDir,
+                path,
+            ],
+            Stdin = content,
+        }, ct);
+        if (!write.Success)
+            throw new MergeConflictResolutionFailedException(
+                $"safe write rejected '{path}': {write.Stderr.Trim()}");
     }
 
     private static void ValidateConflictResolverPath(string path)
@@ -2455,6 +2503,55 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new MergeConflictResolutionFailedException($"unsafe conflict file path '{path}'");
         }
     }
+
+    private const string SafeReadSandboxFileScript = """
+        set -eu
+        root=$1
+        rel=$2
+        limit=$3
+        case "$limit" in ''|*[!0-9]*) echo "invalid byte limit" >&2; exit 64;; esac
+        root_real=$(cd "$root" 2>/dev/null && pwd -P) || { echo "worktree root not found" >&2; exit 65; }
+        case "$rel" in /*|*\\*|''|.|..|./*|../*|*/./*|*/../*|*/.|*/..) echo "unsafe relative path" >&2; exit 66;; esac
+        parent_rel=${rel%/*}
+        base=${rel##*/}
+        if [ "$parent_rel" = "$rel" ]; then
+            parent_path=$root_real
+        else
+            parent_path=$root_real/$parent_rel
+        fi
+        parent_real=$(cd "$parent_path" 2>/dev/null && pwd -P) || { echo "parent path not found" >&2; exit 67; }
+        case "$parent_real/" in "$root_real/"|"$root_real"/*) ;; *) echo "path escapes worktree" >&2; exit 68;; esac
+        target=$parent_real/$base
+        if [ -L "$target" ]; then echo "refusing symlink" >&2; exit 69; fi
+        if [ ! -f "$target" ]; then echo "not a regular file" >&2; exit 70; fi
+        dd if="$target" bs="$limit" count=1 iflag=nofollow status=none | base64
+        """;
+
+    private const string SafeWriteSandboxFileScript = """
+        set -eu
+        root=$1
+        rel=$2
+        root_real=$(cd "$root" 2>/dev/null && pwd -P) || { echo "worktree root not found" >&2; exit 65; }
+        case "$rel" in /*|*\\*|''|.|..|./*|../*|*/./*|*/../*|*/.|*/..) echo "unsafe relative path" >&2; exit 66;; esac
+        parent_rel=${rel%/*}
+        base=${rel##*/}
+        if [ "$parent_rel" = "$rel" ]; then
+            parent_path=$root_real
+        else
+            parent_path=$root_real/$parent_rel
+        fi
+        parent_real=$(cd "$parent_path" 2>/dev/null && pwd -P) || { echo "parent path not found" >&2; exit 67; }
+        case "$parent_real/" in "$root_real/"|"$root_real"/*) ;; *) echo "path escapes worktree" >&2; exit 68;; esac
+        target=$parent_real/$base
+        if [ -L "$target" ]; then echo "refusing symlink" >&2; exit 69; fi
+        if [ ! -f "$target" ]; then echo "not a regular file" >&2; exit 70; fi
+        tmp=$(mktemp "$parent_real/.codeybox-resolve.XXXXXX") || exit 71
+        trap 'rm -f "$tmp"' EXIT
+        cat > "$tmp"
+        if mode=$(stat -c '%a' -- "$target" 2>/dev/null); then chmod "$mode" "$tmp"; fi
+        mv -f -T "$tmp" "$target"
+        trap - EXIT
+        """;
 
     private async Task<IReadOnlyList<ConflictHunk>> ExtractHostConflictHunksAsync(
         string repoId,
