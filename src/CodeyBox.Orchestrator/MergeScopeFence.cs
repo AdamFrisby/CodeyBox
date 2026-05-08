@@ -33,6 +33,9 @@ internal static partial class MergeScopeFence
     {
         var hunks = new List<ConflictHunk>();
         int? startLine = null;
+        var mainLineNumber = 0;
+        var mainSideLineCount = 0;
+        var state = ConflictParseState.Outside;
         var lines = conflictedContent.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
         for (var i = 0; i < lines.Length; i++)
         {
@@ -42,7 +45,22 @@ internal static partial class MergeScopeFence
             {
                 if (startLine is not null)
                     throw new InvalidOperationException($"nested conflict marker in {path}:{lineNumber}");
-                startLine = lineNumber;
+                startLine = mainLineNumber + 1;
+                mainSideLineCount = 0;
+                state = ConflictParseState.MainSide;
+                continue;
+            }
+
+            if (line.StartsWith("|||||||", StringComparison.Ordinal) && state == ConflictParseState.MainSide)
+            {
+                state = ConflictParseState.BaseSide;
+                continue;
+            }
+
+            if (line.StartsWith("=======", StringComparison.Ordinal) &&
+                state is ConflictParseState.MainSide or ConflictParseState.BaseSide)
+            {
+                state = ConflictParseState.WorkSide;
                 continue;
             }
 
@@ -50,8 +68,21 @@ internal static partial class MergeScopeFence
             {
                 if (startLine is null)
                     throw new InvalidOperationException($"unmatched conflict end marker in {path}:{lineNumber}");
-                hunks.Add(new ConflictHunk(path, startLine.Value, lineNumber));
+                var endLine = Math.Max(startLine.Value, startLine.Value + mainSideLineCount - 1);
+                hunks.Add(new ConflictHunk(path, startLine.Value, endLine));
+                mainLineNumber += mainSideLineCount;
                 startLine = null;
+                state = ConflictParseState.Outside;
+                continue;
+            }
+
+            if (state == ConflictParseState.Outside)
+            {
+                mainLineNumber++;
+            }
+            else if (state == ConflictParseState.MainSide)
+            {
+                mainSideLineCount++;
             }
         }
 
@@ -64,6 +95,7 @@ internal static partial class MergeScopeFence
         IGitHost gitHost,
         string repositoryId,
         string mainTreeish,
+        string conflictBaselineTreeish,
         string resolvedTreeish,
         IReadOnlyList<ConflictHunk> hunks,
         int bufferLines,
@@ -76,12 +108,19 @@ internal static partial class MergeScopeFence
             .GroupBy(h => h.Path, StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
         var conflictFiles = hunksByPath.Keys.ToHashSet(StringComparer.Ordinal);
-        var changes = await gitHost.GetChangedPathsAsync(repositoryId, mainTreeish, resolvedTreeish, ct);
-        var changedFiles = new HashSet<string>(StringComparer.Ordinal);
         var violations = new List<string>();
 
-        foreach (var change in changes)
+        var baselineChanges = await gitHost.GetChangedPathsAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, ct);
+        foreach (var change in baselineChanges)
         {
+            if (!conflictFiles.Contains(change.Path))
+            {
+                violations.Add(change.Status.StartsWith('R') || change.Status.StartsWith('A') || change.Status.StartsWith('D')
+                    ? $"{change.Path}:1 {DescribeStatus(change)}"
+                    : $"{change.Path}:1 changed non-conflicted file");
+                continue;
+            }
+
             if (change.Status.StartsWith('R') || change.Status.StartsWith('A') || change.Status.StartsWith('D'))
             {
                 violations.Add($"{change.Path}:1 {DescribeStatus(change)}");
@@ -93,26 +132,18 @@ internal static partial class MergeScopeFence
                 violations.Add($"{change.Path}:1 unsupported change status {change.Status}");
                 continue;
             }
+        }
 
-            changedFiles.Add(change.Path);
-            if (!hunksByPath.TryGetValue(change.Path, out var fileHunks))
-            {
-                violations.Add($"{change.Path}:1 changed non-conflicted file");
-                continue;
-            }
-
-            var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, mainTreeish, resolvedTreeish, change.Path, ct);
+        foreach (var (path, fileHunks) in hunksByPath)
+        {
+            var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, mainTreeish, resolvedTreeish, path, ct);
+            if (string.IsNullOrWhiteSpace(diff))
+                violations.Add($"{path}:1 conflicted file was not part of the resolved diff");
             foreach (var lineNumber in ChangedLineNumbers(diff))
             {
                 if (!IsInsideAnyHunk(lineNumber, fileHunks, bufferLines))
-                    violations.Add($"{change.Path}:{lineNumber}");
+                    violations.Add($"{path}:{lineNumber}");
             }
-        }
-
-        foreach (var file in conflictFiles)
-        {
-            if (!changedFiles.Contains(file))
-                violations.Add($"{file}:1 conflicted file was not part of the resolved diff");
         }
 
         if (violations.Count > 0)
@@ -187,4 +218,12 @@ internal static partial class MergeScopeFence
 
     [GeneratedRegex(@"^@@ -(?<old>\d+)(?:,\d+)? \+(?<new>\d+)(?:,\d+)? @@", RegexOptions.CultureInvariant)]
     private static partial Regex DiffHunkHeader();
+
+    private enum ConflictParseState
+    {
+        Outside,
+        MainSide,
+        BaseSide,
+        WorkSide,
+    }
 }

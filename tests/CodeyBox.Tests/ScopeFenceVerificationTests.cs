@@ -73,10 +73,38 @@ public sealed class ScopeFenceVerificationTests : IDisposable
         Assert.Contains("file.txt:18", ex.Message);
     }
 
+    [Fact]
+    public async Task AllowsCleanWorkBranchChangeAlreadyInConflictBaseline()
+    {
+        var ctx = await CreateContextAsync();
+        var clone = await CloneAsync(ctx);
+        await File.WriteAllTextAsync(Path.Combine(clone, "clean.txt"), "legitimate work change\n");
+        await TestSupport.RunGit(clone, "add", "clean.txt");
+        await TestSupport.RunGit(clone, "commit", "-m", "canonical conflict baseline");
+        await TestSupport.RunGit(clone, "branch", "baseline");
+        var path = Path.Combine(clone, "file.txt");
+        var lines = await File.ReadAllLinesAsync(path);
+        lines[10] = "inside";
+        await File.WriteAllLinesAsync(path, lines);
+        await TestSupport.RunGit(clone, "commit", "-am", "resolved");
+        await TestSupport.RunGit(clone, "push", "origin", "baseline", "HEAD:resolved");
+
+        await MergeScopeFence.VerifyAsync(
+            ctx.GitHost,
+            ctx.RepoId,
+            "main",
+            "baseline",
+            "resolved",
+            [new ConflictHunk("file.txt", 10, 12)],
+            bufferLines: 5,
+            CancellationToken.None);
+    }
+
     private static Task VerifyAsync(Context ctx)
         => MergeScopeFence.VerifyAsync(
             ctx.GitHost,
             ctx.RepoId,
+            "main",
             "main",
             "resolved",
             [new ConflictHunk("file.txt", 10, 12)],

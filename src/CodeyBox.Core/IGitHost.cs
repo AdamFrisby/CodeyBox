@@ -33,6 +33,10 @@ public interface IGitHost
     /// </summary>
     SandboxRepositoryAccess GetSandboxAccess(string repositoryId);
 
+    /// <summary>Returns the host filesystem path for a managed bare repository.</summary>
+    string GetRepoPath(string repositoryId)
+        => throw new NotSupportedException("This git host does not expose a host repository path.");
+
     /// <summary>Returns the resolved default branch name for the repo.</summary>
     Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default);
 

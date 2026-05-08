@@ -58,13 +58,20 @@ the orchestrator runs host-side `git merge-tree --write-tree --no-messages`
 against the pre-merge main commit and the work tip.
 
 For clean merges, the agent commit tree must exactly match the host
-`merge-tree` result. For conflicted merges, the host reads the conflict-marker
-tree, records each `<<<<<<<` ... `>>>>>>>` hunk, and applies a deterministic
-scope fence to the resolved commit. The resolver may change only conflicted
-files and only lines inside those hunks plus `Audit.MergeScopeBufferLines`
-context lines. The default buffer is 5. New files, deletes, renames, edits to
-non-conflicted files, and whitespace-only edits outside the allowed ranges are
-rejected and the work item enters `MergeConflictResolutionFailed`.
+`merge-tree` result. For conflicted merges, the resolver is pointed at an
+isolated temporary bare repository, not the work item's host bare repository,
+so prompt-injected conflict text cannot push or rewrite host refs before
+verification. The host reads the conflict-marker tree, records each
+`<<<<<<<` ... `>>>>>>>` hunk in pre-merge main-file line coordinates, and
+applies a deterministic scope fence to the resolved commit before importing it.
+The resolver may change only conflicted files and only lines inside those hunks
+plus `Audit.MergeScopeBufferLines` context lines. The default buffer is 5.
+The fence compares resolver side effects against git's canonical
+conflict-marker tree, so non-conflicting work-branch changes that were already
+part of the canonical merge are preserved. New resolver-created files, deletes,
+renames, edits to non-conflicted files, and whitespace-only edits outside the
+allowed ranges are rejected and the work item enters
+`MergeConflictResolutionFailed`.
 
 This deterministic scope fence is the security boundary. The optional merge
 security review is advisory-only: it has no authority to fail the merge because
