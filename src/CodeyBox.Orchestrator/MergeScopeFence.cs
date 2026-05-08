@@ -110,8 +110,14 @@ internal static partial class MergeScopeFence
         var conflictFiles = hunksByPath.Keys.ToHashSet(StringComparer.Ordinal);
         var violations = new List<string>();
 
-        var baselineChanges = await gitHost.GetChangedPathsAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, ct);
-        foreach (var change in baselineChanges)
+        _ = conflictBaselineTreeish;
+
+        var resolvedChanges = await gitHost.GetChangedPathsAsync(repositoryId, mainTreeish, resolvedTreeish, ct);
+        var changedFiles = resolvedChanges.Select(c => c.Path).ToHashSet(StringComparer.Ordinal);
+        foreach (var missing in conflictFiles.Except(changedFiles, StringComparer.Ordinal))
+            violations.Add($"{missing}:1 conflicted file was not part of the resolved diff");
+
+        foreach (var change in resolvedChanges)
         {
             if (!conflictFiles.Contains(change.Path))
             {
@@ -137,8 +143,6 @@ internal static partial class MergeScopeFence
         foreach (var (path, fileHunks) in hunksByPath)
         {
             var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, mainTreeish, resolvedTreeish, path, ct);
-            if (string.IsNullOrWhiteSpace(diff))
-                violations.Add($"{path}:1 conflicted file was not part of the resolved diff");
             foreach (var lineNumber in ChangedLineNumbers(diff))
             {
                 if (!IsInsideAnyHunk(lineNumber, fileHunks, bufferLines))

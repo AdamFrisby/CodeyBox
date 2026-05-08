@@ -212,10 +212,11 @@ internal enum MergeStrategy
 /// File-write contents are consumed in order; provide one entry per
 /// expected work-phase (or rework-phase) invocation.
 /// </summary>
-internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner
+internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, IConflictResolverAgentRunner
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
+    public Queue<Func<IReadOnlyList<ConflictResolverFile>, IReadOnlyDictionary<string, string>>> ConflictResolutionPlan { get; } = new();
     public Queue<string> StdoutChunks { get; } = new();
     public Queue<IReadOnlyList<string>> StdoutChunkBatches { get; } = new();
     public List<bool> CaptureStructuredStreamCalls { get; } = new();
@@ -233,6 +234,35 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
     {
         StructuredStreamSupportProbeCount++;
         return Task.FromResult(true);
+    }
+
+    public Task<ConflictResolverResult> ResolveConflictsAsync(
+        string prompt,
+        IReadOnlyList<ConflictResolverFile> files,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        _ = prompt;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = ct;
+        if (ConflictResolutionPlan.Count == 0)
+        {
+            return Task.FromResult(new ConflictResolverResult(
+                false,
+                "ScriptedAgent: ran out of conflict-resolution plan entries",
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                null,
+                null));
+        }
+
+        return Task.FromResult(new ConflictResolverResult(
+            true,
+            "resolved",
+            ConflictResolutionPlan.Dequeue()(files),
+            ResultStdout,
+            null));
     }
 
     public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)

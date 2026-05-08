@@ -10,22 +10,28 @@ public sealed class MergePhaseEndToEndPropertyTest : IDisposable
 
     public void Dispose() => Directory.Delete(_workspace, recursive: true);
 
-    [Fact]
-    public async Task MainNeverLosesCommitsSilently()
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public async Task MainNeverLosesCommitsSilently(int mainCommitCount)
     {
-        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        await CommitAsync(seed, "main-before.txt", "main before\n", "main before");
-        var preMergeMain = (await TestSupport.RunGit(seed, "rev-parse", "main")).stdout.Trim();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace, $"seed-{mainCommitCount}");
+        for (var i = 0; i < mainCommitCount; i++)
+            await CommitAsync(seed, $"main-before-{i}.txt", $"main before {i}\n", $"main before {i}");
+        var mainCommitsBeforeMerge = (await TestSupport.RunGit(seed, "rev-list", "main"))
+            .stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite($"work-{mainCommitCount}.txt", $"work {mainCommitCount}\n"));
         var item = new WorkItem
         {
             Id = WorkItemId.New(),
             ProjectId = new ProjectId("test-project"),
-            Title = "property",
+            Title = $"property {mainCommitCount}",
             Prompt = "write work",
-            WorkBranch = "feature/property",
+            WorkBranch = $"feature/property-{mainCommitCount}",
         };
         await tp.Store.CreateAsync(item);
 
@@ -34,7 +40,8 @@ public sealed class MergePhaseEndToEndPropertyTest : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
-        await TestSupport.RunGit(barePath, "merge-base", "--is-ancestor", preMergeMain, "main");
+        foreach (var commit in mainCommitsBeforeMerge)
+            await TestSupport.RunGit(barePath, "merge-base", "--is-ancestor", commit, "main");
     }
 
     private static async Task CommitAsync(string repo, string path, string content, string message)

@@ -1690,56 +1690,85 @@ public sealed class PipelineRunner : IPipelineRunner
         var prompt = hostMerge.HasConflicts
             ? BuildConflictResolverPrompt(baseBranch, workBranch, conflictHunks, project.Audit.MergeScopeBufferLines)
             : BuildMergePrompt(baseBranch, workBranch, hostMerge, project.Audit.MergeScopeBufferLines);
-        AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
         var mergeSw = Stopwatch.StartNew();
-
-        var mergeExecScope = await TimingScope.BeginAsync(
-            _timings, item.Id, "merge", "agent.exec",
-            metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-            log: _log,
-            activitySource: CodeyBoxActivities.Pipeline);
-        var canCaptureMergeStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "merge", ct);
-        var mergeStreamCapture = canCaptureMergeStructuredStream
-            ? await BeginAgentStreamCaptureAsync(item.Id, "merge", 1, ct)
-            : null;
-        var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
         AgentResult agentResult;
-        using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        try
+        long mergeExecElapsedMs;
+        DateTimeOffset mergeEndedAt;
+        var mergeStructuredStreamCaptured = false;
+        if (hostMerge.HasConflicts)
         {
+            var mergeExecScope = await TimingScope.BeginAsync(
+                _timings, item.Id, "merge", "agent.exec",
+                metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value, ["capability"] = "conflict-text-only" },
+                log: _log,
+                activitySource: CodeyBoxActivities.Pipeline);
             await using (mergeExecScope)
             {
-                var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
-                    stdoutChunkCallback: mergeStdoutCallback,
-                    captureStructuredStream: mergeStreamCapture is not null);
-                var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
-                if (completed != runTask)
-                {
-                    await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
-                    completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
-                    if (completed != runTask)
-                        await runnerCts.CancelAsync();
-                }
-
-                agentResult = await runTask;
-                if (hostShutdownToken.IsCancellationRequested)
-                    throw new OperationCanceledException(hostShutdownToken);
+                AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
+                agentResult = await RunConstrainedConflictResolverAsync(
+                    runner,
+                    sandbox,
+                    prompt,
+                    conflictHunks,
+                    item.ModelId,
+                    item.ReasoningMode,
+                    ct);
             }
+            mergeExecElapsedMs = mergeExecScope.ElapsedMs;
+            mergeEndedAt = DateTimeOffset.UtcNow;
         }
-        finally
+        else
         {
-            if (mergeStreamCapture is not null)
-                await mergeStreamCapture.DisposeAsync();
+            AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
+            var mergeExecScope = await TimingScope.BeginAsync(
+                _timings, item.Id, "merge", "agent.exec",
+                metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+                log: _log,
+                activitySource: CodeyBoxActivities.Pipeline);
+            var canCaptureMergeStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "merge", ct);
+            var mergeStreamCapture = canCaptureMergeStructuredStream
+                ? await BeginAgentStreamCaptureAsync(item.Id, "merge", 1, ct)
+                : null;
+            mergeStructuredStreamCaptured = mergeStreamCapture is not null;
+            var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
+            using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            try
+            {
+                await using (mergeExecScope)
+                {
+                    var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
+                        stdoutChunkCallback: mergeStdoutCallback,
+                        captureStructuredStream: mergeStreamCapture is not null);
+                    var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
+                    if (completed != runTask)
+                    {
+                        await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
+                        completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                        if (completed != runTask)
+                            await runnerCts.CancelAsync();
+                    }
+
+                    agentResult = await runTask;
+                    if (hostShutdownToken.IsCancellationRequested)
+                        throw new OperationCanceledException(hostShutdownToken);
+                }
+            }
+            finally
+            {
+                if (mergeStreamCapture is not null)
+                    await mergeStreamCapture.DisposeAsync();
+            }
+            mergeExecElapsedMs = mergeExecScope.ElapsedMs;
+            mergeEndedAt = DateTimeOffset.UtcNow;
         }
-        CodeyBoxMeters.AgentDuration.Record(mergeExecScope.ElapsedMs,
+        CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
             new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
             new KeyValuePair<string, object?>("phase", "merge"));
 
-        var mergeEndedAt = DateTimeOffset.UtcNow;
         var observedModelId = ResolveObservedModelId(runner, item.ModelId);
-        var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecScope.ElapsedMs);
-        if (mergeStreamCapture is null)
-            await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecScope.ElapsedMs, ct);
+        var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecElapsedMs);
+        if (!mergeStructuredStreamCaptured)
+            await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt);
         mergeSw.Stop();
@@ -1888,6 +1917,84 @@ public sealed class PipelineRunner : IPipelineRunner
         return headSha;
     }
 
+    private static async Task<AgentResult> RunConstrainedConflictResolverAsync(
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string prompt,
+        IReadOnlyList<ConflictHunk> conflictHunks,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct)
+    {
+        if (runner is not IConflictResolverAgentRunner resolver)
+        {
+            return new AgentResult(
+                false,
+                $"agent {runner.Kind} does not implement host-constrained merge conflict resolution",
+                null,
+                "conflicted merges require IConflictResolverAgentRunner so the resolver receives no sandbox, shell, network, or repository filesystem access");
+        }
+
+        var files = conflictHunks
+            .Select(h => h.Path)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        foreach (var file in files)
+            ValidateConflictResolverPath(file);
+
+        var resolverFiles = new List<ConflictResolverFile>(files.Length);
+        foreach (var file in files)
+        {
+            var read = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat \"$1\"", "codeybox-read-conflict-file", $"{SandboxConventions.WorkDir}/{file}"],
+            }, ct);
+            if (!read.Success)
+                return new AgentResult(false, $"failed to read conflicted file '{file}'", read.Stdout, read.Stderr);
+            resolverFiles.Add(new ConflictResolverFile(file, read.Stdout));
+        }
+
+        var result = await resolver.ResolveConflictsAsync(prompt, resolverFiles, modelId, reasoningMode, ct);
+        if (!result.Success)
+            return new AgentResult(false, result.Summary, result.Stdout, result.Stderr);
+
+        var expected = files.ToHashSet(StringComparer.Ordinal);
+        var actual = result.ResolvedFiles.Keys.ToHashSet(StringComparer.Ordinal);
+        var missing = expected.Except(actual, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        var extra = actual.Except(expected, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        if (missing.Length > 0 || extra.Length > 0)
+        {
+            var message = $"conflict resolver returned an invalid file set; missing=[{string.Join(", ", missing)}], extra=[{string.Join(", ", extra)}]";
+            return new AgentResult(false, message, result.Stdout, result.Stderr);
+        }
+
+        foreach (var (path, content) in result.ResolvedFiles)
+        {
+            ValidateConflictResolverPath(path);
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$1\"", "codeybox-write-conflict-file", $"{SandboxConventions.WorkDir}/{path}"],
+                Stdin = content,
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, $"failed to write resolved file '{path}'", write.Stdout, write.Stderr);
+        }
+
+        return new AgentResult(true, result.Summary, result.Stdout, result.Stderr);
+    }
+
+    private static void ValidateConflictResolverPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)
+            || Path.IsPathRooted(path)
+            || path.Contains('\\', StringComparison.Ordinal)
+            || path.Split('/', StringSplitOptions.None).Any(static part => part is "" or "." or ".."))
+        {
+            throw new MergeConflictResolutionFailedException($"unsafe conflict file path '{path}'");
+        }
+    }
+
     private async Task<IReadOnlyList<ConflictHunk>> ExtractHostConflictHunksAsync(
         string repoId,
         GitMergeTreeResult hostMerge,
@@ -1958,6 +2065,35 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _log.LogWarning(ex, "Failed to delete isolated merge repository {Path}", path);
+        }
+    }
+
+    private async Task VerifyMergeAncestryAsync(
+        string repoId,
+        string preMergeSha,
+        string workTipSha,
+        string mergeSha,
+        CancellationToken ct)
+    {
+        var target = _gitHost.GetRepoPath(repoId);
+        try
+        {
+            await RunHostGitAsync(target, ct, "merge-base", "--is-ancestor", preMergeSha, mergeSha);
+        }
+        catch (InvalidOperationException)
+        {
+            throw new MergePhaseInconsistentResultException(
+                $"accepted merge commit {mergeSha} does not preserve pre-merge main ancestry {preMergeSha}");
+        }
+
+        try
+        {
+            await RunHostGitAsync(target, ct, "merge-base", "--is-ancestor", workTipSha, mergeSha);
+        }
+        catch (InvalidOperationException)
+        {
+            throw new MergePhaseInconsistentResultException(
+                $"accepted merge commit {mergeSha} does not preserve work branch ancestry {workTipSha}");
         }
     }
 
@@ -2037,7 +2173,7 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    private async Task VerifyMergeResultAgainstHostAsync(
+    internal async Task VerifyMergeResultAgainstHostAsync(
         WorkItemId workItemId,
         string repoId,
         string preMergeSha,
@@ -2047,6 +2183,8 @@ public sealed class PipelineRunner : IPipelineRunner
         int bufferLines,
         CancellationToken ct)
     {
+        await VerifyMergeAncestryAsync(repoId, preMergeSha, workTipSha, mergeSha, ct);
+
         var refreshedHostMerge = await _gitHost.ComputeMergeTreeAsync(repoId, preMergeSha, workTipSha, ct);
         if (refreshedHostMerge.HasConflicts != hostMerge.HasConflicts
             || !string.Equals(refreshedHostMerge.TreeSha, hostMerge.TreeSha, StringComparison.Ordinal))
@@ -2234,9 +2372,10 @@ public sealed class PipelineRunner : IPipelineRunner
         return $$"""
         # Conflict resolution task
 
-        You are operating inside a sandbox at /work that contains a clone with
-        `{{workBranch}}` already merged into `{{baseBranch}}` and stopped at
-        conflict markers. Resolve only the listed conflict hunks.
+        You will receive the conflicted file contents for `{{workBranch}}`
+        merged into `{{baseBranch}}`. Return complete resolved contents for
+        exactly those same files. You do not have shell, network, or repository
+        filesystem access.
 
         Conflict scope contract:
         {{hunkList}}
@@ -2246,14 +2385,8 @@ public sealed class PipelineRunner : IPipelineRunner
           - A buffer of +/-{{bufferLines}} lines around each hunk is permitted only for mechanical adjustments.
           - You MAY NOT add, delete, or rename files.
           - You MAY NOT modify any file outside the conflict list.
-          - Do not run git push, fetch, rebase, reset, or checkout.
           - Out-of-scope changes will be rejected by deterministic host verification.
           - Preserve the intent of both sides; do not take one side blindly.
-
-        Finish with a clean merge commit. Every commit message MUST include
-        this trailer, separated from the subject by a blank line:
-
-            {{CodeyBoxTrailers.CoAuthoredBy}}
         """;
     }
 

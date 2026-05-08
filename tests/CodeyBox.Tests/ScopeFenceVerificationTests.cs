@@ -74,7 +74,7 @@ public sealed class ScopeFenceVerificationTests : IDisposable
     }
 
     [Fact]
-    public async Task AllowsCleanWorkBranchChangeAlreadyInConflictBaseline()
+    public async Task RejectsCleanWorkBranchChangeAlreadyInConflictBaseline()
     {
         var ctx = await CreateContextAsync();
         var clone = await CloneAsync(ctx);
@@ -89,7 +89,7 @@ public sealed class ScopeFenceVerificationTests : IDisposable
         await TestSupport.RunGit(clone, "commit", "-am", "resolved");
         await TestSupport.RunGit(clone, "push", "origin", "baseline", "HEAD:resolved");
 
-        await MergeScopeFence.VerifyAsync(
+        var ex = await Assert.ThrowsAsync<ScopeFenceViolation>(() => MergeScopeFence.VerifyAsync(
             ctx.GitHost,
             ctx.RepoId,
             "main",
@@ -97,7 +97,8 @@ public sealed class ScopeFenceVerificationTests : IDisposable
             "resolved",
             [new ConflictHunk("file.txt", 10, 12)],
             bufferLines: 5,
-            CancellationToken.None);
+            CancellationToken.None));
+        Assert.Contains("clean.txt:1 new file", ex.Message);
     }
 
     private static Task VerifyAsync(Context ctx)

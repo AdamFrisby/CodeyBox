@@ -35,6 +35,31 @@ public interface IStructuredStreamAgentRunner : IAgentRunner
 }
 
 /// <summary>
+/// Optional runner capability for merge conflict resolution. Unlike
+/// <see cref="IAgentRunner.RunAsync"/>, this path receives only conflict file
+/// text and returns file contents; it is not given a sandbox, shell, repository
+/// mount, or network profile.
+/// </summary>
+public interface IConflictResolverAgentRunner : IAgentRunner
+{
+    Task<ConflictResolverResult> ResolveConflictsAsync(
+        string prompt,
+        IReadOnlyList<ConflictResolverFile> files,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default);
+}
+
+public sealed record ConflictResolverFile(string Path, string Content);
+
+public sealed record ConflictResolverResult(
+    bool Success,
+    string Summary,
+    IReadOnlyDictionary<string, string> ResolvedFiles,
+    string? Stdout,
+    string? Stderr);
+
+/// <summary>
 /// Optional runner capability for CLIs where CodeyBox pins a default model
 /// even when the work item does not carry an explicit ModelId.
 /// </summary>
