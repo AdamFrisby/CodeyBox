@@ -519,7 +519,7 @@ public static class AgentStreamAnalytics
                     g.Key,
                     g.Count(),
                     durations.Sum(),
-                    durations.Count == 0 ? 0 : durations[durations.Count / 2]);
+                    MedianMs(durations));
             })
             .OrderByDescending(t => t.TotalDurationMs)
             .ThenBy(t => t.Tool, StringComparer.OrdinalIgnoreCase)
@@ -547,6 +547,18 @@ public static class AgentStreamAnalytics
 
     private static long ToMs(TimeSpan? value) =>
         value.HasValue ? Math.Max(0, (long)Math.Round(value.Value.TotalMilliseconds)) : 0;
+
+    private static long MedianMs(IReadOnlyList<long> sortedDurations)
+    {
+        if (sortedDurations.Count == 0)
+            return 0;
+
+        var middle = sortedDurations.Count / 2;
+        if (sortedDurations.Count % 2 == 1)
+            return sortedDurations[middle];
+
+        return (long)Math.Round((sortedDurations[middle - 1] + sortedDurations[middle]) / 2.0);
+    }
 
     private static long UnionToolDurationMs(IEnumerable<ToolCallInvocation> toolCalls)
     {
@@ -641,7 +653,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             }
 
             eventCount++;
-            var timestamp = parsed.Timestamp;
+            var timestamp = parsed.Timestamp ?? ProjectTimestamp(context, jsonLine);
 
             if (timestamp is { } eventTimestamp)
             {
@@ -679,13 +691,17 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             {
                 if (toolStarts.Remove(result.Id, out var started))
                 {
-                    var endedAt = result.EndedAt ?? timestamp;
+                    var candidateEndedAt = result.EndedAt ?? timestamp;
                     var duration = result.Duration
-                        ?? (started.StartedAt.HasValue && endedAt.HasValue
-                            ? endedAt.Value - started.StartedAt.Value
+                        ?? (started.StartedAt.HasValue && candidateEndedAt.HasValue
+                            ? candidateEndedAt.Value - started.StartedAt.Value
                             : (TimeSpan?)null);
                     if (duration.HasValue && duration.Value < TimeSpan.Zero)
                         duration = null;
+                    var endedAt = result.EndedAt
+                        ?? (started.StartedAt.HasValue && duration.HasValue && parsed.Timestamp is null
+                            ? started.StartedAt.Value + duration.Value
+                            : timestamp);
                     if (endedAt is null && started.StartedAt.HasValue && duration.HasValue)
                         endedAt = started.StartedAt.Value + duration.Value;
 
@@ -756,6 +772,40 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         if (context is null || context.InvocationEndedAt < context.InvocationStartedAt)
             return null;
         return context.InvocationEndedAt - context.InvocationStartedAt;
+    }
+
+    private static DateTimeOffset? ProjectTimestamp(
+        AgentStreamParserContext? context,
+        AgentStreamJsonLine jsonLine)
+    {
+        var duration = ContextDuration(context);
+        if (context is null || duration is null)
+            return null;
+
+        if (context.LineCount is > 1)
+        {
+            var denominator = context.LineCount.Value - 1;
+            var numerator = Math.Clamp(jsonLine.LineNumber, 0, denominator);
+            return context.InvocationStartedAt + Scale(duration.Value, numerator, denominator);
+        }
+
+        if (context.SizeBytes is > 0)
+        {
+            var numerator = Math.Clamp(jsonLine.StartOffset, 0, context.SizeBytes.Value);
+            return context.InvocationStartedAt + Scale(duration.Value, numerator, context.SizeBytes.Value);
+        }
+
+        return context.InvocationStartedAt;
+    }
+
+    private static TimeSpan Scale(TimeSpan duration, long numerator, long denominator)
+    {
+        if (denominator <= 0 || numerator <= 0)
+            return TimeSpan.Zero;
+        if (numerator >= denominator)
+            return duration;
+
+        return TimeSpan.FromTicks((long)Math.Round(duration.Ticks * (double)numerator / denominator));
     }
 
     private static string ClassifyStall(string? previousEventType, int openToolCount)

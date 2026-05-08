@@ -355,9 +355,12 @@ does not write to the summary cache.
 ```
 
 If the captured CLI stream has no event timestamps or duration fields,
-CodeyBox reports timing fields as `null` or zero. Non-timing analytics such as
-token counts, tool-call frequency, redacted tool inputs, output byte counts,
-and unfinished tool calls are still returned when the stream contains enough
+CodeyBox keeps the stream file read-only and projects events into the matching
+`work_item_costs` invocation window by JSONL line position. That keeps total
+duration, time to first token, tool-call durations, stalls, and the
+thinking-vs-executing split populated for timestamp-less Claude and Codex
+streams. Without a matching invocation window, timing fields remain `null` or
+zero while non-timing analytics are still returned when the stream has enough
 structured data to derive them.
 
 The analysis response includes `finalAssistantMessage` when the parser can

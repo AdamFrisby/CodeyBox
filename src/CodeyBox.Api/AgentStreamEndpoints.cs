@@ -78,7 +78,7 @@ internal static class AgentStreamEndpoints
         var analysisCt = timeoutCts.Token;
         try
         {
-            var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: false, analysisCt);
+            var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: true, analysisCt);
             var file = files.FirstOrDefault(f => string.Equals(f.FileName, fileName, StringComparison.Ordinal));
             if (file is null) return Results.NotFound();
 
