@@ -110,9 +110,7 @@ internal static partial class MergeScopeFence
         var conflictFiles = hunksByPath.Keys.ToHashSet(StringComparer.Ordinal);
         var violations = new List<string>();
 
-        _ = conflictBaselineTreeish;
-
-        var resolvedChanges = await gitHost.GetChangedPathsAsync(repositoryId, mainTreeish, resolvedTreeish, ct);
+        var resolvedChanges = await gitHost.GetChangedPathsAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, ct);
         var changedFiles = resolvedChanges.Select(c => c.Path).ToHashSet(StringComparer.Ordinal);
         foreach (var missing in conflictFiles.Except(changedFiles, StringComparer.Ordinal))
             violations.Add($"{missing}:1 conflicted file was not part of the resolved diff");
@@ -152,16 +150,6 @@ internal static partial class MergeScopeFence
 
         if (violations.Count > 0)
             throw new ScopeFenceViolation(violations);
-    }
-
-    public static IReadOnlyList<AuditFinding> ReviewResolvedDiffForSuspiciousPatterns(string diff)
-    {
-        var findings = new List<AuditFinding>();
-        AddIfContains(findings, diff, "eval(", "eval call in merge resolution");
-        AddIfContains(findings, diff, "exec(", "exec call in merge resolution");
-        AddIfContains(findings, diff, "Convert.FromBase64String", "base64 decoder in merge resolution");
-        AddIfContains(findings, diff, "HttpClient", "network client in merge resolution");
-        return findings;
     }
 
     private static IEnumerable<int> ChangedLineNumbers(string diff)
@@ -208,17 +196,6 @@ internal static partial class MergeScopeFence
             : change.Status.StartsWith('A')
                 ? "new file"
                 : "deleted file";
-
-    private static void AddIfContains(List<AuditFinding> findings, string diff, string needle, string title)
-    {
-        if (!diff.Contains(needle, StringComparison.OrdinalIgnoreCase))
-            return;
-        findings.Add(new AuditFinding(
-            "merge-security-review",
-            AuditSeverity.Info,
-            title,
-            "Advisory-only merge security review finding; deterministic scope fence remains the merge gate."));
-    }
 
     [GeneratedRegex(@"^@@ -(?<old>\d+)(?:,\d+)? \+(?<new>\d+)(?:,\d+)? @@", RegexOptions.CultureInvariant)]
     private static partial Regex DiffHunkHeader();

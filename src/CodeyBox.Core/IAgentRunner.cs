@@ -35,16 +35,19 @@ public interface IStructuredStreamAgentRunner : IAgentRunner
 }
 
 /// <summary>
-/// Optional runner capability for merge conflict resolution. Unlike
-/// <see cref="IAgentRunner.RunAsync"/>, this path receives only conflict file
-/// text and returns file contents; it is not given a sandbox, shell, repository
-/// mount, or network profile.
+/// Optional runner capability for merge conflict resolution. Unlike the normal
+/// merge path, this receives only conflict file text and runs in a text-only
+/// sandbox with no repository mount. The host writes returned contents back to
+/// the real merge worktree after deterministic scope-fence verification.
 /// </summary>
 public interface IConflictResolverAgentRunner : IAgentRunner
 {
     Task<ConflictResolverResult> ResolveConflictsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
         string prompt,
         IReadOnlyList<ConflictResolverFile> files,
+        AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default);

@@ -36,7 +36,7 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
                 badMerge,
                 hostMerge,
                 bufferLines: 5,
-                CancellationToken.None));
+                ct: CancellationToken.None));
 
         Assert.Contains("one-sided resolution", ex.Message);
     }
@@ -60,7 +60,7 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
                 badMerge,
                 hostMerge,
                 bufferLines: 5,
-                CancellationToken.None));
+                ct: CancellationToken.None));
 
         Assert.Contains("does not preserve pre-merge main ancestry", ex.Message);
     }
@@ -313,7 +313,16 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             Prompt = "merge",
             WorkBranch = "work",
         });
-        var pipeline = CreateVerifier(gitHost, workStore, auditStore);
+        var reviewAgent = new ScriptedAgent([]);
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = "unused",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit(),
+        };
+        var pipeline = CreateVerifier(gitHost, workStore, auditStore, reviewAgent, project);
 
         await pipeline.VerifyMergeResultAgainstHostAsync(
             workItemId,
@@ -323,7 +332,9 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             resolved,
             hostMerge,
             bufferLines: 5,
-            CancellationToken.None);
+            ct: CancellationToken.None,
+            project: project,
+            securityReviewRunner: reviewAgent);
 
         var reports = await auditStore.GetByWorkItemAsync(workItemId.ToString());
         var report = Assert.Single(reports);
@@ -371,10 +382,15 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
         return await gitHost.ResolveCommitAsync(repoId, "resolved");
     }
 
-    private PipelineRunner CreateVerifier(LocalGitHost gitHost, IWorkItemStore workStore, IAuditReportStore auditStore)
+    private PipelineRunner CreateVerifier(
+        LocalGitHost gitHost,
+        IWorkItemStore workStore,
+        IAuditReportStore auditStore,
+        ScriptedAgent? agent = null,
+        Project? project = null)
     {
-        var agent = new ScriptedAgent([]);
-        var project = new Project
+        agent ??= new ScriptedAgent([]);
+        project ??= new Project
         {
             Id = new ProjectId("test-project"),
             DisplayName = "Test Project",

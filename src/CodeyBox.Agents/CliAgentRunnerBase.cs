@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 
@@ -8,7 +9,7 @@ namespace CodeyBox.Agents;
 /// inside the sandbox. Subclasses describe how to invoke their CLI; this base
 /// handles credential staging and result wrapping uniformly.
 /// </summary>
-public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner
+public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner, IConflictResolverAgentRunner
 {
     private const string AgentRunIdEnvironmentVariable = "CODEYBOX_AGENT_RUN_ID";
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ActiveAgentRunIds = new();
@@ -158,6 +159,79 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Summary: result.Success ? "ok" : $"agent exited {result.ExitCode}",
             Stdout: result.Stdout,
             Stderr: result.Stderr);
+    }
+
+    public virtual async Task<ConflictResolverResult> ResolveConflictsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        IReadOnlyList<ConflictResolverFile> files,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        var resultPath = CombineSandboxPath(workingDirectory, "conflict-resolution.json");
+        var resolverPrompt = BuildConflictResolverTextPrompt(prompt, files, resultPath);
+        var agentResult = await RunAsync(
+            sandbox,
+            workingDirectory,
+            resolverPrompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct).ConfigureAwait(false);
+
+        if (!agentResult.Success)
+        {
+            return new ConflictResolverResult(
+                false,
+                agentResult.Summary,
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                agentResult.Stdout,
+                agentResult.Stderr);
+        }
+
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["cat", resultPath],
+        }, ct).ConfigureAwait(false);
+        if (!read.Success || string.IsNullOrWhiteSpace(read.Stdout))
+        {
+            return new ConflictResolverResult(
+                false,
+                $"conflict resolver did not write {resultPath}",
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                agentResult.Stdout,
+                read.Stderr);
+        }
+
+        try
+        {
+            var parsed = JsonSerializer.Deserialize<ConflictResolutionJson>(read.Stdout, JsonOptions);
+            var resolved = parsed?.Files?
+                .Where(static f => !string.IsNullOrWhiteSpace(f.Path))
+                .ToDictionary(
+                    static f => f.Path!,
+                    static f => f.Content ?? string.Empty,
+                    StringComparer.Ordinal)
+                ?? new Dictionary<string, string>(StringComparer.Ordinal);
+            return new ConflictResolverResult(
+                true,
+                "resolved",
+                resolved,
+                agentResult.Stdout,
+                agentResult.Stderr);
+        }
+        catch (JsonException ex)
+        {
+            return new ConflictResolverResult(
+                false,
+                $"conflict resolver produced invalid JSON: {ex.Message}",
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                agentResult.Stdout,
+                read.Stdout);
+        }
     }
 
     public virtual async Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default)
@@ -630,6 +704,57 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     private string AgentRunKey(ISandbox sandbox, string workingDirectory) =>
         $"{Kind.Value}\n{sandbox.Id}\n{workingDirectory}";
+
+    private static string BuildConflictResolverTextPrompt(
+        string contractPrompt,
+        IReadOnlyList<ConflictResolverFile> files,
+        string resultPath)
+    {
+        var payload = JsonSerializer.Serialize(new
+        {
+            files = files.Select(static f => new { path = f.Path, content = f.Content }),
+        }, JsonOptions);
+
+        return $$"""
+            # Merge conflict resolver
+
+            You are resolving merge conflicts from text only. Do not inspect the filesystem,
+            run shell commands, access the network beyond the model call, or create any files
+            except the required JSON result file.
+
+            Scope contract:
+            {{contractPrompt}}
+
+            Conflicted file inputs are provided as JSON. Return complete resolved contents for
+            exactly these paths and no other paths.
+
+            Input:
+            {{payload}}
+
+            Write {{resultPath}} as a single JSON object with this exact shape:
+            {
+              "files": [
+                { "path": "relative/path", "content": "complete resolved file contents" }
+              ]
+            }
+
+            Do not include markdown fences or commentary in the JSON file. Exit after writing it.
+            """;
+    }
+
+    private static string CombineSandboxPath(string directory, string file)
+        => string.IsNullOrWhiteSpace(directory)
+            ? file
+            : $"{directory.TrimEnd('/')}/{file}";
+
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = true,
+        PropertyNameCaseInsensitive = true,
+    };
+
+    private sealed record ConflictResolutionJson(List<ConflictResolutionFileJson>? Files);
+    private sealed record ConflictResolutionFileJson(string? Path, string? Content);
 
     private static IReadOnlyDictionary<string, string> WithAgentRunId(
         IReadOnlyDictionary<string, string>? environment,

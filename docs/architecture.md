@@ -50,7 +50,7 @@ See [`audit.md`](audit.md) for the audit phase in detail.
 | Work / Rework sandbox        | VM (Multipass/KVM) | Nothing            | No                    | Yes (only its own)    |
 | Audit-tool sandbox           | VM (Multipass/KVM) | Nothing            | No                    | **No**                |
 | Audit-LLM / clean-merge sandbox | VM (Multipass/KVM) | Nothing         | No                    | Yes (only its own)    |
-| Conflict resolver            | Host text API boundary | Conflict text only | No                 | No sandbox-injected keys |
+| Conflict resolver            | Text-only VM sandbox | Conflict text only | No                 | Yes (resolver only) |
 | Host git server              | Host (or sidecar)  | Sandbox network    | No                    | No                    |
 | Upstream remote (e.g. GitHub)| External           | —                  | —                     | —                     |
 
@@ -61,28 +61,30 @@ against the pre-merge main commit and the work tip.
 For clean merges, the agent commit tree must exactly match the host
 `merge-tree` result, and the accepted commit must keep both the pre-merge main
 commit and the work tip in its ancestry. For conflicted merges, the normal
-sandboxed agent runner is not invoked. The host first creates the conflicted
-working tree, reads only the conflicted file contents, records each
+repository-mounted merge agent runner is not invoked. The host first creates the
+conflicted working tree, reads only the conflicted file contents, records each
 `<<<<<<<` ... `>>>>>>>` hunk in pre-merge main-file line coordinates, and sends
-that text to an `IConflictResolverAgentRunner`. The resolver receives no
-sandbox object, shell, repository filesystem, git remote, or network profile;
-it can only return complete replacement contents for exactly the conflicted
-paths.
+that text to an `IConflictResolverAgentRunner` in a separate text-only sandbox
+with no repository checkout or git remote. The resolver can only return complete
+replacement contents for exactly the conflicted paths; the host applies those
+contents to the merge worktree.
 
 After the host writes those returned contents and creates the merge commit, it
 applies a deterministic scope fence before updating main. The final
-main-to-merge changed-file set must exactly equal the conflicted file set, and
-each changed line must fall inside a conflict hunk plus
+conflict-baseline-to-resolved changed-file set must exactly equal the
+conflicted file set, and each main-to-resolved changed line in those files must
+fall inside a conflict hunk plus
 `Audit.MergeScopeBufferLines` context lines. The default buffer is 5. New files,
 deletes, renames, edits to non-conflicted files, missing conflicted-file edits,
 and whitespace-only edits outside the allowed ranges are rejected and the work
 item enters `MergeConflictResolutionFailed`.
 
 This deterministic scope fence is the security boundary. The optional merge
-security review is advisory-only: it has no authority to fail the merge because
-it reads the same untrusted conflict content as the resolver. Findings are
-logged for operator review, but only host git verification and the scope fence
-gate the push.
+security review is an LLM text review over the resolved conflict diff in a
+separate sandbox with no repository checkout. It is advisory-only: it has no
+authority to fail the merge because it reads the same untrusted conflict content
+as the resolver. Findings are logged for operator review, but only host git
+verification and the scope fence gate the push.
 
 ## State machine
 

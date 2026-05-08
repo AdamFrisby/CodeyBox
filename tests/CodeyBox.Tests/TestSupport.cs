@@ -237,13 +237,19 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
     }
 
     public Task<ConflictResolverResult> ResolveConflictsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
         string prompt,
         IReadOnlyList<ConflictResolverFile> files,
+        AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default)
     {
+        _ = sandbox;
+        _ = workingDirectory;
         _ = prompt;
+        _ = credential;
         _ = modelId;
         _ = reasoningMode;
         _ = ct;
@@ -283,6 +289,19 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
         {
             return await HandleMergeAsync(sandbox, workingDirectory, prompt, ct);
+        }
+        if (prompt.Contains("# Advisory merge security review", StringComparison.Ordinal))
+        {
+            var r = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "scripted-security-review", "/audit/merge-security-review.json"],
+                Stdin = ResultStdout ?? """
+                    {"findings":[{"title":"scripted advisory finding","description":"Advisory-only scripted merge security review finding.","location":"file.txt:1"}]}
+                    """,
+            }, ct);
+            return r.Success
+                ? new AgentResult(true, "reviewed", ResultStdout, null)
+                : new AgentResult(false, "review failed", r.Stdout, r.Stderr);
         }
         return await HandleWorkAsync(sandbox, workingDirectory, ct);
     }
