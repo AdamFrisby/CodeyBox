@@ -133,6 +133,46 @@ public sealed class ClaudeStreamParserTests
 public sealed class CodexStreamParserTests
 {
     [Fact]
+    public async Task SniffKindAsync_RecognizesInstalledPayloadResponseItemShape()
+    {
+        await using var stream = StreamOf("""
+            {"type":"response_item","payload":{"type":"function_call","call_id":"call_1","name":"unified_exec","arguments":"{\"cmd\":\"dotnet test\"}"}}
+            """);
+
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream);
+
+        Assert.Equal(AgentKind.Codex, kind);
+    }
+
+    [Fact]
+    public async Task ParseAsync_ParsesInstalledPayloadResponseItemsAndEventMsgTokenUsage()
+    {
+        var parser = new CodexStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"thread.started","timestamp":"2026-01-01T00:00:00Z","thread_id":"thread_1"}
+            {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"function_call","call_id":"call_1","name":"unified_exec","arguments":"{\"cmd\":\"dotnet test\"}"}}
+            {"type":"event_msg","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":42,"cached_input_tokens":5,"output_tokens":7,"reasoning_output_tokens":1,"total_tokens":54}}}}
+            {"type":"response_item","timestamp":"2026-01-01T00:00:12Z","payload":{"type":"function_call_output","call_id":"call_1","output":"ok"}}
+            {"type":"response_item","timestamp":"2026-01-01T00:00:13Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}
+            {"type":"event_msg","timestamp":"2026-01-01T00:00:15Z","payload":{"type":"turn_complete","usage":{"input_tokens":50,"output_tokens":9,"cached_input_tokens":6},"time_to_first_token_ms":1000}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("call_1", tool.ToolUseId);
+        Assert.Equal("unified_exec", tool.ToolName);
+        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
+        Assert.Equal(2, tool.OutputBytes);
+        Assert.Equal(50, summary.InputTokens);
+        Assert.Equal(9, summary.OutputTokens);
+        Assert.Equal(6, summary.CachedInputTokens);
+        Assert.Equal("Done.", summary.FinalAssistantMessage);
+        Assert.Equal(TimeSpan.FromSeconds(15), summary.TotalDuration);
+        Assert.Equal(TimeSpan.FromMilliseconds(1000), summary.TimeToFirstToken);
+    }
+
+    [Fact]
     public async Task ParseAsync_ParsesNestedItemCompletedEvents()
     {
         var parser = new CodexStreamParser();
@@ -978,7 +1018,7 @@ public sealed class MissingFileTests : IClassFixture<AgentStreamAnalysisApiFacto
         Assert.Equal(45, body.GetProperty("outputTokens").GetInt32());
         Assert.Equal(6, body.GetProperty("cachedInputTokens").GetInt32());
         Assert.Equal(4_000, body.GetProperty("totalDurationMs").GetInt64());
-        Assert.Equal("fresh done", body.GetProperty("finalAssistantMessage").GetString());
+        Assert.Equal(JsonValueKind.Null, body.GetProperty("finalAssistantMessage").ValueKind);
         var tool = Assert.Single(body.GetProperty("toolCalls").EnumerateArray());
         Assert.Equal("fresh", tool.GetProperty("toolUseId").GetString());
         Assert.Equal("Read", tool.GetProperty("toolName").GetString());
