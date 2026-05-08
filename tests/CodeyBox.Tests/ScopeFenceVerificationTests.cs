@@ -149,7 +149,7 @@ public sealed class ScopeFenceVerificationTests : IDisposable
     }
 
     [Fact]
-    public async Task RejectsCleanWorkBranchChangeAlreadyInConflictBaseline()
+    public async Task AllowsCleanWorkBranchChangeAlreadyInConflictBaseline()
     {
         var ctx = await CreateContextAsync();
         var clone = await CloneAsync(ctx);
@@ -164,7 +164,7 @@ public sealed class ScopeFenceVerificationTests : IDisposable
         await TestSupport.RunGit(clone, "commit", "-am", "resolved");
         await TestSupport.RunGit(clone, "push", "origin", "baseline", "HEAD:resolved");
 
-        var ex = await Assert.ThrowsAsync<ScopeFenceViolation>(() => MergeScopeFence.VerifyAsync(
+        await MergeScopeFence.VerifyAsync(
             ctx.GitHost,
             ctx.RepoId,
             "main",
@@ -172,9 +172,50 @@ public sealed class ScopeFenceVerificationTests : IDisposable
             "resolved",
             [new ConflictHunk("file.txt", 10, 12)],
             bufferLines: 5,
+            CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task RejectsMainCoordinateInflationFromLongWorkSide()
+    {
+        var ctx = await CreateContextAsync(lineCount: 80);
+        var clone = await CloneAsync(ctx);
+        var baseline = Enumerable.Range(1, 80).Select(i => $"line {i}").ToList();
+        baseline.RemoveAt(9);
+        baseline.InsertRange(9,
+        [
+            "<<<<<<< main",
+            "main 10",
+            "=======",
+            .. Enumerable.Range(1, 40).Select(i => $"work payload {i}"),
+            ">>>>>>> work",
+        ]);
+        await File.WriteAllLinesAsync(Path.Combine(clone, "file.txt"), baseline);
+        await TestSupport.RunGit(clone, "commit", "-am", "canonical conflict baseline");
+        await TestSupport.RunGit(clone, "branch", "baseline");
+
+        var resolved = baseline.ToList();
+        var conflictStart = resolved.FindIndex(static line => line == "<<<<<<< main");
+        var conflictEnd = resolved.FindIndex(static line => line == ">>>>>>> work");
+        resolved.RemoveRange(conflictStart, conflictEnd - conflictStart + 1);
+        resolved.Insert(conflictStart, "resolved 10");
+        var unrelatedLine = resolved.FindIndex(static line => line == "line 45");
+        resolved[unrelatedLine] = "inflated-scope payload";
+        await File.WriteAllLinesAsync(Path.Combine(clone, "file.txt"), resolved);
+        await TestSupport.RunGit(clone, "commit", "-am", "resolved with inflated-scope payload");
+        await TestSupport.RunGit(clone, "push", "origin", "baseline", "HEAD:resolved");
+
+        var ex = await Assert.ThrowsAsync<ScopeFenceViolation>(() => MergeScopeFence.VerifyAsync(
+            ctx.GitHost,
+            ctx.RepoId,
+            "main",
+            "baseline",
+            "resolved",
+            [new ConflictHunk("file.txt", 10, 52)],
+            bufferLines: 5,
             CancellationToken.None));
 
-        Assert.Contains("clean.txt:1 new file", ex.Message);
+        Assert.Contains("file.txt:88", ex.Message);
     }
 
     private static Task VerifyAsync(Context ctx)

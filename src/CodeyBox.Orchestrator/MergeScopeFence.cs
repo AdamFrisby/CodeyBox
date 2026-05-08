@@ -96,7 +96,11 @@ internal static partial class MergeScopeFence
         var conflictFiles = hunksByPath.Keys.ToHashSet(StringComparer.Ordinal);
         var violations = new List<string>();
 
-        var resolvedChanges = await gitHost.GetChangedPathsAsync(repositoryId, mainTreeish, resolvedTreeish, ct);
+        // The resolver edits the canonical conflicted merge tree, not the
+        // pre-merge main tree. Diffing against that baseline keeps line
+        // coordinates in the same file shape as the captured conflict hunks
+        // and excludes clean work-branch changes that git already merged.
+        var resolvedChanges = await gitHost.GetChangedPathsAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, ct);
         var changedFiles = resolvedChanges.Select(c => c.Path).ToHashSet(StringComparer.Ordinal);
         foreach (var missing in conflictFiles.Except(changedFiles, StringComparer.Ordinal))
             violations.Add($"{missing}:1 conflicted file was not part of the resolved diff");
@@ -126,7 +130,7 @@ internal static partial class MergeScopeFence
 
         foreach (var (path, fileHunks) in hunksByPath)
         {
-            var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, mainTreeish, resolvedTreeish, path, ct);
+            var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, path, ct);
             foreach (var lineNumber in ChangedOldLineCoordinates(diff))
             {
                 if (!IsInsideAnyHunk(lineNumber, fileHunks, bufferLines))
