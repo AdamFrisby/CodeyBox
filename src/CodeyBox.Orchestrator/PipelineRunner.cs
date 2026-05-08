@@ -220,7 +220,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
             var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
             var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
-            var workBranch = item.WorkBranch ?? $"codeybox/{item.Id.ToString()[..8]}";
+            var workBranch = item.WorkBranch ?? DefaultWorkBranchFor(item.Id);
             if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
                 throw new InvalidOperationException(
                     $"workBranch must differ from baseBranch (both '{baseBranch}'); refusing to bypass merge-phase containment");
@@ -230,8 +230,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 await _store.UpdateAsync((await _store.GetAsync(item.Id, ct) ?? item) with { WorkBranch = workBranch }, ct);
             }
 
-            if (string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
-                await RebaseExistingWorkBranchOntoFreshBaseAsync(item, repoId, baseBranch, workBranch, project, ct);
+            await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
 
             // The retry endpoint sets the entry state to a pre-phase marker
             // (Queued / WorkComplete / AuditPassed / Merged) so we resume at
@@ -456,6 +455,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private async Task RebaseExistingWorkBranchOntoFreshBaseAsync(
         WorkItem item,
+        IAgentRunner runner,
         string repoId,
         string baseBranch,
         string workBranch,
@@ -502,28 +502,29 @@ public sealed class PipelineRunner : IPipelineRunner
             if (baseAlreadyAncestor.Success)
                 return;
 
+            ValidatePickupRebaseWorkBranch(item, workBranch);
+
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
             await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
 
+            IReadOnlyList<string> rebaseConflictFiles;
             await using (var rebaseScope = await TimingScope.BeginAsync(
                 _timings, item.Id, "pickup", "git.rebase_work_branch_onto_base",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
-                var rebase = await sandbox.ExecAsync(new SandboxExec
-                {
-                    Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--keep-empty", $"origin/{baseBranch}"],
-                }, ct);
-                if (!rebase.Success)
-                {
-                    await sandbox.ExecAsync(new SandboxExec
-                    {
-                        Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
-                    }, CancellationToken.None);
-                    throw new MergeConflictResolutionFailedException(
-                        $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}");
-                }
+                rebaseConflictFiles = await RebaseCheckedOutBranchWithScopeFenceAsync(
+                    item,
+                    runner,
+                    sandbox,
+                    repoId,
+                    baseBranch,
+                    workBranch,
+                    $"origin/{baseBranch}",
+                    oldTip,
+                    project,
+                    ct);
             }
 
             var newTip = await RevParseSandboxAsync(sandbox, "HEAD", ct);
@@ -543,6 +544,23 @@ public sealed class PipelineRunner : IPipelineRunner
                     $"HEAD:refs/heads/{workBranch}");
             }
 
+            if (rebaseConflictFiles.Count > 0)
+            {
+                var credential = _credentials is IProjectAwareCredentialProvider pac
+                    ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
+                    : await _credentials.GetAsync(runner.Kind, ct);
+                await RecordMergeSecurityReviewAsync(
+                    item.Id,
+                    repoId,
+                    oldTip,
+                    newTip,
+                    rebaseConflictFiles,
+                    project,
+                    runner,
+                    credential,
+                    ct);
+            }
+
             _log.LogInformation(
                 "Rebased work branch {WorkBranch} for work item {WorkItemId} from {OldTip} onto base {BaseBranch} at {BaseTip}; new tip {NewTip}",
                 workBranch,
@@ -555,6 +573,211 @@ public sealed class PipelineRunner : IPipelineRunner
         finally
         {
             gate.Release();
+        }
+    }
+
+    private static string DefaultWorkBranchFor(WorkItemId id) => $"codeybox/{id.ToString()[..8]}";
+
+    private static void ValidatePickupRebaseWorkBranch(WorkItem item, string workBranch)
+    {
+        var expected = DefaultWorkBranchFor(item.Id);
+        if (!string.Equals(workBranch, expected, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"pickup-time rebase may force-push only the isolated per-work-item branch '{expected}', not '{workBranch}'");
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> RebaseCheckedOutBranchWithScopeFenceAsync(
+        WorkItem item,
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        string upstreamRef,
+        string oldTip,
+        Project project,
+        CancellationToken ct)
+    {
+        var credential = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(runner.Kind, ct);
+        var conflictFiles = new SortedSet<string>(StringComparer.Ordinal);
+        var resolvedAnyConflict = false;
+
+        var rebase = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--keep-empty", upstreamRef],
+        }, ct);
+
+        while (!rebase.Success)
+        {
+            try
+            {
+                var hunks = await ExtractSandboxConflictHunksAsync(sandbox, ct);
+                if (hunks.Count == 0)
+                    throw new MergeConflictResolutionFailedException(
+                        $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed without inspectable conflict hunks; work branch left at original tip {oldTip}");
+
+                foreach (var path in hunks.Select(static h => h.Path))
+                    conflictFiles.Add(path);
+
+                var baselines = await ReadConflictFilesAsync(sandbox, hunks, ct);
+                var prompt = BuildRebaseConflictResolverPrompt(baseBranch, workBranch, hunks, project.Audit.MergeScopeBufferLines);
+                var agentResult = await RunConstrainedConflictResolverAsync(
+                    runner,
+                    sandbox,
+                    prompt,
+                    hunks,
+                    credential,
+                    item.ModelId,
+                    item.ReasoningMode,
+                    ct);
+                if (!agentResult.Success)
+                    throw new MergeConflictResolutionFailedException(
+                        $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {agentResult.Summary}");
+
+                await VerifySandboxConflictResolutionScopeAsync(
+                    sandbox,
+                    baselines,
+                    hunks,
+                    project.Audit.MergeScopeBufferLines,
+                    ct);
+                await FinalizeRebaseConflictResolutionAsync(sandbox, hunks, ct);
+                resolvedAnyConflict = true;
+
+                rebase = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--continue"],
+                    ExtraEnvironment = new Dictionary<string, string>
+                    {
+                        ["GIT_EDITOR"] = "true",
+                        ["GIT_SEQUENCE_EDITOR"] = "true",
+                    },
+                }, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
+                }, CancellationToken.None);
+                if (ex is MergeConflictResolutionFailedException)
+                    throw;
+                throw new MergeConflictResolutionFailedException(
+                    $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}: {ex.Message}",
+                    ex);
+            }
+        }
+
+        _ = repoId;
+        _ = oldTip;
+        return resolvedAnyConflict ? conflictFiles.ToArray() : [];
+    }
+
+    private static async Task<IReadOnlyList<ConflictHunk>> ExtractSandboxConflictHunksAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        var unmerged = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--name-only", "--diff-filter=U"],
+        }, ct);
+        if (!unmerged.Success)
+            throw new MergeConflictResolutionFailedException($"failed to inspect pickup-time rebase conflicts: {unmerged.Stderr}");
+
+        var hunks = new List<ConflictHunk>();
+        foreach (var file in unmerged.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            ValidateConflictResolverPath(file);
+            var read = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat \"$1\"", "codeybox-read-rebase-conflict", $"{SandboxConventions.WorkDir}/{file}"],
+            }, ct);
+            if (!read.Success)
+                throw new MergeConflictResolutionFailedException($"failed to read pickup-time rebase conflict file '{file}': {read.Stderr}");
+            hunks.AddRange(MergeScopeFence.ExtractConflictHunks(file, read.Stdout));
+        }
+
+        return hunks;
+    }
+
+    private static async Task<IReadOnlyDictionary<string, string>> ReadConflictFilesAsync(
+        ISandbox sandbox,
+        IReadOnlyList<ConflictHunk> hunks,
+        CancellationToken ct)
+    {
+        var files = hunks.Select(static h => h.Path).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        var contents = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var file in files)
+        {
+            var read = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat \"$1\"", "codeybox-read-rebase-baseline", $"{SandboxConventions.WorkDir}/{file}"],
+            }, ct);
+            if (!read.Success)
+                throw new MergeConflictResolutionFailedException($"failed to read pickup-time rebase conflict baseline '{file}': {read.Stderr}");
+            contents[file] = read.Stdout;
+        }
+
+        return contents;
+    }
+
+    private static async Task VerifySandboxConflictResolutionScopeAsync(
+        ISandbox sandbox,
+        IReadOnlyDictionary<string, string> baselines,
+        IReadOnlyList<ConflictHunk> hunks,
+        int bufferLines,
+        CancellationToken ct)
+    {
+        var resolved = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var path in baselines.Keys)
+        {
+            var read = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat \"$1\"", "codeybox-read-rebase-resolved", $"{SandboxConventions.WorkDir}/{path}"],
+            }, ct);
+            if (!read.Success)
+                throw new MergeConflictResolutionFailedException($"failed to read pickup-time rebase resolution '{path}': {read.Stderr}");
+            resolved[path] = read.Stdout;
+        }
+
+        MergeScopeFence.VerifyResolvedContents(baselines, resolved, hunks, bufferLines);
+    }
+
+    private static async Task FinalizeRebaseConflictResolutionAsync(
+        ISandbox sandbox,
+        IReadOnlyList<ConflictHunk> conflictHunks,
+        CancellationToken ct)
+    {
+        var files = conflictHunks.Select(h => h.Path).Distinct(StringComparer.Ordinal).ToArray();
+        if (files.Length > 0)
+        {
+            var addArgv = new List<string> { "git", "-C", SandboxConventions.WorkDir, "add", "--" };
+            addArgv.AddRange(files);
+            await RunWithCancellation(sandbox, ct, addArgv.ToArray());
+        }
+
+        var unmerged = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--name-only", "--diff-filter=U"],
+        }, ct);
+        if (!unmerged.Success)
+            throw new InvalidOperationException($"failed to inspect unmerged paths: {unmerged.Stderr}");
+        if (!string.IsNullOrWhiteSpace(unmerged.Stdout))
+            throw new InvalidOperationException($"pickup-time rebase resolver left unmerged paths:\n{unmerged.Stdout}");
+
+        if (files.Length > 0)
+        {
+            var grepArgv = new List<string>
+            {
+                "git", "-C", SandboxConventions.WorkDir, "grep", "-n", "-E", "^(<<<<<<<|=======|>>>>>>>)", "--",
+            };
+            grepArgv.AddRange(files);
+            var markers = await sandbox.ExecAsync(new SandboxExec { Argv = grepArgv }, ct);
+            if (markers.ExitCode == 0)
+                throw new InvalidOperationException($"pickup-time rebase resolver left conflict markers:\n{markers.Stdout}");
+            if (markers.ExitCode != 1)
+                throw new InvalidOperationException($"failed to scan for conflict markers: {markers.Stderr}");
         }
     }
 
@@ -2720,6 +2943,34 @@ public sealed class PipelineRunner : IPipelineRunner
         You will receive the conflicted file contents for `{{workBranch}}`
         merged into `{{baseBranch}}`. Return complete resolved contents for
         exactly those same files. You do not have shell, network, or repository
+        filesystem access.
+
+        Conflict scope contract:
+        {{hunkList}}
+
+        Constraints:
+          - You may modify ONLY the lines in those hunks.
+          - A buffer of +/-{{bufferLines}} lines around each hunk is permitted only for mechanical adjustments.
+          - You MAY NOT add, delete, or rename files.
+          - You MAY NOT modify any file outside the conflict list.
+          - Out-of-scope changes will be rejected by deterministic host verification.
+          - Preserve the intent of both sides; do not take one side blindly.
+        """;
+    }
+
+    private static string BuildRebaseConflictResolverPrompt(
+        string baseBranch,
+        string workBranch,
+        IReadOnlyList<ConflictHunk> hunks,
+        int bufferLines)
+    {
+        var hunkList = string.Join('\n', hunks.Select(h => $"          - {h.Path}:{h.StartLine}-{h.EndLine}"));
+        return $$"""
+        # Conflict resolution task
+
+        You will receive conflicted file contents from rebasing `{{workBranch}}`
+        onto `{{baseBranch}}`. Return complete resolved contents for exactly
+        those same files. You do not have shell, network, or repository
         filesystem access.
 
         Conflict scope contract:

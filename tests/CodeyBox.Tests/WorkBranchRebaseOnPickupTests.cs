@@ -20,7 +20,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem("codeybox/rebase-clean") with { State = WorkItemState.WorkComplete };
+        var item = NewItem() with { State = WorkItemState.Merged };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
 
@@ -70,7 +70,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem("codeybox/rebase-conflict") with { State = WorkItemState.WorkComplete };
+        var item = NewItem() with { State = WorkItemState.Merged };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var originalTip = await CommitToBareBranchAsync(
@@ -81,15 +81,27 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
             "work changes readme");
 
         await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+        tp.Agent.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            Assert.Equal("README.md", file.Path);
+            Assert.Contains("<<<<<<<", file.Content);
+            Assert.Contains("main branch change", file.Content);
+            Assert.Contains("work branch change", file.Content);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main branch change\nwork branch change\n",
+            };
+        });
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
-        Assert.Contains("pickup-time rebase", final.LastError);
-        Assert.Equal(originalTip, await RevParseAsync(barePath, item.WorkBranch!));
-        Assert.Equal("work branch change\n", await ShowAsync(barePath, $"{item.WorkBranch}:README.md"));
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(tp.Agent.ConflictResolutionPlan);
+        Assert.NotEqual(originalTip, await RevParseAsync(barePath, item.WorkBranch!));
+        Assert.Equal("main branch change\nwork branch change\n", await ShowAsync(barePath, $"{item.WorkBranch}:README.md"));
     }
 
     [Fact]
@@ -97,7 +109,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem("codeybox/rebase-noop") with { State = WorkItemState.WorkComplete };
+        var item = NewItem() with { State = WorkItemState.Merged };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var (_, originalTip) = await CommitTwoWorkBranchCommitsAsync(barePath, item.WorkBranch!);
@@ -115,7 +127,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem("codeybox/rebase-authorship") with { State = WorkItemState.WorkComplete };
+        var item = NewItem() with { State = WorkItemState.Merged };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         await CommitToBareBranchAsync(
@@ -144,7 +156,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem("codeybox/rebase-agent-view");
+        var item = NewItem();
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         await CommitToBareBranchAsync(barePath, item.WorkBranch!, "prior.txt", "prior attempt\n", "prior attempt");
@@ -177,6 +189,76 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         Assert.Equal("agent saw fresh main\n", await ShowAsync(barePath, "main:agent.txt"));
     }
 
+    [Fact]
+    public async Task ExistingNonIsolatedWorkBranchIsNotForcePushed()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/not-isolated") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var originalTip = await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "work.txt",
+            "work\n",
+            "work");
+        await CommitToSeedAsync(seed, "main.txt", "main advanced\n", "main advanced");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("pickup-time rebase may force-push only", final.LastError);
+        Assert.Equal(originalTip, await RevParseAsync(barePath, item.WorkBranch!));
+    }
+
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(1, 0)]
+    [InlineData(2, 3)]
+    [InlineData(4, 2)]
+    public async Task RebaseAlwaysProducesNonEmptyMergeBaseWithMain(int workCommitCount, int mainAdvanceCount)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem() with { State = WorkItemState.Merged };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchCommitsAsync(barePath, item.WorkBranch!, workCommitCount);
+        for (var i = 0; i < mainAdvanceCount; i++)
+            await CommitToSeedAsync(seed, $"main-{i}.txt", $"main {i}\n", $"main {i}");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        await TestSupport.RunGit(barePath, "merge-base", "--is-ancestor", "main", item.WorkBranch!);
+        Assert.Equal(await RevParseAsync(barePath, "main"), await GitStdoutTrimAsync(barePath, "merge-base", "main", item.WorkBranch!));
+    }
+
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(2, 1)]
+    [InlineData(3, 2)]
+    public async Task RebaseNeverDropsCommits(int workCommitCount, int mainAdvanceCount)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem() with { State = WorkItemState.Merged };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchCommitsAsync(barePath, item.WorkBranch!, workCommitCount);
+        for (var i = 0; i < mainAdvanceCount; i++)
+            await CommitToSeedAsync(seed, $"advance-{i}.txt", $"advance {i}\n", $"advance {i}");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        for (var i = 0; i < workCommitCount; i++)
+            Assert.Equal($"work {i}\n", await ShowAsync(barePath, $"{item.WorkBranch}:work-{i}.txt"));
+    }
+
     private async Task<(string B, string C)> CommitTwoWorkBranchCommitsAsync(string barePath, string branch)
     {
         var clone = await CloneForCommitAsync(barePath);
@@ -187,6 +269,15 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         var c = await RevParseAsync(clone, "HEAD");
         await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
         return (b, c);
+    }
+
+    private async Task CommitWorkBranchCommitsAsync(string barePath, string branch, int count)
+    {
+        var clone = await CloneForCommitAsync(barePath);
+        await TestSupport.RunGit(clone, "checkout", "-B", branch, "origin/main");
+        for (var i = 0; i < count; i++)
+            await WriteAndCommitAsync(clone, $"work-{i}.txt", $"work {i}\n", $"work {i}");
+        await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
     }
 
     private async Task<string> CommitToBareBranchAsync(
@@ -247,14 +338,21 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         return stdout;
     }
 
-    private static WorkItem NewItem(string workBranch) => new()
+    private static async Task<string> GitStdoutTrimAsync(string repoPath, params string[] args)
+        => (await GitStdoutAsync(repoPath, args)).Trim();
+
+    private static WorkItem NewItem(string? workBranch = null)
     {
-        Id = WorkItemId.New(),
-        ProjectId = new ProjectId("test-project"),
-        Title = "test",
-        Prompt = "do thing",
-        BaseBranch = "main",
-        WorkBranch = workBranch,
-        PushUpstream = false,
-    };
+        var id = WorkItemId.New();
+        return new WorkItem
+        {
+            Id = id,
+            ProjectId = new ProjectId("test-project"),
+            Title = "test",
+            Prompt = "do thing",
+            BaseBranch = "main",
+            WorkBranch = workBranch ?? $"codeybox/{id.ToString()[..8]}",
+            PushUpstream = false,
+        };
+    }
 }
