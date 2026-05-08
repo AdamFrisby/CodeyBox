@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
@@ -63,7 +62,8 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly string _disabledHostHooksPath;
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> PickupRebaseLocks = new(StringComparer.Ordinal);
+    private static readonly object PickupRebaseLocksGate = new();
+    private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -466,10 +466,13 @@ public sealed class PipelineRunner : IPipelineRunner
         Validation.ValidateBranchName(workBranch, nameof(workBranch));
 
         var lockKey = $"{repoId}:{workBranch}";
-        var gate = PickupRebaseLocks.GetOrAdd(lockKey, static _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(ct);
+        var gate = RetainPickupRebaseLock(lockKey);
+        var lockEntered = false;
         try
         {
+            await gate.Semaphore.WaitAsync(ct);
+            lockEntered = true;
+
             var access = _gitHost.GetSandboxAccess(repoId);
             var spec = BuildSandboxSpec(
                 access,
@@ -572,8 +575,46 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         finally
         {
-            gate.Release();
+            ReleasePickupRebaseLock(lockKey, gate, lockEntered);
         }
+    }
+
+    private static PickupRebaseLock RetainPickupRebaseLock(string key)
+    {
+        lock (PickupRebaseLocksGate)
+        {
+            if (!PickupRebaseLocks.TryGetValue(key, out var gate))
+            {
+                gate = new PickupRebaseLock();
+                PickupRebaseLocks.Add(key, gate);
+            }
+
+            gate.ReferenceCount++;
+            return gate;
+        }
+    }
+
+    private static void ReleasePickupRebaseLock(string key, PickupRebaseLock gate, bool releaseSemaphore)
+    {
+        if (releaseSemaphore)
+            gate.Semaphore.Release();
+
+        lock (PickupRebaseLocksGate)
+        {
+            gate.ReferenceCount--;
+            if (gate.ReferenceCount == 0
+                && PickupRebaseLocks.TryGetValue(key, out var current)
+                && ReferenceEquals(current, gate))
+            {
+                PickupRebaseLocks.Remove(key);
+            }
+        }
+    }
+
+    private sealed class PickupRebaseLock
+    {
+        public SemaphoreSlim Semaphore { get; } = new(1, 1);
+        public int ReferenceCount { get; set; }
     }
 
     private static string DefaultWorkBranchFor(WorkItemId id) => $"codeybox/{id.ToString()[..8]}";
@@ -608,7 +649,15 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var rebase = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--keep-empty", upstreamRef],
+            Argv =
+            [
+                "git", "-C", SandboxConventions.WorkDir,
+                "rebase",
+                "--keep-empty",
+                "--reapply-cherry-picks",
+                "--empty=keep",
+                upstreamRef,
+            ],
         }, ct);
 
         while (!rebase.Success)
