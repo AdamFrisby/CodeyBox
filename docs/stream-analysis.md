@@ -27,11 +27,11 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. Claude Code 2.1 stream-json and Codex CLI 0.128 command-execution events can omit per-event `timestamp`, `started_at`, `completed_at`, and duration fields. In that case the analyser keeps the capture file read-only and does not infer event timing from JSONL line or byte position. Timestamp-less events can still contribute tokens, cost, tool frequency, input summaries, output sizes, and final text, but total duration, TTFT, stalls, and tool-call intervals remain zero or null unless the stream provides explicit timestamp or duration fields.
+Captured CLI streams do not always include timestamps. Claude Code 2.1 stream-json and Codex CLI 0.128 command-execution events can omit per-event `timestamp`, `started_at`, `completed_at`, and duration fields. In that case the analyser keeps the capture file read-only and projects timestamp-less events onto the known invocation start/end window from the matching work-item cost row. It uses JSONL line position when line count is available, otherwise byte offset and captured file size. Those projected times drive total duration, TTFT, stalls, tool-call intervals, and the thinking/executing split for real captured streams that only contain raw CLI stdout. If there is no matching invocation timing context, timestamp-less events still contribute tokens, cost, tool frequency, input summaries, output sizes, and final text, but timing fields remain zero or null.
 
 ## Thinking Vs Executing
 
-`executingMs` is the wall-clock union of completed tool-call intervals per invocation. Overlapping parallel tool calls are counted once. Tool results that include an explicit duration but no start/end timestamps contribute that duration without forming an interval. `thinkingMs` is `totalAgentDurationMs - executingMs`, clamped at zero. Timestamp-less streams without explicit duration fields do not contribute timing to this split.
+`executingMs` is the wall-clock union of completed tool-call intervals per invocation. Overlapping parallel tool calls are counted once. Tool results that include an explicit duration but no start/end timestamps contribute that duration without forming an interval. When stream events are timestamp-less but the invocation timing context is available, projected event times create estimated tool intervals. `thinkingMs` is `totalAgentDurationMs - executingMs`, clamped at zero.
 
 ## Persistence
 

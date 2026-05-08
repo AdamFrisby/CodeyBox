@@ -831,7 +831,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         TimeSpan? observedTotalDuration = null;
         TimeSpan? observedTimeToFirstToken = null;
         var recognizedEventCount = 0;
-        var realTimestampCount = 0;
+        var projectedTimestampCount = 0;
 
         await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, _options.MaxLineBytes, ct).ConfigureAwait(false))
         {
@@ -858,9 +858,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             eventCount++;
             if (parsed.IsRecognized)
                 recognizedEventCount++;
-            if (parsed.Timestamp.HasValue)
-                realTimestampCount++;
-            var timestamp = parsed.Timestamp;
+            var timestamp = parsed.Timestamp ?? ProjectTimestamp(context, jsonLine);
+            if (parsed.Timestamp is null && timestamp.HasValue)
+                projectedTimestampCount++;
 
             if (timestamp is { } eventTimestamp)
             {
@@ -953,7 +953,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             return AgentStreamParserSelection.UnsupportedSummary();
 
         var total = observedTotalDuration
-            ?? (firstTimestamp.HasValue && lastTimestamp.HasValue
+            ?? (projectedTimestampCount > 0 && context is not null && context.InvocationEndedAt >= context.InvocationStartedAt
+                ? context.InvocationEndedAt - context.InvocationStartedAt
+                : firstTimestamp.HasValue && lastTimestamp.HasValue
                 ? lastTimestamp.Value - firstTimestamp.Value
                 : TimeSpan.Zero);
         var ttft = observedTimeToFirstToken
@@ -974,6 +976,33 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                 .ToList(),
             stalls,
             finalText);
+    }
+
+    private static DateTimeOffset? ProjectTimestamp(AgentStreamParserContext? context, AgentStreamJsonLine line)
+    {
+        if (context is null || context.InvocationEndedAt < context.InvocationStartedAt)
+            return null;
+
+        var duration = context.InvocationEndedAt - context.InvocationStartedAt;
+        if (duration == TimeSpan.Zero)
+            return context.InvocationStartedAt;
+
+        double ratio;
+        if (context.LineCount is > 1)
+        {
+            ratio = line.LineNumber / (double)(context.LineCount.Value - 1);
+        }
+        else if (context.SizeBytes is > 0)
+        {
+            ratio = line.StartOffset / (double)context.SizeBytes.Value;
+        }
+        else
+        {
+            return null;
+        }
+
+        ratio = Math.Clamp(ratio, 0d, 1d);
+        return context.InvocationStartedAt + TimeSpan.FromTicks((long)Math.Round(duration.Ticks * ratio));
     }
 
     private static string ClassifyStall(string? previousEventType, int openToolCount)
