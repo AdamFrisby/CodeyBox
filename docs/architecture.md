@@ -153,7 +153,22 @@ intent is that you can swap any of these without touching the orchestrator:
   config, so repo-local credential helpers, SSH commands, and URL rewrites
   cannot influence host git. Host git commands also set `core.hooksPath`
   to an empty host-controlled directory, so sandbox-written bare-repo hooks
-  cannot run during ref updates.
+  cannot run during ref updates. After refresh and before any work, audit,
+  or merge agent invocation, pickup rebases the item's configured work branch
+  onto the refreshed base inside that item's sandboxed bare repository and
+  force-pushes it back with a lease. This includes explicit work-branch names
+  supplied through the API or replay flow; the branch still must differ from
+  the base branch. First pickup skips this because no work branch exists yet.
+  Rebase conflicts use the same constrained text-only conflict resolver
+  contract as merge conflicts: conflict hunks are extracted from bounded,
+  canonicalized in-worktree file reads, the +/- buffer scope fence is verified
+  deterministically, and advisory security review is reused when audit
+  reporting is configured. The rebase force-push is limited to the
+  server-owned per-item `codeybox/<work-item-id-prefix>` branch; explicit API
+  or replay branches outside that exact ref are left untouched. Items resumed
+  from `Merged` for upstream-push recovery skip pickup rebase because no work,
+  audit, or merge phase will run. If resolution fails, the rebase is aborted
+  before pushing and the item transitions to `MergeConflictResolutionFailed`.
 * **Credentials follow least privilege.** Each sandbox sees only the
   minimum it needs. Tool-only audit sandboxes see no agent secrets.
   Upstream creds live only in the orchestrator process and never cross
