@@ -100,7 +100,7 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_ProjectsTimestamplessEventsIntoInvocationContext()
+    public async Task ParseAsync_DoesNotProjectTimestamplessEventsIntoInvocationContext()
     {
         var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(30) });
         var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
@@ -118,13 +118,15 @@ public sealed class ClaudeStreamParserTests
             SizeBytes: stream.Length));
 
         var tool = Assert.Single(summary.ToolCalls);
-        Assert.Equal(started.AddSeconds(40), tool.StartedAt);
-        Assert.Equal(started.AddSeconds(80), tool.EndedAt);
-        Assert.Equal(TimeSpan.FromSeconds(40), tool.Duration);
-        Assert.Equal(TimeSpan.FromMinutes(2), summary.TotalDuration);
-        Assert.Equal(TimeSpan.FromSeconds(40), summary.TimeToFirstToken);
-        Assert.Equal(3, summary.Stalls.Count);
-        Assert.Contains(summary.Stalls, s => s.Classification == "tool_execution" && s.GapDuration == TimeSpan.FromSeconds(40));
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+        Assert.Null(summary.TimeToFirstToken);
+        Assert.Empty(summary.Stalls);
+        Assert.Equal(100, summary.InputTokens);
+        Assert.Equal(20, summary.OutputTokens);
+        Assert.Equal(0.42m, summary.EstimatedUsd);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
@@ -246,7 +248,7 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_ProjectsCodexCommandTimingsFromInvocationContext()
+    public async Task ParseAsync_DoesNotProjectCodexCommandTimingsFromInvocationContext()
     {
         var parser = new CodexStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(15) });
         var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
@@ -268,11 +270,11 @@ public sealed class CodexStreamParserTests
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Equal(started.AddSeconds(20), tool.StartedAt);
-        Assert.Equal(started.AddSeconds(30), tool.EndedAt);
-        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
-        Assert.Equal(TimeSpan.FromSeconds(50), summary.TotalDuration);
-        Assert.Equal(TimeSpan.FromSeconds(40), summary.TimeToFirstToken);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
+        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
+        Assert.Null(summary.TimeToFirstToken);
         Assert.Empty(summary.Stalls);
     }
 
@@ -596,7 +598,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task AnalyzeRecentTerminalWorkItemsAsync_ProjectsTiminglessCodexSummary()
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_DoesNotProjectTiminglessCodexSummary()
     {
         var item = CreateItem(WorkItemState.Done);
         await _workItems.CreateAsync(item);
@@ -631,7 +633,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         Assert.Equal(1, count);
         var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
         Assert.Equal(AgentKind.Codex, row.AgentKind);
-        Assert.Equal(TimeSpan.FromSeconds(60), row.Summary.TotalDuration);
+        Assert.Equal(TimeSpan.Zero, row.Summary.TotalDuration);
         Assert.Null(row.Summary.TimeToFirstToken);
         Assert.Equal(10, row.Summary.InputTokens);
         Assert.Equal(2, row.Summary.OutputTokens);
@@ -639,9 +641,9 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         var tool = Assert.Single(row.Summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Equal(started.AddSeconds(30), tool.StartedAt);
-        Assert.Equal(started.AddSeconds(45), tool.EndedAt);
-        Assert.Equal(TimeSpan.FromSeconds(15), tool.Duration);
+        Assert.Null(tool.StartedAt);
+        Assert.Null(tool.EndedAt);
+        Assert.Null(tool.Duration);
         Assert.True(tool.Succeeded);
         Assert.Equal(6, tool.OutputBytes);
     }
@@ -706,6 +708,28 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
         Assert.Equal(AgentKind.Claude, row.AgentKind);
         Assert.Equal("Read", Assert.Single(row.Summary.ToolCalls).ToolName);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_TreatsKnownAgentFileWithoutRecognizedEventsAsUnsupported()
+    {
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Claude };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
+            string.Join("\n", Enumerable.Repeat("""{"type":"metadata","source":"capture"}""", 20)));
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(new AgentKind("unknown"), row.AgentKind);
+        Assert.Empty(row.Summary.ToolCalls);
+        Assert.Equal(TimeSpan.Zero, row.Summary.TotalDuration);
     }
 
     [Fact]
@@ -1028,7 +1052,7 @@ public sealed class MissingFileTests : IClassFixture<AgentStreamAnalysisApiFacto
 public sealed class OnDemandAnalysisEndpointTests
 {
     [Fact]
-    public async Task AnalyzeFile_RequestsLineCountsForTimestamplessFallback()
+    public async Task AnalyzeFile_DoesNotRequestLineCountsForTimingProjection()
     {
         using var factory = new AgentStreamAnalysisApiFactory();
         var item = AgentStreamAnalysisApiFactory.CreateItem(WorkItemState.Done);
@@ -1043,7 +1067,8 @@ public sealed class OnDemandAnalysisEndpointTests
         var resp = await client.GetAsync($"/workitems/{item.Id}/agent-streams/{fileName}/analysis");
         resp.EnsureSuccessStatusCode();
 
-        Assert.Contains(true, factory.Streams.IncludeLineCountRequests);
+        Assert.Contains(false, factory.Streams.IncludeLineCountRequests);
+        Assert.DoesNotContain(true, factory.Streams.IncludeLineCountRequests);
     }
 }
 

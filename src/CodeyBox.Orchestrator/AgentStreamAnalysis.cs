@@ -34,7 +34,10 @@ public sealed record AgentStreamSummary(
     decimal? EstimatedUsd,
     IReadOnlyList<ToolCallInvocation> ToolCalls,
     IReadOnlyList<StallEvent> Stalls,
-    string? FinalAssistantMessage);
+    string? FinalAssistantMessage)
+{
+    public bool IsUnsupported { get; init; }
+}
 
 public sealed record ToolCallInvocation(
     string ToolUseId,
@@ -442,7 +445,7 @@ public sealed class UnknownAgentStreamParser : IAgentStreamParser
     public AgentKind Kind { get; } = new("unknown");
 
     public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
-        Task.FromResult(new AgentStreamSummary(TimeSpan.Zero, null, 0, 0, 0, null, [], [], null));
+        Task.FromResult(AgentStreamParserSelection.UnsupportedSummary());
 }
 
 internal sealed record AgentStreamJsonLine(string Text, long LineNumber, long StartOffset, long EndOffset);
@@ -570,7 +573,7 @@ public static class AgentStreamParserSelection
 
     public static bool ShouldTreatAsUnsupported(AgentKind kind, AgentStreamSummary summary)
     {
-        if (string.Equals(kind.Value, "unknown", StringComparison.OrdinalIgnoreCase))
+        if (summary.IsUnsupported || string.Equals(kind.Value, "unknown", StringComparison.OrdinalIgnoreCase))
             return true;
 
         return false;
@@ -599,7 +602,7 @@ public static class AgentStreamParserSelection
     }
 
     public static AgentStreamSummary UnsupportedSummary() =>
-        new(TimeSpan.Zero, null, 0, 0, 0, null, [], [], null);
+        new AgentStreamSummary(TimeSpan.Zero, null, 0, 0, 0, null, [], [], null) { IsUnsupported = true };
 
     private static AgentKind? SniffKind(JsonElement root)
     {
@@ -816,6 +819,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         string? finalText = null;
         TimeSpan? observedTotalDuration = null;
         TimeSpan? observedTimeToFirstToken = null;
+        var recognizedEventCount = 0;
 
         await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, _options.MaxLineBytes, ct).ConfigureAwait(false))
         {
@@ -840,7 +844,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             }
 
             eventCount++;
-            var timestamp = parsed.Timestamp ?? ProjectTimestamp(context, jsonLine);
+            if (parsed.IsRecognized)
+                recognizedEventCount++;
+            var timestamp = parsed.Timestamp;
 
             if (timestamp is { } eventTimestamp)
             {
@@ -929,11 +935,13 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                 0));
         }
 
-        var contextDuration = ContextDuration(context);
+        if (recognizedEventCount == 0)
+            return AgentStreamParserSelection.UnsupportedSummary();
+
         var total = observedTotalDuration
             ?? (firstTimestamp.HasValue && lastTimestamp.HasValue
                 ? lastTimestamp.Value - firstTimestamp.Value
-                : contextDuration ?? TimeSpan.Zero);
+                : TimeSpan.Zero);
         var ttft = observedTimeToFirstToken
             ?? (firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
                 ? firstAssistantTimestamp.Value - firstTimestamp.Value
@@ -952,47 +960,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                 .ToList(),
             stalls,
             finalText);
-    }
-
-    private static TimeSpan? ContextDuration(AgentStreamParserContext? context)
-    {
-        if (context is null || context.InvocationEndedAt < context.InvocationStartedAt)
-            return null;
-        return context.InvocationEndedAt - context.InvocationStartedAt;
-    }
-
-    private static DateTimeOffset? ProjectTimestamp(
-        AgentStreamParserContext? context,
-        AgentStreamJsonLine jsonLine)
-    {
-        var duration = ContextDuration(context);
-        if (context is null || duration is null)
-            return null;
-
-        if (context.LineCount is > 1)
-        {
-            var denominator = context.LineCount.Value - 1;
-            var numerator = Math.Clamp(jsonLine.LineNumber, 0, denominator);
-            return context.InvocationStartedAt + Scale(duration.Value, numerator, denominator);
-        }
-
-        if (context.SizeBytes is > 0)
-        {
-            var numerator = Math.Clamp(jsonLine.StartOffset, 0, context.SizeBytes.Value);
-            return context.InvocationStartedAt + Scale(duration.Value, numerator, context.SizeBytes.Value);
-        }
-
-        return context.InvocationStartedAt;
-    }
-
-    private static TimeSpan Scale(TimeSpan duration, long numerator, long denominator)
-    {
-        if (denominator <= 0 || numerator <= 0)
-            return TimeSpan.Zero;
-        if (numerator >= denominator)
-            return duration;
-
-        return TimeSpan.FromTicks((long)Math.Round(duration.Ticks * (double)numerator / denominator));
     }
 
     private static string ClassifyStall(string? previousEventType, int openToolCount)
@@ -1065,6 +1032,17 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             ? FirstDuration(root)
             : null;
         var ttft = FirstDuration(root, "time_to_first_token_ms", "ttft_ms", "ttft_duration_ms");
+        var recognized = IsRecognizedStreamEvent(
+            type,
+            starts,
+            results,
+            isAssistant,
+            inputTokens,
+            outputTokens,
+            cachedInputTokens,
+            cost,
+            totalDuration,
+            ttft);
         return new ParsedEvent(
             NormalizeType(type, starts, results, isAssistant),
             timestamp,
@@ -1077,8 +1055,71 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             cost,
             totalDuration,
             ttft,
-            string.Equals(type, "result", StringComparison.OrdinalIgnoreCase) ? finalText : contentText);
+            string.Equals(type, "result", StringComparison.OrdinalIgnoreCase) ? finalText : contentText,
+            recognized);
     }
+
+    private static bool IsRecognizedStreamEvent(
+        string type,
+        IReadOnlyList<ToolBuilder> starts,
+        IReadOnlyList<ToolResultBuilder> results,
+        bool isAssistant,
+        int? inputTokens,
+        int? outputTokens,
+        int? cachedInputTokens,
+        decimal? cost,
+        TimeSpan? totalDuration,
+        TimeSpan? ttft)
+    {
+        if (starts.Count > 0
+            || results.Count > 0
+            || isAssistant
+            || inputTokens.HasValue
+            || outputTokens.HasValue
+            || cachedInputTokens.HasValue
+            || cost.HasValue
+            || totalDuration.HasValue
+            || ttft.HasValue)
+        {
+            return true;
+        }
+
+        return KnownStreamEventTypes.Contains(type);
+    }
+
+    private static readonly HashSet<string> KnownStreamEventTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "system",
+        "assistant",
+        "user",
+        "result",
+        "tool_use",
+        "tool_result",
+        "function_call",
+        "function_call_output",
+        "response",
+        "response_item",
+        "raw_response_item",
+        "event_msg",
+        "thread.started",
+        "thread.completed",
+        "turn.started",
+        "turn.completed",
+        "turn.failed",
+        "turn_complete",
+        "task_complete",
+        "item.started",
+        "item.completed",
+        "message",
+        "agent_message",
+        "token_count",
+        "command_execution",
+        "execution",
+        "exec_command_begin",
+        "exec_command_end",
+        "mcp_tool_call_begin",
+        "mcp_tool_call_end",
+    };
 
     protected static string NormalizeType(
         string type,
@@ -1446,7 +1487,8 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         decimal? EstimatedUsd,
         TimeSpan? TotalDuration,
         TimeSpan? TimeToFirstToken,
-        string? FinalText);
+        string? FinalText,
+        bool IsRecognized);
 
     protected sealed record ToolBuilder(string Id, string Name, string InputSummary, DateTimeOffset? StartedAt);
     protected sealed record ToolResultBuilder(
