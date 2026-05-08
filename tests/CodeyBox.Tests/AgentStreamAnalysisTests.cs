@@ -100,7 +100,7 @@ public sealed class ClaudeStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_DoesNotProjectTimestamplessEventsIntoInvocationContext()
+    public async Task ParseAsync_ProjectsTimestamplessEventsIntoInvocationContext()
     {
         var parser = new ClaudeStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(30) });
         var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
@@ -118,12 +118,13 @@ public sealed class ClaudeStreamParserTests
             SizeBytes: stream.Length));
 
         var tool = Assert.Single(summary.ToolCalls);
-        Assert.Null(tool.StartedAt);
-        Assert.Null(tool.EndedAt);
-        Assert.Null(tool.Duration);
-        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
-        Assert.Null(summary.TimeToFirstToken);
-        Assert.Empty(summary.Stalls);
+        Assert.Equal(started.AddSeconds(40), tool.StartedAt);
+        Assert.Equal(started.AddSeconds(80), tool.EndedAt);
+        Assert.Equal(TimeSpan.FromSeconds(40), tool.Duration);
+        Assert.Equal(TimeSpan.FromMinutes(2), summary.TotalDuration);
+        Assert.Equal(TimeSpan.FromSeconds(40), summary.TimeToFirstToken);
+        Assert.Contains(summary.Stalls, s => s.Classification == "tool_execution" && s.GapDuration == TimeSpan.FromSeconds(40));
+        Assert.Contains(summary.Stalls, s => s.Classification == "llm" && s.GapDuration == TimeSpan.FromSeconds(40));
         Assert.Equal(100, summary.InputTokens);
         Assert.Equal(20, summary.OutputTokens);
         Assert.Equal(0.42m, summary.EstimatedUsd);
@@ -248,7 +249,7 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_DoesNotProjectCodexCommandTimingsFromInvocationContext()
+    public async Task ParseAsync_ProjectsCodexCommandTimingsFromInvocationContext()
     {
         var parser = new CodexStreamParser(new AgentStreamParserOptions { StallThreshold = TimeSpan.FromSeconds(15) });
         var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
@@ -263,19 +264,20 @@ public sealed class CodexStreamParserTests
 
         var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
             started,
-            started.AddSeconds(50),
+            started.AddSeconds(100),
             LineCount: 6,
             SizeBytes: stream.Length));
 
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Null(tool.StartedAt);
-        Assert.Null(tool.EndedAt);
-        Assert.Null(tool.Duration);
-        Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
-        Assert.Null(summary.TimeToFirstToken);
-        Assert.Empty(summary.Stalls);
+        Assert.Equal(started.AddSeconds(40), tool.StartedAt);
+        Assert.Equal(started.AddSeconds(60), tool.EndedAt);
+        Assert.Equal(TimeSpan.FromSeconds(20), tool.Duration);
+        Assert.Equal(TimeSpan.FromSeconds(100), summary.TotalDuration);
+        Assert.Equal(TimeSpan.FromSeconds(80), summary.TimeToFirstToken);
+        Assert.Contains(summary.Stalls, s => s.Classification == "tool_execution" && s.GapDuration == TimeSpan.FromSeconds(20));
+        Assert.Contains(summary.Stalls, s => s.Classification == "llm" && s.GapDuration == TimeSpan.FromSeconds(20));
     }
 
     [Fact]
@@ -598,7 +600,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task AnalyzeRecentTerminalWorkItemsAsync_DoesNotProjectTiminglessCodexSummary()
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_ProjectsTiminglessCodexSummary()
     {
         var item = CreateItem(WorkItemState.Done);
         await _workItems.CreateAsync(item);
@@ -608,6 +610,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
             {"type":"turn.started"}
             {"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"","exit_code":null,"status":"in_progress"}}
             {"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"/work\n","exit_code":0,"status":"completed"}}
+            {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Done."}}
             {"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}
             """);
         await _costs.RecordAsync(new WorkItemCost
@@ -633,17 +636,17 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         Assert.Equal(1, count);
         var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
         Assert.Equal(AgentKind.Codex, row.AgentKind);
-        Assert.Equal(TimeSpan.Zero, row.Summary.TotalDuration);
-        Assert.Null(row.Summary.TimeToFirstToken);
+        Assert.Equal(TimeSpan.FromSeconds(60), row.Summary.TotalDuration);
+        Assert.Equal(TimeSpan.FromSeconds(48), row.Summary.TimeToFirstToken);
         Assert.Equal(10, row.Summary.InputTokens);
         Assert.Equal(2, row.Summary.OutputTokens);
 
         var tool = Assert.Single(row.Summary.ToolCalls);
         Assert.Equal("item_0", tool.ToolUseId);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Null(tool.StartedAt);
-        Assert.Null(tool.EndedAt);
-        Assert.Null(tool.Duration);
+        Assert.Equal(started.AddSeconds(24), tool.StartedAt);
+        Assert.Equal(started.AddSeconds(36), tool.EndedAt);
+        Assert.Equal(TimeSpan.FromSeconds(12), tool.Duration);
         Assert.True(tool.Succeeded);
         Assert.Equal(6, tool.OutputBytes);
     }
@@ -1052,7 +1055,7 @@ public sealed class MissingFileTests : IClassFixture<AgentStreamAnalysisApiFacto
 public sealed class OnDemandAnalysisEndpointTests
 {
     [Fact]
-    public async Task AnalyzeFile_DoesNotRequestLineCountsForTimingProjection()
+    public async Task AnalyzeFile_RequestsLineCountsForTimingProjection()
     {
         using var factory = new AgentStreamAnalysisApiFactory();
         var item = AgentStreamAnalysisApiFactory.CreateItem(WorkItemState.Done);
@@ -1067,8 +1070,7 @@ public sealed class OnDemandAnalysisEndpointTests
         var resp = await client.GetAsync($"/workitems/{item.Id}/agent-streams/{fileName}/analysis");
         resp.EnsureSuccessStatusCode();
 
-        Assert.Contains(false, factory.Streams.IncludeLineCountRequests);
-        Assert.DoesNotContain(true, factory.Streams.IncludeLineCountRequests);
+        Assert.Contains(true, factory.Streams.IncludeLineCountRequests);
     }
 }
 
