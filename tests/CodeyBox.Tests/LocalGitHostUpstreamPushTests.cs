@@ -79,6 +79,34 @@ public sealed class LocalGitHostUpstreamPushTests : IDisposable
         Assert.Equal(3, headParents.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length);
     }
 
+    [Fact]
+    public async Task PushToUpstreamAsync_RewritesSandboxControlledBareConfigBeforeHostGit()
+    {
+        var (gitHost, repoId, upstreamBare) = await CreateSeededHostRepoAsync();
+        await CommitToHostRepoAsync(gitHost.GetRepoPath(repoId), "agent.txt", "agent\n", "local agent change");
+
+        var repoConfig = Path.Combine(gitHost.GetRepoPath(repoId), "config");
+        await File.WriteAllTextAsync(repoConfig, """
+            [core]
+                repositoryformatversion = 0
+                filemode = true
+                bare = true
+                sshCommand = sh -c 'echo host-exec >&2'
+            [credential]
+                helper = !sh -c 'echo host-credential >&2'
+
+            """);
+
+        await gitHost.PushToUpstreamAsync(repoId, upstreamBare, "main", new Dictionary<string, string>());
+
+        var sanitized = await File.ReadAllTextAsync(repoConfig);
+        Assert.Contains("bare = true", sanitized);
+        Assert.DoesNotContain("sshCommand", sanitized);
+        Assert.DoesNotContain("credential", sanitized);
+        var (_, agentFile, _) = await TestSupport.RunGit(upstreamBare, "show", "main:agent.txt");
+        Assert.Equal("agent\n", agentFile);
+    }
+
     private async Task<(LocalGitHost GitHost, string RepoId, string UpstreamBare)> CreateSeededHostRepoAsync()
     {
         var upstreamWork = await TestSupport.CreateSeedRepoAsync(_workspace, "upstream-work");

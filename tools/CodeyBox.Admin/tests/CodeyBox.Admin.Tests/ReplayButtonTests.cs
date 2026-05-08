@@ -1,5 +1,6 @@
 using Bunit;
 using Microsoft.Extensions.DependencyInjection;
+using CodeyBox.Admin.Web;
 using CodeyBox.Admin.Web.Models;
 using CodeyBox.Admin.Web.Services;
 using WorkItemDetailPage = CodeyBox.Admin.Web.Components.Pages.WorkItemDetail;
@@ -14,6 +15,11 @@ namespace CodeyBox.Admin.Tests;
 /// </summary>
 public sealed class ReplayButtonTests : TestContext
 {
+    public ReplayButtonTests()
+    {
+        Services.AddSingleton(new OrchestratorHubSettings("", null));
+    }
+
     private static WorkItemDto MakeItem(string id, string state) => new()
     {
         Id = id,

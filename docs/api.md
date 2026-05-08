@@ -313,6 +313,100 @@ GET /workitems/abc12345-0000-0000-0000-000000000000/agent-streams/work-1-a1b2c3.
 
 Returns `404 Not Found` when the work item or file does not exist.
 
+#### `GET /workitems/{id}/agent-streams/{fileName}/analysis`
+
+Parses one captured stream on demand and returns a per-invocation summary. This
+does not write to the summary cache.
+
+```json
+{
+  "fileName": "work-1-a1b2c3.jsonl",
+  "phase": "work",
+  "iteration": 1,
+  "agentKind": "claude",
+  "totalDurationMs": 720000,
+  "timeToFirstTokenMs": 1400,
+  "inputTokens": 50000,
+  "outputTokens": 3000,
+  "cachedInputTokens": 12000,
+  "estimatedUsd": 1.23,
+  "finalAssistantMessage": "Done.",
+  "toolCalls": [
+    {
+      "toolUseId": "toolu_01",
+      "toolName": "Bash",
+      "inputSummary": "{\"command\":\"dotnet test\"}",
+      "startedAt": "2026-01-01T00:00:02+00:00",
+      "endedAt": "2026-01-01T00:08:02+00:00",
+      "durationMs": 480000,
+      "succeeded": true,
+      "outputBytes": 12000
+    }
+  ],
+  "stalls": [
+    {
+      "gapDurationMs": 45000,
+      "previousEventType": "tool_use",
+      "nextEventType": "tool_result",
+      "classification": "tool_execution"
+    }
+  ]
+}
+```
+
+If the captured CLI stream has no event timestamps or duration fields,
+CodeyBox keeps the stream file read-only and does not infer event timing from
+JSONL line or byte position. Timing fields remain `null` or zero while
+non-timing analytics are still returned when the stream has enough structured
+data to derive them. Explicit stream duration fields are still used when the
+CLI emits them.
+
+`finalAssistantMessage` carries the parser's final assistant text when the
+captured stream includes one. It is `null` for unsupported agents, truncated
+streams that never emitted final text, or CLIs that do not expose final text in
+their stream JSON.
+
+#### `GET /workitems/{id}/agent-streams/aggregate`
+
+Returns cached aggregate agent-stream analytics for one work item, including
+per-invocation summaries for the Timings tab. Missing streams return zeros and
+an empty `invocations` array.
+
+```json
+{
+  "workItemId": "abc12345-0000-0000-0000-000000000000",
+  "totalAgentDurationMs": 1834000,
+  "totalToolCalls": 47,
+  "byTool": [
+    { "tool": "Bash", "count": 23, "totalDurationMs": 542000, "medianMs": 14000 }
+  ],
+  "thinkingMs": 612000,
+  "executingMs": 549120,
+  "stallCount": 4,
+  "longestStallMs": 184000,
+  "estimatedUsdTotal": 4.27,
+  "slowestToolCalls": [
+    {
+      "workItemId": "abc12345-0000-0000-0000-000000000000",
+      "phase": "audit",
+      "iteration": 9,
+      "toolName": "Bash",
+      "durationMs": 184000,
+      "succeeded": true,
+      "outputBytes": 12000
+    }
+  ],
+  "invocations": []
+}
+```
+
+#### `GET /workitems/agent-streams/aggregate?n=50`
+
+Returns the same aggregate counters across the last `n` terminal work items
+with precomputed summaries. `n` is clamped to 1-500. Fleet aggregates keep
+`invocations` empty but include `slowestToolCalls` for the operator dashboard
+leaderboard.
+
 ### `GET /workitems/{id}/costs`
 
 Returns token usage and estimated cost data for a single work item, aggregated

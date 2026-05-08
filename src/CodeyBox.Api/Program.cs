@@ -860,6 +860,11 @@ builder.Services.AddSingleton<IWorkItemCostStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemCostStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IAgentStreamSummaryStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteAgentStreamSummaryStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IQueueController>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -929,6 +934,27 @@ builder.Services.AddSingleton<IAgentStreamStore>(sp =>
     new AgentStreamStore(
         sp.GetRequiredService<AgentStreamsOptions>(),
         sp.GetRequiredService<ILogger<AgentStreamStore>>()));
+builder.Services.AddSingleton(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentStreamAnalysis;
+    if (opts.StallThreshold < TimeSpan.Zero)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:StallThreshold must be non-negative");
+    if (opts.MaxLineBytes < 1024)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxLineBytes must be >= 1024");
+    if (opts.MaxJsonDepth < 1)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxJsonDepth must be >= 1");
+    if (opts.MaxEvents < 1)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxEvents must be >= 1");
+    if (opts.MaxToolCalls < 0)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxToolCalls must be non-negative");
+    if (opts.MaxStalls < 0)
+        throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxStalls must be non-negative");
+    return opts;
+});
+builder.Services.AddSingleton<IAgentStreamParser, ClaudeStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, CodexStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
@@ -1041,6 +1067,8 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
 builder.Services.AddHostedService(sp => new AgentStreamRetentionService(
     sp.GetRequiredService<IAgentStreamStore>(),
     sp.GetRequiredService<ILogger<AgentStreamRetentionService>>()));
+builder.Services.AddSingleton<StreamAnalysisService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<StreamAnalysisService>());
 builder.Services.AddHostedService(sp => new BudgetAlertService(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IWorkItemCostStore>(),
@@ -1393,6 +1421,9 @@ namespace CodeyBox.Api
 
         /// <summary>Structured agent stdout stream capture configuration.</summary>
         public AgentStreamsOptions AgentStreams { get; set; } = new();
+
+        /// <summary>Read-only analytics parser configuration for captured agent streams.</summary>
+        public AgentStreamParserOptions AgentStreamAnalysis { get; set; } = new();
 
         /// <summary>
         /// Agent class definitions for quota-aware routing. Each class lists one or

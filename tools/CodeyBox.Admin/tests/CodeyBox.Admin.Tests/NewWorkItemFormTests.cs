@@ -277,6 +277,9 @@ public sealed class CapturingApiClient : ICodeyBoxApiClient
     public Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default)
         => Task.FromResult<AggregateTimingsDto?>(null);
 
+    public Task<AgentStreamAggregateDto?> GetWorkItemAgentStreamAggregateAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<AgentStreamAggregateDto?>(null);
+
     public Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default)
         => Task.FromResult<WorkItemCostsDto?>(null);
 

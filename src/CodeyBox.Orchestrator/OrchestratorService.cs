@@ -478,6 +478,23 @@ public sealed class OrchestratorService : BackgroundService
 
         try
         {
+            var current = await _store.GetAsync(id, ct);
+            if (current is null)
+            {
+                _log.LogWarning("Worker {WorkerId} dequeued unknown work item {Id} after claiming active slot", workerIndex, id);
+                return;
+            }
+
+            if (current.State is WorkItemState.Cancelled or WorkItemState.Done
+                or WorkItemState.Failed or WorkItemState.AuditFailed
+                or WorkItemState.AbandonedAfterRecoveryAttempts)
+            {
+                _log.LogInformation("Worker {WorkerId} skipping {Id} after active claim: terminal state {State}", workerIndex, id, current.State);
+                return;
+            }
+
+            item = current;
+
             // Dependency gate: skip items whose deps aren't all terminal yet.
             if (item.DependsOn.Count > 0)
             {

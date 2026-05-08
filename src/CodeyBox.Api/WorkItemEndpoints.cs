@@ -375,6 +375,7 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         ITaskQueue queue,
         IGitHost gitHost,
+        IAgentStreamSummaryStore? streamSummaries,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -416,6 +417,8 @@ internal static class WorkItemEndpoints
         // Reset RecoveryAttempts so an abandoned item is not immediately re-abandoned on next restart.
         var resumed = item.With(resumeState.Value, error: null) with { RecoveryAttempts = 0 };
         await store.UpdateAsync(resumed, ct);
+        if (streamSummaries is not null)
+            await streamSummaries.DeleteByWorkItemAsync(workItemId, ct);
         AuditLog.WorkItemRetried(workItemId, from);
         await queue.EnqueueAsync(resumed.Id, ct);
         return Results.Accepted($"/workitems/{workItemId}", new { id = workItemId.ToString(), from, state = resumeState.Value.ToString() });
@@ -699,6 +702,7 @@ internal static class WorkItemEndpoints
         string id,
         IWorkItemStore store,
         ITaskQueue queue,
+        IAgentStreamSummaryStore? streamSummaries,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -720,6 +724,8 @@ internal static class WorkItemEndpoints
         var updated = await store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
         if (!updated)
             return Results.Conflict(new { error = "concurrent uncancel request already processed this item" });
+        if (streamSummaries is not null)
+            await streamSummaries.DeleteByWorkItemAsync(requeued.Id, ct);
         await queue.EnqueueAsync(requeued.Id, ct);
         AuditLog.WorkItemRetried(requeued.Id, "uncancel");
 
@@ -1220,7 +1226,7 @@ internal static class WorkItemEndpoints
 
         var tail = broadcaster.GetTail(item!.Id);
         if (tail is null)
-            return Results.Ok("");  // Work item exists but no live stream data yet.
+            return Results.Text("", "text/plain");  // Work item exists but no live stream data yet.
 
         return Results.Text(tail, "text/plain");
     }

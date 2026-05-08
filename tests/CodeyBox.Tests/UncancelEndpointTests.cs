@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace CodeyBox.Tests;
 
@@ -136,6 +137,37 @@ public sealed class UncancelEndpointTests : IDisposable
         var readBack = await _factory.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, readBack!.State);
         Assert.Equal(0, readBack.RecoveryAttempts);
+    }
+
+    [Fact]
+    public async Task Uncancel_DeletesCachedAgentStreamSummaries()
+    {
+        var item = CancelledItem(WorkItemCancellationReason.ParentCascaded, "parent dependency cancelled");
+        await _factory.Store.CreateAsync(item);
+        var summaries = _factory.Services.GetRequiredService<IAgentStreamSummaryStore>();
+        await summaries.UpsertAsync(new AgentStreamSummaryRow(
+            item.Id,
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Claude,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(1),
+                10,
+                20,
+                0,
+                null,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var resp = await _client.PostAsync($"/workitems/{item.Id}/uncancel", null);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var rows = await summaries.GetByWorkItemAsync(item.Id);
+        Assert.Empty(rows);
     }
 
     // ── 404 for unknown ID ────────────────────────────────────────────────────

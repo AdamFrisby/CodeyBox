@@ -58,6 +58,95 @@ else
         </section>
     }
 
+    @if (_agentActivity is not null)
+    {
+        <section class="agent-activity">
+            <h2>Agent activity</h2>
+            @{
+                var supportedInvocations = _agentActivity.Invocations
+                    .Where(i => !IsUnsupportedInvocation(i))
+                    .ToList();
+                var unsupportedInvocationCount = _agentActivity.Invocations.Count - supportedInvocations.Count;
+            }
+            @if (supportedInvocations.Count == 0)
+            {
+                <p class="agent-activity-empty">stream-json not supported by this agent's CLI version, stream capture is disabled, or no cached stream summary is available yet.</p>
+            }
+            else
+            {
+                @if (unsupportedInvocationCount > 0)
+                {
+                    <p class="agent-activity-empty">@unsupportedInvocationCount stream capture file(s) could not be analysed because stream-json is not supported by this agent's CLI version.</p>
+                }
+                <table class="detail-table agent-activity-table">
+                    <thead>
+                        <tr>
+                            <th>Invocation</th>
+                            <th>Total</th>
+                            <th>Tools</th>
+                            <th>Thinking / executing</th>
+                            <th>Stalls</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var invocation in supportedInvocations)
+                        {
+                            var executing = UnionToolDurationMs(invocation.ToolCalls);
+                            var thinking = Math.Max(0, invocation.TotalDurationMs - executing);
+                            var total = Math.Max(1, thinking + executing);
+                            var thinkingPct = thinking * 100.0 / total;
+                            <tr class="@(invocation.Stalls.Count > 0 ? "agent-activity-stalled" : "")">
+                                <td>
+                                    <details>
+                                        <summary>
+                                            <code>@(invocation.Phase ?? "unknown")</code>
+                                            @if (invocation.Iteration.HasValue)
+                                            {
+                                                <span>iter @invocation.Iteration</span>
+                                            }
+                                        </summary>
+                                        @if (invocation.ToolCalls.Count > 0)
+                                        {
+                                            <table class="detail-table agent-tool-calls">
+                                                <thead>
+                                                    <tr><th>Tool</th><th>Duration</th><th>Status</th><th>Input</th></tr>
+                                                </thead>
+                                                <tbody>
+                                                    @foreach (var tool in invocation.ToolCalls.OrderByDescending(t => t.DurationMs ?? 0))
+                                                    {
+                                                        <tr>
+                                                            <td><code>@tool.ToolName</code></td>
+                                                            <td>@(tool.DurationMs.HasValue ? FormatDuration(tool.DurationMs.Value) : "unfinished")</td>
+                                                            <td>@FormatToolStatus(tool.Succeeded)</td>
+                                                            <td><code>@tool.InputSummary</code></td>
+                                                        </tr>
+                                                    }
+                                                </tbody>
+                                            </table>
+                                        }
+                                        @foreach (var stall in invocation.Stalls.OrderByDescending(s => s.GapDurationMs))
+                                        {
+                                            <p class="agent-stall">Stall @FormatDuration(stall.GapDurationMs) @stall.Classification</p>
+                                        }
+                                    </details>
+                                </td>
+                                <td>@FormatDuration(invocation.TotalDurationMs)</td>
+                                <td>@invocation.ToolCalls.Count</td>
+                                <td>
+                                    <div class="agent-split" title="thinking @FormatDuration(thinking), executing @FormatDuration(executing)">
+                                        <span class="agent-split-thinking" style="width:@(thinkingPct.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))%"></span>
+                                        <span class="agent-split-executing"></span>
+                                    </div>
+                                </td>
+                                <td>@invocation.Stalls.Count</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        </section>
+    }
+
     @if (_timings.TopSteps.Count > 0)
     {
         <section class="timings-top">
@@ -121,6 +210,7 @@ else
     [Parameter] public string Id { get; set; } = "";
 
     private WorkItemTimingsDto? _timings;
+    private AgentStreamAggregateDto? _agentActivity;
     private string? _error;
     private bool _notFound;
 
@@ -134,6 +224,8 @@ else
         {
             _timings = await ApiClient.GetWorkItemTimingsAsync(Id);
             _notFound = _timings is null;
+            if (!_notFound)
+                _agentActivity = await ApiClient.GetWorkItemAgentStreamAggregateAsync(Id);
         }
         catch (Exception ex)
         {
@@ -141,6 +233,67 @@ else
             _error = "Failed to load timings. Check server logs for details.";
         }
     }
+
+    private static string FormatToolStatus(bool? succeeded) => succeeded switch
+    {
+        true => "ok",
+        false => "error",
+        null => "unknown",
+    };
+
+    private static bool IsUnsupportedInvocation(AgentStreamInvocationDto invocation) =>
+        string.Equals(invocation.AgentKind, "unknown", StringComparison.OrdinalIgnoreCase)
+        && invocation.TotalDurationMs == 0
+        && invocation.TimeToFirstTokenMs is null
+        && invocation.InputTokens == 0
+        && invocation.OutputTokens == 0
+        && invocation.CachedInputTokens == 0
+        && invocation.EstimatedUsd is null
+        && invocation.ToolCalls.Count == 0
+        && invocation.Stalls.Count == 0
+        && string.IsNullOrWhiteSpace(invocation.FinalAssistantMessage);
+
+    private static long UnionToolDurationMs(IEnumerable<AgentStreamToolCallDto> toolCalls)
+    {
+        var materialized = toolCalls.ToList();
+        var intervals = materialized
+            .Where(HasValidInterval)
+            .Select(t => (Start: t.StartedAt!.Value, End: t.EndedAt!.Value))
+            .OrderBy(t => t.Start)
+            .ToList();
+
+        var durationOnlyMs = materialized
+            .Where(t => !HasValidInterval(t))
+            .Sum(t => t.DurationMs ?? 0);
+
+        if (intervals.Count == 0)
+            return durationOnlyMs;
+
+        var total = TimeSpan.Zero;
+        var currentStart = intervals[0].Start;
+        var currentEnd = intervals[0].End;
+        foreach (var interval in intervals.Skip(1))
+        {
+            if (interval.Start <= currentEnd)
+            {
+                if (interval.End > currentEnd)
+                    currentEnd = interval.End;
+                continue;
+            }
+
+            total += currentEnd - currentStart;
+            currentStart = interval.Start;
+            currentEnd = interval.End;
+        }
+
+        total += currentEnd - currentStart;
+        return Math.Max(0, (long)Math.Round(total.TotalMilliseconds)) + durationOnlyMs;
+    }
+
+    private static bool HasValidInterval(AgentStreamToolCallDto toolCall) =>
+        toolCall.StartedAt.HasValue
+        && toolCall.EndedAt.HasValue
+        && toolCall.EndedAt.Value >= toolCall.StartedAt.Value;
 
     private static string FormatDuration(long ms)
     {

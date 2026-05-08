@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using CodeyBox.Core;
+using System.Text.Json;
 
 namespace CodeyBox.Orchestrator;
 
@@ -207,6 +208,68 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         }
     }
 
+    public async Task ReconcileFromAgentStreamSummaryAsync(AgentStreamSummaryRow row, CancellationToken ct = default)
+    {
+        if (row.Summary.EstimatedUsd is null)
+            return;
+
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using (var update = _conn.CreateCommand())
+            {
+                update.CommandText = """
+                    UPDATE work_item_costs
+                    SET input_tokens = $input,
+                        cached_input_tokens = $cached,
+                        output_tokens = $output,
+                        estimated_usd = $usd,
+                        raw_metadata_json = $meta
+                    WHERE id = (
+                        SELECT id FROM work_item_costs
+                        WHERE work_item_id = $wi
+                          AND phase IN ($phase, $canonicalPhase)
+                          AND (
+                              ($iter IS NULL AND iteration IS NULL)
+                              OR iteration = $iter
+                              OR ($iter <= 1 AND iteration IS NULL)
+                          )
+                          AND agent_kind = $kind
+                        ORDER BY CASE WHEN phase = $canonicalPhase THEN 0 ELSE 1 END,
+                                 started_at DESC
+                        LIMIT 1
+                    )
+                    """;
+                BindReconcile(update, row);
+                var changed = await update.ExecuteNonQueryAsync(ct);
+                if (changed > 0)
+                    return;
+            }
+
+            using var insert = _conn.CreateCommand();
+            insert.CommandText = """
+                INSERT INTO work_item_costs
+                    (id, work_item_id, phase, iteration, agent_kind, model_id,
+                     input_tokens, cached_input_tokens, output_tokens,
+                     estimated_usd, started_at, ended_at, raw_metadata_json)
+                VALUES
+                    ($id, $wi, $phase, $iter, $kind, NULL,
+                     $input, $cached, $output, $usd, $started, $ended, $meta)
+                """;
+            BindReconcile(insert, row);
+            insert.Parameters.AddWithValue("$id", $"stream-{row.WorkItemId}-{row.FileName}");
+            var ended = row.SummarisedAt;
+            var started = ended - row.Summary.TotalDuration;
+            insert.Parameters.AddWithValue("$started", started.ToString("O"));
+            insert.Parameters.AddWithValue("$ended", ended.ToString("O"));
+            await insert.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<decimal> SumEstimatedUsdAsync(
         string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
     {
@@ -248,6 +311,25 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         EndedAt = DateTimeOffset.Parse(r.GetString(11)),
         RawMetadataJson = r.GetString(12),
     };
+
+    private static void BindReconcile(SqliteCommand cmd, AgentStreamSummaryRow row)
+    {
+        cmd.Parameters.AddWithValue("$wi", row.WorkItemId.ToString());
+        cmd.Parameters.AddWithValue("$phase", row.Phase);
+        cmd.Parameters.AddWithValue("$canonicalPhase", CanonicalCostPhase(row.Phase));
+        cmd.Parameters.AddWithValue("$iter", row.Iteration.HasValue ? row.Iteration.Value : DBNull.Value);
+        cmd.Parameters.AddWithValue("$kind", row.AgentKind.Value);
+        cmd.Parameters.AddWithValue("$input", row.Summary.InputTokens);
+        cmd.Parameters.AddWithValue("$cached", row.Summary.CachedInputTokens);
+        cmd.Parameters.AddWithValue("$output", row.Summary.OutputTokens);
+        cmd.Parameters.AddWithValue("$usd", (double)(row.Summary.EstimatedUsd ?? 0m));
+        cmd.Parameters.AddWithValue("$meta", $$"""{"source":"agent_stream_analyser","fileName":{{JsonSerializer.Serialize(row.FileName)}},"streamPhase":{{JsonSerializer.Serialize(row.Phase)}}}""");
+    }
+
+    private static string CanonicalCostPhase(string phase) =>
+        phase.StartsWith("audit-llm-", StringComparison.OrdinalIgnoreCase)
+            ? "audit"
+            : phase;
 
     public void Dispose()
     {

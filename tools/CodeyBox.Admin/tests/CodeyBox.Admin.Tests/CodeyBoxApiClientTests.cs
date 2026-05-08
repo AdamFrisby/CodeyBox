@@ -77,6 +77,19 @@ public sealed class CodeyBoxApiClientTests
     }
 
     [Fact]
+    public async Task GetFleetAgentStreamAggregateAsync_CallsCorrectEndpoint()
+    {
+        var (client, handler) = Build("""
+            {"totalAgentDurationMs":0,"totalToolCalls":0,"byTool":[],"thinkingMs":0,"executingMs":0,"stallCount":0,"longestStallMs":0,"estimatedUsdTotal":0,"slowestToolCalls":[],"invocations":[]}
+            """);
+
+        await client.GetFleetAgentStreamAggregateAsync(50);
+
+        Assert.Equal(HttpMethod.Get, handler.LastMethod);
+        Assert.Equal("/workitems/agent-streams/aggregate?n=50", handler.LastPath);
+    }
+
+    [Fact]
     public async Task CreateWorkItemAsync_PostsToCorrectEndpoint()
     {
         var respJson = """

@@ -794,3 +794,47 @@ h1 {
     font-style: italic;
     margin-top: 0.5rem;
 }
+
+.agent-activity {
+    margin-top: 1.25rem;
+}
+
+.agent-activity-table summary {
+    cursor: pointer;
+}
+
+.agent-activity-stalled {
+    background: #fff5f5;
+}
+
+.agent-tool-calls {
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+}
+
+.agent-stall {
+    color: #b42318;
+    font-weight: 600;
+    margin: 0.35rem 0 0;
+}
+
+.agent-split {
+    display: flex;
+    width: 120px;
+    height: 12px;
+    border: 1px solid #ccd0d5;
+    border-radius: 3px;
+    overflow: hidden;
+    background: #f6f8fa;
+}
+
+.agent-split-thinking {
+    display: block;
+    background: #3b82f6;
+}
+
+.agent-split-executing {
+    display: block;
+    flex: 1;
+    background: #22c55e;
+}
