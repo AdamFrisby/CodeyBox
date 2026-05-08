@@ -2186,28 +2186,6 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    private async Task RejectWholeFileOneSidedResolutionAsync(
-        string repoId,
-        string preMergeSha,
-        string workTipSha,
-        string mergeSha,
-        IReadOnlyList<string> conflictedFiles,
-        CancellationToken ct)
-    {
-        foreach (var file in conflictedFiles)
-        {
-            var resolved = await _gitHost.ReadTextFileAsync(repoId, mergeSha, file, ct);
-            var main = await _gitHost.ReadTextFileAsync(repoId, preMergeSha, file, ct);
-            var work = await _gitHost.ReadTextFileAsync(repoId, workTipSha, file, ct);
-            if (string.Equals(resolved, main, StringComparison.Ordinal) ||
-                string.Equals(resolved, work, StringComparison.Ordinal))
-            {
-                throw new MergePhaseInconsistentResultException(
-                    $"merge resolver produced a one-sided resolution for conflicted file '{file}'");
-            }
-        }
-    }
-
     internal async Task VerifyMergeResultAgainstHostAsync(
         WorkItemId workItemId,
         string repoId,
@@ -2244,8 +2222,6 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         var hunks = await ExtractHostConflictHunksAsync(repoId, hostMerge, ct);
-
-        await RejectWholeFileOneSidedResolutionAsync(repoId, preMergeSha, workTipSha, mergeSha, hostMerge.ConflictedFiles, ct);
 
         try
         {

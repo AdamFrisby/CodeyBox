@@ -25,7 +25,7 @@ public sealed class ConflictHunkExtractionTests
         var hunks = MergeScopeFence.ExtractConflictHunks("file.txt", content);
 
         Assert.Equal(
-            [new ConflictHunk("file.txt", 2, 2), new ConflictHunk("file.txt", 4, 4)],
+            [new ConflictHunk("file.txt", 2, 6), new ConflictHunk("file.txt", 8, 12)],
             hunks);
     }
 
@@ -47,7 +47,7 @@ public sealed class ConflictHunkExtractionTests
         var hunks = MergeScopeFence.ExtractConflictHunks("adjacent.txt", content);
 
         Assert.Equal(
-            [new ConflictHunk("adjacent.txt", 1, 1), new ConflictHunk("adjacent.txt", 1, 1)],
+            [new ConflictHunk("adjacent.txt", 1, 3), new ConflictHunk("adjacent.txt", 4, 8)],
             hunks);
     }
 }

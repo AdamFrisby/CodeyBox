@@ -33,8 +33,6 @@ internal static partial class MergeScopeFence
     {
         var hunks = new List<ConflictHunk>();
         int? startLine = null;
-        var mainLineNumber = 0;
-        var mainSideLineCount = 0;
         var state = ConflictParseState.Outside;
         var lines = conflictedContent.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
         for (var i = 0; i < lines.Length; i++)
@@ -45,8 +43,7 @@ internal static partial class MergeScopeFence
             {
                 if (startLine is not null)
                     throw new InvalidOperationException($"nested conflict marker in {path}:{lineNumber}");
-                startLine = mainLineNumber + 1;
-                mainSideLineCount = 0;
+                startLine = lineNumber;
                 state = ConflictParseState.MainSide;
                 continue;
             }
@@ -68,21 +65,10 @@ internal static partial class MergeScopeFence
             {
                 if (startLine is null)
                     throw new InvalidOperationException($"unmatched conflict end marker in {path}:{lineNumber}");
-                var endLine = Math.Max(startLine.Value, startLine.Value + mainSideLineCount - 1);
-                hunks.Add(new ConflictHunk(path, startLine.Value, endLine));
-                mainLineNumber += mainSideLineCount;
+                hunks.Add(new ConflictHunk(path, startLine.Value, lineNumber));
                 startLine = null;
                 state = ConflictParseState.Outside;
                 continue;
-            }
-
-            if (state == ConflictParseState.Outside)
-            {
-                mainLineNumber++;
-            }
-            else if (state == ConflictParseState.MainSide)
-            {
-                mainSideLineCount++;
             }
         }
 
@@ -101,6 +87,7 @@ internal static partial class MergeScopeFence
         int bufferLines,
         CancellationToken ct)
     {
+        _ = mainTreeish;
         if (bufferLines < 0)
             throw new ArgumentOutOfRangeException(nameof(bufferLines), "buffer must be non-negative");
 
@@ -140,8 +127,8 @@ internal static partial class MergeScopeFence
 
         foreach (var (path, fileHunks) in hunksByPath)
         {
-            var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, mainTreeish, resolvedTreeish, path, ct);
-            foreach (var lineNumber in ChangedLineNumbers(diff))
+            var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, path, ct);
+            foreach (var lineNumber in ChangedOldLineNumbers(diff))
             {
                 if (!IsInsideAnyHunk(lineNumber, fileHunks, bufferLines))
                     violations.Add($"{path}:{lineNumber}");
@@ -152,15 +139,47 @@ internal static partial class MergeScopeFence
             throw new ScopeFenceViolation(violations);
     }
 
-    private static IEnumerable<int> ChangedLineNumbers(string diff)
+    private static IEnumerable<int> ChangedOldLineNumbers(string diff)
     {
         var oldLine = 0;
         var newLine = 0;
+        var editStart = (int?)null;
+        var editEnd = 0;
+        var editHasDeletion = false;
+
+        IEnumerable<int> FlushEdit()
+        {
+            if (editStart is null)
+                yield break;
+            for (var line = editStart.Value; line <= editEnd; line++)
+                yield return line;
+            editStart = null;
+            editEnd = 0;
+            editHasDeletion = false;
+        }
+
+        void TouchOldLine(int lineNumber)
+        {
+            if (editStart is null)
+            {
+                editStart = lineNumber;
+                editEnd = lineNumber;
+                return;
+            }
+
+            if (lineNumber < editStart.Value)
+                editStart = lineNumber;
+            if (lineNumber > editEnd)
+                editEnd = lineNumber;
+        }
+
         foreach (var line in diff.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
         {
             var match = DiffHunkHeader().Match(line);
             if (match.Success)
             {
+                foreach (var changedLine in FlushEdit())
+                    yield return changedLine;
                 oldLine = int.Parse(match.Groups["old"].Value);
                 newLine = int.Parse(match.Groups["new"].Value);
                 continue;
@@ -171,20 +190,27 @@ internal static partial class MergeScopeFence
 
             if (line.StartsWith('+'))
             {
-                yield return newLine;
+                if (!editHasDeletion)
+                    TouchOldLine(oldLine);
                 newLine++;
             }
             else if (line.StartsWith('-'))
             {
-                yield return oldLine;
+                TouchOldLine(oldLine);
+                editHasDeletion = true;
                 oldLine++;
             }
             else if (line.StartsWith(' '))
             {
+                foreach (var changedLine in FlushEdit())
+                    yield return changedLine;
                 oldLine++;
                 newLine++;
             }
         }
+
+        foreach (var changedLine in FlushEdit())
+            yield return changedLine;
     }
 
     private static bool IsInsideAnyHunk(int lineNumber, IReadOnlyList<ConflictHunk> hunks, int bufferLines)

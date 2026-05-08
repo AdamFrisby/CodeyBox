@@ -5,6 +5,7 @@ using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -20,14 +21,14 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
     [Fact]
     public async Task SilentSilentResolutionDetected()
     {
-        var (gitHost, repoId) = await CreateConflictingRepoAsync();
+        var (gitHost, repoId) = await CreateConflictingRepoWithMainOnlyAdjacentChangeAsync();
         var preMergeMain = await gitHost.ResolveCommitAsync(repoId, "main");
         var workTip = await gitHost.ResolveCommitAsync(repoId, "work");
         var hostMerge = await gitHost.ComputeMergeTreeAsync(repoId, preMergeMain, workTip);
         var badMerge = await CommitOneSidedConflictResolutionAsync(gitHost, repoId);
         var pipeline = CreateVerifier(gitHost);
 
-        var ex = await Assert.ThrowsAsync<MergePhaseInconsistentResultException>(() =>
+        var ex = await Assert.ThrowsAsync<MergeConflictResolutionFailedException>(() =>
             pipeline.VerifyMergeResultAgainstHostAsync(
                 WorkItemId.New(),
                 repoId,
@@ -38,7 +39,28 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
                 bufferLines: 5,
                 ct: CancellationToken.None));
 
-        Assert.Contains("one-sided resolution", ex.Message);
+        Assert.Contains("file.txt:1", ex.Message);
+    }
+
+    [Fact]
+    public async Task OneSidedHunkResolutionIsAcceptedWhenInsideScope()
+    {
+        var (gitHost, repoId) = await CreateSingleLineConflictingRepoAsync();
+        var preMergeMain = await gitHost.ResolveCommitAsync(repoId, "main");
+        var workTip = await gitHost.ResolveCommitAsync(repoId, "work");
+        var hostMerge = await gitHost.ComputeMergeTreeAsync(repoId, preMergeMain, workTip);
+        var oneSidedMerge = await CommitOneSidedConflictResolutionAsync(gitHost, repoId);
+        var pipeline = CreateVerifier(gitHost);
+
+        await pipeline.VerifyMergeResultAgainstHostAsync(
+            WorkItemId.New(),
+            repoId,
+            preMergeMain,
+            workTip,
+            oneSidedMerge,
+            hostMerge,
+            bufferLines: 5,
+            ct: CancellationToken.None);
     }
 
     [Fact]
@@ -65,7 +87,7 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
         Assert.Contains("does not preserve pre-merge main ancestry", ex.Message);
     }
 
-    private async Task<(LocalGitHost GitHost, string RepoId)> CreateConflictingRepoAsync()
+    private async Task<(LocalGitHost GitHost, string RepoId)> CreateSingleLineConflictingRepoAsync()
     {
         var seed = Path.Combine(_workspace, "seed-conflict");
         Directory.CreateDirectory(seed);
@@ -84,6 +106,33 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
 
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-conflict") },
+            NullLogger<LocalGitHost>.Instance);
+        var repoId = await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed);
+        return (gitHost, repoId);
+    }
+
+    private async Task<(LocalGitHost GitHost, string RepoId)> CreateConflictingRepoWithMainOnlyAdjacentChangeAsync()
+    {
+        var seed = Path.Combine(_workspace, "seed-conflict-main-adjacent");
+        Directory.CreateDirectory(seed);
+        await TestSupport.RunGit(seed, "init", "-b", "main");
+        await TestSupport.RunGit(seed, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(seed, "config", "user.name", "Test");
+        await File.WriteAllLinesAsync(Path.Combine(seed, "file.txt"),
+            ["stable header", "same 2", "same 3", "same 4", "same 5", "same 6", "same 7", "same 8", "base", "stable tail"]);
+        await TestSupport.RunGit(seed, "add", "file.txt");
+        await TestSupport.RunGit(seed, "commit", "-m", "base");
+        await TestSupport.RunGit(seed, "checkout", "-b", "work");
+        await File.WriteAllLinesAsync(Path.Combine(seed, "file.txt"),
+            ["stable header", "same 2", "same 3", "same 4", "same 5", "same 6", "same 7", "same 8", "work", "stable tail"]);
+        await TestSupport.RunGit(seed, "commit", "-am", "work");
+        await TestSupport.RunGit(seed, "checkout", "main");
+        await File.WriteAllLinesAsync(Path.Combine(seed, "file.txt"),
+            ["main header", "same 2", "same 3", "same 4", "same 5", "same 6", "same 7", "same 8", "main", "stable tail"]);
+        await TestSupport.RunGit(seed, "commit", "-am", "main");
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-conflict-main-adjacent") },
             NullLogger<LocalGitHost>.Instance);
         var repoId = await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed);
         return (gitHost, repoId);
@@ -489,5 +538,99 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
 
         public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default) =>
             Task.FromResult(0);
+    }
+}
+
+[Collection("Pipeline integration")]
+public sealed class ConflictResolverPipelinePathTests : IDisposable
+{
+    private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-conflict-resolver-pipeline-").FullName;
+
+    public void Dispose() => Directory.Delete(_workspace, recursive: true);
+
+    [Fact]
+    public async Task ConflictedMergeRunsTextOnlyResolverAndUpdatesMain()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace, "seed-conflict-resolver");
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main\n");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work\n"));
+        tp.Agent.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            Assert.Equal("README.md", file.Path);
+            Assert.Contains("<<<<<<<", file.Content);
+            Assert.Contains("main", file.Content);
+            Assert.Contains("work", file.Content);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main\nwork\n",
+            };
+        });
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "conflict resolver pipeline",
+            Prompt = "change README",
+            WorkBranch = "feature/conflict-resolver",
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(tp.Agent.ConflictResolutionPlan);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, readme, _) = await TestSupport.RunGit(barePath, "show", "main:README.md");
+        Assert.Equal("main\nwork\n", readme);
+        await TestSupport.RunGit(barePath, "merge-base", "--is-ancestor", "feature/conflict-resolver", "main");
+    }
+
+    private sealed class MainAdvancingAuditor : IAuditor
+    {
+        private readonly string _workspace;
+        private readonly string _path;
+        private readonly string _content;
+
+        public string? GitRoot { get; set; }
+        public string Name => "advance-main";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public MainAdvancingAuditor(string workspace, string path, string content)
+        {
+            _workspace = workspace;
+            _path = path;
+            _content = content;
+        }
+
+        public async Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            if (GitRoot is null)
+                throw new InvalidOperationException("GitRoot must be assigned before the auditor runs.");
+
+            var barePath = Path.Combine(GitRoot, context.WorkItemId + ".git");
+            var clone = Path.Combine(_workspace, "advance-main-" + Guid.NewGuid().ToString("N")[..8]);
+            await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", context.BaseBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, _path), _content);
+            await TestSupport.RunGit(clone, "commit", "-am", "advance main during audit");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
+            return new AuditResult(true, []);
+        }
     }
 }

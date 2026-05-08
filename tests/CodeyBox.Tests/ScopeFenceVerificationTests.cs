@@ -74,6 +74,44 @@ public sealed class ScopeFenceVerificationTests : IDisposable
     }
 
     [Fact]
+    public async Task RejectsOutOfHunkInsertionAfterHunkShrink()
+    {
+        var ctx = await CreateContextAsync(lineCount: 60);
+        var clone = await CloneAsync(ctx);
+        var baseline = Enumerable.Range(1, 60).Select(i => $"line {i}").ToList();
+        baseline[9] = "<<<<<<< main";
+        baseline[10] = "main 11";
+        baseline[11] = "main 12";
+        baseline[12] = "=======";
+        baseline[13] = "work 14";
+        baseline[14] = "work 15";
+        baseline[15] = ">>>>>>> work";
+        await File.WriteAllLinesAsync(Path.Combine(clone, "file.txt"), baseline);
+        await TestSupport.RunGit(clone, "commit", "-am", "canonical conflict baseline");
+        await TestSupport.RunGit(clone, "branch", "baseline");
+
+        var resolved = baseline.ToList();
+        resolved.RemoveRange(9, 7);
+        resolved.Insert(9, "resolved hunk");
+        resolved[33] = "payload after shifted hunk";
+        await File.WriteAllLinesAsync(Path.Combine(clone, "file.txt"), resolved);
+        await TestSupport.RunGit(clone, "commit", "-am", "resolved with shifted payload");
+        await TestSupport.RunGit(clone, "push", "origin", "baseline", "HEAD:resolved");
+
+        var ex = await Assert.ThrowsAsync<ScopeFenceViolation>(() =>
+            MergeScopeFence.VerifyAsync(
+                ctx.GitHost,
+                ctx.RepoId,
+                "main",
+                "baseline",
+                "resolved",
+                [new ConflictHunk("file.txt", 10, 16)],
+                bufferLines: 0,
+                CancellationToken.None));
+        Assert.Contains("file.txt:40", ex.Message);
+    }
+
+    [Fact]
     public async Task AllowsCleanWorkBranchChangeAlreadyInConflictBaseline()
     {
         var ctx = await CreateContextAsync();
@@ -111,14 +149,14 @@ public sealed class ScopeFenceVerificationTests : IDisposable
             bufferLines: 5,
             CancellationToken.None);
 
-    private async Task<Context> CreateContextAsync()
+    private async Task<Context> CreateContextAsync(int lineCount = 20)
     {
         var seed = Path.Combine(_workspace, "seed-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(seed);
         await TestSupport.RunGit(seed, "init", "-b", "main");
         await TestSupport.RunGit(seed, "config", "user.email", "test@test.com");
         await TestSupport.RunGit(seed, "config", "user.name", "Test");
-        await File.WriteAllLinesAsync(Path.Combine(seed, "file.txt"), Enumerable.Range(1, 20).Select(i => $"line {i}"));
+        await File.WriteAllLinesAsync(Path.Combine(seed, "file.txt"), Enumerable.Range(1, lineCount).Select(i => $"line {i}"));
         await TestSupport.RunGit(seed, "add", "file.txt");
         await TestSupport.RunGit(seed, "commit", "-m", "initial");
 

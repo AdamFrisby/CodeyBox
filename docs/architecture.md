@@ -63,8 +63,8 @@ For clean merges, the agent commit tree must exactly match the host
 commit and the work tip in its ancestry. For conflicted merges, the normal
 repository-mounted merge agent runner is not invoked. The host first creates the
 conflicted working tree, reads only the conflicted file contents, records each
-`<<<<<<<` ... `>>>>>>>` hunk in pre-merge main-file line coordinates, and sends
-that text through `ITextOnlyAgentRunner`. That call is pure text-in/text-out:
+`<<<<<<<` ... `>>>>>>>` hunk as the marker span in the conflicted merge-tree
+file, and sends that text through `ITextOnlyAgentRunner`. That call is pure text-in/text-out:
 no repository checkout, shell, filesystem, agent tools, writable result file, or
 model-controlled network is exposed to the untrusted conflict text. The resolver
 can only return complete replacement contents for exactly the conflicted paths;
@@ -73,8 +73,9 @@ the host applies those contents to the merge worktree.
 After the host writes those returned contents and creates the merge commit, it
 applies a deterministic scope fence before updating main. The final
 conflict-baseline-to-resolved changed-file set must exactly equal the
-conflicted file set, and each main-to-resolved changed line in those files must
-fall inside a conflict hunk plus
+conflicted file set, and each conflict-baseline-to-resolved changed line in
+those files is checked in conflicted-baseline coordinates. Every changed old-side
+line must fall inside a conflict marker span plus
 `Audit.MergeScopeBufferLines` context lines. The default buffer is 5. New files,
 deletes, renames, edits to non-conflicted files, missing conflicted-file edits,
 and whitespace-only edits outside the allowed ranges are rejected and the work
