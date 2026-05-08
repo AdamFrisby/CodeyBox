@@ -94,6 +94,7 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
     {
         var type = FirstString(root, "type", "event", "name") ?? "unknown";
         var timestamp = TryTimestamp(root);
+        var eventTimestamp = timestamp;
         var starts = new List<ToolBuilder>();
         var results = new List<ToolResultBuilder>();
         var isAssistant = false;
@@ -110,20 +111,25 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
             if (string.Equals(itemType, "command_execution", StringComparison.OrdinalIgnoreCase))
             {
                 var id = FirstString(item, "id", "call_id", "tool_use_id") ?? Guid.NewGuid().ToString("N");
+                var itemStartedAt = TryTimestamp(item, "started_at", "start_time", "startedAt", "started_at_unix_ms", "started_at_ms");
+                var itemEndedAt = TryTimestamp(item, "completed_at", "ended_at", "end_time", "completedAt", "endedAt", "completed_at_unix_ms", "ended_at_unix_ms", "completed_at_ms", "ended_at_ms");
+                var itemDuration = FirstDuration(item);
                 if (string.Equals(type, "item.started", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(FirstString(item, "status"), "in_progress", StringComparison.OrdinalIgnoreCase))
                 {
+                    eventTimestamp = itemStartedAt ?? eventTimestamp;
                     starts.Add(new ToolBuilder(
                         id,
                         CommandToolName(FirstString(item, "command")),
                         InputSummary(item),
-                        timestamp));
+                        itemStartedAt ?? timestamp));
                 }
 
                 if (string.Equals(type, "item.completed", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(FirstString(item, "status"), "completed", StringComparison.OrdinalIgnoreCase))
                 {
-                    results.Add(new ToolResultBuilder(id, CommandSucceeded(item), OutputBytes(item)));
+                    eventTimestamp = itemEndedAt ?? eventTimestamp;
+                    results.Add(new ToolResultBuilder(id, CommandSucceeded(item), OutputBytes(item), itemEndedAt ?? timestamp, itemDuration));
                 }
             }
             else if (string.Equals(itemType, "function_call", StringComparison.OrdinalIgnoreCase)
@@ -137,13 +143,13 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
                      || string.Equals(itemType, "tool_result", StringComparison.OrdinalIgnoreCase))
             {
                 var id = FirstString(item, "call_id", "id", "tool_use_id") ?? "unknown";
-                results.Add(new ToolResultBuilder(id, !Bool(item, "is_error", "error"), OutputBytes(item)));
+                results.Add(new ToolResultBuilder(id, !Bool(item, "is_error", "error"), OutputBytes(item), timestamp, FirstDuration(item)));
             }
 
             finalText = FirstString(item, "text", "final_message") ?? finalText;
             ParseContent(item, starts, results, ref finalText);
             ParseUsage(item, out var itemInput, out var itemOutput, out var itemCached);
-            var parsed = ParseScalars(root, type, timestamp, starts, results, isAssistant, finalText);
+            var parsed = ParseScalars(root, type, eventTimestamp, starts, results, isAssistant, finalText);
             return parsed with
             {
                 InputTokens = parsed.InputTokens ?? itemInput,
@@ -229,7 +235,7 @@ public sealed class GeminiStreamParser : FlexibleAgentStreamParser
         if (TryGet(root, out var functionResponse, "functionResponse", "function_response", "toolResult", "tool_result"))
         {
             var id = FirstString(functionResponse, "id", "call_id", "name") ?? "unknown";
-            results.Add(new ToolResultBuilder(id, !Bool(functionResponse, "is_error", "error"), OutputBytes(functionResponse)));
+            results.Add(new ToolResultBuilder(id, !Bool(functionResponse, "is_error", "error"), OutputBytes(functionResponse), timestamp, FirstDuration(functionResponse)));
         }
 
         if (TryGet(root, out var candidates, "candidates") && candidates.ValueKind == JsonValueKind.Array)
@@ -364,22 +370,25 @@ public static class AgentStreamParserSelection
     {
         if (sniffedKind is not null)
             return sniffedKind.Value;
-
-        var candidatePhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { file.Phase };
-        if (file.Phase.StartsWith("audit-llm-", StringComparison.OrdinalIgnoreCase))
-            candidatePhases.Add("audit");
-
-        var matchingKinds = costs
-            .Where(c => candidatePhases.Contains(c.Phase)
-                && ((!c.Iteration.HasValue && file.Iteration <= 1) || c.Iteration == file.Iteration))
-            .Select(c => new AgentKind(c.AgentKind))
-            .Distinct()
-            .ToList();
-        if (matchingKinds.Count == 1)
-            return matchingKinds[0];
-
-        return item.Agent ?? new AgentKind("unknown");
+        return new AgentKind("unknown");
     }
+
+    public static bool ShouldTreatAsUnsupported(AgentKind kind, AgentStreamSummary summary)
+    {
+        if (string.Equals(kind.Value, "unknown", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Codex 0.128 emits thread/item/turn JSONL without timestamps. Unless
+        // the stream contains explicit duration/timestamp fields, persisting
+        // token/tool counts as a normal invocation would hide that the primary
+        // timing analytics cannot be computed from this CLI shape.
+        return kind == AgentKind.Codex
+            && ((summary.TotalDuration == TimeSpan.Zero || summary.TimeToFirstToken is null)
+                || summary.ToolCalls.Any(t => t.Duration is null));
+    }
+
+    public static AgentStreamSummary UnsupportedSummary() =>
+        new(TimeSpan.Zero, null, 0, 0, 0, null, [], [], null);
 
     private static AgentKind? SniffKind(JsonElement root)
     {
@@ -475,7 +484,7 @@ public static class AgentStreamAnalytics
             .OrderBy(t => t.Start)
             .ToList();
         if (intervals.Count == 0)
-            return 0;
+            return toolCalls.Sum(t => ToMs(t.Duration));
 
         var total = TimeSpan.Zero;
         var currentStart = intervals[0].Start;
@@ -528,6 +537,8 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         var cachedInputTokens = 0;
         decimal? estimatedUsd = null;
         string? finalText = null;
+        TimeSpan? observedTotalDuration = null;
+        TimeSpan? observedTimeToFirstToken = null;
 
         await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, _options.MaxLineBytes, ct).ConfigureAwait(false))
         {
@@ -590,18 +601,22 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             {
                 if (toolStarts.Remove(result.Id, out var started))
                 {
-                    var duration = started.StartedAt.HasValue && timestamp.HasValue
-                        ? timestamp.Value - started.StartedAt.Value
-                        : (TimeSpan?)null;
+                    var endedAt = result.EndedAt ?? timestamp;
+                    var duration = result.Duration
+                        ?? (started.StartedAt.HasValue && endedAt.HasValue
+                            ? endedAt.Value - started.StartedAt.Value
+                            : (TimeSpan?)null);
                     if (duration.HasValue && duration.Value < TimeSpan.Zero)
                         duration = null;
+                    if (endedAt is null && started.StartedAt.HasValue && duration.HasValue)
+                        endedAt = started.StartedAt.Value + duration.Value;
 
                     completedTools.Add(new ToolCallInvocation(
                         started.Id,
                         started.Name,
                         started.InputSummary,
                         started.StartedAt,
-                        timestamp,
+                        endedAt,
                         duration,
                         result.Succeeded,
                         result.OutputBytes));
@@ -613,6 +628,8 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             if (parsed.CachedInputTokens.HasValue) cachedInputTokens = parsed.CachedInputTokens.Value;
             if (parsed.EstimatedUsd.HasValue) estimatedUsd = parsed.EstimatedUsd.Value;
             if (!string.IsNullOrWhiteSpace(parsed.FinalText)) finalText = parsed.FinalText;
+            if (parsed.TotalDuration.HasValue) observedTotalDuration = parsed.TotalDuration.Value;
+            if (parsed.TimeToFirstToken.HasValue) observedTimeToFirstToken = parsed.TimeToFirstToken.Value;
 
             if (eventCount >= _options.MaxEvents)
                 break;
@@ -631,12 +648,14 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                 0));
         }
 
-        var total = firstTimestamp.HasValue && lastTimestamp.HasValue
-            ? lastTimestamp.Value - firstTimestamp.Value
-            : TimeSpan.Zero;
-        var ttft = firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
-            ? firstAssistantTimestamp.Value - firstTimestamp.Value
-            : (TimeSpan?)null;
+        var total = observedTotalDuration
+            ?? (firstTimestamp.HasValue && lastTimestamp.HasValue
+                ? lastTimestamp.Value - firstTimestamp.Value
+                : TimeSpan.Zero);
+        var ttft = observedTimeToFirstToken
+            ?? (firstTimestamp.HasValue && firstAssistantTimestamp.HasValue
+                ? firstAssistantTimestamp.Value - firstTimestamp.Value
+                : (TimeSpan?)null);
 
         return new AgentStreamSummary(
             total < TimeSpan.Zero ? TimeSpan.Zero : total,
@@ -704,7 +723,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             || string.Equals(type, "function_call_output", StringComparison.OrdinalIgnoreCase))
         {
             var id = FirstString(root, "tool_use_id", "call_id", "id") ?? "unknown";
-            results = results.Concat([new ToolResultBuilder(id, !Bool(root, "is_error", "error"), OutputBytes(root))]).ToList();
+            results = results.Concat([new ToolResultBuilder(id, !Bool(root, "is_error", "error"), OutputBytes(root), timestamp, FirstDuration(root))]).ToList();
         }
 
         if (string.Equals(type, "tool_use", StringComparison.OrdinalIgnoreCase)
@@ -718,6 +737,11 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         ParseUsage(root, out var inputTokens, out var outputTokens, out var cachedInputTokens);
         var finalText = FirstString(root, "result", "final", "final_message", "text", "content") ?? contentText;
         var cost = FirstDecimal(root, "total_cost_usd", "cost_usd", "estimated_usd");
+        var totalDuration = string.Equals(type, "turn.completed", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "result", StringComparison.OrdinalIgnoreCase)
+            ? FirstDuration(root)
+            : null;
+        var ttft = FirstDuration(root, "time_to_first_token_ms", "ttft_ms", "ttft_duration_ms");
         return new ParsedEvent(
             NormalizeType(type, starts, results, isAssistant),
             timestamp,
@@ -728,6 +752,8 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
             outputTokens,
             cachedInputTokens,
             cost,
+            totalDuration,
+            ttft,
             string.Equals(type, "result", StringComparison.OrdinalIgnoreCase) ? finalText : contentText);
     }
 
@@ -771,7 +797,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
                      || string.Equals(itemType, "function_response", StringComparison.OrdinalIgnoreCase))
             {
                 var id = FirstString(item, "tool_use_id", "id", "call_id") ?? "unknown";
-                results.Add(new ToolResultBuilder(id, !Bool(item, "is_error", "error"), OutputBytes(item)));
+                results.Add(new ToolResultBuilder(id, !Bool(item, "is_error", "error"), OutputBytes(item), null, FirstDuration(item)));
             }
             else if (string.Equals(itemType, "text", StringComparison.OrdinalIgnoreCase)
                      || string.Equals(itemType, "output_text", StringComparison.OrdinalIgnoreCase))
@@ -799,16 +825,124 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
     private static int? FirstCachedInputTokens(JsonElement root) =>
         FirstInt(root, "cache_read_input_tokens", "cached_input_tokens", "cached_tokens", "cache_creation_input_tokens");
 
-    protected static DateTimeOffset? TryTimestamp(JsonElement root)
+    protected static DateTimeOffset? TryTimestamp(JsonElement root, params string[] preferredNames)
     {
-        var raw = FirstString(root, "timestamp", "created_at", "time");
-        if (raw is not null && DateTimeOffset.TryParse(raw, out var dto))
-            return dto;
-        var unixMs = FirstLong(root, "timestamp_ms", "created_at_ms");
-        if (unixMs.HasValue)
-            return DateTimeOffset.FromUnixTimeMilliseconds(unixMs.Value);
-        var unixSeconds = FirstLong(root, "created", "timestamp");
-        return unixSeconds.HasValue ? DateTimeOffset.FromUnixTimeSeconds(unixSeconds.Value) : null;
+        foreach (var name in preferredNames)
+        {
+            if (TryParseTimestampProperty(root, name) is { } preferred)
+                return preferred;
+        }
+
+        foreach (var name in new[]
+        {
+            "timestamp", "created_at", "time", "started_at", "completed_at", "ended_at",
+            "timestamp_ms", "created_at_ms", "started_at_ms", "completed_at_ms", "ended_at_ms",
+            "started_at_unix_ms", "completed_at_unix_ms", "ended_at_unix_ms",
+            "created", "started_at_unix", "completed_at_unix", "ended_at_unix",
+        })
+        {
+            if (TryParseTimestampProperty(root, name) is { } parsed)
+                return parsed;
+        }
+
+        return null;
+    }
+
+    private static DateTimeOffset? TryParseTimestampProperty(JsonElement root, string name)
+    {
+        if (!TryGet(root, out var value, name))
+            return null;
+
+        if (value.ValueKind == JsonValueKind.String)
+        {
+            var raw = value.GetString();
+            if (raw is not null && DateTimeOffset.TryParse(raw, out var dto))
+                return dto;
+            if (raw is not null && long.TryParse(raw, out var numeric))
+                return TimestampFromNumber(name, numeric);
+            return null;
+        }
+
+        return value.TryGetInt64(out var parsed) ? TimestampFromNumber(name, parsed) : null;
+    }
+
+    private static DateTimeOffset? TimestampFromNumber(string name, long value)
+    {
+        try
+        {
+            if (name.EndsWith("_ms", StringComparison.OrdinalIgnoreCase)
+                || name.EndsWith("Ms", StringComparison.Ordinal)
+                || value > 10_000_000_000)
+            {
+                return DateTimeOffset.FromUnixTimeMilliseconds(value);
+            }
+
+            return DateTimeOffset.FromUnixTimeSeconds(value);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
+    protected static TimeSpan? FirstDuration(JsonElement el)
+        => FirstDuration(el,
+            "duration_ms", "elapsed_ms", "wall_time_ms", "runtime_ms",
+            "duration_seconds", "elapsed_seconds", "wall_time_seconds", "runtime_seconds",
+            "duration", "elapsed", "wall_time");
+
+    protected static TimeSpan? FirstDuration(JsonElement el, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (!TryGet(el, out var value, name))
+                continue;
+
+            if (value.TryGetDouble(out var numeric) && numeric >= 0)
+            {
+                return name.EndsWith("_seconds", StringComparison.OrdinalIgnoreCase)
+                    || name.EndsWith("Seconds", StringComparison.Ordinal)
+                    ? TimeSpan.FromSeconds(numeric)
+                    : TimeSpan.FromMilliseconds(numeric);
+            }
+
+            if (value.ValueKind != JsonValueKind.String)
+                continue;
+            var raw = value.GetString();
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+            if (TimeSpan.TryParse(raw, out var parsed) && parsed >= TimeSpan.Zero)
+                return parsed;
+            if (raw.EndsWith("ms", StringComparison.OrdinalIgnoreCase)
+                && double.TryParse(raw[..^2], out var ms)
+                && ms >= 0)
+                return TimeSpan.FromMilliseconds(ms);
+            if (raw.EndsWith("s", StringComparison.OrdinalIgnoreCase)
+                && double.TryParse(raw[..^1], out var seconds)
+                && seconds >= 0)
+                return TimeSpan.FromSeconds(seconds);
+        }
+
+        if (FirstString(el, "aggregated_output", "output") is { } output)
+        {
+            var marker = "Wall time:";
+            var index = output.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (index >= 0)
+            {
+                var tail = output[(index + marker.Length)..].TrimStart();
+                var end = tail.IndexOfAny(['\r', '\n']);
+                var line = end >= 0 ? tail[..end] : tail;
+                line = line.Replace("seconds", "s", StringComparison.OrdinalIgnoreCase)
+                    .Replace("second", "s", StringComparison.OrdinalIgnoreCase)
+                    .Trim();
+                if (line.EndsWith("s", StringComparison.OrdinalIgnoreCase)
+                    && double.TryParse(line[..^1].Trim(), out var seconds)
+                    && seconds >= 0)
+                    return TimeSpan.FromSeconds(seconds);
+            }
+        }
+
+        return null;
     }
 
     protected static string InputSummary(JsonElement el)
@@ -987,10 +1121,17 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParser
         int? OutputTokens,
         int? CachedInputTokens,
         decimal? EstimatedUsd,
+        TimeSpan? TotalDuration,
+        TimeSpan? TimeToFirstToken,
         string? FinalText);
 
     protected sealed record ToolBuilder(string Id, string Name, string InputSummary, DateTimeOffset? StartedAt);
-    protected sealed record ToolResultBuilder(string Id, bool? Succeeded, int OutputBytes);
+    protected sealed record ToolResultBuilder(
+        string Id,
+        bool? Succeeded,
+        int OutputBytes,
+        DateTimeOffset? EndedAt,
+        TimeSpan? Duration);
 
     private sealed class InputSummaryTruncatedException : Exception
     {

@@ -95,7 +95,13 @@ internal static class AgentStreamEndpoints
             if (stream is null) return Results.NotFound();
 
             var summary = await parser.ParseAsync(stream, analysisCt);
-            return Results.Ok(ToSummaryDto(summary, fileName, file.Phase, file.Iteration, parser.Kind));
+            var rowKind = parser.Kind;
+            if (AgentStreamParserSelection.ShouldTreatAsUnsupported(rowKind, summary))
+            {
+                rowKind = new AgentKind("unknown");
+                summary = AgentStreamParserSelection.UnsupportedSummary();
+            }
+            return Results.Ok(ToSummaryDto(summary, fileName, file.Phase, file.Iteration, rowKind));
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {

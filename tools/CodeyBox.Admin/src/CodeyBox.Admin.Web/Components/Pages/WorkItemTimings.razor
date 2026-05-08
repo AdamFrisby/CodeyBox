@@ -261,7 +261,7 @@ else
             .OrderBy(t => t.Start)
             .ToList();
         if (intervals.Count == 0)
-            return 0;
+            return toolCalls.Sum(t => t.DurationMs ?? 0);
 
         var total = TimeSpan.Zero;
         var currentStart = intervals[0].Start;

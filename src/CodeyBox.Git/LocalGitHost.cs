@@ -57,6 +57,10 @@ public sealed class LocalGitHost : IGitHost
             if (seedFromUrl is not null)
                 Validation.ValidateRepositoryUrl(seedFromUrl, nameof(seedFromUrl));
 
+            var trustedDefaultBranch = string.IsNullOrWhiteSpace(baseBranch) && seedFromUrl is not null
+                ? await ResolveUpstreamDefaultBranchAsync(_opts.RootDirectory, path, seedFromUrl, ct)
+                : null;
+
             Directory.CreateDirectory(path);
             if (seedFromUrl is not null)
             {
@@ -77,6 +81,9 @@ public sealed class LocalGitHost : IGitHost
             {
                 Repository.Init(path, isBare: true);
             }
+
+            if (trustedDefaultBranch is not null)
+                WriteTrustedDefaultBranch(repoId, trustedDefaultBranch);
 
             // Allow non-fast-forward pushes from the work sandbox to its branch.
             // The receive hook is conservative: protect the default/target branch.
@@ -112,12 +119,22 @@ public sealed class LocalGitHost : IGitHost
 
     public async Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
     {
-        var path = GetRepoPath(repositoryId);
-        using var repo = new Repository(path);
-        var head = repo.Refs["HEAD"] as SymbolicReference;
-        if (head?.Target?.CanonicalName is { } target && target.StartsWith("refs/heads/", StringComparison.Ordinal))
-            return target["refs/heads/".Length..];
-        // If the repo was just init'd and has no commits yet, fall back.
+        var trustedPath = GetTrustedDefaultBranchPath(repositoryId);
+        if (File.Exists(trustedPath))
+        {
+            var branch = (await File.ReadAllTextAsync(trustedPath, ct).ConfigureAwait(false)).Trim();
+            if (!string.IsNullOrWhiteSpace(branch))
+            {
+                Validation.ValidateBranchName(branch, "defaultBranch");
+                return branch;
+            }
+        }
+
+        // Do not read HEAD from the bare repo here. The bare repo is mounted
+        // read-write into the sandbox, so HEAD is agent-controlled after the
+        // first run. Repos created before the trusted sidecar existed fall back
+        // to the configured host default until the next upstream refresh writes
+        // the sidecar.
         await Task.CompletedTask;
         return _opts.FallbackDefaultBranch;
     }
@@ -303,6 +320,8 @@ public sealed class LocalGitHost : IGitHost
         }
 
         Validation.ValidateBranchName(branch, nameof(baseBranch));
+        if (string.IsNullOrWhiteSpace(baseBranch))
+            WriteTrustedDefaultBranch(Path.GetFileNameWithoutExtension(bareRepoPath), branch);
         SanitizeBareRepositoryConfig(bareRepoPath);
         var rc = await RunGitAsync(
             workdir: bareRepoPath,
@@ -325,15 +344,24 @@ public sealed class LocalGitHost : IGitHost
         if (!string.IsNullOrWhiteSpace(baseBranch))
             return baseBranch;
 
+        return await ResolveUpstreamDefaultBranchAsync(bareRepoPath, bareRepoPath, seedFromUrl, ct);
+    }
+
+    private async Task<string?> ResolveUpstreamDefaultBranchAsync(
+        string workdir,
+        string bareRepoPathForLog,
+        string seedFromUrl,
+        CancellationToken ct)
+    {
         // HEAD lives inside the sandbox-writable bare repo, so do not use it
         // to choose what host-side refresh should fetch. Ask the upstream for
-        // its advertised default branch under the host-controlled git config.
-        var rc = await RunGitAsync(bareRepoPath, ct, "ls-remote", "--symref", seedFromUrl, "HEAD");
+        // its advertised default branch under host-controlled git config.
+        var rc = await RunGitAsync(workdir, ct, "ls-remote", "--symref", seedFromUrl, "HEAD");
         if (rc.ExitCode != 0)
         {
             _log.LogWarning(
                 "Failed to resolve upstream default branch for bare repo {Path} from {Upstream}: {Stderr}",
-                bareRepoPath,
+                bareRepoPathForLog,
                 ScrubCredentialMaterial(seedFromUrl),
                 ScrubCredentialMaterial(rc.Stderr));
             return null;
@@ -353,8 +381,20 @@ public sealed class LocalGitHost : IGitHost
         _log.LogDebug(
             "Upstream {Upstream} did not advertise a symbolic HEAD while refreshing bare repo {Path}",
             ScrubCredentialMaterial(seedFromUrl),
-            bareRepoPath);
+            bareRepoPathForLog);
         return null;
+    }
+
+    private string GetTrustedDefaultBranchPath(string repositoryId)
+        => Path.Combine(_opts.RootDirectory, repositoryId + ".default-branch");
+
+    private void WriteTrustedDefaultBranch(string repositoryId, string branch)
+    {
+        Validation.ValidateBranchName(branch, "defaultBranch");
+        var path = GetTrustedDefaultBranchPath(repositoryId);
+        var tempPath = path + ".codeybox-" + Guid.NewGuid().ToString("N") + ".tmp";
+        File.WriteAllText(tempPath, branch + Environment.NewLine);
+        File.Move(tempPath, path, overwrite: true);
     }
 
     private static void SanitizeBareRepositoryConfig(string bareRepoPath)

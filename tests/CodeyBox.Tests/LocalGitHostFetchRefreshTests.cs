@@ -133,6 +133,23 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
     }
 
     [Fact]
+    public async Task GetDefaultBranchAsync_UsesTrustedUpstreamDefaultNotSandboxWritableHead()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
+        await CommitToRepoAsync(seed, "develop.txt", "develop\n", "create develop");
+
+        var gitHost = CreateGitHost();
+        var id = WorkItemId.New();
+
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, baseBranch: null);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await File.WriteAllTextAsync(Path.Combine(barePath, "HEAD"), "ref: refs/heads/attacker\n");
+
+        Assert.Equal("develop", await gitHost.GetDefaultBranchAsync(repoId));
+    }
+
+    [Fact]
     public async Task ExistingBareRepo_RefreshSanitizesSandboxWritableConfig()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

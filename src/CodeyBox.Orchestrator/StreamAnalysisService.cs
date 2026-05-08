@@ -77,12 +77,18 @@ public sealed class StreamAnalysisService : BackgroundService
                 continue;
 
             var summary = await parser.ParseAsync(stream, ct).ConfigureAwait(false);
+            var rowKind = parser.Kind;
+            if (AgentStreamParserSelection.ShouldTreatAsUnsupported(rowKind, summary))
+            {
+                rowKind = new AgentKind("unknown");
+                summary = AgentStreamParserSelection.UnsupportedSummary();
+            }
             var row = new AgentStreamSummaryRow(
                 item.Id,
                 file.FileName,
                 file.Phase,
                 file.Iteration,
-                parser.Kind,
+                rowKind,
                 summary,
                 DateTimeOffset.UtcNow);
             await _summaries.UpsertAsync(row, ct).ConfigureAwait(false);

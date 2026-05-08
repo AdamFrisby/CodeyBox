@@ -130,7 +130,7 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_DoesNotInferTimingFromCapturedFileMetadata()
+    public async Task ParseAsync_UsesCodexTimingFieldsWhenEventsDoNotHaveTopLevelTimestamps()
     {
         var parser = new CodexStreamParser();
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-codex-stream-{Guid.NewGuid():N}");
@@ -144,11 +144,11 @@ public sealed class CodexStreamParserTests
                 capture!.WriteChunk(
                     "{\"type\":\"thread.started\",\"thread_id\":\"thread_1\"}\n" +
                     "{\"type\":\"turn.started\"}\n" +
-                    "{\"type\":\"item.started\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n");
+                    "{\"type\":\"item.started\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\",\"started_at_unix_ms\":1767225601000}}\n");
                 capture.WriteChunk(
-                    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"/work\\n\",\"exit_code\":0,\"status\":\"completed\"}}\n" +
+                    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/bash -lc pwd\",\"aggregated_output\":\"/work\\n\",\"exit_code\":0,\"status\":\"completed\",\"completed_at_unix_ms\":1767225604000,\"duration_ms\":3000}}\n" +
                     "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"Done.\"}}\n" +
-                    "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":29990,\"cached_input_tokens\":18176,\"output_tokens\":44,\"reasoning_output_tokens\":0}}\n");
+                    "{\"type\":\"turn.completed\",\"duration_ms\":15000,\"time_to_first_token_ms\":1200,\"usage\":{\"input_tokens\":29990,\"cached_input_tokens\":18176,\"output_tokens\":44,\"reasoning_output_tokens\":0}}\n");
             }
 
             var file = Assert.Single(await store.ListAsync(itemId));
@@ -158,17 +158,17 @@ public sealed class CodexStreamParserTests
             var tool = Assert.Single(summary.ToolCalls);
             Assert.Equal("item_0", tool.ToolUseId);
             Assert.Equal("Bash", tool.ToolName);
-            Assert.Null(tool.StartedAt);
-            Assert.Null(tool.EndedAt);
-            Assert.Null(tool.Duration);
+            Assert.Equal(DateTimeOffset.FromUnixTimeMilliseconds(1767225601000), tool.StartedAt);
+            Assert.Equal(DateTimeOffset.FromUnixTimeMilliseconds(1767225604000), tool.EndedAt);
+            Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
             Assert.True(tool.Succeeded);
             Assert.Equal(6, tool.OutputBytes);
             Assert.Equal(29990, summary.InputTokens);
             Assert.Equal(44, summary.OutputTokens);
             Assert.Equal(18176, summary.CachedInputTokens);
             Assert.Equal("Done.", summary.FinalAssistantMessage);
-            Assert.Equal(TimeSpan.Zero, summary.TotalDuration);
-            Assert.Null(summary.TimeToFirstToken);
+            Assert.Equal(TimeSpan.FromSeconds(15), summary.TotalDuration);
+            Assert.Equal(TimeSpan.FromMilliseconds(1200), summary.TimeToFirstToken);
             Assert.Empty(summary.Stalls);
         }
         finally
@@ -465,6 +465,34 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_TreatsTiminglessCodexStreamAsUnsupported()
+    {
+        var item = CreateItem(WorkItemState.Done);
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl", """
+            {"type":"thread.started","thread_id":"thread_1"}
+            {"type":"turn.started"}
+            {"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+            {"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"/work\n","exit_code":0,"status":"completed"}}
+            {"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}
+            """);
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new CodexStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(new AgentKind("unknown"), row.AgentKind);
+        Assert.Equal(TimeSpan.Zero, row.Summary.TotalDuration);
+        Assert.Empty(row.Summary.ToolCalls);
+        Assert.Equal(0, row.Summary.InputTokens);
+    }
+
+    [Fact]
     public async Task AnalyzeRecentTerminalWorkItemsAsync_PropagatesStreamAnalysisFailures()
     {
         var item = CreateItem(WorkItemState.Done);
@@ -511,6 +539,49 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         _workItems.Dispose();
         try { File.Delete(_dbPath); } catch { }
         try { Directory.Delete(_streamRoot, recursive: true); } catch { }
+    }
+}
+
+public sealed class AgentStreamParserSelectionTests
+{
+    [Fact]
+    public void ResolveKind_WhenSniffingFails_DoesNotFallBackToWorkItemOrCostAgent()
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "stream",
+            Prompt = "stream",
+            Agent = AgentKind.Claude,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            12,
+            null,
+            DateTimeOffset.UtcNow);
+        var costs = new[]
+        {
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "work",
+                Iteration = 1,
+                AgentKind = "claude",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = DateTimeOffset.UtcNow,
+                EndedAt = DateTimeOffset.UtcNow,
+            },
+        };
+
+        var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind: null, costs);
+
+        Assert.Equal(new AgentKind("unknown"), kind);
     }
 }
 
