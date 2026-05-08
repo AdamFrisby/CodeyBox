@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
@@ -212,7 +213,7 @@ internal enum MergeStrategy
 /// File-write contents are consumed in order; provide one entry per
 /// expected work-phase (or rework-phase) invocation.
 /// </summary>
-internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, IConflictResolverAgentRunner
+internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
@@ -225,6 +226,9 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
     public string? ResultStdout { get; set; }
     public AgentKind Kind { get; init; } = AgentKind.Claude;
 
+    private sealed record ConflictResolverInputJson(List<ConflictResolverInputFileJson>? Files);
+    private sealed record ConflictResolverInputFileJson(string? Path, string? Content);
+
     public ScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
     {
         _mergeStrategies = new Queue<MergeStrategy>(mergeStrategies);
@@ -236,39 +240,43 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         return Task.FromResult(true);
     }
 
-    public Task<ConflictResolverResult> ResolveConflictsAsync(
-        ISandbox sandbox,
-        string workingDirectory,
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
-        IReadOnlyList<ConflictResolverFile> files,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default)
     {
-        _ = sandbox;
-        _ = workingDirectory;
-        _ = prompt;
         _ = credential;
         _ = modelId;
         _ = reasoningMode;
         _ = ct;
-        if (ConflictResolutionPlan.Count == 0)
+        if (prompt.StartsWith("# Merge conflict resolver", StringComparison.Ordinal))
         {
-            return Task.FromResult(new ConflictResolverResult(
-                false,
-                "ScriptedAgent: ran out of conflict-resolution plan entries",
-                new Dictionary<string, string>(StringComparer.Ordinal),
-                null,
+            if (ConflictResolutionPlan.Count == 0)
+                return Task.FromResult(new TextOnlyAgentResult(false, "ScriptedAgent: ran out of conflict-resolution plan entries", null, null));
+
+            var files = ParseConflictResolverFiles(prompt);
+            var resolved = ConflictResolutionPlan.Dequeue()(files);
+            var output = JsonSerializer.Serialize(new
+            {
+                files = resolved.Select(static f => new { path = f.Key, content = f.Value }),
+            });
+            return Task.FromResult(new TextOnlyAgentResult(true, "resolved", output, null));
+        }
+
+        if (prompt.StartsWith("# Advisory merge security review", StringComparison.Ordinal))
+        {
+            return Task.FromResult(new TextOnlyAgentResult(
+                true,
+                "reviewed",
+                ResultStdout ?? """
+                    {"findings":[{"title":"scripted advisory finding","description":"Advisory-only scripted merge security review finding.","location":"file.txt:1"}]}
+                    """,
                 null));
         }
 
-        return Task.FromResult(new ConflictResolverResult(
-            true,
-            "resolved",
-            ConflictResolutionPlan.Dequeue()(files),
-            ResultStdout,
-            null));
+        return Task.FromResult(new TextOnlyAgentResult(false, "unsupported text-only prompt", null, null));
     }
 
     public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
@@ -290,20 +298,26 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         {
             return await HandleMergeAsync(sandbox, workingDirectory, prompt, ct);
         }
-        if (prompt.Contains("# Advisory merge security review", StringComparison.Ordinal))
-        {
-            var r = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "scripted-security-review", "/audit/merge-security-review.json"],
-                Stdin = ResultStdout ?? """
-                    {"findings":[{"title":"scripted advisory finding","description":"Advisory-only scripted merge security review finding.","location":"file.txt:1"}]}
-                    """,
-            }, ct);
-            return r.Success
-                ? new AgentResult(true, "reviewed", ResultStdout, null)
-                : new AgentResult(false, "review failed", r.Stdout, r.Stderr);
-        }
         return await HandleWorkAsync(sandbox, workingDirectory, ct);
+    }
+
+    private static IReadOnlyList<ConflictResolverFile> ParseConflictResolverFiles(string prompt)
+    {
+        const string marker = "Conflicted file inputs are provided as JSON:";
+        var start = prompt.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+            return [];
+        start += marker.Length;
+        var end = prompt.IndexOf("\n\nReturn a single JSON object", start, StringComparison.Ordinal);
+        if (end < 0)
+            return [];
+        var json = prompt[start..end].Trim();
+        var parsed = JsonSerializer.Deserialize<ConflictResolverInputJson>(json, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        return parsed?.Files?
+            .Where(static f => !string.IsNullOrWhiteSpace(f.Path))
+            .Select(static f => new ConflictResolverFile(f.Path!, f.Content ?? string.Empty))
+            .ToList()
+            ?? [];
     }
 
     private async Task<AgentResult> HandleWorkAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct)

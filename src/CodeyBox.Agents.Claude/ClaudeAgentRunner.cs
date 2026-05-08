@@ -1,6 +1,9 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
 
 namespace CodeyBox.Agents.Claude;
 
@@ -9,8 +12,10 @@ namespace CodeyBox.Agents.Claude;
 /// is expected to be installed in the sandbox image; the host injects only
 /// the API token via tmpfs/env.
 /// </summary>
-public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider
+public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
+    private static readonly HttpClient TextOnlyHttp = new();
+
     public override AgentKind Kind => AgentKind.Claude;
 
     /// <summary>
@@ -95,6 +100,59 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? modelId = null,
         string? reasoningMode = null)
         => BuildClaudeInvocation(prompt, modelId, resume: true, captureStructuredStream: false);
+
+    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        _ = reasoningMode;
+        string? oauthToken = null;
+        string? apiKey = null;
+        credential?.EnvironmentVariables.TryGetValue("CLAUDE_CODE_OAUTH_TOKEN", out oauthToken);
+        credential?.EnvironmentVariables.TryGetValue("ANTHROPIC_API_KEY", out apiKey);
+        if (string.IsNullOrEmpty(oauthToken) && string.IsNullOrEmpty(apiKey))
+            return new TextOnlyAgentResult(false, "missing Claude text-only credential", null, "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required");
+
+        try
+        {
+            var body = JsonSerializer.Serialize(new
+            {
+                model = string.IsNullOrWhiteSpace(modelId) ? DefaultModelId ?? "claude-haiku-4-5-20251001" : modelId,
+                max_tokens = 8192,
+                messages = new[] { new { role = "user", content = prompt } },
+            });
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
+            if (!string.IsNullOrEmpty(oauthToken))
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", oauthToken);
+            else
+                request.Headers.Add("x-api-key", apiKey!);
+            request.Headers.Add("anthropic-version", "2023-06-01");
+            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+
+            using var response = await TextOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                return new TextOnlyAgentResult(false, $"Claude text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
+
+            using var doc = JsonDocument.Parse(responseText);
+            var output = string.Concat(doc.RootElement
+                .GetProperty("content")
+                .EnumerateArray()
+                .Where(static c => c.TryGetProperty("type", out var type)
+                    && string.Equals(type.GetString(), "text", StringComparison.Ordinal)
+                    && c.TryGetProperty("text", out _))
+                .Select(static c => c.GetProperty("text").GetString()));
+            return new TextOnlyAgentResult(true, "ok", output, null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new TextOnlyAgentResult(false, "Claude text-only call failed", null, ex.Message);
+        }
+    }
 
     private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, bool resume, bool captureStructuredStream)
     {

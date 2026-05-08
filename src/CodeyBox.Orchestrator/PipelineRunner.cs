@@ -1711,8 +1711,6 @@ public sealed class PipelineRunner : IPipelineRunner
                     prompt,
                     conflictHunks,
                     credential,
-                    project,
-                    item.Id,
                     item.ModelId,
                     item.ReasoningMode,
                     ct);
@@ -1939,19 +1937,17 @@ public sealed class PipelineRunner : IPipelineRunner
         string prompt,
         IReadOnlyList<ConflictHunk> conflictHunks,
         AgentCredential? credential,
-        Project project,
-        WorkItemId workItemId,
         string? modelId,
         string? reasoningMode,
         CancellationToken ct)
     {
-        if (runner is not IConflictResolverAgentRunner resolver)
+        if (runner is not ITextOnlyAgentRunner textOnlyRunner)
         {
             return new AgentResult(
                 false,
-                $"agent {runner.Kind} does not implement host-constrained merge conflict resolution",
+                $"agent {runner.Kind} does not implement text-only merge conflict resolution",
                 null,
-                "conflicted merges require IConflictResolverAgentRunner");
+                "conflicted merges require ITextOnlyAgentRunner");
         }
 
         var files = conflictHunks
@@ -1974,44 +1970,41 @@ public sealed class PipelineRunner : IPipelineRunner
             resolverFiles.Add(new ConflictResolverFile(file, read.Stdout));
         }
 
-        var resolverAccess = new SandboxRepositoryAccess(
-            CloneUrlInsideSandbox: "codeybox-conflict-resolver-text-only",
-            Mounts: [],
-            Network: SandboxNetworkPolicy.Denied);
-        var resolverSpec = BuildSandboxSpec(
-            resolverAccess,
-            includeAgentCredential: credential,
-            allowAgentNetwork: credential is not null,
-            hostNetworkProfile: project.NetworkProfiles.Merge,
-            timingWorkItemId: workItemId,
-            timingPhase: "merge-conflict-resolver");
-        await using var resolverSandbox = await _sandboxes.CreateAsync(resolverSpec, ct);
-        if (credential is not null && credential.Files.Count > 0)
-            await MaterialiseCredentialFilesAsync(resolverSandbox, credential, ct);
+        var resolverPrompt = BuildConflictResolverTextOnlyPrompt(prompt, resolverFiles);
+        var textResult = await textOnlyRunner.RunTextOnlyAsync(resolverPrompt, credential, modelId, reasoningMode, ct);
+        if (!textResult.Success)
+            return new AgentResult(false, textResult.Summary, textResult.Output, textResult.Error);
 
-        var result = await resolver.ResolveConflictsAsync(
-            resolverSandbox,
-            SandboxConventions.WorkDir,
-            prompt,
-            resolverFiles,
-            credential,
-            modelId,
-            reasoningMode,
-            ct);
-        if (!result.Success)
-            return new AgentResult(false, result.Summary, result.Stdout, result.Stderr);
+        ConflictResolutionJson parsed;
+        try
+        {
+            parsed = JsonSerializer.Deserialize<ConflictResolutionJson>(ExtractJsonObject(textResult.Output), JsonOpts)
+                ?? new ConflictResolutionJson(null);
+        }
+        catch (JsonException ex)
+        {
+            return new AgentResult(false, $"conflict resolver produced invalid JSON: {ex.Message}", textResult.Output, textResult.Error);
+        }
+
+        var resolvedFiles = parsed.Files?
+            .Where(static f => !string.IsNullOrWhiteSpace(f.Path))
+            .ToDictionary(
+                static f => f.Path!,
+                static f => f.Content ?? string.Empty,
+                StringComparer.Ordinal)
+            ?? new Dictionary<string, string>(StringComparer.Ordinal);
 
         var expected = files.ToHashSet(StringComparer.Ordinal);
-        var actual = result.ResolvedFiles.Keys.ToHashSet(StringComparer.Ordinal);
+        var actual = resolvedFiles.Keys.ToHashSet(StringComparer.Ordinal);
         var missing = expected.Except(actual, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
         var extra = actual.Except(expected, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
         if (missing.Length > 0 || extra.Length > 0)
         {
             var message = $"conflict resolver returned an invalid file set; missing=[{string.Join(", ", missing)}], extra=[{string.Join(", ", extra)}]";
-            return new AgentResult(false, message, result.Stdout, result.Stderr);
+            return new AgentResult(false, message, textResult.Output, textResult.Error);
         }
 
-        foreach (var (path, content) in result.ResolvedFiles)
+        foreach (var (path, content) in resolvedFiles)
         {
             ValidateConflictResolverPath(path);
             var write = await sandbox.ExecAsync(new SandboxExec
@@ -2023,7 +2016,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 return new AgentResult(false, $"failed to write resolved file '{path}'", write.Stdout, write.Stderr);
         }
 
-        return new AgentResult(true, result.Summary, result.Stdout, result.Stderr);
+        return new AgentResult(true, textResult.Summary, textResult.Output, textResult.Error);
     }
 
     private static void ValidateConflictResolverPath(string path)
@@ -2321,34 +2314,41 @@ public sealed class PipelineRunner : IPipelineRunner
         if (findings.Count == 0)
             return;
 
-        var ended = DateTimeOffset.UtcNow;
-        await _auditReports.CreateAsync(new AuditReport
+        try
         {
-            Id = $"{repoId}:merge-security-review:{mergeSha}",
-            WorkItemId = workItemId.ToString(),
-            Iteration = 0,
-            AuditorName = "merge-security-review",
-            AuditorKind = "llm-advisory-readonly",
-            WorstSeverity = "Info",
-            StartedAt = started,
-            EndedAt = ended,
-            DurationMs = (long)(ended - started).TotalMilliseconds,
-            Findings = findings.Select(f =>
+            var ended = DateTimeOffset.UtcNow;
+            await _auditReports.CreateAsync(new AuditReport
             {
-                var (files, lineHints) = ParseLocation(f.Location);
-                var reportFiles = files.Count == 0 ? conflictedFiles : files;
-                return new AuditReportFinding(
-                    FindingIdComputer.Compute(f.AuditorName, f.Title, reportFiles),
-                    "Info",
-                    f.Title,
-                    f.Description,
-                    reportFiles,
-                    lineHints);
-            }).ToList(),
-            RawOutput = RawOutputRedactor.TruncateToBytes(
-                RawOutputRedactor.Redact(rawOutput ?? "Advisory-only security review. Deterministic scope fence is the merge gate."),
-                256 * 1024),
-        }, ct);
+                Id = $"{repoId}:merge-security-review:{mergeSha}",
+                WorkItemId = workItemId.ToString(),
+                Iteration = 0,
+                AuditorName = "merge-security-review",
+                AuditorKind = "llm-advisory-readonly",
+                WorstSeverity = "Info",
+                StartedAt = started,
+                EndedAt = ended,
+                DurationMs = (long)(ended - started).TotalMilliseconds,
+                Findings = findings.Select(f =>
+                {
+                    var (files, lineHints) = ParseLocation(f.Location);
+                    var reportFiles = files.Count == 0 ? conflictedFiles : files;
+                    return new AuditReportFinding(
+                        FindingIdComputer.Compute(f.AuditorName, f.Title, reportFiles),
+                        "Info",
+                        f.Title,
+                        f.Description,
+                        reportFiles,
+                        lineHints);
+                }).ToList(),
+                RawOutput = RawOutputRedactor.TruncateToBytes(
+                    RawOutputRedactor.Redact(rawOutput ?? "Advisory-only security review. Deterministic scope fence is the merge gate."),
+                    256 * 1024),
+            }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Failed to persist advisory merge security review for work item {WorkItemId}", workItemId);
+        }
     }
 
     private async Task<(MergeSecurityReviewJson? Review, string? RawOutput)> RunMergeSecurityReviewAsync(
@@ -2359,48 +2359,33 @@ public sealed class PipelineRunner : IPipelineRunner
         string diff,
         CancellationToken ct)
     {
-        var access = new SandboxRepositoryAccess(
-            CloneUrlInsideSandbox: "codeybox-merge-security-review-readonly",
-            Mounts: [],
-            Network: SandboxNetworkPolicy.Denied);
-        var spec = BuildSandboxSpec(
-            access,
-            includeAgentCredential: credential,
-            allowAgentNetwork: credential is not null,
-            hostNetworkProfile: project.NetworkProfiles.AuditAgent,
-            timingWorkItemId: workItemId,
-            timingPhase: "merge-security-review");
-        spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
-        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-        if (credential is not null && credential.Files.Count > 0)
-            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
-        await Run(sandbox, "mkdir", "-p", "/audit");
+        _ = workItemId;
+        _ = project;
+        if (runner is not ITextOnlyAgentRunner textOnlyRunner)
+        {
+            _log.LogWarning(
+                "Advisory merge security review skipped because agent {AgentKind} does not implement text-only review",
+                runner.Kind.Value);
+            return (null, "Advisory merge security review skipped: configured agent is not text-only capable.");
+        }
 
         var prompt = BuildMergeSecurityReviewPrompt(diff);
-        var result = await runner.RunAsync(
-            sandbox,
-            SandboxConventions.WorkDir,
-            prompt,
-            credential,
-            modelId: null,
-            reasoningMode: null,
-            ct: ct);
+        var result = await textOnlyRunner.RunTextOnlyAsync(prompt, credential, modelId: null, reasoningMode: null, ct: ct);
         if (!result.Success)
         {
             _log.LogWarning(
                 "Advisory merge security review agent {AgentKind} failed: {Summary} {Stderr}",
                 runner.Kind.Value,
                 result.Summary,
-                result.Stderr);
-            return (null, result.Stdout);
+                result.Error);
+            return (null, result.Output);
         }
 
-        var read = await sandbox.ExecAsync(new SandboxExec { Argv = ["cat", "/audit/merge-security-review.json"] }, ct);
-        if (!read.Success || string.IsNullOrWhiteSpace(read.Stdout))
-            return (null, result.Stdout);
+        if (string.IsNullOrWhiteSpace(result.Output))
+            return (null, result.Output);
 
-        var parsed = JsonSerializer.Deserialize<MergeSecurityReviewJson>(read.Stdout, JsonOpts);
-        return (parsed, string.Concat(result.Stdout, "\n", read.Stdout));
+        var parsed = JsonSerializer.Deserialize<MergeSecurityReviewJson>(ExtractJsonObject(result.Output), JsonOpts);
+        return (parsed, result.Output);
     }
 
     internal static string BuildPrDescription(WorkItemId itemId, string? agentStdout)
@@ -2425,9 +2410,10 @@ public sealed class PipelineRunner : IPipelineRunner
         => $$"""
             # Advisory merge security review
 
-            You are a read-only security reviewer. Review only the resolved merge-conflict
-            diff provided in this prompt. Do not inspect the filesystem, run shell commands,
-            access the network beyond the model call, or write any file except the JSON result.
+            You are a read-only security reviewer running as a pure text-in/text-out
+            model call. Review only the resolved merge-conflict diff provided in this
+            prompt. You have no shell, filesystem, repository checkout, agent tools,
+            or model-controlled network access.
 
             This review is advisory only. The deterministic host scope fence is the merge gate.
             Surface suspicious patterns such as dynamic code execution, network access,
@@ -2438,22 +2424,69 @@ public sealed class PipelineRunner : IPipelineRunner
             {{diff.Replace("```", "` ` `", StringComparison.Ordinal)}}
             ```
 
-            Write /audit/merge-security-review.json as a single JSON object with this exact shape:
+            Return a single JSON object with this exact shape:
             {
               "findings": [
                 { "title": "short title", "description": "details", "location": "path:line" }
               ]
             }
 
-            Use an empty findings array when there is nothing suspicious. Do not include any
-            markdown or commentary in the JSON file. Exit after writing it.
+            Use an empty findings array when there is nothing suspicious. Return only
+            the JSON object, with no markdown or commentary.
             """;
+
+    private static string BuildConflictResolverTextOnlyPrompt(
+        string contractPrompt,
+        IReadOnlyList<ConflictResolverFile> files)
+    {
+        var payload = JsonSerializer.Serialize(new
+        {
+            files = files.Select(static f => new { path = f.Path, content = f.Content }),
+        }, JsonOpts);
+
+        return $$"""
+            # Merge conflict resolver
+
+            You are resolving merge conflicts from text only. You have no shell,
+            filesystem, repository checkout, agent tools, or model-controlled network
+            access. Return complete resolved contents for exactly the provided paths.
+
+            Scope contract:
+            {{contractPrompt}}
+
+            Conflicted file inputs are provided as JSON:
+            {{payload}}
+
+            Return a single JSON object with this exact shape:
+            {
+              "files": [
+                { "path": "relative/path", "content": "complete resolved file contents" }
+              ]
+            }
+
+            Do not include markdown fences or commentary. Return only the JSON object.
+            """;
+    }
+
+    private static string ExtractJsonObject(string? output)
+    {
+        if (string.IsNullOrWhiteSpace(output))
+            throw new JsonException("empty JSON output");
+        var start = output.IndexOf('{');
+        var end = output.LastIndexOf('}');
+        if (start < 0 || end < start)
+            throw new JsonException("JSON object not found in output");
+        return output[start..(end + 1)];
+    }
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
     {
+        WriteIndented = true,
         PropertyNameCaseInsensitive = true,
     };
 
+    private sealed record ConflictResolutionJson(List<ConflictResolutionFileJson>? Files);
+    private sealed record ConflictResolutionFileJson(string? Path, string? Content);
     private sealed record MergeSecurityReviewJson(List<MergeSecurityReviewFindingJson>? Findings);
     private sealed record MergeSecurityReviewFindingJson(string? Title, string? Description, string? Location);
 

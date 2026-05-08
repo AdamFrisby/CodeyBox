@@ -35,32 +35,27 @@ public interface IStructuredStreamAgentRunner : IAgentRunner
 }
 
 /// <summary>
-/// Optional runner capability for merge conflict resolution. Unlike the normal
-/// merge path, this receives only conflict file text and runs in a text-only
-/// sandbox with no repository mount. The host writes returned contents back to
-/// the real merge worktree after deterministic scope-fence verification.
+/// Optional runner capability for prompts that must be handled as pure
+/// text-in/text-out model calls. Implementations must not expose a shell,
+/// filesystem, repository checkout, agent tool runtime, or model-controlled
+/// network to the prompt; the only output channel is returned text.
+/// Credentials are transport authentication for the provider call only and
+/// must never be included in the prompt, model-visible context, or returned
+/// output.
 /// </summary>
-public interface IConflictResolverAgentRunner : IAgentRunner
+public interface ITextOnlyAgentRunner : IAgentRunner
 {
-    Task<ConflictResolverResult> ResolveConflictsAsync(
-        ISandbox sandbox,
-        string workingDirectory,
+    Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
-        IReadOnlyList<ConflictResolverFile> files,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default);
 }
 
-public sealed record ConflictResolverFile(string Path, string Content);
+public sealed record TextOnlyAgentResult(bool Success, string Summary, string? Output, string? Error);
 
-public sealed record ConflictResolverResult(
-    bool Success,
-    string Summary,
-    IReadOnlyDictionary<string, string> ResolvedFiles,
-    string? Stdout,
-    string? Stderr);
+public sealed record ConflictResolverFile(string Path, string Content);
 
 /// <summary>
 /// Optional runner capability for CLIs where CodeyBox pins a default model

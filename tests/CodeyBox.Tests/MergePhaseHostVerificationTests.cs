@@ -342,6 +342,48 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
         Assert.Contains("Advisory-only", report.RawOutput);
     }
 
+    [Fact]
+    public async Task AdvisoryPersistenceFailureDoesNotGateMergeVerification()
+    {
+        var (gitHost, repoId) = await CreateConflictingRepoAsync();
+        var preMergeMain = await gitHost.ResolveCommitAsync(repoId, "main");
+        var workTip = await gitHost.ResolveCommitAsync(repoId, "work");
+        var hostMerge = await gitHost.ComputeMergeTreeAsync(repoId, preMergeMain, workTip);
+        var resolved = await CommitResolvedEvalInsideHunkAsync(gitHost, repoId);
+        using var workStore = new SqliteWorkItemStore(Path.Combine(_workspace, "throwing-audit.db"));
+        var workItemId = WorkItemId.New();
+        await workStore.CreateAsync(new WorkItem
+        {
+            Id = workItemId,
+            ProjectId = new ProjectId("test-project"),
+            Title = "security advisory persistence",
+            Prompt = "merge",
+            WorkBranch = "work",
+        });
+        var reviewAgent = new ScriptedAgent([]);
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = "unused",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit(),
+        };
+        var pipeline = CreateVerifier(gitHost, workStore, new ThrowingAuditReportStore(), reviewAgent, project);
+
+        await pipeline.VerifyMergeResultAgainstHostAsync(
+            workItemId,
+            repoId,
+            preMergeMain,
+            workTip,
+            resolved,
+            hostMerge,
+            bufferLines: 5,
+            ct: CancellationToken.None,
+            project: project,
+            securityReviewRunner: reviewAgent);
+    }
+
     private async Task<(LocalGitHost GitHost, string RepoId)> CreateConflictingRepoAsync()
     {
         var seed = Path.Combine(_workspace, "seed");
@@ -432,5 +474,20 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
         var stderr = await process.StandardError.ReadToEndAsync();
         await process.WaitForExitAsync();
         return (process.ExitCode, stdout, stderr);
+    }
+
+    private sealed class ThrowingAuditReportStore : IAuditReportStore
+    {
+        public Task CreateAsync(AuditReport report, CancellationToken ct = default) =>
+            throw new InvalidOperationException("simulated advisory persistence failure");
+
+        public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<AuditReport>>([]);
+
+        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default) =>
+            Task.FromResult(0);
     }
 }

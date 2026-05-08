@@ -64,10 +64,11 @@ commit and the work tip in its ancestry. For conflicted merges, the normal
 repository-mounted merge agent runner is not invoked. The host first creates the
 conflicted working tree, reads only the conflicted file contents, records each
 `<<<<<<<` ... `>>>>>>>` hunk in pre-merge main-file line coordinates, and sends
-that text to an `IConflictResolverAgentRunner` in a separate text-only sandbox
-with no repository checkout or git remote. The resolver can only return complete
-replacement contents for exactly the conflicted paths; the host applies those
-contents to the merge worktree.
+that text through `ITextOnlyAgentRunner`. That call is pure text-in/text-out:
+no repository checkout, shell, filesystem, agent tools, writable result file, or
+model-controlled network is exposed to the untrusted conflict text. The resolver
+can only return complete replacement contents for exactly the conflicted paths;
+the host applies those contents to the merge worktree.
 
 After the host writes those returned contents and creates the merge commit, it
 applies a deterministic scope fence before updating main. The final
@@ -81,10 +82,12 @@ item enters `MergeConflictResolutionFailed`.
 
 This deterministic scope fence is the security boundary. The optional merge
 security review is an LLM text review over the resolved conflict diff in a
-separate sandbox with no repository checkout. It is advisory-only: it has no
-authority to fail the merge because it reads the same untrusted conflict content
-as the resolver. Findings are logged for operator review, but only host git
-verification and the scope fence gate the push.
+pure text-in/text-out call with no repository checkout, shell, filesystem, agent
+tools, writable result file, or model-controlled network. It is advisory-only:
+it has no authority to fail the merge because it reads the same untrusted
+conflict content as the resolver. Findings are logged for operator review, but
+review failures and finding-persistence failures do not block the merge; only
+host git verification and the scope fence gate the push.
 
 ## State machine
 
