@@ -74,7 +74,7 @@ internal static class FleetEndpoints
                 .Select(r => ((WorkItemState)r.State).ToString())
                 .ToList();
 
-            var hasRecentFailures = projectOutcomes.Count(o => o is "Failed" or "AuditFailed") >= 3;
+            var hasRecentFailures = projectOutcomes.Count(o => o is "Failed" or "AuditFailed" or "MergeConflictResolutionFailed") >= 3;
 
             double? monthlySpendUsd = null;
             string budgetThresholdState = "unknown";

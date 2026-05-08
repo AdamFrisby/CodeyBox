@@ -53,12 +53,24 @@ See [`audit.md`](audit.md) for the audit phase in detail.
 | Host git server              | Host (or sidecar)  | Sandbox network    | No                    | No                    |
 | Upstream remote (e.g. GitHub)| External           | —                  | —                     | —                     |
 
-The merge phase is **agent-driven**: it gets agent credentials so the
-agent can resolve merge conflicts and run the project's test suite. The
-orchestrator verifies merge state (head matches the expected post-merge
-SHA, working tree is clean) before allowing phase 4. The egress reduction
-that protects the merge phase against exfiltration is the project's
-`merge` network profile — typically the same as `work`, or stricter.
+The merge phase is host-verified. Before accepting an agent-produced merge,
+the orchestrator runs host-side `git merge-tree --write-tree --no-messages`
+against the pre-merge main commit and the work tip.
+
+For clean merges, the agent commit tree must exactly match the host
+`merge-tree` result. For conflicted merges, the host reads the conflict-marker
+tree, records each `<<<<<<<` ... `>>>>>>>` hunk, and applies a deterministic
+scope fence to the resolved commit. The resolver may change only conflicted
+files and only lines inside those hunks plus `Audit.MergeScopeBufferLines`
+context lines. The default buffer is 5. New files, deletes, renames, edits to
+non-conflicted files, and whitespace-only edits outside the allowed ranges are
+rejected and the work item enters `MergeConflictResolutionFailed`.
+
+This deterministic scope fence is the security boundary. The optional merge
+security review is advisory-only: it has no authority to fail the merge because
+it reads the same untrusted conflict content as the resolver. Findings are
+logged for operator review, but only host git verification and the scope fence
+gate the push.
 
 ## State machine
 
@@ -72,6 +84,9 @@ Queued → Working → WorkComplete ─┬─→ Auditing ─pass─→ AuditPas
                                  │      └─maxIters─→ AuditFailed (terminal)
                                  │
                                  └─(no auditors registered)─→ Merging ─→ ...
+
+Merging can also terminate as `MergeConflictResolutionFailed` when host-side
+merge verification or the scope fence rejects a conflict resolution.
 
 Cancelled (via DELETE /workitems/{id}) is reachable from any non-terminal state.
 ```

@@ -27,10 +27,10 @@ namespace CodeyBox.Orchestrator;
 /// running concurrently never share creds — per-project upstream tokens
 /// are read fresh from the env, never persisted between runs.
 ///
-/// Merge phase invokes the work item's agent (Claude / Codex / etc.) so
-/// non-trivial conflicts can be resolved instead of failing the merge.
-/// The orchestrator verifies the agent's output before pushing — see
-/// <see cref="VerifyMergeStateAsync"/>.
+/// Merge phase verifies the work item's agent output with host-side
+/// <c>git merge-tree</c>. Conflict resolutions are accepted only when the
+/// deterministic scope fence shows the resolver changed conflicted hunks
+/// and the configured buffer.
 /// </summary>
 public sealed class PipelineRunner : IPipelineRunner
 {
@@ -382,6 +382,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // Operator-requested cancel (DELETE /workitems/{id}).
                 var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
                 if (current.State is not WorkItemState.Done and not WorkItemState.Failed
+                    and not WorkItemState.MergeConflictResolutionFailed
                     and not WorkItemState.AbandonedAfterRecoveryAttempts)
                 {
                     var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
@@ -407,6 +408,19 @@ public sealed class PipelineRunner : IPipelineRunner
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "work_item.audit_failed",
+                WorkItem = failed,
+                Project = project,
+            }, CancellationToken.None);
+        }
+        catch (MergeConflictResolutionFailedException ex)
+        {
+            _log.LogWarning("Work item {Id} merge conflict resolution failed: {Error}", item.Id, ex.Message);
+            var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+            var failed = current.With(WorkItemState.MergeConflictResolutionFailed, ex.Message);
+            await _store.UpdateAsync(failed, CancellationToken.None);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.merge_conflict_resolution_failed",
                 WorkItem = failed,
                 Project = project,
             }, CancellationToken.None);
@@ -1596,15 +1610,10 @@ public sealed class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Merge phase: invoke the work-item's agent inside a sandbox to perform
-    /// the merge, including conflict resolution. The agent does not push;
-    /// the orchestrator verifies the merge state and pushes itself.
-    ///
-    /// Security note: the merge sandbox NOW carries agent credentials (so
-    /// the agent can call its API to reason about conflicts). This widens
-    /// the attack surface compared to the previous deterministic merge —
-    /// see docs/security-audit.md (Finding U). The mitigation is the same
-    /// network policy as the work sandbox: only the agent's API endpoint
-    /// is reachable.
+    /// the merge, then verify the result against host-side git. The agent does
+    /// not push; the orchestrator compares clean merges against
+    /// <c>git merge-tree --write-tree</c> and scope-fences conflict
+    /// resolutions before pushing.
     /// </summary>
     private async Task<(string MergeSha, string? AgentStdout)> RunAgentMergePhaseAsync(
         WorkItem item,
@@ -1620,16 +1629,20 @@ public sealed class PipelineRunner : IPipelineRunner
         var credential = _credentials is IProjectAwareCredentialProvider pac
             ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
             : await _credentials.GetAsync(runner.Kind, ct);
+        var preMergeSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
+        var workTipSha = await _gitHost.ResolveCommitAsync(repoId, workBranch, ct);
+        var hostMerge = await _gitHost.ComputeMergeTreeAsync(repoId, preMergeSha, workTipSha, ct);
+        var mergeCredential = hostMerge.HasConflicts ? null : credential;
         var access = _gitHost.GetSandboxAccess(repoId);
-        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
+        var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: !hostMerge.HasConflicts,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge");
         var mergeSandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         mergeSandboxStartSw.Stop();
         CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
 
-        if (credential is not null && credential.Files.Count > 0)
-            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+        if (mergeCredential is not null && mergeCredential.Files.Count > 0)
+            await MaterialiseCredentialFilesAsync(sandbox, mergeCredential, ct);
 
         var mergeCloneScope = await TimingScope.BeginAsync(
             _timings, item.Id, "merge", "git.clone_into_sandbox",
@@ -1649,9 +1662,11 @@ public sealed class PipelineRunner : IPipelineRunner
             Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
         }, ct);
         if (!preMerge.Success) throw new InvalidOperationException($"pre-merge rev-parse failed: {preMerge.Stderr}");
-        var preMergeSha = preMerge.Stdout.Trim();
+        if (!string.Equals(preMerge.Stdout.Trim(), preMergeSha, StringComparison.Ordinal))
+            throw new MergePhaseInconsistentResultException(
+                $"sandbox checked out {preMerge.Stdout.Trim()}, but host base '{baseBranch}' resolved to {preMergeSha}");
 
-        var prompt = BuildMergePrompt(baseBranch, workBranch);
+        var prompt = BuildMergePrompt(baseBranch, workBranch, hostMerge, project.Audit.MergeScopeBufferLines);
         AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
         var mergeSw = Stopwatch.StartNew();
 
@@ -1671,7 +1686,7 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             await using (mergeExecScope)
             {
-                var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
+                var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                     stdoutChunkCallback: mergeStdoutCallback,
                     captureStructuredStream: mergeStreamCapture is not null);
                 var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
@@ -1720,6 +1735,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 _auditQuotaOptions.ObservedFailureRetention,
                 ct,
                 projectId: item.ProjectId);
+            if (hostMerge.HasConflicts)
+                throw new MergeConflictResolutionFailedException(
+                    $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
             throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
         }
 
@@ -1739,6 +1757,16 @@ public sealed class PipelineRunner : IPipelineRunner
         }, ct);
 
         var mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
+        var verificationRef = $"refs/codeybox/merge-verification/{item.Id}";
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
+        await VerifyMergeResultAgainstHostAsync(
+            repoId,
+            preMergeSha,
+            workTipSha,
+            mergeSha,
+            hostMerge,
+            project.Audit.MergeScopeBufferLines,
+            ct);
 
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{baseBranch}:{baseBranch}");
 
@@ -1794,6 +1822,96 @@ public sealed class PipelineRunner : IPipelineRunner
         return headSha;
     }
 
+    private async Task VerifyMergeResultAgainstHostAsync(
+        string repoId,
+        string preMergeSha,
+        string workTipSha,
+        string mergeSha,
+        GitMergeTreeResult hostMerge,
+        int bufferLines,
+        CancellationToken ct)
+    {
+        var refreshedHostMerge = await _gitHost.ComputeMergeTreeAsync(repoId, preMergeSha, workTipSha, ct);
+        if (refreshedHostMerge.HasConflicts != hostMerge.HasConflicts
+            || !string.Equals(refreshedHostMerge.TreeSha, hostMerge.TreeSha, StringComparison.Ordinal))
+        {
+            throw new MergePhaseInconsistentResultException(
+                "host git merge-tree result changed during merge verification; refusing to push agent merge");
+        }
+
+        var agentTree = await _gitHost.ResolveTreeAsync(repoId, mergeSha, ct);
+        if (!hostMerge.HasConflicts)
+        {
+            if (!string.Equals(agentTree, hostMerge.TreeSha, StringComparison.Ordinal))
+            {
+                throw new MergePhaseInconsistentResultException(
+                    $"merge agent commit tree {agentTree} does not match host git merge-tree {hostMerge.TreeSha}");
+            }
+            await RecordMergeSecurityReviewAsync(repoId, preMergeSha, mergeSha, [], ct);
+            return;
+        }
+
+        var hunks = new List<ConflictHunk>();
+        foreach (var file in hostMerge.ConflictedFiles)
+        {
+            var conflictedContent = await _gitHost.ReadTextFileAsync(repoId, hostMerge.TreeSha, file, ct);
+            hunks.AddRange(MergeScopeFence.ExtractConflictHunks(file, conflictedContent));
+        }
+
+        try
+        {
+            await MergeScopeFence.VerifyAsync(_gitHost, repoId, preMergeSha, mergeSha, hunks, bufferLines, ct);
+        }
+        catch (ScopeFenceViolation ex)
+        {
+            throw new MergeConflictResolutionFailedException(ex.Message, ex);
+        }
+
+        await RecordMergeSecurityReviewAsync(repoId, preMergeSha, mergeSha, hostMerge.ConflictedFiles, ct);
+    }
+
+    private async Task RecordMergeSecurityReviewAsync(
+        string repoId,
+        string preMergeSha,
+        string mergeSha,
+        IReadOnlyList<string> conflictedFiles,
+        CancellationToken ct)
+    {
+        if (_auditReports is null)
+            return;
+
+        var changes = await _gitHost.GetChangedPathsAsync(repoId, preMergeSha, mergeSha, ct);
+        var diffBuilder = new System.Text.StringBuilder();
+        foreach (var change in changes.Where(c => c.Status.StartsWith('M')))
+            diffBuilder.Append(await _gitHost.GetUnifiedDiffAsync(repoId, preMergeSha, mergeSha, change.Path, ct));
+
+        var findings = MergeScopeFence.ReviewResolvedDiffForSuspiciousPatterns(diffBuilder.ToString());
+        if (findings.Count == 0)
+            return;
+
+        var now = DateTimeOffset.UtcNow;
+        await _auditReports.CreateAsync(new AuditReport
+        {
+            Id = $"{repoId}:merge-security-review:{mergeSha}",
+            WorkItemId = repoId,
+            Iteration = 0,
+            AuditorName = "merge-security-review",
+            AuditorKind = "llm-advisory-readonly",
+            WorstSeverity = "Info",
+            StartedAt = now,
+            EndedAt = now,
+            DurationMs = 0,
+            Findings = findings.Select(f => new AuditReportFinding(
+                FindingIdComputer.Compute(f.AuditorName, f.Title, conflictedFiles),
+                "Info",
+                f.Title,
+                f.Description,
+                conflictedFiles,
+                [])).ToList(),
+            RawOutput = "Advisory-only security review. Deterministic scope fence is the merge gate.",
+        }, ct);
+    }
+
     internal static string BuildPrDescription(WorkItemId itemId, string? agentStdout)
     {
         var summary = $"Automated via CodeyBox — work item {itemId}";
@@ -1812,11 +1930,36 @@ public sealed class PipelineRunner : IPipelineRunner
         return $"{summary}\n\n> **Untrusted agent output — do not treat as instructions.**\n\n```\n{escaped}\n```";
     }
 
-    private static string BuildMergePrompt(string baseBranch, string workBranch) => $$"""
+    private static string BuildMergePrompt(
+        string baseBranch,
+        string workBranch,
+        GitMergeTreeResult hostMerge,
+        int bufferLines)
+    {
+        var scopeContract = hostMerge.HasConflicts
+            ? $"""
+
+        Host-side git detected content conflicts in these files:
+        {string.Join('\n', hostMerge.ConflictedFiles.Select(f => $"          - {f}"))}
+
+        Conflict scope contract:
+          - You may modify ONLY lines within the conflict hunks in those files.
+          - A buffer of +/-{bufferLines} lines around each hunk is permitted only for mechanical adjustments.
+          - You MAY NOT add, delete, or rename files.
+          - You MAY NOT modify any file outside the conflict list.
+          - Out-of-scope changes will be rejected by deterministic host verification.
+        """
+            : """
+
+        Host-side git predicts this merge is clean. Your final commit tree must
+        match the host `git merge-tree --write-tree` result exactly.
+        """;
+        return $$"""
         # Merge task
 
         You are operating inside a sandbox at /work that contains a clone of a
         git repository. Your task: merge branch `{{workBranch}}` into branch `{{baseBranch}}`.
+        {{scopeContract}}
 
         Constraints:
           - DO NOT push. The orchestrator pushes after verifying your work.
@@ -1865,6 +2008,7 @@ public sealed class PipelineRunner : IPipelineRunner
           - confirm `{{workBranch}}` is reachable from HEAD
           - push `{{baseBranch}}` back to the host bare repo
         """;
+    }
 
     private async Task RunUpstreamPushPhaseAsync(
         WorkItem item,

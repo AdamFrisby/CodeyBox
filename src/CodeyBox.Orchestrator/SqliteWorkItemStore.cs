@@ -337,7 +337,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             WHERE project_id = $pid
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
+              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);
@@ -377,7 +377,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 SELECT project_id, state,
                        ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
                 FROM work_items
-                WHERE state IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.Cancelled})
+                WHERE state IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.Cancelled})
             )
             SELECT project_id, state FROM ranked WHERE rn <= $per_project
             ORDER BY project_id, rn;

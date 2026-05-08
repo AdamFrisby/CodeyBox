@@ -145,6 +145,7 @@ public sealed class StreamAnalysisService : BackgroundService
         state is WorkItemState.Done
             or WorkItemState.Failed
             or WorkItemState.AuditFailed
+            or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.Cancelled
             or WorkItemState.AbandonedAfterRecoveryAttempts;
 }

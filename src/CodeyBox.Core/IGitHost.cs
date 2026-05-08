@@ -65,7 +65,59 @@ public interface IGitHost
     Task<(string DiffStat, string FullDiff)> GetDiffAsync(
         string repositoryId, string baseBranch, string workBranch,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Computes git's canonical host-side merge tree for two commits in the
+    /// host bare repo. A non-zero git exit from content conflicts is returned
+    /// as <see cref="GitMergeTreeResult.HasConflicts"/> rather than thrown.
+    /// </summary>
+    Task<GitMergeTreeResult> ComputeMergeTreeAsync(
+        string repositoryId,
+        string mainCommit,
+        string workCommit,
+        CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side merge-tree verification.");
+
+    /// <summary>Resolves a ref or commit expression in the host bare repo.</summary>
+    Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side commit resolution.");
+
+    /// <summary>Returns the tree object for a commit or tree-ish expression.</summary>
+    Task<string> ResolveTreeAsync(string repositoryId, string treeish, CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side tree resolution.");
+
+    /// <summary>Reads a text file from a commit or tree in the host bare repo.</summary>
+    Task<string> ReadTextFileAsync(string repositoryId, string treeish, string path, CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side file reads.");
+
+    /// <summary>Returns name-status changes between two commits or trees in the host bare repo.</summary>
+    Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(
+        string repositoryId,
+        string fromTreeish,
+        string toTreeish,
+        CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side diff inspection.");
+
+    /// <summary>Returns a zero-context diff for one path between two commits or trees.</summary>
+    Task<string> GetUnifiedDiffAsync(
+        string repositoryId,
+        string fromTreeish,
+        string toTreeish,
+        string path,
+        CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side diff inspection.");
 }
+
+public sealed record GitMergeTreeResult(
+    bool HasConflicts,
+    string TreeSha,
+    IReadOnlyList<string> ConflictedFiles,
+    string RawOutput);
+
+public sealed record GitChangedPath(
+    string Status,
+    string Path,
+    string? OldPath = null);
 
 /// <summary>
 /// All the bits the orchestrator needs to fold into a <see cref="SandboxSpec"/>

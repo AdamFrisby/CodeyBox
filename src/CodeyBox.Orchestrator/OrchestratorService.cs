@@ -417,6 +417,7 @@ public sealed class OrchestratorService : BackgroundService
         }
         if (item.State is WorkItemState.Cancelled or WorkItemState.Done
             or WorkItemState.Failed or WorkItemState.AuditFailed
+            or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.AbandonedAfterRecoveryAttempts)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
@@ -487,6 +488,7 @@ public sealed class OrchestratorService : BackgroundService
 
             if (current.State is WorkItemState.Cancelled or WorkItemState.Done
                 or WorkItemState.Failed or WorkItemState.AuditFailed
+                or WorkItemState.MergeConflictResolutionFailed
                 or WorkItemState.AbandonedAfterRecoveryAttempts)
             {
                 _log.LogInformation("Worker {WorkerId} skipping {Id} after active claim: terminal state {State}", workerIndex, id, current.State);

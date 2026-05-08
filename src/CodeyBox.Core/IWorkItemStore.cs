@@ -53,7 +53,7 @@ public interface IWorkItemStore
     /// <summary>
     /// Fleet aggregation: returns the most-recent <paramref name="perProject"/> terminal work item states
     /// per project, newest-first. Uses ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC).
-    /// Terminal states: Done, Failed, AuditFailed, Cancelled.
+    /// Terminal states: Done, Failed, AuditFailed, MergeConflictResolutionFailed, Cancelled.
     /// </summary>
     Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default);
 
