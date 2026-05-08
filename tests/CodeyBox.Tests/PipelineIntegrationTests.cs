@@ -46,7 +46,7 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task WorkPhasePush_WithStaleBareRepoWorkBranch_RebasesAndRetriesOnce()
+    public async Task WorkPhasePickup_WithExistingBareRepoWorkBranch_PreservesPriorAttempt()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
@@ -75,7 +75,7 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task WorkPhasePush_WithStaleBareRepoWorkBranchConflict_FailsWithClearError()
+    public async Task WorkPhasePush_WithExistingBareRepoWorkBranch_StartsFromExistingTip()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
@@ -90,15 +90,12 @@ public sealed class PipelineIntegrationTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains(
-            "sandbox rebase conflict while reconciling push of work branch 'feature/retry-conflict'; manual resolution required",
-            final.LastError);
+        Assert.Equal(WorkItemState.Done, final!.State);
 
         var (_, readmeOnWorkBranch, _) = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:README.md");
         var (_, readmeOnMain, _) = await TestSupport.RunGit(barePath, "show", "main:README.md");
-        Assert.Equal("prior attempt\n", readmeOnWorkBranch);
-        Assert.Equal("seed\n", readmeOnMain);
+        Assert.Equal("fresh run\n", readmeOnWorkBranch);
+        Assert.Equal("fresh run\n", readmeOnMain);
     }
 
     [Fact]

@@ -153,7 +153,12 @@ intent is that you can swap any of these without touching the orchestrator:
   config, so repo-local credential helpers, SSH commands, and URL rewrites
   cannot influence host git. Host git commands also set `core.hooksPath`
   to an empty host-controlled directory, so sandbox-written bare-repo hooks
-  cannot run during ref updates.
+  cannot run during ref updates. After refresh and before any work, audit,
+  or merge agent invocation, pickup rebases an existing work branch onto the
+  refreshed base inside a sandbox and force-pushes it back with a lease. First
+  pickup skips this because no work branch exists yet. Rebase conflicts abort
+  before pushing and transition the item to `MergeConflictResolutionFailed`,
+  matching the scope-fenced merge conflict failure path.
 * **Credentials follow least privilege.** Each sandbox sees only the
   minimum it needs. Tool-only audit sandboxes see no agent secrets.
   Upstream creds live only in the orchestrator process and never cross

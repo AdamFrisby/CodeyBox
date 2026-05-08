@@ -45,13 +45,32 @@ If the upstream fetch exits non-zero, the orchestrator logs a redacted
 warning and continues with the previous local tip instead of deleting the
 bare repo.
 
+After that refresh, pickup performs a sandboxed work-branch freshness check
+before any work, audit, or merge agent sees the repository. If the work branch
+already exists, the sandbox fetches the refreshed base and work refs, checks
+whether the refreshed base is already an ancestor of the work branch, and when
+needed runs:
+
+```bash
+git checkout -B <workBranch> origin/<workBranch>
+git rebase --keep-empty origin/<baseBranch>
+git push --force-with-lease=refs/heads/<workBranch>:<oldTip> origin HEAD:refs/heads/<workBranch>
+```
+
+First pickup is a no-op because there is no work-branch ref yet. Rebase
+conflicts abort the in-sandbox rebase before any push and move the work item to
+`MergeConflictResolutionFailed`, the same operator-facing failure state used by
+scope-fenced merge conflict resolution.
+
 ## Phase 1: Work
 
 ```bash
 # Inside the work sandbox:
 git clone /repos/<id>.git /work
 cd /work
-git checkout -B codeybox/<id>          # work branch off baseBranch
+git checkout -B codeybox/<id> origin/<baseBranch>      # first pickup
+# or, on retry after the pickup rebase above:
+git checkout -B codeybox/<id> origin/codeybox/<id>
 
 # Identity resolution (precedence: project > host global git config > fallback)
 git config user.email <resolved-email>

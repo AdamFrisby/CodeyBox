@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
@@ -62,6 +63,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly string _disabledHostHooksPath;
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> PickupRebaseLocks = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -227,6 +229,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 item = item with { WorkBranch = workBranch };
                 await _store.UpdateAsync((await _store.GetAsync(item.Id, ct) ?? item) with { WorkBranch = workBranch }, ct);
             }
+
+            if (string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
+                await RebaseExistingWorkBranchOntoFreshBaseAsync(item, repoId, baseBranch, workBranch, project, ct);
 
             // The retry endpoint sets the entry state to a pre-phase marker
             // (Queued / WorkComplete / AuditPassed / Merged) so we resume at
@@ -449,6 +454,148 @@ public sealed class PipelineRunner : IPipelineRunner
 
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
 
+    private async Task RebaseExistingWorkBranchOntoFreshBaseAsync(
+        WorkItem item,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        Project project,
+        CancellationToken ct)
+    {
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+        Validation.ValidateBranchName(workBranch, nameof(workBranch));
+
+        var lockKey = $"{repoId}:{workBranch}";
+        var gate = PickupRebaseLocks.GetOrAdd(lockKey, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var access = _gitHost.GetSandboxAccess(repoId);
+            var spec = BuildSandboxSpec(
+                access,
+                includeAgentCredential: null,
+                allowAgentNetwork: false,
+                hostNetworkProfile: null,
+                timingWorkItemId: item.Id,
+                timingPhase: "pickup");
+
+            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            await using (var cloneScope = await TimingScope.BeginAsync(
+                _timings, item.Id, "pickup", "git.clone_into_sandbox",
+                activitySource: CodeyBoxActivities.Sandbox, log: _log))
+            {
+                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            }
+
+            await FetchOriginBranchAsync(sandbox, baseBranch, required: true, ct);
+            var hasWorkBranch = await FetchOriginBranchAsync(sandbox, workBranch, required: false, ct)
+                && await OriginBranchExistsAsync(sandbox, workBranch, ct);
+            if (!hasWorkBranch)
+                return;
+
+            var oldTip = await RevParseSandboxAsync(sandbox, $"origin/{workBranch}", ct);
+            var baseTip = await RevParseSandboxAsync(sandbox, $"origin/{baseBranch}", ct);
+            var baseAlreadyAncestor = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "merge-base", "--is-ancestor", baseTip, oldTip],
+            }, ct);
+            if (baseAlreadyAncestor.Success)
+                return;
+
+            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
+
+            await using (var rebaseScope = await TimingScope.BeginAsync(
+                _timings, item.Id, "pickup", "git.rebase_work_branch_onto_base",
+                activitySource: CodeyBoxActivities.Sandbox, log: _log))
+            {
+                var rebase = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--keep-empty", $"origin/{baseBranch}"],
+                }, ct);
+                if (!rebase.Success)
+                {
+                    await sandbox.ExecAsync(new SandboxExec
+                    {
+                        Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
+                    }, CancellationToken.None);
+                    throw new MergeConflictResolutionFailedException(
+                        $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}");
+                }
+            }
+
+            var newTip = await RevParseSandboxAsync(sandbox, "HEAD", ct);
+            if (string.Equals(newTip, oldTip, StringComparison.Ordinal))
+                return;
+
+            await using (var pushScope = await TimingScope.BeginAsync(
+                _timings, item.Id, "pickup", "git.force_push_rebased_work_branch",
+                activitySource: CodeyBoxActivities.Sandbox, log: _log))
+            {
+                await Run(
+                    sandbox,
+                    "git", "-C", SandboxConventions.WorkDir,
+                    "push",
+                    $"--force-with-lease=refs/heads/{workBranch}:{oldTip}",
+                    "origin",
+                    $"HEAD:refs/heads/{workBranch}");
+            }
+
+            _log.LogInformation(
+                "Rebased work branch {WorkBranch} for work item {WorkItemId} from {OldTip} onto base {BaseBranch} at {BaseTip}; new tip {NewTip}",
+                workBranch,
+                item.Id,
+                oldTip,
+                baseBranch,
+                baseTip,
+                newTip);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private static async Task<bool> FetchOriginBranchAsync(ISandbox sandbox, string branch, bool required, CancellationToken ct)
+    {
+        var fetch = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "git", "-C", SandboxConventions.WorkDir,
+                "fetch", "--no-tags", "origin",
+                $"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+            ],
+        }, ct);
+        if (fetch.Success)
+            return true;
+        if (!required)
+            return false;
+        throw new InvalidOperationException($"failed to fetch branch '{branch}' from origin: {fetch.Stderr}");
+    }
+
+    private static async Task<bool> OriginBranchExistsAsync(ISandbox sandbox, string branch, CancellationToken ct)
+    {
+        var showRef = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "show-ref", "--verify", "--quiet", $"refs/remotes/origin/{branch}"],
+        }, ct);
+        return showRef.Success;
+    }
+
+    private static async Task<string> RevParseSandboxAsync(ISandbox sandbox, string rev, CancellationToken ct)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "--verify", $"{rev}^{{commit}}"],
+        }, ct);
+        if (!result.Success)
+            throw new InvalidOperationException($"failed to resolve sandbox revision '{rev}': {result.Stderr}");
+        return result.Stdout.Trim();
+    }
+
     internal static string BuildInitialWorkPrompt(
         string userPrompt,
         bool allowAgentQuestions = false,
@@ -562,9 +709,14 @@ public sealed class PipelineRunner : IPipelineRunner
             prompt = BuildResumePrompt(prompt, preemptCheckpoint);
         }
         else if (isInitial)
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
+        {
+            if (await OriginBranchExistsAsync(sandbox, branch, ct))
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+            else
+                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
+        }
         else
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", branch);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
         var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
         await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
