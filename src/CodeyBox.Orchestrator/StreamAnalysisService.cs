@@ -50,7 +50,7 @@ public sealed class StreamAnalysisService : BackgroundService
 
     public async Task<int> AnalyzeWorkItemAsync(WorkItem item, CancellationToken ct = default)
     {
-        var files = await _streams.ListAsync(item.Id, AgentStreamStore.MaxListLimit, includeLineCount: true, ct).ConfigureAwait(false);
+        var files = await _streams.ListAsync(item.Id, AgentStreamStore.MaxListLimit, includeLineCount: false, ct).ConfigureAwait(false);
         var count = 0;
         var existingSummaries = (await _summaries.GetByWorkItemAsync(item.Id, ct).ConfigureAwait(false))
             .ToDictionary(r => r.FileName, StringComparer.Ordinal);

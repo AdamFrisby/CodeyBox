@@ -27,11 +27,11 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. Claude Code 2.1 stream-json and Codex CLI 0.128 command-execution events can omit per-event `timestamp`, `started_at`, `completed_at`, and duration fields. In that case the analyser keeps the capture file read-only and uses the matching `work_item_costs` invocation window (`started_at` to `ended_at`) as the wall-clock timing source. Events are placed within that window by JSONL line position, so total duration, TTFT, tool-call duration, stalls, and thinking-vs-executing split remain populated for the installed stream shapes. Event-emitted timestamps and duration fields still win whenever the CLI provides them.
+Captured CLI streams do not always include timestamps. Claude Code 2.1 stream-json and Codex CLI 0.128 command-execution events can omit per-event `timestamp`, `started_at`, `completed_at`, and duration fields. In that case the analyser keeps the capture file read-only and does not infer event timing from JSONL line or byte position. Timestamp-less events can still contribute tokens, cost, tool frequency, input summaries, output sizes, and final text observed internally, but total duration, TTFT, stalls, and tool-call intervals remain zero or null unless the stream provides explicit timestamp or duration fields.
 
 ## Thinking Vs Executing
 
-`executingMs` is the wall-clock union of completed tool-call intervals per invocation. Overlapping parallel tool calls are counted once. `thinkingMs` is `totalAgentDurationMs - executingMs`, clamped at zero. This split identifies whether a slow invocation was mostly model-side waiting/thinking or tool execution.
+`executingMs` is the wall-clock union of completed tool-call intervals per invocation. Overlapping parallel tool calls are counted once. Tool results that include an explicit duration but no start/end timestamps contribute that duration without forming an interval. `thinkingMs` is `totalAgentDurationMs - executingMs`, clamped at zero. Timestamp-less streams without explicit duration fields do not contribute timing to this split.
 
 ## Persistence
 

@@ -78,8 +78,7 @@ internal static class AgentStreamEndpoints
         var analysisCt = timeoutCts.Token;
         try
         {
-            var files = await streams.ListAsync(item!.Id, AgentStreamStore.MaxListLimit, includeLineCount: true, analysisCt);
-            var file = files.FirstOrDefault(f => string.Equals(f.FileName, fileName, StringComparison.Ordinal));
+            var file = await streams.GetAsync(item!.Id, fileName, includeLineCount: false, analysisCt);
             if (file is null) return Results.NotFound();
 
             await using var sniffStream = await streams.OpenReadAsync(item.Id, fileName, analysisCt);
@@ -228,7 +227,7 @@ internal static class AgentStreamEndpoints
             outputTokens = summary.OutputTokens,
             cachedInputTokens = summary.CachedInputTokens,
             estimatedUsd = summary.EstimatedUsd,
-            finalAssistantMessage = summary.FinalAssistantMessage,
+            finalAssistantMessage = (string?)null,
             toolCalls = summary.ToolCalls.Select(t => new
             {
                 toolUseId = t.ToolUseId,

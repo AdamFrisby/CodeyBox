@@ -832,7 +832,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         TimeSpan? observedTimeToFirstToken = null;
         var recognizedEventCount = 0;
         var realTimestampCount = 0;
-        var contextDuration = ValidContextDuration(context);
 
         await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, _options.MaxLineBytes, ct).ConfigureAwait(false))
         {
@@ -861,7 +860,7 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                 recognizedEventCount++;
             if (parsed.Timestamp.HasValue)
                 realTimestampCount++;
-            var timestamp = parsed.Timestamp ?? ProjectTimestamp(context, jsonLine);
+            var timestamp = parsed.Timestamp;
 
             if (timestamp is { } eventTimestamp)
             {
@@ -954,9 +953,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             return AgentStreamParserSelection.UnsupportedSummary();
 
         var total = observedTotalDuration
-            ?? (realTimestampCount == 0 && contextDuration.HasValue
-                ? contextDuration.Value
-                : (TimeSpan?)null)
             ?? (firstTimestamp.HasValue && lastTimestamp.HasValue
                 ? lastTimestamp.Value - firstTimestamp.Value
                 : TimeSpan.Zero);
@@ -978,37 +974,6 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                 .ToList(),
             stalls,
             finalText);
-    }
-
-    private static TimeSpan? ValidContextDuration(AgentStreamParserContext? context)
-    {
-        if (context is null || context.InvocationEndedAt < context.InvocationStartedAt)
-            return null;
-        return context.InvocationEndedAt - context.InvocationStartedAt;
-    }
-
-    private static DateTimeOffset? ProjectTimestamp(AgentStreamParserContext? context, AgentStreamJsonLine line)
-    {
-        var duration = ValidContextDuration(context);
-        if (context is null || duration is null)
-            return null;
-
-        double ratio;
-        if (context.LineCount is > 1)
-        {
-            ratio = line.LineNumber / (double)(context.LineCount.Value - 1);
-        }
-        else if (context.SizeBytes is > 0)
-        {
-            ratio = line.StartOffset / (double)context.SizeBytes.Value;
-        }
-        else
-        {
-            ratio = 0;
-        }
-
-        ratio = Math.Clamp(ratio, 0, 1);
-        return context.InvocationStartedAt + TimeSpan.FromTicks((long)Math.Round(duration.Value.Ticks * ratio));
     }
 
     private static string ClassifyStall(string? previousEventType, int openToolCount)

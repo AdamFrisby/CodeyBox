@@ -355,13 +355,11 @@ does not write to the summary cache.
 ```
 
 If the captured CLI stream has no event timestamps or duration fields,
-CodeyBox keeps the stream file read-only and projects events into the matching
-`work_item_costs` invocation window by JSONL line position. That keeps total
-duration, time to first token, tool-call durations, stalls, and the
-thinking-vs-executing split populated for timestamp-less Claude and Codex
-streams. Without a matching invocation window, timing fields remain `null` or
-zero while non-timing analytics are still returned when the stream has enough
-structured data to derive them.
+CodeyBox keeps the stream file read-only and does not infer event timing from
+JSONL line or byte position. Timing fields remain `null` or zero while
+non-timing analytics are still returned when the stream has enough structured
+data to derive them. Explicit stream duration fields are still used when the
+CLI emits them.
 
 `finalAssistantMessage` is always returned as `null` from API analytics
 responses. The parser may observe final model text internally, but API responses

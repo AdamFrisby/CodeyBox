@@ -16,6 +16,11 @@ public interface IAgentStreamStore
         int limit = AgentStreamStore.DefaultListLimit,
         bool includeLineCount = false,
         CancellationToken ct = default);
+    Task<AgentStreamFile?> GetAsync(
+        WorkItemId workItemId,
+        string fileName,
+        bool includeLineCount = false,
+        CancellationToken ct = default);
     Task<Stream?> OpenReadAsync(WorkItemId workItemId, string fileName, CancellationToken ct = default);
     Task<int> SweepAsync(DateTimeOffset now, CancellationToken ct = default);
 }
@@ -102,18 +107,10 @@ public sealed class AgentStreamStore : IAgentStreamStore
                     break;
                 visited++;
 
-                var info = new FileInfo(path);
-                var fileName = info.Name;
-                if (!TryParseFileName(fileName, out var phase, out var iteration))
+                if (BuildFile(path, includeLineCount, ct) is not { } file)
                     continue;
 
-                result.Add(new AgentStreamFile(
-                    fileName,
-                    phase,
-                    iteration,
-                    info.Length,
-                    includeLineCount ? CountLines(info.FullName) : null,
-                    new DateTimeOffset(info.CreationTimeUtc, TimeSpan.Zero)));
+                result.Add(file);
             }
 
             return Task.FromResult<IReadOnlyList<AgentStreamFile>>(result);
@@ -122,6 +119,30 @@ public sealed class AgentStreamStore : IAgentStreamStore
         {
             _log.LogWarning(ex, "Failed to list agent streams for work item {WorkItemId}", workItemId);
             return Task.FromResult<IReadOnlyList<AgentStreamFile>>([]);
+        }
+    }
+
+    public Task<AgentStreamFile?> GetAsync(
+        WorkItemId workItemId,
+        string fileName,
+        bool includeLineCount = false,
+        CancellationToken ct = default)
+    {
+        if (!Options.Enabled || !IsSafeFileName(fileName) || !TryParseFileName(fileName, out _, out _))
+            return Task.FromResult<AgentStreamFile?>(null);
+
+        try
+        {
+            var path = Path.Combine(GetWorkItemDirectory(workItemId), fileName);
+            if (!File.Exists(path))
+                return Task.FromResult<AgentStreamFile?>(null);
+
+            return Task.FromResult(BuildFile(path, includeLineCount, ct));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _log.LogWarning(ex, "Failed to get agent stream file {FileName} for work item {WorkItemId}", fileName, workItemId);
+            return Task.FromResult<AgentStreamFile?>(null);
         }
     }
 
@@ -261,12 +282,30 @@ public sealed class AgentStreamStore : IAgentStreamStore
         return !string.IsNullOrWhiteSpace(phase);
     }
 
-    private static long CountLines(string path)
+    private static AgentStreamFile? BuildFile(string path, bool includeLineCount, CancellationToken ct)
+    {
+        var info = new FileInfo(path);
+        if (!TryParseFileName(info.Name, out var phase, out var iteration))
+            return null;
+
+        return new AgentStreamFile(
+            info.Name,
+            phase,
+            iteration,
+            info.Length,
+            includeLineCount ? CountLines(info.FullName, ct) : null,
+            new DateTimeOffset(info.CreationTimeUtc, TimeSpan.Zero));
+    }
+
+    private static long CountLines(string path, CancellationToken ct)
     {
         var count = 0L;
         using var reader = new StreamReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
         while (reader.ReadLine() is not null)
+        {
+            ct.ThrowIfCancellationRequested();
             count++;
+        }
         return count;
     }
 
