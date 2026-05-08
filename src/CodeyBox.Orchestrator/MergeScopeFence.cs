@@ -128,7 +128,7 @@ internal static partial class MergeScopeFence
         foreach (var (path, fileHunks) in hunksByPath)
         {
             var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, path, ct);
-            foreach (var lineNumber in ChangedOldLineNumbers(diff))
+            foreach (var lineNumber in ChangedOldLineCoordinates(diff))
             {
                 if (!IsInsideAnyHunk(lineNumber, fileHunks, bufferLines))
                     violations.Add($"{path}:{lineNumber}");
@@ -139,38 +139,41 @@ internal static partial class MergeScopeFence
             throw new ScopeFenceViolation(violations);
     }
 
-    private static IEnumerable<int> ChangedOldLineNumbers(string diff)
+    private static IEnumerable<int> ChangedOldLineCoordinates(string diff)
     {
         var oldLine = 0;
-        var newLine = 0;
-        var editStart = (int?)null;
-        var editEnd = 0;
-        var editHasDeletion = false;
+        var deletedLines = new List<int>();
+        var addedLineCount = 0;
+        var insertionAnchor = (int?)null;
 
         IEnumerable<int> FlushEdit()
         {
-            if (editStart is null)
+            if (deletedLines.Count == 0 && addedLineCount == 0)
                 yield break;
-            for (var line = editStart.Value; line <= editEnd; line++)
+
+            foreach (var line in deletedLines)
                 yield return line;
-            editStart = null;
-            editEnd = 0;
-            editHasDeletion = false;
+
+            var addedAnchor = deletedLines.Count > 0
+                ? deletedLines[0]
+                : insertionAnchor.GetValueOrDefault(oldLine + 1);
+            for (var offset = 0; offset < addedLineCount; offset++)
+                yield return addedAnchor + offset;
+
+            deletedLines.Clear();
+            addedLineCount = 0;
+            insertionAnchor = null;
         }
 
-        void TouchOldLine(int lineNumber)
+        void TouchAddedLine()
         {
-            if (editStart is null)
+            if (addedLineCount == 0 && deletedLines.Count == 0)
             {
-                editStart = lineNumber;
-                editEnd = lineNumber;
-                return;
+                // In a zero-context diff, a pure insertion at "@@ -N,0 +M @@" is
+                // inserted after old line N, so its first projected coordinate is N+1.
+                insertionAnchor = oldLine + 1;
             }
-
-            if (lineNumber < editStart.Value)
-                editStart = lineNumber;
-            if (lineNumber > editEnd)
-                editEnd = lineNumber;
+            addedLineCount++;
         }
 
         foreach (var line in diff.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
@@ -181,7 +184,6 @@ internal static partial class MergeScopeFence
                 foreach (var changedLine in FlushEdit())
                     yield return changedLine;
                 oldLine = int.Parse(match.Groups["old"].Value);
-                newLine = int.Parse(match.Groups["new"].Value);
                 continue;
             }
 
@@ -190,14 +192,11 @@ internal static partial class MergeScopeFence
 
             if (line.StartsWith('+'))
             {
-                if (!editHasDeletion)
-                    TouchOldLine(oldLine);
-                newLine++;
+                TouchAddedLine();
             }
             else if (line.StartsWith('-'))
             {
-                TouchOldLine(oldLine);
-                editHasDeletion = true;
+                deletedLines.Add(oldLine);
                 oldLine++;
             }
             else if (line.StartsWith(' '))
@@ -205,7 +204,6 @@ internal static partial class MergeScopeFence
                 foreach (var changedLine in FlushEdit())
                     yield return changedLine;
                 oldLine++;
-                newLine++;
             }
         }
 

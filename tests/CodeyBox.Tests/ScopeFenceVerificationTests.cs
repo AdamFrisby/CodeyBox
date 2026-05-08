@@ -45,6 +45,19 @@ public sealed class ScopeFenceVerificationTests : IDisposable
     }
 
     [Fact]
+    public async Task RejectsDeletedConflictedFile()
+    {
+        var ctx = await CreateContextAsync();
+        var clone = await CloneAsync(ctx);
+        await TestSupport.RunGit(clone, "rm", "file.txt");
+        await TestSupport.RunGit(clone, "commit", "-m", "resolved delete");
+        await TestSupport.RunGit(clone, "push", "origin", "HEAD:resolved");
+
+        var ex = await Assert.ThrowsAsync<ScopeFenceViolation>(() => VerifyAsync(ctx));
+        Assert.Contains("file.txt:1 deleted file", ex.Message);
+    }
+
+    [Fact]
     public async Task AllowsBufferZoneEdit()
     {
         var ctx = await CreateContextAsync();
@@ -58,6 +71,30 @@ public sealed class ScopeFenceVerificationTests : IDisposable
     {
         var ctx = await CreateContextAsync();
         await CommitResolvedAsync(ctx, lines => lines[17] = "too far");
+
+        var ex = await Assert.ThrowsAsync<ScopeFenceViolation>(() => VerifyAsync(ctx));
+        Assert.Contains("file.txt:18", ex.Message);
+    }
+
+    [Fact]
+    public async Task RejectsInsertionJustOutsideBuffer()
+    {
+        var ctx = await CreateContextAsync(lineCount: 25);
+        await CommitResolvedLinesAsync(ctx, lines => lines.Insert(17, "inserted payload"));
+
+        var ex = await Assert.ThrowsAsync<ScopeFenceViolation>(() => VerifyAsync(ctx));
+        Assert.Contains("file.txt:18", ex.Message);
+    }
+
+    [Fact]
+    public async Task RejectsOversizedInsertedPayloadInAllowedReplacement()
+    {
+        var ctx = await CreateContextAsync(lineCount: 25);
+        await CommitResolvedLinesAsync(ctx, lines =>
+        {
+            lines.RemoveAt(9);
+            lines.InsertRange(9, Enumerable.Range(1, 10).Select(i => $"payload {i}"));
+        });
 
         var ex = await Assert.ThrowsAsync<ScopeFenceViolation>(() => VerifyAsync(ctx));
         Assert.Contains("file.txt:18", ex.Message);
@@ -176,6 +213,18 @@ public sealed class ScopeFenceVerificationTests : IDisposable
         await File.WriteAllLinesAsync(path, lines);
         foreach (var addition in additions)
             await File.WriteAllTextAsync(Path.Combine(clone, addition.Path), addition.Content);
+        await TestSupport.RunGit(clone, "add", "-A");
+        await TestSupport.RunGit(clone, "commit", "-m", "resolved");
+        await TestSupport.RunGit(clone, "push", "origin", "HEAD:resolved");
+    }
+
+    private async Task CommitResolvedLinesAsync(Context ctx, Action<List<string>> mutate)
+    {
+        var clone = await CloneAsync(ctx);
+        var path = Path.Combine(clone, "file.txt");
+        var lines = (await File.ReadAllLinesAsync(path)).ToList();
+        mutate(lines);
+        await File.WriteAllLinesAsync(path, lines);
         await TestSupport.RunGit(clone, "add", "-A");
         await TestSupport.RunGit(clone, "commit", "-m", "resolved");
         await TestSupport.RunGit(clone, "push", "origin", "HEAD:resolved");
