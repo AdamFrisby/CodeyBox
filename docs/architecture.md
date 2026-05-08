@@ -49,16 +49,46 @@ See [`audit.md`](audit.md) for the audit phase in detail.
 | Orchestrator (REST + workers)| Host               | Host OS only       | **Yes**               | Yes (to inject)       |
 | Work / Rework sandbox        | VM (Multipass/KVM) | Nothing            | No                    | Yes (only its own)    |
 | Audit-tool sandbox           | VM (Multipass/KVM) | Nothing            | No                    | **No**                |
-| Audit-LLM / Merge sandbox    | VM (Multipass/KVM) | Nothing            | No                    | Yes (only its own)    |
+| Audit-LLM / clean-merge sandbox | VM (Multipass/KVM) | Nothing         | No                    | Yes (only its own)    |
+| Conflict resolver            | Text-only VM sandbox | Conflict text only | No                 | Yes (resolver only) |
 | Host git server              | Host (or sidecar)  | Sandbox network    | No                    | No                    |
 | Upstream remote (e.g. GitHub)| External           | —                  | —                     | —                     |
 
-The merge phase is **agent-driven**: it gets agent credentials so the
-agent can resolve merge conflicts and run the project's test suite. The
-orchestrator verifies merge state (head matches the expected post-merge
-SHA, working tree is clean) before allowing phase 4. The egress reduction
-that protects the merge phase against exfiltration is the project's
-`merge` network profile — typically the same as `work`, or stricter.
+The merge phase is host-verified. Before accepting an agent-produced merge,
+the orchestrator runs host-side `git merge-tree --write-tree --no-messages`
+against the pre-merge main commit and the work tip.
+
+For clean merges, the agent commit tree must exactly match the host
+`merge-tree` result, and the accepted commit must keep both the pre-merge main
+commit and the work tip in its ancestry. For conflicted merges, the normal
+repository-mounted merge agent runner is not invoked. The host first creates the
+conflicted working tree, reads only the conflicted file contents, records each
+`<<<<<<<` ... `>>>>>>>` hunk as the marker span in the conflicted merge-tree
+file, and sends that text through `ITextOnlyAgentRunner`. That call is pure text-in/text-out:
+no repository checkout, shell, filesystem, agent tools, writable result file, or
+model-controlled network is exposed to the untrusted conflict text. The resolver
+can only return complete replacement contents for exactly the conflicted paths;
+the host applies those contents to the merge worktree.
+
+After the host writes those returned contents and creates the merge commit, it
+applies a deterministic scope fence before updating main. The final
+conflict-baseline-to-resolved changed-file set must exactly equal the
+conflicted file set, and each conflict-baseline-to-resolved changed line in
+those files is checked in conflicted-baseline coordinates. Every changed old-side
+line must fall inside a conflict marker span plus
+`Audit.MergeScopeBufferLines` context lines. The default buffer is 5. New files,
+deletes, renames, edits to non-conflicted files, missing conflicted-file edits,
+and whitespace-only edits outside the allowed ranges are rejected and the work
+item enters `MergeConflictResolutionFailed`.
+
+This deterministic scope fence is the security boundary. The optional merge
+security review is an LLM text review over the resolved conflict diff in a
+pure text-in/text-out call with no repository checkout, shell, filesystem, agent
+tools, writable result file, or model-controlled network. It is advisory-only:
+it has no authority to fail the merge because it reads the same untrusted
+conflict content as the resolver. Findings are logged for operator review, but
+review failures and finding-persistence failures do not block the merge; only
+host git verification and the scope fence gate the push.
 
 ## State machine
 
@@ -72,6 +102,9 @@ Queued → Working → WorkComplete ─┬─→ Auditing ─pass─→ AuditPas
                                  │      └─maxIters─→ AuditFailed (terminal)
                                  │
                                  └─(no auditors registered)─→ Merging ─→ ...
+
+Merging can also terminate as `MergeConflictResolutionFailed` when host-side
+merge verification or the scope fence rejects a conflict resolution.
 
 Cancelled (via DELETE /workitems/{id}) is reachable from any non-terminal state.
 ```

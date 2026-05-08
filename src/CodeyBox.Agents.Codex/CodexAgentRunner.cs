@@ -1,6 +1,9 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
 
 namespace CodeyBox.Agents.Codex;
 
@@ -13,9 +16,10 @@ namespace CodeyBox.Agents.Codex;
 ///         <c>CODEX_AUTH_JSON</c> credential env var before invoking codex.</item>
 /// </list>
 /// </summary>
-public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider
+public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     private static readonly AsyncLocal<string?> CurrentStructuredStreamFlag = new();
+    private static readonly HttpClient TextOnlyHttp = new();
 
     public override AgentKind Kind => AgentKind.Codex;
 
@@ -112,6 +116,45 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         }
     }
 
+    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        var apiKey = ResolveOpenAiApiKey(credential);
+        if (string.IsNullOrEmpty(apiKey))
+            return new TextOnlyAgentResult(false, "missing Codex text-only credential", null, "OPENAI_API_KEY is required for text-only calls");
+
+        try
+        {
+            var body = new Dictionary<string, object?>
+            {
+                ["model"] = string.IsNullOrWhiteSpace(modelId) ? DefaultModelId ?? "gpt-4o-mini" : modelId,
+                ["input"] = prompt,
+                ["max_output_tokens"] = 8192,
+            };
+            if (!string.IsNullOrWhiteSpace(reasoningMode))
+                body["reasoning"] = new Dictionary<string, string> { ["effort"] = reasoningMode };
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.openai.com/v1/responses");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            request.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+
+            using var response = await TextOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                return new TextOnlyAgentResult(false, $"Codex text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
+
+            return new TextOnlyAgentResult(true, "ok", ExtractResponseText(responseText), null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new TextOnlyAgentResult(false, "Codex text-only call failed", null, ex.Message);
+        }
+    }
+
     protected override AgentInvocation BuildInvocation(
         string prompt,
         AgentCredential? credential,
@@ -168,5 +211,60 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         if (output.Contains("--json", StringComparison.Ordinal))
             return "--json";
         return null;
+    }
+
+    private static string? ResolveOpenAiApiKey(AgentCredential? credential)
+    {
+        string? apiKey = null;
+        credential?.EnvironmentVariables.TryGetValue("OPENAI_API_KEY", out apiKey);
+        if (!string.IsNullOrEmpty(apiKey))
+            return apiKey;
+
+        string? authJson = null;
+        credential?.EnvironmentVariables.TryGetValue("CODEX_AUTH_JSON", out authJson);
+        if (string.IsNullOrEmpty(authJson))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(authJson);
+            if (doc.RootElement.TryGetProperty("OPENAI_API_KEY", out var key)
+                && key.ValueKind == JsonValueKind.String)
+                return key.GetString();
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static string ExtractResponseText(string responseText)
+    {
+        using var doc = JsonDocument.Parse(responseText);
+        if (doc.RootElement.TryGetProperty("output_text", out var outputText)
+            && outputText.ValueKind == JsonValueKind.String)
+            return outputText.GetString() ?? string.Empty;
+
+        var parts = new List<string>();
+        if (doc.RootElement.TryGetProperty("output", out var output)
+            && output.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in output.EnumerateArray())
+            {
+                if (!item.TryGetProperty("content", out var content)
+                    || content.ValueKind != JsonValueKind.Array)
+                    continue;
+                foreach (var chunk in content.EnumerateArray())
+                {
+                    if (chunk.TryGetProperty("text", out var text)
+                        && text.ValueKind == JsonValueKind.String)
+                        parts.Add(text.GetString() ?? string.Empty);
+                }
+            }
+        }
+
+        return string.Concat(parts);
     }
 }

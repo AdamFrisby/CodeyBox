@@ -79,7 +79,7 @@ public sealed record WorkItem
     /// <summary>
     /// IDs of work items this item depends on. The orchestrator will not pick
     /// this item up until every dependency has reached a terminal state
-    /// (Done, Failed, AuditFailed, or Cancelled). Immutable after creation.
+    /// (Done, Failed, AuditFailed, MergeConflictResolutionFailed, or Cancelled). Immutable after creation.
     /// </summary>
     public IReadOnlyList<WorkItemId> DependsOn { get; init; } = [];
 

@@ -203,10 +203,15 @@ public sealed class ReleaseService
         // Check whether any linked work items are non-Done (failed/cancelled) before
         // notifying the operator. The operator then decides whether to proceed or add more work.
         var items = await CollectWorkItemsAsync(id, ct);
-        var hasFailed = items.Any(i => i.State is WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled);
+        var hasFailed = items.Any(i => i.State is WorkItemState.Failed or WorkItemState.AuditFailed
+            or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled);
         if (hasFailed)
             await PublishAsync("release.has_failed_work_items", closed, project, ct,
-                new { failedCount = items.Count(i => i.State is WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled) });
+                new
+                {
+                    failedCount = items.Count(i => i.State is WorkItemState.Failed or WorkItemState.AuditFailed
+                        or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled),
+                });
 
         // If all items are already terminal → begin review immediately.
         if (AllTerminal(items))
@@ -788,7 +793,8 @@ public sealed class ReleaseService
     private static bool AllTerminal(IReadOnlyList<WorkItem> items) =>
         items.Count > 0 &&
         items.All(i => i.State is WorkItemState.Done or WorkItemState.Failed
-                                or WorkItemState.AuditFailed or WorkItemState.Cancelled);
+                                or WorkItemState.AuditFailed or WorkItemState.MergeConflictResolutionFailed
+                                or WorkItemState.Cancelled);
 
     private async Task<bool> WaitForWorkItemTerminalAsync(WorkItemId id, TimeSpan timeout, CancellationToken ct)
     {
@@ -799,7 +805,8 @@ public sealed class ReleaseService
             var item = await _workItems.GetAsync(id, ct);
             if (item is null) return true;
             if (item.State is WorkItemState.Done or WorkItemState.Failed
-                           or WorkItemState.AuditFailed or WorkItemState.Cancelled)
+                           or WorkItemState.AuditFailed or WorkItemState.MergeConflictResolutionFailed
+                           or WorkItemState.Cancelled)
                 return true;
             if (DateTimeOffset.UtcNow >= deadline)
                 return false;

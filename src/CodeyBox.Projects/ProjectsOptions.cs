@@ -110,6 +110,7 @@ public sealed class ProjectAuditConfig
     public int? StuckThresholdMinutes { get; set; }
     public bool? AutoRetryOnStuck { get; set; }
     public int? MaxStuckRetries { get; set; }
+    public int? MergeScopeBufferLines { get; set; }
 
     public List<string>? Languages { get; set; }
     public List<string>? AuditTypes { get; set; }

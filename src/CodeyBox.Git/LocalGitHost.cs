@@ -133,6 +133,7 @@ public sealed class LocalGitHost : IGitHost
         Validation.ValidateRepositoryUrl(upstreamUrl, nameof(upstreamUrl));
         Validation.ValidateBranchName(branch, nameof(branch));
         var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
         // git push [<repository> [<refspec>...]] — push doesn't support `--`
         // before <repository>, so we rely on URL validation above to ensure
         // the URL is well-formed and not option-like.
@@ -215,6 +216,112 @@ public sealed class LocalGitHost : IGitHost
     }
 
     public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
+
+    public async Task<GitMergeTreeResult> ComputeMergeTreeAsync(
+        string repositoryId,
+        string mainCommit,
+        string workCommit,
+        CancellationToken ct = default)
+    {
+        Validation.ValidateCommitSha(mainCommit, nameof(mainCommit));
+        Validation.ValidateCommitSha(workCommit, nameof(workCommit));
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+
+        var rc = await RunGitAsync(
+            workdir: path,
+            ct,
+            "merge-tree", "--write-tree", "--no-messages", mainCommit, workCommit);
+        var lines = rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length == 0 || !LooksLikeSha(lines[0]))
+            throw new InvalidOperationException($"git merge-tree did not return a tree: {rc.Stderr}{rc.Stdout}");
+
+        var conflicted = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var line in lines.Skip(1))
+        {
+            var tab = line.LastIndexOf('\t');
+            if (tab >= 0 && tab + 1 < line.Length)
+                conflicted.Add(line[(tab + 1)..]);
+        }
+
+        return new GitMergeTreeResult(
+            HasConflicts: rc.ExitCode != 0 || conflicted.Count > 0,
+            TreeSha: lines[0].Trim(),
+            ConflictedFiles: [.. conflicted],
+            RawOutput: rc.Stdout);
+    }
+
+    public async Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
+    {
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(path, ct, "rev-parse", "--verify", $"{commitish}^{{commit}}");
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException($"git rev-parse commit '{commitish}' failed: {rc.Stderr}");
+        return rc.Stdout.Trim();
+    }
+
+    public async Task<string> ResolveTreeAsync(string repositoryId, string treeish, CancellationToken ct = default)
+    {
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(path, ct, "rev-parse", "--verify", $"{treeish}^{{tree}}");
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException($"git rev-parse tree '{treeish}' failed: {rc.Stderr}");
+        return rc.Stdout.Trim();
+    }
+
+    public async Task<string> ReadTextFileAsync(string repositoryId, string treeish, string filePath, CancellationToken ct = default)
+    {
+        ValidateRepositoryRelativePath(filePath);
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(path, ct, "show", $"{treeish}:{filePath}");
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException($"git show '{treeish}:{filePath}' failed: {rc.Stderr}");
+        return rc.Stdout;
+    }
+
+    public async Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(
+        string repositoryId,
+        string fromTreeish,
+        string toTreeish,
+        CancellationToken ct = default)
+    {
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(path, ct, "diff", "--name-status", "-M", fromTreeish, toTreeish);
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException($"git diff --name-status failed: {rc.Stderr}");
+
+        var changes = new List<GitChangedPath>();
+        foreach (var line in rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var parts = line.Split('\t', StringSplitOptions.None);
+            if (parts.Length == 2)
+                changes.Add(new GitChangedPath(parts[0], parts[1]));
+            else if (parts.Length == 3)
+                changes.Add(new GitChangedPath(parts[0], parts[2], parts[1]));
+        }
+        return changes;
+    }
+
+    public async Task<string> GetUnifiedDiffAsync(
+        string repositoryId,
+        string fromTreeish,
+        string toTreeish,
+        string filePath,
+        CancellationToken ct = default)
+    {
+        ValidateRepositoryRelativePath(filePath);
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(
+            path, ct, "diff", "--no-ext-diff", "--no-color", "--unified=0", fromTreeish, toTreeish, "--", filePath);
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException($"git diff for '{filePath}' failed: {rc.Stderr}");
+        return rc.Stdout;
+    }
 
     private static async Task<RepositoryLockLease> AcquireRepositoryLockAsync(string path, CancellationToken ct)
     {
@@ -367,6 +474,19 @@ public sealed class LocalGitHost : IGitHost
 
             """);
         File.Move(tempPath, configPath, overwrite: true);
+    }
+
+    private static bool LooksLikeSha(string value)
+        => value.Length is >= 40 and <= 64 && value.All(Uri.IsHexDigit);
+
+    private static void ValidateRepositoryRelativePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)
+            || Path.IsPathRooted(path)
+            || path.Split('/', '\\').Any(p => p is "" or "." or ".."))
+        {
+            throw new ArgumentException("Path must be repository-relative and must not contain traversal segments.", nameof(path));
+        }
     }
 
     private static string ScrubCredentialMaterial(string value)

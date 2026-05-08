@@ -131,6 +131,7 @@ public sealed class ProjectRepository : IProjectRepository
         var mergedStuck = rawStuck.HasValue ? rawStuck.Value : -1;
         var mergedAutoRetry = project?.AutoRetryOnStuck ?? defaults?.AutoRetryOnStuck ?? false;
         var mergedMaxRetries = project?.MaxStuckRetries ?? defaults?.MaxStuckRetries ?? 2;
+        var mergedMergeScopeBufferLines = Math.Max(0, project?.MergeScopeBufferLines ?? defaults?.MergeScopeBufferLines ?? 5);
 
         var rawAuditAgent = project?.AuditAgent ?? defaults?.AuditAgent;
         var mergedAuditAgent = string.IsNullOrWhiteSpace(rawAuditAgent)
@@ -155,6 +156,7 @@ public sealed class ProjectRepository : IProjectRepository
             StuckThresholdMinutes = mergedStuck,
             AutoRetryOnStuck = mergedAutoRetry,
             MaxStuckRetries = mergedMaxRetries,
+            MergeScopeBufferLines = mergedMergeScopeBufferLines,
             Languages = mergedLanguages,
             LanguagesConfigured = languagesConfigured,
             AuditTypes = mergedAuditTypes,

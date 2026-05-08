@@ -22,6 +22,7 @@ public static class WorkItemDependencies
             WorkItemState.Failed,
             WorkItemState.AuditFailed,
             WorkItemState.Cancelled,
+            WorkItemState.MergeConflictResolutionFailed,
             WorkItemState.AbandonedAfterRecoveryAttempts,
         };
 

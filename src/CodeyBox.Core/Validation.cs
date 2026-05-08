@@ -23,6 +23,9 @@ public static partial class Validation
     [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,254}$", RegexOptions.CultureInvariant)]
     private static partial Regex BranchNameRegex();
 
+    [GeneratedRegex(@"^[0-9a-fA-F]{40,64}$", RegexOptions.CultureInvariant)]
+    private static partial Regex CommitShaRegex();
+
     /// <summary>
     /// Git tag name: ASCII alnum plus a small set of separators. Slashes are
     /// excluded (tags don't need namespacing), keeping the set conservative
@@ -67,6 +70,14 @@ public static partial class Validation
             throw new ArgumentException($"{fieldName} must not end with '.lock'", fieldName);
         if (!BranchNameRegex().IsMatch(name))
             throw new ArgumentException($"{fieldName} '{name}' is not a valid branch name", fieldName);
+    }
+
+    public static void ValidateCommitSha(string sha, string fieldName)
+    {
+        if (string.IsNullOrWhiteSpace(sha))
+            throw new ArgumentException($"{fieldName} must not be empty", fieldName);
+        if (!CommitShaRegex().IsMatch(sha))
+            throw new ArgumentException($"{fieldName} '{sha}' is not a valid commit sha", fieldName);
     }
 
     public static void ValidateRepositoryUrl(string url, string fieldName)

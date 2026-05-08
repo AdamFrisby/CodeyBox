@@ -321,6 +321,12 @@ public sealed record ProjectAudit
     /// <summary>Maximum automatic re-queues per work item due to stuck detection.</summary>
     public int MaxStuckRetries { get; init; } = 2;
 
+    /// <summary>
+    /// Number of context lines around each deterministic merge conflict hunk
+    /// that the conflict resolver may change. Defaults to 5.
+    /// </summary>
+    public int MergeScopeBufferLines { get; init; } = 5;
+
     public IReadOnlyList<string> Languages { get; init; } = [];
     public bool LanguagesConfigured { get; init; }
     public IReadOnlyList<string> AuditTypes { get; init; } = [];

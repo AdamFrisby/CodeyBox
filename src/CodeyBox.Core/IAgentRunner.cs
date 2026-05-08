@@ -35,6 +35,29 @@ public interface IStructuredStreamAgentRunner : IAgentRunner
 }
 
 /// <summary>
+/// Optional runner capability for prompts that must be handled as pure
+/// text-in/text-out model calls. Implementations must not expose a shell,
+/// filesystem, repository checkout, agent tool runtime, or model-controlled
+/// network to the prompt; the only output channel is returned text.
+/// Credentials are transport authentication for the provider call only and
+/// must never be included in the prompt, model-visible context, or returned
+/// output.
+/// </summary>
+public interface ITextOnlyAgentRunner : IAgentRunner
+{
+    Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default);
+}
+
+public sealed record TextOnlyAgentResult(bool Success, string Summary, string? Output, string? Error);
+
+public sealed record ConflictResolverFile(string Path, string Content);
+
+/// <summary>
 /// Optional runner capability for CLIs where CodeyBox pins a default model
 /// even when the work item does not carry an explicit ModelId.
 /// </summary>

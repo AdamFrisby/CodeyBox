@@ -384,7 +384,8 @@ internal static class WorkItemEndpoints
 
         // Only resume from terminal-failed states. Done items have nothing
         // to retry; non-terminal states would race the pipeline.
-        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed or WorkItemState.Cancelled
+        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
+            or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
             or WorkItemState.AbandonedAfterRecoveryAttempts))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
@@ -444,12 +445,13 @@ internal static class WorkItemEndpoints
         var terminalStates = new[]
         {
             WorkItemState.Done, WorkItemState.Failed,
-            WorkItemState.AuditFailed, WorkItemState.Cancelled,
+            WorkItemState.AuditFailed, WorkItemState.MergeConflictResolutionFailed,
+            WorkItemState.Cancelled,
         };
         if (!terminalStates.Contains(source!.State))
             return Results.BadRequest(new
             {
-                error = $"cannot replay work item in state {source.State}; source must be in a terminal state (Done, Failed, AuditFailed, Cancelled)"
+                error = $"cannot replay work item in state {source.State}; source must be in a terminal state (Done, Failed, AuditFailed, MergeConflictResolutionFailed, Cancelled)"
             });
 
         // Resolve agent override — null means keep the source's agent.
@@ -625,6 +627,7 @@ internal static class WorkItemEndpoints
 
         if (item.State is WorkItemState.Done or WorkItemState.Failed
             or WorkItemState.Cancelled or WorkItemState.AuditFailed
+            or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.AbandonedAfterRecoveryAttempts)
             return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
 
@@ -1247,6 +1250,7 @@ internal static class WorkItemEndpoints
         var isTerminal = item.State is
             WorkItemState.Done or WorkItemState.Failed or
             WorkItemState.Cancelled or WorkItemState.AuditFailed or
+            WorkItemState.MergeConflictResolutionFailed or
             WorkItemState.AbandonedAfterRecoveryAttempts;
 
         var entries = await timeline.GetTimelineAsync(workItemId.ToString(), isTerminal, item.CreatedAt, ct);
