@@ -330,7 +330,7 @@ does not write to the summary cache.
   "outputTokens": 3000,
   "cachedInputTokens": 12000,
   "estimatedUsd": 1.23,
-  "finalAssistantMessage": null,
+  "finalAssistantMessage": "Done.",
   "toolCalls": [
     {
       "toolUseId": "toolu_01",
@@ -361,9 +361,10 @@ non-timing analytics are still returned when the stream has enough structured
 data to derive them. Explicit stream duration fields are still used when the
 CLI emits them.
 
-`finalAssistantMessage` is always returned as `null` from API analytics
-responses. The parser may observe final model text internally, but API responses
-intentionally expose only numeric and structural analytics.
+`finalAssistantMessage` carries the parser's final assistant text when the
+captured stream includes one. It is `null` for unsupported agents, truncated
+streams that never emitted final text, or CLIs that do not expose final text in
+their stream JSON.
 
 #### `GET /workitems/{id}/agent-streams/aggregate`
 

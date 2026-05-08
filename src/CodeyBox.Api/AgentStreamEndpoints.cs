@@ -227,7 +227,7 @@ internal static class AgentStreamEndpoints
             outputTokens = summary.OutputTokens,
             cachedInputTokens = summary.CachedInputTokens,
             estimatedUsd = summary.EstimatedUsd,
-            finalAssistantMessage = (string?)null,
+            finalAssistantMessage = summary.FinalAssistantMessage,
             toolCalls = summary.ToolCalls.Select(t => new
             {
                 toolUseId = t.ToolUseId,

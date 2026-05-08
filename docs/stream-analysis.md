@@ -11,7 +11,7 @@ Each invocation summary includes:
 - authoritative cost from the agent result event when present
 - tool calls with name, redacted input summary, start/end timestamps, duration, success flag, and output bytes
 - stall events
-- no final assistant text in API or cached dashboard responses; model text can contain user data, prompts, or tool output and is intentionally withheld from analytics surfaces
+- final assistant text when the captured stream includes it
 
 Claude, Codex, and Gemini parsers are registered separately because their CLI stream shapes differ. Unsupported agents produce an empty `unknown` summary so the dashboard can remain graceful when stream JSON is not available.
 
@@ -27,7 +27,7 @@ Stalls are classified from the prior event state:
 
 Truncated files are accepted. A `tool_use` without a matching result is recorded as unfinished with null end time, null duration, and unknown success.
 
-Captured CLI streams do not always include timestamps. Claude Code 2.1 stream-json and Codex CLI 0.128 command-execution events can omit per-event `timestamp`, `started_at`, `completed_at`, and duration fields. In that case the analyser keeps the capture file read-only and does not infer event timing from JSONL line or byte position. Timestamp-less events can still contribute tokens, cost, tool frequency, input summaries, output sizes, and final text observed internally, but total duration, TTFT, stalls, and tool-call intervals remain zero or null unless the stream provides explicit timestamp or duration fields.
+Captured CLI streams do not always include timestamps. Claude Code 2.1 stream-json and Codex CLI 0.128 command-execution events can omit per-event `timestamp`, `started_at`, `completed_at`, and duration fields. In that case the analyser keeps the capture file read-only and does not infer event timing from JSONL line or byte position. Timestamp-less events can still contribute tokens, cost, tool frequency, input summaries, output sizes, and final text, but total duration, TTFT, stalls, and tool-call intervals remain zero or null unless the stream provides explicit timestamp or duration fields.
 
 ## Thinking Vs Executing
 
@@ -64,4 +64,4 @@ Cost in the agent `result` event is more authoritative than the pipeline cost ex
 
 Audit stream files use detailed phases such as `audit-llm-security:llm-review`; reconciliation also matches the canonical `audit` phase used by pipeline cost rows so stream result costs correct the existing row instead of adding a duplicate.
 
-Cached dashboard summaries and on-demand API analysis responses keep final assistant text null so analytics surfaces stay numeric and structural.
+Cached dashboard summaries and on-demand API analysis responses expose the same final assistant text parsed from the stream. The field remains nullable because not every CLI schema emits final text and truncated files may end before the final response.

@@ -621,7 +621,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         var row = Assert.Single(rows);
         Assert.Equal("work-1-abcdef.jsonl", row.FileName);
         Assert.Single(row.Summary.ToolCalls);
-        Assert.Null(row.Summary.FinalAssistantMessage);
+        Assert.Equal("done", row.Summary.FinalAssistantMessage);
         var costs = await _costs.GetByWorkItemAsync(item.Id.ToString());
         var cost = Assert.Single(costs);
         Assert.Equal(0.75, cost.EstimatedUsd);
@@ -953,7 +953,7 @@ public sealed class AggregateEndpointTests : IClassFixture<AgentStreamAnalysisAp
         var bash = body.GetProperty("byTool").EnumerateArray().Single(t => t.GetProperty("tool").GetString() == "Bash");
         Assert.Equal(4_000, bash.GetProperty("totalDurationMs").GetInt64());
         var invocation = Assert.Single(body.GetProperty("invocations").EnumerateArray());
-        Assert.Equal(JsonValueKind.Null, invocation.GetProperty("finalAssistantMessage").ValueKind);
+        Assert.Equal("done", invocation.GetProperty("finalAssistantMessage").GetString());
     }
 }
 
@@ -1101,7 +1101,7 @@ public sealed class MissingFileTests : IClassFixture<AgentStreamAnalysisApiFacto
         Assert.Equal(45, body.GetProperty("outputTokens").GetInt32());
         Assert.Equal(6, body.GetProperty("cachedInputTokens").GetInt32());
         Assert.Equal(4_000, body.GetProperty("totalDurationMs").GetInt64());
-        Assert.Equal(JsonValueKind.Null, body.GetProperty("finalAssistantMessage").ValueKind);
+        Assert.Equal("fresh done", body.GetProperty("finalAssistantMessage").GetString());
         var tool = Assert.Single(body.GetProperty("toolCalls").EnumerateArray());
         Assert.Equal("fresh", tool.GetProperty("toolUseId").GetString());
         Assert.Equal("Read", tool.GetProperty("toolName").GetString());
