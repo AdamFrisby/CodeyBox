@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "id",
+    "reviewFocus"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "displayName": {
+      "type": "string"
+    },
+    "llmAuditorName": {
+      "type": "string"
+    },
+    "reviewFocus": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

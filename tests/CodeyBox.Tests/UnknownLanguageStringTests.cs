@@ -1,6 +1,5 @@
 using CodeyBox.Core;
 using CodeyBox.Projects;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
@@ -8,9 +7,8 @@ namespace CodeyBox.Tests;
 public sealed class UnknownLanguageStringTests
 {
     [Fact]
-    public async Task ProjectRepositoryLogsWarningAndSkipsUnknownLanguage()
+    public async Task ProjectRepositoryPreservesConfigOnlyLanguagesForPresetCatalog()
     {
-        var logger = new CapturingLogger<ProjectRepository>();
         var repo = new ProjectRepository(Options.Create(new ProjectsOptions
         {
             Projects =
@@ -22,20 +20,16 @@ public sealed class UnknownLanguageStringTests
                     Audit = new ProjectAuditConfig { Languages = ["python", "zig"] },
                 },
             ],
-        }), logger);
+        }));
 
         var project = await repo.GetAsync(new ProjectId("alpha"));
 
-        Assert.Equal(["python"], project!.Audit.Languages);
-        Assert.Contains(logger.Entries, e =>
-            e.Level == LogLevel.Warning &&
-            e.Message.Contains("unsupported audit language 'zig'", StringComparison.Ordinal));
+        Assert.Equal(["python", "zig"], project!.Audit.Languages);
     }
 
     [Fact]
-    public async Task ProjectRepositorySkipsLanguagesOutsideBuiltInSet()
+    public async Task ProjectRepositoryNoLongerUsesCompileTimeLanguageAllowlist()
     {
-        var logger = new CapturingLogger<ProjectRepository>();
         var repo = new ProjectRepository(Options.Create(new ProjectsOptions
         {
             Projects =
@@ -47,22 +41,10 @@ public sealed class UnknownLanguageStringTests
                     Audit = new ProjectAuditConfig { Languages = ["typescript", "javascript", "ruby", "shell"] },
                 },
             ],
-        }), logger);
+        }));
 
         var project = await repo.GetAsync(new ProjectId("alpha"));
 
-        Assert.Empty(project!.Audit.Languages);
-        Assert.Contains(logger.Entries, e =>
-            e.Level == LogLevel.Warning &&
-            e.Message.Contains("unsupported audit language 'typescript'", StringComparison.Ordinal));
-        Assert.Contains(logger.Entries, e =>
-            e.Level == LogLevel.Warning &&
-            e.Message.Contains("unsupported audit language 'javascript'", StringComparison.Ordinal));
-        Assert.Contains(logger.Entries, e =>
-            e.Level == LogLevel.Warning &&
-            e.Message.Contains("unsupported audit language 'ruby'", StringComparison.Ordinal));
-        Assert.Contains(logger.Entries, e =>
-            e.Level == LogLevel.Warning &&
-            e.Message.Contains("unsupported audit language 'shell'", StringComparison.Ordinal));
+        Assert.Equal(["typescript", "javascript", "ruby", "shell"], project!.Audit.Languages);
     }
 }

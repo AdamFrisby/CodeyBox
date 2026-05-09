@@ -1,0 +1,14 @@
+id: go
+displayName: "Go"
+marker:
+  globs: ["**/go.mod"]
+  script: |
+    find . -type d \( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \) -prune -o -name 'go.mod' -exec dirname {} \; | sort -u
+auditors:
+  - name: go:format-check
+    script: "out=$(gofmt -l .) || exit $?; test -z \"$out\" || { printf '%s\\n' \"$out\"; exit 1; }"
+    toolName: "gofmt"
+  - name: go:vet
+    argv: ["go", "vet", "./..."]
+  - name: go:test-pass
+    argv: ["go", "test", "./..."]

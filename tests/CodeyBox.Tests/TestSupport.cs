@@ -194,6 +194,7 @@ internal sealed class ScriptedAuditorCatalog : IPresetCatalog
     public IReadOnlyList<IAuditor> ResolveAuditType(string name, PresetContext ctx) => _auditors;
     public IReadOnlyList<string> KnownLanguages => [];
     public IReadOnlyList<string> KnownAuditTypes => _auditors.Count == 0 ? [] : ["scripted"];
+    public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}";
 }
 
 internal enum MergeStrategy

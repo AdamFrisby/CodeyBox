@@ -114,29 +114,15 @@ public sealed class LlmReviewAuditor : IAuditor
         var safePrompt = context.OriginalPrompt
             .Replace("</task_description>", "< /task_description>", StringComparison.OrdinalIgnoreCase);
 
-        return $$"""
-            You are a strict code reviewer. Review the working tree at {{SandboxConventions.WorkDir}}, focusing on:
-            {{_opts.ReviewFocus}}
-
-            Original task being reviewed:
-            <task_description>
-            {{safePrompt}}
-            </task_description>
-
-            Examine the diff between {{context.BaseBranch}} and {{context.WorkBranch}}, plus the surrounding code.
-            Then write your verdict to {{ResultFile}} as a single JSON object with this exact shape:
-
-            {
-              "passed": true|false,
-              "findings": [
-                { "severity": "error|warning|info", "title": "short title",
-                  "description": "details", "location": "path:line" }
-              ]
-            }
-
-            "passed" must be false if there is ANY finding with severity "error".
-            Do not include other text in the JSON file. After writing the file, exit.
-            """;
+        return LlmPromptFrameTemplate.Render(_opts.FrameTemplate, new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["workingDirectory"] = SandboxConventions.WorkDir,
+            ["reviewFocus"] = _opts.ReviewFocus,
+            ["baseBranch"] = context.BaseBranch,
+            ["workBranch"] = context.WorkBranch,
+            ["originalPrompt"] = safePrompt,
+            ["resultFile"] = ResultFile,
+        });
     }
 
     private static AuditSeverity ParseSeverity(string? s) => s?.ToLowerInvariant() switch
@@ -167,4 +153,51 @@ public sealed record LlmReviewAuditorOptions
     /// "- Architectural boundaries / loose coupling violations\n- Hardcoded secrets".
     /// </summary>
     public required string ReviewFocus { get; init; }
+
+    public required string FrameTemplate { get; init; }
+}
+
+public static class LlmPromptFrameTemplate
+{
+    public static readonly IReadOnlySet<string> AllowedPlaceholders =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            "workingDirectory",
+            "reviewFocus",
+            "baseBranch",
+            "workBranch",
+            "originalPrompt",
+            "resultFile",
+        };
+
+    public static IReadOnlyList<string> FindPlaceholders(string template)
+    {
+        var placeholders = new List<string>();
+        for (var i = 0; i < template.Length;)
+        {
+            var start = template.IndexOf("{{", i, StringComparison.Ordinal);
+            if (start < 0)
+                break;
+            var end = template.IndexOf("}}", start + 2, StringComparison.Ordinal);
+            if (end < 0)
+                break;
+            placeholders.Add(template[(start + 2)..end].Trim());
+            i = end + 2;
+        }
+        return placeholders;
+    }
+
+    public static string Render(string template, IReadOnlyDictionary<string, string> values)
+    {
+        var rendered = template;
+        foreach (var placeholder in FindPlaceholders(template).Distinct(StringComparer.Ordinal))
+        {
+            if (!AllowedPlaceholders.Contains(placeholder))
+                throw new InvalidOperationException($"Unknown LLM prompt frame placeholder '{{{{{placeholder}}}}}'");
+            if (!values.TryGetValue(placeholder, out var value))
+                throw new InvalidOperationException($"No value supplied for LLM prompt frame placeholder '{{{{{placeholder}}}}}'");
+            rendered = rendered.Replace("{{" + placeholder + "}}", value, StringComparison.Ordinal);
+        }
+        return rendered;
+    }
 }

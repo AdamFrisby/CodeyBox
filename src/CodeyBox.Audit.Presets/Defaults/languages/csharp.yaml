@@ -1,0 +1,13 @@
+id: csharp
+displayName: "C#"
+marker:
+  globs: ["**/*.csproj", "**/*.sln", "**/*.slnx"]
+  script: |
+    find . -type d \( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \) -prune -o \( -name '*.csproj' -o -name '*.sln' -o -name '*.slnx' \) -exec dirname {} \; | sort -u
+auditors:
+  - name: csharp:format-check
+    argv: ["dotnet", "format", "--verify-no-changes"]
+  - name: csharp:build-WaE
+    argv: ["dotnet", "build", "--no-incremental", "/warnaserror"]
+  - name: csharp:test-pass
+    argv: ["dotnet", "test", "--no-build"]

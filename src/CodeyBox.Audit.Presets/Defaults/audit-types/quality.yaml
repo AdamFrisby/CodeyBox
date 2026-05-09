@@ -1,0 +1,10 @@
+id: quality
+displayName: "Quality review"
+llmAuditorName: quality:llm-review
+reviewFocus: |-
+  - Dead code (unreachable branches, unused functions/imports)
+  - Magic numbers and unexplained literal constants
+  - Unclear or misleading names; abbreviations a new reader couldn't expand
+  - Error handling at boundaries that swallows or rethrows incorrectly
+  - Duplicated logic that should be a single helper
+  - Comments that describe WHAT instead of WHY

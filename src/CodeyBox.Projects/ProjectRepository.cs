@@ -18,14 +18,12 @@ public sealed class ProjectRepository : IProjectRepository
 {
     private readonly Dictionary<string, Project> _byId;
     private readonly IReadOnlyList<Project> _list;
-    private readonly ILogger<ProjectRepository> _logger;
 
     public ProjectRepository(IOptions<ProjectsOptions> options)
         : this(options, NullLogger<ProjectRepository>.Instance) { }
 
     public ProjectRepository(IOptions<ProjectsOptions> options, ILogger<ProjectRepository> logger)
     {
-        _logger = logger;
         var opts = options.Value;
         var defaults = opts.Defaults ?? new ProjectDefaultsConfig();
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -121,7 +119,7 @@ public sealed class ProjectRepository : IProjectRepository
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
         var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;
         var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ProjectAuditLanguages.Default;
-        var mergedLanguages = FilterSupportedLanguages(projectId, configuredLanguages);
+        var mergedLanguages = FilterConfiguredLanguages(configuredLanguages);
         var mergedAuditTypes = project?.AuditTypes ?? defaults?.AuditTypes ?? [];
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
 
@@ -167,21 +165,13 @@ public sealed class ProjectRepository : IProjectRepository
         };
     }
 
-    private IReadOnlyList<string> FilterSupportedLanguages(string? projectId, IEnumerable<string> languages)
+    private static IReadOnlyList<string> FilterConfiguredLanguages(IEnumerable<string> languages)
     {
         var filtered = new List<string>();
         foreach (var language in languages)
         {
             if (string.IsNullOrWhiteSpace(language))
                 continue;
-            if (!ProjectAuditLanguages.IsSupported(language))
-            {
-                _logger.LogWarning(
-                    "Project '{ProjectId}' declares unsupported audit language '{Language}'; skipping",
-                    projectId ?? "(unknown)",
-                    language);
-                continue;
-            }
             filtered.Add(language);
         }
         return filtered;

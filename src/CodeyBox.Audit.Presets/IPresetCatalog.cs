@@ -29,6 +29,9 @@ public interface IPresetCatalog
 
     /// <summary>All known audit-type preset names.</summary>
     IReadOnlyList<string> KnownAuditTypes { get; }
+
+    /// <summary>Validated LLM review frame template used by configured LLM auditors.</summary>
+    string LlmPromptFrameTemplate { get; }
 }
 
 /// <summary>

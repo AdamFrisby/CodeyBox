@@ -739,7 +739,13 @@ builder.Services.AddSingleton<CredentialSmokeGate>(sp =>
 // --- Projects + per-project upstream + audit composer ------------------------
 builder.Services.AddSingleton<IProjectRepository, ProjectRepository>();
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
-builder.Services.AddSingleton<IPresetCatalog, PresetCatalog>();
+builder.Services.AddSingleton<IPresetCatalog>(_ =>
+{
+    var options = builder.Configuration.GetSection("CodeyBox:Presets").Get<PresetCatalogOptions>()
+        ?? new PresetCatalogOptions();
+    options.ProjectRoot ??= builder.Environment.ContentRootPath;
+    return new PresetCatalog(options);
+});
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------

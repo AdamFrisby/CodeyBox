@@ -63,16 +63,13 @@ public sealed class ProjectAuditorComposer
 
         foreach (var lang in project.Audit.Languages)
         {
-            if (!ProjectAuditLanguages.IsSupported(lang))
-            {
+            var languageAuditors = _catalog.ResolveLanguage(lang, ctx);
+            if (languageAuditors.Count == 0)
                 _logger.LogWarning(
                     "Project '{ProjectId}' declares unsupported audit language '{Language}'; skipping",
                     project.Id.Value,
                     lang);
-                continue;
-            }
-
-            auditors.AddRange(_catalog.ResolveLanguage(lang, ctx));
+            auditors.AddRange(languageAuditors);
         }
 
         foreach (var type in project.Audit.AuditTypes)
@@ -86,7 +83,7 @@ public sealed class ProjectAuditorComposer
             }
             else
             {
-                auditors.Add(MaterialiseCustom(custom, ctx));
+                auditors.Add(MaterialiseCustom(custom, ctx, _catalog.LlmPromptFrameTemplate));
             }
         }
 
@@ -119,7 +116,7 @@ public sealed class ProjectAuditorComposer
     ///   "diff-pattern" — DiffPatternAuditor with the given Patterns
     ///   "llm"          — LlmReviewAuditor with the given ReviewFocus
     /// </summary>
-    private static IAuditor MaterialiseCustom(CustomAuditorDescriptor c, PresetContext ctx)
+    private static IAuditor MaterialiseCustom(CustomAuditorDescriptor c, PresetContext ctx, string frameTemplate)
     {
         if (string.IsNullOrWhiteSpace(c.Name))
             throw new InvalidOperationException($"Custom auditor of kind '{c.Kind}' requires a non-empty Name");
@@ -145,6 +142,7 @@ public sealed class ProjectAuditorComposer
                 Name = c.Name,
                 Agent = ctx.Agent,
                 ReviewFocus = c.ReviewFocus ?? throw new InvalidOperationException($"llm auditor '{c.Name}' needs ReviewFocus"),
+                FrameTemplate = frameTemplate,
             }),
             _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm)"),
         };

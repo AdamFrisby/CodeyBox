@@ -1,0 +1,90 @@
+id: tests
+displayName: "Test meaningfulness review"
+llmAuditorName: tests:meaningfulness-review
+reviewFocus: |-
+  You are reviewing whether the test changes in this diff give
+  ADEQUATE and MEANINGFUL coverage of the production-code changes.
+  Read both halves: the new/changed production code AND the test
+  changes. Your goal is to flag tests that exist on paper but would
+  not catch a plausible bug.
+
+  Severity guidance:
+    - Error: a code path with no test, or a new test that's
+      impossibility-mirror / pure-mock / no-assertion / trivially-true.
+    - Warning: happy-path-only on branchy code, edge cases missing,
+      failure paths uncovered.
+    - Info: suggestions to strengthen the suite.
+
+  # Adequacy — flag missing tests as Error
+  - Each NEW public function / class / endpoint / branch in this
+    diff should have at least one test that exercises it.
+  - Each NEW error path (throw, return error, validation rejection)
+    should have at least one test that triggers it.
+  - Each NEW config option / feature flag should have tests for both
+    on and off branches when the flag changes behaviour.
+  - Tests that were removed without a replacement covering the same
+    path are Error, regardless of why.
+
+  # Meaningfulness — bad patterns to flag as Error
+  - **Implementation-mirroring**: the test asserts the same expression
+    the implementation computes. Example: production has
+      `def add(a,b): return a + b`,
+    test asserts `add(1,2) == 1+2`. The test is logically equivalent
+    to the impl and would not detect any algebraic error.
+  - **Pure-mock tests**: the test sets up mocks, calls the SUT, and
+    only asserts against the mock invocations. The assertions
+    confirm the SUT's call pattern but not its real effect. Mocks
+    are fine for isolating dependencies; the test must additionally
+    assert a real outcome (return value, observable state change,
+    published event content).
+  - **No-assertion tests**: the test runs code and exits without
+    asserting anything. The "test" only catches throws.
+  - **Trivially-true assertions**: Assert.True(true), assert 1 == 1,
+    expect(x).toBe(x), Assert.Equal(x, x). Already caught by the
+    deterministic auditor; flag any the deterministic check missed.
+  - **Tautology asserting on construction**: a test that creates a
+    new instance and asserts a property holds the value just passed
+    to its constructor. This tests the framework, not the code.
+  - **Coverage-padding**: a test whose only purpose is to exercise
+    a line so coverage tooling reports green; no behaviour is
+    checked.
+
+  # Meaningfulness — good patterns to confirm exist
+  - **Integration tests** that exercise multiple modules together,
+    where each must work for the test to pass.
+  - **Failure-mode tests**: timeout, network error, malformed input,
+    exhausted resources, partial failure / retry.
+  - **Edge cases**: empty / null / boundary / max / min / unicode /
+    concurrent / very-large / very-small.
+  - **Property tests** for parsing, validation, and stateful logic
+    when feasible.
+  - **Round-trip tests** for serialization, encoding, encryption.
+  - **Regression tests** for any bug fix in this change.
+
+  # Meaningfulness — heuristic
+  For each test, ask: "if I introduced a plausible bug X in the
+  implementation, would this test catch it?" If the answer for every
+  plausible X is no, the test is not meaningful.
+
+  Examples of plausible bugs the tests should catch:
+    - Off-by-one
+    - Inverted condition (== vs !=, < vs <=)
+    - Forgotten null / empty check
+    - Wrong order of operations
+    - Wrong field used (id vs userId)
+    - Forgotten failure-path handling
+
+  # Skipped / disabled tests
+  - Any new @Skip / it.skip / [Fact(Skip=...)] / @pytest.mark.skip /
+    #[ignore] without a clearly documented reason → Error.
+  - Tests removed entirely → Error if they covered a still-extant
+    code path (cross-reference with the production diff).
+
+  # Test organisation (Info-level)
+  - Test names that don't describe the behaviour under test.
+  - Multiple unrelated assertions in a single test.
+  - Setup that obscures the test (heavy fixtures for simple checks).
+
+  Cite the test file:line you're flagging in 'location'. Where the
+  problem is "no test exists for this prod change," cite the
+  production file:line where the missing coverage is.

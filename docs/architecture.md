@@ -40,7 +40,10 @@ shepherd state.
    └─────────────────────────────────────────────────────────┘
 ```
 
-See [`audit.md`](audit.md) for the audit phase in detail.
+See [`audit.md`](audit.md) for the audit phase in detail. Built-in language
+presets are config-driven YAML resources; see [`languages.md`](languages.md)
+for the schema and override rules. LLM audit focus prompts and the review frame
+are also config-driven; see [`audit-types.md`](audit-types.md).
 
 ## Process / trust boundaries
 

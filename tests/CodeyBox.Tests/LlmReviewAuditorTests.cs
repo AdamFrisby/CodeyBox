@@ -15,6 +15,7 @@ public sealed class LlmReviewAuditorTests
             Name = "security:llm-review",
             Agent = runner,
             ReviewFocus = "- verify credentials are available",
+            FrameTemplate = "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
         });
         var credential = new AgentCredential(
             AgentKind.Codex,
