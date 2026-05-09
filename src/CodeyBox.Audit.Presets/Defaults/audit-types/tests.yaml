@@ -75,8 +75,8 @@ reviewFocus: |-
     - Forgotten failure-path handling
 
   # Skipped / disabled tests
-  - Any new @Skip / it.skip / [Fact(Skip=...)] / @pytest.mark.skip /
-    #[ignore] without a clearly documented reason → Error.
+  - Any new framework-level skip marker, decorator, or attribute without a
+    clearly documented reason → Error.
   - Tests removed entirely → Error if they covered a still-extant
     code path (cross-reference with the production diff).
 

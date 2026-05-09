@@ -1,0 +1,79 @@
+using CodeyBox.Audit.Presets;
+using CodeyBox.Core;
+using CodeyBox.Projects;
+using CodeyBox.Sandbox;
+
+namespace CodeyBox.Tests;
+
+public sealed class ProjectAuditorComposerPresetTests
+{
+    [Fact]
+    public async Task Compose_AppliesProjectAuditTypeFocusAndFrame()
+    {
+        var runner = new CapturingAgent();
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                AuditTypes = ["completeness"],
+                AuditTypeOverrides = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["completeness"] = new() { ReviewFocus = "project-specific completeness focus" },
+                },
+                LlmPromptFrameTemplate = "frame-start\n{{reviewFocus}}\n{{resultFile}}",
+            },
+        };
+
+        var auditor = Assert.Single(composer.Compose(project, runner));
+        await auditor.RunAsync(new ResultFileSandbox(), "/work", new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work"));
+
+        Assert.Contains("frame-start", runner.Prompt, StringComparison.Ordinal);
+        Assert.Contains("project-specific completeness focus", runner.Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("TODO / FIXME / XXX", runner.Prompt, StringComparison.Ordinal);
+    }
+
+    private sealed class CapturingAgent : IAgentRunner
+    {
+        public AgentKind Kind => AgentKind.Claude;
+        public string Prompt { get; private set; } = string.Empty;
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            Prompt = prompt;
+            return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
+        }
+    }
+
+    private sealed class ResultFileSandbox : ISandbox
+    {
+        public string Id => "result-file-sandbox";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "cat")
+                return Task.FromResult(new SandboxExecResult(0, "{\"passed\":true,\"findings\":[]}", ""));
+
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+}

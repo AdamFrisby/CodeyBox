@@ -165,7 +165,8 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 }
 
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
-builder.Services.Configure<ProjectsOptions>(builder.Configuration.GetSection("CodeyBox"));
+builder.Services.AddSingleton<IOptions<ProjectsOptions>>(_ =>
+    Options.Create(ProjectsOptionsBinder.Bind(builder.Configuration.GetSection("CodeyBox"))));
 builder.Services.Configure<HostOptions>(o =>
 {
     var cbOpts = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
@@ -739,13 +740,14 @@ builder.Services.AddSingleton<CredentialSmokeGate>(sp =>
 // --- Projects + per-project upstream + audit composer ------------------------
 builder.Services.AddSingleton<IProjectRepository, ProjectRepository>();
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
-builder.Services.AddSingleton<IPresetCatalog>(_ =>
+builder.Services.AddSingleton(_ =>
 {
     var options = builder.Configuration.GetSection("CodeyBox:Presets").Get<PresetCatalogOptions>()
         ?? new PresetCatalogOptions();
     options.ProjectRoot ??= builder.Environment.ContentRootPath;
-    return new PresetCatalog(options);
+    return options;
 });
+builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(sp.GetRequiredService<PresetCatalogOptions>()));
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------

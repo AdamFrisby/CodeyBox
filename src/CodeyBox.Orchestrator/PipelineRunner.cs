@@ -251,7 +251,8 @@ public sealed class PipelineRunner : IPipelineRunner
             // agent to run the mechanical (shell) auditors itself before
             // committing, pre-empting iter-1 rework cycles for trivial
             // findings (format, lint, build-WaE).
-            var auditors = _auditorComposer.Compose(project, agentRunner);
+            var repositoryPresetFiles = await LoadPresetFilesFromRepositoryAsync(repoId, baseBranch, ct);
+            var auditors = _auditorComposer.Compose(project, agentRunner, repositoryPresetFiles);
 
             // -------- Phase 1: Work --------
             if (!skipWork)
@@ -1749,6 +1750,38 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         return (findings, activeAuditAgentKind);
+    }
+
+    private async Task<IReadOnlyDictionary<string, string>> LoadPresetFilesFromRepositoryAsync(
+        string repoId,
+        string baseBranch,
+        CancellationToken ct)
+    {
+        try
+        {
+            var paths = await _gitHost.ListFilesAsync(repoId, baseBranch, "codeybox", ct);
+
+            var presetPaths = paths.Where(IsPresetPath).ToList();
+            if (presetPaths.Count == 0)
+                return new Dictionary<string, string>(StringComparer.Ordinal);
+
+            var result = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var path in presetPaths)
+                result[path] = await _gitHost.ReadTextFileAsync(repoId, baseBranch, path, ct);
+            return result;
+        }
+        catch (NotSupportedException)
+        {
+            return new Dictionary<string, string>(StringComparer.Ordinal);
+        }
+    }
+
+    private static bool IsPresetPath(string path)
+    {
+        if (string.Equals(path, "codeybox/llm-prompt-frame.yaml", StringComparison.Ordinal))
+            return true;
+        return path.StartsWith("codeybox/languages/", StringComparison.Ordinal) && path.EndsWith(".yaml", StringComparison.Ordinal)
+            || path.StartsWith("codeybox/audit-types/", StringComparison.Ordinal) && path.EndsWith(".yaml", StringComparison.Ordinal);
     }
 
     /// <summary>

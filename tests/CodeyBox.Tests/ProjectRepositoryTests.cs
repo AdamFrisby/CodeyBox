@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Configuration;
 using CodeyBox.Core;
 using CodeyBox.Projects;
 
@@ -126,6 +127,31 @@ public sealed class ProjectRepositoryTests
         Assert.Equal(1, p!.Audit.MaxIterations);
         // AuditTypes wasn't overridden in the project, so we keep the default list.
         Assert.Equal(new[] { "security" }, p.Audit.AuditTypes);
+    }
+
+    [Fact]
+    public async Task ProjectAuditTypesObject_BindsSelectionAndPromptOverrides()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:security:ReviewFocus"] = "project security focus",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:DisplayName"] = "Custom review",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:custom:ReviewFocus"] = "custom focus",
+                ["CodeyBox:Projects:0:Audit:LlmPromptFrameTemplate"] = "{{reviewFocus}}\n{{resultFile}}",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(["custom", "security"], p!.Audit.AuditTypes.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal("project security focus", p.Audit.AuditTypeOverrides["security"].ReviewFocus);
+        Assert.Equal("Custom review", p.Audit.AuditTypeOverrides["custom"].DisplayName);
+        Assert.Equal("{{reviewFocus}}\n{{resultFile}}", p.Audit.LlmPromptFrameTemplate);
     }
 
     [Fact]

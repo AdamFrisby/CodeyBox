@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Collections;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using CodeyBox.Audit.Llm;
@@ -17,8 +18,8 @@ internal sealed class PresetConfigLoader
     private const string ResourcePrefix = "CodeyBox.Audit.Presets.Defaults.";
     private static readonly IDeserializer Deserializer = new DeserializerBuilder()
         .WithNamingConvention(CamelCaseNamingConvention.Instance)
-        .IgnoreUnmatchedProperties()
         .Build();
+    private static readonly IDeserializer RawDeserializer = new DeserializerBuilder().Build();
     private static readonly JsonSerializerOptions SchemaJsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -46,6 +47,9 @@ internal sealed class PresetConfigLoader
         LoadUserLanguageFiles(options.ProjectRoot, languages);
         LoadUserAuditTypeFiles(options.ProjectRoot, auditTypes);
         LoadUserFrameFile(options.ProjectRoot, ref frame);
+        LoadProjectLanguageFiles(options.ProjectFiles, languages);
+        LoadProjectAuditTypeFiles(options.ProjectFiles, auditTypes);
+        LoadProjectFrameFile(options.ProjectFiles, ref frame);
 
         ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
         ValidateFrame("llm-prompt-frame.yaml", frame.Frame);
@@ -117,6 +121,39 @@ internal sealed class PresetConfigLoader
         ValidateFrame(path, frame.Frame);
     }
 
+    private static void LoadProjectLanguageFiles(
+        IReadOnlyDictionary<string, string> projectFiles,
+        Dictionary<string, LanguagePresetDefinition> languages)
+    {
+        foreach (var (path, yaml) in PresetFileContents(projectFiles, "languages"))
+        {
+            var definition = ReadYamlText<LanguagePresetDefinition>(yaml, path, "language");
+            ValidateLanguage(path, definition, allowPartial: languages.ContainsKey(definition.Id));
+            ComposeLanguage(languages, definition);
+        }
+    }
+
+    private static void LoadProjectAuditTypeFiles(
+        IReadOnlyDictionary<string, string> projectFiles,
+        Dictionary<string, AuditTypePresetDefinition> auditTypes)
+    {
+        foreach (var (path, yaml) in PresetFileContents(projectFiles, "audit-types"))
+        {
+            var definition = ReadYamlText<AuditTypePresetDefinition>(yaml, path, "audit-type");
+            ValidateAuditType(path, definition);
+            auditTypes[definition.Id] = definition;
+        }
+    }
+
+    private static void LoadProjectFrameFile(IReadOnlyDictionary<string, string> projectFiles, ref FramePresetDefinition frame)
+    {
+        if (!projectFiles.TryGetValue("codeybox/llm-prompt-frame.yaml", out var yaml))
+            return;
+
+        frame = ReadYamlText<FramePresetDefinition>(yaml, "codeybox/llm-prompt-frame.yaml", "frame");
+        ValidateFrame("codeybox/llm-prompt-frame.yaml", frame.Frame);
+    }
+
     private static void ApplyProjectConfigOverrides(
         PresetCatalogOptions options,
         Dictionary<string, LanguagePresetDefinition> languages,
@@ -169,6 +206,12 @@ internal sealed class PresetConfigLoader
     {
         if (!languages.TryGetValue(incoming.Id, out var existing) || incoming.Replace)
         {
+            if (incoming.Replace && existing is not null)
+            {
+                incoming.Marker ??= existing.Marker;
+                if (string.IsNullOrWhiteSpace(incoming.DisplayName))
+                    incoming.DisplayName = existing.DisplayName;
+            }
             languages[incoming.Id] = incoming;
             return;
         }
@@ -191,6 +234,14 @@ internal sealed class PresetConfigLoader
             : [];
     }
 
+    private static IEnumerable<KeyValuePair<string, string>> PresetFileContents(
+        IReadOnlyDictionary<string, string> files,
+        string childDirectory)
+        => files
+            .Where(kvp => kvp.Key.StartsWith($"codeybox/{childDirectory}/", StringComparison.Ordinal) &&
+                          kvp.Key.EndsWith(".yaml", StringComparison.Ordinal))
+            .OrderBy(kvp => kvp.Key, StringComparer.Ordinal);
+
     private static IEnumerable<string> ResourceNames(Assembly assembly, string child, string suffix)
         => assembly.GetManifestResourceNames()
             .Where(n => n.StartsWith(ResourcePrefix + child, StringComparison.Ordinal) &&
@@ -202,16 +253,18 @@ internal sealed class PresetConfigLoader
         using var stream = assembly.GetManifestResourceStream(resourceName)
             ?? throw new PresetConfigurationException($"Embedded preset resource '{resourceName}' was not found.");
         using var reader = new StreamReader(stream);
-        var value = ReadYaml<T>(reader.ReadToEnd(), resourceName);
-        ValidateJsonSchema(assembly, schemaName, resourceName, value);
-        return value;
+        return ReadYamlText<T>(reader.ReadToEnd(), resourceName, schemaName);
     }
 
     private static T ReadYamlFile<T>(string path, string schemaName)
+        => ReadYamlText<T>(File.ReadAllText(path), path, schemaName);
+
+    private static T ReadYamlText<T>(string yaml, string source, string schemaName)
     {
-        var value = ReadYaml<T>(File.ReadAllText(path), path);
-        ValidateJsonSchema(typeof(PresetConfigLoader).Assembly, schemaName, path, value);
-        return value;
+        var json = ReadYamlJson(yaml, source);
+        ValidateKnownProperties(schemaName, source, json);
+        ValidateJsonSchema(typeof(PresetConfigLoader).Assembly, schemaName, source, json);
+        return ReadYaml<T>(yaml, source);
     }
 
     private static T ReadYaml<T>(string yaml, string source)
@@ -252,6 +305,95 @@ internal sealed class PresetConfigLoader
         var pointer = detail?.InstanceLocation.ToString() ?? "/";
         var message = detail?.Errors?.Values.FirstOrDefault() ?? "schema validation failed";
         throw new PresetConfigurationException($"{source}: {pointer} {message}");
+    }
+
+    private static void ValidateKnownProperties(string schemaName, string source, JsonElement instance)
+    {
+        if (instance.ValueKind != JsonValueKind.Object)
+            return;
+
+        switch (schemaName)
+        {
+            case "language":
+                ValidateObjectProperties(source, "/", instance, ["id", "displayName", "replace", "marker", "auditors"]);
+                if (instance.TryGetProperty("marker", out var marker) && marker.ValueKind == JsonValueKind.Object)
+                    ValidateObjectProperties(source, "/marker", marker, ["globs", "script"]);
+                if (instance.TryGetProperty("auditors", out var auditors) && auditors.ValueKind == JsonValueKind.Array)
+                {
+                    for (var i = 0; i < auditors.GetArrayLength(); i++)
+                    {
+                        var auditor = auditors[i];
+                        if (auditor.ValueKind == JsonValueKind.Object)
+                            ValidateObjectProperties(source, $"/auditors/{i}", auditor, ["name", "argv", "script", "toolName", "treatExit127AsMissingTool"]);
+                    }
+                }
+                break;
+            case "audit-type":
+                ValidateObjectProperties(source, "/", instance, ["id", "displayName", "llmAuditorName", "reviewFocus"]);
+                break;
+            case "frame":
+                ValidateObjectProperties(source, "/", instance, ["frame"]);
+                break;
+        }
+    }
+
+    private static void ValidateObjectProperties(string source, string pointer, JsonElement obj, IReadOnlyList<string> allowed)
+    {
+        foreach (var property in obj.EnumerateObject())
+        {
+            if (!allowed.Contains(property.Name))
+                throw new PresetConfigurationException($"{source}: {pointer}/{property.Name} is not allowed by the preset schema.");
+        }
+    }
+
+    private static JsonElement ReadYamlJson(string yaml, string source)
+    {
+        try
+        {
+            var raw = RawDeserializer.Deserialize(new StringReader(yaml));
+            if (raw is null)
+                throw new PresetConfigurationException($"{source}: YAML document is empty.");
+            return JsonSerializer.SerializeToElement(NormalizeYamlValue(raw), SchemaJsonOptions);
+        }
+        catch (YamlException ex)
+        {
+            var line = ex.Start.Line;
+            var column = ex.Start.Column;
+            throw new PresetConfigurationException(
+                $"{source}: malformed YAML at line {line}, column {column}: {ex.Message}", ex);
+        }
+    }
+
+    private static object? NormalizeYamlValue(object? value)
+    {
+        if (value is IDictionary dictionary)
+        {
+            var normalized = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (DictionaryEntry entry in dictionary)
+            {
+                var key = entry.Key?.ToString();
+                if (string.IsNullOrWhiteSpace(key))
+                    continue;
+                normalized[key] = NormalizeYamlValue(entry.Value);
+            }
+            return normalized;
+        }
+
+        if (value is IEnumerable enumerable and not string)
+        {
+            var normalized = new List<object?>();
+            foreach (var item in enumerable)
+                normalized.Add(NormalizeYamlValue(item));
+            return normalized;
+        }
+
+        if (value is string text)
+        {
+            if (bool.TryParse(text, out var boolValue))
+                return boolValue;
+        }
+
+        return value;
     }
 
     private static void ValidateLanguage(string source, LanguagePresetDefinition definition, bool allowPartial)

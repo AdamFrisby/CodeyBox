@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Configuration;
+
 namespace CodeyBox.Projects;
 
 /// <summary>
@@ -114,6 +116,8 @@ public sealed class ProjectAuditConfig
 
     public List<string>? Languages { get; set; }
     public List<string>? AuditTypes { get; set; }
+    public Dictionary<string, ProjectAuditTypeOverrideConfig>? AuditTypeOverrides { get; set; }
+    public string? LlmPromptFrameTemplate { get; set; }
     public List<CustomAuditorConfig>? Custom { get; set; }
 
     /// <summary>
@@ -131,6 +135,51 @@ public sealed class ProjectAuditConfig
     /// Null = inherit global default. Set to 1 to serialise (useful for 429-prone accounts).
     /// </summary>
     public int? MaxLlmAuditorParallelism { get; set; }
+}
+
+public sealed class ProjectAuditTypeOverrideConfig
+{
+    public string? DisplayName { get; set; }
+    public string? ReviewFocus { get; set; }
+}
+
+public static class ProjectsOptionsBinder
+{
+    public static ProjectsOptions Bind(IConfiguration section)
+    {
+        var options = section.Get<ProjectsOptions>() ?? new ProjectsOptions();
+        ApplyAuditTypeMap(section.GetSection("Defaults:Audit"), options.Defaults.Audit);
+
+        var projectSections = section.GetSection("Projects").GetChildren().ToList();
+        for (var i = 0; i < options.Projects.Count && i < projectSections.Count; i++)
+            ApplyAuditTypeMap(projectSections[i].GetSection("Audit"), options.Projects[i].Audit);
+
+        return options;
+    }
+
+    private static void ApplyAuditTypeMap(IConfigurationSection auditSection, ProjectAuditConfig? audit)
+    {
+        if (audit is null)
+            return;
+
+        var auditTypesSection = auditSection.GetSection("AuditTypes");
+        if (!auditTypesSection.Exists())
+            return;
+
+        var children = auditTypesSection.GetChildren().ToList();
+        if (children.Count == 0 || children.All(c => int.TryParse(c.Key, out _)))
+            return;
+
+        audit.AuditTypes = children.Select(c => c.Key).Where(k => !string.IsNullOrWhiteSpace(k)).ToList();
+        audit.AuditTypeOverrides = children
+            .Select(c => new
+            {
+                Id = c.Key,
+                Override = c.Get<ProjectAuditTypeOverrideConfig>() ?? new ProjectAuditTypeOverrideConfig(),
+            })
+            .Where(x => x.Override.DisplayName is not null || x.Override.ReviewFocus is not null)
+            .ToDictionary(x => x.Id, x => x.Override, StringComparer.OrdinalIgnoreCase);
+    }
 }
 
 public sealed class CustomAuditorConfig

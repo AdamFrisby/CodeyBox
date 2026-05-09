@@ -25,6 +25,7 @@ namespace CodeyBox.Projects;
 public sealed class ProjectAuditorComposer
 {
     private readonly IPresetCatalog _catalog;
+    private readonly PresetCatalogOptions _catalogOptions;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly ILogger<ProjectAuditorComposer> _logger;
 
@@ -35,9 +36,11 @@ public sealed class ProjectAuditorComposer
     public ProjectAuditorComposer(
         IPresetCatalog catalog,
         IEnumerable<IAuditor> pluginAuditors,
-        ILogger<ProjectAuditorComposer> logger)
+        ILogger<ProjectAuditorComposer> logger,
+        PresetCatalogOptions? catalogOptions = null)
     {
         _catalog = catalog;
+        _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
         _logger = logger;
 
         var index = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
@@ -57,13 +60,20 @@ public sealed class ProjectAuditorComposer
         : this(catalog, [], NullLogger<ProjectAuditorComposer>.Instance) { }
 
     public IReadOnlyList<IAuditor> Compose(Project project, IAgentRunner agentForLlmAuditors)
+        => Compose(project, agentForLlmAuditors, repositoryPresetFiles: null);
+
+    public IReadOnlyList<IAuditor> Compose(
+        Project project,
+        IAgentRunner agentForLlmAuditors,
+        IReadOnlyDictionary<string, string>? repositoryPresetFiles)
     {
+        var catalog = ResolveCatalog(project, repositoryPresetFiles);
         var ctx = new PresetContext(agentForLlmAuditors);
         var auditors = new List<IAuditor>();
 
         foreach (var lang in project.Audit.Languages)
         {
-            var languageAuditors = _catalog.ResolveLanguage(lang, ctx);
+            var languageAuditors = catalog.ResolveLanguage(lang, ctx);
             if (languageAuditors.Count == 0)
                 _logger.LogWarning(
                     "Project '{ProjectId}' declares unsupported audit language '{Language}'; skipping",
@@ -73,7 +83,7 @@ public sealed class ProjectAuditorComposer
         }
 
         foreach (var type in project.Audit.AuditTypes)
-            auditors.AddRange(_catalog.ResolveAuditType(type, ctx));
+            auditors.AddRange(catalog.ResolveAuditType(type, ctx));
 
         foreach (var custom in project.Audit.Custom)
         {
@@ -83,12 +93,36 @@ public sealed class ProjectAuditorComposer
             }
             else
             {
-                auditors.Add(MaterialiseCustom(custom, ctx, _catalog.LlmPromptFrameTemplate));
+                auditors.Add(MaterialiseCustom(custom, ctx, catalog.LlmPromptFrameTemplate));
             }
         }
 
         return auditors;
     }
+
+    private IPresetCatalog ResolveCatalog(Project project, IReadOnlyDictionary<string, string>? repositoryPresetFiles)
+    {
+        if (!HasProjectPresetOverrides(project) && (repositoryPresetFiles is null || repositoryPresetFiles.Count == 0))
+            return _catalog;
+
+        var options = _catalogOptions.Clone();
+        if (repositoryPresetFiles is not null)
+            options.ProjectFiles = new Dictionary<string, string>(repositoryPresetFiles, StringComparer.Ordinal);
+        foreach (var (id, ov) in project.Audit.AuditTypeOverrides)
+        {
+            options.AuditTypeOverrides[id] = new AuditTypePresetOverride
+            {
+                DisplayName = ov.DisplayName,
+                ReviewFocus = ov.ReviewFocus,
+            };
+        }
+        if (project.Audit.LlmPromptFrameTemplate is not null)
+            options.LlmPromptFrameTemplate = project.Audit.LlmPromptFrameTemplate;
+        return new PresetCatalog(options);
+    }
+
+    private static bool HasProjectPresetOverrides(Project project)
+        => project.Audit.AuditTypeOverrides.Count > 0 || project.Audit.LlmPromptFrameTemplate is not null;
 
     private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors)
     {

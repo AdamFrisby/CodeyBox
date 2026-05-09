@@ -1,6 +1,6 @@
 # Config-Driven Language Presets
 
-Language presets are loaded at startup from YAML. Built-in defaults ship as embedded resources under `CodeyBox.Audit.Presets/Defaults/languages`, and project-level files can extend or replace them from:
+Language presets are loaded from YAML. Built-in defaults ship as embedded resources under `CodeyBox.Audit.Presets/Defaults/languages`, and project files on the configured base branch can extend or replace them from:
 
 ```text
 codeybox/languages/<language-id>.yaml
@@ -34,7 +34,7 @@ auditors:
     argv: ["dotnet", "tool", "run", "custom-check"]
 ```
 
-Set `replace: true` to replace the built-in language definition:
+Set `replace: true` to replace the built-in auditor list. For an existing language, detection markers are preserved when the override omits `marker`:
 
 ```yaml
 id: csharp
@@ -46,8 +46,12 @@ auditors:
     argv: ["dotnet", "test"]
 ```
 
+## Trust Boundary
+
+Repository-local preset files can define shell commands. Treat `codeybox/languages` as operator-controlled project configuration: review changes to these files before they land on the base branch. The orchestrator reads them from the base branch when composing auditors; work-branch edits do not change the auditor set for the current run.
+
 ## Validation
 
-All built-in and project YAML is validated at startup. Invalid YAML, missing required fields, bad LLM placeholders, and common command typos fail startup with the file path and a JSON-pointer-style field location. For example, `argv: ["dottest"]` reports a `did you mean 'dotnet'?` diagnostic.
+All built-in and project YAML is schema-validated before use. Invalid YAML, unknown fields, missing required fields, bad LLM placeholders, and common command typos fail loudly with the file path and a JSON-pointer-style field location. For example, `argv: ["dottest"]` reports a `did you mean 'dotnet'?` diagnostic.
 
-Project configuration under `CodeyBox:Presets:LanguageOverrides` is applied after files, so appsettings wins over `codeybox/languages`.
+Global operator configuration under `CodeyBox:Presets:LanguageOverrides` is applied after files, so appsettings wins over `codeybox/languages`.

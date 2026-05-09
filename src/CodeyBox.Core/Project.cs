@@ -330,6 +330,9 @@ public sealed record ProjectAudit
     public IReadOnlyList<string> Languages { get; init; } = [];
     public bool LanguagesConfigured { get; init; }
     public IReadOnlyList<string> AuditTypes { get; init; } = [];
+    public IReadOnlyDictionary<string, ProjectAuditTypeOverride> AuditTypeOverrides { get; init; }
+        = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase);
+    public string? LlmPromptFrameTemplate { get; init; }
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
 
     /// <summary>
@@ -365,6 +368,12 @@ public sealed record ProjectAudit
     /// file races. Tool auditors are unaffected and always run sequentially.
     /// </summary>
     public int MaxLlmAuditorParallelism { get; init; } = 3;
+}
+
+public sealed record ProjectAuditTypeOverride
+{
+    public string? DisplayName { get; init; }
+    public string? ReviewFocus { get; init; }
 }
 
 /// <summary>

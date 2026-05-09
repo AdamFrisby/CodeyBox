@@ -163,6 +163,23 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void SchemaValidation_RejectsUnknownYamlField()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "csharp.yaml"), """
+            id: csharp
+            audtors:
+              - name: csharp:bad
+                argv: ["dotnet", "test"]
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("audtors", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void UserOverride_AdditiveAuditors_AppendsInOrder()
     {
         using var temp = TempProject();
@@ -203,6 +220,57 @@ public sealed class PresetCatalogTests
             .ToArray();
 
         Assert.Equal(["csharp:replacement"], names);
+    }
+
+    [Fact]
+    public void UserOverride_ProjectConfigReplaceMode_PreservesBuiltInMarker()
+    {
+        var names = new PresetCatalog(new PresetCatalogOptions
+        {
+            LanguageOverrides =
+            {
+                ["csharp"] = new LanguagePresetOverride
+                {
+                    Replace = true,
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "csharp:replacement",
+                            Argv = ["dotnet", "test"],
+                        },
+                    ],
+                },
+            },
+        })
+            .ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Select(a => a.Name)
+            .ToArray();
+
+        Assert.Equal(["csharp:replacement"], names);
+    }
+
+    [Fact]
+    public void ProjectFiles_LoadRepositoryLocalLanguageYaml()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            ProjectFiles =
+            {
+                ["codeybox/languages/elixir.yaml"] = """
+                    id: elixir
+                    displayName: "Elixir"
+                    marker:
+                      globs: ["**/mix.exs"]
+                    auditors:
+                      - name: elixir:test-pass
+                        argv: ["mix", "test"]
+                    """,
+            },
+        });
+
+        Assert.Contains("elixir", catalog.KnownLanguages);
+        Assert.Equal(["elixir:test-pass"], catalog.ResolveLanguage("elixir", new PresetContext(new FakeAgent())).Select(a => a.Name).ToArray());
     }
 
     [Fact]

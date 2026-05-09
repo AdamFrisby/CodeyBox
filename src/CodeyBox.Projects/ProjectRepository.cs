@@ -121,6 +121,8 @@ public sealed class ProjectRepository : IProjectRepository
         var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ProjectAuditLanguages.Default;
         var mergedLanguages = FilterConfiguredLanguages(configuredLanguages);
         var mergedAuditTypes = project?.AuditTypes ?? defaults?.AuditTypes ?? [];
+        var mergedAuditTypeOverrides = MergeAuditTypeOverrides(defaults?.AuditTypeOverrides, project?.AuditTypeOverrides);
+        var mergedFrameTemplate = project?.LlmPromptFrameTemplate ?? defaults?.LlmPromptFrameTemplate;
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
 
         // Stuck-probe config. null in config = -1 (inherit from PipelineOptions global).
@@ -158,12 +160,39 @@ public sealed class ProjectRepository : IProjectRepository
             Languages = mergedLanguages,
             LanguagesConfigured = languagesConfigured,
             AuditTypes = mergedAuditTypes,
+            AuditTypeOverrides = mergedAuditTypeOverrides,
+            LlmPromptFrameTemplate = mergedFrameTemplate,
             Custom = mergedCustom,
             AuditAgent = mergedAuditAgent,
             PerAuditorAgent = mergedPerAuditorAgent,
             MaxLlmAuditorParallelism = mergedMaxLlmPar,
         };
     }
+
+    private static IReadOnlyDictionary<string, ProjectAuditTypeOverride> MergeAuditTypeOverrides(
+        Dictionary<string, ProjectAuditTypeOverrideConfig>? defaults,
+        Dictionary<string, ProjectAuditTypeOverrideConfig>? project)
+    {
+        var merged = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase);
+        if (defaults is not null)
+        {
+            foreach (var (id, ov) in defaults)
+                merged[id] = ResolveAuditTypeOverride(ov);
+        }
+        if (project is not null)
+        {
+            foreach (var (id, ov) in project)
+                merged[id] = ResolveAuditTypeOverride(ov);
+        }
+        return merged;
+    }
+
+    private static ProjectAuditTypeOverride ResolveAuditTypeOverride(ProjectAuditTypeOverrideConfig config)
+        => new()
+        {
+            DisplayName = config.DisplayName,
+            ReviewFocus = config.ReviewFocus,
+        };
 
     private static IReadOnlyList<string> FilterConfiguredLanguages(IEnumerable<string> languages)
     {
