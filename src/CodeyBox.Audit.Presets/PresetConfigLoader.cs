@@ -501,12 +501,6 @@ internal sealed class PresetConfigLoader
         if (string.IsNullOrWhiteSpace(tool))
             return;
         
-        // Scripts from trusted sources can use any tool (including sh).
-        // Scripts from untrusted sources are already rejected in ValidateAuditor.
-        // Argv from trusted sources can use any tool.
-        if (isTrusted)
-            return;
-
         if (KnownTools.Contains(tool))
             return;
 
@@ -517,11 +511,16 @@ internal sealed class PresetConfigLoader
             .ThenBy(x => x.Tool, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
 
-        var message = $"{source}: {pointer} = '{tool}' is not a known audit tool.";
         if (suggestion is not null)
-            message += $" Did you mean '{suggestion.Tool}'?";
-        
-        throw new PresetConfigurationException(message);
+        {
+            throw new PresetConfigurationException(
+                $"{source}: {pointer} = '{tool}' is not a known audit tool. Did you mean '{suggestion.Tool}'?");
+        }
+
+        if (isTrusted)
+            return;
+
+        throw new PresetConfigurationException($"{source}: {pointer} = '{tool}' is not a known audit tool.");
     }
 
     private static void ValidateAuditType(string source, AuditTypePresetDefinition definition, bool isTrusted)

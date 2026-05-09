@@ -358,6 +358,59 @@ public sealed class PresetCatalogTests
         Assert.Contains("valid regex", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void SchemaValidation_RejectsTypoInArgv_EvenForTrustedSource()
+    {
+        // appsettings is trusted
+        var options = new PresetCatalogOptions
+        {
+            LanguageOverrides =
+            {
+                ["csharp"] = new LanguagePresetOverride
+                {
+                    Auditors = [new ConfiguredAuditor { Name = "test", Argv = ["dottest", "test"] }]
+                }
+            }
+        };
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(options));
+
+        Assert.Contains("did you mean 'dotnet'", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SchemaValidation_AllowsCustomTool_ForTrustedSource()
+    {
+        // appsettings is trusted
+        var options = new PresetCatalogOptions
+        {
+            LanguageOverrides =
+            {
+                ["csharp"] = new LanguagePresetOverride
+                {
+                    Auditors = [new ConfiguredAuditor { Name = "test", Argv = ["my-custom-tool", "test"] }]
+                }
+            }
+        };
+
+        var catalog = new PresetCatalog(options);
+        var auditors = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()));
+        Assert.Contains(auditors, a => a.Name == "test");
+    }
+
+    [Fact]
+    public void BuiltInLanguages_AuditCountsMatchLegacy()
+    {
+        var catalog = new PresetCatalog();
+        var ctx = new PresetContext(new FakeAgent());
+
+        Assert.Equal(3, catalog.ResolveLanguage("csharp", ctx).Count);
+        Assert.Equal(3, catalog.ResolveLanguage("python", ctx).Count);
+        Assert.Equal(3, catalog.ResolveLanguage("node", ctx).Count);
+        Assert.Equal(3, catalog.ResolveLanguage("go", ctx).Count);
+        Assert.Equal(3, catalog.ResolveLanguage("rust", ctx).Count);
+    }
+
     private static TempDirectory TempProject() => new();
 
     private sealed class TempDirectory : IDisposable
