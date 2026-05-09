@@ -52,6 +52,20 @@ public sealed class GeminiAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_Argv_ContainsSkipTrustFlag()
+    {
+        // Without --skip-trust the gemini CLI silently demotes --yolo to
+        // "default" approval-mode for untrusted workspaces, which deadlocks
+        // the non-interactive run because no operator can answer prompts.
+        var sandbox = new CapturingSandbox();
+        var runner = new GeminiAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "do the thing", credential: null);
+
+        Assert.Contains("--skip-trust", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
     public async Task RunAsync_Argv_PassesPromptAfterDashP()
     {
         const string prompt = "write a fizzbuzz in Go";

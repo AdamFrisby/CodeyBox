@@ -35,6 +35,52 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override string PreemptProcessPattern => Binary;
 
+    /// <summary>
+    /// Materialises the Gemini OAuth credentials and settings file into
+    /// <c>~/.gemini/</c> inside the sandbox if the env-var bundle is present
+    /// (set by <c>GeminiOAuthFileCredentialProvider</c>). The Gemini CLI
+    /// hard-reads these paths and offers no env-var alternative for OAuth, so
+    /// we shuttle them in via env vars and write them at sandbox-prepare time.
+    /// </summary>
+    protected override async Task<AgentResult?> PrepareSandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AgentCredential? credential,
+        AgentResumeContext? resume,
+        CancellationToken ct = default)
+    {
+        // Skip the bash hook entirely when no OAuth bundle is present (e.g.
+        // operators using GEMINI_API_KEY); the CLI will fall back to whichever
+        // env-var auth path the credential pipeline plugged in.
+        if (credential is null
+            || !credential.EnvironmentVariables.ContainsKey("CODEYBOX_GEMINI_OAUTH_CREDS_JSON"))
+            return null;
+
+        var script =
+            "set -eu\n" +
+            "mkdir -p \"$HOME/.gemini\"\n" +
+            "umask 077\n" +
+            "if [ -n \"${CODEYBOX_GEMINI_OAUTH_CREDS_JSON:-}\" ]; then\n" +
+            "  printf '%s' \"$CODEYBOX_GEMINI_OAUTH_CREDS_JSON\" > \"$HOME/.gemini/oauth_creds.json\"\n" +
+            "fi\n" +
+            "if [ -n \"${CODEYBOX_GEMINI_SETTINGS_JSON:-}\" ]; then\n" +
+            "  printf '%s' \"$CODEYBOX_GEMINI_SETTINGS_JSON\" > \"$HOME/.gemini/settings.json\"\n" +
+            "fi\n";
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["bash", "-c", script],
+        }, ct);
+        if (!write.Success)
+        {
+            return new AgentResult(
+                Success: false,
+                Summary: $"failed to materialise gemini auth: exit {write.ExitCode}",
+                Stdout: write.Stdout,
+                Stderr: write.Stderr);
+        }
+        return null;
+    }
+
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
         var help = await sandbox.ExecAsync(new SandboxExec
@@ -57,10 +103,14 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? reasoningMode = null,
         bool captureStructuredStream = false)
     {
-        // gemini --yolo -p "<prompt>": sends a single non-interactive prompt and exits.
-        // --yolo skips all tool-use confirmation prompts — appropriate inside the
-        // sandbox where the VM boundary is the permission boundary.
-        var argv = new List<string> { Binary, "--yolo" };
+        // gemini --yolo --skip-trust -p "<prompt>": sends a single non-interactive
+        // prompt and exits. --yolo skips all tool-use confirmation prompts;
+        // --skip-trust grants workspace trust for this session (otherwise
+        // gemini-cli silently demotes --yolo to "default" approval-mode and
+        // prompts on every tool call, which deadlocks in non-interactive use).
+        // Both are appropriate inside the sandbox where the VM boundary is the
+        // real permission boundary.
+        var argv = new List<string> { Binary, "--yolo", "--skip-trust" };
         if (captureStructuredStream)
         {
             argv.Add("--output-format");
