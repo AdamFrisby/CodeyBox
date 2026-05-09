@@ -142,6 +142,9 @@ public sealed class ProjectAuditTypeOverrideConfig
 {
     public string? DisplayName { get; set; }
     public string? ReviewFocus { get; set; }
+    public bool Replace { get; set; }
+    public List<ProjectConfiguredAuditorConfig>? Auditors { get; set; }
+    public List<DiffPatternConfig>? Patterns { get; set; }
 }
 
 public sealed class ProjectLanguagePresetOverrideConfig

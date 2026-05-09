@@ -111,14 +111,19 @@ public sealed class LlmReviewAuditor : IAuditor
 
     private string BuildPrompt(AuditContext context)
     {
-        // Escape any closing tag sequence in user content to prevent delimiter breakout.
+        // Escape closing tag sequences and common delimiters in user content to prevent breakout.
         var safePrompt = context.OriginalPrompt
-            .Replace("</task_description>", "< /task_description>", StringComparison.OrdinalIgnoreCase);
+            .Replace("</", "< /", StringComparison.Ordinal)
+            .Replace("]]>", "]] >", StringComparison.Ordinal);
+
+        var safeFocus = _opts.ReviewFocus
+            .Replace("</", "< /", StringComparison.Ordinal)
+            .Replace("]]>", "]] >", StringComparison.Ordinal);
 
         return LlmPromptFrameTemplate.Render(_opts.FrameTemplate, new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["workingDirectory"] = SandboxConventions.WorkDir,
-            ["reviewFocus"] = _opts.ReviewFocus,
+            ["reviewFocus"] = safeFocus,
             ["baseBranch"] = context.BaseBranch,
             ["workBranch"] = context.WorkBranch,
             ["originalPrompt"] = safePrompt,

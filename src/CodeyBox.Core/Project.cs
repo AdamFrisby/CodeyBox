@@ -391,6 +391,9 @@ public sealed record ProjectAuditTypeOverride
 {
     public string? DisplayName { get; init; }
     public string? ReviewFocus { get; init; }
+    public bool Replace { get; init; }
+    public IReadOnlyList<ProjectConfiguredAuditor> Auditors { get; init; } = [];
+    public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];
 }
 
 /// <summary>

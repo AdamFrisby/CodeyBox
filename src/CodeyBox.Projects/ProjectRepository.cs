@@ -95,6 +95,20 @@ public sealed class ProjectRepository : IProjectRepository
             {
                 DisplayName = ov.DisplayName,
                 ReviewFocus = ov.ReviewFocus,
+                Replace = ov.Replace,
+                Auditors = ov.Auditors.Select(a => new ConfiguredAuditor
+                {
+                    Name = a.Name,
+                    Argv = [.. a.Argv],
+                    Script = a.Script,
+                    ToolName = a.ToolName,
+                    TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                }).ToList(),
+                Patterns = ov.Patterns.Select(p => new ConfiguredDiffPattern
+                {
+                    Regex = p.Regex,
+                    Description = p.Description,
+                }).ToList(),
             };
         }
 
@@ -328,6 +342,13 @@ public sealed class ProjectRepository : IProjectRepository
         {
             DisplayName = config.DisplayName,
             ReviewFocus = config.ReviewFocus,
+            Replace = config.Replace,
+            Auditors = (config.Auditors ?? []).Select(ResolveConfiguredAuditor).ToList(),
+            Patterns = (config.Patterns ?? []).Select(p => new DiffPatternDescriptor
+            {
+                Description = p.Description ?? "(no description)",
+                Regex = p.Regex ?? string.Empty,
+            }).ToList(),
         };
 
     private static IReadOnlyList<string> FilterConfiguredLanguages(IEnumerable<string> languages)

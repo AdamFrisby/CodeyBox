@@ -31,8 +31,8 @@ internal sealed class PresetConfigLoader
         new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "cargo", "dotnet", "eslint", "gitleaks", "go", "gofmt", "govulncheck",
-            "mix", "mypy", "npm", "pip-audit", "prettier", "pytest", "pyright",
-            "ruff", "safety", "semgrep", "sh"
+            "mix", "mypy", "mypy or pyright", "npm", "pip-audit", "prettier",
+            "pytest", "pyright", "ruff", "safety", "semgrep"
         };
 
     public PresetConfigSnapshot Load(PresetCatalogOptions? options)
@@ -64,7 +64,7 @@ internal sealed class PresetConfigLoader
         foreach (var resourceName in ResourceNames(assembly, "languages.", ".yaml"))
         {
             var definition = ReadYamlResource<LanguagePresetDefinition>(assembly, resourceName, "language");
-            ValidateLanguage(resourceName, definition, allowPartial: false);
+            ValidateLanguage(resourceName, definition, allowPartial: false, isTrusted: true);
             languages[definition.Id] = definition;
         }
         return languages;
@@ -76,7 +76,7 @@ internal sealed class PresetConfigLoader
         foreach (var resourceName in ResourceNames(assembly, "audit_types.", ".yaml"))
         {
             var definition = ReadYamlResource<AuditTypePresetDefinition>(assembly, resourceName, "audit-type");
-            ValidateAuditType(resourceName, definition);
+            ValidateAuditType(resourceName, definition, isTrusted: true);
             auditTypes[definition.Id] = definition;
         }
         return auditTypes;
@@ -94,7 +94,10 @@ internal sealed class PresetConfigLoader
         foreach (var file in PresetFiles(projectRoot, "languages"))
         {
             var definition = ReadYamlFile<LanguagePresetDefinition>(file, "language");
-            ValidateLanguage(file, definition, allowPartial: languages.ContainsKey(definition.Id));
+            if (definition.Marker?.Script != null)
+                throw new PresetConfigurationException($"{file}: /marker/script is not allowed in repository-provided configuration for security reasons. Use /marker/globs instead.");
+            
+            ValidateLanguage(file, definition, allowPartial: languages.ContainsKey(definition.Id), isTrusted: false);
             ComposeLanguage(languages, definition);
         }
     }
@@ -104,7 +107,10 @@ internal sealed class PresetConfigLoader
         foreach (var file in PresetFiles(projectRoot, "audit-types"))
         {
             var definition = ReadYamlFile<AuditTypePresetDefinition>(file, "audit-type");
-            ValidateAuditType(file, definition);
+            if (!string.IsNullOrWhiteSpace(definition.LlmAuditorName))
+                throw new PresetConfigurationException($"{file}: /llmAuditorName is not allowed in repository-provided configuration for security reasons.");
+
+            ValidateAuditType(file, definition, isTrusted: false);
             ComposeAuditType(auditTypes, definition);
         }
     }
@@ -171,7 +177,7 @@ internal sealed class PresetConfigLoader
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                 }).ToList(),
             };
-            ValidateLanguage($"Audit.Languages.Overrides[{id}]", definition, allowPartial: languages.ContainsKey(id));
+            ValidateLanguage($"Audit.Languages.Overrides[{id}]", definition, allowPartial: languages.ContainsKey(id), isTrusted: true);
             ComposeLanguage(languages, definition);
         }
 
@@ -198,7 +204,7 @@ internal sealed class PresetConfigLoader
                     Severity = p.Severity,
                 }).ToList(),
             };
-            ValidateAuditType($"Audit.AuditTypes[{id}]", definition);
+            ValidateAuditType($"Audit.AuditTypes[{id}]", definition, isTrusted: true);
             ComposeAuditType(auditTypes, definition);
         }
 
@@ -310,14 +316,36 @@ internal sealed class PresetConfigLoader
         using var reader = new StreamReader(stream);
         var schema = JsonSchema.FromText(reader.ReadToEnd());
         var instance = JsonSerializer.SerializeToElement(value, SchemaJsonOptions);
-        var result = schema.Evaluate(instance, new EvaluationOptions { OutputFormat = OutputFormat.List });
+        var result = schema.Evaluate(instance, new EvaluationOptions { OutputFormat = OutputFormat.Hierarchical });
         if (result.IsValid)
             return;
 
-        var detail = result.Details?.FirstOrDefault(d => !d.IsValid);
-        var pointer = detail?.InstanceLocation.ToString() ?? "/";
-        var message = detail?.Errors?.Values.FirstOrDefault() ?? "schema validation failed";
-        throw new PresetConfigurationException($"{source}: {pointer} {message}");
+        var errors = new List<string>();
+        CollectErrors(result, errors);
+
+        var message = errors.Count > 0 
+            ? string.Join("; ", errors.Distinct())
+            : "schema validation failed";
+
+        throw new PresetConfigurationException($"{source}: {message}");
+    }
+
+    private static void CollectErrors(EvaluationResults result, List<string> errors)
+    {
+        if (result.Errors != null)
+        {
+            foreach (var error in result.Errors)
+            {
+                errors.Add($"{result.InstanceLocation}: {error.Value}");
+            }
+        }
+        if (result.Details != null)
+        {
+            foreach (var detail in result.Details)
+            {
+                CollectErrors(detail, errors);
+            }
+        }
     }
 
     private static void ValidateKnownProperties(string schemaName, string source, JsonElement instance)
@@ -420,20 +448,20 @@ internal sealed class PresetConfigLoader
 
         if (value is string text)
         {
-            if (bool.TryParse(text, out var boolValue))
-                return boolValue;
+            if (string.Equals(text, "true", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(text, "false", StringComparison.OrdinalIgnoreCase)) return false;
         }
 
         return value;
     }
 
-    private static void ValidateLanguage(string source, LanguagePresetDefinition definition, bool allowPartial)
+    private static void ValidateLanguage(string source, LanguagePresetDefinition definition, bool allowPartial, bool isTrusted)
     {
         if (string.IsNullOrWhiteSpace(definition.Id))
             throw new PresetConfigurationException($"{source}: /id is required.");
         if (!allowPartial && definition.Marker is null)
             throw new PresetConfigurationException($"{source}: /marker is required.");
-        if (!allowPartial && definition.Auditors.Count == 0)
+        if (!allowPartial && (definition.Auditors == null || definition.Auditors.Count == 0))
             throw new PresetConfigurationException($"{source}: /auditors must contain at least one auditor.");
         if (definition.Marker is not null &&
             string.IsNullOrWhiteSpace(definition.Marker.Script) &&
@@ -443,10 +471,10 @@ internal sealed class PresetConfigLoader
         }
 
         for (var i = 0; i < definition.Auditors.Count; i++)
-            ValidateAuditor(source, $"/auditors/{i}", definition.Auditors[i]);
+            ValidateAuditor(source, $"/auditors/{i}", definition.Auditors[i], isTrusted);
     }
 
-    private static void ValidateAuditor(string source, string pointer, AuditorDefinition auditor)
+    private static void ValidateAuditor(string source, string pointer, AuditorDefinition auditor, bool isTrusted)
     {
         if (string.IsNullOrWhiteSpace(auditor.Name))
             throw new PresetConfigurationException($"{source}: {pointer}/name is required.");
@@ -455,36 +483,54 @@ internal sealed class PresetConfigLoader
         if (auditor.Argv.Count > 0 && !string.IsNullOrWhiteSpace(auditor.Script))
             throw new PresetConfigurationException($"{source}: {pointer} cannot include both argv and script.");
 
-        var tool = auditor.Argv.Count > 0 ? auditor.Argv[0] : auditor.ToolName;
-        ValidateToolName(source, $"{pointer}/argv/0", tool);
+        if (!isTrusted && !string.IsNullOrWhiteSpace(auditor.Script))
+            throw new PresetConfigurationException($"{source}: {pointer}/script is not allowed in repository-provided configuration for security reasons. Use /argv instead.");
+
+        if (auditor.Argv.Count > 0)
+        {
+            ValidateToolName(source, $"{pointer}/argv/0", auditor.Argv[0], isTrusted);
+        }
+        else if (!string.IsNullOrWhiteSpace(auditor.ToolName))
+        {
+            ValidateToolName(source, $"{pointer}/toolName", auditor.ToolName, isTrusted);
+        }
     }
 
-    private static void ValidateToolName(string source, string pointer, string? tool)
+    private static void ValidateToolName(string source, string pointer, string? tool, bool isTrusted)
     {
         if (string.IsNullOrWhiteSpace(tool))
             return;
+        
+        // Scripts from trusted sources can use any tool (including sh).
+        // Scripts from untrusted sources are already rejected in ValidateAuditor.
+        // Argv from trusted sources can use any tool.
+        if (isTrusted)
+            return;
+
         if (KnownTools.Contains(tool))
             return;
 
         var suggestion = KnownTools
-            .Select(t => new { Tool = t, Distance = EditDistance(tool, t) })
+            .Select(t => new { Tool = t, Distance = EditDistanceHelper.Compute(tool, t) })
             .Where(x => x.Distance <= 2)
             .OrderBy(x => x.Distance)
             .ThenBy(x => x.Tool, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
 
+        var message = $"{source}: {pointer} = '{tool}' is not a known audit tool.";
         if (suggestion is not null)
-            throw new PresetConfigurationException(
-                $"{source}: {pointer} = '{tool}' is not a known audit tool; did you mean '{suggestion.Tool}'?");
+            message += $" Did you mean '{suggestion.Tool}'?";
+        
+        throw new PresetConfigurationException(message);
     }
 
-    private static void ValidateAuditType(string source, AuditTypePresetDefinition definition)
+    private static void ValidateAuditType(string source, AuditTypePresetDefinition definition, bool isTrusted)
     {
         if (string.IsNullOrWhiteSpace(definition.Id))
             throw new PresetConfigurationException($"{source}: /id is required.");
 
         for (var i = 0; i < definition.Auditors.Count; i++)
-            ValidateAuditor(source, $"/auditors/{i}", definition.Auditors[i]);
+            ValidateAuditor(source, $"/auditors/{i}", definition.Auditors[i], isTrusted);
 
         for (var i = 0; i < definition.Patterns.Count; i++)
         {
@@ -497,7 +543,7 @@ internal sealed class PresetConfigLoader
 
             try
             {
-                _ = new Regex(pattern.Regex);
+                _ = new Regex(pattern.Regex, RegexOptions.None, TimeSpan.FromSeconds(1));
             }
             catch (ArgumentException ex)
             {
@@ -533,27 +579,6 @@ internal sealed class PresetConfigLoader
         }
     }
 
-    private static int EditDistance(string left, string right)
-    {
-        var dp = new int[left.Length + 1, right.Length + 1];
-        for (var i = 0; i <= left.Length; i++)
-            dp[i, 0] = i;
-        for (var j = 0; j <= right.Length; j++)
-            dp[0, j] = j;
-
-        for (var i = 1; i <= left.Length; i++)
-        {
-            for (var j = 1; j <= right.Length; j++)
-            {
-                var cost = char.ToLowerInvariant(left[i - 1]) == char.ToLowerInvariant(right[j - 1]) ? 0 : 1;
-                dp[i, j] = Math.Min(
-                    Math.Min(dp[i - 1, j] + 1, dp[i, j - 1] + 1),
-                    dp[i - 1, j - 1] + cost);
-            }
-        }
-        return dp[left.Length, right.Length];
-    }
-
     public static IReadOnlyList<IAuditor> MaterialiseLanguage(LanguagePresetDefinition definition)
     {
         var marker = definition.Marker ?? throw new PresetConfigurationException($"Language '{definition.Id}' has no marker.");
@@ -578,7 +603,7 @@ internal sealed class PresetConfigLoader
                     markerScript,
                     a.Name,
                     a.Script,
-                    a.ToolName,
+                    a.ToolName ?? a.Name,
                     a.TreatExit127AsMissingTool)).ToList();
     }
 

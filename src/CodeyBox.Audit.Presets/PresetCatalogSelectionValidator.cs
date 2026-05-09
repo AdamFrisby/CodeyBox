@@ -48,32 +48,10 @@ public static class PresetCatalogSelectionValidator
 
     private static string? FindSuggestion(string id, IEnumerable<string> knownIds)
         => knownIds
-            .Select(known => new { Id = known, Distance = EditDistance(id, known) })
+            .Select(known => new { Id = known, Distance = EditDistanceHelper.Compute(id, known) })
             .Where(candidate => candidate.Distance <= 3)
             .OrderBy(candidate => candidate.Distance)
             .ThenBy(candidate => candidate.Id, StringComparer.OrdinalIgnoreCase)
             .Select(candidate => candidate.Id)
             .FirstOrDefault();
-
-    private static int EditDistance(string left, string right)
-    {
-        var dp = new int[left.Length + 1, right.Length + 1];
-        for (var i = 0; i <= left.Length; i++)
-            dp[i, 0] = i;
-        for (var j = 0; j <= right.Length; j++)
-            dp[0, j] = j;
-
-        for (var i = 1; i <= left.Length; i++)
-        {
-            for (var j = 1; j <= right.Length; j++)
-            {
-                var cost = char.ToLowerInvariant(left[i - 1]) == char.ToLowerInvariant(right[j - 1]) ? 0 : 1;
-                dp[i, j] = Math.Min(
-                    Math.Min(dp[i - 1, j] + 1, dp[i, j - 1] + 1),
-                    dp[i - 1, j - 1] + cost);
-            }
-        }
-
-        return dp[left.Length, right.Length];
-    }
 }

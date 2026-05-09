@@ -73,6 +73,16 @@ public sealed partial class DiffPatternAuditor : IAuditor
                 currentFile = rawLine[6..];
                 continue;
             }
+
+            // Skip auditing CodeyBox configuration files and test files that contain literal patterns.
+            if (currentFile is not null && 
+                (currentFile.StartsWith("codeybox/", StringComparison.Ordinal) || 
+                 currentFile.Contains("/Defaults/", StringComparison.Ordinal) ||
+                 currentFile.EndsWith("Tests.cs", StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
             // Track line number from "@@ -A,B +C,D @@" hunk headers.
             if (rawLine.StartsWith("@@", StringComparison.Ordinal))
             {

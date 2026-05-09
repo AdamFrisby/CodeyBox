@@ -77,7 +77,7 @@ internal static class AuditTypePresets
     private static IReadOnlyList<DiffPattern> MaterialisePatterns(IReadOnlyList<DiffPatternDefinition> definitions)
         => definitions.Select(d => new DiffPattern
         {
-            Regex = new Regex(d.Regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+            Regex = new Regex(d.Regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1)),
             Description = d.Description,
             Severity = ParseSeverity(d.Severity),
         }).ToList();
