@@ -76,6 +76,35 @@ public sealed class ProjectAuditorComposerPresetTests
         Assert.Equal(["csharp:project-test"], auditors.Select(a => a.Name).ToArray());
     }
 
+    [Fact]
+    public void Compose_LoadsLanguagePresetFromLocalRepository()
+    {
+        using var temp = new TempDirectory();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "languages", "elixir.yaml"), """
+            id: elixir
+            displayName: "Elixir"
+            marker:
+              globs: ["**/mix.exs"]
+            auditors:
+              - name: elixir:test-pass
+                argv: ["mix", "test"]
+            """);
+
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = new Uri(temp.Path).AbsoluteUri,
+            Audit = new ProjectAudit { Languages = ["elixir"] },
+        };
+
+        var auditors = composer.Compose(project, new CapturingAgent());
+
+        Assert.Equal(["elixir:test-pass"], auditors.Select(a => a.Name).ToArray());
+    }
+
     private sealed class CapturingAgent : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
@@ -110,5 +139,22 @@ public sealed class ProjectAuditorComposerPresetTests
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class TempDirectory : IDisposable
+    {
+        public TempDirectory()
+        {
+            Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "codeybox-presets-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Path);
+        }
+
+        public string Path { get; }
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Path))
+                Directory.Delete(Path, recursive: true);
+        }
     }
 }

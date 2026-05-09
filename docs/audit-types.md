@@ -1,6 +1,6 @@
 # Config-Driven Audit Type Prompts
 
-Audit-type LLM review focus prompts are loaded from operator-controlled configuration. Built-in defaults are embedded under `CodeyBox.Audit.Presets/Defaults/audit-types`, and startup config under the service content root can override or add audit types from:
+Audit-type LLM review focus prompts are loaded from configuration. Built-in defaults are embedded under `CodeyBox.Audit.Presets/Defaults/audit-types`, and a project repository can override or add audit types from:
 
 ```text
 codeybox/audit-types/<audit-type-id>.yaml
@@ -87,6 +87,6 @@ Allowed placeholders are:
 {{resultFile}}
 ```
 
-Unknown placeholders fail startup with a clear validation error. The LLM auditor retry and JSON parsing logic remains in code; the configurable data is limited to review focus text and the surrounding frame template.
+Unknown placeholders fail startup with a clear validation error. Selected audit-type ids are validated against the composed catalog, so typos such as `securty` fail startup with a did-you-mean suggestion. The LLM auditor retry and JSON parsing logic remains in code; the configurable data is limited to review focus text and the surrounding frame template.
 
-Per-project appsettings can also override the frame with `Audit.LlmPromptFrameTemplate`. The orchestrator does not read audit-type or frame YAML from audited repositories; repository changes to `codeybox/audit-types` and `codeybox/llm-prompt-frame.yaml` are ignored by audit composition. Prompt overrides are powerful and should remain operator-reviewed because these values are fed into filesystem/network-capable LLM auditors.
+Per-project appsettings can also override the frame with `Audit.LlmPromptFrameTemplate`. Repository-owned prompt files are loaded when the project repository is available as a local `file://` worktree/path; appsettings overrides are applied last. Prompt overrides are powerful because these values are fed into filesystem/network-capable LLM auditors, so production operators should decide which repositories may supply them.

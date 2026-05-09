@@ -40,7 +40,7 @@ public sealed class ProjectRepository : IProjectRepository
             var project = Resolve(pc, defaults);
             if (!seen.Add(project.Id.Value))
                 throw new InvalidOperationException($"Duplicate project id: {project.Id}");
-            ValidatePresetOverrides(project, presetCatalogOptions);
+            ValidateAuditPresetConfiguration(project, presetCatalogOptions);
             resolved.Add(project);
         }
         _list = resolved;
@@ -53,20 +53,16 @@ public sealed class ProjectRepository : IProjectRepository
     public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
         => Task.FromResult(_list);
 
-    private static void ValidatePresetOverrides(Project project, PresetCatalogOptions? presetCatalogOptions)
+    private static void ValidateAuditPresetConfiguration(Project project, PresetCatalogOptions? presetCatalogOptions)
     {
-        if (project.Audit.LanguageOverrides.Count == 0 &&
-            project.Audit.AuditTypeOverrides.Count == 0 &&
-            project.Audit.LlmPromptFrameTemplate is null)
-        {
-            return;
-        }
-
         var options = presetCatalogOptions?.Clone() ?? new PresetCatalogOptions();
+        ApplyRepositoryPresetRoot(project, options);
         ApplyPresetOverrideOptions(project, options);
+
         try
         {
-            _ = new PresetCatalog(options);
+            var catalog = new PresetCatalog(options);
+            ValidateSelectedPresets(project, catalog);
         }
         catch (PresetConfigurationException ex)
         {
@@ -104,6 +100,48 @@ public sealed class ProjectRepository : IProjectRepository
 
         if (project.Audit.LlmPromptFrameTemplate is not null)
             options.LlmPromptFrameTemplate = project.Audit.LlmPromptFrameTemplate;
+    }
+
+    internal static bool ApplyRepositoryPresetRoot(Project project, PresetCatalogOptions options)
+    {
+        var root = ResolveRepositoryPresetRoot(project.RepositoryUrl);
+        if (root is null)
+            return false;
+
+        if (!options.AdditionalProjectRoots.Contains(root, StringComparer.Ordinal))
+            options.AdditionalProjectRoots.Add(root);
+        return true;
+    }
+
+    internal static string? ResolveRepositoryPresetRoot(string repositoryUrl)
+    {
+        string? path = null;
+        if (Uri.TryCreate(repositoryUrl, UriKind.Absolute, out var uri))
+        {
+            if (!uri.IsFile)
+                return null;
+            path = uri.LocalPath;
+        }
+        else if (Path.IsPathRooted(repositoryUrl) || repositoryUrl.StartsWith(".", StringComparison.Ordinal))
+        {
+            path = repositoryUrl;
+        }
+
+        if (string.IsNullOrWhiteSpace(path))
+            return null;
+
+        path = Path.GetFullPath(path);
+        if (Path.GetFileName(path).Equals(".git", StringComparison.OrdinalIgnoreCase))
+            path = Directory.GetParent(path)?.FullName ?? path;
+
+        return Directory.Exists(path) ? path : null;
+    }
+
+    private static void ValidateSelectedPresets(Project project, IPresetCatalog catalog)
+    {
+        var owner = $"Project '{project.Id.Value}'";
+        PresetCatalogSelectionValidator.ValidateLanguageIds(owner, project.Audit.Languages, catalog.KnownLanguages);
+        PresetCatalogSelectionValidator.ValidateAuditTypeIds(owner, project.Audit.AuditTypes, catalog.KnownAuditTypes);
     }
 
     private Project Resolve(ProjectConfig pc, ProjectDefaultsConfig defaults)

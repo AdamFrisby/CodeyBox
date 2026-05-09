@@ -683,9 +683,9 @@ the orchestrator only reads through the interface.
 
 ## Adding a language or audit-type preset
 
-Use operator-owned startup YAML under `codeybox/languages` or
+Use repository-owned YAML under `codeybox/languages` or
 `codeybox/audit-types`, or per-project appsettings overrides, for project-specific preset data. Built-in defaults
-live in `CodeyBox.Audit.Presets/Defaults` as embedded resources. The orchestrator ignores preset YAML committed to audited repositories. See
+live in `CodeyBox.Audit.Presets/Defaults` as embedded resources. Selected preset ids are validated against the composed catalog at startup with did-you-mean diagnostics for typos. See
 [`languages.md`](languages.md) and [`audit-types.md`](audit-types.md).
 
 For one-off auditors that don't need a preset (project-specific build

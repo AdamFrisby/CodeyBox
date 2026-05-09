@@ -62,19 +62,12 @@ public sealed class ProjectAuditorComposer
     public IReadOnlyList<IAuditor> Compose(Project project, IAgentRunner agentForLlmAuditors)
     {
         var catalog = ResolveCatalog(project);
+        ValidateSelectedPresets(project, catalog);
         var ctx = new PresetContext(agentForLlmAuditors);
         var auditors = new List<IAuditor>();
 
         foreach (var lang in project.Audit.Languages)
-        {
-            var languageAuditors = catalog.ResolveLanguage(lang, ctx);
-            if (languageAuditors.Count == 0)
-                _logger.LogWarning(
-                    "Project '{ProjectId}' declares unsupported audit language '{Language}'; skipping",
-                    project.Id.Value,
-                    lang);
-            auditors.AddRange(languageAuditors);
-        }
+            auditors.AddRange(catalog.ResolveLanguage(lang, ctx));
 
         foreach (var type in project.Audit.AuditTypes)
             auditors.AddRange(catalog.ResolveAuditType(type, ctx));
@@ -96,10 +89,14 @@ public sealed class ProjectAuditorComposer
 
     private IPresetCatalog ResolveCatalog(Project project)
     {
-        if (!HasProjectPresetOverrides(project))
+        if (_catalog is not PresetCatalog)
             return _catalog;
 
         var options = _catalogOptions.Clone();
+        var hasRepositoryPresetRoot = ProjectRepository.ApplyRepositoryPresetRoot(project, options);
+        if (!hasRepositoryPresetRoot && !HasProjectPresetOverrides(project))
+            return _catalog;
+
         ProjectRepository.ApplyPresetOverrideOptions(project, options);
         return new PresetCatalog(options);
     }
@@ -108,6 +105,13 @@ public sealed class ProjectAuditorComposer
         => project.Audit.LanguageOverrides.Count > 0 ||
            project.Audit.AuditTypeOverrides.Count > 0 ||
            project.Audit.LlmPromptFrameTemplate is not null;
+
+    private static void ValidateSelectedPresets(Project project, IPresetCatalog catalog)
+    {
+        var owner = $"Project '{project.Id.Value}'";
+        PresetCatalogSelectionValidator.ValidateLanguageIds(owner, project.Audit.Languages, catalog.KnownLanguages);
+        PresetCatalogSelectionValidator.ValidateAuditTypeIds(owner, project.Audit.AuditTypes, catalog.KnownAuditTypes);
+    }
 
     private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors)
     {

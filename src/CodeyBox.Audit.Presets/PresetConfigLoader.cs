@@ -44,9 +44,12 @@ internal sealed class PresetConfigLoader
         var auditTypes = LoadEmbeddedAuditTypes(assembly);
         var frame = LoadEmbeddedFrame(assembly);
 
-        LoadUserLanguageFiles(options.ProjectRoot, languages);
-        LoadUserAuditTypeFiles(options.ProjectRoot, auditTypes);
-        LoadUserFrameFile(options.ProjectRoot, ref frame);
+        foreach (var projectRoot in ProjectRoots(options))
+        {
+            LoadUserLanguageFiles(projectRoot, languages);
+            LoadUserAuditTypeFiles(projectRoot, auditTypes);
+            LoadUserFrameFile(projectRoot, ref frame);
+        }
 
         ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
         ValidateFrame("llm-prompt-frame.yaml", frame.Frame);
@@ -196,6 +199,18 @@ internal sealed class PresetConfigLoader
         return Directory.Exists(directory)
             ? Directory.EnumerateFiles(directory, "*.yaml").Order(StringComparer.Ordinal)
             : [];
+    }
+
+    private static IEnumerable<string> ProjectRoots(PresetCatalogOptions options)
+    {
+        if (!string.IsNullOrWhiteSpace(options.ProjectRoot))
+            yield return options.ProjectRoot;
+
+        foreach (var root in options.AdditionalProjectRoots)
+        {
+            if (!string.IsNullOrWhiteSpace(root))
+                yield return root;
+        }
     }
 
     private static IEnumerable<string> ResourceNames(Assembly assembly, string child, string suffix)

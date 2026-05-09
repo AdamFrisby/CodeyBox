@@ -1,6 +1,6 @@
 # Config-Driven Language Presets
 
-Language presets are loaded from operator-controlled configuration. Built-in defaults ship as embedded resources under `CodeyBox.Audit.Presets/Defaults/languages`, and startup config under the service content root can extend or replace them from:
+Language presets are loaded from configuration. Built-in defaults ship as embedded resources under `CodeyBox.Audit.Presets/Defaults/languages`, and a project repository can extend or replace them from:
 
 ```text
 codeybox/languages/<language-id>.yaml
@@ -48,11 +48,11 @@ auditors:
 
 ## Trust Boundary
 
-Language presets can define shell commands. The orchestrator does not read preset YAML from audited repositories; `codeybox/languages` is service startup configuration owned by the operator. Repository changes to `codeybox/languages` are ignored by audit composition.
+Language presets can define shell commands. The orchestrator reads repository-owned `codeybox/languages` when the project repository is available as a local `file://` worktree/path at startup or composition time, then validates the resulting catalog before expanding auditors. Appsettings overrides remain the operator-controlled layer and win over repository files.
 
 ## Validation
 
-All built-in YAML, operator YAML, and appsettings preset overrides are schema-validated before use. Invalid YAML, unknown fields, missing required fields, bad LLM placeholders, and common command typos fail loudly with the file path and a JSON-pointer-style field location. For example, `argv: ["dottest"]` reports a `did you mean 'dotnet'?` diagnostic.
+All built-in YAML, repository YAML, operator YAML, and appsettings preset overrides are schema-validated before use. Invalid YAML, unknown fields, missing required fields, bad LLM placeholders, and common command typos fail loudly with the file path and a JSON-pointer-style field location. Selected language ids are also validated against the composed catalog; typos such as `cshrap` fail startup with a did-you-mean suggestion. For example, `argv: ["dottest"]` reports a `did you mean 'dotnet'?` diagnostic.
 
 Global operator configuration under `CodeyBox:Presets:LanguageOverrides` is applied after files, so appsettings wins over `codeybox/languages`.
 

@@ -30,36 +30,28 @@ public sealed class MultiLanguagePresetTests
     }
 
     [Fact]
-    public void UnknownLanguage_IsLoggedAndSkippedByComposer()
+    public void UnknownLanguage_IsRejectedByComposer()
     {
         var logger = new CapturingLogger<ProjectAuditorComposer>();
         var composer = new ProjectAuditorComposer(new PresetCatalog(), [], logger);
         var project = ProjectWithLanguages(["zig"]);
 
-        var auditors = composer.Compose(project, new FakeAgent());
+        var ex = Assert.Throws<PresetConfigurationException>(() => composer.Compose(project, new FakeAgent()));
 
-        Assert.Empty(auditors);
-        Assert.Contains(logger.Entries, e =>
-            e.Level == LogLevel.Warning &&
-            e.Message.Contains("unsupported audit language 'zig'", StringComparison.Ordinal));
+        Assert.Contains("unknown language id 'zig'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Did you mean", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void JavaScriptAndTypeScriptLanguagesAreLoggedAndSkipped()
+    public void JavaScriptAndTypeScriptLanguagesAreRejected()
     {
         var logger = new CapturingLogger<ProjectAuditorComposer>();
         var composer = new ProjectAuditorComposer(new PresetCatalog(), [], logger);
         var project = ProjectWithLanguages(["javascript", "typescript"]);
 
-        var auditors = composer.Compose(project, new FakeAgent());
+        var ex = Assert.Throws<PresetConfigurationException>(() => composer.Compose(project, new FakeAgent()));
 
-        Assert.Empty(auditors);
-        Assert.Contains(logger.Entries, e =>
-            e.Level == LogLevel.Warning &&
-            e.Message.Contains("unsupported audit language 'javascript'", StringComparison.Ordinal));
-        Assert.Contains(logger.Entries, e =>
-            e.Level == LogLevel.Warning &&
-            e.Message.Contains("unsupported audit language 'typescript'", StringComparison.Ordinal));
+        Assert.Contains("unknown language id 'javascript'", ex.Message, StringComparison.Ordinal);
     }
 
     private static Project ProjectWithLanguages(IReadOnlyList<string> languages) => new()
