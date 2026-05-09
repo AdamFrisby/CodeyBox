@@ -103,14 +103,20 @@ public sealed class GeminiAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_WithReasoningModeHigh_InjectsThinkingFlag()
+    public async Task RunAsync_WithReasoningModeHigh_DoesNotAddThinkingFlag()
     {
+        // Gemini CLI 0.40+ has no --thinking/--reasoning flag. Reasoning level
+        // is encoded in the model preset (gemini-3-* extends chat-base-3 which
+        // sets thinkingLevel: HIGH). ReasoningMode is informational only on
+        // this runner — passing "high" must not add a fictitious flag.
         var sandbox = new CapturingSandbox();
         var runner = new GeminiAgentRunner();
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null, reasoningMode: "high");
 
-        Assert.Contains("--thinking", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--thinking", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--reasoning", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--effort", sandbox.CapturedExec!.Argv);
     }
 
     [Fact]
@@ -122,6 +128,23 @@ public sealed class GeminiAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null, reasoningMode: null);
 
         Assert.DoesNotContain("--thinking", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task RunAsync_StructuredStreamCapture_UsesOutputFormatStreamJson()
+    {
+        // gemini-cli's structured stream flag is `--output-format stream-json`,
+        // not `--json` (which doesn't exist).
+        var sandbox = new CapturingSandbox { HelpOutput = "--output-format choices: text, json, stream-json" };
+        var runner = new GeminiAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        Assert.DoesNotContain("--json", argv);
+        var ofIdx = argv.IndexOf("--output-format");
+        Assert.True(ofIdx >= 0, "argv must contain --output-format flag");
+        Assert.Equal("stream-json", argv[ofIdx + 1]);
     }
 
     // ── Binary override ───────────────────────────────────────────────────────
@@ -304,9 +327,17 @@ internal sealed class CapturingSandbox : ISandbox
     public string Id => "fake";
     public SandboxExec? CapturedExec { get; private set; }
 
+    /// <summary>
+    /// Optional canned response for `--help` invocations (used by structured-
+    /// stream detection). When null, falls back to the regular stdout/stderr.
+    /// </summary>
+    public string? HelpOutput { get; init; }
+
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
         CapturedExec = exec;
+        if (HelpOutput is not null && exec.Argv.Contains("--help"))
+            return Task.FromResult(new SandboxExecResult(0, HelpOutput, string.Empty));
         if (_stdoutChunk is not null)
             exec.StdoutChunkCallback?.Invoke(_stdoutChunk);
         return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));

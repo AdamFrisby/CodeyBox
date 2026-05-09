@@ -1125,7 +1125,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 agentEndedAt,
                 _auditQuotaOptions.ObservedFailureRetention,
                 ct,
-                projectId: item.ProjectId);
+                projectId: item.ProjectId,
+                stdout: agentResult.Stdout);
 
             // Truncate agent-controlled output to prevent unbounded content from
             // reaching the audit log via the exception message chain.
@@ -1820,7 +1821,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditContext ctx,
         CancellationToken ct)
     {
-        if (needsCreds && run.Result.AgentStderr is not null)
+        if (needsCreds && (run.Result.AgentStderr is not null || run.Result.AgentStdout is not null))
         {
             await QuotaFailureDetector.RecordIfQuotaFailureAsync(
                 _quotaFailures,
@@ -1831,7 +1832,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 DateTimeOffset.UtcNow,
                 _auditQuotaOptions.ObservedFailureRetention,
                 ct,
-                projectId: projectId);
+                projectId: projectId,
+                stdout: run.Result.AgentStdout);
         }
 
         if (needsCreds)
@@ -2210,7 +2212,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 mergeEndedAt,
                 _auditQuotaOptions.ObservedFailureRetention,
                 ct,
-                projectId: item.ProjectId);
+                projectId: item.ProjectId,
+                stdout: agentResult.Stdout);
             if (hostMerge.HasConflicts)
                 throw new MergeConflictResolutionFailedException(
                     $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");

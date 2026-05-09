@@ -82,20 +82,28 @@ public sealed class AgentRunnerStructuredStreamFlagTests
     }
 
     [Fact]
-    public async Task Gemini_WhenCaptureEnabled_UsesJsonFlag()
+    public async Task Gemini_WhenCaptureEnabled_UsesOutputFormatStreamJsonFlag()
     {
-        var sandbox = new CapturingSandbox(stdout: "--json");
+        // gemini-cli's structured stream flag is `--output-format stream-json`,
+        // not `--json` (which doesn't exist in gemini-cli ≥ 0.40).
+        var sandbox = new CapturingSandbox(stdout: "--output-format stream-json");
         await new GeminiAgentRunner().RunAsync(sandbox, "/work", "prompt", null, captureStructuredStream: true);
 
-        Assert.Contains("--json", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--json", sandbox.CapturedExec!.Argv);
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var ofIdx = argv.IndexOf("--output-format");
+        Assert.True(ofIdx >= 0, "argv must contain --output-format flag");
+        Assert.Equal("stream-json", argv[ofIdx + 1]);
     }
 
     [Fact]
-    public async Task Gemini_WhenJsonFlagUnavailable_FallsBackWithoutJsonFlag()
+    public async Task Gemini_WhenStreamJsonUnavailable_FallsBackWithoutFlag()
     {
         var sandbox = new CapturingSandbox(stdout: "Usage: gemini");
         var result = await new GeminiAgentRunner().RunAsync(sandbox, "/work", "prompt", null, captureStructuredStream: true);
 
+        Assert.DoesNotContain("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("stream-json", sandbox.CapturedExec!.Argv);
         Assert.DoesNotContain("--json", sandbox.CapturedExec!.Argv);
         Assert.Contains("structured stream capture was disabled", result.Stderr);
     }
@@ -120,7 +128,7 @@ public sealed class AgentRunnerStructuredStreamFlagTests
     public async Task Gemini_WhenCaptureEnabledAndSupported_ForwardsRawStdoutCallback()
     {
         var chunks = new List<string>();
-        var sandbox = new CapturingSandbox(stdout: "--json", stdoutChunk: "\x1b[32m{\"type\":\"event\"}\x1b[0m");
+        var sandbox = new CapturingSandbox(stdout: "--output-format stream-json", stdoutChunk: "\x1b[32m{\"type\":\"event\"}\x1b[0m");
 
         await new GeminiAgentRunner().RunAsync(
             sandbox,

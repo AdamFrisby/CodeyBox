@@ -13,6 +13,8 @@ obj/
 # Per-developer dev/test helpers (see local/README.md after creation).
 /local/
 
-# Serilog rolling-file output (see CodeyBox:AuditLog options).
+# Serilog rolling-file output (see CodeyBox:AuditLog options) and per-agent
+# structured-stream logs (see CodeyBox:AgentStreamCapture options).
 /logs/
 **/logs/*.json
+**/logs/agents/

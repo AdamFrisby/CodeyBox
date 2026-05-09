@@ -31,7 +31,7 @@ Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
         "Members": [
           { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7", "QualityScore": 100 },
           { "Agent": "codex",  "Billing": "Subscription", "ModelId": "gpt-5.5",         "QualityScore": 100 },
-          { "Agent": "gemini", "Billing": "Subscription", "ModelId": "gemini-3-flash",  "QualityScore": 95, "ReasoningMode": "high" },
+          { "Agent": "gemini", "Billing": "Subscription", "ModelId": "gemini-3-flash-preview", "QualityScore": 95, "ReasoningMode": "high" },
           { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-7", "QualityScore": 100 }
         ]
       }

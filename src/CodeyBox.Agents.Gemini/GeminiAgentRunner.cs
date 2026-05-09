@@ -46,7 +46,8 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             return false;
 
         var output = string.Concat(help.Stdout, "\n", help.Stderr);
-        return output.Contains("--json", StringComparison.Ordinal);
+        return output.Contains("--output-format", StringComparison.Ordinal)
+            && output.Contains("stream-json", StringComparison.Ordinal);
     }
 
     protected override AgentInvocation BuildInvocation(
@@ -61,18 +62,22 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         // sandbox where the VM boundary is the permission boundary.
         var argv = new List<string> { Binary, "--yolo" };
         if (captureStructuredStream)
-            argv.Add("--json");
+        {
+            argv.Add("--output-format");
+            argv.Add("stream-json");
+        }
         if (!string.IsNullOrEmpty(modelId))
         {
             argv.Add("--model");
             argv.Add(modelId);
         }
-        // ReasoningMode="high" maps to --thinking, which enables Gemini's extended
-        // thinking (high-quality reasoning) mode. Requires @google/gemini-cli ≥ 0.1.9.
-        // Config validation rejects Gemini members with QualityScore >= 90 without
-        // ReasoningMode="high", so this branch fires for all frontier-adjacent Gemini slots.
-        if (string.Equals(reasoningMode, "high", StringComparison.OrdinalIgnoreCase))
-            argv.Add("--thinking");
+        // Gemini CLI 0.40+ has no --reasoning/--thinking/--effort flag.
+        // Reasoning level is encoded in the model config: gemini-3-* preset
+        // configs (e.g. gemini-3-flash-preview, gemini-3-pro-preview) extend
+        // chat-base-3 which sets thinkingLevel: HIGH. gemini-2.5-* uses the
+        // default thinking budget. So ReasoningMode is informational only on
+        // this runner — picking a gemini-3-* ModelId is what gives "high".
+        _ = reasoningMode;
         argv.Add("-p");
         argv.Add(prompt);
         return new AgentInvocation(argv);
@@ -163,7 +168,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         var stderr = Strip(result.Stderr);
         if (captureStructuredStream && !structuredStreamSupported)
         {
-            var warning = $"Warning: Gemini CLI at '{Binary}' does not advertise --json; structured stream capture was disabled.";
+            var warning = $"Warning: Gemini CLI at '{Binary}' does not advertise --output-format stream-json; structured stream capture was disabled.";
             stderr = string.IsNullOrEmpty(stderr) ? warning : $"{warning}\n{stderr}";
         }
 
