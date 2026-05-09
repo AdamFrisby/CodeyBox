@@ -500,6 +500,36 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         codexOauthFile,
         sp.GetService<ILogger<CodexOAuthFileCredentialProvider>>()));
 
+    // Gemini (Google AI Studio / Code Assist) OAuth files. The CLI hard-reads
+    // ~/.gemini/{oauth_creds,settings}.json — there's no env-var alternative
+    // for OAuth-personal — so the orchestrator ships their contents to the
+    // sandbox via env vars and GeminiAgentRunner.PrepareSandboxAsync writes
+    // them back to ~/.gemini/ inside the VM. Re-read on each pickup picks up
+    // refreshed access tokens without an orchestrator restart.
+    var geminiHome = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".gemini");
+    var geminiOAuthFile =
+        Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_FILE")
+        ?? builder.Configuration["CodeyBox:GeminiOAuthFile"]
+        ?? Path.Combine(geminiHome, "oauth_creds.json");
+    if (geminiOAuthFile.StartsWith("~/", StringComparison.Ordinal))
+        geminiOAuthFile = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            geminiOAuthFile[2..]);
+    var geminiSettingsFile =
+        Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_SETTINGS_FILE")
+        ?? builder.Configuration["CodeyBox:GeminiSettingsFile"]
+        ?? Path.Combine(geminiHome, "settings.json");
+    if (geminiSettingsFile.StartsWith("~/", StringComparison.Ordinal))
+        geminiSettingsFile = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            geminiSettingsFile[2..]);
+    builtInFirst.Add(new GeminiOAuthFileCredentialProvider(
+        geminiOAuthFile,
+        geminiSettingsFile,
+        sp.GetService<ILogger<GeminiOAuthFileCredentialProvider>>()));
+
     // Enumerate plugin-registered ICredentialProvider types using the list captured
     // from AddCodeyBoxPlugins (called before builder.Build()). Each plugin type is
     // registered in DI under its concrete type by PluginLoader.RegisterPlugins;
