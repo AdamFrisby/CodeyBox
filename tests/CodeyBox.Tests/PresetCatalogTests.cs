@@ -251,29 +251,6 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
-    public void ProjectFiles_LoadRepositoryLocalLanguageYaml()
-    {
-        var catalog = new PresetCatalog(new PresetCatalogOptions
-        {
-            ProjectFiles =
-            {
-                ["codeybox/languages/elixir.yaml"] = """
-                    id: elixir
-                    displayName: "Elixir"
-                    marker:
-                      globs: ["**/mix.exs"]
-                    auditors:
-                      - name: elixir:test-pass
-                        argv: ["mix", "test"]
-                    """,
-            },
-        });
-
-        Assert.Contains("elixir", catalog.KnownLanguages);
-        Assert.Equal(["elixir:test-pass"], catalog.ResolveLanguage("elixir", new PresetContext(new FakeAgent())).Select(a => a.Name).ToArray());
-    }
-
-    [Fact]
     public void UserOverride_ProjectConfigWinsForAuditTypeFocus()
     {
         using var temp = TempProject();

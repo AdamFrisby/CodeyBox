@@ -329,6 +329,8 @@ public sealed record ProjectAudit
 
     public IReadOnlyList<string> Languages { get; init; } = [];
     public bool LanguagesConfigured { get; init; }
+    public IReadOnlyDictionary<string, ProjectLanguagePresetOverride> LanguageOverrides { get; init; }
+        = new Dictionary<string, ProjectLanguagePresetOverride>(StringComparer.OrdinalIgnoreCase);
     public IReadOnlyList<string> AuditTypes { get; init; } = [];
     public IReadOnlyDictionary<string, ProjectAuditTypeOverride> AuditTypeOverrides { get; init; }
         = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase);
@@ -368,6 +370,21 @@ public sealed record ProjectAudit
     /// file races. Tool auditors are unaffected and always run sequentially.
     /// </summary>
     public int MaxLlmAuditorParallelism { get; init; } = 3;
+}
+
+public sealed record ProjectLanguagePresetOverride
+{
+    public bool Replace { get; init; }
+    public IReadOnlyList<ProjectConfiguredAuditor> Auditors { get; init; } = [];
+}
+
+public sealed record ProjectConfiguredAuditor
+{
+    public string Name { get; init; } = string.Empty;
+    public IReadOnlyList<string> Argv { get; init; } = [];
+    public string? Script { get; init; }
+    public string? ToolName { get; init; }
+    public bool? TreatExit127AsMissingTool { get; init; }
 }
 
 public sealed record ProjectAuditTypeOverride

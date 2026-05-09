@@ -47,9 +47,6 @@ internal sealed class PresetConfigLoader
         LoadUserLanguageFiles(options.ProjectRoot, languages);
         LoadUserAuditTypeFiles(options.ProjectRoot, auditTypes);
         LoadUserFrameFile(options.ProjectRoot, ref frame);
-        LoadProjectLanguageFiles(options.ProjectFiles, languages);
-        LoadProjectAuditTypeFiles(options.ProjectFiles, auditTypes);
-        LoadProjectFrameFile(options.ProjectFiles, ref frame);
 
         ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
         ValidateFrame("llm-prompt-frame.yaml", frame.Frame);
@@ -119,39 +116,6 @@ internal sealed class PresetConfigLoader
 
         frame = ReadYamlFile<FramePresetDefinition>(path, "frame");
         ValidateFrame(path, frame.Frame);
-    }
-
-    private static void LoadProjectLanguageFiles(
-        IReadOnlyDictionary<string, string> projectFiles,
-        Dictionary<string, LanguagePresetDefinition> languages)
-    {
-        foreach (var (path, yaml) in PresetFileContents(projectFiles, "languages"))
-        {
-            var definition = ReadYamlText<LanguagePresetDefinition>(yaml, path, "language");
-            ValidateLanguage(path, definition, allowPartial: languages.ContainsKey(definition.Id));
-            ComposeLanguage(languages, definition);
-        }
-    }
-
-    private static void LoadProjectAuditTypeFiles(
-        IReadOnlyDictionary<string, string> projectFiles,
-        Dictionary<string, AuditTypePresetDefinition> auditTypes)
-    {
-        foreach (var (path, yaml) in PresetFileContents(projectFiles, "audit-types"))
-        {
-            var definition = ReadYamlText<AuditTypePresetDefinition>(yaml, path, "audit-type");
-            ValidateAuditType(path, definition);
-            auditTypes[definition.Id] = definition;
-        }
-    }
-
-    private static void LoadProjectFrameFile(IReadOnlyDictionary<string, string> projectFiles, ref FramePresetDefinition frame)
-    {
-        if (!projectFiles.TryGetValue("codeybox/llm-prompt-frame.yaml", out var yaml))
-            return;
-
-        frame = ReadYamlText<FramePresetDefinition>(yaml, "codeybox/llm-prompt-frame.yaml", "frame");
-        ValidateFrame("codeybox/llm-prompt-frame.yaml", frame.Frame);
     }
 
     private static void ApplyProjectConfigOverrides(
@@ -233,14 +197,6 @@ internal sealed class PresetConfigLoader
             ? Directory.EnumerateFiles(directory, "*.yaml").Order(StringComparer.Ordinal)
             : [];
     }
-
-    private static IEnumerable<KeyValuePair<string, string>> PresetFileContents(
-        IReadOnlyDictionary<string, string> files,
-        string childDirectory)
-        => files
-            .Where(kvp => kvp.Key.StartsWith($"codeybox/{childDirectory}/", StringComparison.Ordinal) &&
-                          kvp.Key.EndsWith(".yaml", StringComparison.Ordinal))
-            .OrderBy(kvp => kvp.Key, StringComparer.Ordinal);
 
     private static IEnumerable<string> ResourceNames(Assembly assembly, string child, string suffix)
         => assembly.GetManifestResourceNames()

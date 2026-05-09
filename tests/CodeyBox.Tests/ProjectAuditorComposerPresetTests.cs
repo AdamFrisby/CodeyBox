@@ -41,6 +41,41 @@ public sealed class ProjectAuditorComposerPresetTests
         Assert.DoesNotContain("TODO / FIXME / XXX", runner.Prompt, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Compose_AppliesProjectLanguageOverride()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Languages = ["csharp"],
+                LanguageOverrides = new Dictionary<string, ProjectLanguagePresetOverride>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["csharp"] = new()
+                    {
+                        Replace = true,
+                        Auditors =
+                        [
+                            new ProjectConfiguredAuditor
+                            {
+                                Name = "csharp:project-test",
+                                Argv = ["dotnet", "test"],
+                            },
+                        ],
+                    },
+                },
+            },
+        };
+
+        var auditors = composer.Compose(project, new CapturingAgent());
+
+        Assert.Equal(["csharp:project-test"], auditors.Select(a => a.Name).ToArray());
+    }
+
     private sealed class CapturingAgent : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;

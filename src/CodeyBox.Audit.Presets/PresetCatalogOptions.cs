@@ -3,8 +3,6 @@ namespace CodeyBox.Audit.Presets;
 public sealed class PresetCatalogOptions
 {
     public string? ProjectRoot { get; set; }
-    public Dictionary<string, string> ProjectFiles { get; set; } =
-        new Dictionary<string, string>(StringComparer.Ordinal);
     public Dictionary<string, LanguagePresetOverride> LanguageOverrides { get; set; } =
         new Dictionary<string, LanguagePresetOverride>(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, AuditTypePresetOverride> AuditTypeOverrides { get; set; } =
@@ -15,7 +13,6 @@ public sealed class PresetCatalogOptions
         => new()
         {
             ProjectRoot = ProjectRoot,
-            ProjectFiles = new Dictionary<string, string>(ProjectFiles, StringComparer.Ordinal),
             LanguageOverrides = LanguageOverrides.ToDictionary(
                 kvp => kvp.Key,
                 kvp => kvp.Value.Clone(),

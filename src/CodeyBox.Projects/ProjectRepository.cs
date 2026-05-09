@@ -1,3 +1,4 @@
+using CodeyBox.Audit.Presets;
 using Microsoft.Extensions.Options;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
@@ -23,6 +24,12 @@ public sealed class ProjectRepository : IProjectRepository
         : this(options, NullLogger<ProjectRepository>.Instance) { }
 
     public ProjectRepository(IOptions<ProjectsOptions> options, ILogger<ProjectRepository> logger)
+        : this(options, logger, null) { }
+
+    public ProjectRepository(
+        IOptions<ProjectsOptions> options,
+        ILogger<ProjectRepository> logger,
+        PresetCatalogOptions? presetCatalogOptions)
     {
         var opts = options.Value;
         var defaults = opts.Defaults ?? new ProjectDefaultsConfig();
@@ -33,6 +40,7 @@ public sealed class ProjectRepository : IProjectRepository
             var project = Resolve(pc, defaults);
             if (!seen.Add(project.Id.Value))
                 throw new InvalidOperationException($"Duplicate project id: {project.Id}");
+            ValidatePresetOverrides(project, presetCatalogOptions);
             resolved.Add(project);
         }
         _list = resolved;
@@ -44,6 +52,59 @@ public sealed class ProjectRepository : IProjectRepository
 
     public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
         => Task.FromResult(_list);
+
+    private static void ValidatePresetOverrides(Project project, PresetCatalogOptions? presetCatalogOptions)
+    {
+        if (project.Audit.LanguageOverrides.Count == 0 &&
+            project.Audit.AuditTypeOverrides.Count == 0 &&
+            project.Audit.LlmPromptFrameTemplate is null)
+        {
+            return;
+        }
+
+        var options = presetCatalogOptions?.Clone() ?? new PresetCatalogOptions();
+        ApplyPresetOverrideOptions(project, options);
+        try
+        {
+            _ = new PresetCatalog(options);
+        }
+        catch (PresetConfigurationException ex)
+        {
+            throw new InvalidOperationException(
+                $"Project '{project.Id.Value}' audit preset configuration is invalid: {ex.Message}", ex);
+        }
+    }
+
+    internal static void ApplyPresetOverrideOptions(Project project, PresetCatalogOptions options)
+    {
+        foreach (var (id, ov) in project.Audit.LanguageOverrides)
+        {
+            options.LanguageOverrides[id] = new LanguagePresetOverride
+            {
+                Replace = ov.Replace,
+                Auditors = ov.Auditors.Select(a => new ConfiguredAuditor
+                {
+                    Name = a.Name,
+                    Argv = [.. a.Argv],
+                    Script = a.Script,
+                    ToolName = a.ToolName,
+                    TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                }).ToList(),
+            };
+        }
+
+        foreach (var (id, ov) in project.Audit.AuditTypeOverrides)
+        {
+            options.AuditTypeOverrides[id] = new AuditTypePresetOverride
+            {
+                DisplayName = ov.DisplayName,
+                ReviewFocus = ov.ReviewFocus,
+            };
+        }
+
+        if (project.Audit.LlmPromptFrameTemplate is not null)
+            options.LlmPromptFrameTemplate = project.Audit.LlmPromptFrameTemplate;
+    }
 
     private Project Resolve(ProjectConfig pc, ProjectDefaultsConfig defaults)
     {
@@ -120,6 +181,7 @@ public sealed class ProjectRepository : IProjectRepository
         var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;
         var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ProjectAuditLanguages.Default;
         var mergedLanguages = FilterConfiguredLanguages(configuredLanguages);
+        var mergedLanguageOverrides = MergeLanguageOverrides(defaults?.LanguageOverrides, project?.LanguageOverrides);
         var mergedAuditTypes = project?.AuditTypes ?? defaults?.AuditTypes ?? [];
         var mergedAuditTypeOverrides = MergeAuditTypeOverrides(defaults?.AuditTypeOverrides, project?.AuditTypeOverrides);
         var mergedFrameTemplate = project?.LlmPromptFrameTemplate ?? defaults?.LlmPromptFrameTemplate;
@@ -159,6 +221,7 @@ public sealed class ProjectRepository : IProjectRepository
             MergeScopeBufferLines = mergedMergeScopeBufferLines,
             Languages = mergedLanguages,
             LanguagesConfigured = languagesConfigured,
+            LanguageOverrides = mergedLanguageOverrides,
             AuditTypes = mergedAuditTypes,
             AuditTypeOverrides = mergedAuditTypeOverrides,
             LlmPromptFrameTemplate = mergedFrameTemplate,
@@ -168,6 +231,41 @@ public sealed class ProjectRepository : IProjectRepository
             MaxLlmAuditorParallelism = mergedMaxLlmPar,
         };
     }
+
+    private static IReadOnlyDictionary<string, ProjectLanguagePresetOverride> MergeLanguageOverrides(
+        Dictionary<string, ProjectLanguagePresetOverrideConfig>? defaults,
+        Dictionary<string, ProjectLanguagePresetOverrideConfig>? project)
+    {
+        var merged = new Dictionary<string, ProjectLanguagePresetOverride>(StringComparer.OrdinalIgnoreCase);
+        if (defaults is not null)
+        {
+            foreach (var (id, ov) in defaults)
+                merged[id] = ResolveLanguageOverride(ov);
+        }
+        if (project is not null)
+        {
+            foreach (var (id, ov) in project)
+                merged[id] = ResolveLanguageOverride(ov);
+        }
+        return merged;
+    }
+
+    private static ProjectLanguagePresetOverride ResolveLanguageOverride(ProjectLanguagePresetOverrideConfig config)
+        => new()
+        {
+            Replace = config.Replace,
+            Auditors = (config.Auditors ?? []).Select(ResolveConfiguredAuditor).ToList(),
+        };
+
+    private static ProjectConfiguredAuditor ResolveConfiguredAuditor(ProjectConfiguredAuditorConfig config)
+        => new()
+        {
+            Name = config.Name ?? string.Empty,
+            Argv = config.Argv ?? [],
+            Script = config.Script,
+            ToolName = config.ToolName,
+            TreatExit127AsMissingTool = config.TreatExit127AsMissingTool,
+        };
 
     private static IReadOnlyDictionary<string, ProjectAuditTypeOverride> MergeAuditTypeOverrides(
         Dictionary<string, ProjectAuditTypeOverrideConfig>? defaults,

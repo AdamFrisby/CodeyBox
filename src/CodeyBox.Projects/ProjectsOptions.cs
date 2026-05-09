@@ -115,6 +115,7 @@ public sealed class ProjectAuditConfig
     public int? MergeScopeBufferLines { get; set; }
 
     public List<string>? Languages { get; set; }
+    public Dictionary<string, ProjectLanguagePresetOverrideConfig>? LanguageOverrides { get; set; }
     public List<string>? AuditTypes { get; set; }
     public Dictionary<string, ProjectAuditTypeOverrideConfig>? AuditTypeOverrides { get; set; }
     public string? LlmPromptFrameTemplate { get; set; }
@@ -143,18 +144,57 @@ public sealed class ProjectAuditTypeOverrideConfig
     public string? ReviewFocus { get; set; }
 }
 
+public sealed class ProjectLanguagePresetOverrideConfig
+{
+    public bool Replace { get; set; }
+    public List<ProjectConfiguredAuditorConfig>? Auditors { get; set; }
+}
+
+public sealed class ProjectConfiguredAuditorConfig
+{
+    public string? Name { get; set; }
+    public List<string>? Argv { get; set; }
+    public string? Script { get; set; }
+    public string? ToolName { get; set; }
+    public bool? TreatExit127AsMissingTool { get; set; }
+}
+
 public static class ProjectsOptionsBinder
 {
     public static ProjectsOptions Bind(IConfiguration section)
     {
         var options = section.Get<ProjectsOptions>() ?? new ProjectsOptions();
+        ApplyLanguageMap(section.GetSection("Defaults:Audit"), options.Defaults.Audit);
         ApplyAuditTypeMap(section.GetSection("Defaults:Audit"), options.Defaults.Audit);
 
         var projectSections = section.GetSection("Projects").GetChildren().ToList();
         for (var i = 0; i < options.Projects.Count && i < projectSections.Count; i++)
+        {
+            ApplyLanguageMap(projectSections[i].GetSection("Audit"), options.Projects[i].Audit);
             ApplyAuditTypeMap(projectSections[i].GetSection("Audit"), options.Projects[i].Audit);
+        }
 
         return options;
+    }
+
+    private static void ApplyLanguageMap(IConfigurationSection auditSection, ProjectAuditConfig? audit)
+    {
+        if (audit is null)
+            return;
+
+        var overridesSection = auditSection.GetSection("Languages:Overrides");
+        if (!overridesSection.Exists())
+            return;
+
+        audit.LanguageOverrides = overridesSection
+            .GetChildren()
+            .Select(c => new
+            {
+                Id = c.Key,
+                Override = c.Get<ProjectLanguagePresetOverrideConfig>() ?? new ProjectLanguagePresetOverrideConfig(),
+            })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+            .ToDictionary(x => x.Id, x => x.Override, StringComparer.OrdinalIgnoreCase);
     }
 
     private static void ApplyAuditTypeMap(IConfigurationSection auditSection, ProjectAuditConfig? audit)

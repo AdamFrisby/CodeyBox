@@ -1,6 +1,6 @@
 # Config-Driven Language Presets
 
-Language presets are loaded from YAML. Built-in defaults ship as embedded resources under `CodeyBox.Audit.Presets/Defaults/languages`, and project files on the configured base branch can extend or replace them from:
+Language presets are loaded from operator-controlled configuration. Built-in defaults ship as embedded resources under `CodeyBox.Audit.Presets/Defaults/languages`, and startup config under the service content root can extend or replace them from:
 
 ```text
 codeybox/languages/<language-id>.yaml
@@ -25,7 +25,7 @@ auditors:
     treatExit127AsMissingTool: true
 ```
 
-`id`, `marker`, and `auditors` are required for a new language. For an existing language, a project file with the same `id` appends auditors by default:
+`id`, `marker`, and `auditors` are required for a new language. For an existing language, a file with the same `id` appends auditors by default:
 
 ```yaml
 id: csharp
@@ -48,10 +48,37 @@ auditors:
 
 ## Trust Boundary
 
-Repository-local preset files can define shell commands. Treat `codeybox/languages` as operator-controlled project configuration: review changes to these files before they land on the base branch. The orchestrator reads them from the base branch when composing auditors; work-branch edits do not change the auditor set for the current run.
+Language presets can define shell commands. The orchestrator does not read preset YAML from audited repositories; `codeybox/languages` is service startup configuration owned by the operator. Repository changes to `codeybox/languages` are ignored by audit composition.
 
 ## Validation
 
-All built-in and project YAML is schema-validated before use. Invalid YAML, unknown fields, missing required fields, bad LLM placeholders, and common command typos fail loudly with the file path and a JSON-pointer-style field location. For example, `argv: ["dottest"]` reports a `did you mean 'dotnet'?` diagnostic.
+All built-in YAML, operator YAML, and appsettings preset overrides are schema-validated before use. Invalid YAML, unknown fields, missing required fields, bad LLM placeholders, and common command typos fail loudly with the file path and a JSON-pointer-style field location. For example, `argv: ["dottest"]` reports a `did you mean 'dotnet'?` diagnostic.
 
 Global operator configuration under `CodeyBox:Presets:LanguageOverrides` is applied after files, so appsettings wins over `codeybox/languages`.
+
+Per-project appsettings can tune a language with `Audit.Languages.Overrides.<language-id>`. These overrides append to defaults unless `Replace` is true:
+
+```json
+{
+  "CodeyBox": {
+    "Projects": [
+      {
+        "Id": "alpha",
+        "Audit": {
+          "Languages": {
+            "0": "csharp",
+            "Overrides": {
+              "csharp": {
+                "Replace": true,
+                "Auditors": [
+                  { "Name": "csharp:test-pass", "Argv": ["dotnet", "test"] }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+```

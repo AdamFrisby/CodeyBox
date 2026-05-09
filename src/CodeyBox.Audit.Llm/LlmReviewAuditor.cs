@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -189,15 +190,32 @@ public static class LlmPromptFrameTemplate
 
     public static string Render(string template, IReadOnlyDictionary<string, string> values)
     {
-        var rendered = template;
-        foreach (var placeholder in FindPlaceholders(template).Distinct(StringComparer.Ordinal))
+        var rendered = new StringBuilder(template.Length);
+        for (var i = 0; i < template.Length;)
         {
+            var start = template.IndexOf("{{", i, StringComparison.Ordinal);
+            if (start < 0)
+            {
+                rendered.Append(template, i, template.Length - i);
+                break;
+            }
+
+            var end = template.IndexOf("}}", start + 2, StringComparison.Ordinal);
+            if (end < 0)
+            {
+                rendered.Append(template, i, template.Length - i);
+                break;
+            }
+
+            rendered.Append(template, i, start - i);
+            var placeholder = template[(start + 2)..end].Trim();
             if (!AllowedPlaceholders.Contains(placeholder))
                 throw new InvalidOperationException($"Unknown LLM prompt frame placeholder '{{{{{placeholder}}}}}'");
             if (!values.TryGetValue(placeholder, out var value))
                 throw new InvalidOperationException($"No value supplied for LLM prompt frame placeholder '{{{{{placeholder}}}}}'");
-            rendered = rendered.Replace("{{" + placeholder + "}}", value, StringComparison.Ordinal);
+            rendered.Append(value);
+            i = end + 2;
         }
-        return rendered;
+        return rendered.ToString();
     }
 }

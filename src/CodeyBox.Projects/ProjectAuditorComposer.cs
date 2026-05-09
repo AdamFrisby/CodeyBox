@@ -60,14 +60,8 @@ public sealed class ProjectAuditorComposer
         : this(catalog, [], NullLogger<ProjectAuditorComposer>.Instance) { }
 
     public IReadOnlyList<IAuditor> Compose(Project project, IAgentRunner agentForLlmAuditors)
-        => Compose(project, agentForLlmAuditors, repositoryPresetFiles: null);
-
-    public IReadOnlyList<IAuditor> Compose(
-        Project project,
-        IAgentRunner agentForLlmAuditors,
-        IReadOnlyDictionary<string, string>? repositoryPresetFiles)
     {
-        var catalog = ResolveCatalog(project, repositoryPresetFiles);
+        var catalog = ResolveCatalog(project);
         var ctx = new PresetContext(agentForLlmAuditors);
         var auditors = new List<IAuditor>();
 
@@ -100,29 +94,20 @@ public sealed class ProjectAuditorComposer
         return auditors;
     }
 
-    private IPresetCatalog ResolveCatalog(Project project, IReadOnlyDictionary<string, string>? repositoryPresetFiles)
+    private IPresetCatalog ResolveCatalog(Project project)
     {
-        if (!HasProjectPresetOverrides(project) && (repositoryPresetFiles is null || repositoryPresetFiles.Count == 0))
+        if (!HasProjectPresetOverrides(project))
             return _catalog;
 
         var options = _catalogOptions.Clone();
-        if (repositoryPresetFiles is not null)
-            options.ProjectFiles = new Dictionary<string, string>(repositoryPresetFiles, StringComparer.Ordinal);
-        foreach (var (id, ov) in project.Audit.AuditTypeOverrides)
-        {
-            options.AuditTypeOverrides[id] = new AuditTypePresetOverride
-            {
-                DisplayName = ov.DisplayName,
-                ReviewFocus = ov.ReviewFocus,
-            };
-        }
-        if (project.Audit.LlmPromptFrameTemplate is not null)
-            options.LlmPromptFrameTemplate = project.Audit.LlmPromptFrameTemplate;
+        ProjectRepository.ApplyPresetOverrideOptions(project, options);
         return new PresetCatalog(options);
     }
 
     private static bool HasProjectPresetOverrides(Project project)
-        => project.Audit.AuditTypeOverrides.Count > 0 || project.Audit.LlmPromptFrameTemplate is not null;
+        => project.Audit.LanguageOverrides.Count > 0 ||
+           project.Audit.AuditTypeOverrides.Count > 0 ||
+           project.Audit.LlmPromptFrameTemplate is not null;
 
     private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors)
     {
