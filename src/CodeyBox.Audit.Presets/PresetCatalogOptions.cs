@@ -44,12 +44,33 @@ public sealed class AuditTypePresetOverride
 {
     public string? DisplayName { get; set; }
     public string? ReviewFocus { get; set; }
+    public List<ConfiguredAuditor> Auditors { get; set; } = [];
+    public List<ConfiguredDiffPattern> Patterns { get; set; } = [];
+    public bool Replace { get; set; }
 
     public AuditTypePresetOverride Clone()
         => new()
         {
             DisplayName = DisplayName,
             ReviewFocus = ReviewFocus,
+            Auditors = Auditors.Select(a => a.Clone()).ToList(),
+            Patterns = Patterns.Select(p => p.Clone()).ToList(),
+            Replace = Replace,
+        };
+}
+
+public sealed class ConfiguredDiffPattern
+{
+    public string Regex { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public string? Severity { get; set; }
+
+    public ConfiguredDiffPattern Clone()
+        => new()
+        {
+            Regex = Regex,
+            Description = Description,
+            Severity = Severity,
         };
 }
 

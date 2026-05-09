@@ -1,6 +1,44 @@
 id: tests
 displayName: "Test meaningfulness review"
 llmAuditorName: tests:meaningfulness-review
+patterns:
+  - regex: '^\s*assert\s+True\s*$'
+    description: 'assert True (no-op assertion)'
+  - regex: '^\s*assert\s+1\s*==\s*1\s*$'
+    description: 'assert 1 == 1 (trivially-true)'
+  - regex: '^\s*assert\s+not\s+False\s*$'
+    description: 'assert not False (no-op)'
+  - regex: '^\s*pass\s*#\s*test\b'
+    description: 'pass-only test body'
+    severity: warning
+  - regex: '\bAssert\.True\s*\(\s*true\s*[,)]'
+    description: 'Assert.True(true) (no-op)'
+  - regex: '\bAssert\.IsTrue\s*\(\s*true\s*[,)]'
+    description: 'Assert.IsTrue(true) (no-op)'
+  - regex: '\bAssert\.False\s*\(\s*false\s*[,)]'
+    description: 'Assert.False(false) (no-op)'
+  - regex: '\bAssert\.Equal\s*\(\s*(\w+)\s*,\s*\1\s*\)'
+    description: 'Assert.Equal(x, x) (no-op)'
+  - regex: '\bAssert\.AreEqual\s*\(\s*(\w+)\s*,\s*\1\s*\)'
+    description: 'Assert.AreEqual(x, x) (no-op)'
+  - regex: '\bAssert\.That\s*\(\s*true\b'
+    description: 'Assert.That(true, ...) (no-op)'
+  - regex: '\bexpect\s*\(\s*true\s*\)\s*\.\s*toBe\s*\(\s*true\s*\)'
+    description: 'expect(true).toBe(true) (no-op)'
+  - regex: '\bexpect\s*\(\s*1\s*\)\s*\.\s*toBe\s*\(\s*1\s*\)'
+    description: 'expect(1).toBe(1) (no-op)'
+  - regex: '\bexpect\s*\(\s*(\w+)\s*\)\s*\.\s*toBe\s*\(\s*\1\s*\)'
+    description: 'expect(x).toBe(x) (no-op)'
+  - regex: '\bexpect\s*\(\s*(\w+)\s*\)\s*\.\s*toEqual\s*\(\s*\1\s*\)'
+    description: 'expect(x).toEqual(x) (no-op)'
+  - regex: '\bassert\.True\s*\(\s*t\s*,\s*true\s*[,)]'
+    description: 'assert.True(t, true) (no-op)'
+  - regex: '\bassert\.Equal\s*\(\s*t\s*,\s*(\w+)\s*,\s*\1\s*\)'
+    description: 'assert.Equal(t, x, x) (no-op)'
+  - regex: '^\s*assert!\s*\(\s*true\s*\)'
+    description: 'assert!(true) (no-op)'
+  - regex: '^\s*assert_eq!\s*\(\s*(\w+)\s*,\s*\1\s*\)'
+    description: 'assert_eq!(x, x) (no-op)'
 reviewFocus: |-
   You are reviewing whether the test changes in this diff give
   ADEQUATE and MEANINGFUL coverage of the production-code changes.

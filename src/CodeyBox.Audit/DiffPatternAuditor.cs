@@ -29,6 +29,8 @@ public sealed partial class DiffPatternAuditor : IAuditor
     public string Kind => "diff-pattern";
     public AuditCapabilities Required => AuditCapabilities.None;
 
+    public IReadOnlyList<DiffPattern> Patterns => _opts.Patterns;
+
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
         // Diff workBranch against baseBranch (three-dot: "the changes on

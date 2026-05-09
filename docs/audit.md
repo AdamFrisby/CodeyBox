@@ -89,12 +89,12 @@ if the auditor itself is an LLM call.
 Runs an arbitrary command inside the audit sandbox. Exit code 0 = pass;
 non-zero = fail with stdout/stderr captured as a single Error finding.
 
-```csharp
-new ShellCommandAuditor(new ShellCommandAuditorOptions
-{
-    Name = "golangci-lint",
-    Argv = ["golangci-lint", "run", "./..."],
-})
+Configured via YAML in `auditors` list:
+
+```yaml
+auditors:
+  - name: "golangci-lint"
+    argv: ["golangci-lint", "run", "./..."]
 ```
 
 Use for any tool with the standard "exit 0 = good" contract: linters,
@@ -105,17 +105,16 @@ Capability: `None`.
 
 ### Built-in audit-type presets
 
-CodeyBox ships these audit-type presets, registered automatically with
-`PresetCatalog`:
+CodeyBox ships these audit-type presets as YAML resources (see `docs/audit-types.md`):
 
-| Preset         | Bundles                                                                |
-|----------------|------------------------------------------------------------------------|
-| `security`     | gitleaks + semgrep + comprehensive LLM review (ASVS 5.0 + Top 10 + LLM-specific). The review prompt walks 21 categories — injection, XSS, validation, files, XXE, authn, authz, sessions/JWT, OAuth, crypto, transport, config, data protection, SSRF, DoS, logging, memory safety, races, dependencies, AI/prompt-injection, business logic. |
-| `architecture` | LLM review for coupling, layering, leaking internals.                  |
-| `quality`      | LLM review for dead code, magic numbers, naming, error handling.       |
-| `completeness` | LLM review for TODOs, missing tests, half-finished impls.              |
-| `cheating`     | Diff-pattern matcher + LLM review for agent shortcuts (suppression markers, stubbed implementations, skipped tests, hardcoded "mock" returns). |
-| `tests`        | Diff-pattern matcher for no-op assertions + LLM review for test meaningfulness (implementation-mirroring tests, pure-mock tests, missing failure-path coverage). |
+| Preset         | Components                                                              |
+|----------------|-------------------------------------------------------------------------|
+| `security`     | gitleaks + semgrep + comprehensive LLM review focus (ASVS 5.0 + Top 10 + LLM-specific). |
+| `architecture` | LLM review focus for coupling, layering, leaking internals.                  |
+| `quality`      | LLM review focus for dead code, magic numbers, naming, error handling.       |
+| `completeness` | LLM review focus for TODOs, missing tests, half-finished impls.              |
+| `cheating`     | Deterministic diff-patterns + LLM review focus for agent shortcuts. |
+| `tests`        | Deterministic diff-patterns for no-op assertions + LLM review focus for test meaningfulness. |
 
 A project enables a preset by listing its name in
 `Audit.AuditTypes` (see `docs/projects.md`).
@@ -123,51 +122,22 @@ A project enables a preset by listing its name in
 ### Built-in language presets
 
 Language presets are selected with `Project.Audit.Languages`. They are
-tool-only and only run when their marker files are present in the work tree:
+tool-only YAML resources; see `docs/languages.md`.
 
-| Language | Marker files | Auditors |
+| Language | Marker files | auditors |
 |---|---|---|
-| `csharp` | `*.csproj`, `*.sln`, `*.slnx` | `csharp:format-check`, `csharp:build-WaE`, `csharp:test-pass` |
-| `python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `python:format-check`, `python:typecheck`, `python:test-pass` |
-| `node` | `package.json` | `node:format-check`, `node:lint`, `node:test-pass` |
-| `go` | `go.mod` | `go:format-check`, `go:vet`, `go:test-pass` |
-| `rust` | `Cargo.toml` | `rust:format-check`, `rust:lint`, `rust:test-pass` |
-
-If a language is declared but its marker files are absent, the corresponding
-auditors emit Info findings and skip. Unknown language strings are logged at
-startup and skipped.
-
+...
 ### `LlmReviewAuditor` (`CodeyBox.Audit.Llm`)
 
 Runs an `IAgentRunner` with a review-style prompt. The agent is
 instructed to write a JSON verdict to `/audit/result.json`:
-
-```json
-{
-  "passed": true,
-  "findings": [
-    { "severity": "error|warning|info",
-      "title": "...", "description": "...", "location": "path:line" }
-  ]
-}
-```
-
+...
 If the file is missing or unparsable, the auditor reports a single Error
 finding with the parser failure and the truncated agent output. The
 pipeline treats that as a normal audit failure and re-runs on the next
 iteration (the agent may not yet be reliably producing structured output).
 
-```csharp
-new LlmReviewAuditor(new LlmReviewAuditorOptions
-{
-    Name = "Architecture review",
-    Agent = new ClaudeAgentRunner(),
-    ReviewFocus =
-        "- Loose-coupling violations (concrete types in cross-module signatures)\n" +
-        "- Missing input validation at trust boundaries\n" +
-        "- Hardcoded secrets or URLs",
-})
-```
+Configured via `reviewFocus` and `llmAuditorName` in audit-type YAML.
 
 Capability: `AgentCredentials | Network`.
 

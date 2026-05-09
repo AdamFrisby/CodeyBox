@@ -1,6 +1,6 @@
 # Config-Driven Audit Type Prompts
 
-Audit-type LLM review focus prompts are loaded from configuration. Built-in defaults are embedded under `CodeyBox.Audit.Presets/Defaults/audit-types`, and a project repository can override or add audit types from:
+Audit-type auditors, deterministic patterns, and LLM review focus prompts are loaded from configuration. Built-in defaults are embedded under `CodeyBox.Audit.Presets/Defaults/audit-types`, and a project repository can override or add audit types from:
 
 ```text
 codeybox/audit-types/<audit-type-id>.yaml
@@ -12,15 +12,30 @@ codeybox/audit-types/<audit-type-id>.yaml
 id: accessibility
 displayName: "Accessibility review"
 llmAuditorName: accessibility:llm-review
+auditors:
+  - name: accessibility:axe-linter
+    argv: ["npm", "run", "axe-check"]
+patterns:
+  - regex: 'aria-hidden="true"'
+    description: "Manual aria-hidden check"
 reviewFocus: |
   - Missing labels or names for interactive controls
   - Keyboard traps and unreachable controls
   - Color-only state or contrast regressions
 ```
 
-Known audit types such as `security`, `completeness`, `cheating`, and `tests` keep their code-owned auditor behavior. Only their review focus text is configurable. New audit types become LLM review auditors by default.
+All audit types, including built-ins such as `security`, `completeness`, `cheating`, and `tests`, use this configuration-driven mechanism. New audit types can combine shell tools, deterministic diff-patterns, and LLM review auditors.
 
-Per-project appsettings can tune audit voices with `Audit.AuditTypes.<id>.ReviewFocus`. In object form, the `AuditTypes` keys are also the selected audit types for that project:
+`auditors`, `patterns`, and `reviewFocus` are optional. An audit type will include:
+- A shell auditor for each entry in `auditors`.
+- A `DiffPatternAuditor` if `patterns` is non-empty.
+- An `LlmReviewAuditor` if `reviewFocus` is non-empty.
+
+## Composition and Overrides
+
+For an existing audit type, a YAML file with the same `id` appends auditors and patterns by default, and replaces the `reviewFocus` if supplied. Set `replace: true` to replace the entire definition.
+
+Per-project appsettings can tune audit voices with `Audit.AuditTypes.<id>.ReviewFocus`. You can also override auditors and patterns from appsettings:
 
 ```json
 {
@@ -31,10 +46,10 @@ Per-project appsettings can tune audit voices with `Audit.AuditTypes.<id>.Review
         "Audit": {
           "AuditTypes": {
             "security": {
-              "ReviewFocus": "- Project-specific auth and tenant-boundary checks"
-            },
-            "completeness": {
-              "ReviewFocus": "- Product acceptance criteria from the work item"
+              "ReviewFocus": "- Project-specific auth and tenant-boundary checks",
+              "Auditors": [
+                { "Name": "security:custom-scanner", "Argv": ["custom-scan", "."] }
+              ]
             }
           }
         }
@@ -44,7 +59,7 @@ Per-project appsettings can tune audit voices with `Audit.AuditTypes.<id>.Review
 }
 ```
 
-The existing list form still works when no prompt overrides are needed:
+The existing list form still works when no prompt or auditor overrides are needed:
 
 ```json
 {
@@ -52,21 +67,7 @@ The existing list form still works when no prompt overrides are needed:
 }
 ```
 
-Global operator configuration under `CodeyBox:Presets:AuditTypeOverrides` is applied after `codeybox/audit-types`, and per-project appsettings are applied last:
-
-```json
-{
-  "CodeyBox": {
-    "Presets": {
-      "AuditTypeOverrides": {
-        "completeness": {
-          "ReviewFocus": "- Product-specific acceptance criteria"
-        }
-      }
-    }
-  }
-}
-```
+Global operator configuration under `CodeyBox:Presets:AuditTypeOverrides` is applied after `codeybox/audit-types`, and per-project appsettings are applied last.
 
 ## Frame Prompt
 

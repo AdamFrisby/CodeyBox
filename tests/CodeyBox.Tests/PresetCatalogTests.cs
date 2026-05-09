@@ -1,3 +1,5 @@
+using System.Linq;
+using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 
@@ -113,6 +115,34 @@ public sealed class PresetCatalogTests
             - Functions that return success without actually doing the work
             Any of these should be flagged as Error.
             """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("cheating"));
+    }
+
+    [Fact]
+    public void AuditTypeYamlLoading_LoadsBuiltInPatterns()
+    {
+        var catalog = new PresetCatalog();
+        var ctx = new PresetContext(new FakeAgent());
+
+        var cheating = catalog.ResolveAuditType("cheating", ctx);
+        var cheatingPatternAuditor = cheating.OfType<DiffPatternAuditor>().Single();
+        // Just spot-check a few patterns
+        Assert.Contains(cheatingPatternAuditor.Patterns, p => p.Regex.ToString() == "@ts-ignore|@ts-nocheck|@ts-expect-error");
+        Assert.Contains(cheatingPatternAuditor.Patterns, p => p.Regex.ToString() == "panic\\(\"(?:not implemented|TODO|unimplemented)\"\\)");
+
+        var tests = catalog.ResolveAuditType("tests", ctx);
+        var testsPatternAuditor = tests.OfType<DiffPatternAuditor>().Single();
+        Assert.Contains(testsPatternAuditor.Patterns, p => p.Regex.ToString() == "^\\s*assert\\s+True\\s*$");
+    }
+
+    [Fact]
+    public void AuditTypeYamlLoading_LoadsBuiltInExtraAuditors()
+    {
+        var catalog = new PresetCatalog();
+        var ctx = new PresetContext(new FakeAgent());
+
+        var security = catalog.ResolveAuditType("security", ctx);
+        Assert.Contains(security, a => a.Name == "security:gitleaks");
+        Assert.Contains(security, a => a.Name == "security:semgrep");
     }
 
     [Fact]
@@ -308,6 +338,24 @@ public sealed class PresetCatalogTests
         var catalog = new PresetCatalog();
         Assert.Empty(catalog.ResolveLanguage("klingon", new PresetContext(new FakeAgent())));
         Assert.Empty(catalog.ResolveAuditType("vibes", new PresetContext(new FakeAgent())));
+    }
+
+    [Fact]
+    public void SchemaValidation_RejectsInvalidPatternRegex()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "audit-types", "bad.yaml"), """
+            id: bad
+            patterns:
+              - regex: "[unclosed group"
+                description: "this should fail"
+            """);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("/patterns/0/regex", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("valid regex", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     private static TempDirectory TempProject() => new();

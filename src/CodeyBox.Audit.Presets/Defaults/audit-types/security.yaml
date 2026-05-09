@@ -1,6 +1,11 @@
 id: security
 displayName: "Security review"
 llmAuditorName: security:llm-review
+auditors:
+  - name: security:gitleaks
+    argv: ["gitleaks", "detect", "--source", ".", "--no-banner", "--no-color"]
+  - name: security:semgrep
+    argv: ["semgrep", "--config", "auto", "--error", "--quiet"]
 reviewFocus: |-
   You are performing a security code review aligned to OWASP ASVS 5.0,
   OWASP Top 10 (2021), the CWE Top 25, and current LLM/AI-specific

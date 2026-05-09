@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Collections;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets.Presets;
 using CodeyBox.Audit.Shell;
@@ -104,8 +105,36 @@ internal sealed class PresetConfigLoader
         {
             var definition = ReadYamlFile<AuditTypePresetDefinition>(file, "audit-type");
             ValidateAuditType(file, definition);
-            auditTypes[definition.Id] = definition;
+            ComposeAuditType(auditTypes, definition);
         }
+    }
+
+    private static void ComposeAuditType(
+        Dictionary<string, AuditTypePresetDefinition> auditTypes,
+        AuditTypePresetDefinition incoming)
+    {
+        if (!auditTypes.TryGetValue(incoming.Id, out var existing) || incoming.Replace)
+        {
+            if (incoming.Replace && existing is not null)
+            {
+                if (string.IsNullOrWhiteSpace(incoming.DisplayName))
+                    incoming.DisplayName = existing.DisplayName;
+                if (string.IsNullOrWhiteSpace(incoming.ReviewFocus))
+                    incoming.ReviewFocus = existing.ReviewFocus;
+            }
+            auditTypes[incoming.Id] = incoming;
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(incoming.DisplayName))
+            existing.DisplayName = incoming.DisplayName;
+        if (!string.IsNullOrWhiteSpace(incoming.ReviewFocus))
+            existing.ReviewFocus = incoming.ReviewFocus;
+        if (!string.IsNullOrWhiteSpace(incoming.LlmAuditorName))
+            existing.LlmAuditorName = incoming.LlmAuditorName;
+
+        existing.Auditors.AddRange(incoming.Auditors);
+        existing.Patterns.AddRange(incoming.Patterns);
     }
 
     private static void LoadUserFrameFile(string? projectRoot, ref FramePresetDefinition frame)
@@ -148,16 +177,29 @@ internal sealed class PresetConfigLoader
 
         foreach (var (id, ov) in options.AuditTypeOverrides)
         {
-            if (!auditTypes.TryGetValue(id, out var existing))
+            var definition = new AuditTypePresetDefinition
             {
-                existing = new AuditTypePresetDefinition { Id = id, DisplayName = id };
-                auditTypes[id] = existing;
-            }
-            if (!string.IsNullOrWhiteSpace(ov.DisplayName))
-                existing.DisplayName = ov.DisplayName;
-            if (ov.ReviewFocus is not null)
-                existing.ReviewFocus = ov.ReviewFocus;
-            ValidateAuditType($"Audit.AuditTypes[{id}]", existing);
+                Id = id,
+                DisplayName = ov.DisplayName,
+                ReviewFocus = ov.ReviewFocus ?? string.Empty,
+                Replace = ov.Replace,
+                Auditors = ov.Auditors.Select(a => new AuditorDefinition
+                {
+                    Name = a.Name,
+                    Argv = [.. a.Argv],
+                    Script = a.Script,
+                    ToolName = a.ToolName,
+                    TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                }).ToList(),
+                Patterns = ov.Patterns.Select(p => new DiffPatternDefinition
+                {
+                    Regex = p.Regex,
+                    Description = p.Description,
+                    Severity = p.Severity,
+                }).ToList(),
+            };
+            ValidateAuditType($"Audit.AuditTypes[{id}]", definition);
+            ComposeAuditType(auditTypes, definition);
         }
 
         if (options.LlmPromptFrameTemplate is not null)
@@ -300,7 +342,25 @@ internal sealed class PresetConfigLoader
                 }
                 break;
             case "audit-type":
-                ValidateObjectProperties(source, "/", instance, ["id", "displayName", "llmAuditorName", "reviewFocus"]);
+                ValidateObjectProperties(source, "/", instance, ["id", "displayName", "replace", "llmAuditorName", "reviewFocus", "auditors", "patterns"]);
+                if (instance.TryGetProperty("auditors", out var auditorsAt) && auditorsAt.ValueKind == JsonValueKind.Array)
+                {
+                    for (var i = 0; i < auditorsAt.GetArrayLength(); i++)
+                    {
+                        var auditor = auditorsAt[i];
+                        if (auditor.ValueKind == JsonValueKind.Object)
+                            ValidateObjectProperties(source, $"/auditors/{i}", auditor, ["name", "argv", "script", "toolName", "treatExit127AsMissingTool"]);
+                    }
+                }
+                if (instance.TryGetProperty("patterns", out var patterns) && patterns.ValueKind == JsonValueKind.Array)
+                {
+                    for (var i = 0; i < patterns.GetArrayLength(); i++)
+                    {
+                        var pattern = patterns[i];
+                        if (pattern.ValueKind == JsonValueKind.Object)
+                            ValidateObjectProperties(source, $"/patterns/{i}", pattern, ["regex", "description", "severity"]);
+                    }
+                }
                 break;
             case "frame":
                 ValidateObjectProperties(source, "/", instance, ["frame"]);
@@ -422,8 +482,28 @@ internal sealed class PresetConfigLoader
     {
         if (string.IsNullOrWhiteSpace(definition.Id))
             throw new PresetConfigurationException($"{source}: /id is required.");
-        if (string.IsNullOrWhiteSpace(definition.ReviewFocus))
-            throw new PresetConfigurationException($"{source}: /reviewFocus is required.");
+
+        for (var i = 0; i < definition.Auditors.Count; i++)
+            ValidateAuditor(source, $"/auditors/{i}", definition.Auditors[i]);
+
+        for (var i = 0; i < definition.Patterns.Count; i++)
+        {
+            var pattern = definition.Patterns[i];
+            var pointer = $"/patterns/{i}";
+            if (string.IsNullOrWhiteSpace(pattern.Regex))
+                throw new PresetConfigurationException($"{source}: {pointer}/regex is required.");
+            if (string.IsNullOrWhiteSpace(pattern.Description))
+                throw new PresetConfigurationException($"{source}: {pointer}/description is required.");
+
+            try
+            {
+                _ = new Regex(pattern.Regex);
+            }
+            catch (ArgumentException ex)
+            {
+                throw new PresetConfigurationException($"{source}: {pointer}/regex '{pattern.Regex}' is not a valid regex: {ex.Message}", ex);
+            }
+        }
     }
 
     private static void ValidateFrame(string source, string? frame)
@@ -559,6 +639,16 @@ internal sealed class AuditTypePresetDefinition
     public string? DisplayName { get; set; }
     public string ReviewFocus { get; set; } = string.Empty;
     public string? LlmAuditorName { get; set; }
+    public bool Replace { get; set; }
+    public List<AuditorDefinition> Auditors { get; set; } = [];
+    public List<DiffPatternDefinition> Patterns { get; set; } = [];
+}
+
+internal sealed class DiffPatternDefinition
+{
+    public string Regex { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public string? Severity { get; set; }
 }
 
 internal sealed class FramePresetDefinition
