@@ -19,6 +19,15 @@ namespace CodeyBox.Orchestrator;
 /// permission is granted. On Multipass (separate VM), the agent PID is not
 /// visible from the host and <see cref="TryRead"/> returns <c>null</c>.</para>
 ///
+/// <para><b>Ancestor filter</b>: only processes whose parent chain reaches
+/// the orchestrator's own PID are counted. This avoids false-positives from
+/// host-side <c>claude</c>/<c>codex</c>/<c>gemini</c> CLIs that the operator
+/// runs interactively (e.g. Claude Code on a developer workstation), which
+/// would otherwise be matched as "the agent" and cause spurious stuck-detection
+/// when the operator's CLI is idle. On Multipass the agent isn't a host child
+/// at all, so the filter rejects everything and the probe is correctly
+/// disabled (matching the comment above).</para>
+///
 /// <para>In multi-worker deployments where several agents run concurrently,
 /// this source aggregates stats across all matching processes. A non-zero
 /// CPU delta from any one of them counts as "active", which is conservative:
@@ -32,11 +41,18 @@ internal sealed class ProcFsAgentActivitySource : IAgentActivitySource
         "claude", "codex", "gemini", "copilot",
     ];
 
+    // Cap on parent-chain walks. Sandbox process trees are very shallow
+    // (orchestrator → bwrap/multipass-exec → agent), but a malformed /proc
+    // (PPID cycle, etc.) could otherwise loop forever. 32 is well past any
+    // realistic depth.
+    private const int MaxAncestorWalk = 32;
+
     public ActivitySample? TryRead()
     {
         if (!OperatingSystem.IsLinux())
             return null;
 
+        var orchestratorPid = Environment.ProcessId;
         long totalCpuTicks = 0;
         int totalSockets = 0;
         bool found = false;
@@ -55,12 +71,15 @@ internal sealed class ProcFsAgentActivitySource : IAgentActivitySource
                 if (!Array.Exists(AgentComms, n => string.Equals(n, comm, StringComparison.OrdinalIgnoreCase)))
                     continue;
 
-                // Read CPU ticks
+                // Read CPU ticks (and PPID for the ancestor filter).
                 string stat;
                 try { stat = File.ReadAllText(Path.Combine(procDir, "stat")); }
                 catch { continue; }
 
-                if (!TryParseCpuTicks(stat, out var cpuTicks))
+                if (!TryParseStat(stat, out var cpuTicks, out _))
+                    continue;
+
+                if (!IsDescendantOf(pid, orchestratorPid))
                     continue;
 
                 totalCpuTicks += cpuTicks;
@@ -79,24 +98,52 @@ internal sealed class ProcFsAgentActivitySource : IAgentActivitySource
     }
 
     /// <summary>
-    /// Parses utime+stime from /proc/&lt;pid&gt;/stat. The comm field can
-    /// contain spaces and parentheses, so we anchor at the last ')' to find
-    /// the start of the fixed-layout suffix.
+    /// Walks the parent-pid chain from <paramref name="pid"/> up to PID 1.
+    /// Returns true if <paramref name="ancestorPid"/> appears in that chain
+    /// (or equals <paramref name="pid"/>). Capped at <see cref="MaxAncestorWalk"/>
+    /// hops as a defensive measure.
+    /// </summary>
+    private static bool IsDescendantOf(int pid, int ancestorPid)
+    {
+        var current = pid;
+        for (var i = 0; i < MaxAncestorWalk; i++)
+        {
+            if (current == ancestorPid)
+                return true;
+            if (current <= 1)
+                return false;
+
+            string stat;
+            try { stat = File.ReadAllText($"/proc/{current}/stat"); }
+            catch { return false; }
+
+            if (!TryParseStat(stat, out _, out var ppid))
+                return false;
+            if (ppid == current)
+                return false; // shouldn't happen, but break the loop just in case
+            current = ppid;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Parses ppid + utime+stime from /proc/&lt;pid&gt;/stat. The comm field
+    /// can contain spaces and parentheses, so we anchor at the last ')' to
+    /// find the start of the fixed-layout suffix.
     /// Fields after ')': state ppid pgrp session tty_nr tpgid flags
     ///   minflt cminflt majflt cmajflt utime stime ...
-    /// utime is at offset 11 and stime at offset 12 (0-based) in the suffix.
+    /// ppid is at offset 1; utime at 11; stime at 12 (0-based) in the suffix.
     /// </summary>
-    private static bool TryParseCpuTicks(string stat, out long ticks)
+    private static bool TryParseStat(string stat, out long ticks, out int ppid)
     {
         ticks = 0;
+        ppid = 0;
         var close = stat.LastIndexOf(')');
         if (close < 0) return false;
 
         var parts = stat[(close + 1)..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        // parts[0]=state, [1]=ppid, [2]=pgrp, [3]=session, [4]=tty_nr,
-        // [5]=tpgid, [6]=flags, [7]=minflt, [8]=cminflt, [9]=majflt,
-        // [10]=cmajflt, [11]=utime, [12]=stime
         if (parts.Length < 13) return false;
+        if (!int.TryParse(parts[1], out ppid)) return false;
         if (!long.TryParse(parts[11], out var utime)) return false;
         if (!long.TryParse(parts[12], out var stime)) return false;
         ticks = utime + stime;
