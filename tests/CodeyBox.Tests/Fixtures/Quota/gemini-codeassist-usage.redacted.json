@@ -1,0 +1,22 @@
+{
+  "buckets": [
+    {
+      "resetTime": "2026-05-10T20:30:16Z",
+      "tokenType": "REQUESTS",
+      "modelId": "gemini-2.5-flash",
+      "remainingFraction": 1
+    },
+    {
+      "resetTime": "2026-05-10T20:30:16Z",
+      "tokenType": "REQUESTS",
+      "modelId": "gemini-2.5-flash-lite",
+      "remainingFraction": 0.42
+    },
+    {
+      "resetTime": "2026-05-10T20:30:16Z",
+      "tokenType": "REQUESTS",
+      "modelId": "gemini-2.5-pro",
+      "remainingFraction": 0.05
+    }
+  ]
+}

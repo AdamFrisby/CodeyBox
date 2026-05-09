@@ -65,7 +65,8 @@ public sealed class LlmReviewAuditor : IAuditor
                 Description: agentResult.Stderr ?? agentResult.Summary)],
                 RawOutput: rawOutput,
                 AgentStderr: agentResult.Stderr,
-                AgentSummary: agentResult.Summary);
+                AgentSummary: agentResult.Summary,
+                AgentStdout: agentResult.Stdout);
         }
 
         // Read the JSON result file from the sandbox.

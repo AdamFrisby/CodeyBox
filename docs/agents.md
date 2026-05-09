@@ -107,12 +107,23 @@ specific Gemini model:
 ```
 When `ModelId` is omitted the CLI uses its own default.
 
-**Quota probe:** no Gemini usage endpoint is currently registered. Register
-Gemini as `PayPerApi` in agent-class config so the orchestrator never gates on
-it:
+**Quota probe:** `GeminiQuotaProbe` queries the Code Assist endpoint
+`POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` using
+the OAuth `access_token` from `~/.gemini/oauth_creds.json` (refreshed by
+running `gemini` once). Per-bucket `remainingFraction` values are clamped to
+0-100% and aggregated by min (most-restrictive bucket wins). `Subscription`
+billing is supported; for plain API-key billing use `PayPerApi`:
 ```json
 { "Agent": "gemini", "Billing": "PayPerApi", "ModelId": "gemini-2.5-pro" }
 ```
+
+**Reasoning level:** Gemini CLI 0.40+ has no `--thinking` / `--reasoning` /
+`--effort` flag. The thinking budget is encoded in the model preset:
+`gemini-3-*-preview` (e.g. `gemini-3-flash-preview`, `gemini-3-pro-preview`)
+extends `chat-base-3` which sets `thinkingLevel: HIGH`; `gemini-2.5-*` uses
+the default budget. To get "max reasoning", pick a `gemini-3-*-preview`
+model id — `ReasoningMode: "high"` on the agent-class member is informational
+only for Gemini and does not change the invocation.
 
 **Vertex AI / service-account auth:** the Gemini CLI also accepts Application
 Default Credentials (ADC). If you prefer service-account auth over an API key,

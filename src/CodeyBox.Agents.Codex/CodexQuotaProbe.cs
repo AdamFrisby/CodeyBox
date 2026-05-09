@@ -135,6 +135,29 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
             var overall = TryParseRateLimit(root.TryGetProperty("rate_limit", out var rateLimit) ? rateLimit : root);
             var perModel = ParsePerModel(root);
 
+            // Cap per-model availability by the overall account quota. The
+            // WHAM endpoint exposes a per-model bucket alongside an overall
+            // bucket; even when the per-model bucket reports plenty of room,
+            // the account-wide rate_limit can deny calls (allowed=false /
+            // limit_reached=true). Per-model must respect the overall cap.
+            if (overall is not null && perModel.Count > 0)
+            {
+                var capPct = overall.AvailablePct;
+                foreach (var key in perModel.Keys.ToList())
+                {
+                    var v = perModel[key];
+                    if (v.AvailablePct > capPct)
+                    {
+                        perModel[key] = new ModelQuota
+                        {
+                            AvailablePct = capPct,
+                            ResetAt = overall.ResetAt ?? v.ResetAt,
+                            Window = $"{v.Window} (capped by overall)",
+                        };
+                    }
+                }
+            }
+
             if (overall is not null || perModel.Count > 0)
                 return new AgentQuotaSnapshot
                 {
@@ -212,16 +235,38 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
 
     private static ModelQuota? TryParseWindow(JsonElement el, string window)
     {
+        // Explicit deny flags trump used_percent. The WHAM endpoint sets
+        // `allowed: false` / `limit_reached: true` when a window is exhausted.
+        var explicitDeny = (TryGetBoolProperty(el, "allowed", out var allowed) && !allowed)
+                        || (TryGetBoolProperty(el, "limit_reached", out var lim) && lim);
+
         if (!TryGetDoubleProperty(el, "used_percent", out var usedPct) &&
             !TryGetDoubleProperty(el, "usedPercent", out usedPct))
+        {
+            // No used_percent — but if a deny flag is set, still report 0%.
+            if (explicitDeny)
+                return new ModelQuota { AvailablePct = 0, ResetAt = TryGetResetAt(el), Window = window };
             return null;
+        }
 
+        var pct = Math.Clamp(100.0 - usedPct, 0.0, 100.0);
+        if (explicitDeny) pct = 0;
         return new ModelQuota
         {
-            AvailablePct = Math.Clamp(100.0 - usedPct, 0.0, 100.0),
+            AvailablePct = pct,
             ResetAt = TryGetResetAt(el),
             Window = window,
         };
+    }
+
+    private static bool TryGetBoolProperty(JsonElement el, string name, out bool value)
+    {
+        value = false;
+        if (el.ValueKind != JsonValueKind.Object || !el.TryGetProperty(name, out var prop))
+            return false;
+        if (prop.ValueKind == JsonValueKind.True) { value = true; return true; }
+        if (prop.ValueKind == JsonValueKind.False) { value = false; return true; }
+        return false;
     }
 
     private static JsonElement? TryGetProperty(JsonElement el, string name) =>

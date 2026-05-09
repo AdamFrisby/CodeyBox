@@ -129,6 +129,24 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         return new string(buffer, 0, totalRead);
     }
 
+    // Claude's OAuth usage endpoint returns a flat object with named buckets
+    // like `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`.
+    // Each bucket has `utilization` (0-100, where 100 means capped) and
+    // `resets_at`. Global buckets (no `_<model>` suffix beyond the window
+    // name) constrain ALL models; `_<model>` suffixes constrain only that
+    // family. Effective availability is min(global) globally, and
+    // min(global, model-specific) per model.
+    private static readonly string[] GlobalBuckets = ["five_hour", "seven_day"];
+
+    // Maps a model bucket suffix to model-id substrings it constrains.
+    // E.g. `seven_day_opus` constrains any model id containing "opus".
+    private static readonly (string Suffix, string ModelMatch)[] ModelSuffixes =
+    [
+        ("seven_day_opus", "opus"),
+        ("seven_day_sonnet", "sonnet"),
+        ("seven_day_haiku", "haiku"),
+    ];
+
     internal static AgentQuotaSnapshot ParseResponse(string json)
     {
         try
@@ -136,8 +154,25 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
+            // Try the new flat-bucket shape first.
+            var flat = TryParseFlatShape(root);
+            if (flat is not null) return flat;
+
+            // Fallback: the older `rate_limit` + `additional_rate_limits` shape
+            // (kept for backwards compatibility / future-proofing).
             var overall = TryParseRateLimit(root.TryGetProperty("rate_limit", out var rateLimit) ? rateLimit : root);
             var perModel = ParsePerModel(root);
+
+            if (overall is not null && perModel.Count > 0)
+            {
+                var capPct = overall.AvailablePct;
+                foreach (var key in perModel.Keys.ToList())
+                {
+                    var v = perModel[key];
+                    if (v.AvailablePct > capPct)
+                        perModel[key] = new ModelQuota { AvailablePct = capPct, ResetAt = overall.ResetAt ?? v.ResetAt, Window = $"{v.Window} (capped by overall)" };
+                }
+            }
 
             if (overall is not null || perModel.Count > 0)
                 return new AgentQuotaSnapshot
@@ -154,6 +189,87 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         {
             return Unknown("invalid JSON");
         }
+    }
+
+    private static AgentQuotaSnapshot? TryParseFlatShape(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return null;
+
+        // Detect flat shape: at least one global bucket present with `utilization`.
+        ModelQuota? overall = null;
+        var allBuckets = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
+        foreach (var bucket in GlobalBuckets)
+        {
+            if (!root.TryGetProperty(bucket, out var el) || el.ValueKind != JsonValueKind.Object) continue;
+            var quota = ParseFlatBucket(el, bucket);
+            if (quota is null) continue;
+            allBuckets[bucket] = quota;
+            if (overall is null || quota.AvailablePct < overall.AvailablePct)
+                overall = quota with { Window = bucket };
+        }
+
+        if (overall is null) return null; // not the flat shape
+
+        // Collect model-specific buckets.
+        var modelBuckets = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (suffix, _) in ModelSuffixes)
+        {
+            if (!root.TryGetProperty(suffix, out var el) || el.ValueKind != JsonValueKind.Object) continue;
+            var quota = ParseFlatBucket(el, suffix);
+            if (quota is not null)
+                modelBuckets[suffix] = quota;
+        }
+
+        // Build per-model dict: every model_id matched by a suffix gets
+        // min(overall, model-specific). Keep the suffix as a synthetic key
+        // too so callers that route by suffix still work.
+        var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (suffix, _) in ModelSuffixes)
+        {
+            if (!modelBuckets.TryGetValue(suffix, out var bucket)) continue;
+            var capped = bucket.AvailablePct < overall.AvailablePct
+                ? bucket with { Window = suffix }
+                : new ModelQuota { AvailablePct = overall.AvailablePct, ResetAt = overall.ResetAt ?? bucket.ResetAt, Window = $"{suffix} (capped by overall)" };
+            perModel[suffix] = capped;
+        }
+
+        // Map any client-known model ids by substring match.
+        var configuredModels = new[] { "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5" };
+        foreach (var modelId in configuredModels)
+        {
+            ModelQuota? best = overall; // default to global cap
+            foreach (var (suffix, modelMatch) in ModelSuffixes)
+            {
+                if (!modelId.Contains(modelMatch, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!modelBuckets.TryGetValue(suffix, out var modelBucket)) continue;
+                var effective = modelBucket.AvailablePct < overall.AvailablePct
+                    ? modelBucket
+                    : overall;
+                if (best is null || effective.AvailablePct < best.AvailablePct)
+                    best = effective with { Window = suffix };
+            }
+            if (best is not null)
+                perModel[modelId] = best;
+        }
+
+        return new AgentQuotaSnapshot
+        {
+            AvailablePct = overall.AvailablePct,
+            ResetAt = overall.ResetAt,
+            Notes = null,
+            PerModel = perModel,
+        };
+    }
+
+    private static ModelQuota? ParseFlatBucket(JsonElement el, string window)
+    {
+        if (!TryGetDoubleProperty(el, "utilization", out var utilPct)) return null;
+        return new ModelQuota
+        {
+            AvailablePct = ClampAvailable(100.0 - utilPct),
+            ResetAt = TryGetResetAt(el),
+            Window = window,
+        };
     }
 
     private static Dictionary<string, ModelQuota> ParsePerModel(JsonElement root)
@@ -230,15 +346,21 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
 
     private static ModelQuota? TryParseWindow(JsonElement el, string window)
     {
+        // Explicit deny flags trump usage percentages.
+        var explicitDeny = (TryGetBoolProperty(el, "allowed", out var allowed) && !allowed)
+                        || (TryGetBoolProperty(el, "limit_reached", out var lim) && lim);
+
         if (!TryGetDoubleProperty(el, "used_percent", out var usedPct) &&
             !TryGetDoubleProperty(el, "usedPercent", out usedPct))
         {
             if (TryGetDoubleProperty(el, "available_percent", out var availablePct) ||
                 TryGetDoubleProperty(el, "availablePercent", out availablePct))
             {
+                var pct = ClampAvailable(availablePct);
+                if (explicitDeny) pct = 0;
                 return new ModelQuota
                 {
-                    AvailablePct = ClampAvailable(availablePct),
+                    AvailablePct = pct,
                     ResetAt = TryGetResetAt(el),
                     Window = window,
                 };
@@ -248,23 +370,39 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
                 TryGetDoubleProperty(el, "limit", out var limit) &&
                 limit > 0)
             {
+                var pct = ClampAvailable(100.0 * (1.0 - used / limit));
+                if (explicitDeny) pct = 0;
                 return new ModelQuota
                 {
-                    AvailablePct = ClampAvailable(100.0 * (1.0 - used / limit)),
+                    AvailablePct = pct,
                     ResetAt = TryGetResetAt(el),
                     Window = window,
                 };
             }
 
+            if (explicitDeny)
+                return new ModelQuota { AvailablePct = 0, ResetAt = TryGetResetAt(el), Window = window };
             return null;
         }
 
+        var availPct = ClampAvailable(100.0 - usedPct);
+        if (explicitDeny) availPct = 0;
         return new ModelQuota
         {
-            AvailablePct = ClampAvailable(100.0 - usedPct),
+            AvailablePct = availPct,
             ResetAt = TryGetResetAt(el),
             Window = window,
         };
+    }
+
+    private static bool TryGetBoolProperty(JsonElement el, string name, out bool value)
+    {
+        value = false;
+        if (el.ValueKind != JsonValueKind.Object || !el.TryGetProperty(name, out var prop))
+            return false;
+        if (prop.ValueKind == JsonValueKind.True) { value = true; return true; }
+        if (prop.ValueKind == JsonValueKind.False) { value = false; return true; }
+        return false;
     }
 
     private static JsonElement? TryGetProperty(JsonElement el, string name) =>
@@ -302,6 +440,8 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         {
             if (el.TryGetProperty("reset_at", out var snake))
                 return TryGetResetAt(snake);
+            if (el.TryGetProperty("resets_at", out var snakeS))
+                return TryGetResetAt(snakeS);
             if (el.TryGetProperty("resetAt", out var camel))
                 return TryGetResetAt(camel);
         }

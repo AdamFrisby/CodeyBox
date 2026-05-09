@@ -626,8 +626,21 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CodexQuotaProbe>());
 });
-// No GeminiQuotaProbe: Gemini uses PayPerApi billing (no subscription quota endpoint).
-// The router treats a missing probe as unlimited — intentional. See docs/agents.md.
+// Gemini OAuth-subscription path (Code Assist Individual / AI Pro / AI Ultra).
+// API-key (PayPerApi) and Vertex paths have no analogous endpoint and stay
+// PayPerApi members in the agent class config — for those the router treats
+// a missing probe result as unlimited.
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
+    return new GeminiQuotaProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        () => new AgentQuotaCredentials(
+            ReadGeminiQuotaToken(credentialLog) ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")),
+        sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
+        loggerFactory.CreateLogger<GeminiQuotaProbe>());
+});
 
 // --- Agent class router ------------------------------------------------------
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
@@ -1253,6 +1266,40 @@ static string? ReadClaudeQuotaToken(ILogger log)
         return null;
     }
 
+    return null;
+}
+
+static string? ReadGeminiQuotaToken(ILogger log)
+{
+    // Gemini CLI's OAuth credentials live at ~/.gemini/oauth_creds.json
+    // (the file fallback path; the CLI also supports a keychain-backed
+    // store on first migration, but the file remains for compatibility).
+    var path = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".gemini",
+        "oauth_creds.json");
+    if (!File.Exists(path))
+        return null;
+
+    try
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        if (doc.RootElement.TryGetProperty("access_token", out var token) &&
+            token.ValueKind == JsonValueKind.String)
+            return token.GetString();
+    }
+    catch (JsonException ex)
+    {
+        log.LogWarning(ex, "Gemini quota auth file '{Path}' is malformed; falling back to environment token if configured", path);
+    }
+    catch (IOException ex)
+    {
+        log.LogWarning(ex, "Gemini quota auth file '{Path}' could not be read; falling back to environment token if configured", path);
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        log.LogWarning(ex, "Gemini quota auth file '{Path}' is not readable; falling back to environment token if configured", path);
+    }
     return null;
 }
 
