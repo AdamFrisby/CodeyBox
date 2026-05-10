@@ -52,12 +52,25 @@ internal sealed class PresetConfigLoader
         {
             LoadUserLanguageFiles(projectRoot, languages);
             LoadUserAuditTypeFiles(projectRoot, auditTypes);
+            LoadUserFrameFile(projectRoot, ref frame);
         }
 
         ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
         ValidateFrame("llm-prompt-frame.yaml", frame.Frame);
 
         return new PresetConfigSnapshot(languages, auditTypes, frame.Frame);
+    }
+
+    private static void LoadUserFrameFile(string? projectRoot, ref FramePresetDefinition frame)
+    {
+        if (string.IsNullOrWhiteSpace(projectRoot)) return;
+        var path = Path.Combine(projectRoot, "codeybox", "llm-prompt-frame.yaml");
+        if (File.Exists(path))
+        {
+            var userFrame = ReadYamlFile<FramePresetDefinition>(path, "frame");
+            ValidateFrame(path, userFrame.Frame);
+            frame = userFrame;
+        }
     }
 
     private static Dictionary<string, LanguagePresetDefinition> LoadEmbeddedLanguages(Assembly assembly)
@@ -533,23 +546,39 @@ internal sealed class PresetConfigLoader
 
     private static string BuildMarkerScript(IReadOnlyList<string> globs)
     {
-        var names = globs
-            .Select(GlobToFindName)
-            .Where(n => !string.IsNullOrWhiteSpace(n))
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-        if (names.Count == 0)
+        var expressions = new List<string>();
+        foreach (var glob in globs)
+        {
+            if (string.IsNullOrWhiteSpace(glob)) continue;
+
+            var escaped = glob.Replace("'", "'\\''", StringComparison.Ordinal);
+            if (glob.StartsWith("**/", StringComparison.Ordinal))
+            {
+                var name = glob[3..];
+                if (!name.Contains('/') && !name.Contains('[', StringComparison.Ordinal) && !name.Contains('*', StringComparison.Ordinal))
+                {
+                    // Pure filename search
+                    expressions.Add($"-name '{name.Replace("'", "'\\''", StringComparison.Ordinal)}'");
+                }
+                else
+                {
+                    // Path-based glob search
+                    expressions.Add($"-path './{escaped}'");
+                }
+            }
+            else
+            {
+                // Explicit path search
+                var path = glob.StartsWith("./", StringComparison.Ordinal) ? escaped : "./" + escaped;
+                expressions.Add($"-path '{path}'");
+            }
+        }
+
+        if (expressions.Count == 0)
             throw new PresetConfigurationException("marker.globs must include at least one file-name glob such as '**/*.csproj' or '**/mix.exs'.");
 
-        var expression = string.Join(" -o ", names.Select(n => $"-name '{n.Replace("'", "'\\''", StringComparison.Ordinal)}'"));
-        return $"find . -maxdepth 4 \\( {expression} \\) -print | sed 's#[^/]*$##; s#/$##; s#^$#.#' | sort -u";
-    }
-
-    private static string GlobToFindName(string glob)
-    {
-        var slash = glob.LastIndexOf('/');
-        var name = slash >= 0 ? glob[(slash + 1)..] : glob;
-        return name == "**" || name.Contains('[', StringComparison.Ordinal) ? string.Empty : name;
+        var joined = string.Join(" -o ", expressions);
+        return $"find . -maxdepth 4 \\( {joined} \\) -print | sed 's#[^/]*$##; s#/$##; s#^$#.#' | sort -u";
     }
 }
 

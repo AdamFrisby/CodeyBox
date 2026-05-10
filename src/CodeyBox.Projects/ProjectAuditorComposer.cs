@@ -158,6 +158,7 @@ public sealed class ProjectAuditorComposer
                 {
                     Regex = new Regex(p.Regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeout: TimeSpan.FromSeconds(5)),
                     Description = p.Description,
+                    Severity = AuditSeverityParser.Parse(p.Severity),
                 }).ToList(),
             }),
             "llm" => new LlmReviewAuditor(new LlmReviewAuditorOptions

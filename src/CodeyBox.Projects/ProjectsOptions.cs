@@ -238,4 +238,5 @@ public sealed class DiffPatternConfig
 {
     public string? Description { get; set; }
     public string? Regex { get; set; }
+    public string? Severity { get; set; }
 }

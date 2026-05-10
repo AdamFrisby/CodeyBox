@@ -108,6 +108,7 @@ public sealed class ProjectRepository : IProjectRepository
                 {
                     Regex = p.Regex,
                     Description = p.Description,
+                    Severity = p.Severity,
                 }).ToList(),
             };
         }
@@ -348,6 +349,7 @@ public sealed class ProjectRepository : IProjectRepository
             {
                 Description = p.Description ?? "(no description)",
                 Regex = p.Regex ?? string.Empty,
+                Severity = p.Severity,
             }).ToList(),
         };
 
@@ -380,13 +382,6 @@ public sealed class ProjectRepository : IProjectRepository
             MaxConcurrentForProject = ValidateCap(c.MaxConcurrentForProject, nameof(c.MaxConcurrentForProject)),
         };
     }
-
-    private static AuditSeverity ParseSeverity(string? s) => s?.ToLowerInvariant() switch
-    {
-        "info" => AuditSeverity.Info,
-        "warning" or "warn" => AuditSeverity.Warning,
-        _ => AuditSeverity.Error,
-    };
 
     private static ProjectReleaseConfig ResolveReleaseConfig(ProjectReleaseConfigOptions? c)
     {
@@ -421,6 +416,7 @@ public sealed class ProjectRepository : IProjectRepository
             {
                 Description = p.Description ?? "(no description)",
                 Regex = p.Regex ?? throw new InvalidOperationException($"Pattern in '{c.Name}' missing 'Regex'"),
+                Severity = p.Severity,
             }).ToList(),
         };
     }

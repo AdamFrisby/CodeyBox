@@ -429,6 +429,7 @@ public sealed record DiffPatternDescriptor
 {
     public required string Description { get; init; }
     public required string Regex { get; init; }
+    public string? Severity { get; init; }
 }
 
 /// <summary>

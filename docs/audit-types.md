@@ -33,7 +33,12 @@ All audit types, including built-ins such as `security`, `completeness`, `cheati
 
 ## Composition and Overrides
 
-For an existing audit type, a YAML file with the same `id` appends auditors and patterns by default, and replaces the `reviewFocus` if supplied. Set `replace: true` to replace the entire definition.
+For an existing audit type, a YAML file with the same `id` appends auditors and patterns by default, and replaces the `reviewFocus` if supplied (only in trusted configuration). Set `replace: true` to replace the entire definition.
+
+**Security Restriction**: Repository-provided configuration (`codeybox/audit-types/*.yaml`) is considered untrusted. For security reasons, the following fields are NOT allowed in repository files:
+- `/llmAuditorName`: Only built-in or plugin-provided names are allowed.
+- `/reviewFocus`: LLM prompt tuning is restricted to trusted project configuration (`appsettings.json`) to prevent prompt-injection attacks from untrusted repositories.
+- `/auditors/[]/script`: Use `/auditors/[]/argv` instead.
 
 Per-project appsettings can tune audit voices with `Audit.AuditTypes.<id>.ReviewFocus`. You can also override auditors and patterns from appsettings:
 

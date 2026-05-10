@@ -48,7 +48,13 @@ auditors:
 
 ## Trust Boundary
 
-Language presets can define shell commands. The orchestrator reads repository-owned `codeybox/languages` when the project repository is available as a local `file://` worktree/path at startup or composition time, then validates the resulting catalog before expanding auditors. Appsettings overrides remain the operator-controlled layer and win over repository files.
+Language presets can define shell commands. The orchestrator reads repository-owned `codeybox/languages` when the project repository is available as a local `file://` worktree/path at startup or composition time, then validates the resulting catalog before expanding auditors.
+
+**Security Restriction**: Repository-provided configuration (`codeybox/languages/*.yaml`) is considered untrusted. For security reasons, the following fields are NOT allowed in repository files:
+- `/marker/script`: Use `/marker/globs` instead.
+- `/auditors/[]/script`: Use `/auditors/[]/argv` instead.
+
+Appsettings overrides remain the operator-controlled layer and win over repository files. Operator-controlled configuration (trusted) does NOT have these restrictions.
 
 ## Validation
 
