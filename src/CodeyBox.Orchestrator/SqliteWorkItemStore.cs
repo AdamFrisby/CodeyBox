@@ -96,6 +96,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Default 95 preserves existing semantics (frontier-adjacent fallback allowed).
         RunMigration("ALTER TABLE work_items ADD COLUMN min_model_score INTEGER NOT NULL DEFAULT 95;");
 
+        // Additive migration: capture failure details for auto-retry logic.
+        RunMigration("ALTER TABLE work_items ADD COLUMN failure_kind TEXT;");
+        RunMigration("ALTER TABLE work_items ADD COLUMN quota_reset_at TEXT;");
+        RunMigration("ALTER TABLE work_items ADD COLUMN next_quota_retry_at TEXT;");
+        RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
+
         // Composite indexes for fleet summary aggregation queries.
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_state ON work_items(project_id, state);");
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_updated ON work_items(project_id, updated_at);");
@@ -145,10 +151,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                     stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
-                    min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint)
+                    min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
+                    failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                     $sretries, $started_at, $external_id, $replay_of, $merge_sha,
-                    $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint);
+                    $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
+                    $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -186,7 +194,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     recovery_attempts = $recovery_attempts,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
-                    preempt_checkpoint = $preempt_checkpoint
+                    preempt_checkpoint = $preempt_checkpoint,
+                    failure_kind = $failure_kind,
+                    quota_reset_at = $quota_reset_at,
+                    next_quota_retry_at = $next_quota_retry_at,
+                    quota_retry_attempts = $quota_retry_attempts
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -497,6 +509,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$release_id", (object?)item.ReleaseId?.ToString() ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preempted_at", (object?)item.PreemptedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preempt_checkpoint", (object?)item.PreemptCheckpoint ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$failure_kind", (object?)item.FailureKind ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$quota_reset_at", (object?)item.QuotaResetAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$next_quota_retry_at", (object?)item.NextQuotaRetryAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -530,6 +546,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         ReleaseId = ReadNullableReleaseId(r, "release_id"),
         PreemptedAt = ReadNullableDateTimeOffset(r, "preempted_at"),
         PreemptCheckpoint = r.IsDBNull(r.GetOrdinal("preempt_checkpoint")) ? null : r.GetString(r.GetOrdinal("preempt_checkpoint")),
+        FailureKind = r.IsDBNull(r.GetOrdinal("failure_kind")) ? null : r.GetString(r.GetOrdinal("failure_kind")),
+        QuotaResetAt = ReadNullableDateTimeOffset(r, "quota_reset_at"),
+        NextQuotaRetryAt = ReadNullableDateTimeOffset(r, "next_quota_retry_at"),
+        QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)

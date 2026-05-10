@@ -1204,7 +1204,11 @@ internal static class WorkItemEndpoints
             item.AgentClassId,
             MergeSha: item.MergeSha,
             MinModelScore: item.MinModelScore,
-            ReleaseId: item.ReleaseId?.ToString());
+            ReleaseId: item.ReleaseId?.ToString(),
+            FailureKind: item.FailureKind,
+            QuotaResetAt: item.QuotaResetAt,
+            NextQuotaRetryAt: item.NextQuotaRetryAt,
+            QuotaRetryAttempts: item.QuotaRetryAttempts);
     }
 
     private static ProjectDto ToProjectDto(Project p) => new(
@@ -1353,7 +1357,11 @@ public sealed record WorkItemDto(
     int? FinalAuditBlockingFindings = null,
     string? MergeSha = null,
     int MinModelScore = 95,
-    string? ReleaseId = null);
+    string? ReleaseId = null,
+    string? FailureKind = null,
+    DateTimeOffset? QuotaResetAt = null,
+    DateTimeOffset? NextQuotaRetryAt = null,
+    int QuotaRetryAttempts = 0);
 
 public sealed record ProjectDto(
     string Id,

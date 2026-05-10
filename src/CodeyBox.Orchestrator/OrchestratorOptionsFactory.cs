@@ -59,4 +59,45 @@ public static class OrchestratorOptionsFactory
             MinSpawnInterval = wp.MinSpawnInterval,
         };
     }
+
+    public static OrchestratorOptions Build(
+        int? legacyConcurrency,
+        WorkerPoolOptions workerPool,
+        bool autoRetryEnabled,
+        string autoRetryPeriodicInterval,
+        string autoRetryDriftMargin,
+        int autoRetryMaxRetries,
+        ILogger log)
+    {
+        var options = Build(legacyConcurrency, workerPool, log);
+
+        if (autoRetryEnabled)
+        {
+            if (!TimeSpan.TryParse(autoRetryPeriodicInterval, out TimeSpan periodic))
+                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval must be a valid TimeSpan (e.g. '01:00:00')");
+            if (periodic <= TimeSpan.Zero)
+                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval must be positive");
+
+            if (!TimeSpan.TryParse(autoRetryDriftMargin, out TimeSpan drift))
+                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:ClockDriftSafetyMargin must be a valid TimeSpan (e.g. '00:02:00')");
+            if (drift < TimeSpan.Zero)
+                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:ClockDriftSafetyMargin must be non-negative");
+
+            if (autoRetryMaxRetries < 0)
+                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem must be non-negative");
+
+            options = options with
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = periodic,
+                    ClockDriftSafetyMargin = drift,
+                    MaxAutoRetriesPerWorkItem = autoRetryMaxRetries,
+                }
+            };
+        }
+
+        return options;
+    }
 }

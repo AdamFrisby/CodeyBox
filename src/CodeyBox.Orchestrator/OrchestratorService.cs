@@ -826,6 +826,8 @@ public sealed record OrchestratorOptions
     /// </summary>
     public int MaxRecoveryAttempts { get; init; } = 3;
 
+    public AutoRetryOnQuotaFailureOptions AutoRetryOnQuotaFailure { get; init; } = new();
+
     /// <summary>
     /// Called by the dispatch loop immediately after the spawn timestamp is
     /// written, before <see cref="Task.Run"/>. Used by tests to capture the
@@ -844,6 +846,14 @@ public sealed record OrchestratorOptions
         get => MaxConcurrentWorkers;
         init => MaxConcurrentWorkers = value;
     }
+}
+
+public sealed record AutoRetryOnQuotaFailureOptions
+{
+    public bool Enabled { get; init; } = false;
+    public TimeSpan PeriodicCheckInterval { get; init; } = TimeSpan.FromHours(1);
+    public TimeSpan ClockDriftSafetyMargin { get; init; } = TimeSpan.FromMinutes(2);
+    public int MaxAutoRetriesPerWorkItem { get; init; } = 3;
 }
 
 /// <summary>Snapshot of worker pool state for the /workers/status endpoint.</summary>

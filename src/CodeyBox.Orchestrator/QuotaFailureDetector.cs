@@ -1,6 +1,9 @@
+using System.Text.RegularExpressions;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
+
+public sealed record QuotaDetection(QuotaFailureKind Kind, DateTimeOffset? ResetAt = null);
 
 public static class QuotaFailureDetector
 {
@@ -19,7 +22,9 @@ public static class QuotaFailureDetector
         ("API Error: 401", QuotaFailureKind.Unauthorized),
     ];
 
-    public static QuotaFailureKind? Detect(string? stderr, string? stdout = null)
+    private static readonly Regex ResetAfterRegex = new(@"reset after (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public static QuotaDetection? Detect(string? stderr, string? stdout = null)
     {
         // Some agents (e.g. codex CLI) emit quota errors to stdout as
         // structured JSON events, not stderr. Inspect both streams.
@@ -28,10 +33,28 @@ public static class QuotaFailureDetector
 
         foreach (var (pattern, kind) in Patterns)
         {
-            if (!string.IsNullOrEmpty(stderr) && stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-                return kind;
-            if (!string.IsNullOrEmpty(stdout) && stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-                return kind;
+            var inStderr = !string.IsNullOrEmpty(stderr) && stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase);
+            var inStdout = !string.IsNullOrEmpty(stdout) && stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase);
+
+            if (inStderr || inStdout)
+            {
+                DateTimeOffset? resetAt = null;
+                if (!string.IsNullOrEmpty(stderr))
+                {
+                    var match = ResetAfterRegex.Match(stderr);
+                    if (match.Success)
+                    {
+                        var h = match.Groups[1].Success ? int.Parse(match.Groups[1].Value) : 0;
+                        var m = match.Groups[2].Success ? int.Parse(match.Groups[2].Value) : 0;
+                        var s = match.Groups[3].Success ? int.Parse(match.Groups[3].Value) : 0;
+                        if (h > 0 || m > 0 || s > 0)
+                        {
+                            resetAt = DateTimeOffset.UtcNow.Add(new TimeSpan(h, m, s));
+                        }
+                    }
+                }
+                return new QuotaDetection(kind, resetAt);
+            }
         }
 
         return null;
@@ -55,14 +78,14 @@ public static class QuotaFailureDetector
         if (!string.Equals(summary?.Trim(), "agent exited 1", StringComparison.OrdinalIgnoreCase))
             return;
 
-        var kind = Detect(stderr, stdout);
-        if (kind is null)
+        var detection = Detect(stderr, stdout);
+        if (detection is null)
             return;
 
         if (projectId is { } scopedProject)
-            await store.RecordForProjectAsync(agent, modelId, scopedProject, kind.Value, observedAt, ct);
+            await store.RecordForProjectAsync(agent, modelId, scopedProject, detection.Kind, observedAt, ct);
         else
-            await store.RecordAsync(agent, modelId, kind.Value, observedAt, ct);
+            await store.RecordAsync(agent, modelId, detection.Kind, observedAt, ct);
 
         await store.PruneOlderThanAsync(observedAt - retention, ct);
     }
