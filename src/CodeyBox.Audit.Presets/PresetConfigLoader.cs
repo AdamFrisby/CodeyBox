@@ -19,8 +19,11 @@ internal sealed class PresetConfigLoader
     private const string ResourcePrefix = "CodeyBox.Audit.Presets.Defaults.";
     private static readonly IDeserializer Deserializer = new DeserializerBuilder()
         .WithNamingConvention(CamelCaseNamingConvention.Instance)
+        .WithDuplicateKeyChecking()
         .Build();
-    private static readonly IDeserializer RawDeserializer = new DeserializerBuilder().Build();
+    private static readonly IDeserializer RawDeserializer = new DeserializerBuilder()
+        .WithDuplicateKeyChecking()
+        .Build();
     private static readonly JsonSerializerOptions SchemaJsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -49,7 +52,6 @@ internal sealed class PresetConfigLoader
         {
             LoadUserLanguageFiles(projectRoot, languages);
             LoadUserAuditTypeFiles(projectRoot, auditTypes);
-            LoadUserFrameFile(projectRoot, ref frame);
         }
 
         ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
@@ -109,51 +111,12 @@ internal sealed class PresetConfigLoader
             var definition = ReadYamlFile<AuditTypePresetDefinition>(file, "audit-type");
             if (!string.IsNullOrWhiteSpace(definition.LlmAuditorName))
                 throw new PresetConfigurationException($"{file}: /llmAuditorName is not allowed in repository-provided configuration for security reasons.");
+            if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
+                throw new PresetConfigurationException($"{file}: /reviewFocus is not allowed in repository-provided configuration for security reasons.");
 
             ValidateAuditType(file, definition, isTrusted: false);
             ComposeAuditType(auditTypes, definition);
         }
-    }
-
-    private static void ComposeAuditType(
-        Dictionary<string, AuditTypePresetDefinition> auditTypes,
-        AuditTypePresetDefinition incoming)
-    {
-        if (!auditTypes.TryGetValue(incoming.Id, out var existing) || incoming.Replace)
-        {
-            if (incoming.Replace && existing is not null)
-            {
-                if (string.IsNullOrWhiteSpace(incoming.DisplayName))
-                    incoming.DisplayName = existing.DisplayName;
-                if (string.IsNullOrWhiteSpace(incoming.ReviewFocus))
-                    incoming.ReviewFocus = existing.ReviewFocus;
-            }
-            auditTypes[incoming.Id] = incoming;
-            return;
-        }
-
-        if (!string.IsNullOrWhiteSpace(incoming.DisplayName))
-            existing.DisplayName = incoming.DisplayName;
-        if (!string.IsNullOrWhiteSpace(incoming.ReviewFocus))
-            existing.ReviewFocus = incoming.ReviewFocus;
-        if (!string.IsNullOrWhiteSpace(incoming.LlmAuditorName))
-            existing.LlmAuditorName = incoming.LlmAuditorName;
-
-        existing.Auditors.AddRange(incoming.Auditors);
-        existing.Patterns.AddRange(incoming.Patterns);
-    }
-
-    private static void LoadUserFrameFile(string? projectRoot, ref FramePresetDefinition frame)
-    {
-        if (string.IsNullOrWhiteSpace(projectRoot))
-            return;
-
-        var path = Path.Combine(projectRoot, "codeybox", "llm-prompt-frame.yaml");
-        if (!File.Exists(path))
-            return;
-
-        frame = ReadYamlFile<FramePresetDefinition>(path, "frame");
-        ValidateFrame(path, frame.Frame);
     }
 
     private static void ApplyProjectConfigOverrides(
@@ -213,6 +176,34 @@ internal sealed class PresetConfigLoader
             frame = new FramePresetDefinition { Frame = options.LlmPromptFrameTemplate };
             ValidateFrame("Audit.LlmPromptFrame", frame.Frame);
         }
+    }
+
+    private static void ComposeAuditType(
+        Dictionary<string, AuditTypePresetDefinition> auditTypes,
+        AuditTypePresetDefinition incoming)
+    {
+        if (!auditTypes.TryGetValue(incoming.Id, out var existing) || incoming.Replace)
+        {
+            if (incoming.Replace && existing is not null)
+            {
+                if (string.IsNullOrWhiteSpace(incoming.DisplayName))
+                    incoming.DisplayName = existing.DisplayName;
+                if (string.IsNullOrWhiteSpace(incoming.ReviewFocus))
+                    incoming.ReviewFocus = existing.ReviewFocus;
+            }
+            auditTypes[incoming.Id] = incoming;
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(incoming.DisplayName))
+            existing.DisplayName = incoming.DisplayName;
+        if (!string.IsNullOrWhiteSpace(incoming.ReviewFocus))
+            existing.ReviewFocus = incoming.ReviewFocus;
+        if (!string.IsNullOrWhiteSpace(incoming.LlmAuditorName))
+            existing.LlmAuditorName = incoming.LlmAuditorName;
+
+        existing.Auditors.AddRange(incoming.Auditors);
+        existing.Patterns.AddRange(incoming.Patterns);
     }
 
     private static void ComposeLanguage(
@@ -281,7 +272,6 @@ internal sealed class PresetConfigLoader
     private static T ReadYamlText<T>(string yaml, string source, string schemaName)
     {
         var json = ReadYamlJson(yaml, source);
-        ValidateKnownProperties(schemaName, source, json);
         ValidateJsonSchema(typeof(PresetConfigLoader).Assembly, schemaName, source, json);
         return ReadYaml<T>(yaml, source);
     }
@@ -345,63 +335,6 @@ internal sealed class PresetConfigLoader
             {
                 CollectErrors(detail, errors);
             }
-        }
-    }
-
-    private static void ValidateKnownProperties(string schemaName, string source, JsonElement instance)
-    {
-        if (instance.ValueKind != JsonValueKind.Object)
-            return;
-
-        switch (schemaName)
-        {
-            case "language":
-                ValidateObjectProperties(source, "/", instance, ["id", "displayName", "replace", "marker", "auditors"]);
-                if (instance.TryGetProperty("marker", out var marker) && marker.ValueKind == JsonValueKind.Object)
-                    ValidateObjectProperties(source, "/marker", marker, ["globs", "script"]);
-                if (instance.TryGetProperty("auditors", out var auditors) && auditors.ValueKind == JsonValueKind.Array)
-                {
-                    for (var i = 0; i < auditors.GetArrayLength(); i++)
-                    {
-                        var auditor = auditors[i];
-                        if (auditor.ValueKind == JsonValueKind.Object)
-                            ValidateObjectProperties(source, $"/auditors/{i}", auditor, ["name", "argv", "script", "toolName", "treatExit127AsMissingTool"]);
-                    }
-                }
-                break;
-            case "audit-type":
-                ValidateObjectProperties(source, "/", instance, ["id", "displayName", "replace", "llmAuditorName", "reviewFocus", "auditors", "patterns"]);
-                if (instance.TryGetProperty("auditors", out var auditorsAt) && auditorsAt.ValueKind == JsonValueKind.Array)
-                {
-                    for (var i = 0; i < auditorsAt.GetArrayLength(); i++)
-                    {
-                        var auditor = auditorsAt[i];
-                        if (auditor.ValueKind == JsonValueKind.Object)
-                            ValidateObjectProperties(source, $"/auditors/{i}", auditor, ["name", "argv", "script", "toolName", "treatExit127AsMissingTool"]);
-                    }
-                }
-                if (instance.TryGetProperty("patterns", out var patterns) && patterns.ValueKind == JsonValueKind.Array)
-                {
-                    for (var i = 0; i < patterns.GetArrayLength(); i++)
-                    {
-                        var pattern = patterns[i];
-                        if (pattern.ValueKind == JsonValueKind.Object)
-                            ValidateObjectProperties(source, $"/patterns/{i}", pattern, ["regex", "description", "severity"]);
-                    }
-                }
-                break;
-            case "frame":
-                ValidateObjectProperties(source, "/", instance, ["frame"]);
-                break;
-        }
-    }
-
-    private static void ValidateObjectProperties(string source, string pointer, JsonElement obj, IReadOnlyList<string> allowed)
-    {
-        foreach (var property in obj.EnumerateObject())
-        {
-            if (!allowed.Contains(property.Name))
-                throw new PresetConfigurationException($"{source}: {pointer}/{property.Name} is not allowed by the preset schema.");
         }
     }
 

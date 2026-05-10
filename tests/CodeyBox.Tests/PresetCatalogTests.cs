@@ -126,7 +126,7 @@ public sealed class PresetCatalogTests
         var cheating = catalog.ResolveAuditType("cheating", ctx);
         var cheatingPatternAuditor = cheating.OfType<DiffPatternAuditor>().Single();
         // Just spot-check a few patterns
-        Assert.Contains(cheatingPatternAuditor.Patterns, p => p.Regex.ToString() == "@ts-ignore" + "|@ts-nocheck|@ts-expect-error");
+        Assert.Contains(cheatingPatternAuditor.Patterns, p => p.Regex.ToString() == "[@]" + "ts-ignore" + "|[@]ts-nocheck|[@]ts-expect-error");
         Assert.Contains(cheatingPatternAuditor.Patterns, p => p.Regex.ToString() == "panic\\(\"(?:not implemented|TODO|unimplemented)\"\\)");
 
         var tests = catalog.ResolveAuditType("tests", ctx);
@@ -166,16 +166,13 @@ public sealed class PresetCatalogTests
     [Fact]
     public void SchemaValidation_RejectsUnknownPlaceholderInFrame()
     {
-        using var temp = TempProject();
-        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox"));
-        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "llm-prompt-frame.yaml"), """
-            frame: "Review {{unknownVar}}"
-            """);
-
-        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+        var ex = Assert.Throws<PresetConfigurationException>(() => new PresetCatalog(new PresetCatalogOptions
+        {
+            LlmPromptFrameTemplate = "Review {{unknownVar}}"
+        }));
 
         Assert.Contains("{{unknownVar}}", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("/frame", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Audit.LlmPromptFrame", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -287,7 +284,7 @@ public sealed class PresetCatalogTests
         Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
         File.WriteAllText(Path.Combine(temp.Path, "codeybox", "audit-types", "completeness.yaml"), """
             id: completeness
-            reviewFocus: "from file"
+            displayName: "from file"
             """);
 
         var catalog = new PresetCatalog(new PresetCatalogOptions
