@@ -203,8 +203,13 @@ internal sealed class PresetConfigLoader
         Dictionary<string, LanguagePresetDefinition> languages,
         LanguagePresetDefinition incoming)
     {
-        if (!languages.TryGetValue(incoming.Id, out var existing) || incoming.Replace)
+        languages.TryGetValue(incoming.Id, out var existing);
+
+        if (existing == null || incoming.Replace)
         {
+            if (incoming.Replace && existing != null && incoming.Marker == null)
+                incoming.Marker = existing.Marker;
+
             languages[incoming.Id] = incoming;
             return;
         }
