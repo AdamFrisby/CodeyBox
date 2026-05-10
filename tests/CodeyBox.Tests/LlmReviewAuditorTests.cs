@@ -7,6 +7,20 @@ namespace CodeyBox.Tests;
 public sealed class LlmReviewAuditorTests
 {
     [Fact]
+    public void PromptFrame_Render_ReplacesWhitespacePaddedPlaceholders()
+    {
+        var rendered = LlmPromptFrameTemplate.Render(
+            "{{ reviewFocus }}\n{{resultFile}}",
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["reviewFocus"] = "focus text",
+                ["resultFile"] = "/audit/result.json",
+            });
+
+        Assert.Equal("focus text\n/audit/result.json", rendered);
+    }
+
+    [Fact]
     public async Task RunAsync_PassesAuditCredentialToResolvedAgent()
     {
         var runner = new CredentialCapturingRunner();
@@ -15,6 +29,7 @@ public sealed class LlmReviewAuditorTests
             Name = "security:llm-review",
             Agent = runner,
             ReviewFocus = "- verify credentials are available",
+            FrameTemplate = "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
         });
         var credential = new AgentCredential(
             AgentKind.Codex,

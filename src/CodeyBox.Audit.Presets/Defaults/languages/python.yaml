@@ -1,0 +1,15 @@
+id: python
+displayName: "Python"
+marker:
+  globs: ["**/pyproject.toml", "**/setup.py", "**/setup.cfg", "**/requirements.txt"]
+  script: |
+    find . -type d \( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \) -prune -o \( -name 'pyproject.toml' -o -name 'setup.py' -o -name 'setup.cfg' -o -name 'requirements.txt' \) -exec dirname {} \; | sort -u
+auditors:
+  - name: python:format-check
+    argv: ["ruff", "format", "--check", "."]
+  - name: python:typecheck
+    script: "if command -v mypy >/dev/null 2>&1; then exec mypy .; fi; if command -v pyright >/dev/null 2>&1; then exec pyright --workdir .; fi; echo 'mypy or pyright: not found in sandbox' >&2; exit 127"
+    toolName: "mypy or pyright"
+    treatExit127AsMissingTool: true
+  - name: python:test-pass
+    argv: ["pytest"]

@@ -1,3 +1,4 @@
+using CodeyBox.Audit.Presets;
 using Microsoft.Extensions.Options;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
@@ -18,14 +19,18 @@ public sealed class ProjectRepository : IProjectRepository
 {
     private readonly Dictionary<string, Project> _byId;
     private readonly IReadOnlyList<Project> _list;
-    private readonly ILogger<ProjectRepository> _logger;
 
     public ProjectRepository(IOptions<ProjectsOptions> options)
         : this(options, NullLogger<ProjectRepository>.Instance) { }
 
     public ProjectRepository(IOptions<ProjectsOptions> options, ILogger<ProjectRepository> logger)
+        : this(options, logger, null) { }
+
+    public ProjectRepository(
+        IOptions<ProjectsOptions> options,
+        ILogger<ProjectRepository> logger,
+        PresetCatalogOptions? presetCatalogOptions)
     {
-        _logger = logger;
         var opts = options.Value;
         var defaults = opts.Defaults ?? new ProjectDefaultsConfig();
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -35,6 +40,7 @@ public sealed class ProjectRepository : IProjectRepository
             var project = Resolve(pc, defaults);
             if (!seen.Add(project.Id.Value))
                 throw new InvalidOperationException($"Duplicate project id: {project.Id}");
+            ValidateAuditPresetConfiguration(project, presetCatalogOptions);
             resolved.Add(project);
         }
         _list = resolved;
@@ -46,6 +52,112 @@ public sealed class ProjectRepository : IProjectRepository
 
     public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
         => Task.FromResult(_list);
+
+    private static void ValidateAuditPresetConfiguration(Project project, PresetCatalogOptions? presetCatalogOptions)
+    {
+        var options = presetCatalogOptions?.Clone() ?? new PresetCatalogOptions();
+        ApplyRepositoryPresetRoot(project, options);
+        ApplyPresetOverrideOptions(project, options);
+
+        try
+        {
+            var catalog = new PresetCatalog(options);
+            ValidateSelectedPresets(project, catalog);
+        }
+        catch (PresetConfigurationException ex)
+        {
+            throw new InvalidOperationException(
+                $"Project '{project.Id.Value}' audit preset configuration is invalid: {ex.Message}", ex);
+        }
+    }
+
+    internal static void ApplyPresetOverrideOptions(Project project, PresetCatalogOptions options)
+    {
+        foreach (var (id, ov) in project.Audit.LanguageOverrides)
+        {
+            options.LanguageOverrides[id] = new LanguagePresetOverride
+            {
+                Replace = ov.Replace,
+                Auditors = ov.Auditors.Select(a => new ConfiguredAuditor
+                {
+                    Name = a.Name,
+                    Argv = [.. a.Argv],
+                    Script = a.Script,
+                    ToolName = a.ToolName,
+                    TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                }).ToList(),
+            };
+        }
+
+        foreach (var (id, ov) in project.Audit.AuditTypeOverrides)
+        {
+            options.AuditTypeOverrides[id] = new AuditTypePresetOverride
+            {
+                DisplayName = ov.DisplayName,
+                ReviewFocus = ov.ReviewFocus,
+                Replace = ov.Replace,
+                Auditors = ov.Auditors.Select(a => new ConfiguredAuditor
+                {
+                    Name = a.Name,
+                    Argv = [.. a.Argv],
+                    Script = a.Script,
+                    ToolName = a.ToolName,
+                    TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                }).ToList(),
+                Patterns = ov.Patterns.Select(p => new ConfiguredDiffPattern
+                {
+                    Regex = p.Regex,
+                    Description = p.Description,
+                    Severity = p.Severity,
+                }).ToList(),
+            };
+        }
+
+        if (project.Audit.LlmPromptFrameTemplate is not null)
+            options.LlmPromptFrameTemplate = project.Audit.LlmPromptFrameTemplate;
+    }
+
+    internal static bool ApplyRepositoryPresetRoot(Project project, PresetCatalogOptions options)
+    {
+        var root = ResolveRepositoryPresetRoot(project.RepositoryUrl);
+        if (root is null)
+            return false;
+
+        if (!options.AdditionalProjectRoots.Contains(root, StringComparer.Ordinal))
+            options.AdditionalProjectRoots.Add(root);
+        return true;
+    }
+
+    internal static string? ResolveRepositoryPresetRoot(string repositoryUrl)
+    {
+        string? path = null;
+        if (Uri.TryCreate(repositoryUrl, UriKind.Absolute, out var uri))
+        {
+            if (!uri.IsFile)
+                return null;
+            path = uri.LocalPath;
+        }
+        else if (Path.IsPathRooted(repositoryUrl) || repositoryUrl.StartsWith(".", StringComparison.Ordinal))
+        {
+            path = repositoryUrl;
+        }
+
+        if (string.IsNullOrWhiteSpace(path))
+            return null;
+
+        path = Path.GetFullPath(path);
+        if (Path.GetFileName(path).Equals(".git", StringComparison.OrdinalIgnoreCase))
+            path = Directory.GetParent(path)?.FullName ?? path;
+
+        return Directory.Exists(path) ? path : null;
+    }
+
+    private static void ValidateSelectedPresets(Project project, IPresetCatalog catalog)
+    {
+        var owner = $"Project '{project.Id.Value}'";
+        PresetCatalogSelectionValidator.ValidateLanguageIds(owner, project.Audit.Languages, catalog.KnownLanguages);
+        PresetCatalogSelectionValidator.ValidateAuditTypeIds(owner, project.Audit.AuditTypes, catalog.KnownAuditTypes);
+    }
 
     private Project Resolve(ProjectConfig pc, ProjectDefaultsConfig defaults)
     {
@@ -116,13 +228,16 @@ public sealed class ProjectRepository : IProjectRepository
         // taken whole from whichever side defines them — we don't try to
         // append defaults to project lists, which would be surprising.
         var mergedMaxIter = project?.MaxIterations ?? defaults?.MaxIterations ?? 3;
-        var mergedSeverity = ParseSeverity(project?.FailingSeverity ?? defaults?.FailingSeverity);
+        var mergedSeverity = AuditSeverityParser.Parse(project?.FailingSeverity ?? defaults?.FailingSeverity);
         var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 10;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
         var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;
         var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ProjectAuditLanguages.Default;
-        var mergedLanguages = FilterSupportedLanguages(projectId, configuredLanguages);
+        var mergedLanguages = FilterConfiguredLanguages(configuredLanguages);
+        var mergedLanguageOverrides = MergeLanguageOverrides(defaults?.LanguageOverrides, project?.LanguageOverrides);
         var mergedAuditTypes = project?.AuditTypes ?? defaults?.AuditTypes ?? [];
+        var mergedAuditTypeOverrides = MergeAuditTypeOverrides(defaults?.AuditTypeOverrides, project?.AuditTypeOverrides);
+        var mergedFrameTemplate = project?.LlmPromptFrameTemplate ?? defaults?.LlmPromptFrameTemplate;
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
 
         // Stuck-probe config. null in config = -1 (inherit from PipelineOptions global).
@@ -159,7 +274,10 @@ public sealed class ProjectRepository : IProjectRepository
             MergeScopeBufferLines = mergedMergeScopeBufferLines,
             Languages = mergedLanguages,
             LanguagesConfigured = languagesConfigured,
+            LanguageOverrides = mergedLanguageOverrides,
             AuditTypes = mergedAuditTypes,
+            AuditTypeOverrides = mergedAuditTypeOverrides,
+            LlmPromptFrameTemplate = mergedFrameTemplate,
             Custom = mergedCustom,
             AuditAgent = mergedAuditAgent,
             PerAuditorAgent = mergedPerAuditorAgent,
@@ -167,21 +285,81 @@ public sealed class ProjectRepository : IProjectRepository
         };
     }
 
-    private IReadOnlyList<string> FilterSupportedLanguages(string? projectId, IEnumerable<string> languages)
+    private static IReadOnlyDictionary<string, ProjectLanguagePresetOverride> MergeLanguageOverrides(
+        Dictionary<string, ProjectLanguagePresetOverrideConfig>? defaults,
+        Dictionary<string, ProjectLanguagePresetOverrideConfig>? project)
+    {
+        var merged = new Dictionary<string, ProjectLanguagePresetOverride>(StringComparer.OrdinalIgnoreCase);
+        if (defaults is not null)
+        {
+            foreach (var (id, ov) in defaults)
+                merged[id] = ResolveLanguageOverride(ov);
+        }
+        if (project is not null)
+        {
+            foreach (var (id, ov) in project)
+                merged[id] = ResolveLanguageOverride(ov);
+        }
+        return merged;
+    }
+
+    private static ProjectLanguagePresetOverride ResolveLanguageOverride(ProjectLanguagePresetOverrideConfig config)
+        => new()
+        {
+            Replace = config.Replace,
+            Auditors = (config.Auditors ?? []).Select(ResolveConfiguredAuditor).ToList(),
+        };
+
+    private static ProjectConfiguredAuditor ResolveConfiguredAuditor(ProjectConfiguredAuditorConfig config)
+        => new()
+        {
+            Name = config.Name ?? string.Empty,
+            Argv = config.Argv ?? [],
+            Script = config.Script,
+            ToolName = config.ToolName,
+            TreatExit127AsMissingTool = config.TreatExit127AsMissingTool,
+        };
+
+    private static IReadOnlyDictionary<string, ProjectAuditTypeOverride> MergeAuditTypeOverrides(
+        Dictionary<string, ProjectAuditTypeOverrideConfig>? defaults,
+        Dictionary<string, ProjectAuditTypeOverrideConfig>? project)
+    {
+        var merged = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase);
+        if (defaults is not null)
+        {
+            foreach (var (id, ov) in defaults)
+                merged[id] = ResolveAuditTypeOverride(ov);
+        }
+        if (project is not null)
+        {
+            foreach (var (id, ov) in project)
+                merged[id] = ResolveAuditTypeOverride(ov);
+        }
+        return merged;
+    }
+
+    private static ProjectAuditTypeOverride ResolveAuditTypeOverride(ProjectAuditTypeOverrideConfig config)
+        => new()
+        {
+            DisplayName = config.DisplayName,
+            ReviewFocus = config.ReviewFocus,
+            Replace = config.Replace,
+            Auditors = (config.Auditors ?? []).Select(ResolveConfiguredAuditor).ToList(),
+            Patterns = (config.Patterns ?? []).Select(p => new DiffPatternDescriptor
+            {
+                Description = p.Description ?? "(no description)",
+                Regex = p.Regex ?? string.Empty,
+                Severity = p.Severity,
+            }).ToList(),
+        };
+
+    private static IReadOnlyList<string> FilterConfiguredLanguages(IEnumerable<string> languages)
     {
         var filtered = new List<string>();
         foreach (var language in languages)
         {
             if (string.IsNullOrWhiteSpace(language))
                 continue;
-            if (!ProjectAuditLanguages.IsSupported(language))
-            {
-                _logger.LogWarning(
-                    "Project '{ProjectId}' declares unsupported audit language '{Language}'; skipping",
-                    projectId ?? "(unknown)",
-                    language);
-                continue;
-            }
             filtered.Add(language);
         }
         return filtered;
@@ -204,13 +382,6 @@ public sealed class ProjectRepository : IProjectRepository
             MaxConcurrentForProject = ValidateCap(c.MaxConcurrentForProject, nameof(c.MaxConcurrentForProject)),
         };
     }
-
-    private static AuditSeverity ParseSeverity(string? s) => s?.ToLowerInvariant() switch
-    {
-        "info" => AuditSeverity.Info,
-        "warning" or "warn" => AuditSeverity.Warning,
-        _ => AuditSeverity.Error,
-    };
 
     private static ProjectReleaseConfig ResolveReleaseConfig(ProjectReleaseConfigOptions? c)
     {
@@ -245,6 +416,7 @@ public sealed class ProjectRepository : IProjectRepository
             {
                 Description = p.Description ?? "(no description)",
                 Regex = p.Regex ?? throw new InvalidOperationException($"Pattern in '{c.Name}' missing 'Regex'"),
+                Severity = p.Severity,
             }).ToList(),
         };
     }

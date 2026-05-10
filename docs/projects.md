@@ -107,9 +107,25 @@ Anything a project omits comes from `Defaults` (shallow merge):
 * `BaseBranch` — default integration branch
 * `Audit.*` — every field in `ProjectAudit` falls through individually
 
-`Languages` and `AuditTypes` are list-typed and not append-merged: if a
-project sets `AuditTypes`, it replaces the defaults entirely. Choose your
-defaults expecting them to be replaced wholesale by per-project overrides.
+`Languages` is list-typed and not append-merged: if a project sets it, it
+replaces the defaults entirely. `AuditTypes` supports the existing list form,
+or an object form where keys select audit types and values tune their prompts:
+
+```json
+{
+  "AuditTypes": {
+    "security": {
+      "ReviewFocus": "- Project-specific auth and tenant-boundary checks"
+    },
+    "completeness": {
+      "ReviewFocus": "- Product acceptance criteria from the work item"
+    }
+  },
+  "LlmPromptFrameTemplate": "{{reviewFocus}}\n{{resultFile}}"
+}
+```
+
+See `docs/audit-types.md` for prompt schemas and precedence.
 
 ### Project ID rules
 
@@ -667,10 +683,10 @@ the orchestrator only reads through the interface.
 
 ## Adding a language or audit-type preset
 
-1. New project (or new file in `CodeyBox.Audit.Presets`) registering with
-   `PresetCatalog.RegisterLanguage` or `RegisterAuditType`.
-2. Return your bundle of `IAuditor`s with truthful capability flags.
-3. Document the new preset in this file.
+Use repository-owned YAML under `codeybox/languages` or
+`codeybox/audit-types`, or per-project appsettings overrides, for project-specific preset data. Built-in defaults
+live in `CodeyBox.Audit.Presets/Defaults` as embedded resources. Selected preset ids are validated against the composed catalog at startup with did-you-mean diagnostics for typos. See
+[`languages.md`](languages.md) and [`audit-types.md`](audit-types.md).
 
 For one-off auditors that don't need a preset (project-specific build
 checks, etc.), use a `Custom` entry in the project config — no code change.

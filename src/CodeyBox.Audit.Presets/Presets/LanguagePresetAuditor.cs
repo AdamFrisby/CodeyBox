@@ -146,14 +146,19 @@ internal sealed class LanguagePresetAuditor : IAuditor
 
     private static string ResolveWorkingDirectory(string workingDirectory, string projectDirectory)
     {
-        if (projectDirectory == ".")
+        if (projectDirectory == "." || string.IsNullOrWhiteSpace(projectDirectory))
             return workingDirectory;
 
-        var relativeProjectDirectory = projectDirectory.StartsWith("./", StringComparison.Ordinal)
-            ? projectDirectory[2..]
-            : projectDirectory.TrimStart('/');
-        if (relativeProjectDirectory.Length == 0 || relativeProjectDirectory == ".")
+        var relativeProjectDirectory = projectDirectory.Replace('\\', '/');
+        if (relativeProjectDirectory.StartsWith("./", StringComparison.Ordinal))
+            relativeProjectDirectory = relativeProjectDirectory[2..];
+        relativeProjectDirectory = relativeProjectDirectory.Trim('/');
+
+        if (string.IsNullOrWhiteSpace(relativeProjectDirectory) || relativeProjectDirectory == ".")
             return workingDirectory;
+
+        if (relativeProjectDirectory.Contains("..", StringComparison.Ordinal) || relativeProjectDirectory.StartsWith('/') || Path.IsPathRooted(relativeProjectDirectory))
+            throw new InvalidOperationException($"Language preset discovery returned an unsafe project directory: '{projectDirectory}'. Project directories must be relative and stay within the repository root.");
 
         return workingDirectory.TrimEnd('/') + "/" + relativeProjectDirectory;
     }

@@ -100,6 +100,16 @@ public sealed record AuditFinding(
 
 public enum AuditSeverity { Info, Warning, Error }
 
+public static class AuditSeverityParser
+{
+    public static AuditSeverity Parse(string? s) => s?.ToLowerInvariant() switch
+    {
+        "info" => AuditSeverity.Info,
+        "warning" or "warn" => AuditSeverity.Warning,
+        _ => AuditSeverity.Error,
+    };
+}
+
 /// <summary>
 /// Maps registered auditors. Loose coupling: new auditors are added via DI
 /// without changing the orchestrator.

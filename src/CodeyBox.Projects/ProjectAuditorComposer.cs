@@ -25,6 +25,7 @@ namespace CodeyBox.Projects;
 public sealed class ProjectAuditorComposer
 {
     private readonly IPresetCatalog _catalog;
+    private readonly PresetCatalogOptions _catalogOptions;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly ILogger<ProjectAuditorComposer> _logger;
 
@@ -35,9 +36,11 @@ public sealed class ProjectAuditorComposer
     public ProjectAuditorComposer(
         IPresetCatalog catalog,
         IEnumerable<IAuditor> pluginAuditors,
-        ILogger<ProjectAuditorComposer> logger)
+        ILogger<ProjectAuditorComposer> logger,
+        PresetCatalogOptions? catalogOptions = null)
     {
         _catalog = catalog;
+        _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
         _logger = logger;
 
         var index = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
@@ -58,25 +61,16 @@ public sealed class ProjectAuditorComposer
 
     public IReadOnlyList<IAuditor> Compose(Project project, IAgentRunner agentForLlmAuditors)
     {
+        var catalog = ResolveCatalog(project);
+        ValidateSelectedPresets(project, catalog);
         var ctx = new PresetContext(agentForLlmAuditors);
         var auditors = new List<IAuditor>();
 
         foreach (var lang in project.Audit.Languages)
-        {
-            if (!ProjectAuditLanguages.IsSupported(lang))
-            {
-                _logger.LogWarning(
-                    "Project '{ProjectId}' declares unsupported audit language '{Language}'; skipping",
-                    project.Id.Value,
-                    lang);
-                continue;
-            }
-
-            auditors.AddRange(_catalog.ResolveLanguage(lang, ctx));
-        }
+            auditors.AddRange(catalog.ResolveLanguage(lang, ctx));
 
         foreach (var type in project.Audit.AuditTypes)
-            auditors.AddRange(_catalog.ResolveAuditType(type, ctx));
+            auditors.AddRange(catalog.ResolveAuditType(type, ctx));
 
         foreach (var custom in project.Audit.Custom)
         {
@@ -86,11 +80,37 @@ public sealed class ProjectAuditorComposer
             }
             else
             {
-                auditors.Add(MaterialiseCustom(custom, ctx));
+                auditors.Add(MaterialiseCustom(custom, ctx, catalog.LlmPromptFrameTemplate));
             }
         }
 
         return auditors;
+    }
+
+    private IPresetCatalog ResolveCatalog(Project project)
+    {
+        if (_catalog is not PresetCatalog)
+            return _catalog;
+
+        var options = _catalogOptions.Clone();
+        var hasRepositoryPresetRoot = ProjectRepository.ApplyRepositoryPresetRoot(project, options);
+        if (!hasRepositoryPresetRoot && !HasProjectPresetOverrides(project))
+            return _catalog;
+
+        ProjectRepository.ApplyPresetOverrideOptions(project, options);
+        return new PresetCatalog(options);
+    }
+
+    private static bool HasProjectPresetOverrides(Project project)
+        => project.Audit.LanguageOverrides.Count > 0 ||
+           project.Audit.AuditTypeOverrides.Count > 0 ||
+           project.Audit.LlmPromptFrameTemplate is not null;
+
+    private static void ValidateSelectedPresets(Project project, IPresetCatalog catalog)
+    {
+        var owner = $"Project '{project.Id.Value}'";
+        PresetCatalogSelectionValidator.ValidateLanguageIds(owner, project.Audit.Languages, catalog.KnownLanguages);
+        PresetCatalogSelectionValidator.ValidateAuditTypeIds(owner, project.Audit.AuditTypes, catalog.KnownAuditTypes);
     }
 
     private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors)
@@ -119,7 +139,7 @@ public sealed class ProjectAuditorComposer
     ///   "diff-pattern" — DiffPatternAuditor with the given Patterns
     ///   "llm"          — LlmReviewAuditor with the given ReviewFocus
     /// </summary>
-    private static IAuditor MaterialiseCustom(CustomAuditorDescriptor c, PresetContext ctx)
+    private static IAuditor MaterialiseCustom(CustomAuditorDescriptor c, PresetContext ctx, string frameTemplate)
     {
         if (string.IsNullOrWhiteSpace(c.Name))
             throw new InvalidOperationException($"Custom auditor of kind '{c.Kind}' requires a non-empty Name");
@@ -138,6 +158,7 @@ public sealed class ProjectAuditorComposer
                 {
                     Regex = new Regex(p.Regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeout: TimeSpan.FromSeconds(5)),
                     Description = p.Description,
+                    Severity = AuditSeverityParser.Parse(p.Severity),
                 }).ToList(),
             }),
             "llm" => new LlmReviewAuditor(new LlmReviewAuditorOptions
@@ -145,6 +166,7 @@ public sealed class ProjectAuditorComposer
                 Name = c.Name,
                 Agent = ctx.Agent,
                 ReviewFocus = c.ReviewFocus ?? throw new InvalidOperationException($"llm auditor '{c.Name}' needs ReviewFocus"),
+                FrameTemplate = frameTemplate,
             }),
             _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm)"),
         };

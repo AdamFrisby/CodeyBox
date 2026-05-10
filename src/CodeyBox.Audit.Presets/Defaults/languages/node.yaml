@@ -1,0 +1,13 @@
+id: node
+displayName: "Node.js"
+marker:
+  globs: ["**/package.json"]
+  script: |
+    find . -type d \( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \) -prune -o -name 'package.json' -exec dirname {} \; | sort -u
+auditors:
+  - name: node:format-check
+    argv: ["prettier", "--check", "."]
+  - name: node:lint
+    argv: ["eslint", "."]
+  - name: node:test-pass
+    argv: ["npm", "test"]

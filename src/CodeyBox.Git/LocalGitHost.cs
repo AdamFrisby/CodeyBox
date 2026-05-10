@@ -282,6 +282,17 @@ public sealed class LocalGitHost : IGitHost
         return rc.Stdout;
     }
 
+    public async Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string pathPrefix, CancellationToken ct = default)
+    {
+        ValidateRepositoryRelativePath(pathPrefix);
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(path, ct, "ls-tree", "-r", "--name-only", treeish, "--", pathPrefix);
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException($"git ls-tree '{treeish}:{pathPrefix}' failed: {rc.Stderr}");
+        return rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
     public async Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(
         string repositoryId,
         string fromTreeish,

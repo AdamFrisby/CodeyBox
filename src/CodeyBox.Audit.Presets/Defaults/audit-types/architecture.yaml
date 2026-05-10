@@ -1,0 +1,9 @@
+id: architecture
+displayName: "Architecture review"
+llmAuditorName: architecture:llm-review
+reviewFocus: |-
+  - Loose-coupling violations: concrete types appearing in cross-module method signatures where an interface exists
+  - New direct dependencies that should have gone through an existing abstraction
+  - God objects / classes accumulating unrelated responsibilities
+  - Layering violations (e.g. domain code referencing infrastructure)
+  - Public APIs that leak internal types

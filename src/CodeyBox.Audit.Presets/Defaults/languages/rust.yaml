@@ -1,0 +1,13 @@
+id: rust
+displayName: "Rust"
+marker:
+  globs: ["**/Cargo.toml"]
+  script: |
+    find . -type d \( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \) -prune -o -name 'Cargo.toml' -exec dirname {} \; | sort -u
+auditors:
+  - name: rust:format-check
+    argv: ["cargo", "fmt", "--check"]
+  - name: rust:lint
+    argv: ["cargo", "clippy", "--", "-D", "warnings"]
+  - name: rust:test-pass
+    argv: ["cargo", "test"]

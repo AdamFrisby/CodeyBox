@@ -1,0 +1,9 @@
+id: completeness
+displayName: "Completeness review"
+llmAuditorName: completeness:llm-review
+reviewFocus: |-
+  - TODO / FIXME / XXX markers added in this change
+  - New functionality without corresponding tests
+  - Half-finished implementations (functions that return early, swallowed branches)
+  - Public functions whose docstrings/comments describe behaviour the code doesn't implement
+  - Test files that were renamed or deleted instead of fixed

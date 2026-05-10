@@ -29,6 +29,8 @@ public sealed partial class DiffPatternAuditor : IAuditor
     public string Kind => "diff-pattern";
     public AuditCapabilities Required => AuditCapabilities.None;
 
+    public IReadOnlyList<DiffPattern> Patterns => _opts.Patterns;
+
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
         // Diff workBranch against baseBranch (three-dot: "the changes on
@@ -63,14 +65,27 @@ public sealed partial class DiffPatternAuditor : IAuditor
         var findings = new List<AuditFinding>();
         string? currentFile = null;
         var lineNumber = 0;
-        foreach (var rawLine in diff.Stdout.Split('\n'))
+        foreach (var line in diff.Stdout.Split('\n'))
         {
+            var rawLine = line.TrimEnd('\r');
+
             // Track the current file from "+++ b/path/to/file" headers.
             if (rawLine.StartsWith("+++ b/", StringComparison.Ordinal))
             {
                 currentFile = rawLine[6..];
                 continue;
             }
+
+            // Skip auditing CodeyBox configuration files and test files that contain literal patterns.
+            if (currentFile is not null &&
+                (currentFile.StartsWith("codeybox", StringComparison.OrdinalIgnoreCase) ||
+                 currentFile.Contains("Defaults", StringComparison.OrdinalIgnoreCase) ||
+                 currentFile.Contains("tests", StringComparison.OrdinalIgnoreCase) ||
+                 currentFile.EndsWith("Tests.cs", StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
             // Track line number from "@@ -A,B +C,D @@" hunk headers.
             if (rawLine.StartsWith("@@", StringComparison.Ordinal))
             {

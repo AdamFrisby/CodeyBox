@@ -3,10 +3,9 @@ using CodeyBox.Core;
 namespace CodeyBox.Audit.Presets;
 
 /// <summary>
-/// Default <see cref="IPresetCatalog"/>: returns the built-in language and
-/// audit-type bundles. Operators can wrap this with their own catalog (e.g.
-/// to add a "java" preset or override "python" to use mypy instead of
-/// pyright) without touching orchestrator code.
+/// Default <see cref="IPresetCatalog"/>: loads built-in preset YAML from
+/// embedded resources, then composes optional project-root and appsettings
+/// overrides before any audit work starts.
 /// </summary>
 public sealed class PresetCatalog : IPresetCatalog
 {
@@ -14,11 +13,24 @@ public sealed class PresetCatalog : IPresetCatalog
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Func<PresetContext, IReadOnlyList<IAuditor>>> _auditTypes =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly IReadOnlyDictionary<string, AuditTypePresetDefinition> _auditTypeDefinitions;
 
     public PresetCatalog()
+        : this(null) { }
+
+    public PresetCatalog(PresetCatalogOptions? options)
     {
-        LanguagePresets.Register(this);
-        AuditTypePresets.Register(this);
+        var snapshot = new PresetConfigLoader().Load(options);
+        LlmPromptFrameTemplate = snapshot.LlmPromptFrame;
+        _auditTypeDefinitions = snapshot.AuditTypes;
+
+        foreach (var (name, definition) in snapshot.Languages)
+        {
+            var captured = definition;
+            RegisterLanguage(name, _ => PresetConfigLoader.MaterialiseLanguage(captured));
+        }
+
+        AuditTypePresets.Register(this, snapshot.AuditTypes, snapshot.LlmPromptFrame);
     }
 
     public IReadOnlyList<IAuditor> ResolveLanguage(string name, PresetContext ctx)
@@ -29,6 +41,10 @@ public sealed class PresetCatalog : IPresetCatalog
 
     public IReadOnlyList<string> KnownLanguages => [.. _languages.Keys];
     public IReadOnlyList<string> KnownAuditTypes => [.. _auditTypes.Keys];
+    public string LlmPromptFrameTemplate { get; }
+
+    public string GetAuditTypeReviewFocus(string id)
+        => _auditTypeDefinitions.TryGetValue(id, out var definition) ? definition.ReviewFocus : string.Empty;
 
     internal void RegisterLanguage(string name, Func<PresetContext, IReadOnlyList<IAuditor>> factory)
         => _languages[name] = factory;

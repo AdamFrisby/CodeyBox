@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -25,7 +26,7 @@ namespace CodeyBox.Audit.Llm;
 /// </summary>
 public sealed class LlmReviewAuditor : IAuditor
 {
-    private const string ResultFile = "/audit/result.json";
+    private const string ResultFile = "audit/result.json";
     private readonly LlmReviewAuditorOptions _opts;
 
     public LlmReviewAuditor(LlmReviewAuditorOptions opts)
@@ -39,8 +40,8 @@ public sealed class LlmReviewAuditor : IAuditor
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
-        // Make /audit available for the agent's structured output.
-        await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", "/audit"] }, ct);
+        // Make audit/ directory available for the agent's structured output.
+        await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", "audit"], WorkingDirectory = workingDirectory }, ct);
 
         var prompt = BuildPrompt(context);
         // Use the per-invocation override supplied by the pipeline for cross-review,
@@ -73,6 +74,7 @@ public sealed class LlmReviewAuditor : IAuditor
         var read = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["cat", ResultFile],
+            WorkingDirectory = workingDirectory
         }, ct);
         if (!read.Success || string.IsNullOrWhiteSpace(read.Stdout))
         {
@@ -91,7 +93,7 @@ public sealed class LlmReviewAuditor : IAuditor
                 throw new JsonException("null verdict");
             var findings = (parsed.Findings ?? []).Select(f => new AuditFinding(
                 AuditorName: Name,
-                Severity: ParseSeverity(f.Severity),
+                Severity: AuditSeverityParser.Parse(f.Severity),
                 Title: f.Title ?? "(no title)",
                 Description: f.Description ?? "",
                 Location: f.Location)).ToList();
@@ -110,41 +112,25 @@ public sealed class LlmReviewAuditor : IAuditor
 
     private string BuildPrompt(AuditContext context)
     {
-        // Escape any closing tag sequence in user content to prevent delimiter breakout.
+        // Escape closing tag sequences and common delimiters in user content to prevent breakout.
         var safePrompt = context.OriginalPrompt
-            .Replace("</task_description>", "< /task_description>", StringComparison.OrdinalIgnoreCase);
+            .Replace("</", "< /", StringComparison.Ordinal)
+            .Replace("]]>", "]] >", StringComparison.Ordinal);
 
-        return $$"""
-            You are a strict code reviewer. Review the working tree at {{SandboxConventions.WorkDir}}, focusing on:
-            {{_opts.ReviewFocus}}
+        var safeFocus = _opts.ReviewFocus
+            .Replace("</", "< /", StringComparison.Ordinal)
+            .Replace("]]>", "]] >", StringComparison.Ordinal);
 
-            Original task being reviewed:
-            <task_description>
-            {{safePrompt}}
-            </task_description>
-
-            Examine the diff between {{context.BaseBranch}} and {{context.WorkBranch}}, plus the surrounding code.
-            Then write your verdict to {{ResultFile}} as a single JSON object with this exact shape:
-
-            {
-              "passed": true|false,
-              "findings": [
-                { "severity": "error|warning|info", "title": "short title",
-                  "description": "details", "location": "path:line" }
-              ]
-            }
-
-            "passed" must be false if there is ANY finding with severity "error".
-            Do not include other text in the JSON file. After writing the file, exit.
-            """;
+        return LlmPromptFrameTemplate.Render(_opts.FrameTemplate, new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["workingDirectory"] = SandboxConventions.WorkDir,
+            ["reviewFocus"] = safeFocus,
+            ["baseBranch"] = context.BaseBranch,
+            ["workBranch"] = context.WorkBranch,
+            ["originalPrompt"] = safePrompt,
+            ["resultFile"] = ResultFile,
+        });
     }
-
-    private static AuditSeverity ParseSeverity(string? s) => s?.ToLowerInvariant() switch
-    {
-        "error" => AuditSeverity.Error,
-        "warning" or "warn" => AuditSeverity.Warning,
-        _ => AuditSeverity.Info,
-    };
 
     private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 
@@ -167,4 +153,68 @@ public sealed record LlmReviewAuditorOptions
     /// "- Architectural boundaries / loose coupling violations\n- Hardcoded secrets".
     /// </summary>
     public required string ReviewFocus { get; init; }
+
+    public required string FrameTemplate { get; init; }
+}
+
+public static class LlmPromptFrameTemplate
+{
+    public static readonly IReadOnlySet<string> AllowedPlaceholders =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            "workingDirectory",
+            "reviewFocus",
+            "baseBranch",
+            "workBranch",
+            "originalPrompt",
+            "resultFile",
+        };
+
+    public static IReadOnlyList<string> FindPlaceholders(string template)
+    {
+        var placeholders = new List<string>();
+        for (var i = 0; i < template.Length;)
+        {
+            var start = template.IndexOf("{{", i, StringComparison.Ordinal);
+            if (start < 0)
+                break;
+            var end = template.IndexOf("}}", start + 2, StringComparison.Ordinal);
+            if (end < 0)
+                break;
+            placeholders.Add(template[(start + 2)..end].Trim());
+            i = end + 2;
+        }
+        return placeholders;
+    }
+
+    public static string Render(string template, IReadOnlyDictionary<string, string> values)
+    {
+        var rendered = new StringBuilder(template.Length);
+        for (var i = 0; i < template.Length;)
+        {
+            var start = template.IndexOf("{{", i, StringComparison.Ordinal);
+            if (start < 0)
+            {
+                rendered.Append(template, i, template.Length - i);
+                break;
+            }
+
+            var end = template.IndexOf("}}", start + 2, StringComparison.Ordinal);
+            if (end < 0)
+            {
+                rendered.Append(template, i, template.Length - i);
+                break;
+            }
+
+            rendered.Append(template, i, start - i);
+            var placeholder = template[(start + 2)..end].Trim();
+            if (!AllowedPlaceholders.Contains(placeholder))
+                throw new InvalidOperationException($"Unknown LLM prompt frame placeholder '{{{{{placeholder}}}}}'");
+            if (!values.TryGetValue(placeholder, out var value))
+                throw new InvalidOperationException($"No value supplied for LLM prompt frame placeholder '{{{{{placeholder}}}}}'");
+            rendered.Append(value);
+            i = end + 2;
+        }
+        return rendered.ToString();
+    }
 }

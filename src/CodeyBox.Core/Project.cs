@@ -329,7 +329,12 @@ public sealed record ProjectAudit
 
     public IReadOnlyList<string> Languages { get; init; } = [];
     public bool LanguagesConfigured { get; init; }
+    public IReadOnlyDictionary<string, ProjectLanguagePresetOverride> LanguageOverrides { get; init; }
+        = new Dictionary<string, ProjectLanguagePresetOverride>(StringComparer.OrdinalIgnoreCase);
     public IReadOnlyList<string> AuditTypes { get; init; } = [];
+    public IReadOnlyDictionary<string, ProjectAuditTypeOverride> AuditTypeOverrides { get; init; }
+        = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase);
+    public string? LlmPromptFrameTemplate { get; init; }
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
 
     /// <summary>
@@ -367,6 +372,30 @@ public sealed record ProjectAudit
     public int MaxLlmAuditorParallelism { get; init; } = 3;
 }
 
+public sealed record ProjectLanguagePresetOverride
+{
+    public bool Replace { get; init; }
+    public IReadOnlyList<ProjectConfiguredAuditor> Auditors { get; init; } = [];
+}
+
+public sealed record ProjectConfiguredAuditor
+{
+    public string Name { get; init; } = string.Empty;
+    public IReadOnlyList<string> Argv { get; init; } = [];
+    public string? Script { get; init; }
+    public string? ToolName { get; init; }
+    public bool? TreatExit127AsMissingTool { get; init; }
+}
+
+public sealed record ProjectAuditTypeOverride
+{
+    public string? DisplayName { get; init; }
+    public string? ReviewFocus { get; init; }
+    public bool Replace { get; init; }
+    public IReadOnlyList<ProjectConfiguredAuditor> Auditors { get; init; } = [];
+    public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];
+}
+
 /// <summary>
 /// Free-form auditor description. The composer picks the matching factory
 /// based on <see cref="Kind"/> and applies the remaining fields.
@@ -400,6 +429,7 @@ public sealed record DiffPatternDescriptor
 {
     public required string Description { get; init; }
     public required string Regex { get; init; }
+    public string? Severity { get; init; }
 }
 
 /// <summary>
