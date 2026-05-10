@@ -4,8 +4,8 @@ namespace CodeyBox.Audit.Presets;
 
 /// <summary>
 /// Maps preset names ("python", "security", "cheating", …) to bundles of
-/// auditors. Composed at startup from the built-in preset registry plus any
-/// custom presets the operator registers via DI.
+/// auditors. Composed at startup from built-in YAML defaults and project-specific
+/// configuration.
 ///
 /// Two name spaces, kept logically separate but sharing the same catalog:
 ///   - <b>Languages</b>: tooling specific to a language (linters, type

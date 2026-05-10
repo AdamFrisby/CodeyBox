@@ -52,25 +52,12 @@ internal sealed class PresetConfigLoader
         {
             LoadUserLanguageFiles(projectRoot, languages);
             LoadUserAuditTypeFiles(projectRoot, auditTypes);
-            LoadUserFrameFile(projectRoot, ref frame);
         }
 
         ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
         ValidateFrame("llm-prompt-frame.yaml", frame.Frame);
 
         return new PresetConfigSnapshot(languages, auditTypes, frame.Frame);
-    }
-
-    private static void LoadUserFrameFile(string? projectRoot, ref FramePresetDefinition frame)
-    {
-        if (string.IsNullOrWhiteSpace(projectRoot)) return;
-        var path = Path.Combine(projectRoot, "codeybox", "llm-prompt-frame.yaml");
-        if (File.Exists(path))
-        {
-            var userFrame = ReadYamlFile<FramePresetDefinition>(path, "frame");
-            ValidateFrame(path, userFrame.Frame);
-            frame = userFrame;
-        }
     }
 
     private static Dictionary<string, LanguagePresetDefinition> LoadEmbeddedLanguages(Assembly assembly)
@@ -113,7 +100,7 @@ internal sealed class PresetConfigLoader
                 throw new PresetConfigurationException($"{file}: /marker/script is not allowed in repository-provided configuration for security reasons. Use /marker/globs instead.");
 
             ValidateLanguage(file, definition, allowPartial: languages.ContainsKey(definition.Id), isTrusted: false);
-            ComposeLanguage(languages, definition);
+            ComposeLanguage(languages, definition, isTrusted: false);
         }
     }
 
@@ -128,7 +115,7 @@ internal sealed class PresetConfigLoader
                 throw new PresetConfigurationException($"{file}: /reviewFocus is not allowed in repository-provided configuration for security reasons.");
 
             ValidateAuditType(file, definition, isTrusted: false);
-            ComposeAuditType(auditTypes, definition);
+            ComposeAuditType(auditTypes, definition, isTrusted: false);
         }
     }
 
@@ -154,7 +141,7 @@ internal sealed class PresetConfigLoader
                 }).ToList(),
             };
             ValidateLanguage($"Audit.Languages.Overrides[{id}]", definition, allowPartial: languages.ContainsKey(id), isTrusted: true);
-            ComposeLanguage(languages, definition);
+            ComposeLanguage(languages, definition, isTrusted: true);
         }
 
         foreach (var (id, ov) in options.AuditTypeOverrides)
@@ -181,7 +168,7 @@ internal sealed class PresetConfigLoader
                 }).ToList(),
             };
             ValidateAuditType($"Audit.AuditTypes[{id}]", definition, isTrusted: true);
-            ComposeAuditType(auditTypes, definition);
+            ComposeAuditType(auditTypes, definition, isTrusted: true);
         }
 
         if (options.LlmPromptFrameTemplate is not null)
@@ -193,9 +180,11 @@ internal sealed class PresetConfigLoader
 
     private static void ComposeAuditType(
         Dictionary<string, AuditTypePresetDefinition> auditTypes,
-        AuditTypePresetDefinition incoming)
+        AuditTypePresetDefinition incoming,
+        bool isTrusted)
     {
-        if (!auditTypes.TryGetValue(incoming.Id, out var existing) || incoming.Replace)
+        var shouldReplace = incoming.Replace && isTrusted;
+        if (!auditTypes.TryGetValue(incoming.Id, out var existing) || shouldReplace)
         {
             auditTypes[incoming.Id] = incoming;
             return;
@@ -214,13 +203,15 @@ internal sealed class PresetConfigLoader
 
     private static void ComposeLanguage(
         Dictionary<string, LanguagePresetDefinition> languages,
-        LanguagePresetDefinition incoming)
+        LanguagePresetDefinition incoming,
+        bool isTrusted)
     {
         languages.TryGetValue(incoming.Id, out var existing);
 
-        if (existing == null || incoming.Replace)
+        var shouldReplace = incoming.Replace && isTrusted;
+        if (existing == null || shouldReplace)
         {
-            if (incoming.Replace && existing != null && incoming.Marker == null)
+            if (shouldReplace && existing != null && incoming.Marker == null)
                 incoming.Marker = existing.Marker;
 
             languages[incoming.Id] = incoming;

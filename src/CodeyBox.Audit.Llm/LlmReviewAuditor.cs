@@ -93,7 +93,7 @@ public sealed class LlmReviewAuditor : IAuditor
                 throw new JsonException("null verdict");
             var findings = (parsed.Findings ?? []).Select(f => new AuditFinding(
                 AuditorName: Name,
-                Severity: ParseSeverity(f.Severity),
+                Severity: AuditSeverityParser.Parse(f.Severity),
                 Title: f.Title ?? "(no title)",
                 Description: f.Description ?? "",
                 Location: f.Location)).ToList();
@@ -131,13 +131,6 @@ public sealed class LlmReviewAuditor : IAuditor
             ["resultFile"] = ResultFile,
         });
     }
-
-    private static AuditSeverity ParseSeverity(string? s) => s?.ToLowerInvariant() switch
-    {
-        "error" => AuditSeverity.Error,
-        "warning" or "warn" => AuditSeverity.Warning,
-        _ => AuditSeverity.Info,
-    };
 
     private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 

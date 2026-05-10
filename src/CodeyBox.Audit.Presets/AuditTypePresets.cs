@@ -79,16 +79,8 @@ internal static class AuditTypePresets
         {
             Regex = new Regex(d.Regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1)),
             Description = d.Description,
-            Severity = ParseSeverity(d.Severity),
+            Severity = AuditSeverityParser.Parse(d.Severity),
         }).ToList();
-
-    private static AuditSeverity ParseSeverity(string? s) => s?.ToLowerInvariant() switch
-    {
-        "error" => AuditSeverity.Error,
-        "warning" or "warn" => AuditSeverity.Warning,
-        "info" => AuditSeverity.Info,
-        _ => AuditSeverity.Error,
-    };
 
     private static IAuditor Llm(AuditTypePresetDefinition definition, string frameTemplate, PresetContext ctx)
         => new LlmReviewAuditor(new LlmReviewAuditorOptions

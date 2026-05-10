@@ -227,7 +227,7 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
-    public void UserOverride_ReplaceMode_ReplacesBuiltInAuditors()
+    public void UserOverride_ReplaceMode_IsIgnoredInUntrustedFiles()
     {
         using var temp = TempProject();
         Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "languages"));
@@ -246,7 +246,8 @@ public sealed class PresetCatalogTests
             .Select(a => a.Name)
             .ToArray();
 
-        Assert.Equal(["csharp:replacement"], names);
+        // Security policy: repository-provided config cannot replace built-in auditors
+        Assert.Equal(["csharp:format-check", "csharp:build-WaE", "csharp:test-pass", "csharp:replacement"], names);
     }
 
     [Fact]

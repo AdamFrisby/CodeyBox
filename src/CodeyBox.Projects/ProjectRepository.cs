@@ -228,7 +228,7 @@ public sealed class ProjectRepository : IProjectRepository
         // taken whole from whichever side defines them — we don't try to
         // append defaults to project lists, which would be surprising.
         var mergedMaxIter = project?.MaxIterations ?? defaults?.MaxIterations ?? 3;
-        var mergedSeverity = ParseSeverity(project?.FailingSeverity ?? defaults?.FailingSeverity);
+        var mergedSeverity = AuditSeverityParser.Parse(project?.FailingSeverity ?? defaults?.FailingSeverity);
         var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 10;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
         var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;
