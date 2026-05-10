@@ -184,13 +184,6 @@ internal sealed class PresetConfigLoader
     {
         if (!auditTypes.TryGetValue(incoming.Id, out var existing) || incoming.Replace)
         {
-            if (incoming.Replace && existing is not null)
-            {
-                if (string.IsNullOrWhiteSpace(incoming.DisplayName))
-                    incoming.DisplayName = existing.DisplayName;
-                if (string.IsNullOrWhiteSpace(incoming.ReviewFocus))
-                    incoming.ReviewFocus = existing.ReviewFocus;
-            }
             auditTypes[incoming.Id] = incoming;
             return;
         }
@@ -212,12 +205,6 @@ internal sealed class PresetConfigLoader
     {
         if (!languages.TryGetValue(incoming.Id, out var existing) || incoming.Replace)
         {
-            if (incoming.Replace && existing is not null)
-            {
-                incoming.Marker ??= existing.Marker;
-                if (string.IsNullOrWhiteSpace(incoming.DisplayName))
-                    incoming.DisplayName = existing.DisplayName;
-            }
             languages[incoming.Id] = incoming;
             return;
         }

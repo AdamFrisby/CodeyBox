@@ -5,12 +5,6 @@ namespace CodeyBox.Audit.Presets.Presets;
 
 internal static class LanguagePresetHelpers
 {
-    public const string CSharpMarkerScript = LanguageProjectDiscovery.CSharpDiscoveryScript;
-    public const string PythonMarkerScript = LanguageProjectDiscovery.PythonDiscoveryScript;
-    public const string NodeMarkerScript = LanguageProjectDiscovery.NodeDiscoveryScript;
-    public const string GoMarkerScript = LanguageProjectDiscovery.GoDiscoveryScript;
-    public const string RustMarkerScript = LanguageProjectDiscovery.RustDiscoveryScript;
-
     public static IAuditor Shell(
         string language,
         string markerDescription,

@@ -4,6 +4,9 @@ internal static class EditDistanceHelper
 {
     public static int Compute(string left, string right)
     {
+        if (left.Length > 256 || right.Length > 256)
+            return Math.Max(left.Length, right.Length);
+
         var dp = new int[left.Length + 1, right.Length + 1];
         for (var i = 0; i <= left.Length; i++)
             dp[i, 0] = i;

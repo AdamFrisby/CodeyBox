@@ -78,9 +78,9 @@ public sealed partial class DiffPatternAuditor : IAuditor
 
             // Skip auditing CodeyBox configuration files and test files that contain literal patterns.
             if (currentFile is not null &&
-                (currentFile.StartsWith("codeybox/", StringComparison.OrdinalIgnoreCase) ||
-                 currentFile.Contains("/Defaults/", StringComparison.OrdinalIgnoreCase) ||
-                 currentFile.Contains("/tests/", StringComparison.OrdinalIgnoreCase) ||
+                (currentFile.StartsWith("codeybox", StringComparison.OrdinalIgnoreCase) ||
+                 currentFile.Contains("Defaults", StringComparison.OrdinalIgnoreCase) ||
+                 currentFile.Contains("tests", StringComparison.OrdinalIgnoreCase) ||
                  currentFile.EndsWith("Tests.cs", StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
