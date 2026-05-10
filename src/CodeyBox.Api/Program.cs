@@ -1023,6 +1023,13 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         HostGitIdentity = hostIdentity,
     };
 });
+builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<IGitHost>(),
+    sp.GetRequiredService<ILogger<WorkItemRetrier>>(),
+    sp.GetRequiredService<IAgentStreamSummaryStore>()));
+
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -1054,7 +1061,7 @@ builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<Pipel
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
-    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
     sp.GetRequiredService<OrchestratorOptions>(),
     sp.GetRequiredService<ILogger<QuotaRetryScheduler>>(),
     sp.GetRequiredService<AgentClassRouter>(),

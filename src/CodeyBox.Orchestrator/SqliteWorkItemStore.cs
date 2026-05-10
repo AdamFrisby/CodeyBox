@@ -231,7 +231,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     recovery_attempts = $recovery_attempts,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
-                    preempt_checkpoint = $preempt_checkpoint
+                    preempt_checkpoint = $preempt_checkpoint,
+                    failure_kind = $failure_kind,
+                    quota_reset_at = $quota_reset_at,
+                    next_quota_retry_at = $next_quota_retry_at,
+                    quota_retry_attempts = $quota_retry_attempts
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);

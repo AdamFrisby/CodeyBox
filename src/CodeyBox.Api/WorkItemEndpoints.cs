@@ -373,56 +373,31 @@ internal static class WorkItemEndpoints
         string id,
         RetryWorkItemRequest? body,
         IWorkItemStore store,
-        ITaskQueue queue,
-        IGitHost gitHost,
-        IAgentStreamSummaryStore? streamSummaries,
+        WorkItemRetrier retrier,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
-        var workItemId = item!.Id;
 
         // Only resume from terminal-failed states. Done items have nothing
         // to retry; non-terminal states would race the pipeline.
-        if (item.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
+        if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
             or WorkItemState.AbandonedAfterRecoveryAttempts))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
-        var resumeState = from switch
-        {
-            "work" => WorkItemState.Queued,
-            "audit" => WorkItemState.WorkComplete,
-            "merge" => WorkItemState.AuditPassed,
-            "upstream" => WorkItemState.Merged,
-            _ => (WorkItemState?)null,
-        };
-        if (resumeState is null)
-            return Results.BadRequest(new { error = $"invalid 'from' value '{from}'", valid = new[] { "work", "audit", "merge", "upstream" } });
+        var (success, error, resumeState) = await retrier.RetryAsync(item, from, trigger: "manual", ct);
 
-        // For from != "work", the pipeline expects the bare repo (with the
-        // work branch and any later merges) to still be present. If the
-        // operator deleted it, fail loudly rather than re-clone empty.
-        if (resumeState != WorkItemState.Queued)
+        if (!success)
         {
-            var present = await gitHost.RepositoryExistsAsync(workItemId, ct);
-            if (!present)
-                return Results.Conflict(new
-                {
-                    error = $"cannot retry from '{from}': bare repo for work item {workItemId} no longer exists",
-                    hint = "retry with from=\"work\" to start over from a fresh clone"
-                });
+            if (error!.Contains("no longer exists"))
+                return Results.Conflict(new { error, hint = "retry with from=\"work\" to start over from a fresh clone" });
+
+            return Results.Conflict(new { error });
         }
 
-        // Reset RecoveryAttempts so an abandoned item is not immediately re-abandoned on next restart.
-        var resumed = item.With(resumeState.Value, error: null) with { RecoveryAttempts = 0 };
-        await store.UpdateAsync(resumed, ct);
-        if (streamSummaries is not null)
-            await streamSummaries.DeleteByWorkItemAsync(workItemId, ct);
-        AuditLog.WorkItemRetried(workItemId, from);
-        await queue.EnqueueAsync(resumed.Id, ct);
-        return Results.Accepted($"/workitems/{workItemId}", new { id = workItemId.ToString(), from, state = resumeState.Value.ToString() });
+        return Results.Accepted($"/workitems/{item.Id}", new { id = item.Id.ToString(), from, state = resumeState!.Value.ToString() });
     }
 
     /// <summary>

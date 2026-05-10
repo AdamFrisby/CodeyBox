@@ -455,7 +455,7 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "other");
         }
         finally
         {
@@ -3936,11 +3936,18 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
         var next = current.With(WorkItemState.Failed, error, failureKind: failureKind, quotaResetAt: quotaResetAt);
-        await _store.UpdateAsync(next, ct);
+
+        // Use TryUpdateIfStateAsync to avoid overwriting a state change that happened concurrently (e.g. cancellation via API).
+        var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
+        if (!updated)
+        {
+            _log.LogInformation("Work item {Id} state changed concurrently; skipping Failed transition", item.Id);
+            return;
+        }
 
         if (failureKind == "quota" && _retryScheduler is not null)
         {
-            _retryScheduler.NotifyQuotaFailure(next);
+            await _retryScheduler.NotifyQuotaFailureAsync(next);
         }
 
         _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);

@@ -9,10 +9,10 @@ namespace CodeyBox.Orchestrator;
 /// Hosted service that automatically retries work items that failed due to
 /// quota exhaustion, once quota is available again.
 /// </summary>
-public sealed class QuotaRetryScheduler : BackgroundService
+public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
 {
     private readonly IWorkItemStore _store;
-    private readonly ITaskQueue _queue;
+    private readonly WorkItemRetrier _retrier;
     private readonly AgentClassRouter? _router;
     private readonly IProjectRepository? _projects;
     private readonly IQueueController? _queueController;
@@ -26,7 +26,7 @@ public sealed class QuotaRetryScheduler : BackgroundService
 
     public QuotaRetryScheduler(
         IWorkItemStore store,
-        ITaskQueue queue,
+        WorkItemRetrier retrier,
         OrchestratorOptions opts,
         ILogger<QuotaRetryScheduler> log,
         AgentClassRouter? router = null,
@@ -36,7 +36,7 @@ public sealed class QuotaRetryScheduler : BackgroundService
         TimeProvider? timeProvider = null)
     {
         _store = store;
-        _queue = queue;
+        _retrier = retrier;
         _opts = opts;
         _log = log;
         _router = router;
@@ -201,35 +201,30 @@ public sealed class QuotaRetryScheduler : BackgroundService
         _log.LogInformation("Triggering quota auto-retry ({Trigger}) for work item {Id} (attempt {Attempt})",
             trigger, item.Id, item.QuotaRetryAttempts + 1);
 
-        // Increment retry attempts and reset state to Queued.
-        // Re-using logic from RetryAsync endpoint.
-        var resumed = item.With(WorkItemState.Queued) with
+        // Re-use logic from shared WorkItemRetrier to ensure identical side effects,
+        // audit logs, and conditional state updates (prevents race conditions).
+        var (success, error, _) = await _retrier.RetryAsync(item, from: "work", trigger, ct);
+
+        if (!success)
         {
-            QuotaRetryAttempts = item.QuotaRetryAttempts + 1,
-            RecoveryAttempts = 0
-        };
-
-        // TransitionFailed might have set FailureKind and QuotaResetAt,
-        // .With(Queued) clears them.
-
-        await _store.UpdateAsync(resumed, ct);
-        AuditLog.WorkItemRetried(item.Id, $"auto-retry ({trigger})");
-
-        await _queue.EnqueueAsync(resumed.Id, ct);
+            _log.LogWarning("Failed to trigger quota auto-retry for work item {Id}: {Error}", item.Id, error);
+            return;
+        }
 
         if (_webhooks is not null)
         {
             var project = await _projects!.GetAsync(item.ProjectId, ct);
+            var updated = await _store.GetAsync(item.Id, ct);
             await _webhooks.PublishAsync(new WebhookEvent
             {
-                Event = "workitem.auto_retry",
-                WorkItem = resumed,
+                Event = "work_item.auto_retry",
+                WorkItem = updated ?? item,
                 Project = project,
                 Details = new
                 {
                     workItemId = item.Id.ToString(),
                     reason = "quota",
-                    attemptNumber = resumed.QuotaRetryAttempts,
+                    attemptNumber = (updated?.QuotaRetryAttempts ?? item.QuotaRetryAttempts + 1),
                     triggeredBy = trigger
                 }
             }, CancellationToken.None);
@@ -240,29 +235,35 @@ public sealed class QuotaRetryScheduler : BackgroundService
     /// Notifies the scheduler that a work item has failed with a quota error,
     /// so it can schedule a targeted retry.
     /// </summary>
-    public void NotifyQuotaFailure(WorkItem item)
+    public async Task NotifyQuotaFailureAsync(WorkItem item)
     {
         if (!_opts.AutoRetryOnQuotaFailure.Enabled) return;
         if (item.State != WorkItemState.Failed || item.FailureKind != "quota" || !item.QuotaResetAt.HasValue) return;
 
         var nextRetryAt = item.QuotaResetAt.Value.Add(_opts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin);
-        
+
         // Update the work item with the next retry time so it survives restarts.
-        _ = Task.Run(async () =>
+        try
         {
-            try
+            // We use TryUpdateIfStateAsync to avoid overwriting if it already transitioned.
+            var updated = await _store.TryUpdateIfStateAsync(item with { NextQuotaRetryAt = nextRetryAt }, WorkItemState.Failed, CancellationToken.None);
+            if (updated)
             {
-                var current = await _store.GetAsync(item.Id, CancellationToken.None);
-                if (current is { State: WorkItemState.Failed, FailureKind: "quota" })
-                {
-                    await _store.UpdateAsync(current with { NextQuotaRetryAt = nextRetryAt }, CancellationToken.None);
-                    ScheduleTargetedRetry(item.Id, nextRetryAt);
-                }
+                ScheduleTargetedRetry(item.Id, nextRetryAt);
             }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Error updating NextQuotaRetryAt for work item {Id}", item.Id);
-            }
-        });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error updating NextQuotaRetryAt for work item {Id}", item.Id);
+        }
+    }
+    public override void Dispose()
+    {
+        foreach (var timer in _targetedTimers.Values)
+        {
+            timer.Dispose();
+        }
+        _targetedTimers.Clear();
+        base.Dispose();
     }
 }

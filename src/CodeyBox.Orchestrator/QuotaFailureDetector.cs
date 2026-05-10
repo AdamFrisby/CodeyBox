@@ -22,7 +22,7 @@ public static class QuotaFailureDetector
         ("API Error: 401", QuotaFailureKind.Unauthorized),
     ];
 
-    private static readonly Regex ResetAfterRegex = new(@"reset after (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ResetAfterRegex = new(@"reset after\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public static QuotaDetection? Detect(string? stderr, string? stdout = null)
     {
@@ -39,14 +39,21 @@ public static class QuotaFailureDetector
             if (inStderr || inStdout)
             {
                 DateTimeOffset? resetAt = null;
-                if (!string.IsNullOrEmpty(stderr))
+                // Prefer stderr for reset time as most agents use it, but fall back to stdout.
+                var source = !string.IsNullOrEmpty(stderr) ? stderr : stdout;
+                if (!string.IsNullOrEmpty(source))
                 {
-                    var match = ResetAfterRegex.Match(stderr);
+                    var match = ResetAfterRegex.Match(source);
                     if (match.Success)
                     {
-                        var h = match.Groups[1].Success ? int.Parse(match.Groups[1].Value) : 0;
-                        var m = match.Groups[2].Success ? int.Parse(match.Groups[2].Value) : 0;
-                        var s = match.Groups[3].Success ? int.Parse(match.Groups[3].Value) : 0;
+                        var h = 0;
+                        var m = 0;
+                        var s = 0;
+
+                        if (match.Groups[1].Success && int.TryParse(match.Groups[1].Value, out var hv)) h = Math.Min(hv, 10_000);
+                        if (match.Groups[2].Success && int.TryParse(match.Groups[2].Value, out var mv)) m = Math.Min(mv, 10_000);
+                        if (match.Groups[3].Success && int.TryParse(match.Groups[3].Value, out var sv)) s = Math.Min(sv, 10_000);
+
                         if (h > 0 || m > 0 || s > 0)
                         {
                             resetAt = DateTimeOffset.UtcNow.Add(new TimeSpan(h, m, s));
