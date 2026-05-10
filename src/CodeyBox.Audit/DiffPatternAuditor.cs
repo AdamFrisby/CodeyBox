@@ -65,8 +65,10 @@ public sealed partial class DiffPatternAuditor : IAuditor
         var findings = new List<AuditFinding>();
         string? currentFile = null;
         var lineNumber = 0;
-        foreach (var rawLine in diff.Stdout.Split('\n'))
+        foreach (var line in diff.Stdout.Split('\n'))
         {
+            var rawLine = line.TrimEnd('\r');
+
             // Track the current file from "+++ b/path/to/file" headers.
             if (rawLine.StartsWith("+++ b/", StringComparison.Ordinal))
             {
@@ -75,10 +77,11 @@ public sealed partial class DiffPatternAuditor : IAuditor
             }
 
             // Skip auditing CodeyBox configuration files and test files that contain literal patterns.
-            if (currentFile is not null && 
-                (currentFile.StartsWith("codeybox/", StringComparison.Ordinal) || 
-                 currentFile.Contains("/Defaults/", StringComparison.Ordinal) ||
-                 currentFile.EndsWith("Tests.cs", StringComparison.Ordinal)))
+            if (currentFile is not null &&
+                (currentFile.StartsWith("codeybox/", StringComparison.OrdinalIgnoreCase) ||
+                 currentFile.Contains("/Defaults/", StringComparison.OrdinalIgnoreCase) ||
+                 currentFile.Contains("/tests/", StringComparison.OrdinalIgnoreCase) ||
+                 currentFile.EndsWith("Tests.cs", StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }

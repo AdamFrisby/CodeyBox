@@ -26,7 +26,7 @@ namespace CodeyBox.Audit.Llm;
 /// </summary>
 public sealed class LlmReviewAuditor : IAuditor
 {
-    private const string ResultFile = "/audit/result.json";
+    private const string ResultFile = "audit/result.json";
     private readonly LlmReviewAuditorOptions _opts;
 
     public LlmReviewAuditor(LlmReviewAuditorOptions opts)
@@ -40,8 +40,8 @@ public sealed class LlmReviewAuditor : IAuditor
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
-        // Make /audit available for the agent's structured output.
-        await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", "/audit"] }, ct);
+        // Make audit/ directory available for the agent's structured output.
+        await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", "audit"], WorkingDirectory = workingDirectory }, ct);
 
         var prompt = BuildPrompt(context);
         // Use the per-invocation override supplied by the pipeline for cross-review,
@@ -74,6 +74,7 @@ public sealed class LlmReviewAuditor : IAuditor
         var read = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["cat", ResultFile],
+            WorkingDirectory = workingDirectory
         }, ct);
         if (!read.Success || string.IsNullOrWhiteSpace(read.Stdout))
         {

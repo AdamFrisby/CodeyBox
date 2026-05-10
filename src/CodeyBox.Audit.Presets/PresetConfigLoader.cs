@@ -96,7 +96,7 @@ internal sealed class PresetConfigLoader
             var definition = ReadYamlFile<LanguagePresetDefinition>(file, "language");
             if (definition.Marker?.Script != null)
                 throw new PresetConfigurationException($"{file}: /marker/script is not allowed in repository-provided configuration for security reasons. Use /marker/globs instead.");
-            
+
             ValidateLanguage(file, definition, allowPartial: languages.ContainsKey(definition.Id), isTrusted: false);
             ComposeLanguage(languages, definition);
         }
@@ -323,7 +323,7 @@ internal sealed class PresetConfigLoader
         var errors = new List<string>();
         CollectErrors(result, errors);
 
-        var message = errors.Count > 0 
+        var message = errors.Count > 0
             ? string.Join("; ", errors.Distinct())
             : "schema validation failed";
 
@@ -500,7 +500,7 @@ internal sealed class PresetConfigLoader
     {
         if (string.IsNullOrWhiteSpace(tool))
             return;
-        
+
         if (KnownTools.Contains(tool))
             return;
 
