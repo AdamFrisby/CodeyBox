@@ -38,6 +38,32 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ShipsFullOAuthJsonBundleForInVmRefresh()
+    {
+        // The in-VM claude CLI needs the full credentials file (refresh_token
+        // included) to auto-rotate when the host's access_token expires
+        // mid-run. ClaudeAgentRunner materialises this env var back to
+        // ~/.claude/.credentials.json inside the sandbox.
+        const string raw =
+            """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz","expiresAt":1234567890}}""";
+        var path = WriteCredFile(raw);
+        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+
+        var cred = await p.GetAsync(AgentKind.Claude);
+
+        Assert.NotNull(cred);
+        Assert.Equal(raw, cred!.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar]);
+        Assert.Equal("sk-ant-oat01-abc", cred.EnvironmentVariables["CLAUDE_CODE_OAUTH_TOKEN"]);
+    }
+
+    [Fact]
+    public async Task OAuthJsonEnvVarConstantMatchesGeminiNamingConvention()
+    {
+        // Sanity check the env-var name is the one ClaudeAgentRunner reads.
+        Assert.Equal("CODEYBOX_CLAUDE_OAUTH_JSON", ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar);
+    }
+
+    [Fact]
     public async Task RereadsTokenOnEachCall()
     {
         var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"first"}}""");

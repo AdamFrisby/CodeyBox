@@ -435,10 +435,14 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 //
 // Chain order: BUILT-IN-FIRST → PLUGINS → BUILT-IN-LAST.
 //
-// 1. ClaudeOAuthFileCredentialProvider — reads Claude's token fresh from a
-//    JSON file (default ~/.claude/.credentials.json, the path the local
-//    `claude` CLI refreshes in-place) on every pickup, so a host-side token
-//    rotation is picked up without an orchestrator restart.
+// 1. ClaudeOAuthFileCredentialProvider — reads Claude's credentials fresh
+//    from a JSON file (default ~/.claude/.credentials.json, the path the
+//    local `claude` CLI refreshes in-place) on every pickup, so a host-side
+//    token rotation is picked up without an orchestrator restart. The
+//    provider ships the full creds JSON (including refresh_token) to the
+//    sandbox via CODEYBOX_CLAUDE_OAUTH_JSON so ClaudeAgentRunner can
+//    materialise it inside the VM — the in-VM CLI then auto-rotates instead
+//    of 401-ing when the host rotates the access_token mid-run.
 // 2. Plugin ICredentialProvider implementations — inserted in discovery order
 //    (between OAuth-file and env-var). Vault-issued short-lived credentials
 //    are preferred over env-var fallbacks. Per-project ordering is expressed

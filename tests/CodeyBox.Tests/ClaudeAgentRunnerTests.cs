@@ -1,6 +1,7 @@
 using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -140,4 +141,122 @@ public sealed class ClaudeAgentRunnerTests
 
         Assert.DoesNotContain("--effort", sandbox.CapturedExec!.Argv);
     }
+
+    // ── Sandbox credentials-file materialisation ──────────────────────────────
+
+    [Fact]
+    public async Task RunAsync_WithOAuthJsonBundle_WritesCredentialsFileToSandbox()
+    {
+        // ClaudeAgentRunner.PrepareSandboxAsync must materialise the host's
+        // ~/.claude/.credentials.json inside the VM when the provider has
+        // shipped CODEYBOX_CLAUDE_OAUTH_JSON. This is what lets the in-VM
+        // claude CLI auto-rotate when the host's access_token expires
+        // mid-run; without it, long runs 401 on rework after ~30 minutes.
+        var sandbox = new MultiExecCapturingSandbox();
+        var runner = new ClaudeAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string>
+            {
+                ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-ant-oat01-abc",
+                [ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar] =
+                    """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz"}}""",
+            },
+            new Dictionary<string, string>());
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential);
+
+        // First exec should be the bash hook that writes the creds file.
+        var prep = sandbox.AllExecs[0];
+        Assert.Equal("bash", prep.Argv[0]);
+        Assert.Equal("-c", prep.Argv[1]);
+        var script = prep.Argv[2];
+        Assert.Contains("$HOME/.claude/.credentials.json", script);
+        Assert.Contains("CODEYBOX_CLAUDE_OAUTH_JSON", script);
+        Assert.Contains("chmod 600", script);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithoutOAuthJsonBundle_DoesNotRunPrepHook()
+    {
+        // ANTHROPIC_API_KEY / legacy-only auth flows must not invoke the
+        // bash hook; CapturedExec stays the claude CLI invocation.
+        var sandbox = new MultiExecCapturingSandbox();
+        var runner = new ClaudeAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test" },
+            new Dictionary<string, string>());
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential);
+
+        Assert.Single(sandbox.AllExecs);
+        Assert.Equal("claude", sandbox.AllExecs[0].Argv[0]);
+    }
+
+    [Fact]
+    public async Task RunAsync_NullCredential_DoesNotRunPrepHook()
+    {
+        var sandbox = new MultiExecCapturingSandbox();
+        var runner = new ClaudeAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        Assert.Single(sandbox.AllExecs);
+        Assert.Equal("claude", sandbox.AllExecs[0].Argv[0]);
+    }
+
+    [Fact]
+    public async Task RunAsync_PrepHookFails_PropagatesAsAgentFailure()
+    {
+        // If the sandbox cannot write the creds file, surface the failure
+        // rather than racing on to the claude invocation (which would 401).
+        var sandbox = new MultiExecCapturingSandbox(prepExitCode: 1, prepStderr: "permission denied");
+        var runner = new ClaudeAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string>
+            {
+                [ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar] =
+                    """{"claudeAiOauth":{"accessToken":"x"}}""",
+            },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential);
+
+        Assert.False(result.Success);
+        Assert.Contains("claude auth", result.Summary);
+        Assert.Single(sandbox.AllExecs);
+    }
+}
+
+/// <summary>
+/// Fake sandbox that records every <see cref="SandboxExec"/> it receives.
+/// Used to verify multi-step runners that perform a prep exec before the
+/// agent invocation.
+/// </summary>
+internal sealed class MultiExecCapturingSandbox : ISandbox
+{
+    private readonly int _prepExitCode;
+    private readonly string _prepStderr;
+
+    public MultiExecCapturingSandbox(int prepExitCode = 0, string prepStderr = "")
+    {
+        _prepExitCode = prepExitCode;
+        _prepStderr = prepStderr;
+    }
+
+    public string Id => "fake-multi";
+    public List<SandboxExec> AllExecs { get; } = new();
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+    {
+        AllExecs.Add(exec);
+        // The PrepareSandboxAsync hook runs bash; we distinguish by argv[0].
+        if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
+            return Task.FromResult(new SandboxExecResult(_prepExitCode, string.Empty, _prepStderr));
+        return Task.FromResult(new SandboxExecResult(0, "stdout", "stderr"));
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }

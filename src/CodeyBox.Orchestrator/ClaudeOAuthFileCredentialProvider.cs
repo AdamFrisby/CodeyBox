@@ -5,21 +5,37 @@ using Microsoft.Extensions.Logging;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Reads the Claude OAuth token from a JSON file on every <see cref="GetAsync"/>
-/// call. Designed for the host's <c>~/.claude/.credentials.json</c>, which the
-/// local <c>claude</c> CLI refreshes in-place. Re-reading on each pickup picks
-/// up rotated tokens without an orchestrator restart.
+/// Reads the Claude OAuth credentials from a JSON file on every <see
+/// cref="GetAsync"/> call. Designed for the host's
+/// <c>~/.claude/.credentials.json</c>, which the local <c>claude</c> CLI
+/// refreshes in-place. Re-reading on each pickup picks up rotated tokens
+/// without an orchestrator restart.
 ///
 /// <para>File format expected:</para>
 /// <code>
-/// { "claudeAiOauth": { "accessToken": "sk-ant-oat01-..." } }
+/// { "claudeAiOauth": { "accessToken": "sk-ant-oat01-...", "refreshToken": "..." } }
 /// </code>
+///
+/// <para>The provider surfaces two env vars when the file parses:</para>
+/// <list type="bullet">
+///   <item><description>The legacy sandbox env var (default
+///   <c>CLAUDE_CODE_OAUTH_TOKEN</c>) carrying just the access_token, for
+///   flows that authenticate via Bearer token (API-key style).</description></item>
+///   <item><description><c>CODEYBOX_CLAUDE_OAUTH_JSON</c> carrying the full
+///   file contents (including refresh_token) so that
+///   <see cref="CodeyBox.Agents.Claude.ClaudeAgentRunner"/> can materialise
+///   <c>~/.claude/.credentials.json</c> inside the sandbox. The in-VM CLI
+///   then auto-rotates as needed instead of 401-ing when the host rotates
+///   the access_token mid-run.</description></item>
+/// </list>
 ///
 /// Only handles <see cref="AgentKind.Claude"/>; returns null for other agents
 /// so a chained env-var provider can supply them.
 /// </summary>
 public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
 {
+    public const string OAuthJsonEnvVar = "CODEYBOX_CLAUDE_OAUTH_JSON";
+
     private readonly string _filePath;
     private readonly string _sandboxEnvVar;
     private readonly ILogger<ClaudeOAuthFileCredentialProvider>? _log;
@@ -45,11 +61,24 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
             return null;
         }
 
+        // Read the raw bytes once so the JSON we ship to the sandbox is
+        // identical to what we parse — avoiding a torn read if the host CLI
+        // rotates the file mid-call.
+        string rawContents;
+        try
+        {
+            rawContents = await File.ReadAllTextAsync(_filePath, ct);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Failed to read Claude OAuth file {Path}; falling through", _filePath);
+            return null;
+        }
+
         string token;
         try
         {
-            await using var stream = File.OpenRead(_filePath);
-            using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+            using var doc = JsonDocument.Parse(rawContents);
             if (!doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth) ||
                 !oauth.TryGetProperty("accessToken", out var tokenEl) ||
                 tokenEl.ValueKind != JsonValueKind.String)
@@ -61,14 +90,18 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
         }
         catch (Exception ex)
         {
-            _log?.LogWarning(ex, "Failed to read Claude OAuth file {Path}; falling through", _filePath);
+            _log?.LogWarning(ex, "Failed to parse Claude OAuth file {Path}; falling through", _filePath);
             return null;
         }
 
         if (string.IsNullOrEmpty(token))
             return null;
 
-        var env = new Dictionary<string, string> { [_sandboxEnvVar] = token };
+        var env = new Dictionary<string, string>
+        {
+            [_sandboxEnvVar] = token,
+            [OAuthJsonEnvVar] = rawContents,
+        };
         return new AgentCredential(AgentKind.Claude, env, new Dictionary<string, string>());
     }
 }
