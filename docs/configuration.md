@@ -140,6 +140,36 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 
 ---
 
+## `AutoRetryOnQuotaFailure`
+
+Opt-in automatic re-queue of Failed work items whose failure was caused by
+quota exhaustion (Codex 5-hour rolling, Claude 7-day, Gemini daily, etc.),
+once quota is available again. Only items with `FailureKind = "quota"` are
+eligible; `Cancelled`, `AuditFailed`, and generic `Failed` items are not
+auto-retried.
+
+```json
+"AutoRetryOnQuotaFailure": {
+  "Enabled": false,
+  "PeriodicCheckInterval": "01:00:00",
+  "ClockDriftSafetyMargin": "00:02:00",
+  "MaxAutoRetriesPerWorkItem": 3
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Enabled` | `false` | Master switch. When false, the hosted service is registered but exits at startup; the manual `POST /workitems/{id}/retry` path is unaffected. |
+| `PeriodicCheckInterval` | `01:00:00` (1 h) | Safety-net sweep cadence: every interval the scheduler re-checks every Failed quota item against the quota gate. Catches items whose probe didn't expose a reset timestamp, and re-arms after restarts where a targeted timer was lost. |
+| `ClockDriftSafetyMargin` | `00:02:00` (2 min) | Padding added to the parsed `QuotaResetAt` before firing the targeted retry, to absorb clock drift between this orchestrator and the upstream provider. |
+| `MaxAutoRetriesPerWorkItem` | `3` | Per-item lifetime cap on auto-retries. Prevents ping-pong if the failure was misclassified as quota. Manual retries do not count against this cap. |
+
+Items paused at the project or global queue level are skipped — operators
+pause queues for a reason. Each auto-retry emits a `work_item.auto_retry`
+webhook (see [docs/webhooks.md](webhooks.md#auto_retry-details)).
+
+---
+
 ## `AuditLog`
 
 Rolling file log configuration.

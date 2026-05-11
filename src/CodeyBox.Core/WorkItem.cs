@@ -51,6 +51,30 @@ public sealed record WorkItem
     public string? LastError { get; init; }
 
     /// <summary>
+    /// Informational category of the failure. Set when transitioning to Failed.
+    /// Values: "quota", "timeout", "agent", "infrastructure", "other".
+    /// </summary>
+    public string? FailureKind { get; init; }
+
+    /// <summary>
+    /// When the quota window that caused a "quota" failure is expected to
+    /// reset, if parsed from agent output.
+    /// </summary>
+    public DateTimeOffset? QuotaResetAt { get; init; }
+
+    /// <summary>
+    /// UTC timestamp for the next scheduled auto-retry attempt after a quota
+    /// failure. Used by QuotaRetryScheduler to re-arm timers after restart.
+    /// </summary>
+    public DateTimeOffset? NextQuotaRetryAt { get; init; }
+
+    /// <summary>
+    /// Number of times this work item has been automatically retried after
+    /// a quota failure.
+    /// </summary>
+    public int QuotaRetryAttempts { get; init; }
+
+    /// <summary>
     /// Why the item was cancelled. Only populated when <see cref="State"/> is
     /// <see cref="WorkItemState.Cancelled"/>; null for all other states and for
     /// legacy rows written before this column existed.
@@ -174,10 +198,15 @@ public sealed record WorkItem
     public WorkItem With(
         WorkItemState state,
         string? error = null,
-        WorkItemCancellationReason? cancellationReason = null) => this with
+        WorkItemCancellationReason? cancellationReason = null,
+        string? failureKind = null,
+        DateTimeOffset? quotaResetAt = null) => this with
         {
             State = state,
             LastError = error,
+            FailureKind = state == WorkItemState.Failed ? (failureKind ?? FailureKind) : null,
+            QuotaResetAt = state == WorkItemState.Failed ? (quotaResetAt ?? QuotaResetAt) : null,
+            NextQuotaRetryAt = state == WorkItemState.Failed ? NextQuotaRetryAt : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
             CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
             UpdatedAt = DateTimeOffset.UtcNow,

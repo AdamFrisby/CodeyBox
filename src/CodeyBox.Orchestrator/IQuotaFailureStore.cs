@@ -2,13 +2,6 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-public enum QuotaFailureKind
-{
-    LimitReached,
-    RateLimitExceeded,
-    Unauthorized,
-}
-
 public sealed record QuotaFailureObservation(
     AgentKind Agent,
     string? ModelId,

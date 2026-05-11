@@ -35,6 +35,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `project.queue_paused` | Per-project queue was paused (manual or auto) |
 | `project.queue_resumed` | Per-project queue was resumed |
 | `work_item.recovered` | Dead-worker reaper recovered a work item that was mid-flight when its worker crashed (see [Details](#recovered-details)) |
+| `work_item.auto_retry` | Quota auto-retry scheduler re-queued a Failed work item once its quota window reopened (see [Details](#auto_retry-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
 | `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
@@ -291,6 +292,28 @@ When `event` is `work_item.recovered`, the `details` field is populated:
 | `questionId` | string | The question ID that was answered |
 | `answer` | string | The operator's answer (redacted of secrets) |
 | `answeredBy` | string\|null | Identity of the operator who answered; currently always `null` (auth layer does not yet populate caller identity) |
+
+### `auto_retry` details
+
+When `event` is `work_item.auto_retry`, the `details` field is populated:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "reason": "quota",
+    "attemptNumber": 1,
+    "triggeredBy": "targeted"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item that was auto-retried |
+| `reason` | string | Why the retry was scheduled. Currently always `"quota"`. |
+| `attemptNumber` | int | Which auto-retry attempt this is (1-indexed). Capped at `AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem`. |
+| `triggeredBy` | string | `"targeted"` if fired by the per-item timer at `QuotaResetAt + ClockDriftSafetyMargin`; `"periodic"` if fired by the safety-net sweep. |
 
 ### `question_dismissed` details
 

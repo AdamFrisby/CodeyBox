@@ -1023,6 +1023,13 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         HostGitIdentity = hostIdentity,
     };
 });
+builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<IGitHost>(),
+    sp.GetRequiredService<ILogger<WorkItemRetrier>>(),
+    sp.GetRequiredService<IAgentStreamSummaryStore>()));
+
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -1048,13 +1055,33 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<IWorkItemQuestionStore>(),
     sp.GetRequiredService<IStdoutBroadcaster>(),
     sp.GetService<IAgentStreamStore>(),
-    sp.GetService<IQuotaFailureStore>()));
+    sp.GetService<IQuotaFailureStore>(),
+    sp.GetRequiredService<QuotaRetryScheduler>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
+
+builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    sp.GetRequiredService<OrchestratorOptions>(),
+    sp.GetRequiredService<ILogger<QuotaRetryScheduler>>(),
+    sp.GetRequiredService<AgentClassRouter>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IQueueController>(),
+    sp.GetRequiredService<IWebhookDispatcher>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
+
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.Orchestrator");
-    return OrchestratorOptionsFactory.Build(cbOpts.Concurrency, cbOpts.WorkerPool, startupLog);
+    return OrchestratorOptionsFactory.Build(
+        cbOpts.Concurrency,
+        cbOpts.WorkerPool,
+        cbOpts.AutoRetryOnQuotaFailure.Enabled,
+        cbOpts.AutoRetryOnQuotaFailure.PeriodicCheckInterval,
+        cbOpts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin,
+        cbOpts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem,
+        startupLog);
 });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
     new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
@@ -1213,11 +1240,11 @@ app.MapGet("/quota", async (
                     latestObservedAt = g.Max(x => x.ObservedAt),
                 })
                 .ToList(),
-            wouldAllow = WouldAllow(snapshot.AvailablePct, recentFailure, options),
-            defaultModelWouldAllow = WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options),
+            wouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentFailure, options),
+            defaultModelWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options),
             perModelWouldAllow = modelKeys.ToDictionary(
                 modelId => modelId,
-                modelId => WouldAllow(
+                modelId => QuotaRouter.WouldAllow(
                     snapshot.PerModel.TryGetValue(modelId, out var modelQuota) ? modelQuota.AvailablePct : snapshot.AvailablePct,
                     recentFailuresForProbe.Any(f =>
                     f.Agent == probe.Kind &&
@@ -1254,22 +1281,6 @@ finally
     Log.CloseAndFlush();
 }
 
-static bool WouldAllow(double availablePct, bool recentFailure, QuotaRouterOptions options)
-{
-    if (recentFailure)
-        return false;
-    if (availablePct >= options.MinQuotaPct)
-        return true;
-    if (availablePct >= 0)
-        return false;
-
-    return options.UnknownPolicy switch
-    {
-        QuotaUnknownPolicy.FailOpen => true,
-        QuotaUnknownPolicy.FailCautious => false,
-        _ => !recentFailure,
-    };
-}
 
 static string? ReadClaudeQuotaToken(ILogger log)
 {
@@ -1534,6 +1545,10 @@ namespace CodeyBox.Api
 
         /// <summary>Monthly cost-budget alert sweep configuration. See docs/budget-alerts.md.</summary>
         public BudgetAlertOptions BudgetAlerts { get; set; } = new();
+
+        /// <summary>Automatic retry for quota-failed items.</summary>
+        public AutoRetryOnQuotaFailureConfig AutoRetryOnQuotaFailure { get; set; } = new();
+
         /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 
@@ -1546,6 +1561,14 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+    }
+
+    public sealed class AutoRetryOnQuotaFailureConfig
+    {
+        public bool Enabled { get; set; } = false;
+        public string PeriodicCheckInterval { get; set; } = "01:00:00";
+        public string ClockDriftSafetyMargin { get; set; } = "00:02:00";
+        public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
     }
 
     public sealed class ShutdownOptions

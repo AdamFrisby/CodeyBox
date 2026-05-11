@@ -149,7 +149,8 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     [InlineData("API Error: 401 unauthorized", QuotaFailureKind.Unauthorized)]
     public void Detector_MatchesDocumentedQuotaPatternsOnly(string stderr, QuotaFailureKind expected)
     {
-        Assert.Equal(expected, QuotaFailureDetector.Detect(stderr));
+        var detection = QuotaFailureDetector.Detect(stderr);
+        Assert.Equal(expected, detection?.Kind);
         Assert.Null(QuotaFailureDetector.Detect("ordinary model error"));
     }
 

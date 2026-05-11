@@ -56,6 +56,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly AgentCostCalculator? _costCalculator;
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     private readonly IAgentStreamStore? _agentStreams;
+    private readonly QuotaRetryScheduler? _retryScheduler;
     // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
     // Null when no probes were provided: no quota gate on audit agent.
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
@@ -110,7 +111,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IWorkItemQuestionStore? questionStore = null,
         IStdoutBroadcaster? stdoutBroadcaster = null,
         IAgentStreamStore? agentStreams = null,
-        IQuotaFailureStore? quotaFailures = null)
+        IQuotaFailureStore? quotaFailures = null,
+        QuotaRetryScheduler? retryScheduler = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -130,6 +132,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _stdoutBroadcaster = stdoutBroadcaster;
         _agentStreams = agentStreams;
         _quotaFailures = quotaFailures;
+        _retryScheduler = retryScheduler;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -159,7 +162,7 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} could not resolve project", item.Id);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project: null);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project: null, failureKind: "infrastructure");
             return;
         }
 
@@ -168,7 +171,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var agentKind = item.Agent ?? project.DefaultAgent;
         if (!_agents.TryGet(agentKind, out var agentRunner))
         {
-            await TransitionFailed(item, $"No runner registered for agent '{agentKind}'", CancellationToken.None, project);
+            await TransitionFailed(item, $"No runner registered for agent '{agentKind}'", CancellationToken.None, project, failureKind: "other");
             return;
         }
 
@@ -209,7 +212,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 }, CancellationToken.None);
                 await TransitionFailed(item,
                     $"credential smoke test failed: {smokeResult.FailureReason}",
-                    CancellationToken.None, project);
+                    CancellationToken.None, project, failureKind: "infrastructure");
                 return;
             }
 
@@ -409,6 +412,11 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             throw;
         }
+        catch (OperationCanceledException ex)
+        {
+            _log.LogWarning("Work item {Id} timed out", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "timeout");
+        }
         catch (AuditFailedException ex)
         {
             _log.LogWarning("Work item {Id} audit failed: {Error}", item.Id, ex.Message);
@@ -439,10 +447,15 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             await HandleAgentStuckAsync(item, project, stuckEx);
         }
+        catch (TerminalQuotaError ex)
+        {
+            _log.LogWarning("Work item {Id} failed due to quota: {Error}", item.Id, ex.Message);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "quota", quotaResetAt: ex.ResetAt);
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "other");
         }
         finally
         {
@@ -1116,6 +1129,24 @@ public sealed class PipelineRunner : IPipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
+            var detection = QuotaFailureDetector.Detect(agentResult.Stderr, agentResult.Stdout);
+            if (detection is not null)
+            {
+                await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+                    _quotaFailures,
+                    runner.Kind,
+                    observedModelId,
+                    agentResult.Summary,
+                    agentResult.Stderr,
+                    agentEndedAt,
+                    _auditQuotaOptions.ObservedFailureRetention,
+                    ct,
+                    projectId: item.ProjectId,
+                    stdout: agentResult.Stdout);
+
+                throw new TerminalQuotaError(detection.Kind, $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+            }
+
             await QuotaFailureDetector.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 runner.Kind,
@@ -2203,6 +2234,23 @@ public sealed class PipelineRunner : IPipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
+            var detection = QuotaFailureDetector.Detect(agentResult.Stderr, agentResult.Stdout);
+            if (detection is not null)
+            {
+                await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+                    _quotaFailures,
+                    runner.Kind,
+                    observedModelId,
+                    agentResult.Summary,
+                    agentResult.Stderr,
+                    mergeEndedAt,
+                    _auditQuotaOptions.ObservedFailureRetention,
+                    ct,
+                    projectId: item.ProjectId,
+                    stdout: agentResult.Stdout);
+                throw new TerminalQuotaError(detection.Kind, $"Merge agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+            }
+
             await QuotaFailureDetector.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 runner.Kind,
@@ -3255,7 +3303,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                 {
                     _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
-                    await TransitionFailed(item, conflict.Message, ct, project);
+                    await TransitionFailed(item, conflict.Message, ct, project, failureKind: "infrastructure");
                     break;
                 }
 
@@ -3263,7 +3311,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (attempt < _opts.UpstreamPushMaxAttempts)
                     await Task.Delay(_opts.UpstreamPushBackoff, ct);
                 else
-                    await TransitionFailed(item, $"upstream complete failed after {attempt} attempts: {ex.Message}", ct, project);
+                    await TransitionFailed(item, $"upstream complete failed after {attempt} attempts: {ex.Message}", ct, project, failureKind: "infrastructure");
             }
         }
 
@@ -3849,7 +3897,7 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         else
         {
-            await TransitionFailed(item, stuckEx.Message, CancellationToken.None, project);
+            await TransitionFailed(item, stuckEx.Message, CancellationToken.None, project, failureKind: "agent");
         }
     }
 
@@ -3884,11 +3932,24 @@ public sealed class PipelineRunner : IPipelineRunner
             }, CancellationToken.None);
     }
 
-    private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null)
+    private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
-        var next = current.With(WorkItemState.Failed, error);
-        await _store.UpdateAsync(next, ct);
+        var next = current.With(WorkItemState.Failed, error, failureKind: failureKind, quotaResetAt: quotaResetAt);
+
+        // Use TryUpdateIfStateAsync to avoid overwriting a state change that happened concurrently (e.g. cancellation via API).
+        var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
+        if (!updated)
+        {
+            _log.LogInformation("Work item {Id} state changed concurrently; skipping Failed transition", item.Id);
+            return;
+        }
+
+        if (failureKind == "quota" && _retryScheduler is not null)
+        {
+            await _retryScheduler.NotifyQuotaFailureAsync(next);
+        }
+
         _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
         AuditLog.WorkItemFailed(item.Id, error);
         var effectiveProject = project ?? new Project
