@@ -112,6 +112,35 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
         }
     }
 
+    public async Task<DateTimeOffset?> GetMostRecentAsync(AgentKind agent, string? modelId, TimeSpan window, DateTimeOffset now, CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var cutoff = now.ToUniversalTime() - window;
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT observed_at
+                FROM quota_failures
+                WHERE agent = $agent
+                  AND (($model_id IS NULL AND model_id IS NULL) OR model_id = $model_id)
+                  AND observed_at >= $cutoff
+                ORDER BY observed_at DESC
+                LIMIT 1;
+                """;
+            cmd.Parameters.AddWithValue("$agent", agent.Value);
+            cmd.Parameters.AddWithValue("$model_id", modelId is null ? DBNull.Value : modelId);
+            cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
+            var result = await cmd.ExecuteScalarAsync(ct);
+            if (result is null or DBNull) return null;
+            return DateTimeOffset.TryParse(result.ToString(), out var parsed) ? parsed : null;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
     public async Task<IReadOnlyList<QuotaFailureObservation>> ListRecentAsync(TimeSpan window, DateTimeOffset now, CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct);
