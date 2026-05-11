@@ -106,8 +106,10 @@ public sealed class PerModelObservedFailureBreakerTests : IDisposable
         // "quota exhausted" or floor-based "below floor" rejection reasons.
         var member = new AgentMembership
         {
-            Agent = AgentKind.Gemini, Billing = AgentBilling.Subscription,
-            ModelId = "gemini-3-flash-preview", QualityScore = 100,
+            Agent = AgentKind.Gemini,
+            Billing = AgentBilling.Subscription,
+            ModelId = "gemini-3-flash-preview",
+            QualityScore = 100,
         };
         var reason = AgentClassRouter.FormatObservedFailureReason(member, DateTimeOffset.UtcNow.AddMinutes(-2), DateTimeOffset.UtcNow);
         Assert.DoesNotContain("quota exhausted", reason);
