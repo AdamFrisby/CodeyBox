@@ -34,6 +34,54 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override string PreemptProcessPattern => Binary;
 
+    /// <summary>
+    /// Materialises the host's <c>~/.claude/.credentials.json</c> inside the
+    /// sandbox if the env-var bundle is present (set by
+    /// <c>ClaudeOAuthFileCredentialProvider</c>). The in-VM <c>claude</c> CLI
+    /// reads the file to obtain both access_token and refresh_token, so it can
+    /// auto-rotate without 401-ing when the host's Claude Code rotates the
+    /// access_token mid-run. The legacy <c>CLAUDE_CODE_OAUTH_TOKEN</c> env var
+    /// remains the primary auth path; this hook is purely additive.
+    /// </summary>
+    protected override async Task<AgentResult?> PrepareSandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AgentCredential? credential,
+        AgentResumeContext? resume,
+        CancellationToken ct = default)
+    {
+        // Skip the bash hook entirely when no OAuth bundle is present (e.g.
+        // ANTHROPIC_API_KEY flows); the CLI uses whichever env-var auth path
+        // the credential pipeline plugged in.
+        if (credential is null
+            || !credential.EnvironmentVariables.ContainsKey("CODEYBOX_CLAUDE_OAUTH_JSON"))
+            return null;
+
+        // umask 077 ensures the new file is 0600; the explicit chmod is belt-
+        // and-braces in case the sandbox image overrides umask elsewhere.
+        var script =
+            "set -eu\n" +
+            "umask 077\n" +
+            "mkdir -p \"$HOME/.claude\"\n" +
+            "if [ -n \"${CODEYBOX_CLAUDE_OAUTH_JSON:-}\" ]; then\n" +
+            "  printf '%s' \"$CODEYBOX_CLAUDE_OAUTH_JSON\" > \"$HOME/.claude/.credentials.json\"\n" +
+            "  chmod 600 \"$HOME/.claude/.credentials.json\"\n" +
+            "fi\n";
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["bash", "-c", script],
+        }, ct).ConfigureAwait(false);
+        if (!write.Success)
+        {
+            return new AgentResult(
+                Success: false,
+                Summary: $"failed to materialise claude auth: exit {write.ExitCode}",
+                Stdout: write.Stdout,
+                Stderr: write.Stderr);
+        }
+        return null;
+    }
+
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
         var probe = await sandbox.ExecAsync(new SandboxExec
