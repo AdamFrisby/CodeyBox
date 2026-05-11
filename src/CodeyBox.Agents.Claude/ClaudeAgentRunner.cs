@@ -91,7 +91,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
-        => BuildClaudeInvocation(prompt, modelId, resume: false, captureStructuredStream);
+        => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: false, captureStructuredStream);
 
     protected override AgentInvocation BuildResumeInvocation(
         string prompt,
@@ -99,7 +99,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentResumeContext resume,
         string? modelId = null,
         string? reasoningMode = null)
-        => BuildClaudeInvocation(prompt, modelId, resume: true, captureStructuredStream: false);
+        => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: true, captureStructuredStream: false);
 
     public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
@@ -154,7 +154,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         }
     }
 
-    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, bool resume, bool captureStructuredStream)
+    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, bool resume, bool captureStructuredStream)
     {
         // claude --print sends a single prompt and exits. --dangerously-skip-permissions
         // is appropriate inside the sandbox: the VM boundary IS the permission boundary.
@@ -172,6 +172,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         {
             argv.Add("--model");
             argv.Add(effectiveModel);
+        }
+        // claude --effort accepts: low | medium | high | xhigh | max. Pass
+        // through verbatim when set; the CLI rejects unknown values.
+        if (!string.IsNullOrEmpty(reasoningMode))
+        {
+            argv.Add("--effort");
+            argv.Add(reasoningMode);
         }
         argv.Add(prompt);
         return new AgentInvocation(argv);

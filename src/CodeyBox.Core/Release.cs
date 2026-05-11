@@ -82,4 +82,14 @@ public sealed record DeepAuditContext(
     /// </summary>
     Action<string>? StdoutChunkCallback = null,
     bool CaptureStructuredStream = false,
-    IReadOnlyList<string>? Languages = null);
+    IReadOnlyList<string>? Languages = null,
+    /// <summary>
+    /// Model id to pass to <see cref="AuditRunner"/>. Null lets the runner use
+    /// its own default (e.g. <c>ClaudeAgentRunner.DefaultModelId</c>).
+    /// </summary>
+    string? ModelId = null,
+    /// <summary>
+    /// Reasoning-mode hint passed to <see cref="AuditRunner"/>. The runner maps
+    /// this onto the agent CLI's effort/reasoning flag.
+    /// </summary>
+    string? ReasoningMode = null);

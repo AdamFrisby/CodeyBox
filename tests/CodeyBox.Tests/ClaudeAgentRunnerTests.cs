@@ -94,4 +94,50 @@ public sealed class ClaudeAgentRunnerTests
 
         Assert.Equal(prompt, sandbox.CapturedExec!.Argv[^1]);
     }
+
+    // ── Reasoning-mode plumbing ───────────────────────────────────────────────
+
+    [Theory]
+    [InlineData("low")]
+    [InlineData("medium")]
+    [InlineData("high")]
+    [InlineData("xhigh")]
+    [InlineData("max")]
+    public async Task RunAsync_WithReasoningMode_AppendsEffortFlag(string mode)
+    {
+        var sandbox = new CapturingSandbox();
+        var runner = new ClaudeAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null,
+            modelId: null, reasoningMode: mode);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var effortIdx = argv.IndexOf("--effort");
+        Assert.True(effortIdx >= 0, $"argv must contain --effort when reasoningMode='{mode}'");
+        Assert.Equal(mode, argv[effortIdx + 1]);
+    }
+
+    [Fact]
+    public async Task RunAsync_NoReasoningMode_OmitsEffortFlag()
+    {
+        var sandbox = new CapturingSandbox();
+        var runner = new ClaudeAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null,
+            modelId: null, reasoningMode: null);
+
+        Assert.DoesNotContain("--effort", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task RunAsync_EmptyReasoningMode_OmitsEffortFlag()
+    {
+        var sandbox = new CapturingSandbox();
+        var runner = new ClaudeAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null,
+            modelId: null, reasoningMode: "");
+
+        Assert.DoesNotContain("--effort", sandbox.CapturedExec!.Argv);
+    }
 }

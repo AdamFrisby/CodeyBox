@@ -1570,7 +1570,8 @@ public sealed class PipelineRunner : IPipelineRunner
             auditCts.CancelAfter(project.Audit.PerIterationTimeout);
             using var auditShutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, auditCts);
 
-            var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt);
+            var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt,
+                ModelId: item.ModelId, ReasoningMode: item.ReasoningMode);
             var collectTask = CollectFindingsAsync(project, runner, auditors, repoId, ctx, auditCts.Token);
             var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
             if (completedAuditTask != collectTask)
@@ -1731,7 +1732,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
                 foreach (var (auditor, runner) in toolPairs)
                 {
-                    var run = await ExecAuditorAsync(sandbox, auditor, runner, credential, ctx, ct);
+                    var run = await ExecAuditorAsync(sandbox, auditor, runner, workRunner, credential, ctx, ct);
                     await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                     if (needsCreds && runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= runner.Kind;
@@ -1759,7 +1760,7 @@ public sealed class PipelineRunner : IPipelineRunner
                             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
                         await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
                         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
-                        return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, credential, ctx, ct);
+                        return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, workRunner, credential, ctx, ct);
                     }
                     finally { sem.Release(); }
                 }).ToList();
@@ -1791,6 +1792,7 @@ public sealed class PipelineRunner : IPipelineRunner
         ISandbox sandbox,
         IAuditor auditor,
         IAgentRunner runner,
+        IAgentRunner workRunner,
         AgentCredential? credential,
         AuditContext ctx,
         CancellationToken ct)
@@ -1807,6 +1809,13 @@ public sealed class PipelineRunner : IPipelineRunner
         var stdoutCallback = auditor.Kind == "llm"
             ? BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture)
             : null;
+        // The work item's ModelId came from the AgentMembership picked for the
+        // work agent kind. If audit cross-review picked a different kind, that
+        // model id is vendor-specific and won't be valid for the audit runner —
+        // drop it and let the runner fall back to its DefaultModelId.
+        // ReasoningMode uses the universal low/medium/high vocabulary and is
+        // safe to forward across kinds.
+        var crossKind = runner.Kind != workRunner.Kind;
         // Thread the resolved runner into the context so LlmReviewAuditor
         // can use the cross-review agent instead of its baked-in default.
         var auditorCtx = ctx with
@@ -1815,6 +1824,8 @@ public sealed class PipelineRunner : IPipelineRunner
             AuditCredential = credential,
             StdoutChunkCallback = stdoutCallback,
             CaptureStructuredStream = streamCapture is not null,
+            ModelId = crossKind ? null : ctx.ModelId,
+            ReasoningMode = ctx.ReasoningMode,
         };
         var timingScope = await TimingScope.BeginAsync(
             _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",

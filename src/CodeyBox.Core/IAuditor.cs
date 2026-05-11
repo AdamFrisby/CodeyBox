@@ -80,7 +80,20 @@ public sealed record AuditContext(
     /// the structured (JSON / stream-json) output of the agent CLI in addition
     /// to plain stdout, so the orchestrator can persist it for replay/audit.
     /// </summary>
-    bool CaptureStructuredStream = false);
+    bool CaptureStructuredStream = false,
+    /// <summary>
+    /// Model id to pass to <see cref="AuditRunner"/>, resolved by the pipeline
+    /// from the work item's chosen <c>AgentMembership</c>. Null when the runner
+    /// should use its own default (e.g. when the audit agent kind differs from
+    /// the work agent kind and the membership's model id would be invalid).
+    /// </summary>
+    string? ModelId = null,
+    /// <summary>
+    /// Reasoning-mode hint passed to <see cref="AuditRunner"/>, resolved from
+    /// the work item's <c>AgentMembership.ReasoningMode</c>. The runner maps
+    /// this onto the agent CLI's effort/reasoning flag.
+    /// </summary>
+    string? ReasoningMode = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(

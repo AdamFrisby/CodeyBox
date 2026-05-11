@@ -47,7 +47,10 @@ public sealed class LlmReviewAuditor : IAuditor
         // Use the per-invocation override supplied by the pipeline for cross-review,
         // falling back to the baked-in runner from options (backwards compat).
         var agent = context.AuditRunner ?? _opts.Agent;
-        var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, context.AuditCredential, modelId: null, reasoningMode: null, ct,
+        var agentResult = await agent.RunAsync(sandbox, workingDirectory, prompt, context.AuditCredential,
+            modelId: context.ModelId,
+            reasoningMode: context.ReasoningMode,
+            ct,
             stdoutChunkCallback: context.StdoutChunkCallback,
             captureStructuredStream: context.CaptureStructuredStream);
 

@@ -40,8 +40,8 @@ public sealed class OwaspAsvsDeepAuditor : IDeepAuditor
             workingDirectory,
             prompt,
             credential: null,
-            modelId: null,
-            reasoningMode: null,
+            modelId: context.ModelId,
+            reasoningMode: context.ReasoningMode,
             ct: ct,
             stdoutChunkCallback: context.StdoutChunkCallback,
             captureStructuredStream: context.CaptureStructuredStream);
