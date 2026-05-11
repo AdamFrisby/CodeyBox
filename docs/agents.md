@@ -67,6 +67,10 @@ Run with `--print` for non-interactive output and
 permission boundary. Remove `--dangerously-skip-permissions` if you also
 want the agent's built-in tool-use prompts (you usually don't, inside a VM).
 
+**Reasoning level:** the CLI's `--effort` flag accepts `low | medium | high |
+xhigh | max`. `ReasoningMode` on the agent-class member is passed through
+verbatim; if it's unset the flag is omitted and the CLI's own default applies.
+
 ### GitHub Copilot CLI
 Reads `GH_TOKEN` from the environment. **Important**: a generic
 `GH_TOKEN` grants the agent broad GitHub access, not just Copilot. Issue

@@ -50,10 +50,66 @@ public sealed class LlmReviewAuditorTests
         Assert.Same(credential, runner.ObservedCredential);
     }
 
+    [Fact]
+    public async Task RunAsync_ForwardsModelIdAndReasoningModeToRunner()
+    {
+        var runner = new CredentialCapturingRunner();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
+        });
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work",
+            AuditRunner: runner,
+            ModelId: "claude-opus-4-7",
+            ReasoningMode: "high");
+
+        await auditor.RunAsync(new ResultFileSandbox(), "/work", ctx);
+
+        Assert.Equal("claude-opus-4-7", runner.ObservedModelId);
+        Assert.Equal("high", runner.ObservedReasoningMode);
+    }
+
+    [Fact]
+    public async Task RunAsync_NullModelAndReasoning_StillForwardsNullsNotLiterals()
+    {
+        var runner = new CredentialCapturingRunner();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
+        });
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work",
+            AuditRunner: runner);
+
+        await auditor.RunAsync(new ResultFileSandbox(), "/work", ctx);
+
+        Assert.True(runner.RunCalled);
+        Assert.Null(runner.ObservedModelId);
+        Assert.Null(runner.ObservedReasoningMode);
+    }
+
     private sealed class CredentialCapturingRunner : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Codex;
         public AgentCredential? ObservedCredential { get; private set; }
+        public string? ObservedModelId { get; private set; }
+        public string? ObservedReasoningMode { get; private set; }
+        public bool RunCalled { get; private set; }
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox,
@@ -67,6 +123,9 @@ public sealed class LlmReviewAuditorTests
             bool captureStructuredStream = false)
         {
             ObservedCredential = credential;
+            ObservedModelId = modelId;
+            ObservedReasoningMode = reasoningMode;
+            RunCalled = true;
             return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
         }
     }
