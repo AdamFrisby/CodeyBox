@@ -86,6 +86,27 @@ public interface IGitHost
     Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side commit resolution.");
 
+    /// <summary>
+    /// Resets <paramref name="workBranch"/> in the host bare repo so it points
+    /// at <paramref name="baseBranch"/>'s head, discarding any prior-attempt
+    /// commits on the work branch. If the work branch does not exist, this is
+    /// a no-op. The base branch must resolve to a commit; otherwise the call
+    /// throws. Implementations must verify the post-reset tip and fail loudly
+    /// if it does not equal the base head.
+    ///
+    /// Called from the retry-from-work flow so the agent's next invocation
+    /// observes a pristine base state — the bug this guards against is a
+    /// fail-quiet "Agent produced no changes to commit" outcome when the
+    /// retried agent picks up its prior failed-attempt's commits and decides
+    /// the work is already done.
+    /// </summary>
+    Task ResetWorkBranchToBaseAsync(
+        string repositoryId,
+        string workBranch,
+        string baseBranch,
+        CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side work-branch reset.");
+
     /// <summary>Returns the tree object for a commit or tree-ish expression.</summary>
     Task<string> ResolveTreeAsync(string repositoryId, string treeish, CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side tree resolution.");

@@ -181,6 +181,12 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     [Fact]
     public async Task RetryAfterMainAdvancesEndToEnd()
     {
+        // Retry-from-work (entry = Queued) drops the prior attempt's commits
+        // and starts the agent from a pristine base, so the agent observes
+        // the freshly-advanced main and stacks its new work on it. The prior
+        // attempt's files do NOT carry through to main; the retry-from-work
+        // contract is "start over," not "stack on top." See
+        // RetryFromWorkResetTests for the dedicated coverage.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
         var item = NewItem();
@@ -196,13 +202,13 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
                 Argv =
                 [
                     "sh", "-c",
-                    "git -C \"$1\" log -1 --format=%s origin/main > \"$1/observed-origin-main-subject.txt\" && git -C \"$1\" merge-base --is-ancestor origin/main HEAD",
+                    "git -C \"$1\" log -1 --format=%s origin/main > \"$1/observed-origin-main-subject.txt\" && git -C \"$1\" merge-base --is-ancestor origin/main HEAD && test ! -e \"$1/prior.txt\"",
                     "sh",
                     workingDirectory,
                 ],
             }, ct);
             if (!observed.Success)
-                throw new InvalidOperationException($"agent did not see rebased branch: {observed.Stderr}");
+                throw new InvalidOperationException($"agent did not see pristine fresh main: {observed.Stderr}");
         };
         tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent saw fresh main\n"));
 
@@ -212,8 +218,12 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal("dependency landed\n", await ShowAsync(barePath, "main:observed-origin-main-subject.txt"));
-        Assert.Equal("prior attempt\n", await ShowAsync(barePath, "main:prior.txt"));
         Assert.Equal("agent saw fresh main\n", await ShowAsync(barePath, "main:agent.txt"));
+
+        // The prior attempt's file must not appear on main — retry-from-work
+        // resets the work branch to base before invoking the agent.
+        var priorOnMain = await TestSupport.RunGitNoThrow(barePath, "show", "main:prior.txt");
+        Assert.NotEqual(0, priorOnMain.code);
     }
 
     [Fact]

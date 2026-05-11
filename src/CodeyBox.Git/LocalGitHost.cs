@@ -261,6 +261,67 @@ public sealed class LocalGitHost : IGitHost
         return rc.Stdout.Trim();
     }
 
+    public async Task ResetWorkBranchToBaseAsync(
+        string repositoryId,
+        string workBranch,
+        string baseBranch,
+        CancellationToken ct = default)
+    {
+        Validation.ValidateBranchName(workBranch, nameof(workBranch));
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+        if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"refusing to reset workBranch '{workBranch}' onto itself; baseBranch must differ");
+
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            throw new InvalidOperationException($"bare repo for '{repositoryId}' does not exist at {path}");
+        SanitizeBareRepositoryConfig(path);
+
+        var baseResolved = await RunGitAsync(
+            workdir: path, ct,
+            "rev-parse", "--verify", $"refs/heads/{baseBranch}^{{commit}}");
+        if (baseResolved.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"cannot reset work branch '{workBranch}': base branch '{baseBranch}' did not resolve to a commit: {baseResolved.Stderr}");
+        var baseSha = baseResolved.Stdout.Trim();
+
+        var existing = await RunGitAsync(
+            workdir: path, ct,
+            "rev-parse", "--verify", $"refs/heads/{workBranch}^{{commit}}");
+        if (existing.ExitCode == 0)
+        {
+            var oldSha = existing.Stdout.Trim();
+            if (!string.Equals(oldSha, baseSha, StringComparison.Ordinal))
+            {
+                var update = await RunGitAsync(
+                    workdir: path, ct,
+                    "update-ref", $"refs/heads/{workBranch}", baseSha, oldSha);
+                if (update.ExitCode != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"git update-ref to reset '{workBranch}' from {oldSha} to base '{baseBranch}' ({baseSha}) failed: {update.Stderr}");
+                }
+                _log.LogInformation(
+                    "Reset work branch '{WorkBranch}' in bare repo {RepoId} from {OldTip} to base '{BaseBranch}' tip {BaseTip} for fresh work-phase entry",
+                    workBranch, repositoryId, oldSha, baseBranch, baseSha);
+            }
+        }
+
+        var verify = await RunGitAsync(
+            workdir: path, ct,
+            "rev-parse", "--verify", $"refs/heads/{workBranch}^{{commit}}");
+        if (verify.ExitCode == 0)
+        {
+            var verifiedSha = verify.Stdout.Trim();
+            if (!string.Equals(verifiedSha, baseSha, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"work branch '{workBranch}' tip after reset is {verifiedSha}, expected base '{baseBranch}' tip {baseSha}");
+            }
+        }
+    }
+
     public async Task<string> ResolveTreeAsync(string repositoryId, string treeish, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);

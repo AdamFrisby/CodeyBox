@@ -247,8 +247,24 @@ public sealed class PipelineRunner : IPipelineRunner
             var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged;
             var skipMerge = entry is WorkItemState.Merged;
 
-            if (!skipWork || !skipAudit || !skipMerge)
+            // Fresh work-phase entry (a new WI, or a retry-from-work) must
+            // observe a pristine base state. Reset the work branch in the
+            // bare repo to the base tip so the sandbox clone does not carry
+            // over a prior failed-attempt's commits — without this, the
+            // retried agent inspects the work tree, sees its own prior work
+            // already applied, and exits without writing anything, producing
+            // the fail-quiet "Agent produced no changes to commit" symptom.
+            // For non-Queued entries (resume from audit/merge/upstream) the
+            // existing rebase preserves prior phase commits as intended.
+            if (entry is WorkItemState.Queued
+                && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+            {
+                await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
+            }
+            else if (!skipWork || !skipAudit || !skipMerge)
+            {
                 await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
+            }
 
             // Compose auditors up-front: the work-phase prompt advises the
             // agent to run the mechanical (shell) auditors itself before

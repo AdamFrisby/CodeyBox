@@ -38,6 +38,14 @@ internal static class TestSupport
 
     public static async Task<(int code, string stdout, string stderr)> RunGit(string cwd, params string[] args)
     {
+        var rc = await RunGitNoThrow(cwd, args);
+        if (rc.code != 0)
+            throw new InvalidOperationException($"git {string.Join(' ', args)} failed: {rc.stderr}");
+        return rc;
+    }
+
+    public static async Task<(int code, string stdout, string stderr)> RunGitNoThrow(string cwd, params string[] args)
+    {
         var psi = new ProcessStartInfo
         {
             FileName = "git",
@@ -51,8 +59,6 @@ internal static class TestSupport
         var stdout = await p.StandardOutput.ReadToEndAsync();
         var stderr = await p.StandardError.ReadToEndAsync();
         await p.WaitForExitAsync();
-        if (p.ExitCode != 0)
-            throw new InvalidOperationException($"git {string.Join(' ', args)} failed: {stderr}");
         return (p.ExitCode, stdout, stderr);
     }
 
