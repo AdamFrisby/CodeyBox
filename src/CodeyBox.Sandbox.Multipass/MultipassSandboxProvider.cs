@@ -717,6 +717,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// other VM users. We avoid /run/codeybox/ because that dir is owned by
     /// root and would force a sudo dance to install the file readable by
     /// the non-root exec user.
+    ///
+    /// The transfer call is wrapped in <see cref="MultipassRetry.RunWithRetryAsync"/>
+    /// because multipass returns from <c>launch</c> / <c>start</c> as soon
+    /// as the VM is in Running state, but the in-VM <c>sshd</c> can take a
+    /// few more seconds to bind its listener — under audit-parallelism load
+    /// this race is likely enough to break sandbox creation, and the fix is
+    /// to retry the underlying SCP/SFTP transfer rather than block every
+    /// healthy creation on a fixed sleep.
     /// </summary>
     private async Task<string> TransferEnvAsync(string name, IReadOnlyDictionary<string, string> env, string sandboxRoot, CancellationToken ct)
     {
@@ -725,9 +733,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         if (!OperatingSystem.IsWindows())
             File.SetUnixFileMode(envPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
-        var tx = await RunAsync(
-            [_opts.MultipassBinary, "transfer", envPath, $"{name}:.codeybox-env"],
-            stdin: null, ct: ct);
+        var tx = await MultipassRetry.RunWithRetryAsync(
+            ctInner => RunAsync(
+                [_opts.MultipassBinary, "transfer", envPath, $"{name}:.codeybox-env"],
+                stdin: null, ct: ctInner),
+            _log,
+            description: $"multipass transfer env file -> {name}",
+            ct);
         if (tx.ExitCode != 0)
             throw new InvalidOperationException($"multipass transfer env file failed: {tx.Stderr}");
 
@@ -942,6 +954,116 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 }
 
 internal readonly record struct RunResult(int ExitCode, string Stdout, string Stderr);
+
+/// <summary>
+/// Retries a multipass-CLI call when its stderr indicates the in-VM SSH
+/// daemon hasn't yet bound to its listener. After <c>multipass launch</c>
+/// (or <c>start</c>) returns, the VM shows as Running but <c>sshd</c> can
+/// still take a few seconds to come up; SCP/SFTP-based operations
+/// (<c>multipass transfer</c>) race that window and fail with "Connection
+/// refused" or "Connection reset by peer". This race is more likely under
+/// audit-parallelism load when several VMs are starting at once.
+///
+/// We retry on those specific stderr signatures with exponential backoff
+/// and a bounded wall-clock budget. Persistent SSH refusal, or any other
+/// multipass error ("instance not found", auth failure, etc.) fails fast
+/// — the bug we're papering over is *transient*; a stuck VM still needs
+/// to surface.
+/// </summary>
+internal static class MultipassRetry
+{
+    /// <summary>Number of attempts including the first try. 6 attempts → up to ~23s of delay.</summary>
+    internal const int DefaultMaxAttempts = 6;
+    /// <summary>Initial delay before the first retry.</summary>
+    internal static readonly TimeSpan DefaultInitialDelay = TimeSpan.FromSeconds(1);
+    /// <summary>Maximum delay between any two retries.</summary>
+    internal static readonly TimeSpan DefaultMaxDelay = TimeSpan.FromSeconds(8);
+
+    /// <summary>
+    /// True when <paramref name="stderr"/> matches one of the transient
+    /// SSH-not-ready signatures we retry on. Anything else — including
+    /// "instance not found", auth errors, or unrelated multipass failures
+    /// — is treated as non-retryable so the caller can fail fast.
+    /// </summary>
+    internal static bool IsSshNotReady(string? stderr)
+    {
+        if (string.IsNullOrEmpty(stderr)) return false;
+        return stderr.Contains("Connection refused", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("Connection reset by peer", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Exponential backoff: <c>initial * 2^attempt</c>, capped at <paramref name="max"/>.
+    /// <paramref name="attempt"/> is 0-indexed (the delay BEFORE retry attempt N+1).
+    /// </summary>
+    internal static TimeSpan ComputeBackoff(int attempt, TimeSpan initial, TimeSpan max)
+    {
+        if (attempt < 0) throw new ArgumentOutOfRangeException(nameof(attempt));
+        if (initial <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(initial));
+        if (max < initial) throw new ArgumentOutOfRangeException(nameof(max));
+        // Cap the shift exponent to keep arithmetic well-defined even for
+        // pathologically large attempt numbers. Anything past ~30 is already
+        // saturated against `max` anyway.
+        var shift = Math.Min(attempt, 30);
+        var multiplier = 1L << shift;
+        // Use checked arithmetic: even with shift capped at 30, initial.Ticks * multiplier
+        // could overflow for a very large initial. Saturate to max on overflow.
+        long ticks;
+        try { ticks = checked(initial.Ticks * multiplier); }
+        catch (OverflowException) { return max; }
+        return ticks >= max.Ticks ? max : TimeSpan.FromTicks(ticks);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="action"/>, retrying when its result's stderr
+    /// indicates SSH-not-ready. Returns the final <see cref="RunResult"/> —
+    /// the caller is responsible for translating a non-zero ExitCode into
+    /// an exception. Non-retryable failures (any non-zero exit whose stderr
+    /// is NOT a known SSH-not-ready signature) short-circuit immediately.
+    ///
+    /// <para>For tests, pass <paramref name="delay"/> and <paramref name="backoff"/>
+    /// to avoid sleeping; production callers use the defaults.</para>
+    /// </summary>
+    internal static async Task<RunResult> RunWithRetryAsync(
+        Func<CancellationToken, Task<RunResult>> action,
+        ILogger log,
+        string description,
+        CancellationToken ct,
+        int maxAttempts = DefaultMaxAttempts,
+        Func<int, TimeSpan>? backoff = null,
+        Func<TimeSpan, CancellationToken, Task>? delay = null)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        ArgumentNullException.ThrowIfNull(log);
+        if (maxAttempts < 1) throw new ArgumentOutOfRangeException(nameof(maxAttempts));
+
+        backoff ??= attempt => ComputeBackoff(attempt, DefaultInitialDelay, DefaultMaxDelay);
+        delay ??= static (d, t) => Task.Delay(d, t);
+
+        RunResult result = default;
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            result = await action(ct).ConfigureAwait(false);
+            if (result.ExitCode == 0) return result;
+            // Non-retryable error: fail fast so callers see the real diagnostic
+            // (e.g. "instance not found") rather than a 30-second stall on what
+            // was never going to recover.
+            if (!IsSshNotReady(result.Stderr)) return result;
+            // Last attempt — no delay, return so caller can throw.
+            if (attempt == maxAttempts - 1) break;
+            var d = backoff(attempt);
+            log.LogDebug(
+                "{Description}: SSH not ready (attempt {Attempt}/{Max}); retrying after {Delay}. stderr: {Stderr}",
+                description, attempt + 1, maxAttempts, d, result.Stderr.Trim());
+            await delay(d, ct).ConfigureAwait(false);
+        }
+        log.LogWarning(
+            "{Description}: SSH still refusing after {Max} attempts; surfacing failure. stderr: {Stderr}",
+            description, maxAttempts, result.Stderr.Trim());
+        return result;
+    }
+}
 
 public sealed record MultipassSandboxOptions
 {
