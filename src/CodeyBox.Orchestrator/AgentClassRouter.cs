@@ -148,12 +148,17 @@ public sealed class AgentClassRouter
         foreach (var entry in sorted)
         {
             var member = entry.Member;
-            if (member.Billing == AgentBilling.Subscription
-                && _quotaFailures is not null
-                && await _quotaFailures.HasRecentAsync(member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct))
+            if (member.Billing == AgentBilling.Subscription && _quotaFailures is not null)
             {
-                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "recent quota-shaped failure"));
-                continue;
+                var observedAt = await _quotaFailures.GetMostRecentAsync(
+                    member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct);
+                if (observedAt is { } seenAt)
+                {
+                    var reason = FormatObservedFailureReason(member, seenAt, _time.GetUtcNow());
+                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, reason);
+                    rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reason));
+                    continue;
+                }
             }
 
             var snapshot = await ProbeAsync(member, ct);
@@ -244,11 +249,35 @@ public sealed class AgentClassRouter
 
     private async Task<QuotaGateDecision> EvaluateObservedFailuresAsync(AgentMembership member, CancellationToken ct)
     {
-        if (_quotaFailures is not null
-            && await _quotaFailures.HasRecentAsync(member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct))
-            return new QuotaGateDecision(false, "quota unknown; recent quota-shaped failure");
+        if (_quotaFailures is null)
+            return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure");
+
+        var observedAt = await _quotaFailures.GetMostRecentAsync(
+            member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct);
+        if (observedAt is { } seenAt)
+            return new QuotaGateDecision(false, $"quota unknown; {FormatObservedFailureReason(member, seenAt, _time.GetUtcNow())}");
 
         return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure");
+    }
+
+    /// <summary>
+    /// Builds the rejection reason for an observed-failure breaker hit.
+    /// Format: <c>"observed quota failure 8 minutes ago" on agent/model</c>.
+    /// Distinct from <c>"quota exhausted"</c> (probe-derived) and
+    /// <c>"below floor"</c> so audit log readers can tell breaker hits apart.
+    /// </summary>
+    internal static string FormatObservedFailureReason(AgentMembership member, DateTimeOffset observedAt, DateTimeOffset now)
+    {
+        var ageSeconds = Math.Max(0, (long)(now - observedAt).TotalSeconds);
+        string ageDesc;
+        if (ageSeconds < 60)
+            ageDesc = $"{ageSeconds} seconds ago";
+        else if (ageSeconds < 3600)
+            ageDesc = $"{ageSeconds / 60} minutes ago";
+        else
+            ageDesc = $"{ageSeconds / 3600}h{ageSeconds % 3600 / 60}m ago";
+        var modelDesc = string.IsNullOrEmpty(member.ModelId) ? member.Agent.Value : $"{member.Agent.Value}/{member.ModelId}";
+        return $"{modelDesc} observed quota failure {ageDesc}";
     }
 
     internal static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member)

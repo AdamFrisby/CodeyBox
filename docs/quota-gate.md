@@ -39,20 +39,46 @@ Unexpected JSON fields are ignored. Missing fields make only that part unknown.
 
 ## Observed-Failure Breaker
 
-When an agent exits unsuccessfully and stderr contains one of the documented
-quota patterns, CodeyBox records
+When an agent exits unsuccessfully and stderr **or** stdout contains one of
+the documented quota patterns, CodeyBox records
 `(agent, modelId, failureKind, observedAt)` in `state.db`, with `projectId`
 retained only as diagnostic metadata when available. Subscription quota walls
-are account-wide, so the router skips the same `(agent, modelId)` for
-`ObservedFailureWindowMinutes` across all projects even if the next probe is
-unknown or stale.
+are per-`(agent, modelId)` (some vendor quotas are per-model rolling windows
+invisible to the per-agent probe), so the router skips the exact
+`(agent, modelId)` for `ObservedFailureWindowMinutes` across all projects
+even if the next probe still reports the per-agent ceiling as available.
+Other models on the same agent are not blocked.
 
 Recognized patterns are intentionally conservative:
 
 - `hit your usage limit`
 - `hit your limit`
 - `rate_limit_exceeded`
+- `RESOURCE_EXHAUSTED`
+- `exceeded the rate limit`
+- `quota exceeded`
+- `exhausted your capacity` (Gemini per-model wall)
 - `API Error: 401`
+
+Detection scans stderr, plain-text stdout, and (when present) the structured
+NDJSON stream-json events emitted by claude/codex/gemini CLIs. Stream-json
+error envelopes recognised:
+
+- `{"type":"result","status":"error","error":{"message":"..."}}` (gemini)
+- `{"type":"result","is_error":true,"result":"..."}` (claude)
+- `{"type":"error","message":"..."}` and `{"msg":{"type":"error","message":"..."}}` (codex)
+
+The reset interval (e.g. `reset after 21h41m24s`, `try again after 5m17s`)
+is parsed and persisted as `WorkItem.QuotaResetAt` so the targeted retry
+timer fires once the wall expires.
+
+Routing-log rejections distinguish three cases so audit-log readers can tell
+breaker hits apart from probe-derived rejections:
+
+- `observed quota failure 8 minutes ago` — per-(agent, model) breaker hit.
+- `quota exhausted` — probe returned a value below `MinQuotaPct`.
+- `below floor (X < Y)` — member's `QualityScore` is below the work item's
+  `MinModelScore`.
 
 Records are retained for `ObservedFailureRetentionMinutes`.
 
