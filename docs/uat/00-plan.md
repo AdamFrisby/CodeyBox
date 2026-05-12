@@ -950,6 +950,29 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 - **Automatable**: configuration binding, auth validator, unsafe sandbox guard, validation failures.
 - **Manual / spec-only**: deployment smoke with production-like environment variables.
 
+### API health check endpoint - Exposes an anonymous liveness probe for deployment monitors
+
+**Source**: `src/CodeyBox.Api/Program.cs`, `src/CodeyBox.Api/ApiKeyAuth.cs`
+**Related PRs**: none known
+
+#### Primary user flows
+1. Load balancer or operator calls `GET /healthz` - API returns `200 OK` with `{ "status": "ok" }`.
+2. API key auth is enabled - `/healthz` remains reachable without an `Authorization` header because it is registered as an anonymous prefix.
+3. Auth-disabled development host calls `/healthz` - response remains identical to the authenticated deployment behavior.
+
+#### Edge cases
+- Request includes an invalid bearer token - anonymous prefix bypasses token validation and still returns health.
+- Request path starts with `/healthz` and has extra segments - middleware prefix behavior is explicit and should be covered according to `StartsWithSegments` semantics.
+- Startup configuration is invalid - health endpoint is not served because host startup validation fails before requests are accepted.
+
+#### Failure modes
+- Middleware ordering changes - health endpoint incorrectly starts requiring auth or bypassing unrelated protected endpoints.
+- Endpoint response shape changes - deployment probes and smoke checks lose a stable contract.
+
+#### Test approach
+- **Automatable**: in-memory API host tests for anonymous `GET /healthz`, response status/body, invalid-token request, and protected endpoint still requiring auth.
+- **Manual / spec-only**: deployment/load-balancer liveness probe against a production-like host.
+
 ## Persistence And Recovery
 
 ### SQLite work-item and auxiliary stores - Persists durable pipeline state and related records
@@ -1292,6 +1315,29 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 - **Automatable**: command handlers with fake HTTP, auth resolution order, output formats, error handling, watch polling.
 - **Manual / spec-only**: installed CLI against running API.
 
+### CLI version command - Prints the installed `codeybox` client version without contacting the API
+
+**Source**: `tools/CodeyBox.Cli/CliApp.cs`, `tools/CodeyBox.Cli/Commands/VersionCommand.cs`, `tools/CodeyBox.Cli/Program.cs`
+**Related PRs**: none known
+
+#### Primary user flows
+1. Operator runs `codeybox version` - CLI prints `CliApp.CliVersion` and exits successfully.
+2. Operator has no API URL, API key, or config file - version still works because it does not resolve API configuration or create an HTTP client.
+3. Operator invokes root help - version command appears alongside queue and configure commands.
+
+#### Edge cases
+- Global `--api-url` or `--api-key` options are supplied with `version` - command ignores them and still prints the local client version.
+- Stdout is redirected - output remains a single line suitable for scripts.
+- Version constant changes for a release - command output tracks the compiled `CliApp.CliVersion` value.
+
+#### Failure modes
+- Version command is not registered on the root command - installed CLI cannot report its version.
+- Handler accidentally depends on config resolution - missing or malformed config breaks a local metadata command.
+
+#### Test approach
+- **Automatable**: command invocation for `version`, help registration, no client factory/config access, stdout single-line output.
+- **Manual / spec-only**: installed CLI binary reports the expected packaged version.
+
 ### Project configuration wizard - Generates appsettings project entries from interactive prompts
 
 **Source**: `src/CodeyBox.Cli/Program.cs`
@@ -1413,6 +1459,7 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 | Queue pause, resume, and status endpoints | Yes | Yes | Queue controller, worker pool, admin UI |
 | Project repository and defaults | Yes | Yes | Options binding, pipeline runner |
 | API configuration and startup validation | Yes | Yes | Program startup, options classes |
+| API health check endpoint | Yes | Yes | API host, API key auth middleware |
 | SQLite work-item and auxiliary stores | Yes | Yes | State database path, all persistence-backed features |
 | Restart resumption and recovery caps | Yes | Yes | Worker pool, SQLite stores, dead-worker reaper |
 | Upstream remotes and PR completion | Yes | Yes | Git host, project upstream config, credentials |
@@ -1427,6 +1474,7 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 | Agent stream retention sweep | Yes | Yes | Agent stream store, stream retention config |
 | Fleet and worker observability endpoints | Yes | Yes | Worker registry, work item store |
 | CLI client `codeybox` | Yes | Yes | API endpoints, auth config |
+| CLI version command | Yes | Yes | CLI root command registration |
 | Project configuration wizard | Yes | Yes | Spectre.Console prompts, project config schema |
 | Admin dashboard | Partial | Yes | API client, SignalR, all operator APIs |
 | API authentication and redaction | Yes | Yes | API host, logging, agent streams, upstream credentials |
