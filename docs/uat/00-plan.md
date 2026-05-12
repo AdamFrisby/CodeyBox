@@ -557,6 +557,30 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 - **Automatable**: prompt construction, agent override selection, model/reasoning plumbing, parse failures, deep audit remediation loop with fake agents.
 - **Manual / spec-only**: human review of LLM prompt quality and real release branch deep audit.
 
+### Audit-agent startup validation - Warns when configured audit agents lack credentials
+
+**Source**: `src/CodeyBox.Orchestrator/AuditAgentStartupValidationService.cs`, `src/CodeyBox.Api/Program.cs`, `src/CodeyBox.Core/Project.cs`, `src/CodeyBox.Core/ICredentialProvider.cs`
+**Related PRs**: none known
+
+#### Primary user flows
+1. Host starts with projects configured - service enumerates projects asynchronously without blocking host startup.
+2. Project has `AuditAgent` different from the work agent - credential provider is queried for that audit agent.
+3. Project has per-auditor agent overrides - each distinct override is validated once and warnings name the project, audit agent, and fallback work agent.
+
+#### Edge cases
+- Audit agent equals project default work agent - validation skips it because normal work-agent credential checks cover it.
+- Same audit agent appears globally and per-auditor - de-duplication prevents duplicate warnings.
+- Project list cannot be loaded at startup - service logs debug and leaves runtime fallback behavior unchanged.
+
+#### Failure modes
+- Credential provider returns null - service logs a warning that runtime will fall through to the work agent.
+- Credential provider throws - service logs a warning with the agent and project context.
+- Startup validation task faults after `StartAsync` returns - host remains running and tests should observe `StartupTask`.
+
+#### Test approach
+- **Automatable**: project enumeration, global/per-auditor de-duplication, default-agent skip, missing credential warning, provider exception warning, non-blocking startup.
+- **Manual / spec-only**: operator review of startup logs in a mixed-agent deployment.
+
 ### Audit iteration loop and parallelism - Reworks findings until pass or configured failure
 
 **Source**: `src/CodeyBox.Orchestrator/PipelineRunner.cs`, `src/CodeyBox.Core/IAuditor.cs`, `src/CodeyBox.Orchestrator/SqliteAuditReportStore.cs`, `src/CodeyBox.Api/AuditReportEndpoints.cs`, `docs/audit-reports.md`
@@ -600,6 +624,29 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 #### Test approach
 - **Automatable**: severity parsing, ID stability, report serialization, UI matrix grouping.
 - **Manual / spec-only**: visual inspection of large finding sets.
+
+### Audit report retention sweep - Deletes expired persisted audit report rows
+
+**Source**: `src/CodeyBox.Orchestrator/AuditReportRetentionService.cs`, `src/CodeyBox.Orchestrator/SqliteAuditReportStore.cs`, `src/CodeyBox.Core/IAuditReportStore.cs`, `src/CodeyBox.Api/Program.cs`
+**Related PRs**: none known
+
+#### Primary user flows
+1. Host starts - retention service immediately computes `UtcNow - CodeyBox:AuditLog:RetainedDays` and deletes older `audit_reports` rows.
+2. Host keeps running - sweep repeats daily using `PeriodicTimer`.
+3. Old rows are deleted - service logs the deleted count and cutoff only when rows were removed.
+
+#### Edge cases
+- `RetainedDays` is the minimum valid value - startup validation accepts values `>= 1` and the cutoff is still computed in UTC.
+- Audit report table is empty - sweep completes with zero deleted rows and no noisy log.
+- Shutdown occurs during timer wait or store delete - cancellation exits without warning noise.
+
+#### Failure modes
+- Store delete fails - service logs a warning and retries on the next daily sweep.
+- Cutoff formatting or clock drift creates boundary ambiguity - tests should pin rows around the cutoff and assert only `started_at < cutoff` is deleted.
+
+#### Test approach
+- **Automatable**: immediate startup sweep, cutoff calculation, SQLite `DeleteOlderThanAsync`, zero-delete path, exception logging, cancellation handling.
+- **Manual / spec-only**: long-running environment check that retained report rows match configured days after multiple daily sweeps.
 
 ## Plugins
 
@@ -1072,6 +1119,33 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 - **Automatable**: release API transitions, branch creation race, closed-to-review trigger, deep audit pass/fail, reopen/abandon/release endpoints.
 - **Manual / spec-only**: full release to GitHub tag and release notes.
 
+### Release main sync service - Periodically merges the project main branch into open release branches
+
+**Source**: `src/CodeyBox.Orchestrator/ReleaseMainSyncService.cs`, `src/CodeyBox.Api/Program.cs`, `src/CodeyBox.Core/Release.cs`, `src/CodeyBox.Core/Project.cs`, `src/CodeyBox.Core/IUpstreamRemote.cs`, `src/CodeyBox.Core/IWebhookDispatcher.cs`
+**Related PRs**: #113
+
+#### Primary user flows
+1. Background service wakes every five minutes - it lists open releases and skips anything without a release branch.
+2. Project release config has `AutoSyncMainInterval` - due releases merge the project default base branch, or `main`, into the release branch via the configured upstream remote.
+3. Merge succeeds - service records the in-memory last-sync timestamp and logs the source and target branches.
+4. Merge reports conflict - service records the last-sync timestamp, publishes `release.sync_conflict`, and leaves conflict resolution to a human.
+
+#### Edge cases
+- Project cannot be found or release management is disabled - release is skipped.
+- Auto-sync interval is null - release is skipped because periodic sync is disabled for that project.
+- Host restarts - in-memory last-sync state resets, so open releases are eligible on the first sweep after startup.
+- Custom project default branch is configured - sync uses that branch instead of hard-coded `main`.
+
+#### Failure modes
+- Listing open releases fails - service logs a warning and skips the sweep.
+- Project load fails for one release - that release is skipped while other open releases continue.
+- Upstream merge throws - service logs a warning and does not update last-sync time, allowing the next sweep to retry.
+- Webhook dispatch fails on conflict - dispatcher failure is surfaced through webhook logging while release state remains unresolved.
+
+#### Test approach
+- **Automatable**: due/not-due interval logic, branchless skip, disabled project skip, successful merge, conflict webhook payload, retry-after-exception behavior, restart last-sync reset.
+- **Manual / spec-only**: real release branch auto-sync against GitHub or another upstream provider.
+
 ## Cost, Telemetry, And Streams
 
 ### Cost capture and budget enforcement - Estimates per-item spend and enforces project caps
@@ -1146,6 +1220,31 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 - **Automatable**: parser selection, stream persistence, retention, endpoints, aggregate math, SignalR batching, stdout-tail ring buffer, redaction.
 - **Manual / spec-only**: browser live stdout against a real long-running agent.
 
+### Agent stream retention sweep - Deletes expired agent stream files and empty directories
+
+**Source**: `src/CodeyBox.Orchestrator/AgentStreamRetentionService.cs`, `src/CodeyBox.Orchestrator/AgentStreamStore.cs`, `src/CodeyBox.Orchestrator/AgentStreamsOptions.cs`, `src/CodeyBox.Api/Program.cs`
+**Related PRs**: none known
+
+#### Primary user flows
+1. Host starts with stream capture enabled - retention service runs one sweep immediately.
+2. Host keeps running - service repeats sweeps daily by default.
+3. Files are older than `CodeyBox:AgentStreams:RetainedDays` - store deletes expired `.jsonl` files and then removes empty stream directories.
+
+#### Edge cases
+- Stream capture is disabled - store sweep is a no-op.
+- `RetainedDays` is `0` - streams are kept forever and sweep deletes nothing.
+- Stream root directory does not exist - sweep returns zero deleted files.
+- List and download endpoints run while deletion occurs - file operations tolerate missing files and return empty/404 diagnostics.
+
+#### Failure modes
+- Individual stream file or directory cannot be deleted - store logs warning and continues the sweep.
+- Full sweep throws - retention service logs warning and retries on the next period.
+- Shutdown cancels sweep - cancellation is propagated only when requested by the host.
+
+#### Test approach
+- **Automatable**: immediate sweep, disabled and keep-forever no-ops, expired file deletion, empty directory cleanup, per-file failure continuation, service exception logging.
+- **Manual / spec-only**: verify disk usage reduction in a long-running deployment with real stream files.
+
 ### Fleet and worker observability endpoints - Summarizes fleet state for operators
 
 **Source**: `src/CodeyBox.Api/FleetEndpoints.cs`, `src/CodeyBox.Api/WorkerRegistryEndpoints.cs`, `src/CodeyBox.Orchestrator/SqliteWorkerRegistry.cs`, `tools/CodeyBox.Admin/src/CodeyBox.Admin.Web/Components/Pages/Fleet.razor`
@@ -1192,6 +1291,34 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 #### Test approach
 - **Automatable**: command handlers with fake HTTP, auth resolution order, output formats, error handling, watch polling.
 - **Manual / spec-only**: installed CLI against running API.
+
+### Project configuration wizard - Generates appsettings project entries from interactive prompts
+
+**Source**: `src/CodeyBox.Cli/Program.cs`
+**Related PRs**: none known
+
+#### Primary user flows
+1. Operator runs the wizard - Spectre.Console prompts for project ID, display name, repository URL, base branch, default agent, upstream kind, audit languages/types, and per-phase network profiles.
+2. Operator selects GitHub upstream - wizard prompts owner, repository, and token environment variable and emits a GitHub upstream entry.
+3. Operator selects generic git upstream - wizard prompts URL and optional token environment variable and emits a `git-generic` upstream entry.
+4. Stdout is redirected - wizard writes plain indented JSON suitable for `appsettings.json` instead of rendering a panel.
+5. Operator chooses to save - wizard resolves the requested path, asks before overwriting, writes JSON, or reports file-write errors.
+
+#### Edge cases
+- Project ID has invalid characters or length - prompt validation rejects anything outside 1-64 alphanumeric, dash, or underscore characters.
+- Repository or generic upstream URL is empty, begins with `-`, contains control characters, or has an unsupported scheme - validation rejects it.
+- Branch name contains `..`, ends with `.lock`, starts with a non-alphanumeric character, or exceeds 200 characters - validation rejects it.
+- `CODEYBOX_NETWORK_PROFILES` is set - phase profile choices come from the environment instead of the built-in profile list.
+- Audit language selection is empty - JSON still records an empty `Languages` list, while null optional fields such as omitted audit types are suppressed by serializer settings.
+
+#### Failure modes
+- Output file already exists and overwrite is declined - wizard reports write cancellation without changing the file.
+- Output directory is unwritable or path is invalid - wizard catches the exception and prints a concise error.
+- Terminal is non-interactive but stdin is not scripted - Spectre prompt execution blocks or fails; Phase 2 should document supported scripted invocation.
+
+#### Test approach
+- **Automatable**: validation regexes and helper builders, redirected-output JSON shape via scripted console input, upstream variants, network profile env handling, save/overwrite branches using a temp path.
+- **Manual / spec-only**: terminal UX review for prompt ordering, highlighting, multi-select behavior, and generated snippet readability.
 
 ### Admin dashboard - Blazor Server operator UI for queue, work items, releases, audits, suggestions, costs, timings, fleet, and plugins
 
@@ -1269,8 +1396,10 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 | Audit presets and language discovery | Yes | Yes | Project config, preset YAML |
 | Built-in deterministic auditors | Yes | Yes | Sandbox tool availability |
 | LLM and deep auditors | Yes | Yes | Agent runners, credentials, release service |
+| Audit-agent startup validation | Yes | Yes | Project repository, credential provider chain |
 | Audit iteration loop and parallelism | Yes | Yes | Auditors, pipeline runner, report store |
 | Audit finding schema and stable IDs | Yes | Yes | Audit reports, admin UI |
+| Audit report retention sweep | Yes | Yes | Audit report store, audit log retention config |
 | Plugin foundation | Yes | Yes | Plugin SDK assemblies |
 | Auditor plugin SDK | Yes | Yes | Plugin foundation, audit composer |
 | Upstream remote plugin SDK | Yes | Yes | Plugin foundation, upstream factory |
@@ -1291,10 +1420,13 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 | Outbound webhooks | Yes | Yes | Pipeline events, HTTP dispatcher |
 | GitHub release webhook ingest and changelog generation | Yes | Yes | GitHub upstream config, changelog generator |
 | Release management workflow | Yes | Yes | Work item pipeline, deep auditors, upstream remotes |
+| Release main sync service | Yes | Yes | Release store, project config, upstream remotes, webhooks |
 | Cost capture and budget enforcement | Yes | Yes | Agent streams/output, pricing config, queue controller |
 | Timing and OpenTelemetry export | Yes | Yes | Timing store, OTel configuration |
 | Agent stream capture, analysis, and live stdout | Yes | Yes | Agent runners, stream store, SignalR, admin UI |
+| Agent stream retention sweep | Yes | Yes | Agent stream store, stream retention config |
 | Fleet and worker observability endpoints | Yes | Yes | Worker registry, work item store |
 | CLI client `codeybox` | Yes | Yes | API endpoints, auth config |
+| Project configuration wizard | Yes | Yes | Spectre.Console prompts, project config schema |
 | Admin dashboard | Partial | Yes | API client, SignalR, all operator APIs |
 | API authentication and redaction | Yes | Yes | API host, logging, agent streams, upstream credentials |
