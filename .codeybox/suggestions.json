@@ -1,0 +1,16 @@
+{
+  "suggestions": [
+    {
+      "title": "Scope observed quota failures by project in agent class routing",
+      "rationale": "The Quota And Routing UAT plan requires per-project failure coverage for the Agent class router. The current router checks observed failures by agent and model only when quota is unknown, so a quota-shaped failure recorded for one project also blocks another project using the same agent/model. Production code changes are out of scope for this UAT coverage work item, so the per-project UAT is present but skipped until AgentClassRouter includes WorkItem.ProjectId when querying observed quota failures.",
+      "category": "other",
+      "severity": "important",
+      "estimatedEffort": "small",
+      "filesReferenced": [
+        "docs/uat/00-plan.md",
+        "src/CodeyBox.Orchestrator/AgentClassRouter.cs",
+        "tests/CodeyBox.Tests/Uat/QuotaAndRouting/AgentClassRouterTests.cs"
+      ]
+    }
+  ]
+}
