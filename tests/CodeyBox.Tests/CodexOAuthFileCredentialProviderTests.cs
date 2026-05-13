@@ -33,6 +33,67 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task GetAsync_EmitsHostDirBindMountSoInVmRefreshPropagatesBackToHost()
+    {
+        // The bug being fixed: previously we shipped only a snapshot of
+        // auth.json into the VM via env-var. The in-VM codex CLI refreshes
+        // tokens, but those refreshes land only in the VM. Every later sandbox
+        // boots with a stale snapshot, consumes the same refresh_token, and
+        // gets "refresh_token already used" → entire OAuth family invalidated.
+        // The fix is a bind-mount so the in-VM and host views are the same
+        // file; the orchestrator threads this mount through SandboxSpec.Mounts.
+        var authPath = Path.Combine(_workspace, "auth.json");
+        await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"t\"}}");
+        var provider = new CodexOAuthFileCredentialProvider(authPath);
+
+        var credential = await provider.GetAsync(AgentKind.Codex);
+
+        Assert.NotNull(credential);
+        var mount = Assert.Single(credential!.Mounts);
+        Assert.Equal(_workspace, mount.HostPath);
+        Assert.Equal("/home/ubuntu/.codex", mount.SandboxPath);
+        Assert.False(mount.ReadOnly, "must be writable so in-VM refreshes land on host");
+        Assert.False(mount.Tmpfs, "must back to host fs, not a tmpfs that loses refresh on dispose");
+    }
+
+    [Fact]
+    public async Task GetAsync_WhenHostDirMissing_OmitsBindMountButStillReturnsEnvVarCredential()
+    {
+        // Defensive: if the host dir somehow doesn't exist (file present via
+        // exotic fs handling), don't fabricate a mount entry — fall back to
+        // env-var-only mode. The CredentialMaterialiser path still works.
+        var authPath = Path.Combine(_workspace, "auth.json");
+        await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"t\"}}");
+        var provider = new CodexOAuthFileCredentialProvider(authPath);
+        var credential = await provider.GetAsync(AgentKind.Codex);
+        Assert.NotNull(credential);
+        // sanity: the env var path is unaffected by the new field
+        Assert.NotEmpty(credential!.EnvironmentVariables["CODEX_AUTH_JSON"]);
+    }
+
+    [Fact]
+    public async Task GetAsync_EnvVarProviderDoesNotEmitMount()
+    {
+        // The env-var provider has no host file to mount, so it must not emit
+        // a Mounts entry. The CodexAgentRunner's exec-time guard then falls
+        // back to materialising from CODEX_AUTH_JSON via the snapshot write.
+        const string envVar = "CODEYBOX_TEST_CODEX_AUTH_JSON";
+        var original = Environment.GetEnvironmentVariable(envVar);
+        Environment.SetEnvironmentVariable(envVar, "{\"tokens\":{\"access_token\":\"t\"}}");
+        try
+        {
+            var provider = new CodexAuthJsonEnvironmentCredentialProvider(envVar);
+            var credential = await provider.GetAsync(AgentKind.Codex);
+            Assert.NotNull(credential);
+            Assert.Empty(credential!.Mounts);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(envVar, original);
+        }
+    }
+
+    [Fact]
     public async Task GetAsync_ReadsCodexAuthJsonFromEnvironmentForCodex()
     {
         const string envVar = "CODEYBOX_TEST_CODEX_AUTH_JSON";

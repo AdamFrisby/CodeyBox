@@ -14,7 +14,11 @@ public interface ICredentialProvider
 /// <summary>
 /// A credential bundle for a specific agent. <see cref="EnvironmentVariables"/>
 /// are values the agent's CLI reads at startup; <see cref="Files"/> are
-/// path → contents pairs to materialise as files inside the sandbox.
+/// path → contents pairs to materialise as files inside the sandbox;
+/// <see cref="Mounts"/> are bind-mounts the orchestrator merges into the
+/// sandbox spec (used by providers like Codex that want the in-VM CLI's
+/// token rotations to write back to the host file, avoiding refresh-token-reuse
+/// cascades when the same OAuth pair is snapshotted across multiple VMs).
 /// </summary>
 public sealed record AgentCredential(
     AgentKind Agent,
@@ -30,4 +34,14 @@ public sealed record AgentCredential(
     /// an orchestrator restart.
     /// </summary>
     public DateTimeOffset? ExpiresAt { get; init; }
+
+    /// <summary>
+    /// Optional bind-mounts the credential provider wants applied to any
+    /// sandbox running this agent. The orchestrator merges these into
+    /// <c>SandboxSpec.Mounts</c> when the credential is in scope. Use this
+    /// for OAuth files whose in-VM refresh must propagate back to the host
+    /// (codex), to avoid every sandbox boot starting from a stale snapshot
+    /// and consuming the same refresh_token.
+    /// </summary>
+    public IReadOnlyList<SandboxMount> Mounts { get; init; } = [];
 }

@@ -38,17 +38,32 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         await DetectStructuredStreamFlagAsync(sandbox, ct).ConfigureAwait(false) is not null;
 
     /// <summary>
-    /// ChatGPT-subscription auth: write <c>~/.codex/auth.json</c> into the sandbox.
-    /// The codex CLI reads ONLY that file path; there's no env-var equivalent.
+    /// ChatGPT-subscription auth: ensure <c>~/.codex/auth.json</c> is present
+    /// inside the sandbox. The codex CLI reads ONLY that file path; there's no
+    /// env-var equivalent.
     ///
-    /// We always materialise from the in-sandbox <c>CODEX_AUTH_JSON</c> env var
-    /// (injected at sandbox boot from the agent credential) rather than from
-    /// the credential parameter, because LlmReviewAuditor and similar
-    /// call-sites pass credential=null on the assumption that env-var auth is
-    /// sufficient — true for Claude (env-var-based), false for Codex
-    /// (file-based). Reading from the in-sandbox env covers both code paths
-    /// without requiring auditor changes; if the env var is absent, this is
-    /// a no-op and codex falls back to OPENAI_API_KEY (api-key mode).
+    /// <para>Two paths, decided by what's already in the sandbox:</para>
+    /// <list type="bullet">
+    ///   <item><b>Mount path</b> (preferred, multipass): the credential
+    ///   provider declared a bind-mount that already exposes the host's
+    ///   <c>~/.codex/</c> at <c>$HOME/.codex/</c>. We detect this by stat-ing
+    ///   the file, and skip the write entirely. Critical for correctness:
+    ///   overwriting would clobber any refresh-token rotation the host has
+    ///   done since the credential was read, and would re-introduce the
+    ///   refresh-token-reuse cascade the mount is designed to prevent.</item>
+    ///   <item><b>Env-var snapshot path</b> (fallback, bwrap/process): no
+    ///   mount in scope, so materialise the file from <c>CODEX_AUTH_JSON</c>.
+    ///   Snapshot is fine here because these providers either share the host
+    ///   FS (process) or tear down per-run state anyway (bwrap tmpfs HOME).
+    ///   </item>
+    /// </list>
+    ///
+    /// We always read from the in-sandbox env var (rather than the credential
+    /// parameter) because LlmReviewAuditor and similar call-sites pass
+    /// credential=null on the assumption that env-var auth is sufficient —
+    /// true for Claude (env-var-based), false for Codex (file-based). If the
+    /// env var is absent and no file is present, this is a no-op and codex
+    /// falls back to OPENAI_API_KEY (api-key mode).
     /// </summary>
     protected override async Task<AgentResult?> PrepareSandboxAsync(
         ISandbox sandbox,
@@ -57,9 +72,11 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         AgentResumeContext? resume,
         CancellationToken ct = default)
     {
+        // If a bind-mount already supplied auth.json, leave it alone — writing
+        // would clobber the host's latest refresh-token rotation.
         var write = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["bash", "-c", "set -eu; if [ -n \"${CODEX_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.codex\"; umask 077; printf '%s' \"$CODEX_AUTH_JSON\" > \"$HOME/.codex/auth.json\"; fi"],
+            Argv = ["bash", "-c", "set -eu; if [ -s \"$HOME/.codex/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEX_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.codex\"; umask 077; printf '%s' \"$CODEX_AUTH_JSON\" > \"$HOME/.codex/auth.json\"; fi"],
         }, ct);
         if (!write.Success)
         {

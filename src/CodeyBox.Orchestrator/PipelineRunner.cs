@@ -3626,6 +3626,8 @@ public sealed class PipelineRunner : IPipelineRunner
             });
             foreach (var (k, v) in includeAgentCredential.EnvironmentVariables)
                 env[k] = v;
+            foreach (var m in includeAgentCredential.Mounts)
+                mounts.Add(m);
         }
 
         var allowedHosts = allowAgentNetwork
