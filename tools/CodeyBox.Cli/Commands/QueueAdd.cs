@@ -19,6 +19,7 @@ internal static class QueueAdd
         var promptOpt = new Option<string?>("--prompt", "Inline prompt text");
         var promptFileOpt = new Option<string?>("--prompt-file", "Path to prompt file, or '-' for stdin");
         var agentOpt = new Option<string?>("--agent", "Agent name (e.g. claude, gemini)");
+        var auditorProfileOpt = new Option<string?>("--auditor-profile", "Audit profile name for this work item");
         var baseBranchOpt = new Option<string?>("--base-branch", "Override base branch");
         var workBranchOpt = new Option<string?>("--work-branch", "Work branch name");
         var pushUpstreamOpt = new Option<bool>("--push-upstream", "Push completed branch to upstream");
@@ -35,6 +36,7 @@ internal static class QueueAdd
         cmd.AddOption(promptOpt);
         cmd.AddOption(promptFileOpt);
         cmd.AddOption(agentOpt);
+        cmd.AddOption(auditorProfileOpt);
         cmd.AddOption(baseBranchOpt);
         cmd.AddOption(workBranchOpt);
         cmd.AddOption(pushUpstreamOpt);
@@ -51,6 +53,7 @@ internal static class QueueAdd
             var promptText = ctx.ParseResult.GetValueForOption(promptOpt);
             var promptFile = ctx.ParseResult.GetValueForOption(promptFileOpt);
             var agent = ctx.ParseResult.GetValueForOption(agentOpt);
+            var auditorProfile = ctx.ParseResult.GetValueForOption(auditorProfileOpt);
             var baseBranch = ctx.ParseResult.GetValueForOption(baseBranchOpt);
             var workBranch = ctx.ParseResult.GetValueForOption(workBranchOpt);
             var pushUpstream = ctx.ParseResult.GetValueForOption(pushUpstreamOpt);
@@ -114,6 +117,7 @@ internal static class QueueAdd
                 Title = title,
                 Prompt = prompt,
                 Agent = agent,
+                AuditorProfile = auditorProfile,
                 BaseBranch = baseBranch,
                 WorkBranch = workBranch,
                 PushUpstream = pushUpstream ? true : null,

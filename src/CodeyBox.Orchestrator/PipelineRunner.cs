@@ -170,7 +170,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         try
         {
-            project = project with { Audit = project.Audit.ResolveProfile() };
+            project = project with { Audit = ResolveAuditProfileForWorkItem(project, item) };
         }
         catch (Exception ex)
         {
@@ -672,6 +672,27 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private static string DefaultWorkBranchFor(WorkItemId id) => $"codeybox/{id.ToString()[..8]}";
+
+    private ProjectAudit ResolveAuditProfileForWorkItem(Project project, WorkItem item)
+    {
+        if (!string.IsNullOrWhiteSpace(item.AuditorProfile))
+        {
+            var requested = item.AuditorProfile.Trim();
+            if (requested.Equals(ProjectAudit.DefaultProfileName, StringComparison.OrdinalIgnoreCase)
+                || project.Audit.Profiles.ContainsKey(requested))
+            {
+                return project.Audit.ResolveProfile(requested);
+            }
+
+            _log.LogWarning(
+                "Work item {WorkItemId} requested audit profile '{AuditProfile}', but project {ProjectId} no longer defines it; using project default audit profile",
+                item.Id,
+                requested,
+                project.Id);
+        }
+
+        return project.Audit.ResolveProfile();
+    }
 
     private static bool IsPickupRebaseOwnedWorkBranch(WorkItemId id, string workBranch)
         => string.Equals(workBranch, DefaultWorkBranchFor(id), StringComparison.Ordinal);

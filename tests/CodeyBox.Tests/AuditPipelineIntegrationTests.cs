@@ -181,6 +181,106 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task WorkItemAuditorProfile_InvokesOnlyRequestedProfileAuditors()
+    {
+        var sink = new TestSink();
+        var previousLogger = Log.Logger;
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+            using var tp = TestSupport.BuildPipeline(
+                _workspace,
+                seed,
+                projectAudit: new ProjectAudit
+                {
+                    AuditTypes = ["security"],
+                    Profiles = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["uat"] = new() { AuditTypes = ["cheating"] },
+                    },
+                },
+                presetCatalogOverride: new UatIntegrationCatalog());
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "one"));
+
+            var item = NewItem() with { AuditorProfile = "uat" };
+            await tp.Store.CreateAsync(item);
+            await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+            var auditorRuns = sink.Events
+                .Where(e => GetScalar<string>(e, "EventName") == "auditor.run")
+                .Select(e => GetScalar<string>(e, "AuditorName") ?? string.Empty)
+                .ToArray();
+
+            Assert.Equal(["cheating:deterministic-patterns", "cheating:llm-review"], auditorRuns);
+            Assert.DoesNotContain("security:gitleaks", auditorRuns);
+
+            var profileEvent = Assert.Single(sink.Events,
+                e => GetScalar<string>(e, "EventName") == "audit.profile_selected");
+            Assert.Equal("uat", GetScalar<string>(profileEvent, "AuditProfile"));
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+            Log.Logger = previousLogger;
+        }
+    }
+
+    [Fact]
+    public async Task NullAuditorProfile_InvokesProjectDefaultProfileAuditors()
+    {
+        var sink = new TestSink();
+        var previousLogger = Log.Logger;
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+            using var tp = TestSupport.BuildPipeline(
+                _workspace,
+                seed,
+                projectAudit: new ProjectAudit
+                {
+                    AuditTypes = ["security"],
+                    Profiles = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["uat"] = new() { AuditTypes = ["cheating"] },
+                    },
+                },
+                presetCatalogOverride: new UatIntegrationCatalog());
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "one"));
+
+            var item = NewItem();
+            await tp.Store.CreateAsync(item);
+            await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+            var auditorRuns = sink.Events
+                .Where(e => GetScalar<string>(e, "EventName") == "auditor.run")
+                .Select(e => GetScalar<string>(e, "AuditorName") ?? string.Empty)
+                .ToArray();
+
+            Assert.Equal(["security:gitleaks", "security:semgrep", "security:llm-review"], auditorRuns);
+            Assert.DoesNotContain("cheating:deterministic-patterns", auditorRuns);
+
+            var profileEvent = Assert.Single(sink.Events,
+                e => GetScalar<string>(e, "EventName") == "audit.profile_selected");
+            Assert.Equal(ProjectAudit.DefaultProfileName, GetScalar<string>(profileEvent, "AuditProfile"));
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+            Log.Logger = previousLogger;
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

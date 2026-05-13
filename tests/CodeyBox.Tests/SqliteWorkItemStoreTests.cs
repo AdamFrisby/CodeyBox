@@ -39,6 +39,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             MergeTimeout = TimeSpan.FromMinutes(3),
             PushUpstream = false,
             UpstreamPushAttempts = 2,
+            AuditorProfile = "uat",
         };
         await _store.CreateAsync(item);
         var read = await _store.GetAsync(item.Id);
@@ -49,6 +50,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.Equal(item.PushUpstream, read.PushUpstream);
         Assert.Equal(item.UpstreamPushAttempts, read.UpstreamPushAttempts);
         Assert.Equal(item.Agent, read.Agent);
+        Assert.Equal("uat", read.AuditorProfile);
     }
 
     [Fact]

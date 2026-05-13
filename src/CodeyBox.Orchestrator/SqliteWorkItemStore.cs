@@ -123,6 +123,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // existing rows are treated as not preempted.
         RunMigration("ALTER TABLE work_items ADD COLUMN preempted_at TEXT;");
         RunMigration("ALTER TABLE work_items ADD COLUMN preempt_checkpoint TEXT;");
+
+        // Additive migration: optional per-work-item audit profile override.
+        // NULL means use the project's default audit profile.
+        RunMigration("ALTER TABLE work_items ADD COLUMN auditor_profile TEXT;");
     }
 
     private void RunMigration(string sql)
@@ -152,11 +156,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                     stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                     min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
-                    failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts)
+                    failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, auditor_profile)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                     $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                     $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
-                    $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts);
+                    $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $auditor_profile);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -198,7 +202,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     failure_kind = $failure_kind,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
-                    quota_retry_attempts = $quota_retry_attempts
+                    quota_retry_attempts = $quota_retry_attempts,
+                    auditor_profile = $auditor_profile
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -235,7 +240,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     failure_kind = $failure_kind,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
-                    quota_retry_attempts = $quota_retry_attempts
+                    quota_retry_attempts = $quota_retry_attempts,
+                    auditor_profile = $auditor_profile
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -517,6 +523,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$quota_reset_at", (object?)item.QuotaResetAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$next_quota_retry_at", (object?)item.NextQuotaRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
+        cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -554,6 +561,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         QuotaResetAt = ReadNullableDateTimeOffset(r, "quota_reset_at"),
         NextQuotaRetryAt = ReadNullableDateTimeOffset(r, "next_quota_retry_at"),
         QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
+        AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)
