@@ -6,6 +6,7 @@ internal sealed class CreateWorkItemRequest
     public string Title { get; set; } = "";
     public string Prompt { get; set; } = "";
     public string? Agent { get; set; }
+    public string? AuditorProfile { get; set; }
     public string? BaseBranch { get; set; }
     public string? WorkBranch { get; set; }
     public bool? PushUpstream { get; set; }

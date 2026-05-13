@@ -34,6 +34,12 @@ public sealed record WorkItem
     /// <summary>If set, overrides the project's default agent.</summary>
     public AgentKind? Agent { get; init; }
 
+    /// <summary>
+    /// Optional audit profile override for this work item. Null means use the
+    /// project's configured default audit profile.
+    /// </summary>
+    public string? AuditorProfile { get; init; }
+
     /// <summary>Wall-clock budget for the work phase (also applied per rework iteration).</summary>
     public TimeSpan WorkTimeout { get; init; } = TimeSpan.FromMinutes(60);
 

@@ -123,6 +123,18 @@ internal static class WorkItemEndpoints
             agentOverride = kind;
         }
 
+        string? auditorProfile = null;
+        if (!string.IsNullOrWhiteSpace(req.AuditorProfile))
+        {
+            auditorProfile = req.AuditorProfile.Trim();
+            if (!AuditProfileExists(project.Audit, auditorProfile))
+                return Results.BadRequest(new
+                {
+                    error = $"unknown auditorProfile '{auditorProfile}' for project '{pid}'",
+                    availableProfiles = AvailableAuditProfiles(project.Audit),
+                });
+        }
+
         // ── Dependency validation ─────────────────────────────────────────────
 
         // Parse dependsOn IDs. Cap at 100 to bound sequential existence checks
@@ -229,6 +241,7 @@ internal static class WorkItemEndpoints
             BaseBranch = req.BaseBranch,
             WorkBranch = req.WorkBranch,
             Agent = agentOverride,
+            AuditorProfile = auditorProfile,
             AgentClassId = agentClassId,
             PushUpstream = req.PushUpstream ?? true,
             DependsOn = dependsOnIds,
@@ -489,6 +502,7 @@ internal static class WorkItemEndpoints
             BaseBranch = source.BaseBranch,
             WorkBranch = workBranch,
             Agent = agentOverride,
+            AuditorProfile = source.AuditorProfile,
             AgentClassId = agentClassOverride,
             PushUpstream = source.PushUpstream,
             WorkTimeout = source.WorkTimeout,
@@ -1163,6 +1177,7 @@ internal static class WorkItemEndpoints
             item.Title,
             item.Prompt,
             (item.Agent ?? project?.DefaultAgent ?? AgentKind.Claude).Value,
+            item.AuditorProfile,
             project?.RepositoryUrl,
             item.BaseBranch,
             item.WorkBranch,
@@ -1199,6 +1214,21 @@ internal static class WorkItemEndpoints
             audit.Languages,
             audit.AuditTypes,
             audit.MaxIterations);
+    }
+
+    private static bool AuditProfileExists(ProjectAudit audit, string profile)
+        => profile.Equals(ProjectAudit.DefaultProfileName, StringComparison.OrdinalIgnoreCase)
+           || audit.Profiles.ContainsKey(profile);
+
+    private static IReadOnlyList<string> AvailableAuditProfiles(ProjectAudit audit)
+    {
+        var profiles = new SortedSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ProjectAudit.DefaultProfileName,
+        };
+        foreach (var profile in audit.Profiles.Keys)
+            profiles.Add(profile);
+        return profiles.ToList();
     }
 
     private static async Task<IResult> GetStdoutTailAsync(
@@ -1287,6 +1317,7 @@ public sealed record CreateWorkItemRequest(
     string Title,
     string Prompt,
     string? Agent,
+    string? AuditorProfile,
     string? AgentClassId,
     string? BaseBranch,
     string? WorkBranch,
@@ -1318,6 +1349,7 @@ public sealed record WorkItemDto(
     string Title,
     string Prompt,
     string Agent,
+    string? AuditorProfile,
     string? RepositoryUrl,
     string? BaseBranch,
     string? WorkBranch,

@@ -70,6 +70,7 @@ public sealed class QueueAddTests
                 "--title", "Refactor",
                 "--prompt", "Do refactor",
                 "--agent", "gemini",
+                "--auditor-profile", "uat",
                 "--work-branch", "feat/refactor",
                 "--push-upstream",
                 "--depends-on", "id-1",
@@ -79,6 +80,7 @@ public sealed class QueueAddTests
             Assert.Equal(0, code);
             var body = await captured!.Content!.ReadFromJsonAsync(CliJsonContext.Default.CreateWorkItemRequest);
             Assert.Equal("gemini", body!.Agent);
+            Assert.Equal("uat", body.AuditorProfile);
             Assert.Equal("feat/refactor", body.WorkBranch);
             Assert.True(body.PushUpstream);
             Assert.Equal(["id-1", "id-2"], body.DependsOn);

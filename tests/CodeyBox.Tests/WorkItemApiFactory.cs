@@ -17,13 +17,34 @@ namespace CodeyBox.Tests;
 /// </summary>
 internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-httptest-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath;
+    private readonly bool _ownsDbPath;
+    private readonly Project[] _projects;
 
     public SqliteWorkItemStore Store { get; }
 
-    public WorkItemApiFactory()
+    public WorkItemApiFactory(string? dbPath = null, params Project[] projects)
     {
+        _dbPath = dbPath ?? Path.Combine(
+            Path.GetTempPath(), $"codeybox-httptest-{Guid.NewGuid():N}.db");
+        _ownsDbPath = dbPath is null;
+        _projects = projects.Length > 0
+            ? projects
+            :
+            [
+                new Project
+                {
+                    Id = new ProjectId("test-project"),
+                    DisplayName = "Test Project",
+                    RepositoryUrl = "https://github.com/test/repo",
+                },
+                new Project
+                {
+                    Id = new ProjectId("second-project"),
+                    DisplayName = "Second Project",
+                    RepositoryUrl = "https://github.com/test/repo2",
+                },
+            ];
         Store = new SqliteWorkItemStore(_dbPath);
     }
 
@@ -59,19 +80,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
             // "second-project" is seeded so cross-project uniqueness tests can verify that
             // the same externalId is allowed in two different projects.
             services.RemoveAll<IProjectRepository>();
-            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
-                new Project
-                {
-                    Id = new ProjectId("test-project"),
-                    DisplayName = "Test Project",
-                    RepositoryUrl = "https://github.com/test/repo",
-                },
-                new Project
-                {
-                    Id = new ProjectId("second-project"),
-                    DisplayName = "Second Project",
-                    RepositoryUrl = "https://github.com/test/repo2",
-                }));
+            services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(_projects));
         });
     }
 
@@ -80,7 +89,8 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
         if (disposing)
         {
             Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            if (_ownsDbPath)
+                try { File.Delete(_dbPath); } catch { /* best-effort */ }
         }
         base.Dispose(disposing);
     }
