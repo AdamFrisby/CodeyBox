@@ -22,7 +22,8 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        if (Directory.Exists(_workspace))
+            Directory.Delete(_workspace, recursive: true);
     }
 
     [Theory]
@@ -170,6 +171,22 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         var stored = await context.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, stored!.State);
         Assert.Equal(0, stored.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task ProjectPaused_AutoRetrySkipsWithoutChangingItemState()
+    {
+        var queueController = new QueueControllerStub(projectPaused: true);
+        using var context = BuildRetryContext(queueController: queueController);
+        var item = FailedQuotaItem();
+        await context.Store.CreateAsync(item);
+
+        await InvokePrivateAsync(context.Scheduler, "RunPeriodicSweepAsync", CancellationToken.None);
+
+        var stored = await context.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal(0, stored.QuotaRetryAttempts);
+        Assert.Contains(item.ProjectId, queueController.ProjectStateChecks);
     }
 
     [Fact]
@@ -433,6 +450,7 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         }
 
         public QueueState State => _globalPaused ? QueueState.Paused : QueueState.Running;
+        public List<ProjectId> ProjectStateChecks { get; } = [];
         public DateTimeOffset? PausedAt => null;
         public string? PausedReason => null;
         public Task PauseAsync(string reason, CancellationToken ct) => Task.CompletedTask;
@@ -440,7 +458,10 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         public Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct) => Task.CompletedTask;
         public Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct) => Task.CompletedTask;
         public Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct)
-            => Task.FromResult<ProjectQueueState?>(new ProjectQueueState(projectId, _projectPaused, null, null));
+        {
+            ProjectStateChecks.Add(projectId);
+            return Task.FromResult<ProjectQueueState?>(new ProjectQueueState(projectId, _projectPaused, null, null));
+        }
         public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyDictionary<string, bool>>(new Dictionary<string, bool>());
     }

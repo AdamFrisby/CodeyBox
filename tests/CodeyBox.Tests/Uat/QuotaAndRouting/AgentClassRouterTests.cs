@@ -23,7 +23,7 @@ public sealed class AgentClassRouterTests : IDisposable
     public void Dispose()
     {
         _failures.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        File.Delete(_dbPath);
     }
 
     [Fact]
@@ -168,6 +168,40 @@ public sealed class AgentClassRouterTests : IDisposable
         Assert.Contains("below 10", decision.Reason);
     }
 
+    [Fact(Skip = "Documents current production divergence: project-tagged observed failures are queried through the global router gate. See .codeybox/suggestions.json.")]
+    public async Task UnknownQuotaWithProjectObservedFailure_BlocksSameProjectButNotOtherProjects()
+    {
+        var now = new DateTimeOffset(2026, 5, 13, 10, 0, 0, TimeSpan.Zero);
+        await _failures.RecordForProjectAsync(
+            AgentKind.Claude,
+            "claude-opus-4-7",
+            new ProjectId("project-a"),
+            QuotaFailureKind.LimitReached,
+            now.AddMinutes(-2));
+        var router = BuildRouter(
+            members:
+            [
+                Subscription(AgentKind.Claude, score: 100, modelId: "claude-opus-4-7"),
+            ],
+            probes: [new StaticQuotaProbe(AgentKind.Claude, -1)],
+            options: new QuotaRouterOptions
+            {
+                MinQuotaPct = 10,
+                UnknownPolicy = QuotaUnknownPolicy.UseObservedFailures,
+                ObservedFailureWindow = TimeSpan.FromMinutes(10),
+            },
+            timeProvider: new FixedTimeProvider(now),
+            failures: _failures);
+
+        var sameProject = await router.ResolveAsync(Item("frontier", projectId: "project-a"), null, CancellationToken.None);
+        var otherProject = await router.ResolveAsync(Item("frontier", projectId: "project-b"), null, CancellationToken.None);
+
+        Assert.Null(sameProject.Chosen);
+        Assert.True(sameProject.ShouldWait);
+        Assert.Equal(AgentKind.Claude, otherProject.Chosen!.Agent);
+        Assert.False(otherProject.ShouldWait);
+    }
+
     [Fact]
     public async Task AllSubscriptionMembersExhausted_WaitsForConfiguredRecheckInterval()
     {
@@ -256,10 +290,10 @@ public sealed class AgentClassRouterTests : IDisposable
         QualityScore = score,
     };
 
-    private static WorkItem Item(string? agentClassId, int minModelScore = 0) => new()
+    private static WorkItem Item(string? agentClassId, int minModelScore = 0, string projectId = "test-project") => new()
     {
         Id = WorkItemId.New(),
-        ProjectId = new ProjectId("test-project"),
+        ProjectId = new ProjectId(projectId),
         Title = "Agent router UAT",
         Prompt = "route this",
         AgentClassId = agentClassId,
