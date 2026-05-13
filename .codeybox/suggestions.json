@@ -1,0 +1,16 @@
+{
+  "suggestions": [
+    {
+      "title": "Scope project-tagged observed quota failures in router decisions",
+      "rationale": "The Quota And Routing UAT plan expects project-tagged observed quota failures to block the same project without suppressing unrelated projects. Current production behavior records the project_id but AgentClassRouter queries IQuotaFailureStore.GetMostRecentAsync without a project argument, so a project-tagged failure currently trips the global observed-failure gate for the same agent/model across all projects. The UAT suite now covers the current behavior; implementing project-aware router lookups would close the divergence.",
+      "category": "other",
+      "severity": "important",
+      "estimatedEffort": "medium",
+      "filesReferenced": [
+        "tests/CodeyBox.Tests/Uat/QuotaAndRouting/AgentClassRouterTests.cs",
+        "src/CodeyBox.Orchestrator/AgentClassRouter.cs",
+        "src/CodeyBox.Orchestrator/SqliteQuotaFailureStore.cs"
+      ]
+    }
+  ]
+}

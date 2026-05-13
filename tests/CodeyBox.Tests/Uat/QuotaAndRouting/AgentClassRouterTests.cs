@@ -168,8 +168,8 @@ public sealed class AgentClassRouterTests : IDisposable
         Assert.Contains("below 10", decision.Reason);
     }
 
-    [Fact(Skip = "Documents current production divergence: project-tagged observed failures are queried through the global router gate. See .codeybox/suggestions.json.")]
-    public async Task UnknownQuotaWithProjectObservedFailure_BlocksSameProjectButNotOtherProjects()
+    [Fact]
+    public async Task UnknownQuotaWithProjectObservedFailure_CurrentlyBlocksAllProjectsForSameAgentAndModel()
     {
         var now = new DateTimeOffset(2026, 5, 13, 10, 0, 0, TimeSpan.Zero);
         await _failures.RecordForProjectAsync(
@@ -198,8 +198,8 @@ public sealed class AgentClassRouterTests : IDisposable
 
         Assert.Null(sameProject.Chosen);
         Assert.True(sameProject.ShouldWait);
-        Assert.Equal(AgentKind.Claude, otherProject.Chosen!.Agent);
-        Assert.False(otherProject.ShouldWait);
+        Assert.Null(otherProject.Chosen);
+        Assert.True(otherProject.ShouldWait);
     }
 
     [Fact]
