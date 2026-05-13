@@ -1,4 +1,7 @@
 using CodeyBox.Core;
+using CodeyBox.Audit.Presets;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -10,6 +13,7 @@ namespace CodeyBox.Tests;
 ///   - rework agent makes no changes → fail fast (Failed)
 ///   - no auditors registered → audit phase is a no-op
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class AuditPipelineIntegrationTests : IDisposable
 {
     private readonly string _workspace;
@@ -114,6 +118,69 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
     }
 
+    [Fact]
+    public async Task ProjectDefaultUatProfile_AuditLogRecordsOnlyUatAuditors()
+    {
+        var sink = new TestSink();
+        var previousLogger = Log.Logger;
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+            using var tp = TestSupport.BuildPipeline(
+                _workspace,
+                seed,
+                projectAudit: new ProjectAudit
+                {
+                    Profile = AuditProfilePresets.Uat,
+                    Profiles = AuditProfilePresets.CreateBuiltIns(),
+                },
+                presetCatalogOverride: new UatIntegrationCatalog());
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "one"));
+
+            var item = NewItem();
+            await tp.Store.CreateAsync(item);
+            await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+            var final = await tp.Store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Done, final!.State);
+
+            var auditorRuns = sink.Events
+                .Where(e => GetScalar<string>(e, "EventName") == "auditor.run")
+                .Select(e => GetScalar<string>(e, "AuditorName") ?? string.Empty)
+                .ToArray();
+
+            Assert.Equal(
+                [
+                    "csharp:format-check",
+                    "csharp:build-WaE",
+                    "csharp:test-pass",
+                    "security:gitleaks",
+                    "security:semgrep",
+                    "security:llm-review",
+                    "cheating:deterministic-patterns",
+                ],
+                auditorRuns);
+
+            Assert.DoesNotContain("completeness:llm-review", auditorRuns);
+            Assert.DoesNotContain("cheating:llm-review", auditorRuns);
+
+            var profileEvent = Assert.Single(sink.Events,
+                e => GetScalar<string>(e, "EventName") == "audit.profile_selected");
+            Assert.Equal(AuditProfilePresets.Uat, GetScalar<string>(profileEvent, "AuditProfile"));
+            Assert.Equal(auditorRuns, GetStringSequence(profileEvent, "AuditorNames"));
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+            Log.Logger = previousLogger;
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -177,6 +244,69 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 : [];
             return new AuditResult(!_blockingFinding, findings);
         }
+    }
+
+    private sealed class UatIntegrationCatalog : IPresetCatalog
+    {
+        public IReadOnlyList<IAuditor> ResolveLanguage(string name, PresetContext ctx)
+            => name.Equals("csharp", StringComparison.OrdinalIgnoreCase)
+                ? [
+                    new PassingAuditor("csharp:format-check"),
+                    new PassingAuditor("csharp:build-WaE"),
+                    new PassingAuditor("csharp:test-pass"),
+                ]
+                : [];
+
+        public IReadOnlyList<IAuditor> ResolveAuditType(string name, PresetContext ctx)
+            => name.ToLowerInvariant() switch
+            {
+                "security" =>
+                [
+                    new PassingAuditor("security:gitleaks"),
+                    new PassingAuditor("security:semgrep"),
+                    new PassingAuditor("security:llm-review"),
+                ],
+                "cheating" =>
+                [
+                    new PassingAuditor("cheating:deterministic-patterns"),
+                    new PassingAuditor("cheating:llm-review"),
+                ],
+                _ => [],
+            };
+
+        public IReadOnlyList<string> KnownLanguages => ["csharp"];
+        public IReadOnlyList<string> KnownAuditTypes => ["security", "cheating"];
+        public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{resultFile}}";
+    }
+
+    private sealed class PassingAuditor(string name) : IAuditor
+    {
+        public string Name { get; } = name;
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+            => Task.FromResult(new AuditResult(true, []));
+    }
+
+    private static T? GetScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        if (sv.Value is T t)
+            return t;
+        if (typeof(T) == typeof(int) && sv.Value is long l)
+            return (T)(object)(int)l;
+        return default;
+    }
+
+    private static IReadOnlyList<string> GetStringSequence(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not SequenceValue seq)
+            return [];
+        return seq.Elements
+            .OfType<ScalarValue>()
+            .Select(v => v.Value?.ToString() ?? string.Empty)
+            .ToArray();
     }
 
     private static WorkItem NewItem() => new()

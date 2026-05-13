@@ -45,6 +45,27 @@ presets are config-driven YAML resources; see [`languages.md`](languages.md)
 for the schema and override rules. LLM audit focus prompts and the review frame
 are also config-driven; see [`audit-types.md`](audit-types.md).
 
+## Auditor Profiles
+
+Projects can define named auditor profiles under `Audit.Profiles`. The
+top-level `Audit` object remains the backwards-compatible `default` profile;
+configs without `Profiles` behave as before. `Audit.Profile` selects the
+project-default profile for all work items in that project. Per-work-item
+profile overrides are intentionally out of scope today.
+
+A profile is a complete audit bundle: languages, audit types, custom auditors,
+iteration limits, agent routing, and excluded auditor names. The composer
+resolves the selected profile before expanding language and audit-type presets,
+then removes any exact auditor-name exclusions.
+
+CodeyBox ships a built-in `uat` profile for UAT/test-plan generation work. It
+keeps C# format/build/test checks, `security:gitleaks`, `security:semgrep`,
+`security:llm-review`, and `cheating:deterministic-patterns`; it omits
+`completeness:llm-review` and `cheating:llm-review` because those reviewers
+were repeatedly blocking on the meta-shape of UAT lists rather than substantive
+code-quality signals. The profile sets `MaxIterations` to 5 because UAT audit
+cycles tend to plateau quickly.
+
 ## Process / trust boundaries
 
 | Component                    | Lives in           | Trusts             | Holds upstream creds? | Holds agent API keys? |

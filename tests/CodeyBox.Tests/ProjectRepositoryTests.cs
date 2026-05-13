@@ -155,6 +155,39 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public async Task ProjectAuditProfiles_BindAndResolveSelectedProfile()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:Profile"] = "uat",
+                ["CodeyBox:Projects:0:Audit:MaxIterations"] = "9",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:0"] = "security",
+                ["CodeyBox:Projects:0:Audit:Profiles:uat:MaxIterations"] = "5",
+                ["CodeyBox:Projects:0:Audit:Profiles:uat:Languages:0"] = "csharp",
+                ["CodeyBox:Projects:0:Audit:Profiles:uat:AuditTypes:security:ReviewFocus"] = "uat security focus",
+                ["CodeyBox:Projects:0:Audit:Profiles:uat:ExcludedAuditors:0"] = "cheating:llm-review",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal("uat", p!.Audit.Profile);
+        Assert.Equal(9, p.Audit.MaxIterations);
+
+        var uat = p.Audit.ResolveProfile();
+        Assert.Equal(5, uat.MaxIterations);
+        Assert.Equal(["csharp"], uat.Languages);
+        Assert.Equal(["security"], uat.AuditTypes);
+        Assert.Equal("uat security focus", uat.AuditTypeOverrides["security"].ReviewFocus);
+        Assert.Equal(["cheating:llm-review"], uat.ExcludedAuditors);
+    }
+
+    [Fact]
     public async Task ProjectLanguageOverrides_BindFromLanguagesOverridesPath()
     {
         var config = new ConfigurationBuilder()

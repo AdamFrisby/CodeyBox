@@ -55,20 +55,35 @@ public sealed class ProjectRepository : IProjectRepository
 
     private static void ValidateAuditPresetConfiguration(Project project, PresetCatalogOptions? presetCatalogOptions)
     {
+        if (!project.Audit.Profile.Equals(ProjectAudit.DefaultProfileName, StringComparison.OrdinalIgnoreCase) &&
+            !project.Audit.Profiles.ContainsKey(project.Audit.Profile))
+        {
+            throw new InvalidOperationException(
+                $"Project '{project.Id.Value}' audit profile '{project.Audit.Profile}' is not defined");
+        }
+
         var options = presetCatalogOptions?.Clone() ?? new PresetCatalogOptions();
         ApplyRepositoryPresetRoot(project, options);
-        ApplyPresetOverrideOptions(project, options);
 
         try
         {
-            var catalog = new PresetCatalog(options);
-            ValidateSelectedPresets(project, catalog);
+            ValidateAuditBundle(project, project.Audit, options);
+            foreach (var profile in project.Audit.Profiles.Values)
+                ValidateAuditBundle(project, profile, options);
         }
         catch (PresetConfigurationException ex)
         {
             throw new InvalidOperationException(
                 $"Project '{project.Id.Value}' audit preset configuration is invalid: {ex.Message}", ex);
         }
+    }
+
+    private static void ValidateAuditBundle(Project project, ProjectAudit audit, PresetCatalogOptions baseOptions)
+    {
+        var options = baseOptions.Clone();
+        ApplyPresetOverrideOptions(project with { Audit = audit }, options);
+        var catalog = new PresetCatalog(options);
+        ValidateSelectedPresets(project with { Audit = audit }, catalog);
     }
 
     internal static void ApplyPresetOverrideOptions(Project project, PresetCatalogOptions options)
@@ -224,6 +239,13 @@ public sealed class ProjectRepository : IProjectRepository
 
     private ProjectAudit ResolveAudit(string? projectId, ProjectAuditConfig? project, ProjectAuditConfig? defaults)
     {
+        var baseAudit = ResolveAuditBundle(project, defaults, project?.Profile ?? defaults?.Profile ?? ProjectAudit.DefaultProfileName);
+        var profiles = ResolveAuditProfiles(project, defaults, baseAudit);
+        return baseAudit with { Profiles = profiles };
+    }
+
+    private ProjectAudit ResolveAuditBundle(ProjectAuditConfig? project, ProjectAuditConfig? defaults, string selectedProfile)
+    {
         // Shallow merge: project values win, defaults fill gaps. Lists are
         // taken whole from whichever side defines them — we don't try to
         // append defaults to project lists, which would be surprising.
@@ -239,6 +261,7 @@ public sealed class ProjectRepository : IProjectRepository
         var mergedAuditTypeOverrides = MergeAuditTypeOverrides(defaults?.AuditTypeOverrides, project?.AuditTypeOverrides);
         var mergedFrameTemplate = project?.LlmPromptFrameTemplate ?? defaults?.LlmPromptFrameTemplate;
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
+        var mergedExcludedAuditors = project?.ExcludedAuditors ?? defaults?.ExcludedAuditors ?? [];
 
         // Stuck-probe config. null in config = -1 (inherit from PipelineOptions global).
         // 0 = explicitly disabled for this project. >0 = explicit threshold.
@@ -264,6 +287,7 @@ public sealed class ProjectRepository : IProjectRepository
 
         return new ProjectAudit
         {
+            Profile = selectedProfile,
             MaxIterations = mergedMaxIter,
             FailingSeverity = mergedSeverity,
             PerIterationTimeout = TimeSpan.FromMinutes(mergedTimeoutMin),
@@ -279,11 +303,120 @@ public sealed class ProjectRepository : IProjectRepository
             AuditTypeOverrides = mergedAuditTypeOverrides,
             LlmPromptFrameTemplate = mergedFrameTemplate,
             Custom = mergedCustom,
+            ExcludedAuditors = mergedExcludedAuditors,
             AuditAgent = mergedAuditAgent,
             PerAuditorAgent = mergedPerAuditorAgent,
             MaxLlmAuditorParallelism = mergedMaxLlmPar,
         };
     }
+
+    private IReadOnlyDictionary<string, ProjectAudit> ResolveAuditProfiles(
+        ProjectAuditConfig? project,
+        ProjectAuditConfig? defaults,
+        ProjectAudit baseAudit)
+    {
+        var profiles = new Dictionary<string, ProjectAudit>(
+            AuditProfilePresets.CreateBuiltIns(),
+            StringComparer.OrdinalIgnoreCase);
+
+        if (defaults?.Profiles is not null)
+        {
+            foreach (var (name, config) in defaults.Profiles)
+            {
+                var fallback = profiles.TryGetValue(name, out var existing) ? existing : baseAudit;
+                profiles[name] = ResolveAuditProfileBundle(config, fallback, name);
+            }
+        }
+
+        if (project?.Profiles is not null)
+        {
+            foreach (var (name, config) in project.Profiles)
+            {
+                var fallback = profiles.TryGetValue(name, out var existing) ? existing : baseAudit;
+                profiles[name] = ResolveAuditProfileBundle(config, fallback, name);
+            }
+        }
+
+        return profiles;
+    }
+
+    private ProjectAudit ResolveAuditProfileBundle(ProjectAuditConfig config, ProjectAudit fallback, string profileName)
+    {
+        var resolved = ResolveAuditBundle(config, ProjectAuditToConfig(fallback), profileName);
+        return resolved with { Profile = profileName };
+    }
+
+    private static ProjectAuditConfig ProjectAuditToConfig(ProjectAudit audit)
+        => new()
+        {
+            Profile = audit.Profile,
+            MaxIterations = audit.MaxIterations,
+            FailingSeverity = audit.FailingSeverity.ToString(),
+            PerIterationTimeoutMinutes = (int)audit.PerIterationTimeout.TotalMinutes,
+            StopOnFirstFailure = audit.StopOnFirstFailure,
+            StuckThresholdMinutes = audit.StuckThresholdMinutes,
+            AutoRetryOnStuck = audit.AutoRetryOnStuck,
+            MaxStuckRetries = audit.MaxStuckRetries,
+            MergeScopeBufferLines = audit.MergeScopeBufferLines,
+            Languages = [.. audit.Languages],
+            LanguageOverrides = audit.LanguageOverrides.ToDictionary(
+                kvp => kvp.Key,
+                kvp => new ProjectLanguagePresetOverrideConfig
+                {
+                    Replace = kvp.Value.Replace,
+                    Auditors = kvp.Value.Auditors.Select(ProjectConfiguredAuditorToConfig).ToList(),
+                },
+                StringComparer.OrdinalIgnoreCase),
+            AuditTypes = [.. audit.AuditTypes],
+            AuditTypeOverrides = audit.AuditTypeOverrides.ToDictionary(
+                kvp => kvp.Key,
+                kvp => new ProjectAuditTypeOverrideConfig
+                {
+                    DisplayName = kvp.Value.DisplayName,
+                    ReviewFocus = kvp.Value.ReviewFocus,
+                    Replace = kvp.Value.Replace,
+                    Auditors = kvp.Value.Auditors.Select(ProjectConfiguredAuditorToConfig).ToList(),
+                    Patterns = kvp.Value.Patterns.Select(p => new DiffPatternConfig
+                    {
+                        Description = p.Description,
+                        Regex = p.Regex,
+                        Severity = p.Severity,
+                    }).ToList(),
+                },
+                StringComparer.OrdinalIgnoreCase),
+            LlmPromptFrameTemplate = audit.LlmPromptFrameTemplate,
+            Custom = audit.Custom.Select(CustomAuditorToConfig).ToList(),
+            ExcludedAuditors = [.. audit.ExcludedAuditors],
+            AuditAgent = audit.AuditAgent?.Value,
+            PerAuditorAgent = audit.PerAuditorAgent.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Value),
+            MaxLlmAuditorParallelism = audit.MaxLlmAuditorParallelism,
+        };
+
+    private static ProjectConfiguredAuditorConfig ProjectConfiguredAuditorToConfig(ProjectConfiguredAuditor auditor)
+        => new()
+        {
+            Name = auditor.Name,
+            Argv = [.. auditor.Argv],
+            Script = auditor.Script,
+            ToolName = auditor.ToolName,
+            TreatExit127AsMissingTool = auditor.TreatExit127AsMissingTool,
+        };
+
+    private static CustomAuditorConfig CustomAuditorToConfig(CustomAuditorDescriptor auditor)
+        => new()
+        {
+            Name = auditor.Name,
+            Kind = auditor.Kind,
+            PluginId = auditor.PluginId,
+            Argv = [.. auditor.Argv],
+            ReviewFocus = auditor.ReviewFocus,
+            Patterns = auditor.Patterns.Select(p => new DiffPatternConfig
+            {
+                Description = p.Description,
+                Regex = p.Regex,
+                Severity = p.Severity,
+            }).ToList(),
+        };
 
     private static IReadOnlyDictionary<string, ProjectLanguagePresetOverride> MergeLanguageOverrides(
         Dictionary<string, ProjectLanguagePresetOverrideConfig>? defaults,
@@ -410,6 +543,7 @@ public sealed class ProjectRepository : IProjectRepository
         {
             Name = c.Name,
             Kind = c.Kind,
+            PluginId = c.PluginId,
             Argv = c.Argv ?? [],
             ReviewFocus = c.ReviewFocus,
             Patterns = (c.Patterns ?? []).Select(p => new DiffPatternDescriptor

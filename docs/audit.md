@@ -119,6 +119,19 @@ CodeyBox ships these audit-type presets as YAML resources (see `docs/audit-types
 A project enables a preset by listing its name in
 `Audit.AuditTypes` (see `docs/projects.md`).
 
+### Built-in auditor profiles
+
+Named auditor profiles choose a bundle for a work-item shape before preset
+expansion. The top-level `Audit` block is always the `default` profile. Set
+`Audit.Profile` to select a project default and add custom bundles under
+`Audit.Profiles`.
+
+CodeyBox includes `uat`, a preset for UAT/test-generation work:
+
+| Profile | Auditors | MaxIterations | Notes |
+|---------|----------|---------------|-------|
+| `uat` | `csharp:format-check`, `csharp:build-WaE`, `csharp:test-pass`, `security:gitleaks`, `security:semgrep`, `security:llm-review`, `cheating:deterministic-patterns` | 5 | Omits `completeness:llm-review` and `cheating:llm-review`; UAT lists often record known divergences in `.codeybox/suggestions.json` and timing tests may intentionally exercise wall-clock waits. |
+
 ### Built-in language presets
 
 Language presets are selected with `Project.Audit.Languages`. They are

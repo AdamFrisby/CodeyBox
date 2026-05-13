@@ -8,6 +8,61 @@ namespace CodeyBox.Tests;
 public sealed class ProjectAuditorComposerPresetTests
 {
     [Fact]
+    public void Compose_UsesRequestedNamedProfile()
+    {
+        var composer = new ProjectAuditorComposer(new NamedProfileCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                AuditTypes = ["default-type"],
+                Profiles = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["uat"] = new() { AuditTypes = ["uat-type"] },
+                },
+            },
+        };
+
+        var auditors = composer.Compose(project, new CapturingAgent(), profile: "uat");
+
+        Assert.Equal(["uat-type:auditor"], auditors.Select(a => a.Name).ToArray());
+    }
+
+    [Fact]
+    public void Compose_UatPresetGoldenAuditorList()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Profile = AuditProfilePresets.Uat,
+                Profiles = AuditProfilePresets.CreateBuiltIns(),
+            },
+        };
+
+        var auditors = composer.Compose(project, new CapturingAgent());
+
+        Assert.Equal(
+            [
+                "csharp:format-check",
+                "csharp:build-WaE",
+                "csharp:test-pass",
+                "security:gitleaks",
+                "security:semgrep",
+                "security:llm-review",
+                "cheating:deterministic-patterns",
+            ],
+            auditors.Select(a => a.Name).ToArray());
+    }
+
+    [Fact]
     public async Task Compose_AppliesProjectAuditTypeFocusAndFrame()
     {
         var runner = new CapturingAgent();
@@ -124,6 +179,24 @@ public sealed class ProjectAuditorComposerPresetTests
             Prompt = prompt;
             return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
         }
+    }
+
+    private sealed class NamedProfileCatalog : IPresetCatalog
+    {
+        public IReadOnlyList<IAuditor> ResolveLanguage(string name, PresetContext ctx) => [];
+        public IReadOnlyList<IAuditor> ResolveAuditType(string name, PresetContext ctx) => [new NamedAuditor($"{name}:auditor")];
+        public IReadOnlyList<string> KnownLanguages => [];
+        public IReadOnlyList<string> KnownAuditTypes => ["default-type", "uat-type"];
+        public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{resultFile}}";
+    }
+
+    private sealed class NamedAuditor(string name) : IAuditor
+    {
+        public string Name { get; } = name;
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+            => Task.FromResult(new AuditResult(true, []));
     }
 
     private sealed class ResultFileSandbox : ISandbox

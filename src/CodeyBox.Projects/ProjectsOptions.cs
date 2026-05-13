@@ -100,6 +100,8 @@ public sealed class ProjectUpstreamConfig
 
 public sealed class ProjectAuditConfig
 {
+    public string? Profile { get; set; }
+    public Dictionary<string, ProjectAuditConfig>? Profiles { get; set; }
     public int? MaxIterations { get; set; }
     public string? FailingSeverity { get; set; }
     public int? PerIterationTimeoutMinutes { get; set; }
@@ -120,6 +122,7 @@ public sealed class ProjectAuditConfig
     public Dictionary<string, ProjectAuditTypeOverrideConfig>? AuditTypeOverrides { get; set; }
     public string? LlmPromptFrameTemplate { get; set; }
     public List<CustomAuditorConfig>? Custom { get; set; }
+    public List<string>? ExcludedAuditors { get; set; }
 
     /// <summary>
     /// Agent used for LLM-based auditors. Null = use the project's primary agent.
@@ -167,17 +170,32 @@ public static class ProjectsOptionsBinder
     public static ProjectsOptions Bind(IConfiguration section)
     {
         var options = section.Get<ProjectsOptions>() ?? new ProjectsOptions();
-        ApplyLanguageMap(section.GetSection("Defaults:Audit"), options.Defaults.Audit);
-        ApplyAuditTypeMap(section.GetSection("Defaults:Audit"), options.Defaults.Audit);
+        ApplyAuditMaps(section.GetSection("Defaults:Audit"), options.Defaults.Audit);
 
         var projectSections = section.GetSection("Projects").GetChildren().ToList();
         for (var i = 0; i < options.Projects.Count && i < projectSections.Count; i++)
         {
-            ApplyLanguageMap(projectSections[i].GetSection("Audit"), options.Projects[i].Audit);
-            ApplyAuditTypeMap(projectSections[i].GetSection("Audit"), options.Projects[i].Audit);
+            ApplyAuditMaps(projectSections[i].GetSection("Audit"), options.Projects[i].Audit);
         }
 
         return options;
+    }
+
+    private static void ApplyAuditMaps(IConfigurationSection auditSection, ProjectAuditConfig? audit)
+    {
+        if (audit is null)
+            return;
+
+        ApplyLanguageMap(auditSection, audit);
+        ApplyAuditTypeMap(auditSection, audit);
+
+        var profileSections = auditSection.GetSection("Profiles").GetChildren().ToList();
+        foreach (var profileSection in profileSections)
+        {
+            if (audit.Profiles is null || !audit.Profiles.TryGetValue(profileSection.Key, out var profile))
+                continue;
+            ApplyAuditMaps(profileSection, profile);
+        }
     }
 
     private static void ApplyLanguageMap(IConfigurationSection auditSection, ProjectAuditConfig? audit)
@@ -229,6 +247,7 @@ public sealed class CustomAuditorConfig
 {
     public string? Name { get; set; }
     public string? Kind { get; set; }
+    public string? PluginId { get; set; }
     public List<string>? Argv { get; set; }
     public string? ReviewFocus { get; set; }
     public List<DiffPatternConfig>? Patterns { get; set; }

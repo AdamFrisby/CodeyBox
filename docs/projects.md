@@ -137,6 +137,7 @@ See `docs/audit-types.md` for prompt schemas and precedence.
 
 ```json
 "Audit": {
+  "Profile": "default",
   "MaxIterations": 3,
   "FailingSeverity": "Error",
   "PerIterationTimeoutMinutes": 10,
@@ -144,6 +145,14 @@ See `docs/audit-types.md` for prompt schemas and precedence.
   "MaxLlmAuditorParallelism": 3,
   "Languages": ["python", "node"],
   "AuditTypes": ["security", "architecture", "quality", "completeness", "cheating"],
+  "Profiles": {
+    "uat": {
+      "MaxIterations": 5,
+      "Languages": ["csharp"],
+      "AuditTypes": ["security", "cheating"],
+      "ExcludedAuditors": ["cheating:llm-review"]
+    }
+  },
   "Custom": [
     { "Kind": "shell", "Name": "tests", "Argv": ["npm", "test"] },
     { "Kind": "diff-pattern", "Name": "no-console-log", "Patterns": [
@@ -163,11 +172,18 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `Profile` | string | `"default"` | Project-default named audit profile. `"default"` uses the top-level `Audit` fields. |
+| `Profiles` | object | built-ins include `uat` | Named audit bundles. A profile can set the same fields as `Audit`, plus `ExcludedAuditors` for exact auditor-name removals after preset expansion. |
 | `MaxIterations` | int | `3` | How many audit + rework cycles to attempt before giving up with `AuditFailed` |
 | `FailingSeverity` | string | `"Error"` | Findings at or above this severity block the merge. `"Warning"` or `"Info"` can be used to widen the gate. |
 | `PerIterationTimeoutMinutes` | int | `10` | Wall-clock cap on a single audit iteration's sandbox |
 | `StopOnFirstFailure` | bool | `false` | Stop running auditors as soon as one returns a blocking finding — useful when cheap linters precede expensive LLM auditors |
 | `MaxLlmAuditorParallelism` | int | `3` | Max LLM auditors running concurrently. Default `3` means `security:llm-review`, `completeness:llm-review`, and `cheating:llm-review` all run at the same time. Set to `1` to serialize them if you hit API 429 rate-limit errors. Tool auditors are unaffected and always run sequentially. |
+
+The built-in `uat` profile is intended for UAT/test-generation work. It keeps
+C# format/build/test checks, gitleaks, semgrep, security LLM review, and the
+deterministic cheating patterns, while omitting the completeness and cheating
+LLM reviewers that tend to over-block on UAT list shape.
 
 ### Languages (built-in presets)
 

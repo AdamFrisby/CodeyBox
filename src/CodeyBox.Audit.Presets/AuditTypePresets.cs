@@ -94,3 +94,32 @@ internal static class AuditTypePresets
     private static IAuditor Shell(string name, params string[] argv)
         => new ShellCommandAuditor(new ShellCommandAuditorOptions { Name = name, Argv = argv });
 }
+
+/// <summary>
+/// Built-in named audit profiles. Profiles select full auditor bundles for a
+/// work-item shape; audit types remain the lower-level category presets.
+/// </summary>
+public static class AuditProfilePresets
+{
+    public const string Uat = "uat";
+
+    public static IReadOnlyDictionary<string, ProjectAudit> CreateBuiltIns()
+        => new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase)
+        {
+            [Uat] = CreateUat(),
+        };
+
+    public static ProjectAudit CreateUat() => new()
+    {
+        MaxIterations = 5,
+        Languages = ["csharp"],
+        LanguagesConfigured = true,
+        AuditTypes = ["security", "cheating"],
+
+        // UAT generation produces a test plan/list, not a production-code
+        // patch. The completeness and cheating LLM reviewers repeatedly
+        // overfit that meta-shape; keep deterministic shortcut checks and the
+        // security LLM review, but omit cheating:llm-review here.
+        ExcludedAuditors = ["cheating:llm-review"],
+    };
+}

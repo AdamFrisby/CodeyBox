@@ -299,6 +299,23 @@ public sealed record ProjectPrDescription
 /// </summary>
 public sealed record ProjectAudit
 {
+    public const string DefaultProfileName = "default";
+
+    /// <summary>
+    /// Project-default audit profile name. <c>default</c> uses the fields on this
+    /// instance directly; any other value is resolved from <see cref="Profiles"/>.
+    /// Work-item-level profile overrides are intentionally not modelled here.
+    /// </summary>
+    public string Profile { get; init; } = DefaultProfileName;
+
+    /// <summary>
+    /// Named audit config bundles available to this project. The top-level
+    /// <see cref="ProjectAudit"/> remains the backwards-compatible default
+    /// profile.
+    /// </summary>
+    public IReadOnlyDictionary<string, ProjectAudit> Profiles { get; init; }
+        = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase);
+
     public int MaxIterations { get; init; } = 10;
     public AuditSeverity FailingSeverity { get; init; } = AuditSeverity.Error;
     public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(10);
@@ -336,6 +353,7 @@ public sealed record ProjectAudit
         = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase);
     public string? LlmPromptFrameTemplate { get; init; }
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
+    public IReadOnlyList<string> ExcludedAuditors { get; init; } = [];
 
     /// <summary>
     /// Agent runner used for LLM-based auditors (security:llm-review,
@@ -370,6 +388,26 @@ public sealed record ProjectAudit
     /// file races. Tool auditors are unaffected and always run sequentially.
     /// </summary>
     public int MaxLlmAuditorParallelism { get; init; } = 3;
+
+    public ProjectAudit ResolveProfile(string? profileName = null)
+    {
+        var selected = string.IsNullOrWhiteSpace(profileName) ? Profile : profileName;
+        if (string.IsNullOrWhiteSpace(selected) ||
+            selected.Equals(DefaultProfileName, StringComparison.OrdinalIgnoreCase))
+        {
+            return this with { Profile = DefaultProfileName };
+        }
+
+        if (!Profiles.TryGetValue(selected, out var profile))
+            throw new InvalidOperationException(
+                $"Unknown audit profile '{selected}'. Known profiles: {string.Join(", ", Profiles.Keys.Order(StringComparer.OrdinalIgnoreCase))}");
+
+        return profile with
+        {
+            Profile = selected,
+            Profiles = Profiles,
+        };
+    }
 }
 
 public sealed record ProjectLanguagePresetOverride

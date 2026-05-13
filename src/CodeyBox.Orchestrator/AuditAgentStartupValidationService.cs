@@ -58,12 +58,17 @@ public sealed class AuditAgentStartupValidationService : IHostedService
     private async Task ValidateProjectAsync(Project project, CancellationToken ct)
     {
         var auditKinds = new HashSet<AgentKind>();
+        var audits = new[] { project.Audit.ResolveProfile() }
+            .Concat(project.Audit.Profiles.Values);
 
-        if (project.Audit.AuditAgent is { } auditAgent)
-            auditKinds.Add(auditAgent);
+        foreach (var audit in audits)
+        {
+            if (audit.AuditAgent is { } auditAgent)
+                auditKinds.Add(auditAgent);
 
-        foreach (var kind in project.Audit.PerAuditorAgent.Values)
-            auditKinds.Add(kind);
+            foreach (var kind in audit.PerAuditorAgent.Values)
+                auditKinds.Add(kind);
+        }
 
         foreach (var kind in auditKinds)
         {

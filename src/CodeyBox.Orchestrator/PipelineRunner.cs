@@ -168,6 +168,17 @@ public sealed class PipelineRunner : IPipelineRunner
 
         using var projectScope = AuditLog.ProjectScope(project.Id);
 
+        try
+        {
+            project = project with { Audit = project.Audit.ResolveProfile() };
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Work item {Id} could not resolve audit profile for project {ProjectId}", item.Id, project.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "configuration");
+            return;
+        }
+
         var agentKind = item.Agent ?? project.DefaultAgent;
         if (!_agents.TryGet(agentKind, out var agentRunner))
         {
@@ -271,6 +282,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // committing, pre-empting iter-1 rework cycles for trivial
             // findings (format, lint, build-WaE).
             var auditors = _auditorComposer.Compose(project, agentRunner);
+            AuditLog.AuditProfileSelected(project.Audit.Profile, auditors.Select(a => a.Name).ToArray());
 
             // -------- Phase 1: Work --------
             if (!skipWork)
