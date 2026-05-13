@@ -47,6 +47,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 {
     private readonly MultipassSandboxOptions _opts;
     private readonly ILogger<MultipassSandboxProvider> _log;
+    private readonly IProcessRunner _runner;
     private readonly string _stagingRoot;
     private readonly ITimingStore? _timings;
     // Per-baseline-name semaphore: serialises bake operations so two
@@ -67,9 +68,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings = null)
+        : this(opts, log, timings, new DefaultProcessRunner())
+    {
+    }
+
+    internal MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
+        ITimingStore? timings, IProcessRunner runner)
     {
         _opts = opts;
         _log = log;
+        _runner = runner;
         _timings = timings;
         _stagingRoot = ResolveStagingRoot(opts);
         Directory.CreateDirectory(_stagingRoot);
@@ -81,7 +89,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         TryChmod0700(_stagingRoot);
     }
 
-    private static void TryChmod0700(string path)
+    internal static void TryChmod0700(string path)
     {
         if (OperatingSystem.IsWindows()) return;
         try
@@ -221,7 +229,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // the newly created sandbox immediately rather than serving stale data.
             _listCacheExpiry = DateTimeOffset.MinValue;
             return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log, timingStore, timingItemId, timingPhase,
-                onDisposed: n => { _activeSandboxNames.TryRemove(n, out _); _listCacheExpiry = DateTimeOffset.MinValue; });
+                onDisposed: n => { _activeSandboxNames.TryRemove(n, out _); _listCacheExpiry = DateTimeOffset.MinValue; },
+                runner: _runner);
         }
         catch
         {
@@ -765,7 +774,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         return sb.ToString();
     }
 
-    private static string ShellSingleQuote(string value) =>
+    internal static string ShellSingleQuote(string value) =>
         "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
 
     /// <summary>
@@ -800,6 +809,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         fi
         cd "$1" || exit 127
         shift
+        if [ "${1:-}" = "--env-file" ]; then
+            [ "$#" -ge 2 ] || exit 127
+            set -a
+            . "$2" || exit 126
+            set +a
+            shift 2
+        fi
         if [ "$keep_stdin" = "1" ]; then
             exec "$@"
         else
@@ -914,6 +930,38 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     private async Task<RunResult> RunAsync(IReadOnlyList<string> argv, string? stdin, CancellationToken ct)
     {
+        return await _runner.RunAsync(argv, stdin, ct);
+    }
+
+    private async Task TryDeleteVmAsync(string name)
+    {
+        try
+        {
+            await RunAsync([_opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: CancellationToken.None);
+        }
+        catch { /* best-effort */ }
+    }
+}
+
+internal interface IProcessRunner
+{
+    Task<RunResult> RunAsync(
+        IReadOnlyList<string> argv,
+        string? stdin,
+        CancellationToken ct,
+        Action<string>? stdoutChunkCallback = null,
+        Action<string>? stderrChunkCallback = null);
+}
+
+internal sealed class DefaultProcessRunner : IProcessRunner
+{
+    public async Task<RunResult> RunAsync(
+        IReadOnlyList<string> argv,
+        string? stdin,
+        CancellationToken ct,
+        Action<string>? stdoutChunkCallback = null,
+        Action<string>? stderrChunkCallback = null)
+    {
         var psi = new ProcessStartInfo
         {
             FileName = argv[0],
@@ -926,9 +974,40 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         for (var i = 1; i < argv.Count; i++) psi.ArgumentList.Add(argv[i]);
 
         using var p = new Process { StartInfo = psi };
+        var stdout = new StringBuilder();
+        var stderr = new StringBuilder();
+        var streamChunks = stdoutChunkCallback is not null || stderrChunkCallback is not null;
+        if (streamChunks)
+        {
+            p.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stdout.Append(line);
+                stdoutChunkCallback?.Invoke(line);
+            };
+            p.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stderr.Append(line);
+                stderrChunkCallback?.Invoke(line);
+            };
+        }
+
         p.Start();
-        var stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = p.StandardError.ReadToEndAsync(ct);
+        Task<string>? stdoutTask = null;
+        Task<string>? stderrTask = null;
+        if (streamChunks)
+        {
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+        }
+        else
+        {
+            stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
+            stderrTask = p.StandardError.ReadToEndAsync(ct);
+        }
         if (stdin is not null)
         {
             await p.StandardInput.WriteAsync(stdin);
@@ -940,16 +1019,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             try { p.Kill(entireProcessTree: true); } catch { }
             throw;
         }
-        return new RunResult(p.ExitCode, await stdoutTask, await stderrTask);
-    }
-
-    private async Task TryDeleteVmAsync(string name)
-    {
-        try
-        {
-            await RunAsync([_opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: CancellationToken.None);
-        }
-        catch { /* best-effort */ }
+        if (stdoutTask is not null && stderrTask is not null)
+            return new RunResult(p.ExitCode, await stdoutTask, await stderrTask);
+        return new RunResult(p.ExitCode, stdout.ToString(), stderr.ToString());
     }
 }
 
@@ -1194,11 +1266,14 @@ public sealed record MultipassSandboxOptions
 
 internal sealed class MultipassSandbox : IPreemptibleSandbox
 {
+    internal const int ArgvBytesWarningThreshold = 64 * 1024;
+
     private readonly string _name;
     private readonly string _sandboxRoot;
     private readonly SandboxSpec _spec;
     private readonly MultipassSandboxOptions _opts;
     private readonly ILogger _log;
+    private readonly IProcessRunner _runner;
     private readonly ITimingStore? _timings;
     private readonly WorkItemId _timingItemId;
     private readonly string _timingPhase;
@@ -1209,13 +1284,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
-        Action<string>? onDisposed = null)
+        Action<string>? onDisposed = null, IProcessRunner? runner = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
         _spec = spec;
         _opts = opts;
         _log = log;
+        _runner = runner ?? new DefaultProcessRunner();
         _timings = timings;
         _timingItemId = timingItemId;
         _timingPhase = timingPhase;
@@ -1230,47 +1306,31 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (exec.Argv.Count == 0) throw new ArgumentException("Argv must be non-empty", nameof(exec));
 
-        // Run via the codeybox-exec wrapper so:
-        //   - /run/codeybox/env (transferred at sandbox boot) is sourced —
-        //     credentials live there, never on argv.
-        //   - working directory is enforced.
-        //
-        // Per-exec ExtraEnvironment is appended via --env if multipass
-        // supports it; otherwise inlined into the wrapper invocation. For
-        // simplicity we always inline as KEY=VALUE prefix args to env(1).
-        var argv = new List<string> { _opts.MultipassBinary, "exec", _name, "--" };
-
-        // The codeybox-exec wrapper closes stdin by default to prevent
-        // tools that read stdin from hanging the sandbox. When the
-        // orchestrator deliberately pipes stdin (e.g. git commit -F-),
-        // pass --keep-stdin as the first wrapper arg so it preserves
-        // the pipe.
-        var wrapped = new List<string> { "/usr/local/bin/codeybox-exec" };
-        if (exec.Stdin is not null)
-            wrapped.Add("--keep-stdin");
-        wrapped.Add(exec.WorkingDirectory ?? _spec.WorkingDirectory);
-        if (exec.ExtraEnvironment is not null && exec.ExtraEnvironment.Count > 0)
+        var transferredVmPaths = new List<string>();
+        var wrapped = BuildWrappedInvocation(exec, extraEnvFile: null);
+        var argv = BuildMultipassExecArgv(wrapped);
+        var argvBytes = EstimateArgvBytes(argv);
+        if (argvBytes > ArgvBytesWarningThreshold)
         {
-            // env(1) takes KEY=VALUE pairs followed by the command. Per-exec
-            // env is for non-secret runtime hints — secrets are in /run/codeybox/env.
-            wrapped.Add("env");
-            foreach (var (k, v) in exec.ExtraEnvironment)
-                wrapped.Add($"{k}={v}");
+            _log.LogWarning(
+                "Multipass exec argv for {Name} is {Bytes} bytes; routing through transferred files to avoid ARG_MAX",
+                _name, argvBytes);
+
+            if (exec.ExtraEnvironment is { Count: > 0 })
+            {
+                var envFile = await TransferExecEnvironmentAsync(exec.ExtraEnvironment, ct);
+                transferredVmPaths.Add(envFile);
+                wrapped = BuildWrappedInvocation(exec, envFile);
+                argv = BuildMultipassExecArgv(wrapped);
+            }
+
+            if (EstimateArgvBytes(argv) > ArgvBytesWarningThreshold)
+            {
+                var script = await TransferExecScriptAsync(wrapped, ct);
+                transferredVmPaths.Add(script);
+                argv = [_opts.MultipassBinary, "exec", _name, "--", "/bin/sh", script];
+            }
         }
-        wrapped.AddRange(exec.Argv);
-
-        argv.AddRange(wrapped);
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = argv[0],
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            RedirectStandardInput = exec.Stdin is not null,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        for (var i = 1; i < argv.Count; i++) psi.ArgumentList.Add(argv[i]);
 
         var isFirstExec = Interlocked.CompareExchange(ref _firstExecEmitted, 1, 0) == 0;
         TimingScope? firstExecScope = isFirstExec
@@ -1278,43 +1338,143 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
             : null;
         try
         {
-            using var p = new Process { StartInfo = psi };
-            var stdout = new StringBuilder();
-            var stderr = new StringBuilder();
-            p.OutputDataReceived += (_, e) =>
-            {
-                if (e.Data is null) return;
-                var line = e.Data + "\n";
-                stdout.Append(line);
-                exec.StdoutChunkCallback?.Invoke(line);
-            };
-            p.ErrorDataReceived += (_, e) =>
-            {
-                if (e.Data is null) return;
-                var line = e.Data + "\n";
-                stderr.Append(line);
-                exec.StderrChunkCallback?.Invoke(line);
-            };
-            p.Start();
-            p.BeginOutputReadLine();
-            p.BeginErrorReadLine();
-            if (exec.Stdin is not null)
-            {
-                await p.StandardInput.WriteAsync(exec.Stdin);
-                p.StandardInput.Close();
-            }
-            try { await p.WaitForExitAsync(ct); }
-            catch (OperationCanceledException)
-            {
-                try { p.Kill(entireProcessTree: true); } catch { }
-                throw;
-            }
-            return new SandboxExecResult(p.ExitCode, stdout.ToString(), stderr.ToString());
+            var result = await _runner.RunAsync(
+                argv,
+                exec.Stdin,
+                ct,
+                exec.StdoutChunkCallback,
+                exec.StderrChunkCallback);
+            return new SandboxExecResult(result.ExitCode, result.Stdout, result.Stderr);
         }
         finally
         {
+            if (transferredVmPaths.Count > 0)
+                await TryRemoveTransferredFilesAsync(transferredVmPaths);
             if (firstExecScope is not null)
                 await firstExecScope.DisposeAsync();
+        }
+    }
+
+    private List<string> BuildWrappedInvocation(SandboxExec exec, string? extraEnvFile)
+    {
+        // The codeybox-exec wrapper closes stdin by default to prevent
+        // tools that read stdin from hanging the sandbox. When the
+        // orchestrator deliberately pipes stdin, pass --keep-stdin first.
+        var wrapped = new List<string> { "/usr/local/bin/codeybox-exec" };
+        if (exec.Stdin is not null)
+            wrapped.Add("--keep-stdin");
+        wrapped.Add(exec.WorkingDirectory ?? _spec.WorkingDirectory);
+        if (extraEnvFile is not null)
+        {
+            wrapped.AddRange(["--env-file", extraEnvFile]);
+        }
+        else if (exec.ExtraEnvironment is { Count: > 0 })
+        {
+            // env(1) takes KEY=VALUE pairs followed by the command. This
+            // keeps the common case small and preserves historical ordering.
+            wrapped.Add("env");
+            foreach (var (k, v) in exec.ExtraEnvironment)
+                wrapped.Add($"{k}={v}");
+        }
+        wrapped.AddRange(exec.Argv);
+        return wrapped;
+    }
+
+    private List<string> BuildMultipassExecArgv(IReadOnlyList<string> wrapped) =>
+        [_opts.MultipassBinary, "exec", _name, "--", .. wrapped];
+
+    internal static int EstimateArgvBytes(IReadOnlyList<string> argv)
+    {
+        var total = 0;
+        foreach (var arg in argv)
+            total += Encoding.UTF8.GetByteCount(arg) + 1;
+        return total;
+    }
+
+    private async Task<string> TransferExecEnvironmentAsync(IReadOnlyDictionary<string, string> env, CancellationToken ct)
+    {
+        var fileName = $"env-{Guid.NewGuid():N}";
+        var hostDir = Path.Combine(_sandboxRoot, "exec-env");
+        Directory.CreateDirectory(hostDir);
+        MultipassSandboxProvider.TryChmod0700(hostDir);
+        var hostPath = Path.Combine(hostDir, fileName);
+        await File.WriteAllTextAsync(hostPath, MultipassSandboxProvider.BuildEnvironmentFileContent(env), ct);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+        const string vmDir = "/home/ubuntu/.codeybox-exec-env";
+        await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
+        await TransferFileToVmAsync(hostPath, $".codeybox-exec-env/{fileName}", "multipass transfer exec env file", ct);
+        var vmPath = $"{vmDir}/{fileName}";
+        await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
+        return vmPath;
+    }
+
+    private async Task<string> TransferExecScriptAsync(IReadOnlyList<string> wrapped, CancellationToken ct)
+    {
+        var fileName = $"exec-{Guid.NewGuid():N}.sh";
+        var hostDir = Path.Combine(_sandboxRoot, "exec-scripts");
+        Directory.CreateDirectory(hostDir);
+        MultipassSandboxProvider.TryChmod0700(hostDir);
+        var hostPath = Path.Combine(hostDir, fileName);
+        await File.WriteAllTextAsync(hostPath, BuildExecScript(wrapped), ct);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+        const string vmDir = "/home/ubuntu/.codeybox-exec";
+        await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
+        await TransferFileToVmAsync(hostPath, $".codeybox-exec/{fileName}", "multipass transfer exec script", ct);
+        var vmPath = $"{vmDir}/{fileName}";
+        await RunVmCommandAsync(["chmod", "0700", vmPath], ct);
+        return vmPath;
+    }
+
+    internal static string BuildExecScript(IReadOnlyList<string> wrapped)
+    {
+        var sb = new StringBuilder();
+        sb.Append("#!/bin/sh\nexec");
+        foreach (var arg in wrapped)
+            sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
+        sb.Append('\n');
+        return sb.ToString();
+    }
+
+    private async Task TransferFileToVmAsync(string hostPath, string vmRelativePath, string description, CancellationToken ct)
+    {
+        var tx = await MultipassRetry.RunWithRetryAsync(
+            ctInner => _runner.RunAsync(
+                [_opts.MultipassBinary, "transfer", hostPath, $"{_name}:{vmRelativePath}"],
+                stdin: null,
+                ct: ctInner),
+            _log,
+            description,
+            ct);
+        if (tx.ExitCode != 0)
+            throw new InvalidOperationException($"{description} failed: {tx.Stderr}");
+    }
+
+    private async Task RunVmCommandAsync(IReadOnlyList<string> command, CancellationToken ct)
+    {
+        var result = await _runner.RunAsync(
+            [_opts.MultipassBinary, "exec", _name, "--", .. command],
+            stdin: null,
+            ct: ct);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException($"multipass exec setup command failed: {result.Stderr}");
+    }
+
+    private async Task TryRemoveTransferredFilesAsync(IReadOnlyList<string> vmPaths)
+    {
+        try
+        {
+            _ = await _runner.RunAsync(
+                [_opts.MultipassBinary, "exec", _name, "--", "rm", "-f", .. vmPaths],
+                stdin: null,
+                ct: CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Failed to clean transferred multipass exec files for {Name}", _name);
         }
     }
 
