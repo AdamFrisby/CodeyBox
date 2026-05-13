@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Threading.Channels;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Tests;
@@ -12,18 +14,23 @@ namespace CodeyBox.Tests.Uat.QuotaAndRouting;
 /// </summary>
 public sealed class AgentClassRouterTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-uat-router-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-uat-router-failures-{Guid.NewGuid():N}.db");
+    private readonly string _workDbPath = Path.Combine(Path.GetTempPath(), $"codeybox-uat-router-items-{Guid.NewGuid():N}.db");
     private readonly SqliteQuotaFailureStore _failures;
+    private readonly SqliteWorkItemStore _items;
 
     public AgentClassRouterTests()
     {
         _failures = new SqliteQuotaFailureStore(_dbPath);
+        _items = new SqliteWorkItemStore(_workDbPath);
     }
 
     public void Dispose()
     {
+        _items.Dispose();
         _failures.Dispose();
         File.Delete(_dbPath);
+        File.Delete(_workDbPath);
     }
 
     [Fact]
@@ -203,9 +210,9 @@ public sealed class AgentClassRouterTests : IDisposable
     }
 
     [Fact]
-    public async Task AllSubscriptionMembersExhausted_WaitsForConfiguredRecheckInterval()
+    public async Task AllSubscriptionMembersExhausted_ReenqueuesItemAfterConfiguredRecheckInterval()
     {
-        var interval = TimeSpan.FromMinutes(7);
+        var interval = TimeSpan.FromMilliseconds(50);
         var router = BuildRouter(
             members: [Subscription(AgentKind.Claude, score: 100), Subscription(AgentKind.Codex, score: 99)],
             probes: [new StaticQuotaProbe(AgentKind.Claude, 2), new StaticQuotaProbe(AgentKind.Codex, 3)],
@@ -214,12 +221,36 @@ public sealed class AgentClassRouterTests : IDisposable
                 MinQuotaPct = 10,
                 QuotaRecheckInterval = interval,
             });
+        var item = Item("frontier") with { State = WorkItemState.Queued };
+        await _items.CreateAsync(item);
 
-        var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
+        var queue = new RecordingTaskQueue();
+        var pipeline = new RecordingPipelineRunner();
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var service = new OrchestratorService(
+            queue,
+            _items,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router);
 
-        Assert.Null(decision.Chosen);
-        Assert.True(decision.ShouldWait);
-        Assert.Equal(interval, decision.SuggestedRecheckIn);
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            var reenqueuedId = await queue.SecondEnqueue.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var stored = await _items.GetAsync(item.Id);
+
+            Assert.Equal(item.Id, reenqueuedId);
+            Assert.Equal(WorkItemState.Queued, stored!.State);
+            Assert.Equal(0, pipeline.RunCount);
+            Assert.Equal([item.Id, item.Id], queue.EnqueuedIds.Take(2).ToArray());
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
     }
 
     [Fact]
@@ -331,5 +362,54 @@ public sealed class AgentClassRouterTests : IDisposable
         }
 
         public override DateTimeOffset GetUtcNow() => _now;
+    }
+
+    private sealed class RecordingTaskQueue : ITaskQueue
+    {
+        private readonly Channel<WorkItemId> _channel = Channel.CreateUnbounded<WorkItemId>();
+        private readonly ConcurrentQueue<WorkItemId> _enqueued = new();
+        private int _enqueueCount;
+
+        public TaskCompletionSource<WorkItemId> SecondEnqueue { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public WorkItemId[] EnqueuedIds => _enqueued.ToArray();
+
+        public int Count => _channel.Reader.Count;
+
+        public async ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
+        {
+            var count = Interlocked.Increment(ref _enqueueCount);
+            _enqueued.Enqueue(id);
+            if (count == 2)
+                SecondEnqueue.TrySetResult(id);
+
+            await _channel.Writer.WriteAsync(id, ct);
+        }
+
+        public async ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                return await _channel.Reader.ReadAsync(ct);
+            }
+            catch (ChannelClosedException)
+            {
+                return null;
+            }
+        }
+    }
+
+    private sealed class RecordingPipelineRunner : IPipelineRunner
+    {
+        private int _runCount;
+
+        public int RunCount => Volatile.Read(ref _runCount);
+
+        public Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+        {
+            Interlocked.Increment(ref _runCount);
+            return Task.CompletedTask;
+        }
     }
 }
