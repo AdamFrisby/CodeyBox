@@ -59,8 +59,13 @@ public sealed class ProjectAuditorComposer
     public ProjectAuditorComposer(IPresetCatalog catalog)
         : this(catalog, [], NullLogger<ProjectAuditorComposer>.Instance) { }
 
-    public IReadOnlyList<IAuditor> Compose(Project project, IAgentRunner agentForLlmAuditors)
+    public IReadOnlyList<IAuditor> Compose(
+        Project project,
+        IAgentRunner agentForLlmAuditors,
+        string? profile = null)
     {
+        var audit = project.Audit.ResolveProfile(profile);
+        project = project with { Audit = audit };
         var catalog = ResolveCatalog(project);
         ValidateSelectedPresets(project, catalog);
         var ctx = new PresetContext(agentForLlmAuditors);
@@ -82,6 +87,12 @@ public sealed class ProjectAuditorComposer
             {
                 auditors.Add(MaterialiseCustom(custom, ctx, catalog.LlmPromptFrameTemplate));
             }
+        }
+
+        if (project.Audit.ExcludedAuditors.Count > 0)
+        {
+            var excluded = new HashSet<string>(project.Audit.ExcludedAuditors, StringComparer.OrdinalIgnoreCase);
+            auditors.RemoveAll(a => excluded.Contains(a.Name));
         }
 
         return auditors;

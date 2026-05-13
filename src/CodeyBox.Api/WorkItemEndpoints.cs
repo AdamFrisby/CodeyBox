@@ -1186,16 +1186,20 @@ internal static class WorkItemEndpoints
             QuotaRetryAttempts: item.QuotaRetryAttempts);
     }
 
-    private static ProjectDto ToProjectDto(Project p) => new(
-        p.Id.Value,
-        p.DisplayName,
-        p.RepositoryUrl,
-        p.DefaultBaseBranch,
-        p.DefaultAgent.Value,
-        p.Upstream.Kind,
-        p.Audit.Languages,
-        p.Audit.AuditTypes,
-        p.Audit.MaxIterations);
+    private static ProjectDto ToProjectDto(Project p)
+    {
+        var audit = p.Audit.ResolveProfile();
+        return new ProjectDto(
+            p.Id.Value,
+            p.DisplayName,
+            p.RepositoryUrl,
+            p.DefaultBaseBranch,
+            p.DefaultAgent.Value,
+            p.Upstream.Kind,
+            audit.Languages,
+            audit.AuditTypes,
+            audit.MaxIterations);
+    }
 
     private static async Task<IResult> GetStdoutTailAsync(
         string id,

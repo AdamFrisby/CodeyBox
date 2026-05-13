@@ -190,6 +190,12 @@ public static class AuditLog
 
     // ── Auditor / audit loop ─────────────────────────────────────────────────
 
+    public static void AuditProfileSelected(string profile, IReadOnlyList<string> auditorNames) =>
+        Audit("audit.profile_selected")
+            .ForContext("AuditorNames", auditorNames, destructureObjects: true)
+            .Information("Audit profile {AuditProfile} selected with {AuditorCount} auditor(s)",
+                profile, auditorNames.Count);
+
     public static void AuditorRun(string auditorName, string worstSeverity, TimeSpan duration, AgentKind agentKind) =>
         Audit("auditor.run")
             .Information("Auditor {AuditorName} completed: worstSeverity={WorstSeverity} duration={DurationMs}ms agentKind={AgentKind}",
