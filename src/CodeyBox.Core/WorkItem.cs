@@ -34,8 +34,8 @@ public sealed record WorkItem
     /// <summary>If set, overrides the project's default agent.</summary>
     public AgentKind? Agent { get; init; }
 
-    /// <summary>Wall-clock budget for the work phase.</summary>
-    public TimeSpan WorkTimeout { get; init; } = TimeSpan.FromMinutes(30);
+    /// <summary>Wall-clock budget for the work phase (also applied per rework iteration).</summary>
+    public TimeSpan WorkTimeout { get; init; } = TimeSpan.FromMinutes(60);
 
     /// <summary>Wall-clock budget for the merge phase.</summary>
     public TimeSpan MergeTimeout { get; init; } = TimeSpan.FromMinutes(15);
