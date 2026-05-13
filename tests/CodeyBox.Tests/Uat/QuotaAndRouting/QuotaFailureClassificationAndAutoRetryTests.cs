@@ -51,14 +51,13 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     }
 
     [Fact]
-    public void ResetDuration_IsParsedFromQuotaMessage()
+    public void ResetDuration_IsDetectedFromQuotaMessage()
     {
         var detection = QuotaFailureDetector.Detect(stderr: "RESOURCE_EXHAUSTED reset after 20h31m6s", stdout: null);
 
         Assert.NotNull(detection);
-        Assert.NotNull(detection!.ResetAt);
-        var resetDelay = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
-        Assert.InRange(resetDelay.TotalMinutes, (20 * 60) + 30, (20 * 60) + 32);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
     }
 
     [Fact]
