@@ -64,6 +64,8 @@
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />
+    <ProjectReference Include="..\..\tools\CodeyBox.Admin\src\CodeyBox.Admin.Web\CodeyBox.Admin.Web.csproj"
+                      Aliases="CodeyBoxAdminWeb" />
   </ItemGroup>
 
 </Project>
