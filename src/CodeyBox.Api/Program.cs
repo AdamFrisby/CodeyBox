@@ -1404,7 +1404,7 @@ namespace CodeyBox.Api
     {
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
-        public string SandboxImageReference { get; set; } = "codeybox/agent:latest";
+        public string SandboxImageReference { get; set; } = "";
         public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com", "generativelanguage.googleapis.com"];
         public string[] AuditToolAllowedHosts { get; set; } =
         [

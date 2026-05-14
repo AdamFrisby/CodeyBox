@@ -109,6 +109,23 @@ public sealed class OrchestratorService : BackgroundService
         base.Dispose();
     }
 
+    /// <summary>
+    /// Releases the concurrency gate, swallowing <see cref="ObjectDisposedException"/>
+    /// which can occur when the host's shutdown timeout fires before in-flight worker
+    /// tasks finish draining: <see cref="Dispose"/> disposes the gate, then the still-
+    /// running task's finally tries to Release on the now-disposed semaphore. Without
+    /// this guard the exception faults the inFlight task, propagates through
+    /// <c>Task.WhenAll</c> in <see cref="ExecuteAsync"/>, and trips the host's
+    /// <c>BackgroundServiceExceptionBehavior=StopHost</c> path — which manifests as a
+    /// fatal exit during shutdown and can cause work items to be marked Failed
+    /// rather than left mid-flight for recovery.
+    /// </summary>
+    private void TryReleaseConcurrencyGate()
+    {
+        try { _concurrencyGate.Release(); }
+        catch (ObjectDisposedException) { /* shutdown teardown race; gate already disposed */ }
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // Run the reaper once at startup before replaying pending items.
@@ -164,7 +181,7 @@ public sealed class OrchestratorService : BackgroundService
                         try { await Task.Delay(wait, stoppingToken); }
                         catch (OperationCanceledException)
                         {
-                            _concurrencyGate.Release();
+                            TryReleaseConcurrencyGate();
                             break;
                         }
                     }
@@ -177,7 +194,7 @@ public sealed class OrchestratorService : BackgroundService
             catch (Exception ex)
             {
                 _log.LogError(ex, "OnWorkerSpawned callback threw; releasing concurrency slot and skipping item {Id}", id);
-                _concurrencyGate.Release();
+                TryReleaseConcurrencyGate();
                 continue;
             }
             var workerIndex = Interlocked.Increment(ref _nextWorkerId);
@@ -197,7 +214,7 @@ public sealed class OrchestratorService : BackgroundService
                 {
                     Interlocked.Decrement(ref _currentlyRunning);
                     AuditLog.WorkerPoolWorkerFinished(workerIndex, capturedId);
-                    _concurrencyGate.Release();
+                    TryReleaseConcurrencyGate();
                 }
             });
 
