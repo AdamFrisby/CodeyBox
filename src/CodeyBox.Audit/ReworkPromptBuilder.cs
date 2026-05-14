@@ -24,6 +24,8 @@ public static class ReworkPromptBuilder
         sb.Append("Audit iteration ").Append(iteration).Append(" of ").Append(maxIterations)
           .AppendLine(" found issues with your previous changes. Please address every Error-severity finding below, then commit. The orchestrator re-runs the full audit suite after your commit; it will fail with new findings if anything is still wrong, and you'll get another chance to address them.");
         sb.AppendLine();
+        sb.AppendLine("Evaluate carefully whether a refactor is really required to address a finding. A small, targeted fix is usually sufficient to resolve the auditor's concern — only consider a refactor if that small fix would be papering over a larger architectural fault. Refactors are not forbidden, but they widen the diff, increase regression risk, and often introduce new findings; reach for one only when the smaller fix is clearly inadequate.");
+        sb.AppendLine();
         sb.AppendLine("Make new commits — do not amend.");
         sb.AppendLine();
         sb.AppendLine("Every commit message MUST end with the following trailer, separated from the subject by a blank line:");
