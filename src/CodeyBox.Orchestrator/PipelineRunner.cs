@@ -528,11 +528,23 @@ public sealed class PipelineRunner : IPipelineRunner
             lockEntered = true;
 
             var access = _gitHost.GetSandboxAccess(repoId);
+            // Reuse one of the project's configured network profiles so the
+            // sandbox provider can take the fast baseline-clone path. Egress is
+            // still blocked by allowAgentNetwork:false → AllowedHosts:[], so the
+            // host-bridge attachment is just for boot, not for traffic; the
+            // rebase reads from the file:// mount, not the network. Without a
+            // profile, providers that use per-profile baselines (Multipass) fall
+            // through to full cloud-init from scratch, which routinely exceeds
+            // the launch timeout because MultipassExtraRuncmd re-runs all the
+            // agent-CLI installs the rebase doesn't need.
+            var rebaseProfile = project.NetworkProfiles.AuditTool
+                ?? project.NetworkProfiles.AuditAgent
+                ?? project.NetworkProfiles.Work;
             var spec = BuildSandboxSpec(
                 access,
                 includeAgentCredential: null,
                 allowAgentNetwork: false,
-                hostNetworkProfile: null,
+                hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
                 timingPhase: "pickup");
 
