@@ -36,6 +36,7 @@ public sealed class ProjectConfig
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
     public ProjectBudgetConfig? Budget { get; set; }
     public ProjectReleaseConfigOptions? Release { get; set; }
+    public bool? SkipCredentialSmokeTest { get; set; }
 }
 
 /// <summary>

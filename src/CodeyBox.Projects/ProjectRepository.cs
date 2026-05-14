@@ -195,6 +195,7 @@ public sealed class ProjectRepository : IProjectRepository
             NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),
             Budget = ResolveBudget(pc.Budget),
             ReleaseConfig = ResolveReleaseConfig(pc.Release),
+            SkipCredentialSmokeTest = pc.SkipCredentialSmokeTest ?? false,
         };
     }
 
