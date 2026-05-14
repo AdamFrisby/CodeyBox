@@ -99,10 +99,15 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
     public async Task StdinAndStdoutCallbacks_AreHandledByProviderProcess()
     {
         if (OperatingSystem.IsWindows()) return;
+        var ackPath = Path.Combine(_workspace, "stdout-ack.fifo");
         var fakeBwrap = Path.Combine(_workspace, "fake-stdin-bwrap.sh");
         await File.WriteAllTextAsync(fakeBwrap, """
             #!/bin/sh
-            wc -c
+            mkfifo "$ACK_FIFO"
+            bytes=$(wc -c | tr -d ' ')
+            printf '%s\n' "$bytes"
+            IFS= read -r _ < "$ACK_FIFO"
+            rm -f "$ACK_FIFO"
             """);
         File.SetUnixFileMode(fakeBwrap,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -113,14 +118,23 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
                 ReadOnlyHostBinds = [],
             },
             new RecordingLogger<BubblewrapSandboxProvider>());
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Environment = new Dictionary<string, string> { ["ACK_FIFO"] = ackPath },
+        });
         var chunks = new List<string>();
 
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["ignored"],
             Stdin = "abcdef",
-            StdoutChunkCallback = chunks.Add,
+            StdoutChunkCallback = chunk =>
+            {
+                chunks.Add(chunk);
+                if (chunk.Contains("6", StringComparison.Ordinal))
+                    File.WriteAllText(ackPath, "ack\n");
+            },
         });
 
         Assert.True(result.Success, result.Stderr);
