@@ -14,10 +14,7 @@ internal static class SandboxTargetResolver
         if (!project.GraphicalSandbox || !graphicalEligible)
             return new SandboxTarget(configuredNetworkProfile, SandboxProfileFlavor.Headless);
 
-        var networkProfile = string.IsNullOrWhiteSpace(configuredNetworkProfile)
-            ? null
-            : configuredNetworkProfile;
-        return new SandboxTarget(networkProfile, SandboxProfileFlavor.Graphical);
+        return new SandboxTarget(SandboxConventions.GraphicalNetworkProfile, SandboxProfileFlavor.Graphical);
     }
 }
 

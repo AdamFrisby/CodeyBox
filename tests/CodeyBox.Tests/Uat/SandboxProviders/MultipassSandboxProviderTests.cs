@@ -56,14 +56,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("path: /etc/systemd/system/codeybox-vnc.service", cloudInit);
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
+        Assert.Contains("x11-utils socat", cloudInit);
         Assert.Contains($"-rfbport {SandboxConventions.GraphicalVncPort}", cloudInit);
-        Assert.Contains("listen_addr=$(ip -4 -o addr show", cloudInit);
-        Assert.Contains("-listen \"$listen_addr\"", cloudInit);
-        Assert.Contains("-allow \"$host_addr\"", cloudInit);
+        Assert.Contains("-listen 127.0.0.1", cloudInit);
+        Assert.Contains("-allow 127.0.0.1", cloudInit);
         Assert.Contains("-rfbauth \"$password_file\"", cloudInit);
-        Assert.Contains("codeybox-vnc: no 10.99.x.x interface present", cloudInit);
-        Assert.DoesNotContain("-listen 127.0.0.1", cloudInit);
-        Assert.DoesNotContain("-localhost", cloudInit);
+        Assert.DoesNotContain("-listen \"$listen_addr\"", cloudInit);
+        Assert.DoesNotContain("-allow \"$host_addr\"", cloudInit);
         Assert.DoesNotContain("-nopw", cloudInit);
         Assert.Contains("echo project setup", cloudInit);
 
@@ -75,6 +74,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("codeybox-vnc.service", headlessCloudInit);
         Assert.DoesNotContain("xvfb x11vnc xfce4", headlessCloudInit);
         Assert.DoesNotContain("xdotool scrot ffmpeg", headlessCloudInit);
+        Assert.DoesNotContain("x11-utils socat", headlessCloudInit);
     }
 
     [Fact]
@@ -254,6 +254,24 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.True(result.StdoutLimitExceeded);
         Assert.True(result.Stdout.Length <= 1024, $"captured {result.Stdout.Length} bytes");
+    }
+
+    [Fact]
+    public async Task DefaultProcessRunner_StopsReadingWhenStderrLimitIsExceeded()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var runner = new DefaultProcessRunner();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        var result = await runner.RunAsync(
+            ["sh", "-c", "while :; do printf 1234567890 >&2; done"],
+            stdin: null,
+            ct: timeout.Token,
+            maxStdoutBytes: 1024,
+            maxStderrBytes: 1024);
+
+        Assert.True(result.StderrLimitExceeded);
+        Assert.True(result.Stderr.Length <= 1024, $"captured {result.Stderr.Length} bytes");
     }
 
     [Fact]
@@ -565,6 +583,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var installCommands = new List<string>();
         string? baselineLaunchName = null;
         string? baselineLaunchNetwork = null;
+        string? baselineCloudInit = null;
         string? cloneSource = null;
 
         var runner = new RecordingMultipassRunner((argv, _, _) =>
@@ -581,6 +600,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 baselineLaunchName = argv[3];
                 var networkIndex = argv.ToList().IndexOf("--network");
                 baselineLaunchNetwork = networkIndex >= 0 ? argv[networkIndex + 1] : null;
+                var cloudInitIndex = argv.ToList().IndexOf("--cloud-init");
+                baselineCloudInit = cloudInitIndex >= 0 ? File.ReadAllText(argv[cloudInitIndex + 1]) : null;
                 states[baselineLaunchName] = "Running";
                 return Task.FromResult(new RunResult(0, "", ""));
             }
@@ -646,6 +667,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("cb-baseline-graphical", baselineLaunchName);
         Assert.Equal("name=cb-graphical,mode=auto", baselineLaunchNetwork);
         Assert.Equal("cb-baseline-graphical", cloneSource);
+        var baselineCloudInitText = Assert.IsType<string>(baselineCloudInit);
+        Assert.Contains("systemctl enable codeybox-route.service", baselineCloudInitText);
+        Assert.DoesNotContain("systemctl enable --now codeybox-route.service", baselineCloudInitText);
+        Assert.DoesNotContain("apt-get install -y --no-install-recommends xvfb", baselineCloudInitText);
         Assert.Contains(installCommands, cmd =>
             cmd.Contains("xvfb x11vnc xfce4", StringComparison.Ordinal)
             && cmd.Contains("xdotool scrot ffmpeg", StringComparison.Ordinal));

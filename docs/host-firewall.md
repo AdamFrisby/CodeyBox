@@ -96,7 +96,7 @@ claude           cb-claude       10.99.2.0/24   api.anthropic.com
 internet-only    cb-net          10.99.5.0/24   internet
 codex            cb-codex           10.99.3.0/24   api.openai.com
 multi-llm        cb-multi-llm       10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
-graphical        cb-graphical       10.99.6.0/24   -
+graphical        cb-graphical       10.99.6.0/24   internet
 EOF
 
 # 3. Run the setup script (creates bridges, applies nftables, persists rules).
@@ -165,8 +165,8 @@ creation — never silently degrades to "no enforcement."
 
 Graphical Multipass sandboxes run `x11vnc` on the conventional graphical
 VNC port (`SandboxConventions.GraphicalVncPort`, currently `5900`), bound
-to the VM's `10.99.x.x` graphical bridge address. The server uses a
-per-sandbox VNC password and allows only the bridge gateway address.
+to guest loopback (`127.0.0.1`). The server uses a per-sandbox VNC password
+and is not directly reachable on the VM's `10.99.x.x` bridge address.
 
 For human access, use the loopback-only helper installed by
 `setup-host-networks.sh`:
@@ -178,7 +178,7 @@ codeybox-vnc-loopback <multipass-vm-name> 5901
 Then connect your VNC client to `127.0.0.1:5901`. Programmatic screenshots
 and input use `multipass exec` (`scrot`/`xdotool`); VNC is only an
 operator-facing inspection path. The helper binds host loopback and proxies
-to the guest VNC listener over the selected CodeyBox bridge.
+to the guest loopback VNC listener through `multipass exec`.
 
 ## Sandbox staging directory hardening
 

@@ -51,12 +51,13 @@ public sealed class HostNetworkSetupScriptTests
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$1" == "exec" ]]; then
+    if [[ "$*" == *"command -v socat"* ]]; then
+        exit 0
+    fi
     if [[ "$*" == *"codeybox-vnc-password"* ]]; then
         echo "secret123"
-    else
-        echo "10.99.6.42"
+        exit 0
     fi
-    exit 0
 fi
 echo "unexpected multipass argv: $*" >&2
 exit 9
@@ -66,12 +67,6 @@ exit 9
 set -euo pipefail
 printf '%s\n' "$@" > "$CALL_LOG"
 """);
-        WriteExecutable(Path.Combine(tools, "systemd-socket-proxyd"), """
-#!/usr/bin/env bash
-set -euo pipefail
-exit 0
-""");
-
         var env = new Dictionary<string, string?>
         {
             ["PATH"] = tools + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"),
@@ -93,7 +88,7 @@ exit 0
 
         var ok = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm", "5901"], env);
         Assert.Equal(0, ok.ExitCode);
-        Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> gui-vm:10.99.6.42:5999", ok.Stderr, StringComparison.Ordinal);
+        Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> gui-vm:127.0.0.1:5999 via multipass exec", ok.Stderr, StringComparison.Ordinal);
         Assert.Contains("VNC password: secret123", ok.Stderr, StringComparison.Ordinal);
 
         var socketArgs = await File.ReadAllLinesAsync(callLog);
@@ -101,12 +96,17 @@ exit 0
         Assert.Equal("127.0.0.1:5901", socketArgs[1]);
         Assert.Equal("--inetd", socketArgs[2]);
         Assert.Equal("--", socketArgs[3]);
-        Assert.EndsWith("systemd-socket-proxyd", socketArgs[4], StringComparison.Ordinal);
-        Assert.Equal("10.99.6.42:5999", socketArgs[5]);
+        Assert.Equal("multipass", socketArgs[4]);
+        Assert.Equal("exec", socketArgs[5]);
+        Assert.Equal("gui-vm", socketArgs[6]);
+        Assert.Equal("--", socketArgs[7]);
+        Assert.Equal("socat", socketArgs[8]);
+        Assert.Equal("-", socketArgs[9]);
+        Assert.Equal("TCP:127.0.0.1:5999", socketArgs[10]);
     }
 
     [Fact]
-    public async Task GeneratedVncHelper_RejectsMissingToolsAndMissingGuestBridgeAddress()
+    public async Task GeneratedVncHelper_RejectsMissingToolsAndMissingGuestSocat()
     {
         if (OperatingSystem.IsWindows()) return;
 
@@ -129,25 +129,19 @@ exit 0
         WriteExecutable(Path.Combine(tools, "multipass"), """
 #!/usr/bin/env bash
 set -euo pipefail
-echo "192.168.1.50"
+exit 7
 """);
         WriteExecutable(Path.Combine(tools, "systemd-socket-activate"), """
 #!/usr/bin/env bash
 set -euo pipefail
 exit 0
 """);
-        WriteExecutable(Path.Combine(tools, "systemd-socket-proxyd"), """
-#!/usr/bin/env bash
-set -euo pipefail
-exit 0
-""");
-
-        var noGuestBridge = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm"], new Dictionary<string, string?>
+        var missingGuestSocat = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm"], new Dictionary<string, string?>
         {
             ["PATH"] = tools + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"),
         });
-        Assert.Equal(1, noGuestBridge.ExitCode);
-        Assert.Contains("could not find CodeyBox bridge IPv4 address", noGuestBridge.Stderr, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, missingGuestSocat.ExitCode);
+        Assert.Contains("guest VM is missing required tool: socat", missingGuestSocat.Stderr, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string SetupScriptPath()

@@ -220,6 +220,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
+        var sandboxes = new CapturingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
         var agent = new ReworkResumeRecordingAgent();
         var registry = new AgentRegistry([agent]);
         var projects = new InMemoryProjectRepository(new Project
@@ -229,10 +231,16 @@ public sealed class HostShutdownCancellationTests : IDisposable
             RepositoryUrl = seed,
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Claude,
+            GraphicalSandbox = true,
+            NetworkProfiles = new ProjectNetworkProfiles
+            {
+                Rework = "rework-profile",
+                AuditTool = "audit-tool-profile",
+            },
             Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
         });
         var pipeline = new PipelineRunner(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            sandboxes,
             gitHost, registry, new StaticCredentialProvider(), new InMemoryPullRequestService(),
             projects, new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, new NullWebhookDispatcher(),
@@ -256,6 +264,9 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(1, agent.ResumeCalls);
         Assert.Contains("Interrupted Rework Resume", agent.LastResumePrompt);
         Assert.True(agent.SawScratchpad);
+        var reworkSpec = Assert.Single(sandboxes.Specs, spec => spec.TimingPhase == "rework");
+        Assert.Equal(SandboxProfileFlavor.Graphical, reworkSpec.Flavor);
+        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, reworkSpec.Network.ProfileName);
         var final = await store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Null(final.PreemptedAt);
@@ -778,4 +789,29 @@ internal sealed class NoopResumeAgent : IAgentRunner, IResumableAgentRunner
         var end = text.IndexOf(right, start, StringComparison.Ordinal);
         return end < 0 ? text[start..].Trim() : text[start..end];
     }
+}
+
+internal sealed class CapturingSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+
+    public CapturingSandboxProvider(ISandboxProvider inner)
+    {
+        _inner = inner;
+    }
+
+    public string Name => _inner.Name;
+    public List<SandboxSpec> Specs { get; } = [];
+
+    public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+    {
+        Specs.Add(spec);
+        return _inner.CreateAsync(spec, ct);
+    }
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
 }

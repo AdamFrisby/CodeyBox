@@ -188,7 +188,7 @@ public sealed class DeepAuditConvergenceTests : IDisposable
     }
 
     [Fact]
-    public async Task DeepAuditToolSandbox_UsesGraphicalFlavorAndConfiguredProfileForGraphicalProjects()
+    public async Task DeepAuditToolSandbox_UsesGraphicalFlavorAndDedicatedProfileForGraphicalProjects()
     {
         var auditor = new ScriptedDeepAuditor(
             AuditorName,
@@ -224,7 +224,7 @@ public sealed class DeepAuditConvergenceTests : IDisposable
 
         var spec = Assert.Single(sandboxes.Specs);
         Assert.Equal(SandboxProfileFlavor.Graphical, spec.Flavor);
-        Assert.Equal("audit-tools", spec.Network.ProfileName);
+        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, spec.Network.ProfileName);
         Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
     }
 

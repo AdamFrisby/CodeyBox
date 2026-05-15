@@ -144,29 +144,31 @@ Projects that need to build or test GUI applications can opt in with:
 ```
 
 When enabled, the work, rework, and credential-free audit-tool phases use
-`SandboxProfileFlavor.Graphical` while preserving their configured per-phase
-network profiles. If a graphical-eligible phase has no configured network
-profile, CodeyBox leaves it unset so the host-blocked default bridge applies.
-LLM audit and merge phases keep their normal headless profiles. The Multipass
+`SandboxProfileFlavor.Graphical` and the conventional `graphical` network
+profile (`cb-graphical` in the default operator examples). LLM audit and merge
+phases keep their normal headless profiles. The Multipass
 graphical flavor installs a lightweight XFCE session on Xvfb, starts `x11vnc`
-on the
-VM's `10.99.x.x` CodeyBox bridge address on the conventional graphical VNC
-port (`SandboxConventions.GraphicalVncPort`, currently `5900`), and preinstalls
-`xdotool`, `scrot`, and `ffmpeg`. The VNC server is password-protected and
-allows the bridge gateway address only. For operator viewing, run
+on guest loopback (`127.0.0.1`) on the conventional graphical VNC port
+(`SandboxConventions.GraphicalVncPort`, currently `5900`), and preinstalls
+`xdotool`, `scrot`, `ffmpeg`, and `socat`. The VNC server is password-protected
+and not reachable directly on the guest bridge address. For operator viewing, run
 `codeybox-vnc-loopback <multipass-vm-name> 5901` and connect to
-`127.0.0.1:5901`; the helper binds host loopback and proxies to the selected
-guest bridge address. The CodeyBox
+`127.0.0.1:5901`; the helper binds host loopback and tunnels to guest loopback
+through `multipass exec`. The CodeyBox
 screenshot/input APIs call `scrot` and `xdotool` through `multipass exec`;
 no additional LLM network surface is required.
 
-Operator setup needs every explicit `Work`, `Rework`, or `AuditTool` profile
-bridge your graphical projects select. A common dedicated graphical profile is:
+Operator setup needs the dedicated graphical profile bridge:
 
 ```text
 # /etc/codeybox/networks.conf
-graphical        cb-graphical    10.99.6.0/24   -
+graphical        cb-graphical    10.99.6.0/24   internet
 ```
+
+Use `internet` or an allowlist that covers the Ubuntu package sources while
+the graphical baseline is baked. A no-egress graphical bridge is only viable
+with a custom image that already contains the desktop, VNC, screenshot, and
+input tooling.
 
 Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
 
@@ -176,11 +178,9 @@ Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
 }
 ```
 
-With `MultipassUseBaselineImages=true`, the provider bakes a separate
-graphical baseline VM for each selected network profile the first time a
-graphical project runs. The conventional `graphical` profile uses
-`cb-baseline-graphical`. Delete
-that baseline to force a rebuild after changing graphical tooling or
+With `MultipassUseBaselineImages=true`, the provider bakes
+`cb-baseline-graphical` the first time a graphical project runs. Delete that
+baseline to force a rebuild after changing graphical tooling or
 `MultipassExtraRuncmd`.
 
 **Integration-tested**: end-to-end on a real Ubuntu 25.10 host. The

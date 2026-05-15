@@ -508,7 +508,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // and re-runs every per-instance module including runcmd. Putting
         // installs in runcmd would mean re-running them on every clone —
         // slow, and possibly disk-filling.
-        var cloudInit = BuildCloudInit(extraRuncmd: null, _opts.ExtraCloudInit, flavor);
+        var cloudInit = BuildCloudInit(
+            extraRuncmd: null,
+            extraCloudInit: _opts.ExtraCloudInit,
+            flavor: flavor,
+            startRouteService: flavor != SandboxProfileFlavor.Graphical);
         var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
         Directory.CreateDirectory(stagingDir);
         TryChmod0700(stagingDir);
@@ -673,13 +677,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         if (DateTime.UtcNow >= deadline)
             throw new InvalidOperationException($"multipass VM {name} did not reach Running state within 3 minutes");
 
-        // `cloud-init status --wait` blocks until cloud-init has finished
-        // (success or fail). Exit code is non-zero on failure; we don't
-        // distinguish here because the post-launch verification (mount,
-        // exec) will surface concrete problems.
-        await RunAsync(
+        // `cloud-init status --wait` blocks until cloud-init has finished.
+        // Exit code is non-zero on failure, which matters for graphical
+        // launch because the desktop toolchain may be installed from runcmd.
+        var cloudInit = await RunAsync(
             [_opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
             stdin: null, ct: ct);
+        if (cloudInit.ExitCode != 0)
+            throw new InvalidOperationException($"cloud-init failed for multipass VM {name}: {cloudInit.Stderr}");
     }
 
     /// <summary>
@@ -919,12 +924,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private static readonly string GraphicalVncScript = $$"""
         #!/bin/sh
         set -eu
-        listen_addr=$(ip -4 -o addr show | awk '/inet 10\.99\./ { sub(/\/.*/, "", $4); print $4; exit }')
-        if [ -z "$listen_addr" ]; then
-            echo "codeybox-vnc: no 10.99.x.x interface present" >&2
-            exit 1
-        fi
-        host_addr=$(printf '%s\n' "$listen_addr" | awk -F. '{ print $1 "." $2 "." $3 ".1" }')
         password_dir=/etc/codeybox
         password_file="${password_dir}/x11vnc.pass"
         plain_password_file=/home/ubuntu/.codeybox-vnc-password
@@ -939,14 +938,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         chown ubuntu:ubuntu "$plain_password_file" || true
         /usr/bin/x11vnc -storepasswd "$password" "$password_file" >/dev/null 2>&1
         chmod 0600 "$password_file"
-        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -rfbauth "$password_file" -listen "$listen_addr" -allow "$host_addr" -noxdamage -repeat
+        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -rfbauth "$password_file" -listen 127.0.0.1 -allow 127.0.0.1 -noxdamage -repeat
         """;
 
     private const string GraphicalInstallRuncmd = """
         set -eux
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils
+        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils socat
         systemctl daemon-reload
         systemctl enable codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
         systemctl restart codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
@@ -981,7 +980,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     internal static string BuildCloudInit(
         IReadOnlyList<string>? extraRuncmd,
         string? extraCloudInit,
-        SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless)
+        SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless,
+        bool startRouteService = true)
     {
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
         var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
@@ -1035,27 +1035,22 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         }
         sb.AppendLine("runcmd:");
         // Enable the route service. --now runs it once immediately so the
-        // first boot's traffic uses the profile bridge before any
-        // extraRuncmd installs run.
+        // first boot's traffic uses the profile bridge before any caller
+        // extraRuncmd installs run. Graphical desktop packages are installed
+        // first so baseline baking does not depend on the selected graphical
+        // profile already permitting package-manager egress.
         sb.AppendLine("  - systemctl daemon-reload");
-        sb.AppendLine("  - systemctl enable --now codeybox-route.service");
-        // Splice caller-supplied runcmd entries into the same block, AFTER
-        // the route swap so they have working egress.
+        if (flavor == SandboxProfileFlavor.Graphical && extraRuncmd is not null)
+            AppendRuncmdCommand(sb, GraphicalInstallRuncmd);
+        sb.AppendLine(startRouteService
+            ? "  - systemctl enable --now codeybox-route.service"
+            : "  - systemctl enable codeybox-route.service");
+        // Splice caller-supplied runcmd entries into the same block, after the
+        // route swap so project/tool installs obey the selected profile.
         if (extraRuncmd is not null)
         {
-            var commands = flavor == SandboxProfileFlavor.Graphical
-                ? new[] { GraphicalInstallRuncmd }.Concat(extraRuncmd)
-                : extraRuncmd;
-            foreach (var cmd in commands)
-            {
-                if (string.IsNullOrWhiteSpace(cmd)) continue;
-                // Each entry is a single shell command. We use the YAML
-                // block-literal form (`- |`) so multi-line commands work
-                // and we don't have to worry about escaping.
-                sb.AppendLine("  - |");
-                foreach (var line in cmd.Split('\n'))
-                    sb.Append("      ").AppendLine(line);
-            }
+            foreach (var cmd in extraRuncmd)
+                AppendRuncmdCommand(sb, cmd);
         }
         if (!string.IsNullOrWhiteSpace(extraCloudInit))
         {
@@ -1064,6 +1059,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             sb.AppendLine(extraCloudInit);
         }
         return sb.ToString();
+    }
+
+    private static void AppendRuncmdCommand(StringBuilder sb, string cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return;
+        // Each entry is a single shell command. We use the YAML block-literal
+        // form (`- |`) so multi-line commands work without escaping.
+        sb.AppendLine("  - |");
+        foreach (var line in cmd.Split('\n'))
+            sb.Append("      ").AppendLine(line);
     }
 
     private IReadOnlyList<string> BuildFirstBootRuncmd(SandboxProfileFlavor flavor)
@@ -1516,6 +1521,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
+    internal const int MaxScrollMagnitude = 1000;
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
 
     private readonly string _name;
@@ -1749,9 +1755,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         if (vertical != 0 && horizontal != 0)
             throw new ArgumentException("Scroll events support one axis at a time.");
 
-        var amount = Math.Abs(vertical != 0 ? vertical : horizontal);
-        if (amount > 1000)
-            throw new ArgumentOutOfRangeException(nameof(inputEvent), "Scroll amount must be <= 1000.");
+        var amount = Math.Abs((long)(vertical != 0 ? vertical : horizontal));
+        if (amount > MaxScrollMagnitude)
+            throw new ArgumentOutOfRangeException(nameof(inputEvent), $"Scroll amount must be <= {MaxScrollMagnitude}.");
 
         var button = vertical switch
         {

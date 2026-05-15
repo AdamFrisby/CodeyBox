@@ -378,15 +378,12 @@ the phases that need desktop plumbing:
 ```
 
 When enabled, work, rework, and credential-free audit-tool phases use the
-graphical sandbox flavor while preserving the configured per-phase network
-profile. If one of those phases has no configured profile, CodeyBox leaves the
-profile unset so the host-blocked default bridge applies. The Multipass provider
-bakes a separate graphical baseline for each selected profile, starts an XFCE
-desktop with VNC bound to the VM's CodeyBox bridge address, and exposes
-screenshot/input APIs through sandbox exec. Configure
+graphical sandbox flavor and the conventional `graphical` network profile. The
+Multipass provider bakes `cb-baseline-graphical`, starts an XFCE desktop with
+VNC bound to guest loopback, and exposes screenshot/input APIs through sandbox
+exec. Configure
 `SandboxNetworkProfiles.graphical = cb-graphical`, add the matching
-`graphical cb-graphical ...` line to `/etc/codeybox/networks.conf` when a
-project explicitly selects that profile, and run
+`graphical cb-graphical ...` line to `/etc/codeybox/networks.conf`, and run
 `codeybox-vnc-loopback <multipass-vm-name> 5901` when an operator needs a
 localhost VNC view.
 

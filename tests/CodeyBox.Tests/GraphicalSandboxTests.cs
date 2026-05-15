@@ -66,6 +66,19 @@ public sealed class GraphicalSandboxTests
         };
     }
 
+    public static IEnumerable<object[]> InvalidComputerUseEventCases()
+    {
+        yield return new object[] { new SandboxInputEvent[] { null! } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 10 } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Click, X = -1, Y = 0 } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 10 } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 0, Y = -1 } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Key } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Type } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = 1, Y = 1 } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 1001 } } };
+    }
+
     [Fact]
     public async Task ComputerUseBridge_MapsScreenshotAndInputActionsToSandboxCapabilities()
     {
@@ -202,6 +215,23 @@ public sealed class GraphicalSandboxTests
             bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "move", X = 21, Y = 1 }));
         await Assert.ThrowsAsync<ArgumentException>(() =>
             bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "scroll" }));
+
+        Assert.Empty(sandbox.Events);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidComputerUseEventCases))]
+    public async Task ComputerUseBridge_RejectsMalformedInputEventsBeforeCallingSandbox(IReadOnlyList<SandboxInputEvent> events)
+    {
+        await using var sandbox = new RecordingGraphicalSandbox(NonUniformPng);
+        var bridge = new ComputerUseBridge();
+
+        await Assert.ThrowsAnyAsync<ArgumentException>(() =>
+            bridge.ExecuteAsync(sandbox, new ComputerUseRequest
+            {
+                Action = "events",
+                Events = events,
+            }));
 
         Assert.Empty(sandbox.Events);
     }
@@ -439,7 +469,7 @@ public sealed class GraphicalSandboxTests
     }
 
     [Fact]
-    public async Task PipelineRunner_UsesGraphicalFlavorButPreservesConfiguredProfilesForEligiblePhases()
+    public async Task PipelineRunner_UsesGraphicalFlavorAndDedicatedProfileForEligiblePhases()
     {
         var workspace = Directory.CreateTempSubdirectory("codeybox-graphical-route-").FullName;
         try
@@ -494,14 +524,14 @@ public sealed class GraphicalSandboxTests
             var final = await tp.Store.GetAsync(item.Id);
             Assert.Equal(WorkItemState.Done, final!.State);
             var workSpec = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "work");
-            AssertGraphicalProfile(workSpec, "work-profile");
+            AssertGraphicalProfile(workSpec, SandboxConventions.GraphicalNetworkProfile);
             Assert.Equal("secret", workSpec.Environment["WORK_TOKEN"]);
             var reworkSpec = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "rework");
-            AssertGraphicalProfile(reworkSpec, "rework-profile");
+            AssertGraphicalProfile(reworkSpec, SandboxConventions.GraphicalNetworkProfile);
             Assert.Equal("secret", reworkSpec.Environment["WORK_TOKEN"]);
             var auditSpecs = sandboxes.Specs.Where(s => s.TimingPhase == "audit").ToArray();
             Assert.NotEmpty(auditSpecs);
-            Assert.All(auditSpecs, spec => AssertGraphicalProfile(spec, "audit-tool-profile"));
+            Assert.All(auditSpecs, spec => AssertGraphicalProfile(spec, SandboxConventions.GraphicalNetworkProfile));
 
             var merge = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "merge");
             Assert.Equal(SandboxProfileFlavor.Headless, merge.Flavor);
@@ -514,7 +544,7 @@ public sealed class GraphicalSandboxTests
     }
 
     [Fact]
-    public void SandboxTargetResolver_GraphicalSandboxLeavesMissingEligibleProfilesUnset()
+    public void SandboxTargetResolver_GraphicalSandboxUsesDedicatedProfileForEligiblePhases()
     {
         var project = new Project
         {
@@ -529,11 +559,11 @@ public sealed class GraphicalSandboxTests
         var configured = SandboxTargetResolver.Resolve(project, "work-profile", graphicalEligible: true);
 
         Assert.Equal(SandboxProfileFlavor.Graphical, missing.Flavor);
-        Assert.Null(missing.NetworkProfile);
+        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, missing.NetworkProfile);
         Assert.Equal(SandboxProfileFlavor.Graphical, blank.Flavor);
-        Assert.Null(blank.NetworkProfile);
+        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, blank.NetworkProfile);
         Assert.Equal(SandboxProfileFlavor.Graphical, configured.Flavor);
-        Assert.Equal("work-profile", configured.NetworkProfile);
+        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, configured.NetworkProfile);
     }
 
     [Fact]

@@ -137,11 +137,8 @@ public sealed record Project
 
     /// <summary>
     /// When true, work, rework, and tool-audit sandboxes use the graphical
-    /// sandbox flavor. Configured per-phase network profiles are preserved;
-    /// if a graphical-eligible phase has no configured profile, it launches
-    /// without an explicit host-bridge profile and should be blocked by the
-    /// default host firewall. Default false because graphical VMs are larger
-    /// and slower.
+    /// sandbox flavor and the conventional graphical network profile. Default
+    /// false because graphical VMs are larger and slower.
     /// </summary>
     public bool GraphicalSandbox { get; init; }
 
