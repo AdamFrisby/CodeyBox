@@ -16,6 +16,7 @@ All CodeyBox configuration lives under the `CodeyBox` key in any standard
 | `AgentAllowedHosts` | string[] | `["api.anthropic.com","api.openai.com","api.githubcopilot.com","generativelanguage.googleapis.com"]` | Egress allowlist inside agent sandboxes. |
 | `AuditToolAllowedHosts` | string[] | public package/vulnerability registries | Egress allowlist for network-capable tool auditors such as `deps-cve-scan`; keep this separate from agent API hosts. |
 | `SandboxProvider` | string | — | One of `multipass`, `bubblewrap`, `process`. Required in non-Development environments. |
+| `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Bridge name for projects with `GraphicalSandbox: true`; create it with `scripts/setup-host-networks.sh`. |
 | `DangerouslyAllowProcessSandbox` | bool | `false` | Allow process sandbox outside Development. Do not use in production. |
 | `UpstreamPushMaxAttempts` | int | `5` | Retry count for upstream push (GitHub PR creation). |
 | `UpstreamPushBackoffSeconds` | int | `15` | Seconds between upstream push retries. |

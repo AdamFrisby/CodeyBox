@@ -40,6 +40,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void CloudInit_GraphicalFlavor_InstallsDesktopVncAndInputTools()
+    {
+        var cloudInit = MultipassSandboxProvider.BuildCloudInit(
+            ["echo project setup"],
+            extraCloudInit: null,
+            SandboxProfileFlavor.Graphical);
+
+        Assert.Contains("path: /etc/systemd/system/codeybox-xvfb.service", cloudInit);
+        Assert.Contains("path: /etc/systemd/system/codeybox-xfce.service", cloudInit);
+        Assert.Contains("path: /etc/systemd/system/codeybox-vnc.service", cloudInit);
+        Assert.Contains("xvfb x11vnc xfce4", cloudInit);
+        Assert.Contains("xdotool scrot ffmpeg", cloudInit);
+        Assert.Contains("-rfbport 5900", cloudInit);
+        Assert.Contains("echo project setup", cloudInit);
+    }
+
+    [Fact]
     public void LaunchArgv_MapsConfiguredProfileToHostBridgeAndRejectsUnknownProfiles()
     {
         var provider = NewProvider(networkProfiles: new Dictionary<string, string>

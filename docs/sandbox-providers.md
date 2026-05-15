@@ -125,6 +125,52 @@ group dance (multipass handles its own KVM access). Confirm with
 * **Image bring-up.** First launch downloads the default Ubuntu image
   (~600 MB) to the multipass cache. Subsequent launches reuse it.
 
+### Graphical Multipass sandboxes
+
+Projects that need to build or test GUI applications can opt in with:
+
+```json
+{
+  "CodeyBox": {
+    "Projects": [
+      {
+        "Id": "desktop-app",
+        "RepositoryUrl": "https://example.com/desktop-app.git",
+        "GraphicalSandbox": true
+      }
+    ]
+  }
+}
+```
+
+When enabled, the work, rework, and credential-free audit-tool phases use
+`SandboxProfileFlavor.Graphical` and the logical network profile
+`graphical`. LLM audit and merge phases keep their normal profiles. The
+Multipass graphical flavor installs a lightweight XFCE session on Xvfb,
+starts `x11vnc` on port `5900`, and preinstalls `xdotool`, `scrot`, and
+`ffmpeg`. The CodeyBox screenshot/input APIs call `scrot` and `xdotool`
+through `multipass exec`; no additional LLM network surface is required.
+
+Operator setup needs the graphical bridge:
+
+```text
+# /etc/codeybox/networks.conf
+graphical        cb-graphical    10.99.6.0/24   internet
+```
+
+Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
+
+```json
+"SandboxNetworkProfiles": {
+  "graphical": "cb-graphical"
+}
+```
+
+With `MultipassUseBaselineImages=true`, the provider bakes a separate
+`cb-baseline-graphical` VM the first time a graphical project runs. Delete
+that baseline to force a rebuild after changing graphical tooling or
+`MultipassExtraRuncmd`.
+
 **Integration-tested**: end-to-end on a real Ubuntu 25.10 host. The
 shipped test verifies VM launch, native bind-mount visibility,
 env-from-file (with explicit no-argv-leak verification via in-VM `ps`

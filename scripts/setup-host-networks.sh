@@ -29,6 +29,7 @@
 #   codex            cb-codex        10.99.3.0/24   api.openai.com
 #   multi-llm        cb-multi-llm    10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
 #   internet-only    cb-net          10.99.5.0/24   internet
+#   graphical        cb-graphical    10.99.6.0/24   internet
 #
 # allowed-hosts column accepts:
 #   "-"                     — no egress (only DNS + loopback + replies)
@@ -66,6 +67,7 @@ Example:
   # name           bridge          subnet         allowed-hosts
   isolated         cb-iso          10.99.1.0/24   -
   claude           cb-claude       10.99.2.0/24   api.anthropic.com
+  graphical        cb-graphical    10.99.6.0/24   internet
 
 Then re-run: sudo $0 [path/to/config]
 EOF
@@ -163,6 +165,7 @@ for i in "${!NAMES[@]}"; do
     name="${NAMES[$i]}"
     bridge="${BRIDGES[$i]}"
     echo "        iifname \"${bridge}\" jump cb-${name}"
+    echo "        oifname \"${bridge}\" jump cb-${name}-in"
 done
 
 cat <<EOF
@@ -179,6 +182,15 @@ for i in "${!NAMES[@]}"; do
     hosts="${HOSTS[$i]}"
 
     cat <<EOF
+
+    chain cb-${name}-in {
+        # Block LAN-forwarded inbound traffic to sandbox bridges. Host-originated
+        # connections (including operator-managed 127.0.0.1 tunnels for VNC)
+        # do not traverse this forward chain, and established replies remain
+        # allowed so VM-initiated connections continue to work.
+        ct state established,related accept
+        drop
+    }
 
     chain cb-${name} {
         # Standard "allow replies + DNS" preamble.

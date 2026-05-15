@@ -83,6 +83,20 @@ public interface ISandbox : IAsyncDisposable
     /// added later.
     /// </summary>
     Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns a PNG screenshot of the current graphical desktop. Providers
+    /// that do not support graphical sandboxes throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    Task<byte[]> GetScreenshotAsync(CancellationToken ct = default) =>
+        throw new NotSupportedException("This sandbox does not expose a graphical desktop.");
+
+    /// <summary>
+    /// Synthesizes desktop input events inside a graphical sandbox. Providers
+    /// that do not support graphical sandboxes throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default) =>
+        throw new NotSupportedException("This sandbox does not expose a graphical desktop.");
 }
 
 /// <summary>
@@ -106,6 +120,7 @@ public sealed record SandboxSpec
     public IReadOnlyDictionary<string, string> Environment { get; init; } = new Dictionary<string, string>();
     public SandboxResourceLimits Limits { get; init; } = SandboxResourceLimits.Default;
     public SandboxNetworkPolicy Network { get; init; } = SandboxNetworkPolicy.Denied;
+    public SandboxProfileFlavor Flavor { get; init; } = SandboxProfileFlavor.Headless;
     public string WorkingDirectory { get; init; } = "/work";
 
     /// <summary>
@@ -114,6 +129,30 @@ public sealed record SandboxSpec
     /// </summary>
     public WorkItemId? TimingWorkItemId { get; init; }
     public string? TimingPhase { get; init; }
+}
+
+public enum SandboxProfileFlavor
+{
+    Headless = 0,
+    Graphical = 1,
+}
+
+public enum SandboxInputEventType
+{
+    Click,
+    Key,
+    Move,
+    Scroll,
+    Type,
+}
+
+public sealed record SandboxInputEvent
+{
+    public required SandboxInputEventType Type { get; init; }
+    public int? X { get; init; }
+    public int? Y { get; init; }
+    public string? Key { get; init; }
+    public string? Text { get; init; }
 }
 
 /// <summary>

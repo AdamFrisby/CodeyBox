@@ -96,6 +96,7 @@ claude           cb-claude       10.99.2.0/24   api.anthropic.com
 internet-only    cb-net          10.99.5.0/24   internet
 codex            cb-codex           10.99.3.0/24   api.openai.com
 multi-llm        cb-multi-llm       10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
+graphical        cb-graphical       10.99.6.0/24   internet
 EOF
 
 # 3. Run the setup script (creates bridges, applies nftables, persists rules).
@@ -124,7 +125,8 @@ Two layers of config:
       "isolated":  "cb-iso",
       "claude":    "cb-claude",
       "codex":     "cb-codex",
-      "multi-llm": "cb-multi-llm"
+      "multi-llm": "cb-multi-llm",
+      "graphical": "cb-graphical"
     }
   }
 }
@@ -158,6 +160,16 @@ its egress needs are project-specific.
 If a profile referenced in project config isn't in
 `SandboxNetworkProfiles`, the provider fails loudly at sandbox
 creation — never silently degrades to "no enforcement."
+
+### Graphical VNC exposure
+
+Graphical Multipass sandboxes run `x11vnc` on port `5900`, bound to the
+VM's `10.99.x.x` address on the graphical bridge. The setup script also
+drops new forwarded inbound traffic into every sandbox bridge, so a LAN
+client cannot route directly to that VNC port through the host. Host-local
+connections and operator-managed loopback tunnels do not traverse the
+forward chain; expose VNC to humans through a loopback-only tunnel such as
+`127.0.0.1:5900` when needed.
 
 ## Sandbox staging directory hardening
 

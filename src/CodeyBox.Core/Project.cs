@@ -136,6 +136,13 @@ public sealed record Project
     public ProjectChangelog? Changelog { get; init; }
 
     /// <summary>
+    /// When true, work, rework, and tool-audit sandboxes use the graphical
+    /// sandbox flavor and the dedicated graphical network profile. Default
+    /// false; graphical VMs are opt-in because they are larger and slower.
+    /// </summary>
+    public bool GraphicalSandbox { get; init; }
+
+    /// <summary>
     /// When true, agents in this project may emit structured <c>&lt;codeybox-question&gt;</c>
     /// blocks mid-work to escalate ambiguity to the operator. The work item parks
     /// at NeedsOperatorInput, fires a webhook, and waits for POST /workitems/{id}/answer.

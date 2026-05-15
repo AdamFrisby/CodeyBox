@@ -89,6 +89,12 @@ public sealed class ProjectAuditorComposer
             }
         }
 
+        if (project.GraphicalSandbox
+            && !auditors.Any(a => a.Name.Equals("gui:smoke", StringComparison.OrdinalIgnoreCase)))
+        {
+            auditors.Insert(0, new GraphicalSmokeAuditor());
+        }
+
         if (project.Audit.ExcludedAuditors.Count > 0)
         {
             var excluded = new HashSet<string>(project.Audit.ExcludedAuditors, StringComparer.OrdinalIgnoreCase);

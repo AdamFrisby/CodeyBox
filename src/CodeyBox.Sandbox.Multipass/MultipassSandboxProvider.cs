@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Sandbox.Multipass;
 
@@ -180,7 +181,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // the clone path skips the start (clone is born Stopped).
             if (useBaseline)
             {
-                var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, ct);
+                var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, spec.Flavor, ct);
                 await using var cloneScope = await TimingScope.BeginAsync(
                     timingStore, timingItemId, timingPhase, "vm.clone", log: _log);
                 await CloneFromBaselineAsync(name, baselineName, ct);
@@ -188,7 +189,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
             else
             {
-                var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit);
+                var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit, spec.Flavor);
                 var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
                 await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
                 await using (var launchScope = await TimingScope.BeginAsync(
@@ -417,14 +418,20 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// <c>cb-net</c>. Per-profile baselines also cleanly isolate "what each
     /// profile installed" if profiles ever need different toolchains.
     /// </summary>
-    private async Task<string> EnsureBaselineForProfileAsync(string profileName, CancellationToken ct)
+    private async Task<string> EnsureBaselineForProfileAsync(
+        string profileName,
+        SandboxProfileFlavor flavor,
+        CancellationToken ct)
     {
         if (!_opts.NetworkProfiles.TryGetValue(profileName, out _))
             throw new InvalidOperationException(
                 $"Network profile '{profileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
                 $"Configured profiles: [{string.Join(", ", _opts.NetworkProfiles.Keys)}]");
 
-        var baselineName = _opts.BaselineNamePrefix + profileName;
+        var baselineProfile = flavor == SandboxProfileFlavor.Graphical
+            ? SandboxConventions.GraphicalNetworkProfile
+            : profileName;
+        var baselineName = _opts.BaselineNamePrefix + baselineProfile;
         // multipass instance names cap at 24 chars; trim if a long profile
         // name pushes us over. We use a STABLE hash (SHA-256, first 6 hex
         // chars) for uniqueness so two long profile names don't collide.
@@ -445,7 +452,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         {
             if (await BaselineVmExistsAsync(baselineName, ct))
                 return baselineName;
-            await BakeBaselineAsync(baselineName, profileName, ct);
+            await BakeBaselineAsync(baselineName, profileName, flavor, ct);
             return baselineName;
         }
         finally
@@ -473,7 +480,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         return info.ExitCode == 0;
     }
 
-    private async Task BakeBaselineAsync(string baselineName, string profileName, CancellationToken ct)
+    private async Task BakeBaselineAsync(
+        string baselineName,
+        string profileName,
+        SandboxProfileFlavor flavor,
+        CancellationToken ct)
     {
         var bridge = _opts.NetworkProfiles[profileName];
         _log.LogInformation(
@@ -488,7 +499,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // and re-runs every per-instance module including runcmd. Putting
         // installs in runcmd would mean re-running them on every clone —
         // slow, and possibly disk-filling.
-        var cloudInit = BuildCloudInit(extraRuncmd: null, _opts.ExtraCloudInit);
+        var cloudInit = BuildCloudInit(extraRuncmd: null, _opts.ExtraCloudInit, flavor);
         var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
         Directory.CreateDirectory(stagingDir);
         TryChmod0700(stagingDir);
@@ -526,11 +537,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
             // Run the install commands now, via multipass exec under sudo.
             // Each entry in ExtraRuncmd is a single shell command.
-            for (var i = 0; i < _opts.ExtraRuncmd.Count; i++)
+            var installCommands = BuildFirstBootRuncmd(flavor);
+            for (var i = 0; i < installCommands.Count; i++)
             {
-                var cmd = _opts.ExtraRuncmd[i];
+                var cmd = installCommands[i];
                 if (string.IsNullOrWhiteSpace(cmd)) continue;
-                _log.LogInformation("Baseline install step {N}/{Total}", i + 1, _opts.ExtraRuncmd.Count);
+                _log.LogInformation("Baseline install step {N}/{Total}", i + 1, installCommands.Count);
                 var execRun = await RunAsync(
                     [_opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", cmd],
                     stdin: null, ct: ct);
@@ -843,6 +855,79 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         echo "codeybox-route: default via $gw dev $iface"
         """;
 
+    private const string GraphicalXvfbService = """
+        [Unit]
+        Description=CodeyBox graphical X server
+        After=network-online.target
+
+        [Service]
+        ExecStart=/usr/bin/Xvfb :0 -screen 0 1280x800x24 -nolisten tcp
+        Restart=always
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+        """;
+
+    private const string GraphicalXfceService = """
+        [Unit]
+        Description=CodeyBox XFCE desktop session
+        After=codeybox-xvfb.service
+        Requires=codeybox-xvfb.service
+
+        [Service]
+        User=ubuntu
+        Environment=DISPLAY=:0
+        Environment=XDG_RUNTIME_DIR=/run/user/1000
+        PermissionsStartOnly=true
+        ExecStartPre=/bin/mkdir -p /run/user/1000
+        ExecStartPre=/bin/chown ubuntu:ubuntu /run/user/1000
+        ExecStartPre=/bin/chmod 0700 /run/user/1000
+        ExecStart=/usr/bin/dbus-run-session /usr/bin/startxfce4
+        Restart=on-failure
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+        """;
+
+    private const string GraphicalVncService = """
+        [Unit]
+        Description=CodeyBox x11vnc bridge
+        After=codeybox-xvfb.service
+        Requires=codeybox-xvfb.service
+
+        [Service]
+        ExecStart=/usr/local/sbin/codeybox-vnc
+        Restart=on-failure
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+        """;
+
+    private const string GraphicalVncScript = """
+        #!/bin/sh
+        set -eu
+        iface=$(ip -4 -o addr show | awk '/inet 10\.99\./{print $2; exit}')
+        if [ -z "$iface" ]; then
+            echo "codeybox-vnc: no 10.99.x.x interface present" >&2
+            exit 1
+        fi
+        listen_addr=$(ip -4 -o addr show "$iface" | awk '{print $4}' | cut -d/ -f1)
+        exec /usr/bin/x11vnc -display :0 -rfbport 5900 -forever -shared -nopw -listen "$listen_addr" -noxdamage -repeat
+        """;
+
+    private const string GraphicalInstallRuncmd = """
+        set -eux
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils
+        systemctl daemon-reload
+        systemctl enable codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
+        systemctl restart codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
+        """;
+
     /// <summary>
     /// Builds a cloud-init document that:
     ///   - Installs the exec wrapper at /usr/local/bin/codeybox-exec (root-
@@ -869,10 +954,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// host bridge enforcement is in the host kernel, where the agent has
     /// no view, and is the only egress boundary we treat as load-bearing.
     /// </summary>
-    internal static string BuildCloudInit(IReadOnlyList<string>? extraRuncmd, string? extraCloudInit)
+    internal static string BuildCloudInit(
+        IReadOnlyList<string>? extraRuncmd,
+        string? extraCloudInit,
+        SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless)
     {
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
         var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
+        var graphicalXvfbIndented = string.Join("\n      ", GraphicalXvfbService.Split('\n'));
+        var graphicalXfceIndented = string.Join("\n      ", GraphicalXfceService.Split('\n'));
+        var graphicalVncIndented = string.Join("\n      ", GraphicalVncService.Split('\n'));
+        var graphicalVncScriptIndented = string.Join("\n      ", GraphicalVncScript.Split('\n'));
 
         var sb = new StringBuilder();
         sb.AppendLine("#cloud-config");
@@ -898,6 +990,25 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         sb.AppendLine("      RemainAfterExit=yes");
         sb.AppendLine("      [Install]");
         sb.AppendLine("      WantedBy=multi-user.target");
+        if (flavor == SandboxProfileFlavor.Graphical)
+        {
+            sb.AppendLine("  - path: /etc/systemd/system/codeybox-xvfb.service");
+            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(graphicalXvfbIndented);
+            sb.AppendLine("  - path: /etc/systemd/system/codeybox-xfce.service");
+            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(graphicalXfceIndented);
+            sb.AppendLine("  - path: /etc/systemd/system/codeybox-vnc.service");
+            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(graphicalVncIndented);
+            sb.AppendLine("  - path: /usr/local/sbin/codeybox-vnc");
+            sb.AppendLine("    permissions: '0755'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(graphicalVncScriptIndented);
+        }
         sb.AppendLine("runcmd:");
         // Enable the route service. --now runs it once immediately so the
         // first boot's traffic uses the profile bridge before any
@@ -908,7 +1019,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // the route swap so they have working egress.
         if (extraRuncmd is not null)
         {
-            foreach (var cmd in extraRuncmd)
+            var commands = flavor == SandboxProfileFlavor.Graphical
+                ? new[] { GraphicalInstallRuncmd }.Concat(extraRuncmd)
+                : extraRuncmd;
+            foreach (var cmd in commands)
             {
                 if (string.IsNullOrWhiteSpace(cmd)) continue;
                 // Each entry is a single shell command. We use the YAML
@@ -926,6 +1040,19 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             sb.AppendLine(extraCloudInit);
         }
         return sb.ToString();
+    }
+
+    private IReadOnlyList<string> BuildFirstBootRuncmd(SandboxProfileFlavor flavor)
+    {
+        if (flavor != SandboxProfileFlavor.Graphical)
+            return _opts.ExtraRuncmd;
+
+        var commands = new List<string>(_opts.ExtraRuncmd.Count + 1)
+        {
+            GraphicalInstallRuncmd,
+        };
+        commands.AddRange(_opts.ExtraRuncmd);
+        return commands;
     }
 
     private async Task<RunResult> RunAsync(IReadOnlyList<string> argv, string? stdin, CancellationToken ct)
@@ -1353,6 +1480,128 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
             if (firstExecScope is not null)
                 await firstExecScope.DisposeAsync();
         }
+    }
+
+    public async Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+    {
+        EnsureGraphical();
+        var result = await ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                "tmp=$(mktemp --suffix=.png); trap 'rm -f \"$tmp\"' EXIT; DISPLAY=:0 scrot -z \"$tmp\"; base64 -w0 \"$tmp\"",
+            ],
+            WorkingDirectory = _spec.WorkingDirectory,
+        }, ct);
+
+        if (!result.Success)
+            throw new InvalidOperationException($"graphical screenshot failed: {result.Stderr}");
+
+        try
+        {
+            return Convert.FromBase64String(result.Stdout.Trim());
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException("graphical screenshot command returned invalid base64", ex);
+        }
+    }
+
+    public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+    {
+        EnsureGraphical();
+        foreach (var inputEvent in events)
+        {
+            var argv = BuildXdotoolArgv(inputEvent);
+            if (argv.Count == 0)
+                continue;
+
+            var result = await ExecAsync(new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = _spec.WorkingDirectory,
+            }, ct);
+            if (!result.Success)
+                throw new InvalidOperationException(
+                    $"graphical input event '{inputEvent.Type}' failed: {result.Stderr}");
+        }
+    }
+
+    private void EnsureGraphical()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_spec.Flavor != SandboxProfileFlavor.Graphical)
+            throw new NotSupportedException("This Multipass sandbox was not created with the graphical flavor.");
+    }
+
+    private static IReadOnlyList<string> BuildXdotoolArgv(SandboxInputEvent inputEvent)
+    {
+        var argv = new List<string>
+        {
+            "env",
+            $"DISPLAY={SandboxConventions.GraphicalDisplay}",
+            "xdotool",
+        };
+
+        switch (inputEvent.Type)
+        {
+            case SandboxInputEventType.Click:
+                if (inputEvent.X.HasValue != inputEvent.Y.HasValue)
+                    throw new ArgumentException("Click events must provide both X and Y, or neither.");
+                if (inputEvent.X is { } clickX && inputEvent.Y is { } clickY)
+                    argv.AddRange(["mousemove", "--sync", clickX.ToString(), clickY.ToString()]);
+                argv.AddRange(["click", "1"]);
+                return argv;
+
+            case SandboxInputEventType.Key:
+                if (string.IsNullOrWhiteSpace(inputEvent.Key))
+                    throw new ArgumentException("Key events require Key.");
+                argv.AddRange(["key", "--clearmodifiers", inputEvent.Key]);
+                return argv;
+
+            case SandboxInputEventType.Move:
+                if (inputEvent.X is not { } moveX || inputEvent.Y is not { } moveY)
+                    throw new ArgumentException("Move events require X and Y.");
+                argv.AddRange(["mousemove", "--sync", moveX.ToString(), moveY.ToString()]);
+                return argv;
+
+            case SandboxInputEventType.Scroll:
+                return BuildScrollArgv(argv, inputEvent);
+
+            case SandboxInputEventType.Type:
+                if (inputEvent.Text is null)
+                    throw new ArgumentException("Type events require Text.");
+                argv.AddRange(["type", "--clearmodifiers", "--delay", "0", "--", inputEvent.Text]);
+                return argv;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(inputEvent), inputEvent.Type, "Unknown input event type.");
+        }
+    }
+
+    private static IReadOnlyList<string> BuildScrollArgv(List<string> argv, SandboxInputEvent inputEvent)
+    {
+        var vertical = inputEvent.Y ?? 0;
+        var horizontal = inputEvent.X ?? 0;
+        if (vertical == 0 && horizontal == 0)
+            return [];
+
+        if (vertical != 0 && horizontal != 0)
+            throw new ArgumentException("Scroll events support one axis at a time.");
+
+        var amount = Math.Abs(vertical != 0 ? vertical : horizontal);
+        if (amount > 1000)
+            throw new ArgumentOutOfRangeException(nameof(inputEvent), "Scroll amount must be <= 1000.");
+
+        var button = vertical switch
+        {
+            < 0 => "4",
+            > 0 => "5",
+            _ => horizontal < 0 ? "6" : "7",
+        };
+        argv.AddRange(["click", "--repeat", amount.ToString(), button]);
+        return argv;
     }
 
     private List<string> BuildWrappedInvocation(SandboxExec exec, string? extraEnvFile)

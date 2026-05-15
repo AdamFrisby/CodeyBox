@@ -364,6 +364,26 @@ A profile referenced in project config but not configured in
 `SandboxNetworkProfiles` makes the provider fail loudly at sandbox
 creation — never silently degrades to "no enforcement."
 
+### Graphical sandboxes
+
+Set `GraphicalSandbox: true` on a project to run GUI-capable sandboxes for
+the phases that need desktop plumbing:
+
+```json
+{
+  "Id": "desktop-app",
+  "RepositoryUrl": "https://example.com/desktop-app.git",
+  "GraphicalSandbox": true
+}
+```
+
+When enabled, work, rework, and audit-tool phases use the `graphical`
+network profile and the graphical sandbox flavor. The Multipass provider
+bakes a separate `cb-baseline-graphical` image, starts an XFCE desktop with
+VNC on port `5900`, and exposes screenshot/input APIs through sandbox exec.
+Configure `SandboxNetworkProfiles.graphical = cb-graphical` and add the
+matching `graphical cb-graphical ...` line to `/etc/codeybox/networks.conf`.
+
 ### Custom auditors
 
 Four kinds, all configured in JSON:

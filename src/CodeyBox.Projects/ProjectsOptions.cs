@@ -21,6 +21,7 @@ public sealed class ProjectDefaultsConfig
     public string? BaseBranch { get; set; }
     public ProjectAuditConfig? Audit { get; set; }
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
+    public bool? GraphicalSandbox { get; set; }
 }
 
 public sealed class ProjectConfig
@@ -37,6 +38,7 @@ public sealed class ProjectConfig
     public ProjectBudgetConfig? Budget { get; set; }
     public ProjectReleaseConfigOptions? Release { get; set; }
     public bool? SkipCredentialSmokeTest { get; set; }
+    public bool? GraphicalSandbox { get; set; }
 }
 
 /// <summary>

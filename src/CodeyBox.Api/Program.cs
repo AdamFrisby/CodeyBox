@@ -1478,13 +1478,17 @@ namespace CodeyBox.Api
         /// "SandboxNetworkProfiles": {
         ///   "isolated":  "cb-iso",
         ///   "claude":    "cb-claude",
-        ///   "multi-llm": "cb-multi-llm"
+        ///   "multi-llm": "cb-multi-llm",
+        ///   "graphical": "cb-graphical"
         /// }
         /// </code>
         /// Bridge names are limited to 15 characters by Linux IFNAMSIZ.
         /// Profile names (the keys) have no such limit.
         /// </summary>
-        public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = [];
+        public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase)
+        {
+            [CodeyBox.Sandbox.SandboxConventions.GraphicalNetworkProfile] = "cb-graphical",
+        };
 
         /// <summary>
         /// Shell commands run inside the sandbox VM at first boot, after

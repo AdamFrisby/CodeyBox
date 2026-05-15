@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 
 namespace CodeyBox.Tests;
@@ -60,6 +61,37 @@ public sealed class MultipassIntegrationTests : IDisposable
     private MultipassSandboxProvider NewProvider() => new(
         new MultipassSandboxOptions(),
         NullLogger<MultipassSandboxProvider>.Instance);
+
+    private MultipassSandboxProvider NewGraphicalProvider() => new(
+        new MultipassSandboxOptions
+        {
+            NetworkProfiles = new Dictionary<string, string>
+            {
+                [SandboxConventions.GraphicalNetworkProfile] = "cb-graphical",
+            },
+            UseBaselineImages = true,
+        },
+        NullLogger<MultipassSandboxProvider>.Instance);
+
+    private static bool MultipassNetworkAvailable(string bridge)
+    {
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo
+            {
+                FileName = "multipass",
+                ArgumentList = { "networks" },
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            });
+            if (p is null) return false;
+            var stdout = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(5_000);
+            return p.ExitCode == 0 && stdout.Contains(bridge, StringComparison.Ordinal);
+        }
+        catch { return false; }
+    }
 
     /// <summary>
     /// Minimal end-to-end: launch a VM, exec a command, verify a host
@@ -137,6 +169,81 @@ public sealed class MultipassIntegrationTests : IDisposable
         });
         Assert.True(spawnSpy.Success, spawnSpy.Stderr);
         Assert.Equal("0", spawnSpy.Stdout.Trim());
+    }
+
+    [Fact]
+    [Trait("requires_multipass", "true")]
+    public async Task Multipass_GraphicalScreenshotAndInput_EndToEnd()
+    {
+        if (!_multipassAvailable) return;
+        if (!MultipassNetworkAvailable("cb-graphical")) return;
+
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Flavor = SandboxProfileFlavor.Graphical,
+            Network = new SandboxNetworkPolicy { ProfileName = SandboxConventions.GraphicalNetworkProfile },
+            Mounts = [new SandboxMount { SandboxPath = "/work", Tmpfs = true }],
+            Limits = new SandboxResourceLimits
+            {
+                CpuCount = 2,
+                MemoryBytes = 4L * 1024 * 1024 * 1024,
+                DiskBytes = 20L * 1024 * 1024 * 1024,
+            },
+            WorkingDirectory = "/work",
+        };
+
+        await using var sb = await NewGraphicalProvider().CreateAsync(spec, CancellationToken.None);
+        var dialog = await sb.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                "DISPLAY=:0 xmessage -name codeybox-smoke -buttons OK:0 -geometry 420x160+120+120 'CodeyBox graphical smoke' >/tmp/codeybox-xmessage.log 2>&1 &",
+            ],
+        });
+        Assert.True(dialog.Success, dialog.Stderr);
+
+        await Task.Delay(TimeSpan.FromSeconds(5));
+        var before = await sb.GetScreenshotAsync();
+        var (x, y) = await FindDialogOkButtonAsync(sb);
+        await sb.SynthesizeInputAsync(
+            [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = x, Y = y }],
+            CancellationToken.None);
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        var after = await sb.GetScreenshotAsync();
+
+        Assert.False(before.SequenceEqual(after), "clicking the graphical dialog should change the screenshot");
+    }
+
+    private static async Task<(int X, int Y)> FindDialogOkButtonAsync(ISandbox sandbox)
+    {
+        var geom = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                "DISPLAY=:0 xdotool search --name 'CodeyBox graphical smoke' getwindowgeometry --shell 2>/dev/null | head -n 4",
+            ],
+        });
+        if (!geom.Success)
+            return (330, 260);
+
+        var values = geom.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => line.Split('=', 2))
+            .Where(parts => parts.Length == 2 && int.TryParse(parts[1], out _))
+            .ToDictionary(parts => parts[0], parts => int.Parse(parts[1]), StringComparer.Ordinal);
+
+        if (!values.TryGetValue("X", out var x)
+            || !values.TryGetValue("Y", out var y)
+            || !values.TryGetValue("WIDTH", out var width)
+            || !values.TryGetValue("HEIGHT", out var height))
+        {
+            return (330, 260);
+        }
+
+        return (x + width / 2, y + Math.Max(20, height - 25));
     }
 
     // Egress enforcement is exercised by local/verify-host-firewall.sh
