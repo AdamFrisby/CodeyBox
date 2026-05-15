@@ -163,13 +163,13 @@ creation — never silently degrades to "no enforcement."
 
 ### Graphical VNC exposure
 
-Graphical Multipass sandboxes run `x11vnc` on port `5900`, bound to the
-VM's `10.99.x.x` address on the graphical bridge. The setup script also
-drops new forwarded inbound traffic into every sandbox bridge, so a LAN
-client cannot route directly to that VNC port through the host. Host-local
-connections and operator-managed loopback tunnels do not traverse the
-forward chain; expose VNC to humans through a loopback-only tunnel such as
-`127.0.0.1:5900` when needed.
+Graphical Multipass sandboxes run `x11vnc` on the conventional graphical
+VNC port (`SandboxConventions.GraphicalVncPort`, currently `5900`), bound
+to loopback inside the VM. The VNC listener is not bound to the VM's
+`10.99.x.x` bridge address, so peers on `cb-graphical` cannot connect to
+another sandbox's desktop at L2. Programmatic screenshots and input use
+`multipass exec` (`scrot`/`xdotool`); expose VNC to humans only through an
+operator-managed loopback tunnel when needed.
 
 ## Sandbox staging directory hardening
 

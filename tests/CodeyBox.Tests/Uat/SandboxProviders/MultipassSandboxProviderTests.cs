@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 
 namespace CodeyBox.Tests.Uat.SandboxProviders;
@@ -52,8 +53,89 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("path: /etc/systemd/system/codeybox-vnc.service", cloudInit);
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
-        Assert.Contains("-rfbport 5900", cloudInit);
+        Assert.Contains($"-rfbport {SandboxConventions.GraphicalVncPort}", cloudInit);
+        Assert.Contains("-listen 127.0.0.1", cloudInit);
+        Assert.DoesNotContain("-listen \"$listen_addr\"", cloudInit);
+        Assert.DoesNotContain("codeybox-vnc: no 10.99", cloudInit);
         Assert.Contains("echo project setup", cloudInit);
+
+        var headlessCloudInit = MultipassSandboxProvider.BuildCloudInit(
+            ["echo project setup"],
+            extraCloudInit: null,
+            SandboxProfileFlavor.Headless);
+        Assert.DoesNotContain("codeybox-xvfb.service", headlessCloudInit);
+        Assert.DoesNotContain("codeybox-vnc.service", headlessCloudInit);
+        Assert.DoesNotContain("xvfb x11vnc xfce4", headlessCloudInit);
+        Assert.DoesNotContain("xdotool scrot ffmpeg", headlessCloudInit);
+    }
+
+    [Fact]
+    public async Task GraphicalCapabilities_RejectHeadlessSandbox()
+    {
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, (_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+
+        await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetScreenshotAsync());
+        await Assert.ThrowsAsync<NotSupportedException>(() =>
+            sandbox.SynthesizeInputAsync([new SandboxInputEvent { Type = SandboxInputEventType.Click }]));
+    }
+
+    [Fact]
+    public async Task GetScreenshotAsync_ThrowsWhenScrotFails()
+    {
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
+            Task.FromResult(new RunResult(2, "", "scrot failed")));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
+
+        Assert.Contains("graphical screenshot failed", ex.Message);
+        Assert.Contains("scrot failed", ex.Message);
+    }
+
+    [Fact]
+    public async Task GetScreenshotAsync_ThrowsWhenCommandReturnsInvalidBase64()
+    {
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
+            Task.FromResult(new RunResult(0, "not base64", "")));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
+
+        Assert.Contains("invalid base64", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SynthesizeInputAsync_ThrowsWhenXdotoolFails()
+    {
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
+            Task.FromResult(new RunResult(1, "", "xdotool failed")));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            sandbox.SynthesizeInputAsync([new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Return" }]));
+
+        Assert.Contains("graphical input event 'Key' failed", ex.Message);
+        Assert.Contains("xdotool failed", ex.Message);
+    }
+
+    [Fact]
+    public async Task SynthesizeInputAsync_RejectsMalformedInputEvents()
+    {
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var invalidEvents = new[]
+        {
+            new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 10 },
+            new SandboxInputEvent { Type = SandboxInputEventType.Key },
+            new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 10 },
+            new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = 1, Y = 1 },
+            new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 1001 },
+            new SandboxInputEvent { Type = SandboxInputEventType.Type },
+        };
+
+        foreach (var inputEvent in invalidEvents)
+        {
+            await Assert.ThrowsAnyAsync<ArgumentException>(() =>
+                sandbox.SynthesizeInputAsync([inputEvent]));
+        }
     }
 
     [Fact]
@@ -324,5 +406,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         return runner is null
             ? new MultipassSandboxProvider(options, NullLogger<MultipassSandboxProvider>.Instance)
             : new MultipassSandboxProvider(options, NullLogger<MultipassSandboxProvider>.Instance, null, runner);
+    }
+
+    private MultipassSandbox NewMultipassSandbox(
+        SandboxProfileFlavor flavor,
+        Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> handler)
+    {
+        return new MultipassSandbox(
+            "codeybox-test",
+            _workspace,
+            new SandboxSpec
+            {
+                ImageReference = "ignored",
+                Flavor = flavor,
+                WorkingDirectory = "/work",
+            },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/true" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: new RecordingMultipassRunner(handler));
     }
 }

@@ -147,9 +147,11 @@ When enabled, the work, rework, and credential-free audit-tool phases use
 `SandboxProfileFlavor.Graphical` and the logical network profile
 `graphical`. LLM audit and merge phases keep their normal profiles. The
 Multipass graphical flavor installs a lightweight XFCE session on Xvfb,
-starts `x11vnc` on port `5900`, and preinstalls `xdotool`, `scrot`, and
-`ffmpeg`. The CodeyBox screenshot/input APIs call `scrot` and `xdotool`
-through `multipass exec`; no additional LLM network surface is required.
+starts loopback-only `x11vnc` on the conventional graphical VNC port
+(`SandboxConventions.GraphicalVncPort`, currently `5900`), and preinstalls
+`xdotool`, `scrot`, and `ffmpeg`. The CodeyBox screenshot/input APIs call
+`scrot` and `xdotool` through `multipass exec`; no additional LLM network
+surface is required.
 
 Operator setup needs the graphical bridge:
 

@@ -906,16 +906,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         WantedBy=multi-user.target
         """;
 
-    private const string GraphicalVncScript = """
+    private static readonly string GraphicalVncScript = $$"""
         #!/bin/sh
         set -eu
-        iface=$(ip -4 -o addr show | awk '/inet 10\.99\./{print $2; exit}')
-        if [ -z "$iface" ]; then
-            echo "codeybox-vnc: no 10.99.x.x interface present" >&2
-            exit 1
-        fi
-        listen_addr=$(ip -4 -o addr show "$iface" | awk '{print $4}' | cut -d/ -f1)
-        exec /usr/bin/x11vnc -display :0 -rfbport 5900 -forever -shared -nopw -listen "$listen_addr" -noxdamage -repeat
+        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -nopw -listen 127.0.0.1 -localhost -noxdamage -repeat
         """;
 
     private const string GraphicalInstallRuncmd = """
@@ -1511,6 +1505,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
     {
         EnsureGraphical();
+        ArgumentNullException.ThrowIfNull(events);
         foreach (var inputEvent in events)
         {
             var argv = BuildXdotoolArgv(inputEvent);

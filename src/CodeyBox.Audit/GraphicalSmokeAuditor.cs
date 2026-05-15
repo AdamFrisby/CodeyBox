@@ -11,6 +11,10 @@ namespace CodeyBox.Audit;
 /// </summary>
 public sealed class GraphicalSmokeAuditor : IAuditor
 {
+    // WHY: allow small antialiasing/compositor variation, but reject flat
+    // black/gray/white screenshots that indicate the desktop did not render.
+    private const int MinimumUsefulLumaRange = 8;
+
     private readonly TimeSpan _settleDelay;
 
     public GraphicalSmokeAuditor()
@@ -60,7 +64,7 @@ public sealed class GraphicalSmokeAuditor : IAuditor
         }
 
         var rawOutput = $"PNG {stats.Width}x{stats.Height}; uniqueColors={stats.UniqueColors}; lumaRange={stats.LumaRange}";
-        if (stats.PixelCount <= 0 || stats.UniqueColors < 2 || stats.LumaRange < 8)
+        if (stats.PixelCount <= 0 || stats.UniqueColors < 2 || stats.LumaRange < MinimumUsefulLumaRange)
             return Failed("graphical screenshot appears blank or uniform", rawOutput);
 
         return new AuditResult(true, [], RawOutput: rawOutput);

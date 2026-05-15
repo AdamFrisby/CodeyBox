@@ -84,7 +84,9 @@ internal static class TestSupport
         ITimingStore? timingStore = null,
         string? defaultBaseBranch = "main",
         ProjectAudit? projectAudit = null,
-        IPresetCatalog? presetCatalogOverride = null)
+        IPresetCatalog? presetCatalogOverride = null,
+        ISandboxProvider? sandboxProvider = null,
+        bool graphicalSandbox = false)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -92,7 +94,7 @@ internal static class TestSupport
         var store = new SqliteWorkItemStore(stateDb);
         var queue = new InMemoryTaskQueue();
         var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
-        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var sandboxes = sandboxProvider ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
         var agent = new ScriptedAgent(mergeStrategy?.ToList() ?? [MergeStrategy.RealMerge]);
         var registry = new AgentRegistry([agent]);
@@ -117,6 +119,7 @@ internal static class TestSupport
             DefaultAgent = AgentKind.Claude,
             GitAuthorName = projectGitAuthor?.Name,
             GitAuthorEmail = projectGitAuthor?.Email,
+            GraphicalSandbox = graphicalSandbox,
             Upstream = upstream ?? ProjectUpstream.Noop,
             Audit = audit,
         });

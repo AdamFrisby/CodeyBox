@@ -73,7 +73,7 @@ public sealed class MultipassIntegrationTests : IDisposable
         },
         NullLogger<MultipassSandboxProvider>.Instance);
 
-    private static bool MultipassNetworkAvailable(string bridge)
+    private static string? MultipassNetworkUnavailableReason(string bridge)
     {
         try
         {
@@ -85,12 +85,24 @@ public sealed class MultipassIntegrationTests : IDisposable
                 RedirectStandardError = true,
                 UseShellExecute = false,
             });
-            if (p is null) return false;
+            if (p is null) return "failed to start `multipass networks`";
+            if (!p.WaitForExit(5_000))
+            {
+                try { p.Kill(entireProcessTree: true); } catch { }
+                return "`multipass networks` timed out";
+            }
             var stdout = p.StandardOutput.ReadToEnd();
-            p.WaitForExit(5_000);
-            return p.ExitCode == 0 && stdout.Contains(bridge, StringComparison.Ordinal);
+            var stderr = p.StandardError.ReadToEnd();
+            if (p.ExitCode != 0)
+                return $"`multipass networks` exited {p.ExitCode}: {stderr}";
+            if (!stdout.Contains(bridge, StringComparison.Ordinal))
+                return $"`multipass networks` did not list required bridge '{bridge}'";
+            return null;
         }
-        catch { return false; }
+        catch (Exception ex)
+        {
+            return $"`multipass networks` failed: {ex.Message}";
+        }
     }
 
     /// <summary>
@@ -175,8 +187,13 @@ public sealed class MultipassIntegrationTests : IDisposable
     [Trait("requires_multipass", "true")]
     public async Task Multipass_GraphicalScreenshotAndInput_EndToEnd()
     {
-        if (!_multipassAvailable) return;
-        if (!MultipassNetworkAvailable("cb-graphical")) return;
+        if (!_multipassAvailable)
+            throw new InvalidOperationException("requires_multipass test requires the `multipass` CLI to be available.");
+        var networkUnavailableReason = MultipassNetworkUnavailableReason("cb-graphical");
+        if (networkUnavailableReason is not null)
+            throw new InvalidOperationException(
+                "requires_multipass graphical test requires the cb-graphical bridge from scripts/setup-host-networks.sh: " +
+                networkUnavailableReason);
 
         var spec = new SandboxSpec
         {

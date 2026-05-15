@@ -18,6 +18,9 @@ public sealed class ComputerUseBridge
         ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(request);
 
+        if (string.IsNullOrWhiteSpace(request.Action))
+            throw new ArgumentException("Computer-use Action is required.", nameof(request));
+
         var action = request.Action.Trim().ToLowerInvariant();
         switch (action)
         {
