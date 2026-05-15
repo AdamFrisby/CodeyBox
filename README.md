@@ -67,8 +67,8 @@ Projects that need GUI build/test plumbing can set `GraphicalSandbox: true`.
 With Multipass this uses a graphical baseline image for the selected network
 profile, preserves the project's per-phase egress profile, and starts an
 XFCE/Xvfb desktop with screenshot and input synthesis exposed through the
-sandbox API. If a graphical-eligible phase has no configured profile, it falls
-back to the `graphical` profile mapped to `cb-graphical`.
+sandbox API. Configure explicit graphical phase profiles; an omitted profile
+stays omitted and should be blocked by the host default bridge rules.
 
 See [`docs/`](docs/README.md) for the full write-up. **Read
 [`docs/security.md`](docs/security.md) before deploying.**

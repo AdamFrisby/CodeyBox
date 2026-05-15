@@ -10,14 +10,28 @@ public sealed class HostNetworkSetupScriptTests
         var script = File.ReadAllText(SetupScriptPath());
         var inboundChain = ExtractBetween(
             script,
-            "    chain cb-${name}-in {",
-            "    chain cb-${name} {");
+            "    chain ${in_chain} {",
+            "    chain ${chain} {");
 
-        Assert.Contains("jump cb-${name}-in", script, StringComparison.Ordinal);
-        Assert.Contains("chain cb-${name}-in {", script, StringComparison.Ordinal);
+        Assert.Contains("declare -a NAMES BRIDGES SUBNETS HOSTS CHAINS", script, StringComparison.Ordinal);
+        Assert.Contains("CHAINS+=(\"cb_p${idx}\")", script, StringComparison.Ordinal);
+        Assert.Contains("jump ${in_chain}", script, StringComparison.Ordinal);
+        Assert.Contains("chain ${in_chain} {", script, StringComparison.Ordinal);
         Assert.Contains("Host-originated", inboundChain, StringComparison.Ordinal);
         Assert.Contains("ct state established,related accept", inboundChain, StringComparison.Ordinal);
         Assert.Contains("        drop", inboundChain, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SetupHostNetworks_DoesNotUseProfileLabelsAsNftChainNames()
+    {
+        var script = File.ReadAllText(SetupScriptPath());
+
+        Assert.Contains("chain=\"${CHAINS[$i]}\"", script, StringComparison.Ordinal);
+        Assert.Contains("in_chain=\"${chain}_in\"", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("jump cb-${name}", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("chain cb-${name}", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("cb-${name}-in", script, StringComparison.Ordinal);
     }
 
     [Fact]

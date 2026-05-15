@@ -96,7 +96,7 @@ claude           cb-claude       10.99.2.0/24   api.anthropic.com
 internet-only    cb-net          10.99.5.0/24   internet
 codex            cb-codex           10.99.3.0/24   api.openai.com
 multi-llm        cb-multi-llm       10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
-graphical        cb-graphical       10.99.6.0/24   internet
+graphical        cb-graphical       10.99.6.0/24   -
 EOF
 
 # 3. Run the setup script (creates bridges, applies nftables, persists rules).
@@ -249,7 +249,7 @@ root's permissions don't drift back to default 0755.
 - **Agent reaches an unexpected host.** Either the IP was allowlisted
   (check the resolved IPs against your config) or the rule isn't being
   hit (check `nft -a list ruleset` for counters). If forward traffic on
-  `mpqemubr0` is being accepted, the script's `cb-default-blocked`
+  `mpqemubr0` is being accepted, the script's `cb_default_blocked`
   chain isn't loaded — re-run.
 
 ## Tests

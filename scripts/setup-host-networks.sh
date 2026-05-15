@@ -29,7 +29,7 @@
 #   codex            cb-codex        10.99.3.0/24   api.openai.com
 #   multi-llm        cb-multi-llm    10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
 #   internet-only    cb-net          10.99.5.0/24   internet
-#   graphical        cb-graphical    10.99.6.0/24   internet
+#   graphical        cb-graphical    10.99.6.0/24   -
 #
 # allowed-hosts column accepts:
 #   "-"                     — no egress (only DNS + loopback + replies)
@@ -68,7 +68,7 @@ Example:
   # name           bridge          subnet         allowed-hosts
   isolated         cb-iso          10.99.1.0/24   -
   claude           cb-claude       10.99.2.0/24   api.anthropic.com
-  graphical        cb-graphical    10.99.6.0/24   internet
+  graphical        cb-graphical    10.99.6.0/24   -
 
 Then re-run: sudo $0 [path/to/config]
 EOF
@@ -84,7 +84,7 @@ mkdir -p "$NETWORKD_DIR" "$(dirname "$NFT_FILE")"
 # ---------------------------------------------------------------------------
 # Parse the config file.
 # ---------------------------------------------------------------------------
-declare -a NAMES BRIDGES SUBNETS HOSTS
+declare -a NAMES BRIDGES SUBNETS HOSTS CHAINS
 while IFS= read -r raw; do
     # Strip comments and surrounding whitespace.
     line="${raw%%#*}"
@@ -97,7 +97,8 @@ while IFS= read -r raw; do
     if [[ -z "$name" || -z "$bridge" || -z "$subnet" || -z "$hosts" ]]; then
         echo "invalid line: $raw" >&2; exit 1
     fi
-    NAMES+=("$name"); BRIDGES+=("$bridge"); SUBNETS+=("$subnet"); HOSTS+=("$hosts")
+    idx=${#NAMES[@]}
+    NAMES+=("$name"); BRIDGES+=("$bridge"); SUBNETS+=("$subnet"); HOSTS+=("$hosts"); CHAINS+=("cb_p${idx}")
 done < "$CONFIG_FILE"
 
 if [[ ${#NAMES[@]} -eq 0 ]]; then
@@ -158,21 +159,22 @@ table inet codeybox {
         # Multipass's default bridge — drop ALL forwarded traffic. The
         # multipass control plane uses INPUT (host -> guest), not FORWARD,
         # so this doesn't break VM management.
-        iifname "${MULTIPASS_DEFAULT_IFACE}" jump cb-default-blocked
-        oifname "${MULTIPASS_DEFAULT_IFACE}" jump cb-default-blocked
+        iifname "${MULTIPASS_DEFAULT_IFACE}" jump cb_default_blocked
+        oifname "${MULTIPASS_DEFAULT_IFACE}" jump cb_default_blocked
 EOF
 
 for i in "${!NAMES[@]}"; do
-    name="${NAMES[$i]}"
     bridge="${BRIDGES[$i]}"
-    echo "        iifname \"${bridge}\" jump cb-${name}"
-    echo "        oifname \"${bridge}\" jump cb-${name}-in"
+    chain="${CHAINS[$i]}"
+    in_chain="${chain}_in"
+    echo "        iifname \"${bridge}\" jump ${chain}"
+    echo "        oifname \"${bridge}\" jump ${in_chain}"
 done
 
 cat <<EOF
     }
 
-    chain cb-default-blocked {
+    chain cb_default_blocked {
         # Multipass's default mpqemubr0 has no useful internet path. Drop.
         drop
     }
@@ -181,10 +183,12 @@ EOF
 for i in "${!NAMES[@]}"; do
     name="${NAMES[$i]}"
     hosts="${HOSTS[$i]}"
+    chain="${CHAINS[$i]}"
+    in_chain="${chain}_in"
 
     cat <<EOF
 
-    chain cb-${name}-in {
+    chain ${in_chain} {
         # Block LAN-forwarded inbound traffic to sandbox bridges. Host-originated
         # connections (including operator-managed 127.0.0.1 tunnels for VNC)
         # do not traverse this forward chain, and established replies remain
@@ -193,7 +197,7 @@ for i in "${!NAMES[@]}"; do
         drop
     }
 
-    chain cb-${name} {
+    chain ${chain} {
         # Standard "allow replies + DNS" preamble.
         ct state established,related accept
         ip protocol icmp accept

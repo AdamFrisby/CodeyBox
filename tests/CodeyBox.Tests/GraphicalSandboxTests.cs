@@ -42,6 +42,30 @@ public sealed class GraphicalSandboxTests
         yield return new object[] { BuildPng(1, 1, colorType: 0, decompressedScanlines: [0, 0, 0]), "exceeds expected decoded size" };
     }
 
+    public static IEnumerable<object[]> FilteredPngSuccessCases()
+    {
+        yield return new object[]
+        {
+            "Sub",
+            BuildPng(2, 1, colorType: 2, decompressedScanlines: [1, 0, 0, 0, 255, 255, 255]),
+        };
+        yield return new object[]
+        {
+            "Up",
+            BuildPng(1, 2, colorType: 2, decompressedScanlines: [0, 0, 0, 0, 2, 255, 255, 255]),
+        };
+        yield return new object[]
+        {
+            "Average",
+            BuildPng(2, 1, colorType: 2, decompressedScanlines: [3, 0, 0, 0, 255, 255, 255]),
+        };
+        yield return new object[]
+        {
+            "Paeth",
+            BuildPng(2, 1, colorType: 2, decompressedScanlines: [4, 0, 0, 0, 255, 255, 255]),
+        };
+    }
+
     [Fact]
     public async Task ComputerUseBridge_MapsScreenshotAndInputActionsToSandboxCapabilities()
     {
@@ -63,6 +87,21 @@ public sealed class GraphicalSandboxTests
                 new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 3 },
             ],
             sandbox.Events);
+    }
+
+    [Fact]
+    public async Task ComputerUseBridge_AllowsWhitespaceTypeTextButRejectsWhitespaceKeys()
+    {
+        await using var sandbox = new RecordingGraphicalSandbox(NonUniformPng);
+        var bridge = new ComputerUseBridge();
+
+        await bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "type", Text = " \n\t" });
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "key", Key = " " }));
+
+        var inputEvent = Assert.Single(sandbox.Events);
+        Assert.Equal(SandboxInputEventType.Type, inputEvent.Type);
+        Assert.Equal(" \n\t", inputEvent.Text);
     }
 
     [Fact]
@@ -168,19 +207,35 @@ public sealed class GraphicalSandboxTests
     }
 
     [Fact]
-    public async Task ComputerUseBridge_AppliesInputRateBudgetAndToolTimeout()
+    public void ComputerUseBridge_RejectsInvalidOptions()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ComputerUseBridge(new ComputerUseBridgeOptions { MaxEventsPerCall = 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ComputerUseBridge(new ComputerUseBridgeOptions { MaxTextUtf8Bytes = 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ComputerUseBridge(new ComputerUseBridgeOptions { MaxKeyUtf8Bytes = 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ComputerUseBridge(new ComputerUseBridgeOptions { MaxCoordinate = -1 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ComputerUseBridge(new ComputerUseBridgeOptions { MaxScrollMagnitude = 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ComputerUseBridge(new ComputerUseBridgeOptions { ToolCallTimeout = TimeSpan.Zero }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ComputerUseBridge(new ComputerUseBridgeOptions { MaxInputEventsPerWindow = 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ComputerUseBridge(new ComputerUseBridgeOptions { RateLimitWindow = TimeSpan.Zero }));
+    }
+
+    [Fact]
+    public async Task ComputerUseBridge_AppliesInputRateBudgetExpiryAndToolTimeouts()
     {
         await using var rateSandbox = new RecordingGraphicalSandbox(NonUniformPng);
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var rateLimited = new ComputerUseBridge(new ComputerUseBridgeOptions
         {
             MaxInputEventsPerWindow = 1,
             RateLimitWindow = TimeSpan.FromMinutes(1),
-        });
+        }, () => now);
 
         await rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" });
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" }));
-        Assert.Single(rateSandbox.Events);
+        now += TimeSpan.FromMinutes(1) + TimeSpan.FromTicks(1);
+        await rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" });
+        Assert.Equal(2, rateSandbox.Events.Count);
 
         await using var slowSandbox = new DelayingGraphicalSandbox();
         var timeoutBridge = new ComputerUseBridge(new ComputerUseBridgeOptions
@@ -190,6 +245,8 @@ public sealed class GraphicalSandboxTests
 
         await Assert.ThrowsAsync<TimeoutException>(() =>
             timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "screenshot" }));
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "click" }));
     }
 
     [Fact]
@@ -288,6 +345,21 @@ public sealed class GraphicalSandboxTests
             var finding = Assert.Single(result.Findings);
             Assert.Contains(expected, finding.Description, StringComparison.OrdinalIgnoreCase);
         }
+    }
+
+    [Theory]
+    [MemberData(nameof(FilteredPngSuccessCases))]
+    public async Task GraphicalSmokeAuditor_PassesForFilteredPngVariants(string filterName, byte[] png)
+    {
+        await using var sandbox = new RecordingGraphicalSandbox(png);
+        var auditor = new GraphicalSmokeAuditor(TimeSpan.Zero);
+
+        var result = await auditor.RunAsync(
+            sandbox,
+            "/work",
+            new AuditContext(WorkItemId.New(), "work", "main", 1, "prompt"));
+
+        Assert.True(result.Passed, $"{filterName} filter failed: {result.RawOutput}");
     }
 
     [Fact]
@@ -439,6 +511,29 @@ public sealed class GraphicalSandboxTests
         {
             try { Directory.Delete(workspace, recursive: true); } catch { }
         }
+    }
+
+    [Fact]
+    public void SandboxTargetResolver_GraphicalSandboxLeavesMissingEligibleProfilesUnset()
+    {
+        var project = new Project
+        {
+            Id = new ProjectId("gui"),
+            DisplayName = "GUI",
+            RepositoryUrl = "https://example.com/gui.git",
+            GraphicalSandbox = true,
+        };
+
+        var missing = SandboxTargetResolver.Resolve(project, null, graphicalEligible: true);
+        var blank = SandboxTargetResolver.Resolve(project, "   ", graphicalEligible: true);
+        var configured = SandboxTargetResolver.Resolve(project, "work-profile", graphicalEligible: true);
+
+        Assert.Equal(SandboxProfileFlavor.Graphical, missing.Flavor);
+        Assert.Null(missing.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Graphical, blank.Flavor);
+        Assert.Null(blank.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Graphical, configured.Flavor);
+        Assert.Equal("work-profile", configured.NetworkProfile);
     }
 
     [Fact]

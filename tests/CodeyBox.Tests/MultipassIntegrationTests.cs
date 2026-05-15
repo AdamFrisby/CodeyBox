@@ -219,12 +219,14 @@ public sealed class MultipassIntegrationTests : IDisposable
 
         await Task.Delay(TimeSpan.FromSeconds(5));
         var before = await sb.GetScreenshotAsync();
+        AssertPngSignature(before);
         var (x, y) = await FindDialogOkButtonAsync(sb);
         await sb.SynthesizeInputAsync(
             [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = x, Y = y }],
             CancellationToken.None);
         await Task.Delay(TimeSpan.FromSeconds(2));
         var after = await sb.GetScreenshotAsync();
+        AssertPngSignature(after);
 
         Assert.False(before.SequenceEqual(after), "clicking the graphical dialog should change the screenshot");
 
@@ -369,6 +371,14 @@ public sealed class MultipassIntegrationTests : IDisposable
         }
 
         return (x + width / 2, y + height / 2);
+    }
+
+    private static void AssertPngSignature(byte[] bytes)
+    {
+        byte[] signature = [137, 80, 78, 71, 13, 10, 26, 10];
+        Assert.True(
+            bytes.Length >= signature.Length && bytes.AsSpan(0, signature.Length).SequenceEqual(signature),
+            "screenshot bytes must start with the PNG signature");
     }
 
     // Egress enforcement is exercised by local/verify-host-firewall.sh

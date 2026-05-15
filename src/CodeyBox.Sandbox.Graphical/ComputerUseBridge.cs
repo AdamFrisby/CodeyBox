@@ -152,7 +152,7 @@ public sealed class ComputerUseBridge
                     break;
 
                 case SandboxInputEventType.Type:
-                    ValidateText(inputEvent.Text, _options.MaxTextUtf8Bytes, "Type events require Text.", "Text");
+                    ValidateText(inputEvent.Text, _options.MaxTextUtf8Bytes, "Type events require Text.", "Text", allowWhitespace: true);
                     break;
 
                 default:
@@ -181,9 +181,14 @@ public sealed class ComputerUseBridge
             throw new ArgumentOutOfRangeException(nameof(inputEvent), $"Scroll amount must be <= {_options.MaxScrollMagnitude}.");
     }
 
-    private static void ValidateText(string? value, int maxUtf8Bytes, string missingMessage, string fieldName)
+    private static void ValidateText(
+        string? value,
+        int maxUtf8Bytes,
+        string missingMessage,
+        string fieldName,
+        bool allowWhitespace = false)
     {
-        if (string.IsNullOrWhiteSpace(value))
+        if (value is null || (allowWhitespace ? value.Length == 0 : string.IsNullOrWhiteSpace(value)))
             throw new ArgumentException(missingMessage);
         var byteCount = Encoding.UTF8.GetByteCount(value);
         if (byteCount > maxUtf8Bytes)

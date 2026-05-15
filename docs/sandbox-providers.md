@@ -146,9 +146,10 @@ Projects that need to build or test GUI applications can opt in with:
 When enabled, the work, rework, and credential-free audit-tool phases use
 `SandboxProfileFlavor.Graphical` while preserving their configured per-phase
 network profiles. If a graphical-eligible phase has no configured network
-profile, CodeyBox falls back to the logical `graphical` profile. LLM audit and
-merge phases keep their normal headless profiles. The Multipass graphical
-flavor installs a lightweight XFCE session on Xvfb, starts `x11vnc` on the
+profile, CodeyBox leaves it unset so the host-blocked default bridge applies.
+LLM audit and merge phases keep their normal headless profiles. The Multipass
+graphical flavor installs a lightweight XFCE session on Xvfb, starts `x11vnc`
+on the
 VM's `10.99.x.x` CodeyBox bridge address on the conventional graphical VNC
 port (`SandboxConventions.GraphicalVncPort`, currently `5900`), and preinstalls
 `xdotool`, `scrot`, and `ffmpeg`. The VNC server is password-protected and
@@ -159,13 +160,12 @@ guest bridge address. The CodeyBox
 screenshot/input APIs call `scrot` and `xdotool` through `multipass exec`;
 no additional LLM network surface is required.
 
-Operator setup needs the graphical bridge for fallback graphical phases. If
-your project sets explicit `Work`, `Rework`, or `AuditTool` profiles, those
-bridges also need to be present because graphical VMs will attach to them:
+Operator setup needs every explicit `Work`, `Rework`, or `AuditTool` profile
+bridge your graphical projects select. A common dedicated graphical profile is:
 
 ```text
 # /etc/codeybox/networks.conf
-graphical        cb-graphical    10.99.6.0/24   internet
+graphical        cb-graphical    10.99.6.0/24   -
 ```
 
 Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
@@ -178,7 +178,7 @@ Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
 
 With `MultipassUseBaselineImages=true`, the provider bakes a separate
 graphical baseline VM for each selected network profile the first time a
-graphical project runs. The fallback graphical profile uses
+graphical project runs. The conventional `graphical` profile uses
 `cb-baseline-graphical`. Delete
 that baseline to force a rebuild after changing graphical tooling or
 `MultipassExtraRuncmd`.

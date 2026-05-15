@@ -15,7 +15,7 @@ internal static class SandboxTargetResolver
             return new SandboxTarget(configuredNetworkProfile, SandboxProfileFlavor.Headless);
 
         var networkProfile = string.IsNullOrWhiteSpace(configuredNetworkProfile)
-            ? SandboxConventions.GraphicalNetworkProfile
+            ? null
             : configuredNetworkProfile;
         return new SandboxTarget(networkProfile, SandboxProfileFlavor.Graphical);
     }

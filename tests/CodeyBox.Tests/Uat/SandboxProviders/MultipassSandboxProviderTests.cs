@@ -13,6 +13,9 @@ namespace CodeyBox.Tests.Uat.SandboxProviders;
 /// </summary>
 public sealed class MultipassSandboxProviderTests : IDisposable
 {
+    private static readonly byte[] TinyPng = Convert.FromBase64String(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAAB9Wl9WAAAAC0lEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==");
+
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-uat-multipass-").FullName;
 
     public void Dispose()
@@ -155,6 +158,30 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
 
         Assert.Contains("invalid base64", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetScreenshotAsync_ReturnsDecodedPngBytes()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, Convert.ToBase64String(TinyPng), "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var screenshot = await sandbox.GetScreenshotAsync();
+
+        Assert.Equal(TinyPng, screenshot);
+        AssertPngSignature(screenshot);
+    }
+
+    [Fact]
+    public async Task GetScreenshotAsync_RejectsDecodedNonPngBytes()
+    {
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
+            Task.FromResult(new RunResult(0, Convert.ToBase64String([1, 2, 3, 4, 5, 6, 7, 8]), "")));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
+
+        Assert.Contains("non-PNG", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -812,5 +839,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var envIndex = argv.ToList().IndexOf("env");
         Assert.True(envIndex >= 0, "missing xdotool env command in argv: " + JsonSerializer.Serialize(argv));
         return argv.Skip(envIndex).ToArray();
+    }
+
+    private static void AssertPngSignature(byte[] bytes)
+    {
+        byte[] signature = [137, 80, 78, 71, 13, 10, 26, 10];
+        Assert.True(
+            bytes.Length >= signature.Length && bytes.AsSpan(0, signature.Length).SequenceEqual(signature),
+            "screenshot bytes must start with the PNG signature");
     }
 }

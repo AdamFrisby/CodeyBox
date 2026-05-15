@@ -1516,6 +1516,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
+    private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
 
     private readonly string _name;
     private readonly string _sandboxRoot;
@@ -1653,6 +1654,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
             var screenshot = Convert.FromBase64String(result.Stdout.Trim());
             if (screenshot.Length > _maxScreenshotPngBytes)
                 throw new InvalidOperationException("graphical screenshot PNG exceeded the maximum capture size");
+            if (!HasPngSignature(screenshot))
+                throw new InvalidOperationException("graphical screenshot command returned non-PNG data");
             return screenshot;
         }
         catch (FormatException ex)
@@ -1660,6 +1663,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
             throw new InvalidOperationException("graphical screenshot command returned invalid base64", ex);
         }
     }
+
+    private static bool HasPngSignature(byte[] bytes)
+        => bytes.Length >= PngSignature.Length
+            && bytes.AsSpan(0, PngSignature.Length).SequenceEqual(PngSignature);
 
     public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
     {
