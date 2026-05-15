@@ -141,7 +141,15 @@ public sealed record SandboxResourceLimits
     public static SandboxResourceLimits Default { get; } = new()
     {
         CpuCount = 2,
-        MemoryBytes = 2L * 1024 * 1024 * 1024,
+        // 12 GiB: 2 GiB was tight enough that qemu OOM-crashed mid-task under load
+        // (multipass socket then drops out, surfacing as "cannot connect to the
+        // multipass socket" in CodeyBox). Real-world agent work — LLM inference
+        // helpers, dotnet build/test, npm install graphs — routinely peaks well
+        // above 2 GiB, especially with parallel audits in the same VM. qcow2 disk
+        // stays sparse, so the per-VM cost is only paid when actually used; the
+        // RAM bump matters when multiple VMs are running concurrently. Operators
+        // running many concurrent workers on small hosts can override via spec.
+        MemoryBytes = 12L * 1024 * 1024 * 1024,
         DiskBytes = 8L * 1024 * 1024 * 1024,
         WallClock = TimeSpan.FromMinutes(60),
     };

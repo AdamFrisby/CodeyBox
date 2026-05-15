@@ -16,9 +16,15 @@ public sealed record AuditOptions
 
     /// <summary>
     /// Wall-clock budget for a single audit iteration's sandbox (per
-    /// capability group). Defaults to 10 minutes.
+    /// capability group). Defaults to 30 minutes. The original 10-minute
+    /// default was too tight in practice: LLM auditors at high reasoning
+    /// effort routinely take 5–10 minutes apiece, and an iteration may
+    /// run several in sequence, plus the local toolchain auditors and
+    /// the rework agent itself. 30 min gives enough headroom for typical
+    /// repos; large codebases (e.g. CodeyBox auditing itself) may want
+    /// to override this further via project config.
     /// </summary>
-    public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(10);
+    public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(30);
 
     /// <summary>
     /// If true, stop running auditors as soon as one returns a failing
