@@ -58,13 +58,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
         Assert.Contains("x11-utils socat", cloudInit);
         Assert.Contains($"-rfbport {SandboxConventions.GraphicalVncPort}", cloudInit);
-        Assert.Contains("-listen 127.0.0.1", cloudInit);
-        Assert.Contains("-allow 127.0.0.1", cloudInit);
+        Assert.Contains("-listen \"$listen_addr\"", cloudInit);
+        Assert.Contains("-allow \"$host_addr\"", cloudInit);
         Assert.Contains("-rfbauth \"$password_file\"", cloudInit);
-        Assert.DoesNotContain("-listen \"$listen_addr\"", cloudInit);
-        Assert.DoesNotContain("-allow \"$host_addr\"", cloudInit);
+        Assert.DoesNotContain("-listen 127.0.0.1", cloudInit);
+        Assert.DoesNotContain("-allow 127.0.0.1", cloudInit);
         Assert.DoesNotContain("-nopw", cloudInit);
         Assert.Contains("echo project setup", cloudInit);
+        Assert.True(
+            cloudInit.IndexOf("systemctl enable --now codeybox-route.service", StringComparison.Ordinal)
+            < cloudInit.IndexOf("apt-get update", StringComparison.Ordinal),
+            "graphical package install must run after route swap");
 
         var headlessCloudInit = MultipassSandboxProvider.BuildCloudInit(
             ["echo project setup"],
@@ -75,6 +79,22 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("xvfb x11vnc xfce4", headlessCloudInit);
         Assert.DoesNotContain("xdotool scrot ffmpeg", headlessCloudInit);
         Assert.DoesNotContain("x11-utils socat", headlessCloudInit);
+    }
+
+    [Fact]
+    public void CloudInit_GraphicalFlavor_InstallsDesktopToolsWithEmptyRuncmd()
+    {
+        var cloudInit = MultipassSandboxProvider.BuildCloudInit(
+            [],
+            extraCloudInit: null,
+            SandboxProfileFlavor.Graphical);
+
+        Assert.Contains("xvfb x11vnc xfce4", cloudInit);
+        Assert.Contains("xdotool scrot ffmpeg", cloudInit);
+        Assert.True(
+            cloudInit.IndexOf("systemctl enable --now codeybox-route.service", StringComparison.Ordinal)
+            < cloudInit.IndexOf("apt-get update", StringComparison.Ordinal),
+            "graphical package install must run after route swap");
     }
 
     [Fact]
@@ -111,6 +131,27 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("DISPLAY=:7", argv);
         Assert.Contains("OTHER=value", argv);
         Assert.DoesNotContain($"DISPLAY={SandboxConventions.GraphicalDisplay}", argv);
+    }
+
+    [Fact]
+    public async Task ExecAsync_GraphicalSandboxMergesDisplayIntoCallerEnvironment()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["printenv"],
+            ExtraEnvironment = new Dictionary<string, string>
+            {
+                ["OTHER"] = "value",
+            },
+        });
+
+        var argv = Assert.Single(runner.Calls).Argv;
+        Assert.Contains("OTHER=value", argv);
+        Assert.Contains($"DISPLAY={SandboxConventions.GraphicalDisplay}", argv);
     }
 
     [Fact]
@@ -295,8 +336,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var invalidEvents = new[]
         {
             new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 10 },
+            new SandboxInputEvent { Type = SandboxInputEventType.Click, X = -1, Y = 0 },
             new SandboxInputEvent { Type = SandboxInputEventType.Key },
             new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 10 },
+            new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 0, Y = -1 },
             new SandboxInputEvent { Type = SandboxInputEventType.Scroll },
             new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = 1, Y = 1 },
             new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 1001 },
@@ -318,6 +361,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         await Assert.ThrowsAsync<ArgumentNullException>(() =>
             sandbox.SynthesizeInputAsync(null!));
+        await Assert.ThrowsAnyAsync<ArgumentException>(() =>
+            sandbox.SynthesizeInputAsync([]));
+        await Assert.ThrowsAnyAsync<ArgumentException>(() =>
+            sandbox.SynthesizeInputAsync([null!]));
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
             sandbox.SynthesizeInputAsync([new SandboxInputEvent { Type = (SandboxInputEventType)999 }]));
     }
@@ -668,8 +715,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("name=cb-graphical,mode=auto", baselineLaunchNetwork);
         Assert.Equal("cb-baseline-graphical", cloneSource);
         var baselineCloudInitText = Assert.IsType<string>(baselineCloudInit);
-        Assert.Contains("systemctl enable codeybox-route.service", baselineCloudInitText);
-        Assert.DoesNotContain("systemctl enable --now codeybox-route.service", baselineCloudInitText);
+        Assert.Contains("systemctl enable --now codeybox-route.service", baselineCloudInitText);
         Assert.DoesNotContain("apt-get install -y --no-install-recommends xvfb", baselineCloudInitText);
         Assert.Contains(installCommands, cmd =>
             cmd.Contains("xvfb x11vnc xfce4", StringComparison.Ordinal)

@@ -147,6 +147,12 @@ public sealed class ProjectNetworkProfilesTests
                     RepositoryUrl = "https://e.com/overrides.git",
                     GraphicalSandbox = false,
                 },
+                new()
+                {
+                    Id = "project-true",
+                    RepositoryUrl = "https://e.com/project-true.git",
+                    GraphicalSandbox = true,
+                },
             ],
         };
         var repo = new ProjectRepository(Options.Create(opts));
@@ -155,12 +161,32 @@ public sealed class ProjectNetworkProfilesTests
         {
             Projects = [new() { Id = "plain", RepositoryUrl = "https://e.com/plain.git" }],
         }));
+        var defaultFalseRepo = new ProjectRepository(Options.Create(new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                GraphicalSandbox = false,
+            },
+            Projects =
+            [
+                new()
+                {
+                    Id = "project-true",
+                    RepositoryUrl = "https://e.com/project-true.git",
+                    GraphicalSandbox = true,
+                },
+            ],
+        }));
         var plain = await plainRepo.GetAsync(new ProjectId("plain"));
         var inherited = await repo.GetAsync(new ProjectId("inherits"));
         var overridden = await repo.GetAsync(new ProjectId("overrides"));
+        var projectTrueWithDefaultTrue = await repo.GetAsync(new ProjectId("project-true"));
+        var projectTrueWithDefaultFalse = await defaultFalseRepo.GetAsync(new ProjectId("project-true"));
 
         Assert.False(plain!.GraphicalSandbox);
         Assert.True(inherited!.GraphicalSandbox);
         Assert.False(overridden!.GraphicalSandbox);
+        Assert.True(projectTrueWithDefaultTrue!.GraphicalSandbox);
+        Assert.True(projectTrueWithDefaultFalse!.GraphicalSandbox);
     }
 }

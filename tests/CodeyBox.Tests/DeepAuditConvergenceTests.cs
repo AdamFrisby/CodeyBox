@@ -192,6 +192,7 @@ public sealed class DeepAuditConvergenceTests : IDisposable
     {
         var auditor = new ScriptedDeepAuditor(
             AuditorName,
+            AuditCapabilities.Graphical,
             new AuditResult(true, []));
         var project = ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1) with
         {

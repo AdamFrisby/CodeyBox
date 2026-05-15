@@ -68,6 +68,7 @@ public sealed class GraphicalSandboxTests
 
     public static IEnumerable<object[]> InvalidComputerUseEventCases()
     {
+        yield return new object[] { Array.Empty<SandboxInputEvent>() };
         yield return new object[] { new SandboxInputEvent[] { null! } };
         yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 10 } } };
         yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Click, X = -1, Y = 0 } } };
@@ -75,8 +76,10 @@ public sealed class GraphicalSandboxTests
         yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 0, Y = -1 } } };
         yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Key } } };
         yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Type } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Type, Text = "" } } };
         yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = 1, Y = 1 } } };
         yield return new object[] { new[] { new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 1001 } } };
+        yield return new object[] { new[] { new SandboxInputEvent { Type = (SandboxInputEventType)999 } } };
     }
 
     [Fact]
@@ -304,6 +307,7 @@ public sealed class GraphicalSandboxTests
             new AuditContext(WorkItemId.New(), "work", "main", 1, "prompt"));
 
         Assert.True(result.Passed, result.RawOutput);
+        Assert.True(auditor.Required.HasFlag(AuditCapabilities.Graphical));
         Assert.Empty(result.Findings);
     }
 
@@ -481,6 +485,12 @@ public sealed class GraphicalSandboxTests
                 "route:tool",
                 new AuditResult(false, [new AuditFinding("route:tool", AuditSeverity.Error, "needs rework", "x")]),
                 new AuditResult(true, []));
+            var graphicalAuditor = new QueueAuditor(
+                "gui:contract",
+                AuditCapabilities.Graphical,
+                "tool",
+                new AuditResult(true, []),
+                new AuditResult(true, []));
             var audit = new ProjectAudit
             {
                 MaxIterations = 2,
@@ -497,7 +507,7 @@ public sealed class GraphicalSandboxTests
             using var tp = TestSupport.BuildPipeline(
                 workspace,
                 seed,
-                auditors: [auditor],
+                auditors: [auditor, graphicalAuditor],
                 projectAudit: audit,
                 sandboxProvider: sandboxes,
                 graphicalSandbox: true,
@@ -531,7 +541,12 @@ public sealed class GraphicalSandboxTests
             Assert.Equal("secret", reworkSpec.Environment["WORK_TOKEN"]);
             var auditSpecs = sandboxes.Specs.Where(s => s.TimingPhase == "audit").ToArray();
             Assert.NotEmpty(auditSpecs);
-            Assert.All(auditSpecs, spec => AssertGraphicalProfile(spec, SandboxConventions.GraphicalNetworkProfile));
+            Assert.Contains(auditSpecs, spec =>
+                spec.Flavor == SandboxProfileFlavor.Headless
+                && spec.Network.ProfileName == "audit-tool-profile");
+            Assert.Contains(auditSpecs, spec =>
+                spec.Flavor == SandboxProfileFlavor.Graphical
+                && spec.Network.ProfileName == SandboxConventions.GraphicalNetworkProfile);
 
             var merge = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "merge");
             Assert.Equal(SandboxProfileFlavor.Headless, merge.Flavor);
@@ -554,9 +569,9 @@ public sealed class GraphicalSandboxTests
             GraphicalSandbox = true,
         };
 
-        var missing = SandboxTargetResolver.Resolve(project, null, graphicalEligible: true);
-        var blank = SandboxTargetResolver.Resolve(project, "   ", graphicalEligible: true);
-        var configured = SandboxTargetResolver.Resolve(project, "work-profile", graphicalEligible: true);
+        var missing = SandboxTargetResolver.ResolveProjectPhase(project, null);
+        var blank = SandboxTargetResolver.ResolveProjectPhase(project, "   ");
+        var configured = SandboxTargetResolver.ResolveProjectPhase(project, "work-profile");
 
         Assert.Equal(SandboxProfileFlavor.Graphical, missing.Flavor);
         Assert.Equal(SandboxConventions.GraphicalNetworkProfile, missing.NetworkProfile);
@@ -564,6 +579,22 @@ public sealed class GraphicalSandboxTests
         Assert.Equal(SandboxConventions.GraphicalNetworkProfile, blank.NetworkProfile);
         Assert.Equal(SandboxProfileFlavor.Graphical, configured.Flavor);
         Assert.Equal(SandboxConventions.GraphicalNetworkProfile, configured.NetworkProfile);
+    }
+
+    [Fact]
+    public void SandboxTargetResolver_UsesGraphicalAuditCapability()
+    {
+        var ordinaryTool = SandboxTargetResolver.ResolveAudit(
+            "audit-tool-profile",
+            AuditCapabilities.None);
+        var graphicalTool = SandboxTargetResolver.ResolveAudit(
+            "audit-tool-profile",
+            AuditCapabilities.Graphical);
+
+        Assert.Equal(SandboxProfileFlavor.Headless, ordinaryTool.Flavor);
+        Assert.Equal("audit-tool-profile", ordinaryTool.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Graphical, graphicalTool.Flavor);
+        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, graphicalTool.NetworkProfile);
     }
 
     [Fact]

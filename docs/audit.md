@@ -62,13 +62,16 @@ Each `IAuditor` declares its required capabilities:
     None             = 0,
     AgentCredentials = 1 << 0,
     Network          = 1 << 1,
+    Graphical        = 1 << 2,
 }
 ```
 
 The pipeline groups auditors by capability and spawns **one sandbox per
 group**. Tool-only auditors (`None`) run in a credential-free, network-
 free sandbox; LLM-driven auditors run in a sandbox with the agent
-credentials and network egress allowance.
+credentials and network egress allowance. Auditors that call graphical
+sandbox APIs such as screenshots or synthesized input must declare
+`Graphical`.
 
 This is a defence-in-depth choice: a buggy or compromised linter cannot
 exfiltrate the agent's API key, because the API key is not present in
@@ -80,7 +83,8 @@ If you write a tool auditor, declare `Required = AuditCapabilities.None`
 to keep it in the credential-free sandbox. If your tool genuinely needs
 network (downloading CVE feeds, fetching package versions), declare
 `AuditCapabilities.Network`. Only declare `AuditCapabilities.AgentCredentials`
-if the auditor itself is an LLM call.
+if the auditor itself is an LLM call. Declare `AuditCapabilities.Graphical`
+when the auditor requires a desktop sandbox.
 
 ## Built-in auditors
 

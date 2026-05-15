@@ -51,7 +51,8 @@ public sealed class HostNetworkSetupScriptTests
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$1" == "exec" ]]; then
-    if [[ "$*" == *"command -v socat"* ]]; then
+    if [[ "$*" == *"ip -4 -o addr show"* ]]; then
+        echo "10.99.6.42"
         exit 0
     fi
     if [[ "$*" == *"codeybox-vnc-password"* ]]; then
@@ -66,6 +67,11 @@ exit 9
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$@" > "$CALL_LOG"
+""");
+        WriteExecutable(Path.Combine(tools, "socat"), """
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
 """);
         var env = new Dictionary<string, string?>
         {
@@ -88,7 +94,7 @@ printf '%s\n' "$@" > "$CALL_LOG"
 
         var ok = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm", "5901"], env);
         Assert.Equal(0, ok.ExitCode);
-        Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> gui-vm:127.0.0.1:5999 via multipass exec", ok.Stderr, StringComparison.Ordinal);
+        Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> gui-vm:10.99.6.42:5999 via host bridge", ok.Stderr, StringComparison.Ordinal);
         Assert.Contains("VNC password: secret123", ok.Stderr, StringComparison.Ordinal);
 
         var socketArgs = await File.ReadAllLinesAsync(callLog);
@@ -96,17 +102,13 @@ printf '%s\n' "$@" > "$CALL_LOG"
         Assert.Equal("127.0.0.1:5901", socketArgs[1]);
         Assert.Equal("--inetd", socketArgs[2]);
         Assert.Equal("--", socketArgs[3]);
-        Assert.Equal("multipass", socketArgs[4]);
-        Assert.Equal("exec", socketArgs[5]);
-        Assert.Equal("gui-vm", socketArgs[6]);
-        Assert.Equal("--", socketArgs[7]);
-        Assert.Equal("socat", socketArgs[8]);
-        Assert.Equal("-", socketArgs[9]);
-        Assert.Equal("TCP:127.0.0.1:5999", socketArgs[10]);
+        Assert.Equal("socat", socketArgs[4]);
+        Assert.Equal("-", socketArgs[5]);
+        Assert.Equal("TCP:10.99.6.42:5999,connect-timeout=5", socketArgs[6]);
     }
 
     [Fact]
-    public async Task GeneratedVncHelper_RejectsMissingToolsAndMissingGuestSocat()
+    public async Task GeneratedVncHelper_RejectsMissingToolsAndMissingBridgeAddress()
     {
         if (OperatingSystem.IsWindows()) return;
 
@@ -136,12 +138,17 @@ exit 7
 set -euo pipefail
 exit 0
 """);
-        var missingGuestSocat = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm"], new Dictionary<string, string?>
+        WriteExecutable(Path.Combine(tools, "socat"), """
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+""");
+        var missingBridgeAddress = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm"], new Dictionary<string, string?>
         {
             ["PATH"] = tools + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"),
         });
-        Assert.Equal(1, missingGuestSocat.ExitCode);
-        Assert.Contains("guest VM is missing required tool: socat", missingGuestSocat.Stderr, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, missingBridgeAddress.ExitCode);
+        Assert.Contains("guest VM has no 10.99.x.x profile-bridge address", missingBridgeAddress.Stderr, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string SetupScriptPath()

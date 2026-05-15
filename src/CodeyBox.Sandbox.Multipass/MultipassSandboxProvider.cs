@@ -512,7 +512,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             extraRuncmd: null,
             extraCloudInit: _opts.ExtraCloudInit,
             flavor: flavor,
-            startRouteService: flavor != SandboxProfileFlavor.Graphical);
+            startRouteService: true,
+            includeGraphicalInstall: false);
         var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
         Directory.CreateDirectory(stagingDir);
         TryChmod0700(stagingDir);
@@ -938,7 +939,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         chown ubuntu:ubuntu "$plain_password_file" || true
         /usr/bin/x11vnc -storepasswd "$password" "$password_file" >/dev/null 2>&1
         chmod 0600 "$password_file"
-        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -rfbauth "$password_file" -listen 127.0.0.1 -allow 127.0.0.1 -noxdamage -repeat
+        listen_addr=$(ip -4 -o addr show | awk '/inet 10\.99\./{split($4,a,"/"); print a[1]; exit}')
+        if [ -z "$listen_addr" ]; then
+            echo "codeybox-vnc: no profile bridge address found" >&2
+            exit 1
+        fi
+        host_addr=$(printf '%s\n' "$listen_addr" | awk -F. '{print $1"."$2"."$3".1"}')
+        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -rfbauth "$password_file" -listen "$listen_addr" -allow "$host_addr" -noxdamage -repeat
         """;
 
     private const string GraphicalInstallRuncmd = """
@@ -981,7 +988,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         IReadOnlyList<string>? extraRuncmd,
         string? extraCloudInit,
         SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless,
-        bool startRouteService = true)
+        bool startRouteService = true,
+        bool includeGraphicalInstall = true)
     {
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
         var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
@@ -1035,16 +1043,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         }
         sb.AppendLine("runcmd:");
         // Enable the route service. --now runs it once immediately so the
-        // first boot's traffic uses the profile bridge before any caller
-        // extraRuncmd installs run. Graphical desktop packages are installed
-        // first so baseline baking does not depend on the selected graphical
-        // profile already permitting package-manager egress.
+        // first boot's traffic uses the profile bridge before any package
+        // installation or caller extraRuncmd runs.
         sb.AppendLine("  - systemctl daemon-reload");
-        if (flavor == SandboxProfileFlavor.Graphical && extraRuncmd is not null)
-            AppendRuncmdCommand(sb, GraphicalInstallRuncmd);
         sb.AppendLine(startRouteService
             ? "  - systemctl enable --now codeybox-route.service"
             : "  - systemctl enable codeybox-route.service");
+        if (flavor == SandboxProfileFlavor.Graphical && includeGraphicalInstall)
+            AppendRuncmdCommand(sb, GraphicalInstallRuncmd);
         // Splice caller-supplied runcmd entries into the same block, after the
         // route swap so project/tool installs obey the selected profile.
         if (extraRuncmd is not null)
@@ -1521,7 +1527,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
-    internal const int MaxScrollMagnitude = 1000;
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
 
     private readonly string _name;
@@ -1677,12 +1682,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
     {
         EnsureGraphical();
-        ArgumentNullException.ThrowIfNull(events);
+        SandboxInputEventValidation.Validate(events);
         foreach (var inputEvent in events)
         {
             var argv = BuildXdotoolArgv(inputEvent);
-            if (argv.Count == 0)
-                continue;
 
             var result = await ExecAsync(new SandboxExec
             {
@@ -1712,22 +1715,18 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         switch (inputEvent.Type)
         {
             case SandboxInputEventType.Click:
-                if (inputEvent.X.HasValue != inputEvent.Y.HasValue)
-                    throw new ArgumentException("Click events must provide both X and Y, or neither.");
                 if (inputEvent.X is { } clickX && inputEvent.Y is { } clickY)
                     argv.AddRange(["mousemove", "--sync", clickX.ToString(), clickY.ToString()]);
                 argv.AddRange(["click", "1"]);
                 return argv;
 
             case SandboxInputEventType.Key:
-                if (string.IsNullOrWhiteSpace(inputEvent.Key))
-                    throw new ArgumentException("Key events require Key.");
-                argv.AddRange(["key", "--clearmodifiers", inputEvent.Key]);
+                argv.AddRange(["key", "--clearmodifiers", inputEvent.Key!]);
                 return argv;
 
             case SandboxInputEventType.Move:
-                if (inputEvent.X is not { } moveX || inputEvent.Y is not { } moveY)
-                    throw new ArgumentException("Move events require X and Y.");
+                var moveX = inputEvent.X!.Value;
+                var moveY = inputEvent.Y!.Value;
                 argv.AddRange(["mousemove", "--sync", moveX.ToString(), moveY.ToString()]);
                 return argv;
 
@@ -1735,9 +1734,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
                 return BuildScrollArgv(argv, inputEvent);
 
             case SandboxInputEventType.Type:
-                if (inputEvent.Text is null)
-                    throw new ArgumentException("Type events require Text.");
-                argv.AddRange(["type", "--clearmodifiers", "--delay", "0", "--", inputEvent.Text]);
+                argv.AddRange(["type", "--clearmodifiers", "--delay", "0", "--", inputEvent.Text!]);
                 return argv;
 
             default:
@@ -1749,16 +1746,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     {
         var vertical = inputEvent.Y ?? 0;
         var horizontal = inputEvent.X ?? 0;
-        if (vertical == 0 && horizontal == 0)
-            throw new ArgumentException("Scroll events require a non-zero X or Y amount.");
-
-        if (vertical != 0 && horizontal != 0)
-            throw new ArgumentException("Scroll events support one axis at a time.");
-
         var amount = Math.Abs((long)(vertical != 0 ? vertical : horizontal));
-        if (amount > MaxScrollMagnitude)
-            throw new ArgumentOutOfRangeException(nameof(inputEvent), $"Scroll amount must be <= {MaxScrollMagnitude}.");
-
         var button = vertical switch
         {
             < 0 => "4",

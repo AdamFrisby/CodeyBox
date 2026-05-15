@@ -1,4 +1,3 @@
-using System.Text;
 using CodeyBox.Core;
 
 namespace CodeyBox.Sandbox.Graphical;
@@ -116,83 +115,13 @@ public sealed class ComputerUseBridge
 
     private void ValidateEvents(IReadOnlyList<SandboxInputEvent> events)
     {
-        if (events.Count == 0)
-            throw new ArgumentException("Computer-use input requires at least one event.");
-        if (events.Count > _options.MaxEventsPerCall)
-            throw new ArgumentOutOfRangeException(nameof(events), $"Computer-use input is limited to {_options.MaxEventsPerCall} events per call.");
-
-        for (var i = 0; i < events.Count; i++)
-        {
-            var inputEvent = events[i];
-            if (inputEvent is null)
-                throw new ArgumentException($"Computer-use event {i} is null.", nameof(events));
-
-            switch (inputEvent.Type)
-            {
-                case SandboxInputEventType.Click:
-                    if (inputEvent.X.HasValue != inputEvent.Y.HasValue)
-                        throw new ArgumentException("Click events must provide both X and Y, or neither.");
-                    ValidateCoordinate(inputEvent.X, "X");
-                    ValidateCoordinate(inputEvent.Y, "Y");
-                    break;
-
-                case SandboxInputEventType.Key:
-                    ValidateText(inputEvent.Key, _options.MaxKeyUtf8Bytes, "Key events require Key.", "Key");
-                    break;
-
-                case SandboxInputEventType.Move:
-                    if (inputEvent.X is null || inputEvent.Y is null)
-                        throw new ArgumentException("Move events require X and Y.");
-                    ValidateCoordinate(inputEvent.X, "X");
-                    ValidateCoordinate(inputEvent.Y, "Y");
-                    break;
-
-                case SandboxInputEventType.Scroll:
-                    ValidateScroll(inputEvent);
-                    break;
-
-                case SandboxInputEventType.Type:
-                    ValidateText(inputEvent.Text, _options.MaxTextUtf8Bytes, "Type events require Text.", "Text", allowWhitespace: true);
-                    break;
-
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(events), inputEvent.Type, "Unknown input event type.");
-            }
-        }
-    }
-
-    private void ValidateCoordinate(int? value, string name)
-    {
-        if (value is null)
-            return;
-        if (value.Value < 0 || value.Value > _options.MaxCoordinate)
-            throw new ArgumentOutOfRangeException(name, $"{name} must be between 0 and {_options.MaxCoordinate}.");
-    }
-
-    private void ValidateScroll(SandboxInputEvent inputEvent)
-    {
-        var vertical = inputEvent.Y ?? 0;
-        var horizontal = inputEvent.X ?? 0;
-        if (vertical == 0 && horizontal == 0)
-            throw new ArgumentException("Scroll events require a non-zero X or Y amount.");
-        if (vertical != 0 && horizontal != 0)
-            throw new ArgumentException("Scroll events support one axis at a time.");
-        if (Math.Abs((long)(vertical != 0 ? vertical : horizontal)) > _options.MaxScrollMagnitude)
-            throw new ArgumentOutOfRangeException(nameof(inputEvent), $"Scroll amount must be <= {_options.MaxScrollMagnitude}.");
-    }
-
-    private static void ValidateText(
-        string? value,
-        int maxUtf8Bytes,
-        string missingMessage,
-        string fieldName,
-        bool allowWhitespace = false)
-    {
-        if (value is null || (allowWhitespace ? value.Length == 0 : string.IsNullOrWhiteSpace(value)))
-            throw new ArgumentException(missingMessage);
-        var byteCount = Encoding.UTF8.GetByteCount(value);
-        if (byteCount > maxUtf8Bytes)
-            throw new ArgumentOutOfRangeException(fieldName, $"{fieldName} must be <= {maxUtf8Bytes} UTF-8 bytes.");
+        SandboxInputEventValidation.Validate(
+            events,
+            _options.MaxEventsPerCall,
+            _options.MaxTextUtf8Bytes,
+            _options.MaxKeyUtf8Bytes,
+            _options.MaxCoordinate,
+            _options.MaxScrollMagnitude);
     }
 
     private void ReserveInputBudget(int eventCount)
@@ -257,11 +186,11 @@ public sealed class ComputerUseBridge
 
 public sealed record ComputerUseBridgeOptions
 {
-    public int MaxEventsPerCall { get; init; } = 32;
-    public int MaxTextUtf8Bytes { get; init; } = 4096;
-    public int MaxKeyUtf8Bytes { get; init; } = 128;
-    public int MaxCoordinate { get; init; } = 32767;
-    public int MaxScrollMagnitude { get; init; } = 1000;
+    public int MaxEventsPerCall { get; init; } = SandboxInputEventValidation.DefaultMaxEvents;
+    public int MaxTextUtf8Bytes { get; init; } = SandboxInputEventValidation.DefaultMaxTextUtf8Bytes;
+    public int MaxKeyUtf8Bytes { get; init; } = SandboxInputEventValidation.DefaultMaxKeyUtf8Bytes;
+    public int MaxCoordinate { get; init; } = SandboxInputEventValidation.DefaultMaxCoordinate;
+    public int MaxScrollMagnitude { get; init; } = SandboxInputEventValidation.DefaultMaxScrollMagnitude;
     public TimeSpan ToolCallTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public int MaxInputEventsPerWindow { get; init; } = 240;
     public TimeSpan RateLimitWindow { get; init; } = TimeSpan.FromMinutes(1);

@@ -297,11 +297,11 @@ for bridge in "${BRIDGES[@]}"; do
     networkctl reconfigure "$bridge" 2>/dev/null || true
 done
 
-# Install a loopback-only operator helper for graphical VNC access. The VNC
-# server listens on guest 127.0.0.1 only, so host processes cannot connect
-# directly to a guest bridge address. This helper is the intended human-facing
-# exposure path: it binds host 127.0.0.1 on demand and tunnels to one selected
-# VM through `multipass exec`.
+# Install a loopback-only operator helper for graphical VNC access. Graphical
+# VMs listen on their 10.99.x.x profile-bridge address and allow only the host
+# bridge gateway. This helper is the intended human-facing exposure path: it
+# binds host 127.0.0.1 on demand and connects to one selected VM through the
+# profile bridge.
 cat > "$VNC_HELPER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -311,8 +311,8 @@ usage() {
 Usage: codeybox-vnc-loopback <multipass-vm-name> [local-port]
 
 Starts a foreground VNC proxy on 127.0.0.1:<local-port> for the selected
-graphical Multipass VM, forwarding through `multipass exec` to guest
-127.0.0.1. The remote VNC port defaults to 5900; override with
+graphical Multipass VM, forwarding to the guest's 10.99.x.x bridge address.
+The remote VNC port defaults to 5900; override with
 CODEYBOX_GRAPHICAL_VNC_PORT if the sandbox convention changes.
 USAGE
 }
@@ -322,7 +322,7 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
     exit 2
 fi
 
-for cmd in multipass systemd-socket-activate; do
+for cmd in multipass systemd-socket-activate socat; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "missing required tool: $cmd" >&2; exit 1; }
 done
 
@@ -339,19 +339,20 @@ if [[ ! "$remote_port" =~ ^[0-9]+$ || "$remote_port" -lt 1 || "$remote_port" -gt
     exit 2
 fi
 
-if ! multipass exec "$vm" -- sh -lc 'command -v socat >/dev/null 2>&1'; then
-    echo "guest VM is missing required tool: socat" >&2
+guest_addr="$(multipass exec "$vm" -- sh -lc "ip -4 -o addr show | awk '/inet 10\.99\./{split(\$4,a,\"/\"); print a[1]; exit}'" || true)"
+if [[ -z "$guest_addr" ]]; then
+    echo "guest VM has no 10.99.x.x profile-bridge address" >&2
     exit 1
 fi
 password="$(multipass exec "$vm" -- sh -lc 'cat /home/ubuntu/.codeybox-vnc-password 2>/dev/null || true' || true)"
 
-echo "Forwarding VNC: 127.0.0.1:${listen_port} -> ${vm}:127.0.0.1:${remote_port} via multipass exec" >&2
+echo "Forwarding VNC: 127.0.0.1:${listen_port} -> ${vm}:${guest_addr}:${remote_port} via host bridge" >&2
 if [[ -n "$password" ]]; then
     echo "VNC password: ${password}" >&2
 fi
 echo "Press Ctrl-C to stop." >&2
 exec systemd-socket-activate -l "127.0.0.1:${listen_port}" --inetd -- \
-    multipass exec "$vm" -- socat - "TCP:127.0.0.1:${remote_port}"
+    socat - "TCP:${guest_addr}:${remote_port},connect-timeout=5"
 EOF
 chmod 0755 "$VNC_HELPER"
 

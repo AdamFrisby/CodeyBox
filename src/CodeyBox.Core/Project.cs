@@ -136,9 +136,10 @@ public sealed record Project
     public ProjectChangelog? Changelog { get; init; }
 
     /// <summary>
-    /// When true, work, rework, and tool-audit sandboxes use the graphical
-    /// sandbox flavor and the conventional graphical network profile. Default
-    /// false because graphical VMs are larger and slower.
+    /// When true, work and rework sandboxes use the graphical sandbox flavor
+    /// and the conventional graphical network profile. Auditors use graphical
+    /// sandboxes when they declare <see cref="AuditCapabilities.Graphical"/>.
+    /// Default false because graphical VMs are larger and slower.
     /// </summary>
     public bool GraphicalSandbox { get; init; }
 

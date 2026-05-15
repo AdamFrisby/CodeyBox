@@ -519,10 +519,9 @@ public sealed class ReleaseService
             if (credential is not null)
                 foreach (var (k, v) in credential.EnvironmentVariables) env[k] = v;
 
-            var sandboxTarget = SandboxTargetResolver.Resolve(
-                project,
+            var sandboxTarget = SandboxTargetResolver.ResolveAudit(
                 needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
-                graphicalEligible: !needsCreds);
+                group.Key);
             var spec = new SandboxSpec
             {
                 ImageReference = _pipelineOpts.SandboxImageReference,
