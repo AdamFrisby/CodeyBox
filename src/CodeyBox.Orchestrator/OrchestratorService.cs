@@ -836,12 +836,20 @@ public sealed record OrchestratorOptions
     /// <summary>
     /// Maximum number of times the recovery loop will reset a mid-flight work
     /// item before giving up and transitioning it to
-    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>. Default 3.
-    /// Set to 0 (or any negative value) to disable the cap and recover indefinitely
-    /// (not recommended in production — a permanently-stuck item will be re-enqueued
-    /// on every orchestrator restart without bound).
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>. Default 10.
+    /// The cap exists to catch genuinely stuck items (an item that fails on
+    /// every pickup attempt for the same reason), not routine host restarts.
+    /// 3 turned out to be too tight in active development environments where
+    /// the orchestrator process gets restarted several times an hour to pick
+    /// up config or code changes — a healthy long-running work item could
+    /// burn through 3 attempts in an afternoon without ever actually being
+    /// broken. 10 still cleanly catches a permanently-stuck item, but gives
+    /// real work room to survive routine operator activity.
+    /// Set to 0 (or any negative value) to disable the cap and recover
+    /// indefinitely (not recommended in production — a permanently-stuck
+    /// item will be re-enqueued on every orchestrator restart without bound).
     /// </summary>
-    public int MaxRecoveryAttempts { get; init; } = 3;
+    public int MaxRecoveryAttempts { get; init; } = 10;
 
     public AutoRetryOnQuotaFailureOptions AutoRetryOnQuotaFailure { get; init; } = new();
 
