@@ -147,13 +147,13 @@ When enabled, the work, rework, and credential-free audit-tool phases use
 `SandboxProfileFlavor.Graphical` and the logical network profile
 `graphical`. LLM audit and merge phases keep their normal profiles. The
 Multipass graphical flavor installs a lightweight XFCE session on Xvfb,
-starts `x11vnc` on guest loopback (`127.0.0.1`) on the conventional
-graphical VNC port (`SandboxConventions.GraphicalVncPort`, currently
-`5900`), and preinstalls `xdotool`, `scrot`, and `ffmpeg`. There is no VNC
-listener on the VM bridge address. For operator viewing, run
-`codeybox-vnc-loopback <multipass-vm-name> 5901` and connect to
-`127.0.0.1:5901`; the helper forwards from host loopback through
-`multipass exec` into the guest loopback listener. The CodeyBox
+starts `x11vnc` on the VM's `10.99.x.x` graphical bridge address on the
+conventional graphical VNC port (`SandboxConventions.GraphicalVncPort`,
+currently `5900`), and preinstalls `xdotool`, `scrot`, and `ffmpeg`. The
+VNC server is password-protected and allows the bridge gateway address only.
+For operator viewing, run `codeybox-vnc-loopback <multipass-vm-name> 5901`
+and connect to `127.0.0.1:5901`; the helper binds host loopback and proxies
+to the guest over `cb-graphical`. The CodeyBox
 screenshot/input APIs call `scrot` and `xdotool` through `multipass exec`;
 no additional LLM network surface is required.
 

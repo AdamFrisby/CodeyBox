@@ -54,12 +54,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
         Assert.Contains($"-rfbport {SandboxConventions.GraphicalVncPort}", cloudInit);
-        Assert.Contains("-listen 127.0.0.1", cloudInit);
-        Assert.Contains("-localhost", cloudInit);
-        Assert.DoesNotContain("listen_addr=$(ip -4 -o addr show", cloudInit);
-        Assert.DoesNotContain("-listen \"$listen_addr\"", cloudInit);
-        Assert.DoesNotContain("-allow \"$host_addr\"", cloudInit);
-        Assert.DoesNotContain("codeybox-vnc: no 10.99.x.x interface present", cloudInit);
+        Assert.Contains("listen_addr=$(ip -4 -o addr show", cloudInit);
+        Assert.Contains("-listen \"$listen_addr\"", cloudInit);
+        Assert.Contains("-allow \"$host_addr\"", cloudInit);
+        Assert.Contains("-rfbauth \"$password_file\"", cloudInit);
+        Assert.Contains("codeybox-vnc: no 10.99.x.x interface present", cloudInit);
+        Assert.DoesNotContain("-listen 127.0.0.1", cloudInit);
+        Assert.DoesNotContain("-localhost", cloudInit);
+        Assert.DoesNotContain("-nopw", cloudInit);
         Assert.Contains("echo project setup", cloudInit);
 
         var headlessCloudInit = MultipassSandboxProvider.BuildCloudInit(
@@ -70,6 +72,55 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("codeybox-vnc.service", headlessCloudInit);
         Assert.DoesNotContain("xvfb x11vnc xfce4", headlessCloudInit);
         Assert.DoesNotContain("xdotool scrot ffmpeg", headlessCloudInit);
+    }
+
+    [Fact]
+    public async Task ExecAsync_GraphicalSandboxInjectsDisplayByDefault()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        await sandbox.ExecAsync(new SandboxExec { Argv = ["printenv", "DISPLAY"] });
+
+        var argv = Assert.Single(runner.Calls).Argv;
+        Assert.Contains($"DISPLAY={SandboxConventions.GraphicalDisplay}", argv);
+    }
+
+    [Fact]
+    public async Task ExecAsync_GraphicalSandboxPreservesCallerDisplayOverride()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["printenv", "DISPLAY"],
+            ExtraEnvironment = new Dictionary<string, string>
+            {
+                ["DISPLAY"] = ":7",
+                ["OTHER"] = "value",
+            },
+        });
+
+        var argv = Assert.Single(runner.Calls).Argv;
+        Assert.Contains("DISPLAY=:7", argv);
+        Assert.Contains("OTHER=value", argv);
+        Assert.DoesNotContain($"DISPLAY={SandboxConventions.GraphicalDisplay}", argv);
+    }
+
+    [Fact]
+    public async Task ExecAsync_HeadlessSandboxDoesNotInjectDisplay()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        await sandbox.ExecAsync(new SandboxExec { Argv = ["printenv", "DISPLAY"] });
+
+        var argv = Assert.Single(runner.Calls).Argv;
+        Assert.DoesNotContain($"DISPLAY={SandboxConventions.GraphicalDisplay}", argv);
     }
 
     [Fact]
@@ -123,6 +174,41 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var call = Assert.Single(runner.Calls);
         Assert.Equal(MultipassSandbox.MaxScreenshotBase64StdoutBytes, call.MaxStdoutBytes);
         Assert.Equal(MultipassSandbox.MaxScreenshotStderrBytes, call.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task GetScreenshotAsync_RejectsStderrPastCaptureLimit()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(
+                137,
+                "",
+                new string('e', 1024),
+                StderrLimitExceeded: true)));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
+
+        Assert.Contains("stderr", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("maximum capture size", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxScreenshotBase64StdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxScreenshotStderrBytes, call.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task GetScreenshotAsync_RejectsDecodedPngPastLimit()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, Convert.ToBase64String(new byte[5]), "")));
+        var sandbox = NewMultipassSandbox(
+            SandboxProfileFlavor.Graphical,
+            runner,
+            maxScreenshotPngBytes: 4);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
+
+        Assert.Contains("PNG exceeded", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -610,14 +696,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
     private MultipassSandbox NewMultipassSandbox(
         SandboxProfileFlavor flavor,
-        Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> handler)
+        Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> handler,
+        int? maxScreenshotPngBytes = null)
     {
-        return NewMultipassSandbox(flavor, new RecordingMultipassRunner(handler));
+        return NewMultipassSandbox(flavor, new RecordingMultipassRunner(handler), maxScreenshotPngBytes);
     }
 
     private MultipassSandbox NewMultipassSandbox(
         SandboxProfileFlavor flavor,
-        RecordingMultipassRunner runner)
+        RecordingMultipassRunner runner,
+        int? maxScreenshotPngBytes = null)
     {
         return new MultipassSandbox(
             "codeybox-test",
@@ -630,7 +718,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             },
             new MultipassSandboxOptions { MultipassBinary = "/bin/true" },
             NullLogger<MultipassSandboxProvider>.Instance,
-            runner: runner);
+            runner: runner,
+            maxScreenshotPngBytes: maxScreenshotPngBytes);
     }
 
     private static string[] ExtractXdotoolCommand(IReadOnlyList<string> argv)

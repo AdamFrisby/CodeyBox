@@ -33,7 +33,11 @@ public sealed class HostNetworkSetupScriptTests
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$1" == "exec" ]]; then
-    echo "10.99.6.42"
+    if [[ "$*" == *"codeybox-vnc-password"* ]]; then
+        echo "secret123"
+    else
+        echo "10.99.6.42"
+    fi
     exit 0
 fi
 echo "unexpected multipass argv: $*" >&2
@@ -43,6 +47,11 @@ exit 9
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$@" > "$CALL_LOG"
+""");
+        WriteExecutable(Path.Combine(tools, "systemd-socket-proxyd"), """
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
 """);
 
         var env = new Dictionary<string, string?>
@@ -58,24 +67,16 @@ printf '%s\n' "$@" > "$CALL_LOG"
 
         var ok = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm", "5901"], env);
         Assert.Equal(0, ok.ExitCode);
-        Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> gui-vm:127.0.0.1:5999", ok.Stderr, StringComparison.Ordinal);
+        Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> gui-vm:10.99.6.42:5999", ok.Stderr, StringComparison.Ordinal);
+        Assert.Contains("VNC password: secret123", ok.Stderr, StringComparison.Ordinal);
 
         var socketArgs = await File.ReadAllLinesAsync(callLog);
         Assert.Equal("-l", socketArgs[0]);
         Assert.Equal("127.0.0.1:5901", socketArgs[1]);
         Assert.Equal("--inetd", socketArgs[2]);
         Assert.Equal("--", socketArgs[3]);
-        Assert.Equal("multipass", socketArgs[4]);
-        Assert.Equal("exec", socketArgs[5]);
-        Assert.Equal("gui-vm", socketArgs[6]);
-        Assert.Equal("--", socketArgs[7]);
-        Assert.Equal("sh", socketArgs[8]);
-        Assert.Equal("-lc", socketArgs[9]);
-        Assert.Contains("/usr/lib/systemd/systemd-socket-proxyd", socketArgs[10], StringComparison.Ordinal);
-        Assert.Contains("/lib/systemd/systemd-socket-proxyd", socketArgs[10], StringComparison.Ordinal);
-        Assert.Contains("127.0.0.1:${remote_port}", socketArgs[10], StringComparison.Ordinal);
-        Assert.Equal("sh", socketArgs[11]);
-        Assert.Equal("5999", socketArgs[12]);
+        Assert.EndsWith("systemd-socket-proxyd", socketArgs[4], StringComparison.Ordinal);
+        Assert.Equal("10.99.6.42:5999", socketArgs[5]);
     }
 
     private static string SetupScriptPath()

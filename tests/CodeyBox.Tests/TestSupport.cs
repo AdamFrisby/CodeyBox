@@ -86,7 +86,8 @@ internal static class TestSupport
         ProjectAudit? projectAudit = null,
         IPresetCatalog? presetCatalogOverride = null,
         ISandboxProvider? sandboxProvider = null,
-        bool graphicalSandbox = false)
+        bool graphicalSandbox = false,
+        ProjectNetworkProfiles? networkProfiles = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -120,6 +121,7 @@ internal static class TestSupport
             GitAuthorName = projectGitAuthor?.Name,
             GitAuthorEmail = projectGitAuthor?.Email,
             GraphicalSandbox = graphicalSandbox,
+            NetworkProfiles = networkProfiles ?? new ProjectNetworkProfiles(),
             Upstream = upstream ?? ProjectUpstream.Noop,
             Audit = audit,
         });

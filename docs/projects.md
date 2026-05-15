@@ -380,8 +380,8 @@ the phases that need desktop plumbing:
 When enabled, work, rework, and audit-tool phases use the `graphical`
 network profile and the graphical sandbox flavor. The Multipass provider
 bakes a separate `cb-baseline-graphical` image, starts an XFCE desktop with
-VNC bound to guest loopback, and exposes screenshot/input APIs through
-sandbox exec. Configure
+VNC bound to the `cb-graphical` bridge address, and exposes screenshot/input
+APIs through sandbox exec. Configure
 `SandboxNetworkProfiles.graphical = cb-graphical`, add the matching
 `graphical cb-graphical ...` line to `/etc/codeybox/networks.conf`, and run
 `codeybox-vnc-loopback <multipass-vm-name> 5901` when an operator needs a

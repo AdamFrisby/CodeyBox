@@ -926,7 +926,27 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private static readonly string GraphicalVncScript = $$"""
         #!/bin/sh
         set -eu
-        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -nopw -localhost -listen 127.0.0.1 -noxdamage -repeat
+        listen_addr=$(ip -4 -o addr show | awk '/inet 10\.99\./ { sub(/\/.*/, "", $4); print $4; exit }')
+        if [ -z "$listen_addr" ]; then
+            echo "codeybox-vnc: no 10.99.x.x interface present" >&2
+            exit 1
+        fi
+        host_addr=$(printf '%s\n' "$listen_addr" | awk -F. '{ print $1 "." $2 "." $3 ".1" }')
+        password_dir=/etc/codeybox
+        password_file="${password_dir}/x11vnc.pass"
+        plain_password_file=/home/ubuntu/.codeybox-vnc-password
+        install -d -m 0700 "$password_dir"
+        password=$(dd if=/dev/urandom bs=18 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | head -c 12)
+        if [ -z "$password" ]; then
+            echo "codeybox-vnc: failed to generate VNC password" >&2
+            exit 1
+        fi
+        umask 077
+        printf '%s\n' "$password" > "$plain_password_file"
+        chown ubuntu:ubuntu "$plain_password_file" || true
+        /usr/bin/x11vnc -storepasswd "$password" "$password_file" >/dev/null 2>&1
+        chmod 0600 "$password_file"
+        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -rfbauth "$password_file" -listen "$listen_addr" -allow "$host_addr" -noxdamage -repeat
         """;
 
     private const string GraphicalInstallRuncmd = """
@@ -1514,13 +1534,17 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     private readonly WorkItemId _timingItemId;
     private readonly string _timingPhase;
     private readonly Action<string>? _onDisposed;
+    private readonly int _maxScreenshotPngBytes;
+    private readonly int _maxScreenshotBase64StdoutBytes;
+    private readonly int _maxScreenshotStderrBytes;
     private int _firstExecEmitted;
     private bool _disposed;
     private bool _preserveOnDispose;
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
-        Action<string>? onDisposed = null, IProcessRunner? runner = null)
+        Action<string>? onDisposed = null, IProcessRunner? runner = null,
+        int? maxScreenshotPngBytes = null, int? maxScreenshotStderrBytes = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -1532,6 +1556,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         _timingItemId = timingItemId;
         _timingPhase = timingPhase;
         _onDisposed = onDisposed;
+        _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
+        _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
+        if (_maxScreenshotPngBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxScreenshotPngBytes), "Screenshot PNG limit must be positive.");
+        if (_maxScreenshotStderrBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxScreenshotStderrBytes), "Screenshot stderr limit must be positive.");
+        _maxScreenshotBase64StdoutBytes = ((_maxScreenshotPngBytes + 2) / 3 * 4) + 4096;
         Id = name;
     }
 
@@ -1553,7 +1584,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         if (exec.Argv.Count == 0) throw new ArgumentException("Argv must be non-empty", nameof(exec));
 
         var transferredVmPaths = new List<string>();
-        var wrapped = BuildWrappedInvocation(exec, extraEnvFile: null);
+        var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
+        var wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null);
         var argv = BuildMultipassExecArgv(wrapped);
         var argvBytes = EstimateArgvBytes(argv);
         if (argvBytes > ArgvBytesWarningThreshold)
@@ -1562,11 +1594,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
                 "Multipass exec argv for {Name} is {Bytes} bytes; routing through transferred files to avoid ARG_MAX",
                 _name, argvBytes);
 
-            if (exec.ExtraEnvironment is { Count: > 0 })
+            if (effectiveEnvironment is { Count: > 0 })
             {
-                var envFile = await TransferExecEnvironmentAsync(exec.ExtraEnvironment, ct);
+                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
                 transferredVmPaths.Add(envFile);
-                wrapped = BuildWrappedInvocation(exec, envFile);
+                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile);
                 argv = BuildMultipassExecArgv(wrapped);
             }
 
@@ -1614,7 +1646,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
                 "tmp=$(mktemp --suffix=.png); trap 'rm -f \"$tmp\"' EXIT; DISPLAY=:0 scrot -z \"$tmp\"; base64 -w0 \"$tmp\"",
             ],
             WorkingDirectory = _spec.WorkingDirectory,
-        }, ct, maxStdoutBytes: MaxScreenshotBase64StdoutBytes, maxStderrBytes: MaxScreenshotStderrBytes);
+        }, ct, maxStdoutBytes: _maxScreenshotBase64StdoutBytes, maxStderrBytes: _maxScreenshotStderrBytes);
 
         if (result.StdoutLimitExceeded)
             throw new InvalidOperationException("graphical screenshot output exceeded the maximum capture size");
@@ -1626,7 +1658,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         try
         {
             var screenshot = Convert.FromBase64String(result.Stdout.Trim());
-            if (screenshot.Length > MaxScreenshotPngBytes)
+            if (screenshot.Length > _maxScreenshotPngBytes)
                 throw new InvalidOperationException("graphical screenshot PNG exceeded the maximum capture size");
             return screenshot;
         }
@@ -1668,8 +1700,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     {
         var argv = new List<string>
         {
-            "env",
-            $"DISPLAY={SandboxConventions.GraphicalDisplay}",
             "xdotool",
         };
 
@@ -1733,7 +1763,33 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         return argv;
     }
 
-    private List<string> BuildWrappedInvocation(SandboxExec exec, string? extraEnvFile)
+    private IReadOnlyDictionary<string, string>? BuildEffectiveExecEnvironment(SandboxExec exec)
+    {
+        if (_spec.Flavor != SandboxProfileFlavor.Graphical)
+            return exec.ExtraEnvironment;
+
+        if (exec.ExtraEnvironment is null || exec.ExtraEnvironment.Count == 0)
+        {
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
+            };
+        }
+
+        if (exec.ExtraEnvironment.ContainsKey("DISPLAY"))
+            return exec.ExtraEnvironment;
+
+        var merged = new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
+        {
+            ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
+        };
+        return merged;
+    }
+
+    private List<string> BuildWrappedInvocation(
+        SandboxExec exec,
+        IReadOnlyDictionary<string, string>? effectiveEnvironment,
+        string? extraEnvFile)
     {
         // The codeybox-exec wrapper closes stdin by default to prevent
         // tools that read stdin from hanging the sandbox. When the
@@ -1746,12 +1802,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         {
             wrapped.AddRange(["--env-file", extraEnvFile]);
         }
-        else if (exec.ExtraEnvironment is { Count: > 0 })
+        else if (effectiveEnvironment is { Count: > 0 })
         {
             // env(1) takes KEY=VALUE pairs followed by the command. This
             // keeps the common case small and preserves historical ordering.
             wrapped.Add("env");
-            foreach (var (k, v) in exec.ExtraEnvironment)
+            foreach (var (k, v) in effectiveEnvironment)
                 wrapped.Add($"{k}={v}");
         }
         wrapped.AddRange(exec.Argv);

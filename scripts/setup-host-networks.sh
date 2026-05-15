@@ -294,9 +294,10 @@ for bridge in "${BRIDGES[@]}"; do
 done
 
 # Install a loopback-only operator helper for graphical VNC access. The VNC
-# server itself listens on guest loopback only. This helper is the intended
-# human-facing exposure path: it binds host 127.0.0.1 on demand and proxies
-# through multipass exec to one selected VM.
+# server listens on the guest's cb-graphical bridge address and allows the
+# bridge gateway only. This helper is the intended human-facing exposure path:
+# it binds host 127.0.0.1 on demand and proxies to one selected VM over the
+# host bridge.
 cat > "$VNC_HELPER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -306,7 +307,8 @@ usage() {
 Usage: codeybox-vnc-loopback <multipass-vm-name> [local-port]
 
 Starts a foreground VNC proxy on 127.0.0.1:<local-port> for the selected
-graphical Multipass VM. The remote VNC port defaults to 5900; override with
+graphical Multipass VM, forwarding to the VM's cb-graphical bridge address.
+The remote VNC port defaults to 5900; override with
 CODEYBOX_GRAPHICAL_VNC_PORT if the sandbox convention changes.
 USAGE
 }
@@ -319,6 +321,21 @@ fi
 for cmd in multipass systemd-socket-activate; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "missing required tool: $cmd" >&2; exit 1; }
 done
+proxy_bin=""
+for candidate in systemd-socket-proxyd /usr/lib/systemd/systemd-socket-proxyd /lib/systemd/systemd-socket-proxyd; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        proxy_bin="$(command -v "$candidate")"
+        break
+    fi
+    if [[ -x "$candidate" ]]; then
+        proxy_bin="$candidate"
+        break
+    fi
+done
+if [[ -z "$proxy_bin" ]]; then
+    echo "missing required tool: systemd-socket-proxyd" >&2
+    exit 1
+fi
 
 vm="$1"
 listen_port="${2:-5900}"
@@ -333,12 +350,20 @@ if [[ ! "$remote_port" =~ ^[0-9]+$ || "$remote_port" -lt 1 || "$remote_port" -gt
     exit 2
 fi
 
-remote_proxy='set -eu; remote_port="$1"; for candidate in /usr/lib/systemd/systemd-socket-proxyd /lib/systemd/systemd-socket-proxyd; do if [ -x "$candidate" ]; then exec "$candidate" "127.0.0.1:${remote_port}"; fi; done; echo "missing required tool in VM: systemd-socket-proxyd" >&2; exit 1'
+guest_ip="$(multipass exec "$vm" -- sh -lc "ip -4 -o addr show | awk '/inet 10\\.99\\./ { sub(/\\/.*/, \"\", \$4); print \$4; exit }'")"
+if [[ ! "$guest_ip" =~ ^10\.99\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    echo "could not find cb-graphical bridge IPv4 address for VM: $vm" >&2
+    exit 1
+fi
+password="$(multipass exec "$vm" -- sh -lc 'cat /home/ubuntu/.codeybox-vnc-password 2>/dev/null || true' || true)"
 
-echo "Forwarding VNC: 127.0.0.1:${listen_port} -> ${vm}:127.0.0.1:${remote_port}" >&2
+echo "Forwarding VNC: 127.0.0.1:${listen_port} -> ${vm}:${guest_ip}:${remote_port}" >&2
+if [[ -n "$password" ]]; then
+    echo "VNC password: ${password}" >&2
+fi
 echo "Press Ctrl-C to stop." >&2
 exec systemd-socket-activate -l "127.0.0.1:${listen_port}" --inetd -- \
-    multipass exec "$vm" -- sh -lc "$remote_proxy" sh "$remote_port"
+    "$proxy_bin" "${guest_ip}:${remote_port}"
 EOF
 chmod 0755 "$VNC_HELPER"
 

@@ -187,11 +187,9 @@ public sealed class MultipassIntegrationTests : IDisposable
     [Trait("requires_multipass", "true")]
     public async Task Multipass_GraphicalScreenshotAndInput_EndToEnd()
     {
-        if (!_multipassAvailable)
-            return;
+        Assert.True(_multipassAvailable, "requires_multipass=true test requires the multipass CLI to be installed and usable.");
         var networkUnavailableReason = MultipassNetworkUnavailableReason("cb-graphical");
-        if (networkUnavailableReason is not null)
-            return;
+        Assert.True(networkUnavailableReason is null, networkUnavailableReason);
 
         var spec = new SandboxSpec
         {
@@ -214,7 +212,7 @@ public sealed class MultipassIntegrationTests : IDisposable
             Argv =
             [
                 "sh", "-lc",
-                "DISPLAY=:0 xmessage -name codeybox-smoke -buttons OK:0 -geometry 420x160+120+120 'CodeyBox graphical smoke' >/tmp/codeybox-xmessage.log 2>&1 &",
+                "xmessage -name codeybox-smoke -buttons OK:0 -geometry 420x160+120+120 'CodeyBox graphical smoke' >/tmp/codeybox-xmessage.log 2>&1 &",
             ],
         });
         Assert.True(dialog.Success, dialog.Stderr);
@@ -240,7 +238,7 @@ public sealed class MultipassIntegrationTests : IDisposable
             Argv =
             [
                 "sh", "-lc",
-                "rm -f /tmp/codeybox-xev.log; DISPLAY=:0 xev -name codeybox-input-e2e -geometry 500x300+80+80 -event keyboard -event mouse >/tmp/codeybox-xev.log 2>&1 &",
+                "rm -f /tmp/codeybox-xev.log; xev -name codeybox-input-e2e -geometry 500x300+80+80 -event keyboard -event mouse >/tmp/codeybox-xev.log 2>&1 &",
             ],
         });
         Assert.True(startXev.Success, startXev.Stderr);
@@ -277,7 +275,7 @@ public sealed class MultipassIntegrationTests : IDisposable
         {
             var found = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["sh", "-lc", $"DISPLAY=:0 xdotool search --name '{windowName}' >/dev/null 2>&1"],
+                Argv = ["sh", "-lc", $"xdotool search --name '{windowName}' >/dev/null 2>&1"],
             });
             if (found.Success)
                 return;
@@ -317,7 +315,7 @@ public sealed class MultipassIntegrationTests : IDisposable
             Argv =
             [
                 "sh", "-lc",
-                "DISPLAY=:0 xdotool search --name 'CodeyBox graphical smoke' getwindowgeometry --shell 2>/dev/null | head -n 4",
+                "xdotool search --name 'CodeyBox graphical smoke' getwindowgeometry --shell 2>/dev/null | head -n 4",
             ],
         });
         if (!geom.Success)
@@ -350,7 +348,7 @@ public sealed class MultipassIntegrationTests : IDisposable
             Argv =
             [
                 "sh", "-lc",
-                $"DISPLAY=:0 xdotool search --name '{windowName}' getwindowgeometry --shell 2>/dev/null | head -n 4",
+                $"xdotool search --name '{windowName}' getwindowgeometry --shell 2>/dev/null | head -n 4",
             ],
         });
         if (!geom.Success)

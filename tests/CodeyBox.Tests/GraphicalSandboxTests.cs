@@ -336,10 +336,78 @@ public sealed class GraphicalSandboxTests
         }
     }
 
+    [Fact]
+    public async Task PipelineRunner_KeepsConfiguredHeadlessProfilesWhenGraphicalSandboxDisabled()
+    {
+        var workspace = Directory.CreateTempSubdirectory("codeybox-headless-route-").FullName;
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(workspace);
+            var sandboxes = new CapturingSandboxProvider(
+                new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+            var auditor = new QueueAuditor(
+                "route:tool",
+                new AuditResult(false, [new AuditFinding("route:tool", AuditSeverity.Error, "needs rework", "x")]),
+                new AuditResult(true, []));
+            var audit = new ProjectAudit
+            {
+                MaxIterations = 2,
+                AuditTypes = ["scripted"],
+            };
+            var profiles = new ProjectNetworkProfiles
+            {
+                Work = "work-profile",
+                Rework = "rework-profile",
+                AuditTool = "audit-tool-profile",
+                Merge = "merge-profile",
+            };
+            using var tp = TestSupport.BuildPipeline(
+                workspace,
+                seed,
+                auditors: [auditor],
+                projectAudit: audit,
+                sandboxProvider: sandboxes,
+                graphicalSandbox: false,
+                networkProfiles: profiles);
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("rework.txt", "rework\n"));
+            var item = new WorkItem
+            {
+                Id = WorkItemId.New(),
+                ProjectId = new ProjectId("test-project"),
+                Title = "headless routing",
+                Prompt = "do work",
+                Agent = AgentKind.Claude,
+                WorkBranch = "feature/headless-routing",
+            };
+
+            await tp.Store.CreateAsync(item);
+            await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+            var final = await tp.Store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Done, final!.State);
+            AssertHeadlessProfile(Assert.Single(sandboxes.Specs, s => s.TimingPhase == "work"), "work-profile");
+            AssertHeadlessProfile(Assert.Single(sandboxes.Specs, s => s.TimingPhase == "rework"), "rework-profile");
+            var auditSpecs = sandboxes.Specs.Where(s => s.TimingPhase == "audit").ToArray();
+            Assert.NotEmpty(auditSpecs);
+            Assert.All(auditSpecs, spec => AssertHeadlessProfile(spec, "audit-tool-profile"));
+        }
+        finally
+        {
+            try { Directory.Delete(workspace, recursive: true); } catch { }
+        }
+    }
+
     private static void AssertGraphical(SandboxSpec spec)
     {
         Assert.Equal(SandboxProfileFlavor.Graphical, spec.Flavor);
         Assert.Equal(SandboxConventions.GraphicalNetworkProfile, spec.Network.ProfileName);
+    }
+
+    private static void AssertHeadlessProfile(SandboxSpec spec, string expectedProfile)
+    {
+        Assert.Equal(SandboxProfileFlavor.Headless, spec.Flavor);
+        Assert.Equal(expectedProfile, spec.Network.ProfileName);
     }
 
     private static byte[] WithByte(byte[] png, int offset, byte value)
