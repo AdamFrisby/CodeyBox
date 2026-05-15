@@ -294,9 +294,9 @@ for bridge in "${BRIDGES[@]}"; do
 done
 
 # Install a loopback-only operator helper for graphical VNC access. The VNC
-# server itself listens on the VM's cb-graphical address and allows only the
-# host bridge gateway. This helper is the intended human-facing exposure path:
-# it binds 127.0.0.1 on demand and proxies to one selected VM.
+# server itself listens on guest loopback only. This helper is the intended
+# human-facing exposure path: it binds host 127.0.0.1 on demand and proxies
+# through multipass exec to one selected VM.
 cat > "$VNC_HELPER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -316,7 +316,7 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
     exit 2
 fi
 
-for cmd in multipass systemd-socket-activate systemd-socket-proxyd; do
+for cmd in multipass systemd-socket-activate; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "missing required tool: $cmd" >&2; exit 1; }
 done
 
@@ -328,21 +328,17 @@ if [[ ! "$listen_port" =~ ^[0-9]+$ || "$listen_port" -lt 1 || "$listen_port" -gt
     echo "invalid local port: $listen_port" >&2
     exit 2
 fi
-
-addr="$(
-    multipass exec "$vm" -- sh -lc 'ip -4 -o addr show | awk '"'"'/inet 10\.99\./{split($4,a,"/"); print a[1]; exit}'"'"'' |
-        tr -d '\r' |
-        head -n 1
-)"
-
-if [[ -z "$addr" ]]; then
-    echo "VM '$vm' has no 10.99.x.x graphical/profile bridge address" >&2
-    exit 1
+if [[ ! "$remote_port" =~ ^[0-9]+$ || "$remote_port" -lt 1 || "$remote_port" -gt 65535 ]]; then
+    echo "invalid remote VNC port: $remote_port" >&2
+    exit 2
 fi
 
-echo "Forwarding VNC: 127.0.0.1:${listen_port} -> ${addr}:${remote_port}" >&2
+remote_proxy='set -eu; remote_port="$1"; for candidate in /usr/lib/systemd/systemd-socket-proxyd /lib/systemd/systemd-socket-proxyd; do if [ -x "$candidate" ]; then exec "$candidate" "127.0.0.1:${remote_port}"; fi; done; echo "missing required tool in VM: systemd-socket-proxyd" >&2; exit 1'
+
+echo "Forwarding VNC: 127.0.0.1:${listen_port} -> ${vm}:127.0.0.1:${remote_port}" >&2
 echo "Press Ctrl-C to stop." >&2
-exec systemd-socket-activate -l "127.0.0.1:${listen_port}" --inetd -- systemd-socket-proxyd "${addr}:${remote_port}"
+exec systemd-socket-activate -l "127.0.0.1:${listen_port}" --inetd -- \
+    multipass exec "$vm" -- sh -lc "$remote_proxy" sh "$remote_port"
 EOF
 chmod 0755 "$VNC_HELPER"
 

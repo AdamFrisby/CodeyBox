@@ -117,6 +117,10 @@ public sealed class GraphicalSandboxTests
         await using var sandbox = new RecordingGraphicalSandbox(NonUniformPng);
         var bridge = new ComputerUseBridge();
 
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            bridge.ExecuteAsync(null!, new ComputerUseRequest { Action = "screenshot" }));
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            bridge.ExecuteAsync(sandbox, null!));
         await Assert.ThrowsAsync<ArgumentException>(() =>
             bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = null! }));
         await Assert.ThrowsAsync<ArgumentException>(() =>

@@ -926,13 +926,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private static readonly string GraphicalVncScript = $$"""
         #!/bin/sh
         set -eu
-        listen_addr=$(ip -4 -o addr show | awk '/inet 10\.99\./{split($4,a,"/"); print a[1]; exit}')
-        if [ -z "${listen_addr:-}" ]; then
-            echo "codeybox-vnc: no 10.99.x.x interface present" >&2
-            exit 1
-        fi
-        host_addr=$(printf '%s\n' "$listen_addr" | awk -F. '{print $1"."$2"."$3".1"}')
-        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -nopw -listen "$listen_addr" -allow "$host_addr" -noxdamage -repeat
+        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -nopw -localhost -listen 127.0.0.1 -noxdamage -repeat
         """;
 
     private const string GraphicalInstallRuncmd = """
@@ -1094,7 +1088,9 @@ internal interface IProcessRunner
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null);
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null);
 }
 
 internal sealed class DefaultProcessRunner : IProcessRunner
@@ -1104,7 +1100,9 @@ internal sealed class DefaultProcessRunner : IProcessRunner
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null)
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -1120,8 +1118,9 @@ internal sealed class DefaultProcessRunner : IProcessRunner
         using var p = new Process { StartInfo = psi };
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
+        var limitOutput = maxStdoutBytes.HasValue || maxStderrBytes.HasValue;
         var streamChunks = stdoutChunkCallback is not null || stderrChunkCallback is not null;
-        if (streamChunks)
+        if (streamChunks && !limitOutput)
         {
             p.OutputDataReceived += (_, e) =>
             {
@@ -1142,10 +1141,22 @@ internal sealed class DefaultProcessRunner : IProcessRunner
         p.Start();
         Task<string>? stdoutTask = null;
         Task<string>? stderrTask = null;
-        if (streamChunks)
+        Task<LimitedReadResult>? limitedStdoutTask = null;
+        Task<LimitedReadResult>? limitedStderrTask = null;
+        if (streamChunks && !limitOutput)
         {
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
+        }
+        else if (limitOutput)
+        {
+            void KillForLimit()
+            {
+                try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+            }
+
+            limitedStdoutTask = ReadLimitedAsync(p.StandardOutput, maxStdoutBytes, stdoutChunkCallback, KillForLimit, ct);
+            limitedStderrTask = ReadLimitedAsync(p.StandardError, maxStderrBytes, stderrChunkCallback, KillForLimit, ct);
         }
         else
         {
@@ -1165,11 +1176,89 @@ internal sealed class DefaultProcessRunner : IProcessRunner
         }
         if (stdoutTask is not null && stderrTask is not null)
             return new RunResult(p.ExitCode, await stdoutTask, await stderrTask);
+        if (limitedStdoutTask is not null && limitedStderrTask is not null)
+        {
+            var stdoutResult = await limitedStdoutTask;
+            var stderrResult = await limitedStderrTask;
+            return new RunResult(
+                p.ExitCode,
+                stdoutResult.Text,
+                stderrResult.Text,
+                stdoutResult.LimitExceeded,
+                stderrResult.LimitExceeded);
+        }
         return new RunResult(p.ExitCode, stdout.ToString(), stderr.ToString());
+    }
+
+    private static async Task<LimitedReadResult> ReadLimitedAsync(
+        StreamReader reader,
+        int? maxBytes,
+        Action<string>? chunkCallback,
+        Action onLimitExceeded,
+        CancellationToken ct)
+    {
+        var output = new StringBuilder();
+        var buffer = new char[4096];
+        var totalBytes = 0;
+
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
+            if (read == 0)
+                return new LimitedReadResult(output.ToString(), LimitExceeded: false);
+
+            var chunk = new string(buffer, 0, read);
+            if (maxBytes is { } limit)
+            {
+                var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+                if (totalBytes + chunkBytes > limit)
+                {
+                    var remaining = Math.Max(0, limit - totalBytes);
+                    if (remaining > 0)
+                    {
+                        var truncated = TakeUtf8Prefix(chunk, remaining);
+                        output.Append(truncated);
+                        chunkCallback?.Invoke(truncated);
+                    }
+
+                    onLimitExceeded();
+                    return new LimitedReadResult(output.ToString(), LimitExceeded: true);
+                }
+
+                totalBytes += chunkBytes;
+            }
+
+            output.Append(chunk);
+            chunkCallback?.Invoke(chunk);
+        }
+    }
+
+    private static string TakeUtf8Prefix(string value, int maxBytes)
+    {
+        var used = 0;
+        for (var i = 0; i < value.Length; i++)
+        {
+            var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(i, 1));
+            if (used + charBytes > maxBytes)
+                return value[..i];
+            used += charBytes;
+        }
+
+        return value;
     }
 }
 
-internal readonly record struct RunResult(int ExitCode, string Stdout, string Stderr);
+internal readonly record struct LimitedReadResult(string Text, bool LimitExceeded);
+
+internal readonly record struct RunResult(
+    int ExitCode,
+    string Stdout,
+    string Stderr,
+    bool StdoutLimitExceeded = false,
+    bool StderrLimitExceeded = false)
+{
+    public bool Success => ExitCode == 0;
+}
 
 /// <summary>
 /// Retries a multipass-CLI call when its stderr indicates the in-VM SSH
@@ -1411,6 +1500,9 @@ public sealed record MultipassSandboxOptions
 internal sealed class MultipassSandbox : IPreemptibleSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
+    internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
+    internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
+    internal const int MaxScreenshotStderrBytes = 64 * 1024;
 
     private readonly string _name;
     private readonly string _sandboxRoot;
@@ -1446,6 +1538,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     public string Id { get; }
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+    {
+        var result = await ExecRunAsync(exec, ct);
+        return new SandboxExecResult(result.ExitCode, result.Stdout, result.Stderr);
+    }
+
+    private async Task<RunResult> ExecRunAsync(
+        SandboxExec exec,
+        CancellationToken ct,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (exec.Argv.Count == 0) throw new ArgumentException("Argv must be non-empty", nameof(exec));
@@ -1487,8 +1589,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
                 exec.Stdin,
                 ct,
                 exec.StdoutChunkCallback,
-                exec.StderrChunkCallback);
-            return new SandboxExecResult(result.ExitCode, result.Stdout, result.Stderr);
+                exec.StderrChunkCallback,
+                maxStdoutBytes,
+                maxStderrBytes);
+            return result;
         }
         finally
         {
@@ -1502,7 +1606,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     public async Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
     {
         EnsureGraphical();
-        var result = await ExecAsync(new SandboxExec
+        var result = await ExecRunAsync(new SandboxExec
         {
             Argv =
             [
@@ -1510,14 +1614,21 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
                 "tmp=$(mktemp --suffix=.png); trap 'rm -f \"$tmp\"' EXIT; DISPLAY=:0 scrot -z \"$tmp\"; base64 -w0 \"$tmp\"",
             ],
             WorkingDirectory = _spec.WorkingDirectory,
-        }, ct);
+        }, ct, maxStdoutBytes: MaxScreenshotBase64StdoutBytes, maxStderrBytes: MaxScreenshotStderrBytes);
 
+        if (result.StdoutLimitExceeded)
+            throw new InvalidOperationException("graphical screenshot output exceeded the maximum capture size");
+        if (result.StderrLimitExceeded)
+            throw new InvalidOperationException("graphical screenshot stderr exceeded the maximum capture size");
         if (!result.Success)
             throw new InvalidOperationException($"graphical screenshot failed: {result.Stderr}");
 
         try
         {
-            return Convert.FromBase64String(result.Stdout.Trim());
+            var screenshot = Convert.FromBase64String(result.Stdout.Trim());
+            if (screenshot.Length > MaxScreenshotPngBytes)
+                throw new InvalidOperationException("graphical screenshot PNG exceeded the maximum capture size");
+            return screenshot;
         }
         catch (FormatException ex)
         {

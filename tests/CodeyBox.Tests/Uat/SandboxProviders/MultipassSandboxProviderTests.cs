@@ -54,12 +54,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
         Assert.Contains($"-rfbport {SandboxConventions.GraphicalVncPort}", cloudInit);
-        Assert.Contains("listen_addr=$(ip -4 -o addr show", cloudInit);
-        Assert.Contains("-listen \"$listen_addr\"", cloudInit);
-        Assert.Contains("-allow \"$host_addr\"", cloudInit);
-        Assert.Contains("codeybox-vnc: no 10.99.x.x interface present", cloudInit);
-        Assert.DoesNotContain("-listen 127.0.0.1", cloudInit);
-        Assert.DoesNotContain("-localhost", cloudInit);
+        Assert.Contains("-listen 127.0.0.1", cloudInit);
+        Assert.Contains("-localhost", cloudInit);
+        Assert.DoesNotContain("listen_addr=$(ip -4 -o addr show", cloudInit);
+        Assert.DoesNotContain("-listen \"$listen_addr\"", cloudInit);
+        Assert.DoesNotContain("-allow \"$host_addr\"", cloudInit);
+        Assert.DoesNotContain("codeybox-vnc: no 10.99.x.x interface present", cloudInit);
         Assert.Contains("echo project setup", cloudInit);
 
         var headlessCloudInit = MultipassSandboxProvider.BuildCloudInit(
@@ -107,6 +107,43 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task GetScreenshotAsync_RejectsOutputPastCaptureLimit()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(
+                137,
+                new string('A', 1024),
+                "",
+                StdoutLimitExceeded: true)));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
+
+        Assert.Contains("maximum capture size", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxScreenshotBase64StdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxScreenshotStderrBytes, call.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task DefaultProcessRunner_StopsReadingWhenStdoutLimitIsExceeded()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var runner = new DefaultProcessRunner();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        var result = await runner.RunAsync(
+            ["sh", "-c", "while :; do printf 1234567890; done"],
+            stdin: null,
+            ct: timeout.Token,
+            maxStdoutBytes: 1024,
+            maxStderrBytes: 1024);
+
+        Assert.True(result.StdoutLimitExceeded);
+        Assert.True(result.Stdout.Length <= 1024, $"captured {result.Stdout.Length} bytes");
+    }
+
+    [Fact]
     public async Task SynthesizeInputAsync_ThrowsWhenXdotoolFails()
     {
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
@@ -139,6 +176,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             await Assert.ThrowsAnyAsync<ArgumentException>(() =>
                 sandbox.SynthesizeInputAsync([inputEvent]));
         }
+    }
+
+    [Fact]
+    public async Task SynthesizeInputAsync_RejectsNullEventListAndUnknownEventType()
+    {
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            sandbox.SynthesizeInputAsync(null!));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            sandbox.SynthesizeInputAsync([new SandboxInputEvent { Type = (SandboxInputEventType)999 }]));
     }
 
     [Fact]

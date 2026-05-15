@@ -229,6 +229,85 @@ public sealed class MultipassIntegrationTests : IDisposable
         var after = await sb.GetScreenshotAsync();
 
         Assert.False(before.SequenceEqual(after), "clicking the graphical dialog should change the screenshot");
+
+        await AssertGraphicalInputEventsAffectDesktopAsync(sb);
+    }
+
+    private static async Task AssertGraphicalInputEventsAffectDesktopAsync(ISandbox sandbox)
+    {
+        var startXev = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                "rm -f /tmp/codeybox-xev.log; DISPLAY=:0 xev -name codeybox-input-e2e -geometry 500x300+80+80 -event keyboard -event mouse >/tmp/codeybox-xev.log 2>&1 &",
+            ],
+        });
+        Assert.True(startXev.Success, startXev.Stderr);
+        await WaitForWindowAsync(sandbox, "codeybox-input-e2e");
+
+        var (x, y) = await FindWindowCenterAsync(sandbox, "codeybox-input-e2e", fallback: (330, 230));
+        await sandbox.SynthesizeInputAsync(
+            [
+                new SandboxInputEvent { Type = SandboxInputEventType.Move, X = x, Y = y },
+                new SandboxInputEvent { Type = SandboxInputEventType.Click, X = x, Y = y },
+                new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 1 },
+                new SandboxInputEvent { Type = SandboxInputEventType.Type, Text = "ab" },
+                new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Return" },
+            ],
+            CancellationToken.None);
+
+        var log = await ReadXevLogUntilAsync(
+            sandbox,
+            text => text.Contains("MotionNotify", StringComparison.Ordinal)
+                && text.Contains("button 5", StringComparison.Ordinal)
+                && text.Contains("keysym 0x61, a", StringComparison.Ordinal)
+                && text.Contains("keysym 0xff0d, Return", StringComparison.Ordinal),
+            TimeSpan.FromSeconds(10));
+
+        Assert.Contains("MotionNotify", log, StringComparison.Ordinal);
+        Assert.Contains("button 5", log, StringComparison.Ordinal);
+        Assert.Contains("keysym 0x61, a", log, StringComparison.Ordinal);
+        Assert.Contains("keysym 0xff0d, Return", log, StringComparison.Ordinal);
+    }
+
+    private static async Task WaitForWindowAsync(ISandbox sandbox, string windowName)
+    {
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            var found = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-lc", $"DISPLAY=:0 xdotool search --name '{windowName}' >/dev/null 2>&1"],
+            });
+            if (found.Success)
+                return;
+            await Task.Delay(TimeSpan.FromMilliseconds(250));
+        }
+
+        Assert.Fail($"Window '{windowName}' did not appear.");
+    }
+
+    private static async Task<string> ReadXevLogUntilAsync(
+        ISandbox sandbox,
+        Func<string, bool> predicate,
+        TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        string log = "";
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var read = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-lc", "cat /tmp/codeybox-xev.log 2>/dev/null || true"],
+            });
+            Assert.True(read.Success, read.Stderr);
+            log = read.Stdout;
+            if (predicate(log))
+                return log;
+            await Task.Delay(TimeSpan.FromMilliseconds(250));
+        }
+
+        return log;
     }
 
     private static async Task<(int X, int Y)> FindDialogOkButtonAsync(ISandbox sandbox)
@@ -259,6 +338,39 @@ public sealed class MultipassIntegrationTests : IDisposable
         }
 
         return (x + width / 2, y + Math.Max(20, height - 25));
+    }
+
+    private static async Task<(int X, int Y)> FindWindowCenterAsync(
+        ISandbox sandbox,
+        string windowName,
+        (int X, int Y) fallback)
+    {
+        var geom = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                $"DISPLAY=:0 xdotool search --name '{windowName}' getwindowgeometry --shell 2>/dev/null | head -n 4",
+            ],
+        });
+        if (!geom.Success)
+            return fallback;
+
+        var values = geom.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => line.Split('=', 2))
+            .Where(parts => parts.Length == 2 && int.TryParse(parts[1], out _))
+            .ToDictionary(parts => parts[0], parts => int.Parse(parts[1]), StringComparer.Ordinal);
+
+        if (!values.TryGetValue("X", out var x)
+            || !values.TryGetValue("Y", out var y)
+            || !values.TryGetValue("WIDTH", out var width)
+            || !values.TryGetValue("HEIGHT", out var height))
+        {
+            return fallback;
+        }
+
+        return (x + width / 2, y + height / 2);
     }
 
     // Egress enforcement is exercised by local/verify-host-firewall.sh

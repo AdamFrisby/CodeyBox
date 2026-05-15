@@ -44,10 +44,6 @@ exit 9
 set -euo pipefail
 printf '%s\n' "$@" > "$CALL_LOG"
 """);
-        WriteExecutable(Path.Combine(tools, "systemd-socket-proxyd"), """
-#!/usr/bin/env bash
-exit 0
-""");
 
         var env = new Dictionary<string, string?>
         {
@@ -62,19 +58,24 @@ exit 0
 
         var ok = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm", "5901"], env);
         Assert.Equal(0, ok.ExitCode);
-        Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> 10.99.6.42:5999", ok.Stderr, StringComparison.Ordinal);
+        Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> gui-vm:127.0.0.1:5999", ok.Stderr, StringComparison.Ordinal);
 
         var socketArgs = await File.ReadAllLinesAsync(callLog);
-        Assert.Equal(
-            [
-                "-l",
-                "127.0.0.1:5901",
-                "--inetd",
-                "--",
-                "systemd-socket-proxyd",
-                "10.99.6.42:5999",
-            ],
-            socketArgs);
+        Assert.Equal("-l", socketArgs[0]);
+        Assert.Equal("127.0.0.1:5901", socketArgs[1]);
+        Assert.Equal("--inetd", socketArgs[2]);
+        Assert.Equal("--", socketArgs[3]);
+        Assert.Equal("multipass", socketArgs[4]);
+        Assert.Equal("exec", socketArgs[5]);
+        Assert.Equal("gui-vm", socketArgs[6]);
+        Assert.Equal("--", socketArgs[7]);
+        Assert.Equal("sh", socketArgs[8]);
+        Assert.Equal("-lc", socketArgs[9]);
+        Assert.Contains("/usr/lib/systemd/systemd-socket-proxyd", socketArgs[10], StringComparison.Ordinal);
+        Assert.Contains("/lib/systemd/systemd-socket-proxyd", socketArgs[10], StringComparison.Ordinal);
+        Assert.Contains("127.0.0.1:${remote_port}", socketArgs[10], StringComparison.Ordinal);
+        Assert.Equal("sh", socketArgs[11]);
+        Assert.Equal("5999", socketArgs[12]);
     }
 
     private static string SetupScriptPath()
