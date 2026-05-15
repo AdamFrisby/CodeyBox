@@ -8,12 +8,16 @@ public sealed class HostNetworkSetupScriptTests
     public void SetupHostNetworks_EmitsInboundBridgeChainsForEveryProfile()
     {
         var script = File.ReadAllText(SetupScriptPath());
+        var inboundChain = ExtractBetween(
+            script,
+            "    chain cb-${name}-in {",
+            "    chain cb-${name} {");
 
         Assert.Contains("jump cb-${name}-in", script, StringComparison.Ordinal);
         Assert.Contains("chain cb-${name}-in {", script, StringComparison.Ordinal);
-        Assert.Contains("Host-originated", script, StringComparison.Ordinal);
-        Assert.Contains("ct state established,related accept", script, StringComparison.Ordinal);
-        Assert.Contains("drop", script, StringComparison.Ordinal);
+        Assert.Contains("Host-originated", inboundChain, StringComparison.Ordinal);
+        Assert.Contains("ct state established,related accept", inboundChain, StringComparison.Ordinal);
+        Assert.Contains("        drop", inboundChain, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -65,6 +69,14 @@ exit 0
         Assert.Equal(2, invalid.ExitCode);
         Assert.Contains("invalid local port", invalid.Stderr, StringComparison.OrdinalIgnoreCase);
 
+        var invalidRemoteEnv = new Dictionary<string, string?>(env)
+        {
+            ["CODEYBOX_GRAPHICAL_VNC_PORT"] = "bad-port",
+        };
+        var invalidRemote = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm", "5901"], invalidRemoteEnv);
+        Assert.Equal(2, invalidRemote.ExitCode);
+        Assert.Contains("invalid remote VNC port", invalidRemote.Stderr, StringComparison.OrdinalIgnoreCase);
+
         var ok = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm", "5901"], env);
         Assert.Equal(0, ok.ExitCode);
         Assert.Contains("Forwarding VNC: 127.0.0.1:5901 -> gui-vm:10.99.6.42:5999", ok.Stderr, StringComparison.Ordinal);
@@ -77,6 +89,51 @@ exit 0
         Assert.Equal("--", socketArgs[3]);
         Assert.EndsWith("systemd-socket-proxyd", socketArgs[4], StringComparison.Ordinal);
         Assert.Equal("10.99.6.42:5999", socketArgs[5]);
+    }
+
+    [Fact]
+    public async Task GeneratedVncHelper_RejectsMissingToolsAndMissingGuestBridgeAddress()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        using var temp = new TempDir("codeybox-vnc-helper-errors-");
+        var helper = Path.Combine(temp.Path, "codeybox-vnc-loopback");
+        File.WriteAllText(helper, ExtractVncHelperScript(File.ReadAllText(SetupScriptPath())));
+        MakeExecutable(helper);
+
+        var emptyTools = Path.Combine(temp.Path, "empty-tools");
+        Directory.CreateDirectory(emptyTools);
+        var missingTools = await RunAsync("/bin/bash", [helper, "gui-vm"], new Dictionary<string, string?>
+        {
+            ["PATH"] = emptyTools,
+        });
+        Assert.Equal(1, missingTools.ExitCode);
+        Assert.Contains("missing required tool: multipass", missingTools.Stderr, StringComparison.OrdinalIgnoreCase);
+
+        var tools = Path.Combine(temp.Path, "tools");
+        Directory.CreateDirectory(tools);
+        WriteExecutable(Path.Combine(tools, "multipass"), """
+#!/usr/bin/env bash
+set -euo pipefail
+echo "192.168.1.50"
+""");
+        WriteExecutable(Path.Combine(tools, "systemd-socket-activate"), """
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+""");
+        WriteExecutable(Path.Combine(tools, "systemd-socket-proxyd"), """
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+""");
+
+        var noGuestBridge = await RunAsync("/usr/bin/env", ["bash", helper, "gui-vm"], new Dictionary<string, string?>
+        {
+            ["PATH"] = tools + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"),
+        });
+        Assert.Equal(1, noGuestBridge.ExitCode);
+        Assert.Contains("could not find CodeyBox bridge IPv4 address", noGuestBridge.Stderr, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string SetupScriptPath()
@@ -103,6 +160,16 @@ exit 0
         var end = setupScript.IndexOf(endMarker, contentStart, StringComparison.Ordinal);
         Assert.True(end > contentStart, "VNC helper heredoc end marker was not found.");
         return setupScript[contentStart..end];
+    }
+
+    private static string ExtractBetween(string text, string startMarker, string endMarker)
+    {
+        var start = text.IndexOf(startMarker, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"Start marker '{startMarker}' was not found.");
+        start += startMarker.Length;
+        var end = text.IndexOf(endMarker, start, StringComparison.Ordinal);
+        Assert.True(end > start, $"End marker '{endMarker}' was not found.");
+        return text[start..end];
     }
 
     private static void WriteExecutable(string path, string contents)

@@ -519,7 +519,7 @@ public sealed class ReleaseService
             if (credential is not null)
                 foreach (var (k, v) in credential.EnvironmentVariables) env[k] = v;
 
-            var sandboxTarget = ResolveSandboxTarget(
+            var sandboxTarget = SandboxTargetResolver.Resolve(
                 project,
                 needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
                 graphicalEligible: !needsCreds);
@@ -600,23 +600,6 @@ public sealed class ReleaseService
             return null;
         return await _agentStreams.BeginCaptureAsync(workItemId, phase, iteration, ct);
     }
-
-    private static SandboxTarget ResolveSandboxTarget(
-        Project project,
-        string? configuredNetworkProfile,
-        bool graphicalEligible)
-    {
-        if (project.GraphicalSandbox && graphicalEligible)
-        {
-            return new SandboxTarget(
-                SandboxConventions.GraphicalNetworkProfile,
-                SandboxProfileFlavor.Graphical);
-        }
-
-        return new SandboxTarget(configuredNetworkProfile, SandboxProfileFlavor.Headless);
-    }
-
-    private readonly record struct SandboxTarget(string? NetworkProfile, SandboxProfileFlavor Flavor);
 
     private async Task<bool> CanCaptureStructuredStreamAsync(
         IAgentRunner runner,

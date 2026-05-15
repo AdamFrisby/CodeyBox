@@ -178,7 +178,7 @@ codeybox-vnc-loopback <multipass-vm-name> 5901
 Then connect your VNC client to `127.0.0.1:5901`. Programmatic screenshots
 and input use `multipass exec` (`scrot`/`xdotool`); VNC is only an
 operator-facing inspection path. The helper binds host loopback and proxies
-to the guest VNC listener over the `cb-graphical` bridge.
+to the guest VNC listener over the selected CodeyBox bridge.
 
 ## Sandbox staging directory hardening
 

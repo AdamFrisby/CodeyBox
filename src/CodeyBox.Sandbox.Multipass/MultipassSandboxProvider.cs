@@ -132,7 +132,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
-        EnsureGraphicalProfileSelected(spec);
         var name = $"codeybox-{Guid.NewGuid():N}"[..23]; // multipass max name length is 24
         var sandboxRoot = Path.Combine(_stagingRoot, name);
         Directory.CreateDirectory(sandboxRoot);
@@ -408,32 +407,30 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     }
 
     /// <summary>
-    /// Ensures the baseline VM for <paramref name="profileName"/> exists.
+    /// Ensures the baseline VM for <paramref name="profileName"/> and
+    /// <paramref name="flavor"/> exists.
     /// Bakes it on first call (~5-10 min: launch with cloud-init, install
     /// agent CLIs and runtime, stop). Subsequent calls return the existing
     /// baseline name.
     ///
-    /// We bake one baseline per profile because <c>multipass clone</c>
+    /// We bake one baseline per profile/flavor because <c>multipass clone</c>
     /// inherits the source VM's network attachments — a baseline launched
     /// with <c>--network cb-net</c> can only produce clones attached to
-    /// <c>cb-net</c>. Per-profile baselines also cleanly isolate "what each
-    /// profile installed" if profiles ever need different toolchains.
+    /// <c>cb-net</c>. Graphical baselines also carry a desktop/VNC toolchain,
+    /// so they must not be shared with headless baselines for the same egress
+    /// profile.
     /// </summary>
     private async Task<string> EnsureBaselineForProfileAsync(
         string profileName,
         SandboxProfileFlavor flavor,
         CancellationToken ct)
     {
-        var baselineProfile = flavor == SandboxProfileFlavor.Graphical
-            ? SandboxConventions.GraphicalNetworkProfile
-            : profileName;
-
-        if (!_opts.NetworkProfiles.TryGetValue(baselineProfile, out _))
+        if (!_opts.NetworkProfiles.TryGetValue(profileName, out _))
             throw new InvalidOperationException(
-                $"Network profile '{baselineProfile}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
+                $"Network profile '{profileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
                 $"Configured profiles: [{string.Join(", ", _opts.NetworkProfiles.Keys)}]");
 
-        var baselineName = _opts.BaselineNamePrefix + baselineProfile;
+        var baselineName = _opts.BaselineNamePrefix + BuildBaselineKey(profileName, flavor);
         // multipass instance names cap at 24 chars; trim if a long profile
         // name pushes us over. We use a STABLE hash (SHA-256, first 6 hex
         // chars) for uniqueness so two long profile names don't collide.
@@ -454,7 +451,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         {
             if (await BaselineVmExistsAsync(baselineName, ct))
                 return baselineName;
-            await BakeBaselineAsync(baselineName, baselineProfile, flavor, ct);
+            await BakeBaselineAsync(baselineName, profileName, flavor, ct);
             return baselineName;
         }
         finally
@@ -474,6 +471,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
             return sem;
         }
+    }
+
+    private static string BuildBaselineKey(string profileName, SandboxProfileFlavor flavor)
+    {
+        if (flavor != SandboxProfileFlavor.Graphical)
+            return profileName;
+
+        return profileName.Equals(SandboxConventions.GraphicalNetworkProfile, StringComparison.OrdinalIgnoreCase)
+            ? SandboxConventions.GraphicalNetworkProfile
+            : "graphical-" + profileName;
     }
 
     private async Task<bool> BaselineVmExistsAsync(string name, CancellationToken ct)
@@ -601,7 +608,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     internal IReadOnlyList<string> BuildLaunchArgv(string name, SandboxSpec spec, string cloudInitPath)
     {
-        EnsureGraphicalProfileSelected(spec);
         var argv = new List<string> { _opts.MultipassBinary, "launch", "--name", name };
         if (spec.Limits.CpuCount is { } cpus) argv.AddRange(["--cpus", cpus.ToString()]);
         if (spec.Limits.MemoryBytes is { } mem) argv.AddRange(["--memory", $"{mem / (1024 * 1024)}M"]);
@@ -634,19 +640,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             argv.Add(_opts.DefaultImage);
 
         return argv;
-    }
-
-    private static void EnsureGraphicalProfileSelected(SandboxSpec spec)
-    {
-        if (spec.Flavor != SandboxProfileFlavor.Graphical)
-            return;
-
-        if (string.Equals(spec.Network.ProfileName, SandboxConventions.GraphicalNetworkProfile, StringComparison.OrdinalIgnoreCase))
-            return;
-
-        throw new InvalidOperationException(
-            $"Graphical sandboxes must use network profile '{SandboxConventions.GraphicalNetworkProfile}'. " +
-            $"The requested profile was '{spec.Network.ProfileName ?? "<none>"}'.");
     }
 
     private async Task LaunchAsync(string name, SandboxSpec spec, string cloudInitPath, CancellationToken ct)
@@ -1744,7 +1737,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         var vertical = inputEvent.Y ?? 0;
         var horizontal = inputEvent.X ?? 0;
         if (vertical == 0 && horizontal == 0)
-            return [];
+            throw new ArgumentException("Scroll events require a non-zero X or Y amount.");
 
         if (vertical != 0 && horizontal != 0)
             throw new ArgumentException("Scroll events support one axis at a time.");

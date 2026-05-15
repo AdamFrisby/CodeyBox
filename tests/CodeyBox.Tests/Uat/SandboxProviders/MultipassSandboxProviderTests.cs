@@ -252,6 +252,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 10 },
             new SandboxInputEvent { Type = SandboxInputEventType.Key },
             new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 10 },
+            new SandboxInputEvent { Type = SandboxInputEventType.Scroll },
             new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = 1, Y = 1 },
             new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 1001 },
             new SandboxInputEvent { Type = SandboxInputEventType.Type },
@@ -626,7 +627,92 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public void LaunchArgv_GraphicalFlavorRejectsNonGraphicalProfile()
+    public async Task BaselineImages_GraphicalFlavorPreservesSelectedNetworkProfile()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        string? baselineLaunchName = null;
+        string? baselineLaunchNetwork = null;
+        string? cloneSource = null;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var name, "--format=csv"])
+            {
+                if (states.TryGetValue(name, out var state))
+                    return Task.FromResult(new RunResult(0, state, ""));
+                return Task.FromResult(new RunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                baselineLaunchName = argv[3];
+                var networkIndex = argv.ToList().IndexOf("--network");
+                baselineLaunchNetwork = networkIndex >= 0 ? argv[networkIndex + 1] : null;
+                states[baselineLaunchName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", var execName, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new RunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
+
+            if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", _]
+                && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "clone", var source, "--name", var cloneName])
+            {
+                cloneSource = source;
+                states[cloneName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-graphical-profile"),
+            networkProfiles: new Dictionary<string, string>
+            {
+                ["ci"] = "cb-ci",
+                [SandboxConventions.GraphicalNetworkProfile] = "cb-graphical",
+            },
+            useBaselineImages: true,
+            runner: runner);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Flavor = SandboxProfileFlavor.Graphical,
+            Network = new SandboxNetworkPolicy { ProfileName = "ci" },
+            WorkingDirectory = "/work",
+        };
+
+        await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
+
+        Assert.Equal("cb-baseline-graphical-ci", baselineLaunchName);
+        Assert.Equal("name=cb-ci,mode=auto", baselineLaunchNetwork);
+        Assert.Equal("cb-baseline-graphical-ci", cloneSource);
+    }
+
+    [Fact]
+    public void LaunchArgv_GraphicalFlavorUsesConfiguredProfileBridge()
     {
         var provider = NewProvider(networkProfiles: new Dictionary<string, string>
         {
@@ -640,12 +726,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Network = new SandboxNetworkPolicy { ProfileName = "claude" },
         };
 
-        var ex = Assert.Throws<InvalidOperationException>(() =>
-            provider.BuildLaunchArgv("codeybox-test", spec, "/staging/cloud-init.yaml"));
+        var argv = provider.BuildLaunchArgv("codeybox-test", spec, "/staging/cloud-init.yaml");
+        var networkIndex = argv.ToList().IndexOf("--network");
 
-        Assert.Contains("Graphical sandboxes must use network profile", ex.Message);
-        Assert.Contains(SandboxConventions.GraphicalNetworkProfile, ex.Message);
-        Assert.Contains("claude", ex.Message);
+        Assert.True(networkIndex > 0, string.Join(' ', argv));
+        Assert.Equal("name=cb-claude,mode=auto", argv[networkIndex + 1]);
     }
 
     [Fact]

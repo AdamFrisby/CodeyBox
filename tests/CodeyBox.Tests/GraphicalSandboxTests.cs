@@ -4,6 +4,7 @@ using System.Text;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Graphical;
@@ -127,6 +128,68 @@ public sealed class GraphicalSandboxTests
             bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "events" }));
         await Assert.ThrowsAsync<NotSupportedException>(() =>
             bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "drag" }));
+    }
+
+    [Fact]
+    public async Task ComputerUseBridge_RejectsOversizedInputBeforeCallingSandbox()
+    {
+        await using var sandbox = new RecordingGraphicalSandbox(NonUniformPng);
+        var bridge = new ComputerUseBridge(new ComputerUseBridgeOptions
+        {
+            MaxEventsPerCall = 2,
+            MaxTextUtf8Bytes = 4,
+            MaxKeyUtf8Bytes = 4,
+            MaxCoordinate = 20,
+            MaxScrollMagnitude = 2,
+            MaxInputEventsPerWindow = 100,
+        });
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            bridge.ExecuteAsync(sandbox, new ComputerUseRequest
+            {
+                Action = "events",
+                Events =
+                [
+                    new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "A" },
+                    new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "B" },
+                    new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "C" },
+                ],
+            }));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "type", Text = "hello" }));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "key", Key = "Return" }));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "move", X = 21, Y = 1 }));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "scroll" }));
+
+        Assert.Empty(sandbox.Events);
+    }
+
+    [Fact]
+    public async Task ComputerUseBridge_AppliesInputRateBudgetAndToolTimeout()
+    {
+        await using var rateSandbox = new RecordingGraphicalSandbox(NonUniformPng);
+        var rateLimited = new ComputerUseBridge(new ComputerUseBridgeOptions
+        {
+            MaxInputEventsPerWindow = 1,
+            RateLimitWindow = TimeSpan.FromMinutes(1),
+        });
+
+        await rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" });
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" }));
+        Assert.Single(rateSandbox.Events);
+
+        await using var slowSandbox = new DelayingGraphicalSandbox();
+        var timeoutBridge = new ComputerUseBridge(new ComputerUseBridgeOptions
+        {
+            ToolCallTimeout = TimeSpan.FromMilliseconds(10),
+        });
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "screenshot" }));
     }
 
     [Fact]
@@ -255,6 +318,32 @@ public sealed class GraphicalSandboxTests
     }
 
     [Fact]
+    public void ProjectAuditorComposer_DoesNotAddRegisteredGuiSmokeAuditor_ForHeadlessProjects()
+    {
+        var guiSmoke = new GraphicalSmokeAuditor(TimeSpan.Zero);
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            [guiSmoke],
+            NullLogger<ProjectAuditorComposer>.Instance);
+        var project = new Project
+        {
+            Id = new ProjectId("headless"),
+            DisplayName = "Headless",
+            RepositoryUrl = "https://example.com/headless.git",
+            GraphicalSandbox = false,
+            Audit = new ProjectAudit
+            {
+                Languages = [],
+                AuditTypes = [],
+            },
+        };
+
+        var auditors = composer.Compose(project, new ScriptedAgent([]));
+
+        Assert.Empty(auditors);
+    }
+
+    [Fact]
     public void ProjectAuditorComposer_DoesNotDuplicateGuiSmokeAuditor()
     {
         var existingGuiSmoke = new QueueAuditor("gui:smoke", new AuditResult(true, []));
@@ -278,7 +367,7 @@ public sealed class GraphicalSandboxTests
     }
 
     [Fact]
-    public async Task PipelineRunner_UsesGraphicalSandboxForWorkReworkAndAuditToolPhases()
+    public async Task PipelineRunner_UsesGraphicalFlavorButPreservesConfiguredProfilesForEligiblePhases()
     {
         var workspace = Directory.CreateTempSubdirectory("codeybox-graphical-route-").FullName;
         try
@@ -296,13 +385,25 @@ public sealed class GraphicalSandboxTests
                 AuditTypes = ["scripted"],
                 ExcludedAuditors = ["gui:smoke"],
             };
+            var profiles = new ProjectNetworkProfiles
+            {
+                Work = "work-profile",
+                Rework = "rework-profile",
+                AuditTool = "audit-tool-profile",
+                Merge = "merge-profile",
+            };
             using var tp = TestSupport.BuildPipeline(
                 workspace,
                 seed,
                 auditors: [auditor],
                 projectAudit: audit,
                 sandboxProvider: sandboxes,
-                graphicalSandbox: true);
+                graphicalSandbox: true,
+                networkProfiles: profiles,
+                credentials: new ConstantCredentialProvider(new AgentCredential(
+                    AgentKind.Claude,
+                    new Dictionary<string, string> { ["WORK_TOKEN"] = "secret" },
+                    new Dictionary<string, string>())));
             tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
             tp.Agent.WorkPlan.Enqueue(new FileWrite("rework.txt", "rework\n"));
             var item = new WorkItem
@@ -320,15 +421,92 @@ public sealed class GraphicalSandboxTests
 
             var final = await tp.Store.GetAsync(item.Id);
             Assert.Equal(WorkItemState.Done, final!.State);
-            AssertGraphical(Assert.Single(sandboxes.Specs, s => s.TimingPhase == "work"));
-            AssertGraphical(Assert.Single(sandboxes.Specs, s => s.TimingPhase == "rework"));
+            var workSpec = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "work");
+            AssertGraphicalProfile(workSpec, "work-profile");
+            Assert.Equal("secret", workSpec.Environment["WORK_TOKEN"]);
+            var reworkSpec = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "rework");
+            AssertGraphicalProfile(reworkSpec, "rework-profile");
+            Assert.Equal("secret", reworkSpec.Environment["WORK_TOKEN"]);
             var auditSpecs = sandboxes.Specs.Where(s => s.TimingPhase == "audit").ToArray();
             Assert.NotEmpty(auditSpecs);
-            Assert.All(auditSpecs, AssertGraphical);
+            Assert.All(auditSpecs, spec => AssertGraphicalProfile(spec, "audit-tool-profile"));
 
             var merge = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "merge");
             Assert.Equal(SandboxProfileFlavor.Headless, merge.Flavor);
-            Assert.NotEqual(SandboxConventions.GraphicalNetworkProfile, merge.Network.ProfileName);
+            Assert.Equal("merge-profile", merge.Network.ProfileName);
+        }
+        finally
+        {
+            try { Directory.Delete(workspace, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task PipelineRunner_KeepsCredentialedAuditAgentHeadlessForGraphicalProjects()
+    {
+        var workspace = Directory.CreateTempSubdirectory("codeybox-graphical-audit-agent-").FullName;
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(workspace);
+            var sandboxes = new CapturingSandboxProvider(
+                new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+            var auditor = new QueueAuditor(
+                "security:llm-review",
+                AuditCapabilities.AgentCredentials | AuditCapabilities.Network,
+                "llm",
+                new AuditResult(true, []));
+            var profiles = new ProjectNetworkProfiles
+            {
+                Work = "work-profile",
+                AuditAgent = "audit-agent-profile",
+                AuditTool = "audit-tool-profile",
+            };
+            using var tp = TestSupport.BuildPipeline(
+                workspace,
+                seed,
+                auditors: [auditor],
+                projectAudit: new ProjectAudit
+                {
+                    MaxIterations = 1,
+                    AuditTypes = ["scripted"],
+                    ExcludedAuditors = ["gui:smoke"],
+                },
+                sandboxProvider: sandboxes,
+                graphicalSandbox: true,
+                networkProfiles: profiles,
+                pipelineOptions: new PipelineOptions
+                {
+                    SandboxImageReference = "ignored",
+                    AgentAllowedHosts = ["api.anthropic.com"],
+                    AuditToolAllowedHosts = ["registry.npmjs.org"],
+                },
+                credentials: new ConstantCredentialProvider(new AgentCredential(
+                    AgentKind.Claude,
+                    new Dictionary<string, string> { ["TEST_TOKEN"] = "secret" },
+                    new Dictionary<string, string>())));
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work\n"));
+            var item = new WorkItem
+            {
+                Id = WorkItemId.New(),
+                ProjectId = new ProjectId("test-project"),
+                Title = "graphical audit agent routing",
+                Prompt = "do work",
+                Agent = AgentKind.Claude,
+                WorkBranch = "feature/graphical-audit-agent-routing",
+            };
+
+            await tp.Store.CreateAsync(item);
+            await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+            var final = await tp.Store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Done, final!.State);
+            var auditSpec = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "audit");
+            Assert.Equal(SandboxProfileFlavor.Headless, auditSpec.Flavor);
+            Assert.Equal("audit-agent-profile", auditSpec.Network.ProfileName);
+            Assert.Contains("api.anthropic.com", auditSpec.Network.AllowedHosts);
+            Assert.DoesNotContain("registry.npmjs.org", auditSpec.Network.AllowedHosts);
+            Assert.Equal("secret", auditSpec.Environment["TEST_TOKEN"]);
+            Assert.Contains(auditSpec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
         }
         finally
         {
@@ -398,10 +576,10 @@ public sealed class GraphicalSandboxTests
         }
     }
 
-    private static void AssertGraphical(SandboxSpec spec)
+    private static void AssertGraphicalProfile(SandboxSpec spec, string expectedProfile)
     {
         Assert.Equal(SandboxProfileFlavor.Graphical, spec.Flavor);
-        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, spec.Network.ProfileName);
+        Assert.Equal(expectedProfile, spec.Network.ProfileName);
     }
 
     private static void AssertHeadlessProfile(SandboxSpec spec, string expectedProfile)
@@ -532,19 +710,47 @@ public sealed class GraphicalSandboxTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
+    private sealed class DelayingGraphicalSandbox : ISandbox
+    {
+        public string Id => "delaying-graphical-test";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public async Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            return NonUniformPng;
+        }
+
+        public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+            => await Task.Delay(TimeSpan.FromSeconds(5), ct);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     private sealed class QueueAuditor : IAuditor
     {
         private readonly Queue<AuditResult> _results;
+        private readonly AuditCapabilities _required;
+        private readonly string _kind;
 
         public QueueAuditor(string name, params AuditResult[] results)
+            : this(name, AuditCapabilities.None, "tool", results)
+        {
+        }
+
+        public QueueAuditor(string name, AuditCapabilities required, string kind, params AuditResult[] results)
         {
             Name = name;
+            _required = required;
+            _kind = kind;
             _results = new Queue<AuditResult>(results);
         }
 
         public string Name { get; }
-        public string Kind => "tool";
-        public AuditCapabilities Required => AuditCapabilities.None;
+        public string Kind => _kind;
+        public AuditCapabilities Required => _required;
 
         public Task<AuditResult> RunAsync(
             ISandbox sandbox,

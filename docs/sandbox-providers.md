@@ -144,20 +144,24 @@ Projects that need to build or test GUI applications can opt in with:
 ```
 
 When enabled, the work, rework, and credential-free audit-tool phases use
-`SandboxProfileFlavor.Graphical` and the logical network profile
-`graphical`. LLM audit and merge phases keep their normal profiles. The
-Multipass graphical flavor installs a lightweight XFCE session on Xvfb,
-starts `x11vnc` on the VM's `10.99.x.x` graphical bridge address on the
-conventional graphical VNC port (`SandboxConventions.GraphicalVncPort`,
-currently `5900`), and preinstalls `xdotool`, `scrot`, and `ffmpeg`. The
-VNC server is password-protected and allows the bridge gateway address only.
-For operator viewing, run `codeybox-vnc-loopback <multipass-vm-name> 5901`
-and connect to `127.0.0.1:5901`; the helper binds host loopback and proxies
-to the guest over `cb-graphical`. The CodeyBox
+`SandboxProfileFlavor.Graphical` while preserving their configured per-phase
+network profiles. If a graphical-eligible phase has no configured network
+profile, CodeyBox falls back to the logical `graphical` profile. LLM audit and
+merge phases keep their normal headless profiles. The Multipass graphical
+flavor installs a lightweight XFCE session on Xvfb, starts `x11vnc` on the
+VM's `10.99.x.x` CodeyBox bridge address on the conventional graphical VNC
+port (`SandboxConventions.GraphicalVncPort`, currently `5900`), and preinstalls
+`xdotool`, `scrot`, and `ffmpeg`. The VNC server is password-protected and
+allows the bridge gateway address only. For operator viewing, run
+`codeybox-vnc-loopback <multipass-vm-name> 5901` and connect to
+`127.0.0.1:5901`; the helper binds host loopback and proxies to the selected
+guest bridge address. The CodeyBox
 screenshot/input APIs call `scrot` and `xdotool` through `multipass exec`;
 no additional LLM network surface is required.
 
-Operator setup needs the graphical bridge:
+Operator setup needs the graphical bridge for fallback graphical phases. If
+your project sets explicit `Work`, `Rework`, or `AuditTool` profiles, those
+bridges also need to be present because graphical VMs will attach to them:
 
 ```text
 # /etc/codeybox/networks.conf
@@ -173,7 +177,9 @@ Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
 ```
 
 With `MultipassUseBaselineImages=true`, the provider bakes a separate
-`cb-baseline-graphical` VM the first time a graphical project runs. Delete
+graphical baseline VM for each selected network profile the first time a
+graphical project runs. The fallback graphical profile uses
+`cb-baseline-graphical`. Delete
 that baseline to force a rebuild after changing graphical tooling or
 `MultipassExtraRuncmd`.
 

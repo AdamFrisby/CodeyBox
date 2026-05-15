@@ -307,7 +307,7 @@ usage() {
 Usage: codeybox-vnc-loopback <multipass-vm-name> [local-port]
 
 Starts a foreground VNC proxy on 127.0.0.1:<local-port> for the selected
-graphical Multipass VM, forwarding to the VM's cb-graphical bridge address.
+graphical Multipass VM, forwarding to the VM's CodeyBox bridge address.
 The remote VNC port defaults to 5900; override with
 CODEYBOX_GRAPHICAL_VNC_PORT if the sandbox convention changes.
 USAGE
@@ -352,7 +352,7 @@ fi
 
 guest_ip="$(multipass exec "$vm" -- sh -lc "ip -4 -o addr show | awk '/inet 10\\.99\\./ { sub(/\\/.*/, \"\", \$4); print \$4; exit }'")"
 if [[ ! "$guest_ip" =~ ^10\.99\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-    echo "could not find cb-graphical bridge IPv4 address for VM: $vm" >&2
+    echo "could not find CodeyBox bridge IPv4 address for VM: $vm" >&2
     exit 1
 fi
 password="$(multipass exec "$vm" -- sh -lc 'cat /home/ubuntu/.codeybox-vnc-password 2>/dev/null || true' || true)"

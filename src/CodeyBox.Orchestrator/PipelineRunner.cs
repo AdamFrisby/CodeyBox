@@ -293,7 +293,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     workCts.CancelAfter(item.WorkTimeout);
                     using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, workCts);
-                    var sandboxTarget = ResolveSandboxTarget(project, project.NetworkProfiles.Work, graphicalEligible: true);
+                    var sandboxTarget = SandboxTargetResolver.Resolve(project, project.NetworkProfiles.Work, graphicalEligible: true);
                     workAgentStdout = await RunWithStuckProbeAsync(item, project, agentKind, "work", workCts, ct, phaseCt =>
                         RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
                             BuildInitialWorkPrompt(item.Prompt, project.AllowAgentQuestions, auditors), isInitial: true,
@@ -326,7 +326,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     reworkCts.CancelAfter(item.WorkTimeout);
                     using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
-                    var sandboxTarget = ResolveSandboxTarget(project, project.NetworkProfiles.Rework, graphicalEligible: true);
+                    var sandboxTarget = SandboxTargetResolver.Resolve(project, project.NetworkProfiles.Rework, graphicalEligible: true);
                     reworkStdout = await RunWithStuckProbeAsync(item, project, agentKind, "rework", reworkCts, ct,
                         phaseCt => RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
                             BuildInterruptedReworkResumePrompt(item.Prompt, item.PreemptCheckpoint!),
@@ -1708,7 +1708,7 @@ public sealed class PipelineRunner : IPipelineRunner
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
             using var reworkShutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
-            var sandboxTarget = ResolveSandboxTarget(project, project.NetworkProfiles.Rework, graphicalEligible: true);
+            var sandboxTarget = SandboxTargetResolver.Resolve(project, project.NetworkProfiles.Rework, graphicalEligible: true);
             var reworkStdout = await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct,
                 phaseCt => RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
                     reworkPrompt, isInitial: false,
@@ -1778,7 +1778,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     : await _credentials.GetAsync(groupRunner.Kind, ct))
                 : null;
             var access = _gitHost.GetSandboxAccess(repoId);
-            var sandboxTarget = ResolveSandboxTarget(
+            var sandboxTarget = SandboxTargetResolver.Resolve(
                 project,
                 needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
                 graphicalEligible: !needsCreds);
@@ -3712,23 +3712,6 @@ public sealed class PipelineRunner : IPipelineRunner
             TimingPhase = timingPhase,
         };
     }
-
-    private static SandboxTarget ResolveSandboxTarget(
-        Project project,
-        string? configuredNetworkProfile,
-        bool graphicalEligible)
-    {
-        if (project.GraphicalSandbox && graphicalEligible)
-        {
-            return new SandboxTarget(
-                SandboxConventions.GraphicalNetworkProfile,
-                SandboxProfileFlavor.Graphical);
-        }
-
-        return new SandboxTarget(configuredNetworkProfile, SandboxProfileFlavor.Headless);
-    }
-
-    private readonly record struct SandboxTarget(string? NetworkProfile, SandboxProfileFlavor Flavor);
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {

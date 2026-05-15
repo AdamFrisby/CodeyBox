@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Options;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
@@ -187,7 +188,7 @@ public sealed class DeepAuditConvergenceTests : IDisposable
     }
 
     [Fact]
-    public async Task DeepAuditToolSandbox_UsesGraphicalProfileForGraphicalProjects()
+    public async Task DeepAuditToolSandbox_UsesGraphicalFlavorAndConfiguredProfileForGraphicalProjects()
     {
         var auditor = new ScriptedDeepAuditor(
             AuditorName,
@@ -223,8 +224,67 @@ public sealed class DeepAuditConvergenceTests : IDisposable
 
         var spec = Assert.Single(sandboxes.Specs);
         Assert.Equal(SandboxProfileFlavor.Graphical, spec.Flavor);
-        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, spec.Network.ProfileName);
+        Assert.Equal("audit-tools", spec.Network.ProfileName);
         Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
+    }
+
+    [Fact]
+    public async Task DeepAuditCredentialedSandbox_StaysHeadlessForGraphicalProjects()
+    {
+        var auditor = new ScriptedDeepAuditor(
+            AuditorName,
+            AuditCapabilities.AgentCredentials | AuditCapabilities.Network,
+            new AuditResult(true, []));
+        var project = ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1) with
+        {
+            GraphicalSandbox = true,
+            NetworkProfiles = new ProjectNetworkProfiles
+            {
+                AuditAgent = "audit-agent-profile",
+                AuditTool = "audit-tool-profile",
+            },
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var autoCompleteQueue = new AutoCompleteTaskQueue(_workItemStore);
+        var sandboxes = new CapturingSandboxProvider();
+        var svc = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: autoCompleteQueue,
+            sandboxes: sandboxes,
+            gitHost: new DeepAuditTestGitHost(),
+            agents: new AgentRegistry([new ScriptedAgent([MergeStrategy.RealMerge])]),
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "none",
+                AgentAllowedHosts = ["api.anthropic.com"],
+                AuditToolAllowedHosts = ["registry.npmjs.org"],
+            },
+            credentials: new ConstantCredentialProvider(new AgentCredential(
+                AgentKind.Claude,
+                new Dictionary<string, string> { ["TEST_TOKEN"] = "secret" },
+                new Dictionary<string, string>())));
+
+        var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(rel);
+        var item = MakeWorkItem(rel.Id, WorkItemState.Done);
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+
+        var spec = Assert.Single(sandboxes.Specs);
+        Assert.Equal(SandboxProfileFlavor.Headless, spec.Flavor);
+        Assert.Equal("audit-agent-profile", spec.Network.ProfileName);
+        Assert.Contains("api.anthropic.com", spec.Network.AllowedHosts);
+        Assert.DoesNotContain("registry.npmjs.org", spec.Network.AllowedHosts);
+        Assert.Equal("secret", spec.Environment["TEST_TOKEN"]);
     }
 
     [Theory]

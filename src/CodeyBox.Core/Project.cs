@@ -137,8 +137,10 @@ public sealed record Project
 
     /// <summary>
     /// When true, work, rework, and tool-audit sandboxes use the graphical
-    /// sandbox flavor and the dedicated graphical network profile. Default
-    /// false; graphical VMs are opt-in because they are larger and slower.
+    /// sandbox flavor. Configured per-phase network profiles are preserved;
+    /// if a graphical-eligible phase has no configured profile, it falls back
+    /// to the conventional graphical profile. Default false because graphical
+    /// VMs are larger and slower.
     /// </summary>
     public bool GraphicalSandbox { get; init; }
 

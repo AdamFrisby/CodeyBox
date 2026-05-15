@@ -28,7 +28,7 @@ public sealed class GraphicalSmokeAuditor : IAuditor
     }
 
     public string Name => "gui:smoke";
-    public string Kind => "gui-smoke";
+    public string Kind => "tool";
     public AuditCapabilities Required => AuditCapabilities.None;
 
     public async Task<AuditResult> RunAsync(
