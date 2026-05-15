@@ -89,11 +89,17 @@ internal readonly record struct PngPixelStats(
     int LumaRange)
 {
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+    private const int MaxCompressedPngBytes = 64 * 1024 * 1024;
+    private const int MaxScreenshotDimension = 4096;
+    private const int MaxScreenshotPixels = MaxScreenshotDimension * MaxScreenshotDimension;
+    private const int MaxDecodedScanlineBytes = 80 * 1024 * 1024;
 
     public static PngPixelStats FromPng(byte[] png)
     {
         if (png.Length < PngSignature.Length || !png.AsSpan(0, PngSignature.Length).SequenceEqual(PngSignature))
             throw new InvalidDataException("missing PNG signature");
+        if (png.Length > MaxCompressedPngBytes)
+            throw new InvalidDataException("PNG exceeds maximum compressed screenshot size");
 
         int width = 0;
         int height = 0;
@@ -108,7 +114,8 @@ internal readonly record struct PngPixelStats(
         {
             var length = ReadBigEndianInt32(png.AsSpan(offset, 4));
             offset += 4;
-            if (length < 0 || offset + 4 + length + 4 > png.Length)
+            var chunkEnd = (long)offset + 4L + length + 4L;
+            if (length < 0 || chunkEnd > png.Length)
                 throw new InvalidDataException("invalid PNG chunk length");
 
             var type = System.Text.Encoding.ASCII.GetString(png, offset, 4);
@@ -145,6 +152,11 @@ internal readonly record struct PngPixelStats(
 
         if (width <= 0 || height <= 0)
             throw new InvalidDataException("missing IHDR");
+        if (width > MaxScreenshotDimension || height > MaxScreenshotDimension)
+            throw new InvalidDataException($"PNG dimensions exceed maximum screenshot size {MaxScreenshotDimension}x{MaxScreenshotDimension}");
+        var pixelCount = checked(width * height);
+        if (pixelCount > MaxScreenshotPixels)
+            throw new InvalidDataException("PNG pixel count exceeds maximum screenshot size");
         if (bitDepth != 8)
             throw new NotSupportedException($"unsupported PNG bit depth {bitDepth}");
         if (interlace != 0)
@@ -162,16 +174,11 @@ internal readonly record struct PngPixelStats(
         if (colorType == 3 && (palette is null || palette.Length < 3))
             throw new InvalidDataException("indexed PNG has no palette");
 
-        idat.Position = 0;
-        using var zlib = new ZLibStream(idat, CompressionMode.Decompress);
-        using var decompressed = new MemoryStream();
-        zlib.CopyTo(decompressed);
-        var scanlines = decompressed.ToArray();
-
         var rowBytes = checked(width * bytesPerPixel);
         var expectedBytes = checked((rowBytes + 1) * height);
-        if (scanlines.Length < expectedBytes)
-            throw new InvalidDataException("PNG image data is truncated");
+        if (expectedBytes > MaxDecodedScanlineBytes)
+            throw new InvalidDataException("PNG decoded scanline data exceeds maximum screenshot size");
+        var scanlines = DecompressScanlines(idat, expectedBytes);
 
         var previous = new byte[rowBytes];
         var current = new byte[rowBytes];
@@ -203,9 +210,30 @@ internal readonly record struct PngPixelStats(
         return new PngPixelStats(
             width,
             height,
-            checked(width * height),
+            pixelCount,
             unique.Count,
             maxLuma - minLuma);
+    }
+
+    private static byte[] DecompressScanlines(MemoryStream idat, int expectedBytes)
+    {
+        idat.Position = 0;
+        using var zlib = new ZLibStream(idat, CompressionMode.Decompress);
+        var scanlines = new byte[expectedBytes];
+        var offset = 0;
+        while (offset < scanlines.Length)
+        {
+            var read = zlib.Read(scanlines.AsSpan(offset));
+            if (read == 0)
+                throw new InvalidDataException("PNG image data is truncated");
+            offset += read;
+        }
+
+        Span<byte> extra = stackalloc byte[1];
+        if (zlib.Read(extra) > 0)
+            throw new InvalidDataException("PNG image data exceeds expected decoded size");
+
+        return scanlines;
     }
 
     private static (int R, int G, int B) ReadRgb(byte[] row, int baseIndex, byte colorType, byte[]? palette)

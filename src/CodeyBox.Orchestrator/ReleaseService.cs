@@ -519,7 +519,10 @@ public sealed class ReleaseService
             if (credential is not null)
                 foreach (var (k, v) in credential.EnvironmentVariables) env[k] = v;
 
-            var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
+            var sandboxTarget = ResolveSandboxTarget(
+                project,
+                needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
+                graphicalEligible: !needsCreds);
             var spec = new SandboxSpec
             {
                 ImageReference = _pipelineOpts.SandboxImageReference,
@@ -533,8 +536,9 @@ public sealed class ReleaseService
                             : _pipelineOpts.AuditToolAllowedHosts
                         : [],
                     HostGitEndpoint = access.Network.HostGitEndpoint,
-                    ProfileName = profile,
+                    ProfileName = sandboxTarget.NetworkProfile,
                 },
+                Flavor = sandboxTarget.Flavor,
                 WorkingDirectory = "/work",
             };
 
@@ -596,6 +600,23 @@ public sealed class ReleaseService
             return null;
         return await _agentStreams.BeginCaptureAsync(workItemId, phase, iteration, ct);
     }
+
+    private static SandboxTarget ResolveSandboxTarget(
+        Project project,
+        string? configuredNetworkProfile,
+        bool graphicalEligible)
+    {
+        if (project.GraphicalSandbox && graphicalEligible)
+        {
+            return new SandboxTarget(
+                SandboxConventions.GraphicalNetworkProfile,
+                SandboxProfileFlavor.Graphical);
+        }
+
+        return new SandboxTarget(configuredNetworkProfile, SandboxProfileFlavor.Headless);
+    }
+
+    private readonly record struct SandboxTarget(string? NetworkProfile, SandboxProfileFlavor Flavor);
 
     private async Task<bool> CanCaptureStructuredStreamAsync(
         IAgentRunner runner,

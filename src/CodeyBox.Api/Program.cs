@@ -11,6 +11,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
+using CodeyBox.Audit;
 using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
@@ -752,6 +753,7 @@ builder.Services.AddSingleton(_ =>
     return options;
 });
 builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(sp.GetRequiredService<PresetCatalogOptions>()));
+builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------

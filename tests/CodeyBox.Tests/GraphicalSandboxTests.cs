@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using System.IO.Compression;
+using System.Text;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
@@ -18,6 +21,25 @@ public sealed class GraphicalSandboxTests
         "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAC0lEQVR4nGNgAAMAAAcAAbKGrPQAAAAASUVORK5CYII=");
 
     private static readonly byte[] InvalidPng = [0x01, 0x02, 0x03];
+
+    public static IEnumerable<object[]> MalformedPngCases()
+    {
+        yield return new object[] { WithChunkLength(NonUniformPng, int.MaxValue), "invalid PNG chunk length" };
+        yield return new object[] { WithChunkLength(NonUniformPng, 12), "invalid IHDR length" };
+        yield return new object[] { WithByte(NonUniformPng, 24, 16), "unsupported PNG bit depth" };
+        yield return new object[] { WithByte(NonUniformPng, 25, 5), "unsupported PNG color type" };
+        yield return new object[] { WithByte(NonUniformPng, 28, 1), "interlaced PNG screenshots are not supported" };
+        yield return new object[] { WithByte(NonUniformPng, 25, 3), "indexed PNG has no palette" };
+        yield return new object[]
+        {
+            BuildPng(2, 1, colorType: 3, decompressedScanlines: [0, 0, 1], palette: [0, 0, 0]),
+            "missing palette entry",
+        };
+        yield return new object[] { BuildPng(2, 1, colorType: 2, decompressedScanlines: [0, 0, 0]), "truncated" };
+        yield return new object[] { BuildPng(1, 1, colorType: 2, decompressedScanlines: [99, 0, 0, 0]), "unknown PNG filter" };
+        yield return new object[] { BuildPng(4097, 1, colorType: 0, decompressedScanlines: [0, 0]), "dimensions exceed" };
+        yield return new object[] { BuildPng(1, 1, colorType: 0, decompressedScanlines: [0, 0, 0]), "exceeds expected decoded size" };
+    }
 
     [Fact]
     public async Task ComputerUseBridge_MapsScreenshotAndInputActionsToSandboxCapabilities()
@@ -104,6 +126,19 @@ public sealed class GraphicalSandboxTests
     }
 
     [Fact]
+    public async Task ISandbox_DefaultGraphicalCapabilitiesRejectUnsupportedSandbox()
+    {
+        await using ISandbox sandbox = new HeadlessOnlySandbox();
+
+        var screenshot = await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetScreenshotAsync());
+        var input = await Assert.ThrowsAsync<NotSupportedException>(() =>
+            sandbox.SynthesizeInputAsync([new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Return" }]));
+
+        Assert.Contains("graphical desktop", screenshot.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("graphical desktop", input.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task GraphicalSmokeAuditor_PassesForNonUniformScreenshot()
     {
         await using var sandbox = new RecordingGraphicalSandbox(NonUniformPng);
@@ -168,9 +203,34 @@ public sealed class GraphicalSandboxTests
     }
 
     [Fact]
-    public void ProjectAuditorComposer_AddsGuiSmokeAuditor_ForGraphicalProjects()
+    public async Task GraphicalSmokeAuditor_FailsForMalformedPngVariants()
     {
-        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        foreach (var variant in MalformedPngCases())
+        {
+            var png = Assert.IsType<byte[]>(variant[0]);
+            var expected = Assert.IsType<string>(variant[1]);
+            await using var sandbox = new RecordingGraphicalSandbox(png);
+            var auditor = new GraphicalSmokeAuditor(TimeSpan.Zero);
+
+            var result = await auditor.RunAsync(
+                sandbox,
+                "/work",
+                new AuditContext(WorkItemId.New(), "work", "main", 1, "prompt"));
+
+            Assert.False(result.Passed);
+            var finding = Assert.Single(result.Findings);
+            Assert.Contains(expected, finding.Description, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
+    public void ProjectAuditorComposer_AddsRegisteredGuiSmokeAuditor_ForGraphicalProjects()
+    {
+        var guiSmoke = new GraphicalSmokeAuditor(TimeSpan.Zero);
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            [guiSmoke],
+            NullLogger<ProjectAuditorComposer>.Instance);
         var project = new Project
         {
             Id = new ProjectId("gui"),
@@ -187,6 +247,7 @@ public sealed class GraphicalSandboxTests
         var auditors = composer.Compose(project, new ScriptedAgent([]));
 
         Assert.Equal(["gui:smoke"], auditors.Select(a => a.Name).ToArray());
+        Assert.Same(guiSmoke, Assert.Single(auditors));
     }
 
     [Fact]
@@ -275,6 +336,81 @@ public sealed class GraphicalSandboxTests
     {
         Assert.Equal(SandboxProfileFlavor.Graphical, spec.Flavor);
         Assert.Equal(SandboxConventions.GraphicalNetworkProfile, spec.Network.ProfileName);
+    }
+
+    private static byte[] WithByte(byte[] png, int offset, byte value)
+    {
+        var copy = png.ToArray();
+        copy[offset] = value;
+        return copy;
+    }
+
+    private static byte[] WithChunkLength(byte[] png, int length)
+    {
+        var copy = png.ToArray();
+        Span<byte> destination = copy.AsSpan(8, 4);
+        BinaryPrimitives.WriteInt32BigEndian(destination, length);
+        return copy;
+    }
+
+    private static byte[] BuildPng(
+        int width,
+        int height,
+        byte colorType,
+        byte[] decompressedScanlines,
+        byte bitDepth = 8,
+        byte interlace = 0,
+        byte[]? palette = null)
+    {
+        using var png = new MemoryStream();
+        png.Write([137, 80, 78, 71, 13, 10, 26, 10]);
+
+        var ihdr = new byte[13];
+        BinaryPrimitives.WriteInt32BigEndian(ihdr.AsSpan(0, 4), width);
+        BinaryPrimitives.WriteInt32BigEndian(ihdr.AsSpan(4, 4), height);
+        ihdr[8] = bitDepth;
+        ihdr[9] = colorType;
+        ihdr[10] = 0;
+        ihdr[11] = 0;
+        ihdr[12] = interlace;
+        WriteChunk(png, "IHDR", ihdr);
+
+        if (palette is not null)
+            WriteChunk(png, "PLTE", palette);
+
+        WriteChunk(png, "IDAT", CompressZlib(decompressedScanlines));
+        WriteChunk(png, "IEND", []);
+        return png.ToArray();
+    }
+
+    private static byte[] CompressZlib(byte[] data)
+    {
+        using var compressed = new MemoryStream();
+        using (var zlib = new ZLibStream(compressed, CompressionLevel.SmallestSize, leaveOpen: true))
+        {
+            zlib.Write(data);
+        }
+        return compressed.ToArray();
+    }
+
+    private static void WriteChunk(Stream png, string type, byte[] data)
+    {
+        Span<byte> length = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(length, data.Length);
+        png.Write(length);
+        png.Write(Encoding.ASCII.GetBytes(type));
+        png.Write(data);
+        png.Write([0, 0, 0, 0]);
+    }
+
+    private sealed class HeadlessOnlySandbox : ISandbox
+    {
+        public string Id => "headless-test";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class RecordingGraphicalSandbox : ISandbox

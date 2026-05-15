@@ -16,26 +16,29 @@ namespace CodeyBox.Projects;
 /// <c>Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom</c>.
 /// Stateless; safe to share as a singleton.
 ///
-/// <para>Plugin auditors (registered in DI via <c>IPluginLoader</c>) are injected
-/// as <c>IEnumerable&lt;IAuditor&gt;</c> and indexed by their
-/// <see cref="CodeyBoxPluginAttribute.Id"/> at construction time. Custom entries
-/// with <c>Kind = "plugin"</c> are resolved against this index; unknown IDs log a
-/// warning and are skipped rather than failing the audit.</para>
+/// <para>Registered auditors (built-ins and plugins registered in DI via
+/// <c>IPluginLoader</c>) are injected as <c>IEnumerable&lt;IAuditor&gt;</c>.
+/// Plugin auditors are indexed by their <see cref="CodeyBoxPluginAttribute.Id"/>
+/// for custom <c>Kind = "plugin"</c> entries, while built-in opt-in auditors
+/// can be selected by name without coupling this layer to their concrete
+/// implementation.</para>
 /// </summary>
 public sealed class ProjectAuditorComposer
 {
     private readonly IPresetCatalog _catalog;
     private readonly PresetCatalogOptions _catalogOptions;
+    private readonly IReadOnlyDictionary<string, IAuditor> _registeredAuditorsByName;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly ILogger<ProjectAuditorComposer> _logger;
 
     /// <summary>
     /// DI constructor. Receives all <see cref="IAuditor"/> singletons registered
-    /// by the plugin loader (empty enumerable when no plugins are loaded).
+    /// by the host and plugin loader (empty enumerable when no optional auditors
+    /// are loaded).
     /// </summary>
     public ProjectAuditorComposer(
         IPresetCatalog catalog,
-        IEnumerable<IAuditor> pluginAuditors,
+        IEnumerable<IAuditor> registeredAuditors,
         ILogger<ProjectAuditorComposer> logger,
         PresetCatalogOptions? catalogOptions = null)
     {
@@ -43,13 +46,16 @@ public sealed class ProjectAuditorComposer
         _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
         _logger = logger;
 
+        var byName = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
         var index = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
-        foreach (var auditor in pluginAuditors)
+        foreach (var auditor in registeredAuditors)
         {
+            byName[auditor.Name] = auditor;
             var attr = auditor.GetType().GetCustomAttribute<CodeyBoxPluginAttribute>();
             if (attr is not null)
                 index[attr.Id] = auditor;
         }
+        _registeredAuditorsByName = byName;
         _pluginAuditors = index;
     }
 
@@ -92,7 +98,7 @@ public sealed class ProjectAuditorComposer
         if (project.GraphicalSandbox
             && !auditors.Any(a => a.Name.Equals("gui:smoke", StringComparison.OrdinalIgnoreCase)))
         {
-            auditors.Insert(0, new GraphicalSmokeAuditor());
+            IncludeRegisteredAuditor("gui:smoke", auditors, prepend: true);
         }
 
         if (project.Audit.ExcludedAuditors.Count > 0)
@@ -102,6 +108,22 @@ public sealed class ProjectAuditorComposer
         }
 
         return auditors;
+    }
+
+    private void IncludeRegisteredAuditor(string name, List<IAuditor> auditors, bool prepend)
+    {
+        if (!_registeredAuditorsByName.TryGetValue(name, out var auditor))
+        {
+            _logger.LogWarning(
+                "Auditor '{AuditorName}' was requested by project composition but is not registered; skipping",
+                name);
+            return;
+        }
+
+        if (prepend)
+            auditors.Insert(0, auditor);
+        else
+            auditors.Add(auditor);
     }
 
     private IPresetCatalog ResolveCatalog(Project project)

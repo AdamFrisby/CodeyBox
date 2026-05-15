@@ -186,6 +186,47 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
     }
 
+    [Fact]
+    public async Task DeepAuditToolSandbox_UsesGraphicalProfileForGraphicalProjects()
+    {
+        var auditor = new ScriptedDeepAuditor(
+            AuditorName,
+            new AuditResult(true, []));
+        var project = ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1) with
+        {
+            GraphicalSandbox = true,
+            NetworkProfiles = new ProjectNetworkProfiles { AuditTool = "audit-tools" },
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var autoCompleteQueue = new AutoCompleteTaskQueue(_workItemStore);
+        var sandboxes = new CapturingSandboxProvider();
+        var svc = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: autoCompleteQueue,
+            sandboxes: sandboxes,
+            gitHost: new DeepAuditTestGitHost());
+
+        var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(rel);
+        var item = MakeWorkItem(rel.Id, WorkItemState.Done);
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await svc.OnWorkItemTerminalAsync(rel.Id, default);
+        await PollUntilAsync(rel.Id,
+            s => s is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+
+        var spec = Assert.Single(sandboxes.Specs);
+        Assert.Equal(SandboxProfileFlavor.Graphical, spec.Flavor);
+        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, spec.Network.ProfileName);
+        Assert.DoesNotContain(spec.Mounts, m => m.SandboxPath == SandboxConventions.CredentialsDir);
+    }
+
     [Theory]
     [InlineData("bubblewrap")]
     [InlineData("process")]

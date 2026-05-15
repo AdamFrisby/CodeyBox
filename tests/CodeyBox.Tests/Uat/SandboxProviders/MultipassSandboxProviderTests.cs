@@ -401,6 +401,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         var installCommands = new List<string>();
         string? baselineLaunchName = null;
+        string? baselineLaunchNetwork = null;
         string? cloneSource = null;
 
         var runner = new RecordingMultipassRunner((argv, _, _) =>
@@ -415,6 +416,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 baselineLaunchName = argv[3];
+                var networkIndex = argv.ToList().IndexOf("--network");
+                baselineLaunchNetwork = networkIndex >= 0 ? argv[networkIndex + 1] : null;
                 states[baselineLaunchName] = "Running";
                 return Task.FromResult(new RunResult(0, "", ""));
             }
@@ -471,19 +474,43 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         {
             ImageReference = "ignored",
             Flavor = SandboxProfileFlavor.Graphical,
-            Network = new SandboxNetworkPolicy { ProfileName = "claude" },
+            Network = new SandboxNetworkPolicy { ProfileName = SandboxConventions.GraphicalNetworkProfile },
             WorkingDirectory = "/work",
         };
 
         await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
 
         Assert.Equal("cb-baseline-graphical", baselineLaunchName);
+        Assert.Equal("name=cb-graphical,mode=auto", baselineLaunchNetwork);
         Assert.Equal("cb-baseline-graphical", cloneSource);
         Assert.Contains(installCommands, cmd =>
             cmd.Contains("xvfb x11vnc xfce4", StringComparison.Ordinal)
             && cmd.Contains("xdotool scrot ffmpeg", StringComparison.Ordinal));
         Assert.Contains(installCommands, cmd =>
             cmd.Contains("touch /opt/codeybox-project-tools", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void LaunchArgv_GraphicalFlavorRejectsNonGraphicalProfile()
+    {
+        var provider = NewProvider(networkProfiles: new Dictionary<string, string>
+        {
+            ["claude"] = "cb-claude",
+            [SandboxConventions.GraphicalNetworkProfile] = "cb-graphical",
+        });
+        var spec = new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Flavor = SandboxProfileFlavor.Graphical,
+            Network = new SandboxNetworkPolicy { ProfileName = "claude" },
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            provider.BuildLaunchArgv("codeybox-test", spec, "/staging/cloud-init.yaml"));
+
+        Assert.Contains("Graphical sandboxes must use network profile", ex.Message);
+        Assert.Contains(SandboxConventions.GraphicalNetworkProfile, ex.Message);
+        Assert.Contains("claude", ex.Message);
     }
 
     [Fact]
