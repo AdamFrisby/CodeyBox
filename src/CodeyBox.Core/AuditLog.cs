@@ -148,6 +148,11 @@ public static class AuditLog
             .Information("Sandbox {VmName} created with network profile {NetworkProfile}",
                 vmName, networkProfile);
 
+    public static void SandboxLaunchTransientRetry(WorkItemId workItemId, int attempt, string errorClass) =>
+        Audit("sandbox.launch_transient_retry")
+            .Information("Sandbox launch transient failure for work item {WorkItemId}; retry {Attempt}; errorClass={ErrorClass}",
+                workItemId.ToString(), attempt, errorClass);
+
     public static void SandboxDisposed(string vmName) =>
         Audit("sandbox.disposed")
             .Information("Sandbox {VmName} disposed", vmName);

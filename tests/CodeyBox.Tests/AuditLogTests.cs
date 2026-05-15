@@ -267,6 +267,21 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void SandboxLaunchTransientRetry_emits_sandbox_launch_transient_retry_event()
+    {
+        var workItemId = WorkItemId.New();
+
+        AuditLog.SandboxLaunchTransientRetry(workItemId, 2, "multipass-socket-unreachable");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("sandbox.launch_transient_retry", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(workItemId.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal(2, GetScalar<int>(evt, "Attempt"));
+        Assert.Equal("multipass-socket-unreachable", GetScalar<string>(evt, "ErrorClass"));
+    }
+
+    [Fact]
     public void AuditPassed_emits_audit_passed_event()
     {
         AuditLog.AuditPassed(2);

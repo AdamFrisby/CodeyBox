@@ -87,6 +87,7 @@ Audit-tier events additionally carry:
 | `EventName` | Level | Emitted by | Properties |
 |-------------|-------|-----------|------------|
 | `sandbox.created` | Info | `MultipassSandboxProvider.CreateAsync` | `VmName`, `NetworkProfile` |
+| `sandbox.launch_transient_retry` | Info | `MultipassSandboxProvider.CreateAsync` | `WorkItemId`, `Attempt`, `ErrorClass` |
 | `sandbox.disposed` | Info | `MultipassSandbox.DisposeAsync` | `VmName` |
 
 ### Audit phase

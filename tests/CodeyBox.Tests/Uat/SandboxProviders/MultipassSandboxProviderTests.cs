@@ -264,6 +264,131 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_RetriesTransientMultipassSocketLaunchFailureAndSucceeds()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var launchCalls = 0;
+        var versionCalls = 0;
+
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+            {
+                versionCalls++;
+                return Task.FromResult(new RunResult(0, "multipass 1.15.0", ""));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                launchCalls++;
+                if (launchCalls == 1)
+                    return Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket"));
+                states[argv[3]] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "info", var name, "--format=csv"])
+            {
+                var state = states.TryGetValue(name, out var current) ? current : "Running";
+                return Task.FromResult(new RunResult(0, state, ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var logger = new RecordingLogger<MultipassSandboxProvider>();
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging"),
+            runner: runner,
+            logger: logger,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = WorkItemId.New(),
+        });
+        await sandbox.DisposeAsync();
+
+        Assert.Equal(2, launchCalls);
+        Assert.Equal(1, versionCalls);
+        Assert.Contains(logger.Entries, e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Information
+            && e.Message.Contains("transient multipass daemon error", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CreateAsync_TransientMultipassSocketLaunchFailureExhaustsRetriesWithClearMessage()
+    {
+        var launchCalls = 0;
+        var versionCalls = 0;
+
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+            {
+                versionCalls++;
+                return Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket"));
+            }
+
+            if (argv.Count >= 2 && argv[1] == "launch")
+            {
+                launchCalls++;
+                return Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket"));
+            }
+
+            if (argv.Count >= 2 && argv[1] == "delete")
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var logger = new RecordingLogger<MultipassSandboxProvider>();
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging"),
+            runner: runner,
+            logger: logger,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "ignored",
+                TimingWorkItemId = WorkItemId.New(),
+            }));
+
+        Assert.Contains("multipass daemon unreachable after 2 retries", ex.Message);
+        Assert.Equal(3, launchCalls);
+        Assert.Equal(3, versionCalls);
+        Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning);
+        Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Error);
+    }
+
+    [Fact]
     public async Task RetryHelper_RetriesTransientSshReadinessWithoutRealDelays()
     {
         var attempts = 0;
@@ -293,7 +418,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         IReadOnlyDictionary<string, string>? networkProfiles = null,
         bool useBaselineImages = false,
         IReadOnlyList<string>? extraRuncmd = null,
-        RecordingMultipassRunner? runner = null)
+        RecordingMultipassRunner? runner = null,
+        RecordingLogger<MultipassSandboxProvider>? logger = null,
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
     {
         var options = new MultipassSandboxOptions
         {
@@ -303,9 +430,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             UseBaselineImages = useBaselineImages,
             ExtraRuncmd = extraRuncmd ?? [],
         };
+        Microsoft.Extensions.Logging.ILogger<MultipassSandboxProvider> resolvedLogger = logger is not null
+            ? logger
+            : NullLogger<MultipassSandboxProvider>.Instance;
 
         return runner is null
-            ? new MultipassSandboxProvider(options, NullLogger<MultipassSandboxProvider>.Instance)
-            : new MultipassSandboxProvider(options, NullLogger<MultipassSandboxProvider>.Instance, null, runner);
+            ? new MultipassSandboxProvider(options, resolvedLogger)
+            : new MultipassSandboxProvider(
+                options,
+                resolvedLogger,
+                null,
+                runner,
+                daemonRetryPolicy);
     }
+
+    private static MultipassDaemonRetryPolicy InstantDaemonRetryPolicy() => new()
+    {
+        Delay = (_, _) => Task.CompletedTask,
+        HealthProbeTimeout = TimeSpan.FromMilliseconds(100),
+    };
 }
