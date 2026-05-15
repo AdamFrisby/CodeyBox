@@ -810,6 +810,73 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_ThrowsAndCleansUpWhenCloudInitWaitReturnsNonZero()
+    {
+        // WaitForVmReadyAsync surfaces cloud-init failures so a half-installed
+        // graphical (or headless) VM doesn't return as a "ready" sandbox handle.
+        // The catch in CreateAsync must also tear down the VM and staging dir
+        // so a failed launch doesn't leak.
+        var staging = Path.Combine(_workspace, "staging-cloud-init-failure");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        string? launchedName = null;
+        string? cloudInitTarget = null;
+        string? deletedName = null;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new RunResult(0, state, ""))
+                    : Task.FromResult(new RunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                launchedName = argv[3];
+                states[launchedName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", var execName, "--", "cloud-init", "status", "--wait"])
+            {
+                cloudInitTarget = execName;
+                return Task.FromResult(new RunResult(3, "", "schema validation failed: bad runcmd"));
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deletedName = deleteName;
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var provider = NewProvider(stagingDirectory: staging, runner: runner);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        Assert.Contains("cloud-init failed", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("schema validation failed: bad runcmd", ex.Message, StringComparison.Ordinal);
+        Assert.NotNull(launchedName);
+        Assert.Contains(launchedName!, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(launchedName, cloudInitTarget);
+        Assert.Equal(launchedName, deletedName);
+        Assert.False(
+            Directory.Exists(Path.Combine(staging, launchedName!)),
+            "staging directory for failed sandbox must be removed during cleanup");
+    }
+
+    [Fact]
     public void LaunchArgv_GraphicalFlavorUsesConfiguredProfileBridge()
     {
         var provider = NewProvider(networkProfiles: new Dictionary<string, string>
