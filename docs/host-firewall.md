@@ -165,11 +165,20 @@ creation — never silently degrades to "no enforcement."
 
 Graphical Multipass sandboxes run `x11vnc` on the conventional graphical
 VNC port (`SandboxConventions.GraphicalVncPort`, currently `5900`), bound
-to loopback inside the VM. The VNC listener is not bound to the VM's
-`10.99.x.x` bridge address, so peers on `cb-graphical` cannot connect to
-another sandbox's desktop at L2. Programmatic screenshots and input use
-`multipass exec` (`scrot`/`xdotool`); expose VNC to humans only through an
-operator-managed loopback tunnel when needed.
+to the VM's `10.99.x.x` graphical bridge address. The service allows only
+the host bridge gateway address, so peer sandboxes on `cb-graphical` are
+not accepted by x11vnc.
+
+For human access, use the loopback-only helper installed by
+`setup-host-networks.sh`:
+
+```bash
+codeybox-vnc-loopback <multipass-vm-name> 5901
+```
+
+Then connect your VNC client to `127.0.0.1:5901`. Programmatic screenshots
+and input use `multipass exec` (`scrot`/`xdotool`); VNC is only an
+operator-facing inspection path.
 
 ## Sandbox staging directory hardening
 

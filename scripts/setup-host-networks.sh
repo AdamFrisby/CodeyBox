@@ -56,6 +56,7 @@ CONFIG_FILE="${1:-/etc/codeybox/networks.conf}"
 NFT_FILE="/etc/nftables.d/codeybox.nft"
 NETWORKD_DIR="/etc/systemd/network"
 MULTIPASS_DEFAULT_IFACE="${CODEYBOX_MULTIPASS_DEFAULT_IFACE:-mpqemubr0}"
+VNC_HELPER="/usr/local/bin/codeybox-vnc-loopback"
 
 if [[ ! -r "$CONFIG_FILE" ]]; then
     cat >&2 <<EOF
@@ -292,6 +293,59 @@ for bridge in "${BRIDGES[@]}"; do
     networkctl reconfigure "$bridge" 2>/dev/null || true
 done
 
+# Install a loopback-only operator helper for graphical VNC access. The VNC
+# server itself listens on the VM's cb-graphical address and allows only the
+# host bridge gateway. This helper is the intended human-facing exposure path:
+# it binds 127.0.0.1 on demand and proxies to one selected VM.
+cat > "$VNC_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat >&2 <<USAGE
+Usage: codeybox-vnc-loopback <multipass-vm-name> [local-port]
+
+Starts a foreground VNC proxy on 127.0.0.1:<local-port> for the selected
+graphical Multipass VM. The remote VNC port defaults to 5900; override with
+CODEYBOX_GRAPHICAL_VNC_PORT if the sandbox convention changes.
+USAGE
+}
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    usage
+    exit 2
+fi
+
+for cmd in multipass systemd-socket-activate systemd-socket-proxyd; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "missing required tool: $cmd" >&2; exit 1; }
+done
+
+vm="$1"
+listen_port="${2:-5900}"
+remote_port="${CODEYBOX_GRAPHICAL_VNC_PORT:-5900}"
+
+if [[ ! "$listen_port" =~ ^[0-9]+$ || "$listen_port" -lt 1 || "$listen_port" -gt 65535 ]]; then
+    echo "invalid local port: $listen_port" >&2
+    exit 2
+fi
+
+addr="$(
+    multipass exec "$vm" -- sh -lc 'ip -4 -o addr show | awk '"'"'/inet 10\.99\./{split($4,a,"/"); print a[1]; exit}'"'"'' |
+        tr -d '\r' |
+        head -n 1
+)"
+
+if [[ -z "$addr" ]]; then
+    echo "VM '$vm' has no 10.99.x.x graphical/profile bridge address" >&2
+    exit 1
+fi
+
+echo "Forwarding VNC: 127.0.0.1:${listen_port} -> ${addr}:${remote_port}" >&2
+echo "Press Ctrl-C to stop." >&2
+exec systemd-socket-activate -l "127.0.0.1:${listen_port}" --inetd -- systemd-socket-proxyd "${addr}:${remote_port}"
+EOF
+chmod 0755 "$VNC_HELPER"
+
 # ---------------------------------------------------------------------------
 # Done — summary.
 # ---------------------------------------------------------------------------
@@ -307,10 +361,12 @@ done
 echo
 echo "✓ nftables rules: $NFT_FILE"
 echo "✓ Default Multipass interface (${MULTIPASS_DEFAULT_IFACE}) forwarding: blocked"
+echo "✓ Graphical VNC loopback helper: $VNC_HELPER"
 echo
 echo "To verify:"
 echo "  multipass networks                  # confirms bridges visible to multipass"
 echo "  multipass launch --network <bridge> # launches VM on that profile"
 echo "  nft list table inet codeybox        # inspects active rules"
+echo "  codeybox-vnc-loopback <vm> 5901     # exposes one graphical VM on 127.0.0.1:5901"
 echo
 echo "Re-run this script after editing $CONFIG_FILE or to refresh resolved IPs."

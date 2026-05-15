@@ -894,7 +894,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private const string GraphicalVncService = """
         [Unit]
         Description=CodeyBox x11vnc bridge
-        After=codeybox-xvfb.service
+        After=network-online.target codeybox-xvfb.service
+        Wants=network-online.target
         Requires=codeybox-xvfb.service
 
         [Service]
@@ -909,7 +910,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private static readonly string GraphicalVncScript = $$"""
         #!/bin/sh
         set -eu
-        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -nopw -listen 127.0.0.1 -localhost -noxdamage -repeat
+        listen_addr=$(ip -4 -o addr show | awk '/inet 10\.99\./{split($4,a,"/"); print a[1]; exit}')
+        if [ -z "${listen_addr:-}" ]; then
+            echo "codeybox-vnc: no 10.99.x.x interface present" >&2
+            exit 1
+        fi
+        host_addr=$(printf '%s\n' "$listen_addr" | awk -F. '{print $1"."$2"."$3".1"}')
+        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -nopw -listen "$listen_addr" -allow "$host_addr" -noxdamage -repeat
         """;
 
     private const string GraphicalInstallRuncmd = """

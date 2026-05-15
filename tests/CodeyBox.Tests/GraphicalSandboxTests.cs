@@ -69,6 +69,27 @@ public sealed class GraphicalSandboxTests
     }
 
     [Fact]
+    public async Task ComputerUseBridge_MapsClickKeyAliasesAndScrollFallbacks()
+    {
+        await using var sandbox = new RecordingGraphicalSandbox(NonUniformPng);
+        var bridge = new ComputerUseBridge();
+
+        await bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "click", X = 11, Y = 12 });
+        await bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "key", Text = "Escape" });
+        await bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "scroll", X = 2 });
+        await bridge.ExecuteAsync(sandbox, new ComputerUseRequest { Action = "scroll", X = 99, ScrollX = -3 });
+
+        Assert.Equal(
+            [
+                new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 11, Y = 12 },
+                new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Escape" },
+                new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = 2 },
+                new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = -3 },
+            ],
+            sandbox.Events);
+    }
+
+    [Fact]
     public async Task ComputerUseBridge_RejectsMissingEventsAndUnsupportedActions()
     {
         await using var sandbox = new RecordingGraphicalSandbox(NonUniformPng);

@@ -54,9 +54,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
         Assert.Contains($"-rfbport {SandboxConventions.GraphicalVncPort}", cloudInit);
-        Assert.Contains("-listen 127.0.0.1", cloudInit);
-        Assert.DoesNotContain("-listen \"$listen_addr\"", cloudInit);
-        Assert.DoesNotContain("codeybox-vnc: no 10.99", cloudInit);
+        Assert.Contains("listen_addr=$(ip -4 -o addr show", cloudInit);
+        Assert.Contains("-listen \"$listen_addr\"", cloudInit);
+        Assert.Contains("-allow \"$host_addr\"", cloudInit);
+        Assert.Contains("codeybox-vnc: no 10.99.x.x interface present", cloudInit);
+        Assert.DoesNotContain("-listen 127.0.0.1", cloudInit);
+        Assert.DoesNotContain("-localhost", cloudInit);
         Assert.Contains("echo project setup", cloudInit);
 
         var headlessCloudInit = MultipassSandboxProvider.BuildCloudInit(
@@ -136,6 +139,36 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             await Assert.ThrowsAnyAsync<ArgumentException>(() =>
                 sandbox.SynthesizeInputAsync([inputEvent]));
         }
+    }
+
+    [Fact]
+    public async Task SynthesizeInputAsync_BuildsExpectedXdotoolCommands()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        await sandbox.SynthesizeInputAsync(
+            [
+                new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 12, Y = 34 },
+                new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Return" },
+                new SandboxInputEvent { Type = SandboxInputEventType.Move, X = 45, Y = 56 },
+                new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = -2 },
+                new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = 3 },
+                new SandboxInputEvent { Type = SandboxInputEventType.Type, Text = "typed text" },
+            ]);
+
+        var commands = runner.Calls.Select(c => ExtractXdotoolCommand(c.Argv)).ToArray();
+        Assert.Equal(
+            [
+                ["env", $"DISPLAY={SandboxConventions.GraphicalDisplay}", "xdotool", "mousemove", "--sync", "12", "34", "click", "1"],
+                ["env", $"DISPLAY={SandboxConventions.GraphicalDisplay}", "xdotool", "key", "--clearmodifiers", "Return"],
+                ["env", $"DISPLAY={SandboxConventions.GraphicalDisplay}", "xdotool", "mousemove", "--sync", "45", "56"],
+                ["env", $"DISPLAY={SandboxConventions.GraphicalDisplay}", "xdotool", "click", "--repeat", "2", "4"],
+                ["env", $"DISPLAY={SandboxConventions.GraphicalDisplay}", "xdotool", "click", "--repeat", "3", "7"],
+                ["env", $"DISPLAY={SandboxConventions.GraphicalDisplay}", "xdotool", "type", "--clearmodifiers", "--delay", "0", "--", "typed text"],
+            ],
+            commands);
     }
 
     [Fact]
@@ -363,6 +396,97 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task BaselineImages_GraphicalFlavorUsesSharedGraphicalBaselineAndInstallsDesktop()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var installCommands = new List<string>();
+        string? baselineLaunchName = null;
+        string? cloneSource = null;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var name, "--format=csv"])
+            {
+                if (states.TryGetValue(name, out var state))
+                    return Task.FromResult(new RunResult(0, state, ""));
+                return Task.FromResult(new RunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                baselineLaunchName = argv[3];
+                states[baselineLaunchName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", var execName, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new RunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
+
+            if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", var command]
+                && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
+            {
+                installCommands.Add(command);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "clone", var source, "--name", var cloneName])
+            {
+                cloneSource = source;
+                states[cloneName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-graphical"),
+            networkProfiles: new Dictionary<string, string>
+            {
+                ["claude"] = "cb-claude",
+                [SandboxConventions.GraphicalNetworkProfile] = "cb-graphical",
+            },
+            useBaselineImages: true,
+            extraRuncmd: ["touch /opt/codeybox-project-tools"],
+            runner: runner);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Flavor = SandboxProfileFlavor.Graphical,
+            Network = new SandboxNetworkPolicy { ProfileName = "claude" },
+            WorkingDirectory = "/work",
+        };
+
+        await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
+
+        Assert.Equal("cb-baseline-graphical", baselineLaunchName);
+        Assert.Equal("cb-baseline-graphical", cloneSource);
+        Assert.Contains(installCommands, cmd =>
+            cmd.Contains("xvfb x11vnc xfce4", StringComparison.Ordinal)
+            && cmd.Contains("xdotool scrot ffmpeg", StringComparison.Ordinal));
+        Assert.Contains(installCommands, cmd =>
+            cmd.Contains("touch /opt/codeybox-project-tools", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task RetryHelper_RetriesTransientSshReadinessWithoutRealDelays()
     {
         var attempts = 0;
@@ -412,6 +536,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         SandboxProfileFlavor flavor,
         Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> handler)
     {
+        return NewMultipassSandbox(flavor, new RecordingMultipassRunner(handler));
+    }
+
+    private MultipassSandbox NewMultipassSandbox(
+        SandboxProfileFlavor flavor,
+        RecordingMultipassRunner runner)
+    {
         return new MultipassSandbox(
             "codeybox-test",
             _workspace,
@@ -423,6 +554,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             },
             new MultipassSandboxOptions { MultipassBinary = "/bin/true" },
             NullLogger<MultipassSandboxProvider>.Instance,
-            runner: new RecordingMultipassRunner(handler));
+            runner: runner);
+    }
+
+    private static string[] ExtractXdotoolCommand(IReadOnlyList<string> argv)
+    {
+        var envIndex = argv.ToList().IndexOf("env");
+        Assert.True(envIndex >= 0, "missing xdotool env command in argv: " + JsonSerializer.Serialize(argv));
+        return argv.Skip(envIndex).ToArray();
     }
 }
