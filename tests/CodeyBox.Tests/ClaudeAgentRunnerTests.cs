@@ -85,15 +85,21 @@ public sealed class ClaudeAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_PromptIsLastArgument()
+    public async Task RunAsync_PromptIsPassedViaStdin()
     {
+        // Linux's MAX_ARG_STRLEN is 128 KiB per single argv element; large rework
+        // prompts that include many audit findings exceed this and surface as
+        // exit 126 from the sandbox wrapper's `exec "$@"`. The runner now passes
+        // the prompt via stdin so it isn't bounded by argv-string limits. claude
+        // --print reads stdin when no positional prompt is given.
         const string prompt = "write a test";
         var sandbox = new CapturingSandbox();
         var runner = new ClaudeAgentRunner();
 
         await runner.RunAsync(sandbox, "/work", prompt, credential: null);
 
-        Assert.Equal(prompt, sandbox.CapturedExec!.Argv[^1]);
+        Assert.DoesNotContain(prompt, sandbox.CapturedExec!.Argv);
+        Assert.Equal(prompt, sandbox.CapturedExec!.Stdin);
     }
 
     // ── Reasoning-mode plumbing ───────────────────────────────────────────────

@@ -128,9 +128,15 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         // default thinking budget. So ReasoningMode is informational only on
         // this runner — picking a gemini-3-* ModelId is what gives "high".
         _ = reasoningMode;
-        argv.Add("-p");
-        argv.Add(prompt);
-        return new AgentInvocation(argv);
+        // Pass the prompt via stdin rather than as a positional argv. Linux's
+        // MAX_ARG_STRLEN is 128 KiB per single argv element; rework prompts that
+        // include many audit findings can exceed that and surface as exit 126
+        // from the sandbox wrapper's `exec "$@"`. gemini-cli's -p flag's docstring
+        // says "Appended to input on stdin (if any)" — so we drop -p entirely and
+        // feed the prompt as stdin, which the CLI treats as the primary prompt.
+        // The sandbox wrapper forwards stdin automatically when SandboxExec.Stdin
+        // is non-null, via its --keep-stdin path.
+        return new AgentInvocation(argv, Stdin: prompt);
     }
 
     public async Task<TextOnlyAgentResult> RunTextOnlyAsync(

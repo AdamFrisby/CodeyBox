@@ -208,8 +208,14 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             argv.Add("-c");
             argv.Add($"model_reasoning_effort={reasoningMode}");
         }
-        argv.Add(prompt);
-        return new AgentInvocation(argv);
+        // Pass the prompt via stdin rather than as a positional argv. Linux's
+        // MAX_ARG_STRLEN is 128 KiB per single argv element; rework prompts that
+        // include many audit findings can exceed that and surface as exit 126
+        // from the sandbox wrapper's `exec "$@"`. `codex exec` reads instructions
+        // from stdin when no positional prompt is given (per its --help). The
+        // sandbox wrapper forwards stdin automatically when SandboxExec.Stdin is
+        // non-null, via its --keep-stdin path.
+        return new AgentInvocation(argv, Stdin: prompt);
     }
 
     private async Task<string?> DetectStructuredStreamFlagAsync(ISandbox sandbox, CancellationToken ct)

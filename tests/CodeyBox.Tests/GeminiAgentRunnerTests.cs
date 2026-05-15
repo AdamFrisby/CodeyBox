@@ -66,8 +66,12 @@ public sealed class GeminiAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_Argv_PassesPromptAfterDashP()
+    public async Task RunAsync_PromptIsPassedViaStdin()
     {
+        // Argv-passed prompts that exceed Linux's MAX_ARG_STRLEN (128 KiB per
+        // single arg) surface as exit 126 from the sandbox wrapper's `exec "$@"`.
+        // gemini-cli's -p flag docstring already documents "Appended to input on
+        // stdin (if any)", so feeding the prompt as stdin works without -p.
         const string prompt = "write a fizzbuzz in Go";
         var sandbox = new CapturingSandbox();
         var runner = new GeminiAgentRunner();
@@ -75,9 +79,9 @@ public sealed class GeminiAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", prompt, credential: null);
 
         var argv = sandbox.CapturedExec!.Argv.ToList();
-        var pIdx = argv.IndexOf("-p");
-        Assert.True(pIdx >= 0, "argv must contain -p flag");
-        Assert.Equal(prompt, argv[pIdx + 1]);
+        Assert.DoesNotContain(prompt, argv);
+        Assert.DoesNotContain("-p", argv);
+        Assert.Equal(prompt, sandbox.CapturedExec!.Stdin);
     }
 
     [Fact]
@@ -174,19 +178,9 @@ public sealed class GeminiAgentRunnerTests
         Assert.Equal("/opt/gemini/bin/gemini", sandbox.CapturedExec!.Argv[0]);
     }
 
-    // ── Prompt not on argv before -p ─────────────────────────────────────────
-
-    [Fact]
-    public async Task RunAsync_PromptIsLastArgument()
-    {
-        const string prompt = "my prompt";
-        var sandbox = new CapturingSandbox();
-        var runner = new GeminiAgentRunner();
-
-        await runner.RunAsync(sandbox, "/work", prompt, credential: null);
-
-        Assert.Equal(prompt, sandbox.CapturedExec!.Argv[^1]);
-    }
+    // The prompt-via-stdin contract is covered by RunAsync_PromptIsPassedViaStdin
+    // above; no separate "last argument" test is meaningful now that the prompt
+    // is no longer on argv at all.
 
     // ── Success / failure propagation ─────────────────────────────────────────
 

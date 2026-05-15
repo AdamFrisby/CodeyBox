@@ -53,7 +53,10 @@ public sealed class ConcreteAgentRunnerUatTests
         AssertFlagValue(argv, "--effort", "high");
         AssertFlagValue(argv, "--output-format", "stream-json");
         Assert.Contains("--verbose", argv);
-        Assert.Equal("ship it", argv[^1]);
+        // Prompt passed via stdin (claude --print reads stdin when no positional)
+        // to dodge Linux's 128 KiB per-argv MAX_ARG_STRLEN ceiling.
+        Assert.DoesNotContain("ship it", argv);
+        Assert.Equal("ship it", sandbox.Execs[2].Stdin);
     }
 
     [Fact]
@@ -81,7 +84,10 @@ public sealed class ConcreteAgentRunnerUatTests
         Assert.Contains("--json-stream", argv);
         AssertFlagValue(argv, "--model", "gpt-5.5");
         AssertFlagValue(argv, "-c", "model_reasoning_effort=medium");
-        Assert.Equal("implement", argv[^1]);
+        // Prompt passed via stdin (codex exec reads stdin when no positional)
+        // to dodge Linux's 128 KiB per-argv MAX_ARG_STRLEN ceiling.
+        Assert.DoesNotContain("implement", argv);
+        Assert.Equal("implement", sandbox.Execs[2].Stdin);
     }
 
     [Fact]
@@ -117,7 +123,12 @@ public sealed class ConcreteAgentRunnerUatTests
         Assert.Contains("--skip-trust", argv);
         AssertFlagValue(argv, "--output-format", "stream-json");
         AssertFlagValue(argv, "--model", "gemini-3-pro-preview");
-        AssertFlagValue(argv, "-p", "build");
+        // Prompt passed via stdin (gemini-cli appends -p's value onto stdin per
+        // its own docs; we skip -p entirely so stdin IS the prompt) to dodge
+        // Linux's 128 KiB per-argv MAX_ARG_STRLEN ceiling.
+        Assert.DoesNotContain("-p", argv);
+        Assert.DoesNotContain("build", argv);
+        Assert.Equal("build", sandbox.Execs[2].Stdin);
         Assert.DoesNotContain("--thinking", argv);
         Assert.DoesNotContain("--reasoning", argv);
         Assert.DoesNotContain("--effort", argv);
