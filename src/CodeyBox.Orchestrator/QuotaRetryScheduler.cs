@@ -92,6 +92,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
                 count++;
             }
         }
+        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        {
+            if (item.NextQuotaRetryAt.HasValue)
+            {
+                ScheduleTargetedRetry(item.Id, item.NextQuotaRetryAt.Value);
+                count++;
+            }
+        }
         _log.LogInformation("Re-armed {Count} quota retry timers", count);
     }
 
@@ -104,6 +112,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
             {
                 await TryRetryAsync(item, "periodic", ct);
             }
+        }
+        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        {
+            await TryRetryAsync(item, "periodic", ct);
         }
     }
 
@@ -133,7 +145,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
             try
             {
                 var item = await _store.GetAsync(id, CancellationToken.None);
-                if (item is { State: WorkItemState.Failed, FailureKind: "quota" })
+                if (item is { State: WorkItemState.Failed, FailureKind: "quota" }
+                    || item is { State: WorkItemState.WaitingForQuotaReset })
                 {
                     await TryRetryAsync(item, "targeted", CancellationToken.None);
                 }
@@ -238,18 +251,25 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     public async Task NotifyQuotaFailureAsync(WorkItem item)
     {
         if (!_opts.AutoRetryOnQuotaFailure.Enabled) return;
-        if (item.State != WorkItemState.Failed || item.FailureKind != "quota" || !item.QuotaResetAt.HasValue) return;
+        var isQuotaFailed = item.State == WorkItemState.Failed && item.FailureKind == "quota";
+        var isWaitingReset = item.State == WorkItemState.WaitingForQuotaReset;
+        if (!isQuotaFailed && !isWaitingReset) return;
 
-        var nextRetryAt = item.QuotaResetAt.Value.Add(_opts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin);
+        // Compute next retry: prefer a parsed reset-window plus the operator's
+        // safety margin; fall back to the existing NextQuotaRetryAt if already
+        // set by the pipeline; otherwise wake on the next periodic sweep.
+        DateTimeOffset? nextRetryAt = item.QuotaResetAt is { } reset
+            ? reset.Add(_opts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin)
+            : item.NextQuotaRetryAt;
+        if (nextRetryAt is null) return;
 
-        // Update the work item with the next retry time so it survives restarts.
         try
         {
-            // We use TryUpdateIfStateAsync to avoid overwriting if it already transitioned.
-            var updated = await _store.TryUpdateIfStateAsync(item with { NextQuotaRetryAt = nextRetryAt }, WorkItemState.Failed, CancellationToken.None);
+            var updated = await _store.TryUpdateIfStateAsync(
+                item with { NextQuotaRetryAt = nextRetryAt }, item.State, CancellationToken.None);
             if (updated)
             {
-                ScheduleTargetedRetry(item.Id, nextRetryAt);
+                ScheduleTargetedRetry(item.Id, nextRetryAt.Value);
             }
         }
         catch (Exception ex)

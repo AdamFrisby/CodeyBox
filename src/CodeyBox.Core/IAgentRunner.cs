@@ -23,6 +23,22 @@ public interface IAgentRunner
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false);
+
+    /// <summary>
+    /// Classifies a failed <see cref="AgentResult"/> into a structured
+    /// <see cref="AgentFailureKind"/> so the pipeline can decide whether to
+    /// retry the iteration against the next-best class member (quota), surface
+    /// a transient retry hint (network), or fail the work item (normal /
+    /// auth). The default implementation runs the shared
+    /// <see cref="AgentFailureClassifier"/> heuristics; runners with
+    /// CLI-specific failure shapes can override.
+    /// </summary>
+    AgentFailureClassification ClassifyFailure(AgentResult result)
+    {
+        if (result.Success)
+            return new AgentFailureClassification(AgentFailureKind.Normal);
+        return AgentFailureClassifier.Classify(result.Stderr, result.Stdout);
+    }
 }
 
 /// <summary>

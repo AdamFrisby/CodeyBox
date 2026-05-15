@@ -1060,7 +1060,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IStdoutBroadcaster>(),
     sp.GetService<IAgentStreamStore>(),
     sp.GetService<IQuotaFailureStore>(),
-    sp.GetRequiredService<QuotaRetryScheduler>()));
+    sp.GetRequiredService<QuotaRetryScheduler>(),
+    sp.GetService<AgentClassRouter>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

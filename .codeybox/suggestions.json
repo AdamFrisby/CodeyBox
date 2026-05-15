@@ -1,0 +1,38 @@
+{
+  "suggestions": [
+    {
+      "title": "Extend in-iteration quota fallback to audit and merge phases",
+      "rationale": "The mid-iteration quota fallback wrapper added in this work item only wraps the work phase invocation in PipelineRunner.RunAsync. The audit-loop's RunAgentPhaseAsync (rework iterations) and RunAgentMergePhaseAsync still throw TerminalQuotaError directly when the chosen agent hits quota mid-flight, which fails the work item rather than retrying the same iteration against the next class member. The wrapper InvokeAgentWithQuotaFallbackAsync is general enough to be reused — the call sites just need to thread a (runner, trialItem) closure the same way the work phase does. Scope was limited to the work phase in the initial change to keep the blast radius small for the operator audit; audit/merge mid-iteration quota events are still operator-visible failures today.",
+      "category": "other",
+      "severity": "notable",
+      "estimatedEffort": "medium",
+      "filesReferenced": [
+        "src/CodeyBox.Orchestrator/PipelineRunner.cs"
+      ]
+    },
+    {
+      "title": "Per-runner ClassifyFailure overrides for CLI-specific signatures",
+      "rationale": "IAgentRunner.ClassifyFailure has a default body that delegates to AgentFailureClassifier (substring patterns over stderr+stdout). The work item spec says 'Each runner implements its own heuristics; patterns in a config dict for tuning.' — the default classifier is a good baseline but each runner could override to (a) parse its specific structured-stream JSON envelope (codex turn.failed events, claude type=result subtype=error_during_execution, gemini status=error blocks) for higher precision, and (b) extract precise reset windows from the CLI's own error messages instead of relying on the orchestrator-side QuotaFailureDetector regex. Today no runner overrides; the default is sufficient for current patterns but per-runner overrides would let new CLI failure shapes be added without touching shared code.",
+      "category": "refactor",
+      "severity": "minor",
+      "estimatedEffort": "small",
+      "filesReferenced": [
+        "src/CodeyBox.Agents.Codex/CodexAgentRunner.cs",
+        "src/CodeyBox.Agents.Claude/ClaudeAgentRunner.cs",
+        "src/CodeyBox.Agents.Gemini/GeminiAgentRunner.cs",
+        "src/CodeyBox.Core/AgentFailureClassifier.cs"
+      ]
+    },
+    {
+      "title": "Webhook event \"work_item.waiting_for_quota_reset\" is not in the documented webhook taxonomy",
+      "rationale": "The new transition publishes a webhook event named 'work_item.waiting_for_quota_reset' from PipelineRunner.TransitionWaitingForQuotaResetAsync. docs/webhooks.md (and the related JSON schema if any) should be updated to list this event and its details payload (AgentFallbackDetails). Operators rely on the doc as the source of truth for what to subscribe to; an undocumented event is silently invisible to anyone wiring routes from the docs.",
+      "category": "docs",
+      "severity": "notable",
+      "estimatedEffort": "tiny",
+      "filesReferenced": [
+        "docs/webhooks.md",
+        "src/CodeyBox.Orchestrator/PipelineRunner.cs"
+      ]
+    }
+  ]
+}
