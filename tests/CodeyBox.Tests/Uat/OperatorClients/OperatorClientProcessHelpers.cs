@@ -14,6 +14,22 @@ internal static class OperatorClientPaths
     internal static string CliProject =>
         Path.Combine(RepoRoot, "tools", "CodeyBox.Cli", "CodeyBox.Cli.csproj");
 
+    /// <summary>
+    /// Pre-built CLI dll produced by the CodeyBox.Tests project's build-only
+    /// reference to CodeyBox.Cli. Executing this directly with `dotnet path/to/dll`
+    /// avoids the per-invocation `dotnet run` rebuild that can exceed the test
+    /// timeout under cold sandbox caches.
+    /// </summary>
+    internal static string CliDll =>
+        Path.Combine(RepoRoot, "tools", "CodeyBox.Cli", "bin",
+            BuildConfiguration, "net10.0", "CodeyBox.Cli.dll");
+
+#if DEBUG
+    private const string BuildConfiguration = "Debug";
+#else
+    private const string BuildConfiguration = "Release";
+#endif
+
     private static string FindRepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
@@ -35,14 +51,10 @@ internal static partial class OperatorClientProcess
         IDictionary<string, string?>? environment = null,
         string? stdin = null)
     {
-        var dotnetArgs = new List<string>
-        {
-            "run",
-            "--project",
-            OperatorClientPaths.CliProject,
-            "--no-launch-profile",
-            "--",
-        };
+        // Execute the already-built dll directly. The CLI is pulled in as a
+        // build-only ProjectReference in CodeyBox.Tests.csproj, so the dll is
+        // guaranteed to exist whenever the test assembly is built.
+        var dotnetArgs = new List<string> { OperatorClientPaths.CliDll };
         dotnetArgs.AddRange(args);
         return RunDotnetAsync(dotnetArgs, environment, stdin);
     }

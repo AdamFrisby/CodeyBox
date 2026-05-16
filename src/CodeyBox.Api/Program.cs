@@ -769,11 +769,19 @@ builder.Services.AddHttpClient("webhook")
     {
         AllowAutoRedirect = false,
     });
-builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
+builder.Services.AddSingleton<WebhookEventBroadcaster>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    // WebhookEventBroadcaster's constructor enforces capacity >= 1 and throws
+    // ArgumentOutOfRangeException with a clear message naming the bad value.
+    return new WebhookEventBroadcaster(opts.WebhookEventBus.RingBufferCapacity);
+});
+builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
+{
+    var broadcaster = sp.GetRequiredService<WebhookEventBroadcaster>();
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     if (opts.Webhooks.Count == 0)
-        return new NullWebhookDispatcher();
+        return new BroadcastingWebhookDispatcher(broadcaster, new NullWebhookDispatcher());
 
     var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     var endpointConfigs = opts.Webhooks.Select(w =>
@@ -805,10 +813,11 @@ builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
         };
     }).ToList();
 
-    return new HttpWebhookDispatcher(
+    var http = new HttpWebhookDispatcher(
         new WebhookDispatcherOptions { Endpoints = endpointConfigs },
         sp.GetRequiredService<IHttpClientFactory>(),
         sp.GetRequiredService<ILogger<HttpWebhookDispatcher>>());
+    return new BroadcastingWebhookDispatcher(broadcaster, http);
 });
 
 // --- Changelog automation ----------------------------------------------------
@@ -1189,6 +1198,7 @@ WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 AgentStreamEndpoints.Map(app);
+SseEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
 FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
@@ -1515,6 +1525,14 @@ namespace CodeyBox.Api
         public List<WebhookEndpointOptions> Webhooks { get; set; } = [];
 
         /// <summary>
+        /// In-process event broadcaster used by the SSE endpoints
+        /// (<c>GET /workitems/events</c> and <c>GET /workitems/{id}/events</c>).
+        /// Shared with the webhook dispatcher so SSE subscribers and webhook
+        /// receivers see the same event surface.
+        /// </summary>
+        public WebhookEventBusOptions WebhookEventBus { get; set; } = new();
+
+        /// <summary>
         /// Audit log configuration: rolling file paths, retention, and size caps.
         /// </summary>
         public AuditLogOptions AuditLog { get; set; } = new();
@@ -1788,6 +1806,28 @@ namespace CodeyBox.Api
         public int MaxAttempts { get; set; } = 3;
         public int InitialBackoffSeconds { get; set; } = 1;
         public int TimeoutSeconds { get; set; } = 10;
+    }
+
+    /// <summary>
+    /// In-process event broadcaster configuration. Drives both the SSE
+    /// endpoints' Last-Event-ID replay and the per-work-item ring buffer
+    /// size used to feed reconnecting clients.
+    /// </summary>
+    public sealed class WebhookEventBusOptions
+    {
+        /// <summary>
+        /// Number of recent events retained per work item (and globally)
+        /// for SSE Last-Event-ID resume. Older events are evicted FIFO.
+        /// </summary>
+        public int RingBufferCapacity { get; set; } = 1000;
+
+        /// <summary>
+        /// How often the SSE handler emits a ':keepalive' comment when the
+        /// stream is otherwise idle. Default 15s — half of AWS ALB's 60s
+        /// idle timeout, so proxies don't reap connections that are simply
+        /// not transmitting events.
+        /// </summary>
+        public int HeartbeatSeconds { get; set; } = 15;
     }
 
     /// <summary>
