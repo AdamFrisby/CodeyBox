@@ -330,6 +330,14 @@ public sealed class OrchestratorService : BackgroundService
     internal Task ReplayPendingForTestAsync(CancellationToken ct) => ReplayPendingAsync(ct);
     internal WorkItem? TryBuildRecoveredStateForTest(WorkItem item) => TryBuildRecoveredState(item);
 
+    // Exposed as internal so tests can verify the deferred-pickup contract
+    // without spinning the BackgroundService: PickNextEligibleAsync must skip
+    // items in _deferredItems, and a kick on the queue must clear the deferral.
+    internal Task<WorkItemId?> PickNextEligibleForTestAsync(CancellationToken ct)
+        => PickNextEligibleAsync(ct);
+    internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
+    internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
+
     /// <summary>
     /// On startup, re-enqueue work items that were mid-flight when we last
     /// stopped. Items in non-Queued non-terminal states are reset to a recoverable

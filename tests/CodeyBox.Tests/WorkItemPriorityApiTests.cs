@@ -125,6 +125,22 @@ public sealed class WorkItemPriorityApiTests : IDisposable
     }
 
     [Fact]
+    public async Task PatchPriority_ExceedsProjectCap_Returns400()
+    {
+        var created = await _client.PostAsJsonAsync("/workitems",
+            CreateBody(projectId: "capped-project", priority: 100));
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        var dto = await created.Content.ReadFromJsonAsync<PriorityDto>();
+
+        // 500 is within the global [-1000, 1000] but above the project's MaxPriority=200.
+        var patch = await _client.PatchAsJsonAsync($"/workitems/{dto!.Id}/priority", new { priority = 500 });
+        Assert.Equal(HttpStatusCode.BadRequest, patch.StatusCode);
+
+        var fetched = await _client.GetFromJsonAsync<PriorityDto>($"/workitems/{dto.Id}");
+        Assert.Equal(100, fetched!.Priority);
+    }
+
+    [Fact]
     public async Task PatchPriority_OnNonQueuedItem_StillRecordsButHasNoFlightEffect()
     {
         // The spec says PATCH on a Working/Auditing item is allowed (stored) but doesn't
