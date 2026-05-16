@@ -152,5 +152,28 @@ public sealed class WorkItemPriorityApiTests : IDisposable
         Assert.Equal(HttpStatusCode.NotFound, patch.StatusCode);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Done)]
+    [InlineData(WorkItemState.Failed)]
+    [InlineData(WorkItemState.Cancelled)]
+    [InlineData(WorkItemState.AuditFailed)]
+    public async Task PatchPriority_TerminalState_Returns409(WorkItemState terminalState)
+    {
+        // Terminal items must not silently mutate; priority cannot affect them
+        // and changing closed history records is undesirable (audit/compliance).
+        var created = await _client.PostAsJsonAsync("/workitems", CreateBody(priority: 100));
+        var dto = await created.Content.ReadFromJsonAsync<PriorityDto>();
+        var id = WorkItemId.Parse(dto!.Id);
+        var item = await _factory.Store.GetAsync(id);
+        await _factory.Store.UpdateAsync(item! with { State = terminalState });
+
+        var patch = await _client.PatchAsJsonAsync($"/workitems/{id}/priority", new { priority = 999 });
+        Assert.Equal(HttpStatusCode.Conflict, patch.StatusCode);
+
+        var refreshed = await _factory.Store.GetAsync(id);
+        Assert.Equal(100, refreshed!.Priority);
+        Assert.Equal(terminalState, refreshed.State);
+    }
+
     private sealed record PriorityDto(string Id, int Priority);
 }

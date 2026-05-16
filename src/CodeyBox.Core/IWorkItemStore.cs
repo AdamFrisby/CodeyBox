@@ -1,6 +1,27 @@
 namespace CodeyBox.Core;
 
 /// <summary>
+/// Outcome of <see cref="IWorkItemStore.UpdatePriorityAsync"/>.
+/// </summary>
+public enum PriorityUpdateOutcome
+{
+    /// <summary>The row was updated and the new priority is persisted.</summary>
+    Updated,
+    /// <summary>The row no longer exists.</summary>
+    NotFound,
+    /// <summary>The row exists but is in a terminal state; no write was issued.</summary>
+    TerminalState,
+}
+
+/// <summary>
+/// Result returned by <see cref="IWorkItemStore.UpdatePriorityAsync"/>.
+/// <see cref="Item"/> is populated on <see cref="PriorityUpdateOutcome.Updated"/>
+/// and on <see cref="PriorityUpdateOutcome.TerminalState"/> (so callers can
+/// surface the current state to the client); null on <see cref="PriorityUpdateOutcome.NotFound"/>.
+/// </summary>
+public readonly record struct PriorityUpdateResult(PriorityUpdateOutcome Outcome, WorkItem? Item, int? OldPriority);
+
+/// <summary>
 /// Durable store of work items. Survives orchestrator restart so in-flight
 /// items can be recovered and replayed.
 /// </summary>
@@ -10,6 +31,18 @@ public interface IWorkItemStore
     Task UpdateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>Updates the item only when its persisted state still matches <paramref name="onlyIfState"/>. Returns true if the row was updated.</summary>
     Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default);
+
+    /// <summary>
+    /// Partial UPDATE that touches only the <c>priority</c> and <c>updated_at</c>
+    /// columns for the row identified by <paramref name="id"/>. Avoids the TOCTOU
+    /// race that a full-row <see cref="UpdateAsync"/> introduces when a concurrent
+    /// worker transitions the item out of Queued between caller read and write
+    /// (a full-row write would stomp <c>state</c>, <c>started_at</c>, etc).
+    /// Returns the persisted item after the write, or null if the row no longer
+    /// exists, or a tuple flag indicating the row was in a terminal state and was
+    /// not modified.
+    /// </summary>
+    Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default);
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);

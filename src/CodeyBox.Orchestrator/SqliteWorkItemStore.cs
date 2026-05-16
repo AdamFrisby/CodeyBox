@@ -273,6 +273,54 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         return await reader.ReadAsync(ct) ? Read(reader) : null;
     }
 
+    public async Task<PriorityUpdateResult> UpdatePriorityAsync(
+        WorkItemId id,
+        int priority,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            // Read current row under the write lock so a concurrent worker can't
+            // transition the row between the read and the partial UPDATE below.
+            WorkItem? current;
+            using (var read = _conn.CreateCommand())
+            {
+                read.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                read.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await read.ExecuteReaderAsync(ct);
+                current = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+
+            if (current is null)
+                return new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null);
+
+            if (WorkItemDependencies.TerminalStates.Contains(current.State))
+                return new PriorityUpdateResult(PriorityUpdateOutcome.TerminalState, current, current.Priority);
+
+            // Partial UPDATE: touch only priority + updated_at. Crucially does NOT
+            // write state/started_at/recovery_attempts/etc, so a worker that picks
+            // the item up concurrently isn't stomped.
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET priority = $priority, updated_at = $updated_at
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$priority", priority);
+            cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            var updated = current with { Priority = priority, UpdatedAt = updatedAt };
+            return new PriorityUpdateResult(PriorityUpdateOutcome.Updated, updated, current.Priority);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         using var cmd = _conn.CreateCommand();

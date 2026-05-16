@@ -226,6 +226,76 @@ public sealed class WorkItemPriorityTests : IDisposable
     }
 
     [Fact]
+    public async Task UpdatePriorityAsync_DoesNotStompConcurrentStateTransition()
+    {
+        // Regression: a previous implementation of PATCH /priority did a full-row
+        // UpdateAsync from a stale in-memory snapshot. If the worker transitioned
+        // the item Queued→Working between the API's read and write, the partial
+        // PATCH would stomp state back to Queued (and reset started_at, etc).
+        // UpdatePriorityAsync must touch only priority + updated_at.
+        var startedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var item = MakeItem(priority: 0);
+        await _store.CreateAsync(item);
+
+        // Simulate the worker transitioning the item out of Queued AFTER the
+        // hypothetical PATCH read but BEFORE the partial UPDATE. Use the
+        // store's normal UpdateAsync because that's what the orchestrator
+        // would call.
+        var workingNow = item with
+        {
+            State = WorkItemState.Working,
+            StartedAt = startedAt,
+            UpdatedAt = startedAt,
+            RecoveryAttempts = 3,
+        };
+        await _store.UpdateAsync(workingNow);
+
+        // Now PATCH priority using only the WorkItemId — the partial UPDATE must
+        // not regress state, started_at, or recovery_attempts.
+        var patchedAt = DateTimeOffset.UtcNow;
+        var result = await _store.UpdatePriorityAsync(item.Id, 250, patchedAt);
+        Assert.Equal(PriorityUpdateOutcome.Updated, result.Outcome);
+        Assert.Equal(0, result.OldPriority);
+        Assert.Equal(250, result.Item!.Priority);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.Equal(250, read!.Priority);
+        Assert.Equal(WorkItemState.Working, read.State);
+        Assert.Equal(startedAt, read.StartedAt);
+        Assert.Equal(3, read.RecoveryAttempts);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Done)]
+    [InlineData(WorkItemState.Failed)]
+    [InlineData(WorkItemState.Cancelled)]
+    [InlineData(WorkItemState.AuditFailed)]
+    [InlineData(WorkItemState.MergeConflictResolutionFailed)]
+    [InlineData(WorkItemState.AbandonedAfterRecoveryAttempts)]
+    public async Task UpdatePriorityAsync_RejectsTerminalStates(WorkItemState terminalState)
+    {
+        var item = MakeItem(priority: 100) with { State = terminalState };
+        await _store.CreateAsync(item);
+
+        var result = await _store.UpdatePriorityAsync(item.Id, 500, DateTimeOffset.UtcNow);
+        Assert.Equal(PriorityUpdateOutcome.TerminalState, result.Outcome);
+        Assert.NotNull(result.Item);
+        Assert.Equal(terminalState, result.Item!.State);
+
+        // Priority must not have been mutated on a terminal row.
+        var read = await _store.GetAsync(item.Id);
+        Assert.Equal(100, read!.Priority);
+    }
+
+    [Fact]
+    public async Task UpdatePriorityAsync_NotFound_ForMissingId()
+    {
+        var result = await _store.UpdatePriorityAsync(WorkItemId.New(), 100, DateTimeOffset.UtcNow);
+        Assert.Equal(PriorityUpdateOutcome.NotFound, result.Outcome);
+        Assert.Null(result.Item);
+    }
+
+    [Fact]
     public async Task PriorityPersistsAcrossOrchestratorRestart()
     {
         var item = MakeItem(priority: 750);

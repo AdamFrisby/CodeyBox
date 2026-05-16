@@ -880,10 +880,16 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
-    /// Update the dispatch priority of a work item. Allowed in any state, but only
-    /// affects pickup order while the item is still Queued — in-flight items run to
-    /// terminal state regardless of priority changes. The orchestrator's next dispatch
-    /// tick re-reads the store, so a bumped Queued item jumps ahead immediately.
+    /// Update the dispatch priority of a work item. Allowed for non-terminal
+    /// states; only affects pickup order while the item is still Queued —
+    /// in-flight items run to terminal state regardless of priority changes.
+    /// Terminal items (Done / Failed / Cancelled / AuditFailed /
+    /// MergeConflictResolutionFailed / AbandonedAfterRecoveryAttempts) reject
+    /// with 409 because priority cannot affect them and silently mutating
+    /// closed history is undesirable. The write goes through a partial UPDATE
+    /// touching only the priority and updated_at columns, so a concurrent
+    /// worker picking the item up between the read and the write is not
+    /// stomped (TOCTOU-safe).
     /// </summary>
     private static async Task<IResult> PatchPriorityAsync(
         string id,
@@ -903,12 +909,31 @@ internal static class WorkItemEndpoints
         var priorityError = ValidatePriority(body.Priority, project);
         if (priorityError is not null) return priorityError;
 
+        if (WorkItemDependencies.TerminalStates.Contains(item.State))
+            return Results.Conflict(new
+            {
+                error = $"cannot change priority of work item in terminal state '{item.State}'",
+            });
+
         if (item.Priority == body.Priority)
             return Results.Ok(new { id = item.Id.ToString(), priority = body.Priority, status = "no-op" });
 
-        var updated = item with { Priority = body.Priority, UpdatedAt = DateTimeOffset.UtcNow };
-        await store.UpdateAsync(updated, ct);
-        AuditLog.WorkItemPatched(updated.Id, titleChanged: false, promptChanged: false, agentChanged: false);
+        var result = await store.UpdatePriorityAsync(item.Id, body.Priority, DateTimeOffset.UtcNow, ct);
+        switch (result.Outcome)
+        {
+            case PriorityUpdateOutcome.NotFound:
+                return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+            case PriorityUpdateOutcome.TerminalState:
+                // The item raced into a terminal state between the read above and
+                // the partial UPDATE; surface 409 like the pre-check would have.
+                return Results.Conflict(new
+                {
+                    error = $"work item transitioned to terminal state '{result.Item!.State}' before priority could be updated",
+                });
+        }
+
+        var updated = result.Item!;
+        AuditLog.WorkItemPriorityChanged(updated.Id, result.OldPriority ?? item.Priority, updated.Priority);
 
         // Kick the dispatcher so the new ordering is picked up immediately when the
         // item is still Queued. Harmless for in-flight items: the dispatch loop will
