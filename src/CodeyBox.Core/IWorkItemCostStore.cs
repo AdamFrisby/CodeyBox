@@ -41,4 +41,38 @@ public interface IWorkItemCostStore
     /// </summary>
     Task<decimal> SumEstimatedUsdAsync(
         string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
+
+    /// <summary>
+    /// Aggregates the cost rows for <paramref name="workItemId"/> into a per-iteration
+    /// delta (the most recent iteration's contribution) and a cumulative total across
+    /// every iteration. Returns null when no cost rows exist for the work item — the
+    /// API and webhook layers treat this as "usage unknown" and omit the block.
+    ///
+    /// Default implementation reads via <see cref="GetByWorkItemAsync"/> and reduces
+    /// in memory; override for stores that can compute the aggregation server-side.
+    /// </summary>
+    async Task<WorkItemUsageSummary?> SummariseAsync(string workItemId, CancellationToken ct = default)
+    {
+        var rows = await GetByWorkItemAsync(workItemId, ct);
+        return WorkItemUsageAggregator.Summarise(rows);
+    }
+
+    /// <summary>
+    /// Batched summarisation: returns one entry per <paramref name="workItemIds"/>
+    /// member that has cost rows (missing entries → "usage unknown" at the call site).
+    /// The default implementation falls back to per-item <see cref="GetByWorkItemAsync"/>
+    /// calls; SQLite-backed stores override with a single SELECT … WHERE IN (...) to
+    /// avoid N+1 round-trips on the list endpoint.
+    /// </summary>
+    async Task<IReadOnlyDictionary<string, WorkItemUsageSummary>> SummariseManyAsync(
+        IReadOnlyCollection<string> workItemIds, CancellationToken ct = default)
+    {
+        var results = new Dictionary<string, WorkItemUsageSummary>(workItemIds.Count, StringComparer.Ordinal);
+        foreach (var id in workItemIds)
+        {
+            var summary = await SummariseAsync(id, ct);
+            if (summary is not null) results[id] = summary;
+        }
+        return results;
+    }
 }

@@ -30,4 +30,18 @@ public sealed record WebhookEvent
     /// Null for work-item and agent events.
     /// </summary>
     public Release? Release { get; init; }
+
+    /// <summary>
+    /// Token usage and estimated cost for the most recent iteration of the work
+    /// item, set on iteration- and completion-boundary events. Null when no cost
+    /// data is available for this event (no extractor for the agent, or the
+    /// event does not pertain to a single work item).
+    /// </summary>
+    public WorkItemIterationUsage? Usage { get; init; }
+
+    /// <summary>
+    /// Cumulative token usage and estimated cost across every iteration of the
+    /// work item. Paired with <see cref="Usage"/>; null under the same conditions.
+    /// </summary>
+    public WorkItemUsageTotal? UsageTotal { get; init; }
 }
