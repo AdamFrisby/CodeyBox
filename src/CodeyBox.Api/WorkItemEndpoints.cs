@@ -20,6 +20,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/dependents", GetDependentsAsync);
         group.MapGet("/{id}/replays", GetReplaysAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
+        group.MapPatch("/{id}/priority", PatchPriorityAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
         group.MapGet("/{id}/questions", GetQuestionsAsync);
         group.MapPost("/{id}/answer", AnswerQuestionAsync);
@@ -232,6 +233,14 @@ internal static class WorkItemEndpoints
             agentClassId = req.AgentClassId.Trim();
         }
 
+        int priority = 0;
+        if (req.Priority is { } p)
+        {
+            var priorityError = ValidatePriority(p, project);
+            if (priorityError is not null) return priorityError;
+            priority = p;
+        }
+
         // Use creation timestamp as default queue position so new items sort after
         // any explicitly reordered items (which get small integers 1, 2, 3 …).
         var item = new WorkItem
@@ -248,6 +257,7 @@ internal static class WorkItemEndpoints
             PushUpstream = req.PushUpstream ?? true,
             DependsOn = dependsOnIds,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
+            Priority = priority,
             ExternalId = externalId,
             ReleaseId = releaseId,
         };
@@ -870,6 +880,46 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
+    /// Update the dispatch priority of a work item. Allowed in any state, but only
+    /// affects pickup order while the item is still Queued — in-flight items run to
+    /// terminal state regardless of priority changes. The orchestrator's next dispatch
+    /// tick re-reads the store, so a bumped Queued item jumps ahead immediately.
+    /// </summary>
+    private static async Task<IResult> PatchPriorityAsync(
+        string id,
+        PatchPriorityRequest body,
+        IWorkItemStore store,
+        IProjectRepository projects,
+        ITaskQueue queue,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var project = await projects.GetAsync(item!.ProjectId, ct);
+        if (project is null)
+            return Results.BadRequest(new { error = $"unknown project '{item.ProjectId}'" });
+
+        var priorityError = ValidatePriority(body.Priority, project);
+        if (priorityError is not null) return priorityError;
+
+        if (item.Priority == body.Priority)
+            return Results.Ok(new { id = item.Id.ToString(), priority = body.Priority, status = "no-op" });
+
+        var updated = item with { Priority = body.Priority, UpdatedAt = DateTimeOffset.UtcNow };
+        await store.UpdateAsync(updated, ct);
+        AuditLog.WorkItemPatched(updated.Id, titleChanged: false, promptChanged: false, agentChanged: false);
+
+        // Kick the dispatcher so the new ordering is picked up immediately when the
+        // item is still Queued. Harmless for in-flight items: the dispatch loop will
+        // re-pick from the store and find the highest-priority eligible item.
+        if (updated.State == WorkItemState.Queued)
+            await queue.EnqueueAsync(updated.Id, ct);
+
+        return Results.Ok(new { id = updated.Id.ToString(), priority = updated.Priority });
+    }
+
+    /// <summary>
     /// Reorder the Queued items. The request body must list exactly the current
     /// set of Queued item IDs; any mismatch (stale view) is rejected with 400.
     /// </summary>
@@ -1275,7 +1325,8 @@ internal static class WorkItemEndpoints
             NextQuotaRetryAt: item.NextQuotaRetryAt,
             QuotaRetryAttempts: item.QuotaRetryAttempts,
             Usage: usage?.Iteration,
-            UsageTotal: usage?.Total);
+            UsageTotal: usage?.Total,
+            Priority: item.Priority);
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -1291,6 +1342,28 @@ internal static class WorkItemEndpoints
             audit.Languages,
             audit.AuditTypes,
             audit.MaxIterations);
+    }
+
+    private const int GlobalMinPriority = -1000;
+    private const int GlobalMaxPriority = 1000;
+
+    /// <summary>
+    /// Validates a requested priority against the global cap and the project's
+    /// per-project ceiling. Returns null on success or a 400 result on failure.
+    /// </summary>
+    private static IResult? ValidatePriority(int priority, Project project)
+    {
+        if (priority < GlobalMinPriority || priority > GlobalMaxPriority)
+            return Results.BadRequest(new
+            {
+                error = $"priority must be within [{GlobalMinPriority}, {GlobalMaxPriority}]",
+            });
+        if (priority > project.MaxPriority)
+            return Results.BadRequest(new
+            {
+                error = $"priority {priority} exceeds project '{project.Id}' max priority {project.MaxPriority}",
+            });
+        return null;
     }
 
     private static bool AuditProfileExists(ProjectAudit audit, string profile)
@@ -1404,7 +1477,8 @@ public sealed record CreateWorkItemRequest(
     string? ExternalId = null,
     string[]? DependsOn = null,
     int? MinModelScore = null,
-    string? ReleaseId = null);
+    string? ReleaseId = null,
+    int? Priority = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -1412,6 +1486,8 @@ public sealed record PatchWorkItemRequest(
     string? Title = null,
     string? Prompt = null,
     string? Agent = null);
+
+public sealed record PatchPriorityRequest(int Priority);
 
 public sealed record ReorderWorkItemsRequest(string[]? Ids = null);
 
@@ -1454,7 +1530,8 @@ public sealed record WorkItemDto(
     WorkItemIterationUsage? Usage = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     WorkItemUsageTotal? UsageTotal = null,
-    IReadOnlyList<AgentFallbackDto>? FallbackHistory = null);
+    IReadOnlyList<AgentFallbackDto>? FallbackHistory = null,
+    int Priority = 0);
 
 public sealed record AgentFallbackDto(
     string Id,

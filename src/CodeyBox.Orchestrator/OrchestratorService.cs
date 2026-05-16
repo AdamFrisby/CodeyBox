@@ -33,7 +33,14 @@ public sealed class OrchestratorService : BackgroundService
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
     // item (e.g., both see it as the last satisfied dependent simultaneously).
+    // Also used by the priority-aware pickup query to skip items that have been
+    // dispatched but whose persisted state has not yet flipped out of Queued.
     private readonly ConcurrentDictionary<WorkItemId, byte> _activeItems = new();
+
+    // Tracks work item IDs that are currently sleeping in a deferred-requeue
+    // delay (budget / quota / project-pause defer). They remain Queued in the
+    // store; the pickup query skips them until the delay fires and removes them.
+    private readonly ConcurrentDictionary<WorkItemId, byte> _deferredItems = new();
 
     // Concurrency gate: at most MaxConcurrentWorkers items running at once.
     private readonly SemaphoreSlim _concurrencyGate;
@@ -148,22 +155,58 @@ public sealed class OrchestratorService : BackgroundService
             // from the channel. In-flight workers continue normally during pause.
             if (!await WaitIfPausedAsync(stoppingToken)) break;
 
-            WorkItemId? id;
-            try { id = await _queue.DequeueAsync(stoppingToken); }
+            // Wait for a kick. The channel ID is no longer the source of truth —
+            // we use it purely as a "something changed, re-check the DB" signal
+            // so that priority and equal-priority FIFO ordering come from
+            // a single ORDER BY query rather than channel insertion order.
+            WorkItemId? kick;
+            try { kick = await _queue.DequeueAsync(stoppingToken); }
             catch (OperationCanceledException) { break; }
-            if (id is null) break;
+            if (kick is null) break;
+
+            // A kick for an item currently sleeping in a defer-requeue delay is
+            // treated as an explicit "retry now" signal: clear the deferred mark
+            // so the priority pickup considers the item again on this tick. In
+            // production this lines up with ScheduleDeferredRequeue's own
+            // TryRemove that runs just before it sends this kick.
+            _deferredItems.TryRemove(kick.Value, out _);
 
             // Post-dequeue pause check: handles the race where the queue was paused
-            // while we were blocked in DequeueAsync. Put the item back and re-check.
+            // while we were blocked in DequeueAsync. Just loop; we'll re-check
+            // WaitIfPausedAsync on the next iteration.
             if (_queueController is not null && _queueController.State == QueueState.Paused)
             {
-                await _queue.EnqueueAsync(id.Value, stoppingToken);
+                await _queue.EnqueueAsync(kick.Value, stoppingToken);
                 continue;
             }
 
-            // Block until a concurrency slot is free.
+            // Block until a concurrency slot is free. We acquire the gate BEFORE
+            // resolving which item to pick up so the pickup decision uses the
+            // freshest store state — a priority bump that arrives while a worker
+            // is in-flight is reflected when the gate next frees up.
             try { await _concurrencyGate.WaitAsync(stoppingToken); }
             catch (OperationCanceledException) { break; }
+
+            // Resolve the next eligible item by priority: highest Priority first,
+            // ties broken by CreatedAt ascending. Skips items currently in-flight
+            // (_activeItems) and items currently sleeping in a defer-requeue delay
+            // (_deferredItems). When nothing eligible is found, this kick was
+            // spurious — release the slot and loop back for the next kick.
+            WorkItemId? id = await PickNextEligibleAsync(stoppingToken);
+            if (id is null)
+            {
+                TryReleaseConcurrencyGate();
+                continue;
+            }
+
+            // Reserve the slot now so the next dispatch iteration's pickup query
+            // skips this ID. The Task.Run cleanup below removes the reservation
+            // when the worker exits.
+            if (!_activeItems.TryAdd(id.Value, 0))
+            {
+                TryReleaseConcurrencyGate();
+                continue;
+            }
 
             // Spawn pacing: enforce MinSpawnInterval between successive spawns.
             if (_opts.MinSpawnInterval > TimeSpan.Zero)
@@ -181,6 +224,7 @@ public sealed class OrchestratorService : BackgroundService
                         try { await Task.Delay(wait, stoppingToken); }
                         catch (OperationCanceledException)
                         {
+                            _activeItems.TryRemove(id.Value, out _);
                             TryReleaseConcurrencyGate();
                             break;
                         }
@@ -194,6 +238,7 @@ public sealed class OrchestratorService : BackgroundService
             catch (Exception ex)
             {
                 _log.LogError(ex, "OnWorkerSpawned callback threw; releasing concurrency slot and skipping item {Id}", id);
+                _activeItems.TryRemove(id.Value, out _);
                 TryReleaseConcurrencyGate();
                 continue;
             }
@@ -225,6 +270,43 @@ public sealed class OrchestratorService : BackgroundService
 
         // Drain in-flight tasks before the hosted service exits.
         await Task.WhenAll(inFlight).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Streams the Queued items by priority order and returns the first one that
+    /// is not already in <c>_activeItems</c> or <c>_deferredItems</c> and whose
+    /// dependencies are all in terminal states. Returns null when the queue is
+    /// empty or every queued item is blocked.
+    ///
+    /// Dependency satisfaction is checked in C# (the deps_satisfied is a derived
+    /// property over a JSON column on each row) — for typical queue depths
+    /// the enumerator stops on the first match and never reads the whole table.
+    /// </summary>
+    private async Task<WorkItemId?> PickNextEligibleAsync(CancellationToken stoppingToken)
+    {
+        var skipIds = new HashSet<WorkItemId>(_activeItems.Keys);
+        foreach (var deferredId in _deferredItems.Keys) skipIds.Add(deferredId);
+
+        // Build the state map lazily only when we encounter an item with deps.
+        Dictionary<WorkItemId, WorkItemState>? statesById = null;
+
+        await foreach (var candidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, stoppingToken))
+        {
+            if (candidate.DependsOn.Count == 0)
+                return candidate.Id;
+
+            if (statesById is null)
+            {
+                var snapshot = new List<WorkItem>();
+                await foreach (var i in _store.ListAsync(stoppingToken)) snapshot.Add(i);
+                statesById = WorkItemDependencies.BuildStateMap(snapshot);
+            }
+
+            if (WorkItemDependencies.AreSatisfied(candidate.DependsOn, statesById))
+                return candidate.Id;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -437,6 +519,7 @@ public sealed class OrchestratorService : BackgroundService
         if (item is null)
         {
             _log.LogWarning("Worker {WorkerId} dequeued unknown work item {Id}", workerIndex, id);
+            _activeItems.TryRemove(id, out _);
             return;
         }
         if (item.State is WorkItemState.Cancelled or WorkItemState.Done
@@ -445,6 +528,7 @@ public sealed class OrchestratorService : BackgroundService
             or WorkItemState.AbandonedAfterRecoveryAttempts)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
+            _activeItems.TryRemove(id, out _);
             return;
         }
 
@@ -453,6 +537,7 @@ public sealed class OrchestratorService : BackgroundService
         if (item.State is WorkItemState.NeedsOperatorInput)
         {
             _log.LogWarning("Worker {WorkerId} skipping {Id}: still in NeedsOperatorInput state", workerIndex, id);
+            _activeItems.TryRemove(id, out _);
             return;
         }
 
@@ -466,16 +551,10 @@ public sealed class OrchestratorService : BackgroundService
             return;
         }
 
-        // Double-enqueue guard: when two workers simultaneously complete
-        // the last dependency of the same downstream item, both may enqueue
-        // it. Only one worker should run the pipeline for a given item at a
-        // time. TryAdd is atomic; the losing worker skips gracefully.
-        if (!_activeItems.TryAdd(id, 0))
-        {
-            _log.LogInformation(
-                "Worker {WorkerId} skipping {Id}: already being processed by another worker", workerIndex, id);
-            return;
-        }
+        // _activeItems was reserved by the dispatch loop before this task was
+        // spawned, so the priority-aware pickup query already skips this ID and
+        // we cannot double-dispatch. The TryRemove in the finally block below
+        // releases the reservation when the worker exits.
 
         // Register this execution in the worker registry so the dead-worker
         // reaper can detect and recover it if this process crashes mid-flight.
@@ -796,21 +875,30 @@ public sealed class OrchestratorService : BackgroundService
                 "Deferred requeue backlog is {Count} items; quota exhaustion may be sustained across many work items",
                 count);
 
+        // Mark the item as currently-deferred so the priority pickup query skips it
+        // while the Task.Delay is sleeping. Without this guard, every dispatch tick
+        // would re-pick the same Queued item, hit the same defer condition, and
+        // accumulate redundant deferral tasks.
+        _deferredItems[id] = 0;
+
         _ = Task.Run(async () =>
         {
             try
             {
                 await Task.Delay(delay, stoppingToken);
                 _log.LogInformation("Re-enqueueing deferred work item {Id} after quota recheck interval", id);
+                _deferredItems.TryRemove(id, out _);
                 await _queue.EnqueueAsync(id, stoppingToken);
             }
             catch (OperationCanceledException)
             {
                 // Service is shutting down; item will be recovered on next start.
+                _deferredItems.TryRemove(id, out _);
             }
             catch (Exception ex)
             {
                 _log.LogError(ex, "Failed to re-enqueue deferred work item {Id}", id);
+                _deferredItems.TryRemove(id, out _);
             }
             finally
             {
