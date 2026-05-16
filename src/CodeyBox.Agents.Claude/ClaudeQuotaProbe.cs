@@ -29,6 +29,11 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
     private (string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
+    // Dedupes the Information log line that fires when a configured model is
+    // absent from the probe response. Keyed by (token, modelId).
+    private readonly HashSet<(string Token, string ModelId)> _loggedMissingModels = new();
+    private readonly object _loggedMissingModelsLock = new();
+
     public AgentKind Kind => AgentKind.Claude;
 
     public ClaudeQuotaProbe(
@@ -59,22 +64,66 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
 
+        AgentQuotaSnapshot snapshot;
         await _lock.WaitAsync(ct);
         try
         {
             if (_cache is { } entry
                 && string.Equals(entry.AccessToken, token, StringComparison.Ordinal)
                 && DateTimeOffset.UtcNow < entry.ExpiresAt)
-                return entry.Snapshot;
-
-            var snapshot = await FetchAsync(token, ct);
-            _cache = (token, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
-            return snapshot;
+            {
+                snapshot = entry.Snapshot;
+            }
+            else
+            {
+                snapshot = await FetchAsync(token, ct);
+                _cache = (token, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
+            }
         }
         finally
         {
             _lock.Release();
         }
+
+        return ApplyMemberGate(snapshot, member, token);
+    }
+
+    /// <summary>
+    /// When the configured <see cref="AgentMembership.ModelId"/> is not present
+    /// in the parsed response's per-model buckets, return
+    /// <c>AvailablePct = -1</c> so the router falls onto its
+    /// <c>QuotaUnknownPolicy</c> rather than fail-opening on the global
+    /// availability. Logs once per (token, modelId) so operators can spot
+    /// typos in configured model ids without grepping for log lines.
+    /// </summary>
+    private AgentQuotaSnapshot ApplyMemberGate(AgentQuotaSnapshot snapshot, AgentMembership member, string token)
+    {
+        if (snapshot.AvailablePct < 0) return snapshot;
+        if (string.IsNullOrWhiteSpace(member.ModelId)) return snapshot;
+        if (snapshot.PerModel.ContainsKey(member.ModelId)) return snapshot;
+
+        var modelList = snapshot.PerModel.Count == 0
+            ? "(none)"
+            : string.Join(", ", snapshot.PerModel.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        var notes = $"configured model '{member.ModelId}' not in quota response (have: {modelList})";
+
+        bool firstTime;
+        lock (_loggedMissingModelsLock)
+            firstTime = _loggedMissingModels.Add((token, member.ModelId));
+        if (firstTime)
+        {
+            _log.LogInformation(
+                "Claude quota probe: configured model {ModelId} not in response buckets ({BucketList}); reporting unknown so the router can apply its unknown policy",
+                member.ModelId, modelList);
+        }
+
+        return new AgentQuotaSnapshot
+        {
+            AvailablePct = -1,
+            ResetAt = snapshot.ResetAt,
+            Notes = notes,
+            PerModel = snapshot.PerModel,
+        };
     }
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
