@@ -389,6 +389,113 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxExec_RetriesTransientMultipassSocketErrorAndSucceeds()
+    {
+        // Covers the sandbox-side retry wrapper (MultipassSandbox.RunMultipassAsync),
+        // which is a second integration of MultipassDaemonRetry distinct from
+        // the provider's CreateAsync path. A transient multipass-socket error
+        // surfaced from `multipass exec` mid-lifetime must be retried, not
+        // propagated as an exec failure to the caller.
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var execCalls = 0;
+        var versionCalls = 0;
+        SandboxExecResult? execResult = null;
+        var workItemId = WorkItemId.New();
+
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+            {
+                versionCalls++;
+                return Task.FromResult(new RunResult(0, "multipass 1.15.0", ""));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                states[argv[3]] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "info", var name, "--format=csv"])
+                return Task.FromResult(new RunResult(
+                    0, states.TryGetValue(name, out var current) ? current : "Running", ""));
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            // Exec of the user payload — first attempt returns a transient
+            // socket failure; the second must succeed and produce "hello".
+            if (argv.Count >= 4 && argv[1] == "exec" && argv[3] == "--")
+            {
+                execCalls++;
+                if (execCalls == 1)
+                    return Task.FromResult(new RunResult(
+                        1, "", "cannot connect to the multipass socket"));
+                return Task.FromResult(new RunResult(0, "hello\n", ""));
+            }
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var logger = new RecordingLogger<MultipassSandboxProvider>();
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging"),
+            runner: runner,
+            logger: logger,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = workItemId,
+        });
+        try
+        {
+            execResult = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["echo", "hello"],
+            });
+        }
+        finally
+        {
+            await sandbox.DisposeAsync();
+        }
+
+        Assert.NotNull(execResult);
+        Assert.Equal(0, execResult.ExitCode);
+        Assert.Equal("hello\n", execResult.Stdout);
+        // Two exec attempts — first transient, second success.
+        Assert.Equal(2, execCalls);
+        // Sandbox-side wrapper must have probed multipass version between
+        // attempts (proving the retry layer ran on the sandbox, not the
+        // provider).
+        Assert.True(versionCalls >= 1, $"expected at least one health probe; got {versionCalls}");
+        Assert.Contains(logger.Entries, e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Information
+            && e.Message.Contains("transient multipass daemon error", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task RetryHelper_RetriesTransientSshReadinessWithoutRealDelays()
     {
         var attempts = 0;

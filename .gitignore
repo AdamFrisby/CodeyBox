@@ -13,6 +13,9 @@ obj/
 # Per-developer dev/test helpers (see local/README.md after creation).
 /local/
 
+# Runtime preempt scratchpads emitted by the codeybox agent harness.
+.codeybox/
+
 # Serilog rolling-file output (see CodeyBox:AuditLog options) and per-agent
 # structured-stream logs (see CodeyBox:AgentStreamCapture options).
 /logs/
