@@ -575,15 +575,9 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         }
     }
 
+    builtInLast.Add(new ClaudeEnvironmentCredentialProvider());
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
-        // Claude Code accepts either ANTHROPIC_API_KEY (real API key, format
-        // sk-ant-api03-…) or CLAUDE_CODE_OAUTH_TOKEN (OAuth access token,
-        // format sk-ant-oat01-…). Default mapping is OAuth so subscription
-        // users (Pro/Max/Team/Enterprise) can run without a separate API
-        // key. Operators with a raw API key can change the in-sandbox name
-        // to ANTHROPIC_API_KEY here.
-        new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
         new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
