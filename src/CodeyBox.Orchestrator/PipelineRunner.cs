@@ -1662,6 +1662,7 @@ public sealed class PipelineRunner : IPipelineRunner
             CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
                 new KeyValuePair<string, object?>("iteration", iteration.ToString()));
 
+            var iterUsage = await TryGetUsageSummaryAsync(item.Id);
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "work_item.audit_iteration",
@@ -1670,6 +1671,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 Details = new AuditIterationDetails(
                     iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking,
                     activeAuditAgentKind?.Value),
+                Usage = iterUsage?.Iteration,
+                UsageTotal = iterUsage?.Total,
             }, CancellationToken.None);
 
             if (blocking.Count == 0)
@@ -3998,12 +4001,33 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditLog.WorkItemTransitioned(item.Id, state.ToString());
         CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", state.ToString()));
         if (project is not null)
+        {
+            var usage = await TryGetUsageSummaryAsync(item.Id);
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = StateToEventName(state),
                 WorkItem = next,
                 Project = project,
+                Usage = usage?.Iteration,
+                UsageTotal = usage?.Total,
             }, CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// Best-effort cost summary lookup for webhook usage blocks. Returns null
+    /// when the cost store is absent, no rows exist for the work item, or the
+    /// read fails — usage is reported as absent in any of those cases.
+    /// </summary>
+    private async Task<WorkItemUsageSummary?> TryGetUsageSummaryAsync(WorkItemId id)
+    {
+        if (_costStore is null) return null;
+        try { return await _costStore.SummariseAsync(id.ToString(), CancellationToken.None); }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Cost: failed to summarise usage for work item {Id}; webhook will omit usage", id);
+            return null;
+        }
     }
 
     private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null)

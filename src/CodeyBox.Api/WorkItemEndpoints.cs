@@ -299,7 +299,11 @@ internal static class WorkItemEndpoints
         return Results.Created($"/workitems/{item.Id}", ToDto(item, project, freshDepStates, freshDepExternalIds));
     }
 
-    private static async Task<IResult> ListAsync(IWorkItemStore store, IProjectRepository projects, CancellationToken ct)
+    private static async Task<IResult> ListAsync(
+        IWorkItemStore store,
+        IProjectRepository projects,
+        IWorkItemCostStore? costs,
+        CancellationToken ct)
     {
         var allProjects = (await projects.ListAsync(ct)).ToDictionary(p => p.Id.Value);
         var allItems = new List<WorkItem>();
@@ -307,18 +311,25 @@ internal static class WorkItemEndpoints
         var statesById = WorkItemDependencies.BuildStateMap(allItems);
         var externalIdsById = allItems.ToDictionary(i => i.Id, i => i.ExternalId);
 
-        var list = allItems.Select(item =>
+        var list = new List<WorkItemDto>(allItems.Count);
+        foreach (var item in allItems)
         {
             allProjects.TryGetValue(item.ProjectId.Value, out var p);
             var depExternalIds = item.DependsOn
                 .Where(d => externalIdsById.TryGetValue(d, out _))
                 .ToDictionary(d => d, d => externalIdsById[d]);
-            return ToDto(item, p, statesById, depExternalIds);
-        }).ToList();
+            var usage = await TryGetUsageSummaryAsync(costs, item.Id, ct);
+            list.Add(ToDto(item, p, statesById, depExternalIds, usage));
+        }
         return Results.Ok(list);
     }
 
-    private static async Task<IResult> GetAsync(string id, IWorkItemStore store, IProjectRepository projects, CancellationToken ct)
+    private static async Task<IResult> GetAsync(
+        string id,
+        IWorkItemStore store,
+        IProjectRepository projects,
+        IWorkItemCostStore? costs,
+        CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
@@ -337,7 +348,21 @@ internal static class WorkItemEndpoints
         }
 
         var project = await projects.GetAsync(item.ProjectId, ct);
-        return Results.Ok(ToDto(item, project, statesById, depExternalIds));
+        var usage = await TryGetUsageSummaryAsync(costs, item.Id, ct);
+        return Results.Ok(ToDto(item, project, statesById, depExternalIds, usage));
+    }
+
+    /// <summary>
+    /// Best-effort cost summary lookup. Returns null when no cost store is
+    /// registered, no rows exist for the work item, or the read fails — every
+    /// downstream caller treats null as "usage unknown".
+    /// </summary>
+    private static async Task<WorkItemUsageSummary?> TryGetUsageSummaryAsync(
+        IWorkItemCostStore? costs, WorkItemId workItemId, CancellationToken ct)
+    {
+        if (costs is null) return null;
+        try { return await costs.SummariseAsync(workItemId.ToString(), ct); }
+        catch { return null; }
     }
 
     /// <summary>
@@ -1164,7 +1189,8 @@ internal static class WorkItemEndpoints
         WorkItem item,
         Project? project,
         IReadOnlyDictionary<WorkItemId, WorkItemState> statesById,
-        IReadOnlyDictionary<WorkItemId, string?>? depExternalIds = null)
+        IReadOnlyDictionary<WorkItemId, string?>? depExternalIds = null,
+        WorkItemUsageSummary? usage = null)
     {
         var depsSatisfied = WorkItemDependencies.AreSatisfied(item.DependsOn, statesById);
         var depExtIds = item.DependsOn.ToDictionary(
@@ -1198,7 +1224,9 @@ internal static class WorkItemEndpoints
             FailureKind: item.FailureKind,
             QuotaResetAt: item.QuotaResetAt,
             NextQuotaRetryAt: item.NextQuotaRetryAt,
-            QuotaRetryAttempts: item.QuotaRetryAttempts);
+            QuotaRetryAttempts: item.QuotaRetryAttempts,
+            Usage: usage?.Iteration,
+            UsageTotal: usage?.Total);
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -1372,7 +1400,9 @@ public sealed record WorkItemDto(
     string? FailureKind = null,
     DateTimeOffset? QuotaResetAt = null,
     DateTimeOffset? NextQuotaRetryAt = null,
-    int QuotaRetryAttempts = 0);
+    int QuotaRetryAttempts = 0,
+    WorkItemIterationUsage? Usage = null,
+    WorkItemUsageTotal? UsageTotal = null);
 
 public sealed record ProjectDto(
     string Id,

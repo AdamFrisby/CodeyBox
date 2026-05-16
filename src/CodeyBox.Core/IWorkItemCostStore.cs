@@ -41,4 +41,19 @@ public interface IWorkItemCostStore
     /// </summary>
     Task<decimal> SumEstimatedUsdAsync(
         string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
+
+    /// <summary>
+    /// Aggregates the cost rows for <paramref name="workItemId"/> into a per-iteration
+    /// delta (the most recent iteration's contribution) and a cumulative total across
+    /// every iteration. Returns null when no cost rows exist for the work item — the
+    /// API and webhook layers treat this as "usage unknown" and omit the block.
+    ///
+    /// Default implementation reads via <see cref="GetByWorkItemAsync"/> and reduces
+    /// in memory; override for stores that can compute the aggregation server-side.
+    /// </summary>
+    async Task<WorkItemUsageSummary?> SummariseAsync(string workItemId, CancellationToken ct = default)
+    {
+        var rows = await GetByWorkItemAsync(workItemId, ct);
+        return WorkItemUsageAggregator.Summarise(rows);
+    }
 }
