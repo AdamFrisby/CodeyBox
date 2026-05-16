@@ -169,12 +169,11 @@ public sealed record Project
 
     /// <summary>
     /// Per-project cap on <see cref="WorkItem.Priority"/>. Requests above this cap
-    /// are rejected with 400. Default 1000 — matches the global cap, so no extra
-    /// constraint applies unless an operator lowers it for a specific project.
-    /// Negative priorities are not constrained by this cap (lowering priority is
-    /// always allowed).
+    /// are rejected with 400. Null means no additional project-level cap beyond
+    /// the global priority bounds. Negative priorities are not constrained by
+    /// this cap (lowering priority is always allowed).
     /// </summary>
-    public int MaxPriority { get; init; } = 1000;
+    public int? MaxPriority { get; init; }
 }
 
 /// <summary>

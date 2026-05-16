@@ -1389,10 +1389,10 @@ internal static class WorkItemEndpoints
             {
                 error = $"priority must be within [{GlobalMinPriority}, {GlobalMaxPriority}]",
             });
-        if (priority > project.MaxPriority)
+        if (project.MaxPriority is { } maxPriority && priority > maxPriority)
             return Results.BadRequest(new
             {
-                error = $"priority {priority} exceeds project '{project.Id}' max priority {project.MaxPriority}",
+                error = $"priority {priority} exceeds project '{project.Id}' max priority {maxPriority}",
             });
         return null;
     }

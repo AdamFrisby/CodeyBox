@@ -99,6 +99,13 @@ per-item `agentClassId` in the API payload. See
 A per-item `agentClassId` overrides the project default. Set it to `null`
 (omit it in the JSON payload) to fall back to legacy direct `Agent` pick.
 
+### `MaxPriority`
+
+Set `MaxPriority` to cap the highest work-item priority accepted for this
+project. The global API bound of `[-1000, 1000]` still applies; leaving
+`MaxPriority` unset means there is no additional project-level cap. Negative
+priorities remain allowed so callers can always lower a work item's priority.
+
 ### Inheritance from `Defaults`
 
 Anything a project omits comes from `Defaults` (shallow merge):

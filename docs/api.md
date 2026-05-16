@@ -760,7 +760,7 @@ Only fields provided (non-null) in the body are updated.
 
 ### `PATCH /workitems/{id}/priority`
 
-Update the dispatch priority of a work item. Higher values pick up first; ties break by `createdAt` ascending (FIFO). Priority must be in `[-1000, 1000]` and may be further bounded by a per-project `MaxPriority` cap (default `1000`).
+Update the dispatch priority of a work item. Higher values pick up first; ties break by `createdAt` ascending (FIFO). Priority must be in `[-1000, 1000]` and may be further bounded by a per-project `MaxPriority` cap (default unset, meaning no extra project cap).
 
 ```json
 { "priority": 250 }
@@ -1066,7 +1066,7 @@ for displaying human-readable dependency labels.
 
 `queuePosition` is an ordering hint for Queued items set by `POST /workitems/reorder`. Smaller values sort first. Items not yet explicitly reordered have a position derived from their creation timestamp and sort after explicitly positioned items.
 
-`priority` is the dispatch priority used by the orchestrator (higher wins; ties break by `createdAt` ASC so equal-priority items remain FIFO). Default `0`. May be set on creation and updated via `PATCH /workitems/{id}/priority`. The accepted range is `[-1000, 1000]`, optionally further bounded per project by `Project.MaxPriority` (default `1000`). Priority affects only pickup ORDER; pause, dependency, budget, and quota gates still run after pickup.
+`priority` is the dispatch priority used by the orchestrator (higher wins; ties break by `createdAt` ASC so equal-priority items remain FIFO). Default `0`. May be set on creation and updated via `PATCH /workitems/{id}/priority`. The accepted range is `[-1000, 1000]`, optionally further bounded per project by `Project.MaxPriority` (default unset, meaning no extra project cap). Priority affects only pickup ORDER; pause, dependency, budget, and quota gates still run after pickup.
 
 `state` is one of: `Queued`, `Working`, `WorkComplete`, `Auditing`,
 `AuditPassed`, `Reworking`, `AuditFailed`, `Merging`, `Merged`,
