@@ -66,6 +66,16 @@
     <ProjectReference Include="..\..\src\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />
     <ProjectReference Include="..\..\tools\CodeyBox.Admin\src\CodeyBox.Admin.Web\CodeyBox.Admin.Web.csproj"
                       Aliases="CodeyBoxAdminWeb" />
+    <!--
+      Build dependency only: the CLI UAT tests spawn the CLI as an out-of-process
+      child to exercise the real entry point. ReferenceOutputAssembly=false keeps
+      the CLI's types out of the test ALC; the build dependency just guarantees
+      the CLI dll is on disk so the tests can invoke it via `dotnet path/to/dll`
+      without paying for a per-invocation `dotnet run` rebuild that can exceed
+      the test timeout under cold sandbox caches.
+    -->
+    <ProjectReference Include="..\..\tools\CodeyBox.Cli\CodeyBox.Cli.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

@@ -158,6 +158,97 @@ public sealed class SseEndpointsTests : IDisposable
     }
 
     [Fact]
+    public async Task SingleItemStream_ResolvesCompositeProjectAndExternalId()
+    {
+        // A work item identified by '<projectId>:<externalId>' must resolve via
+        // IWorkItemStore.GetByExternalIdAsync and stream events for that item.
+        const string externalId = "ext-42";
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            ExternalId = externalId,
+            Title = "Composite",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await _factory.Store.CreateAsync(item, CancellationToken.None);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var resp = await _client.GetAsync(
+            $"/workitems/proj:{externalId}/events",
+            HttpCompletionOption.ResponseHeadersRead,
+            cts.Token);
+        resp.EnsureSuccessStatusCode();
+        await WaitForSubscribersAsync(1, cts.Token);
+
+        var broadcaster = _factory.Services.GetRequiredService<WebhookEventBroadcaster>();
+        broadcaster.Publish(EventFor(item, "work_item.working"));
+
+        await using var stream = await resp.Content.ReadAsStreamAsync(cts.Token);
+        using var reader = new StreamReader(stream);
+        var frame = await ReadFrameAsync(reader, cts.Token);
+        Assert.Equal("work_item.working", frame.EventType);
+    }
+
+    [Fact]
+    public async Task SingleItemStream_ReturnsBadRequestForNonGuidNonCompositeId()
+    {
+        // 'not-a-uuid' has no ':' so it must parse as a Guid; failing that, 400.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var resp = await _client.GetAsync("/workitems/not-a-uuid/events", cts.Token);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task SingleItemStream_ReturnsNotFoundForUnknownGuidId()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var resp = await _client.GetAsync(
+            $"/workitems/{Guid.NewGuid()}/events",
+            cts.Token);
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task SingleItemStream_ReturnsNotFoundForUnknownCompositeId()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var resp = await _client.GetAsync(
+            "/workitems/proj:nope-not-here/events",
+            cts.Token);
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(":external-id")]      // empty projectId
+    [InlineData("proj:")]              // empty externalId
+    public async Task SingleItemStream_ReturnsBadRequestForMalformedCompositeId(string idSegment)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var resp = await _client.GetAsync($"/workitems/{idSegment}/events", cts.Token);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task SingleItemStream_ReturnsBadRequestForInvalidProjectIdSegment()
+    {
+        // '!!!' is rejected by ProjectId's validator (non-alnum/dash/underscore).
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var resp = await _client.GetAsync("/workitems/%21%21%21:ext-1/events", cts.Token);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task SingleItemStream_ReturnsBadRequestForInvalidExternalIdSegment()
+    {
+        // External ids must not start with 'wi-' (reserved prefix).
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var resp = await _client.GetAsync("/workitems/proj:wi-reserved/events", cts.Token);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
     public async Task Heartbeat_FiresWhenStreamIsIdle()
     {
         // SseApiFactory sets HeartbeatSeconds=1 so this test can wait briefly.

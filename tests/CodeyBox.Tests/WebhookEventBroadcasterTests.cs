@@ -29,6 +29,21 @@ public sealed class WebhookEventBroadcasterTests
             },
         };
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(int.MinValue)]
+    public void Constructor_RejectsRingBufferCapacityLessThanOne(int capacity)
+    {
+        // Guards against accidentally flipping the comparison in the
+        // broadcaster's ctor (or in the DI factory that forwards to it);
+        // Queue<>(0) would silently accept the bad value and break replay
+        // under load instead of failing fast at startup.
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(
+            () => new WebhookEventBroadcaster(capacity));
+        Assert.Equal("ringBufferCapacity", ex.ParamName);
+    }
+
     [Fact]
     public async Task Subscribe_ReceivesLivePublishedEvents()
     {

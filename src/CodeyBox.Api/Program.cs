@@ -772,10 +772,9 @@ builder.Services.AddHttpClient("webhook")
 builder.Services.AddSingleton<WebhookEventBroadcaster>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var capacity = opts.WebhookEventBus.RingBufferCapacity;
-    if (capacity < 1)
-        throw new InvalidOperationException("CodeyBox:WebhookEventBus:RingBufferCapacity must be >= 1");
-    return new WebhookEventBroadcaster(capacity);
+    // WebhookEventBroadcaster's constructor enforces capacity >= 1 and throws
+    // ArgumentOutOfRangeException with a clear message naming the bad value.
+    return new WebhookEventBroadcaster(opts.WebhookEventBus.RingBufferCapacity);
 });
 builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
 {
@@ -1824,8 +1823,9 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// How often the SSE handler emits a ':keepalive' comment when the
-        /// stream is otherwise idle. Set short enough that intermediate
-        /// proxies don't reap the connection (60s is a common default).
+        /// stream is otherwise idle. Default 15s — half of AWS ALB's 60s
+        /// idle timeout, so proxies don't reap connections that are simply
+        /// not transmitting events.
         /// </summary>
         public int HeartbeatSeconds { get; set; } = 15;
     }
