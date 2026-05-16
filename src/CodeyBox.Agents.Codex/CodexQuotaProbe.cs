@@ -90,6 +90,21 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         }
     }
 
+    /// <summary>
+    /// Drops the in-process snapshot so the next
+    /// <see cref="GetAvailabilityAsync"/> call refetches against the WHAM
+    /// usage endpoint. Wire to <see cref="CodeyBox.Orchestrator.CredentialFileSource.TokenUpdated"/>
+    /// so an out-of-band host token rotation (operator running the CLI, child
+    /// sandbox writeback, scripted refresh) doesn't leave a stale 401 pinned
+    /// for the full cache TTL.
+    /// </summary>
+    public void InvalidateCache()
+    {
+        _lock.Wait();
+        try { _cache = null; }
+        finally { _lock.Release(); }
+    }
+
     private async Task<AgentQuotaSnapshot> FetchAsync(string token, string? accountId, CancellationToken ct)
     {
         try
