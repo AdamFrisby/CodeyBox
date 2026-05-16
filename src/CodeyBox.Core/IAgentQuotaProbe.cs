@@ -17,6 +17,27 @@ public interface IAgentQuotaProbe
 
     /// <summary>Returns a quota snapshot, possibly from an in-process cache.</summary>
     Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct);
+
+    /// <summary>
+    /// Marks <paramref name="member"/> as exhausted for the duration <paramref name="ttl"/>
+    /// without waiting for the next periodic probe. Called by the pipeline when an
+    /// agent invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>:
+    /// the probe should suppress positive availability for <paramref name="ttl"/>
+    /// (or until <paramref name="resetAt"/>, whichever is sooner) so subsequent
+    /// pickups skip this member.
+    ///
+    /// <para>
+    /// Default implementation is a no-op so existing probes don't have to opt in;
+    /// the in-process fallback registry held by <c>AgentClassRouter</c> still tracks
+    /// short-lived exhaustion across pipeline retries even when the underlying probe
+    /// has no write-back path.
+    /// </para>
+    /// </summary>
+    Task MarkExhaustedAsync(
+        AgentMembership member,
+        TimeSpan ttl,
+        DateTimeOffset? resetAt = null,
+        CancellationToken ct = default) => Task.CompletedTask;
 }
 
 /// <summary>OAuth/subscription credentials used by quota probes.</summary>

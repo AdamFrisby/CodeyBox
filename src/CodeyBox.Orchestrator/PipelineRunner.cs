@@ -57,9 +57,26 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     private readonly IAgentStreamStore? _agentStreams;
     private readonly QuotaRetryScheduler? _retryScheduler;
-    // Audit-agent quota probes: keyed by AgentKind, used by ResolveAuditAgentRunnerAsync.
-    // Null when no probes were provided: no quota gate on audit agent.
-    private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _auditQuotaProbesByKind;
+    private readonly AgentClassRouter? _classRouter;
+    private readonly IAgentFallbackHistoryStore? _fallbackHistory;
+    // Per-process exhausted-member TTL when the chosen agent hits quota mid-flight.
+    // Subscription windows reset on the order of hours; one hour is a conservative
+    // upper bound that keeps the in-process cache useful across consecutive pickups
+    // without blocking long enough to delay an actual reset by a meaningful amount.
+    private static readonly TimeSpan QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1);
+    // Upper bound for parsed reset-window hints extracted from an agent's stdout/stderr.
+    // Without a cap, a maliciously-crafted Retry-After header (or prompt-injected output)
+    // could park an item arbitrarily far in the future. 24h is the longest legitimate
+    // subscription reset cadence we know about (Gemini daily); anything beyond is treated
+    // as suspect and clamped.
+    internal static readonly TimeSpan MaxParsedQuotaResetWindow = TimeSpan.FromHours(24);
+    // Subscription-billed quota probes, keyed by AgentKind. PayPerApi / Null probes are
+    // routing utilities (not real quota sources) and intentionally excluded.
+    // Used by both ResolveAuditAgentRunnerAsync (audit-agent quota gate) and
+    // InvokeAgentWithQuotaFallbackAsync (work-agent mid-iteration probe write-back) —
+    // a single probe set serves both because the production wiring registers one
+    // IAgentQuotaProbe singleton per agent kind regardless of caller.
+    private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _quotaProbesByKind;
     private readonly QuotaRouterOptions _auditQuotaOptions;
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
@@ -112,7 +129,9 @@ public sealed class PipelineRunner : IPipelineRunner
         IStdoutBroadcaster? stdoutBroadcaster = null,
         IAgentStreamStore? agentStreams = null,
         IQuotaFailureStore? quotaFailures = null,
-        QuotaRetryScheduler? retryScheduler = null)
+        QuotaRetryScheduler? retryScheduler = null,
+        AgentClassRouter? classRouter = null,
+        IAgentFallbackHistoryStore? fallbackHistory = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -133,13 +152,16 @@ public sealed class PipelineRunner : IPipelineRunner
         _agentStreams = agentStreams;
         _quotaFailures = quotaFailures;
         _retryScheduler = retryScheduler;
+        _classRouter = classRouter;
+        _fallbackHistory = fallbackHistory;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
         _auditReports = auditReports;
         // PayPerApi and Null probes are routing utilities, not real quota sources —
-        // exclude them so only genuine subscription probes gate the audit agent.
-        _auditQuotaProbesByKind = auditQuotaProbes is null ? null
+        // exclude them so only genuine subscription probes gate the audit agent
+        // and only genuine subscription probes receive mid-iteration write-back.
+        _quotaProbesByKind = auditQuotaProbes is null ? null
             : auditQuotaProbes
                 .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
                 .ToDictionary(p => p.Kind);
@@ -293,13 +315,19 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     workCts.CancelAfter(item.WorkTimeout);
                     using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, workCts);
-                    workAgentStdout = await RunWithStuckProbeAsync(item, project, agentKind, "work", workCts, ct, phaseCt =>
-                        RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                            BuildInitialWorkPrompt(item.Prompt, project.AllowAgentQuestions, auditors), isInitial: true,
-                            networkProfile: project.NetworkProfiles.Work,
-                            project: project,
-                            phaseCt,
-                            hostShutdownToken));
+                    // In-iteration quota fallback: if the chosen agent hits quota
+                    // mid-flight, swap to the next class member and retry. Audit,
+                    // rework, and merge phases are wrapped equivalently below.
+                    workAgentStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "work", iteration: null,
+                        async (runner, trialItem) =>
+                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "work", workCts, ct, phaseCt =>
+                                RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
+                                    BuildInitialWorkPrompt(trialItem.Prompt, project.AllowAgentQuestions, auditors), isInitial: true,
+                                    networkProfile: project.NetworkProfiles.Work,
+                                    project: project,
+                                    phaseCt,
+                                    hostShutdownToken)),
+                        ct);
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
                 if (resumingPreempt)
@@ -324,14 +352,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     reworkCts.CancelAfter(item.WorkTimeout);
                     using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
-                    reworkStdout = await RunWithStuckProbeAsync(item, project, agentKind, "rework", reworkCts, ct,
-                        phaseCt => RunAgentPhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                            BuildInterruptedReworkResumePrompt(item.Prompt, item.PreemptCheckpoint!),
-                            isInitial: false,
-                            networkProfile: project.NetworkProfiles.Rework,
-                            project: project,
-                            phaseCt,
-                            hostShutdownToken));
+                    reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
+                        async (runner, trialItem) =>
+                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "rework", reworkCts, ct,
+                                phaseCt => RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
+                                    BuildInterruptedReworkResumePrompt(trialItem.Prompt, trialItem.PreemptCheckpoint!),
+                                    isInitial: false,
+                                    networkProfile: project.NetworkProfiles.Rework,
+                                    project: project,
+                                    phaseCt,
+                                    hostShutdownToken)),
+                        ct);
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
                 await ClearPreemptAsync(item, ct);
@@ -385,12 +416,15 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     mergeCts.CancelAfter(item.MergeTimeout);
                     using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, mergeCts);
-                    (mergeSha, agentStdout) = await RunWithStuckProbeAsync(item, project, agentKind, "merge", mergeCts, ct, phaseCt =>
-                        RunAgentMergePhaseAsync(item, agentRunner, repoId, baseBranch, workBranch,
-                            networkProfile: project.NetworkProfiles.Merge,
-                            project: project,
-                            phaseCt,
-                            hostShutdownToken));
+                    (mergeSha, agentStdout) = await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
+                        async (runner, trialItem) =>
+                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergeCts, ct, phaseCt =>
+                                RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
+                                    networkProfile: project.NetworkProfiles.Merge,
+                                    project: project,
+                                    phaseCt,
+                                    hostShutdownToken)),
+                        ct);
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
                 await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
@@ -474,6 +508,13 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (AgentStuckException stuckEx)
         {
             await HandleAgentStuckAsync(item, project, stuckEx);
+        }
+        catch (AgentClassExhaustedException ex)
+        {
+            _log.LogWarning(
+                "Work item {Id} parking in WaitingForQuotaReset: {Reason}",
+                item.Id, ex.Message);
+            await TransitionWaitingForQuotaResetAsync(item, ex, project);
         }
         catch (TerminalQuotaError ex)
         {
@@ -1190,9 +1231,15 @@ public sealed class PipelineRunner : IPipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
-            var detection = QuotaFailureDetector.Detect(agentResult.Stderr, agentResult.Stdout);
-            if (detection is not null)
+            // Defer to the runner's classifier (default delegates to
+            // AgentFailureClassifier) so per-CLI overrides apply. The
+            // QuotaFailureDetector still owns reset-window parsing for the
+            // exception we throw, since the classifier is intentionally
+            // pattern-only and doesn't extract durations.
+            var classification = runner.ClassifyFailure(agentResult);
+            if (classification.Kind == AgentFailureKind.QuotaExhausted)
             {
+                var detection = QuotaFailureDetector.Detect(agentResult.Stderr, agentResult.Stdout);
                 await QuotaFailureDetector.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     runner.Kind,
@@ -1205,7 +1252,10 @@ public sealed class PipelineRunner : IPipelineRunner
                     projectId: item.ProjectId,
                     stdout: agentResult.Stdout);
 
-                throw new TerminalQuotaError(detection.Kind, $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+                var quotaKind = detection?.Kind ?? QuotaFailureKind.RateLimitExceeded;
+                throw new TerminalQuotaError(quotaKind,
+                    $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}",
+                    detection?.ResetAt ?? classification.QuotaResetAt);
             }
 
             await QuotaFailureDetector.RecordIfQuotaFailureAsync(
@@ -1705,14 +1755,17 @@ public sealed class PipelineRunner : IPipelineRunner
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
             using var reworkShutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
-            var reworkStdout = await RunWithStuckProbeAsync(item, project, runner.Kind, "rework", reworkCts, ct,
-                phaseCt => RunAgentPhaseAsync(item, runner, repoId, baseBranch, workBranch,
-                    reworkPrompt, isInitial: false,
-                    networkProfile: project.NetworkProfiles.Rework,
-                    project: project,
-                    phaseCt,
-                    hostShutdownToken,
-                    iteration: iteration));
+            var reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: iteration,
+                async (workerRunner, trialItem) =>
+                    await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkCts, ct,
+                        phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
+                            reworkPrompt, isInitial: false,
+                            networkProfile: project.NetworkProfiles.Rework,
+                            project: project,
+                            phaseCt,
+                            hostShutdownToken,
+                            iteration: iteration)),
+                ct);
             if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
             {
                 var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
@@ -2088,8 +2141,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
         // Quota gate: when quota probes are wired up, check the audit agent's
         // availability; fall through to the work agent if quota is low.
-        if (_auditQuotaProbesByKind is not null
-            && _auditQuotaProbesByKind.TryGetValue(kind.Value, out var probe))
+        if (_quotaProbesByKind is not null
+            && _quotaProbesByKind.TryGetValue(kind.Value, out var probe))
         {
             var auditMember = new AgentMembership
             {
@@ -2128,6 +2181,237 @@ public sealed class PipelineRunner : IPipelineRunner
         return auditRunner;
     }
 
+    /// <summary>
+    /// Runs <paramref name="invoker"/> with the work item's chosen agent runner;
+    /// if the invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>
+    /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase),
+    /// marks the member exhausted in the router's in-process cache, picks the
+    /// next-best class member, swaps the runner + ModelId + ReasoningMode on a
+    /// trial copy of the work item, and retries the same iteration.
+    ///
+    /// <para>
+    /// When no class router is wired or the item has no agent class, the wrapper
+    /// is a single-attempt pass-through — the original behaviour. When every
+    /// class member is exhausted in this pickup, throws
+    /// <see cref="AgentClassExhaustedException"/> so the top-level
+    /// <see cref="RunAsync"/> can park the item in WaitingForQuotaReset.
+    /// </para>
+    /// <para>
+    /// <paramref name="invoker"/> receives a trial <see cref="WorkItem"/> whose
+    /// <see cref="WorkItem.Agent"/>, <see cref="WorkItem.ModelId"/>, and
+    /// <see cref="WorkItem.ReasoningMode"/> reflect the candidate currently
+    /// being attempted. Callers must propagate this trial item into the agent
+    /// invocation rather than capturing the original.
+    /// </para>
+    /// </summary>
+    private async Task<TResult> InvokeAgentWithQuotaFallbackAsync<TResult>(
+        WorkItem item,
+        Project project,
+        string phase,
+        int? iteration,
+        Func<IAgentRunner, WorkItem, Task<TResult>> invoker,
+        CancellationToken ct)
+    {
+        // Resolve the initial member from the work item's currently-selected agent.
+        // OrchestratorService writes Agent / ModelId / ReasoningMode onto item before
+        // calling Pipeline.RunAsync; we trust those as the first-attempt picks.
+        var initialAgent = item.Agent ?? project.DefaultAgent;
+        if (!_agents.TryGet(initialAgent, out var initialRunner))
+            throw new InvalidOperationException($"No runner registered for agent '{initialAgent}'");
+
+        // Single-attempt path when fallback is not wired (no class, no router).
+        // The behaviour matches the legacy code: TerminalQuotaError bubbles out.
+        if (_classRouter is null
+            || (item.AgentClassId is null && project.DefaultAgentClass is null))
+        {
+            return await invoker(initialRunner, item);
+        }
+
+        var classId = item.AgentClassId ?? project.DefaultAgentClass!;
+        var triedKeys = new HashSet<(AgentKind, string)>();
+        var triedCount = 0;
+        DateTimeOffset? earliestReset = null;
+        var currentRunner = initialRunner;
+        var currentItem = item;
+        // Prefer the catalog's real AgentMembership (correct Billing / QualityScore /
+        // ReasoningMode) so probe write-backs receive an accurate record. Only fall
+        // back to a synthesised placeholder when the catalog has no matching row —
+        // e.g. tests that exercise the wrapper without a fully-populated class.
+        var currentMember = _classRouter.FindMember(classId, initialAgent, item.ModelId)
+            ?? new AgentMembership
+            {
+                Agent = initialAgent,
+                ModelId = item.ModelId,
+                ReasoningMode = item.ReasoningMode,
+                Billing = AgentBilling.Subscription,
+                QualityScore = 100,
+            };
+
+        while (true)
+        {
+            triedKeys.Add((currentMember.Agent, currentMember.ModelId ?? string.Empty));
+            triedCount++;
+
+            try
+            {
+                return await invoker(currentRunner, currentItem);
+            }
+            catch (TerminalQuotaError quotaEx)
+            {
+                // Cap the reset hint against a sane operator-visible ceiling. Reset
+                // windows are extracted from attacker-influenceable agent output;
+                // a maliciously-crafted Retry-After could otherwise park an item
+                // arbitrarily far in the future.
+                var clampedReset = ClampQuotaReset(quotaEx.ResetAt);
+                // Normalize stderr-derived reason for log/webhook serialization:
+                // strip CR/LF so plain-text log sinks can't be spoofed by embedded
+                // newlines (CWE-117), and trim to a single-line summary.
+                var safeReason = SingleLineSummary(quotaEx.Message);
+
+                // Mark the member exhausted in the router and the probe so the
+                // next pickup (or the rest of this pipeline) skips it.
+                _classRouter.MarkExhausted(currentMember, QuotaExhaustionFallbackTtl, clampedReset);
+                if (_quotaProbesByKind is not null
+                    && _quotaProbesByKind.TryGetValue(currentMember.Agent, out var probe))
+                {
+                    try
+                    {
+                        await probe.MarkExhaustedAsync(currentMember, QuotaExhaustionFallbackTtl, clampedReset, ct);
+                    }
+                    catch (Exception probeEx) when (probeEx is not OperationCanceledException)
+                    {
+                        // Probe write-back is best-effort; in-process cache still suppresses.
+                        _log.LogDebug(probeEx, "MarkExhaustedAsync failed for {Agent}", currentMember.Agent.Value);
+                    }
+                }
+                if (clampedReset is { } reset
+                    && (earliestReset is null || reset < earliestReset))
+                {
+                    earliestReset = reset;
+                }
+
+                // Find the next candidate that we haven't already tried this run.
+                var candidates = _classRouter.OrderedFallbackCandidates(item, project);
+                AgentMembership? nextMember = null;
+                foreach (var candidate in candidates)
+                {
+                    var key = (candidate.Agent, candidate.ModelId ?? string.Empty);
+                    if (triedKeys.Contains(key)) continue;
+                    if (!_agents.TryGet(candidate.Agent, out _))
+                    {
+                        // Audible misconfiguration: class declares this agent kind but
+                        // no runner is wired in DI; skipping silently would hide the gap.
+                        _log.LogWarning(
+                            "Class '{ClassId}' member {Agent} has no registered runner; skipping for fallback (work item {WorkItemId})",
+                            classId, candidate.Agent.Value, item.Id);
+                        continue;
+                    }
+                    nextMember = candidate;
+                    break;
+                }
+
+                if (nextMember is null)
+                {
+                    AuditLog.AgentQuotaAllExhausted(item.Id, classId, phase, triedCount);
+                    if (_fallbackHistory is not null)
+                    {
+                        try
+                        {
+                            await _fallbackHistory.RecordAsync(new AgentFallbackRecord(
+                                Id: Guid.NewGuid(),
+                                WorkItemId: item.Id,
+                                Phase: phase,
+                                Iteration: iteration,
+                                FromAgent: currentMember.Agent,
+                                FromModel: currentMember.ModelId,
+                                ToAgent: null,
+                                ToModel: null,
+                                Reason: safeReason,
+                                OccurredAt: DateTimeOffset.UtcNow), CancellationToken.None);
+                        }
+                        catch (Exception histEx)
+                        {
+                            _log.LogDebug(histEx, "fallback history record failed for all-exhausted event");
+                        }
+                    }
+                    var msg = $"All {triedCount} eligible member(s) of class '{classId}' exhausted mid-{phase}; " +
+                              $"last failure: {safeReason}";
+                    throw new AgentClassExhaustedException(classId, phase, triedCount, earliestReset, msg);
+                }
+
+                if (!_agents.TryGet(nextMember.Agent, out var nextRunner))
+                    throw new InvalidOperationException($"No runner registered for fallback agent '{nextMember.Agent}'");
+
+                AuditLog.AgentQuotaFallback(
+                    item.Id, phase, iteration,
+                    fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
+                    toAgent: nextMember.Agent, toModel: nextMember.ModelId,
+                    reason: safeReason);
+
+                // Trial item carries the new Agent / ModelId / ReasoningMode so webhook
+                // consumers that read WorkItem.Agent see the agent actually being run.
+                var trialItem = item with
+                {
+                    Agent = nextMember.Agent,
+                    ModelId = nextMember.ModelId,
+                    ReasoningMode = nextMember.ReasoningMode,
+                };
+
+                if (_fallbackHistory is not null)
+                {
+                    try
+                    {
+                        await _fallbackHistory.RecordAsync(new AgentFallbackRecord(
+                            Id: Guid.NewGuid(),
+                            WorkItemId: item.Id,
+                            Phase: phase,
+                            Iteration: iteration,
+                            FromAgent: currentMember.Agent,
+                            FromModel: currentMember.ModelId,
+                            ToAgent: nextMember.Agent,
+                            ToModel: nextMember.ModelId,
+                            Reason: safeReason,
+                            OccurredAt: DateTimeOffset.UtcNow), CancellationToken.None);
+                    }
+                    catch (Exception histEx)
+                    {
+                        _log.LogDebug(histEx, "fallback history record failed for agent.fallback event");
+                    }
+                }
+
+                if (_webhooks is not null)
+                {
+                    try
+                    {
+                        await _webhooks.PublishAsync(new WebhookEvent
+                        {
+                            Event = "agent.fallback",
+                            WorkItem = trialItem,
+                            Project = project,
+                            Details = new AgentFallbackDetails(
+                                WorkItemId: item.Id.ToString(),
+                                Phase: phase,
+                                Iteration: iteration,
+                                FromAgent: currentMember.Agent.Value,
+                                FromModel: currentMember.ModelId,
+                                ToAgent: nextMember.Agent.Value,
+                                ToModel: nextMember.ModelId,
+                                Reason: safeReason),
+                        }, CancellationToken.None);
+                    }
+                    catch (Exception webhookEx)
+                    {
+                        _log.LogDebug(webhookEx, "agent.fallback webhook publish failed");
+                    }
+                }
+
+                currentMember = nextMember;
+                currentRunner = nextRunner;
+                currentItem = trialItem;
+            }
+        }
+    }
+
     internal static string? ResolveObservedModelId(IAgentRunner runner, string? modelId)
     {
         if (modelId is not null)
@@ -2137,6 +2421,51 @@ public sealed class PipelineRunner : IPipelineRunner
             return string.IsNullOrWhiteSpace(defaults.DefaultModelId) ? null : defaults.DefaultModelId;
 
         return null;
+    }
+
+    /// <summary>
+    /// Clamps a parsed reset-window hint against <see cref="MaxParsedQuotaResetWindow"/>.
+    /// The hint comes from agent stdout/stderr and is attacker-influenceable via
+    /// prompt injection; without a ceiling, a hostile output could park an item
+    /// arbitrarily far in the future and re-arm targeted retry timers for that
+    /// instant. Returns null when input is null.
+    /// </summary>
+    internal static DateTimeOffset? ClampQuotaReset(DateTimeOffset? resetAt)
+    {
+        if (resetAt is not { } parsed) return null;
+        var now = DateTimeOffset.UtcNow;
+        var ceiling = now + MaxParsedQuotaResetWindow;
+        return parsed > ceiling ? ceiling : parsed;
+    }
+
+    /// <summary>
+    /// Normalises a reason string for log / webhook serialisation: strips
+    /// CR/LF and other control characters (replaced with spaces) so plain-text
+    /// log sinks cannot be spoofed by embedded newlines (CWE-117), collapses
+    /// runs of whitespace, and trims. Returns an empty string for null input.
+    /// </summary>
+    internal static string SingleLineSummary(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        var sb = new StringBuilder(text.Length);
+        var lastWasSpace = false;
+        foreach (var ch in text)
+        {
+            if (ch is '\r' or '\n' or '\t' || char.IsControl(ch))
+            {
+                if (!lastWasSpace) { sb.Append(' '); lastWasSpace = true; }
+            }
+            else if (ch == ' ')
+            {
+                if (!lastWasSpace) { sb.Append(' '); lastWasSpace = true; }
+            }
+            else
+            {
+                sb.Append(ch);
+                lastWasSpace = false;
+            }
+        }
+        return sb.ToString().Trim();
     }
 
     /// <summary>
@@ -4065,6 +4394,60 @@ public sealed class PipelineRunner : IPipelineRunner
         }, CancellationToken.None);
     }
 
+    private async Task TransitionWaitingForQuotaResetAsync(
+        WorkItem item,
+        AgentClassExhaustedException ex,
+        Project? project)
+    {
+        var ct = CancellationToken.None;
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        // Schedule the next retry attempt: prefer the earliest reset-window
+        // hint extracted from the failing agents' output; otherwise fall back
+        // to one cache-TTL window so the periodic sweep eventually rediscovers
+        // availability without burning the work-item budget on tight retries.
+        var nextRetryAt = ex.EarliestResetAt ?? DateTimeOffset.UtcNow.Add(QuotaExhaustionFallbackTtl);
+        var next = current.With(WorkItemState.WaitingForQuotaReset, ex.Message,
+            failureKind: "quota", quotaResetAt: ex.EarliestResetAt) with
+        {
+            NextQuotaRetryAt = nextRetryAt,
+        };
+
+        var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
+        if (!updated)
+        {
+            _log.LogInformation(
+                "Work item {Id} state changed concurrently; skipping WaitingForQuotaReset transition",
+                item.Id);
+            return;
+        }
+
+        if (_retryScheduler is not null)
+            await _retryScheduler.NotifyQuotaFailureAsync(next);
+
+        AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForQuotaReset.ToString());
+        var effectiveProject = project ?? new Project
+        {
+            Id = item.ProjectId,
+            DisplayName = item.ProjectId.Value,
+            RepositoryUrl = string.Empty,
+        };
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "work_item.waiting_for_quota_reset",
+            WorkItem = next,
+            Project = effectiveProject,
+            Details = new AgentFallbackDetails(
+                WorkItemId: item.Id.ToString(),
+                Phase: ex.Phase,
+                Iteration: null,
+                FromAgent: (item.Agent ?? effectiveProject.DefaultAgent).Value,
+                FromModel: item.ModelId,
+                ToAgent: null,
+                ToModel: null,
+                Reason: ex.Message),
+        }, ct);
+    }
+
     private static string StateToEventName(WorkItemState state) => state switch
     {
         WorkItemState.Working => "work_item.working",
@@ -4080,6 +4463,7 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItemState.Failed => "work_item.failed",
         WorkItemState.Cancelled => "work_item.cancelled",
         WorkItemState.NeedsOperatorInput => "work_item.needs_operator_input",
+        WorkItemState.WaitingForQuotaReset => "work_item.waiting_for_quota_reset",
         _ => $"work_item.{state.ToString().ToLowerInvariant()}",
     };
 
@@ -4341,6 +4725,22 @@ public sealed record QuestionDismissedDetails(
     string WorkItemId,
     string ProjectId,
     string QuestionId,
+    string Reason);
+
+/// <summary>
+/// Webhook payload for <c>agent.fallback</c>: a mid-iteration QuotaExhausted
+/// classification triggered the pipeline to retry the same iteration against
+/// the next class member. <see cref="ToAgent"/> is null when no fallback was
+/// available and the item parked in WaitingForQuotaReset.
+/// </summary>
+public sealed record AgentFallbackDetails(
+    string WorkItemId,
+    string Phase,
+    int? Iteration,
+    string FromAgent,
+    string? FromModel,
+    string? ToAgent,
+    string? ToModel,
     string Reason);
 
 internal sealed record AuditIterationDetails(

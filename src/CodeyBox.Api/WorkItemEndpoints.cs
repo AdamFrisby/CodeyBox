@@ -340,6 +340,7 @@ internal static class WorkItemEndpoints
         IProjectRepository projects,
         IWorkItemCostStore? costs,
         ILoggerFactory loggerFactory,
+        IAgentFallbackHistoryStore? fallbackHistory,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -361,15 +362,16 @@ internal static class WorkItemEndpoints
         var project = await projects.GetAsync(item.ProjectId, ct);
         var usage = await TryGetUsageSummaryAsync(
             costs, item.Id, loggerFactory.CreateLogger("CodeyBox.Api.WorkItemEndpoints"), ct);
-        return Results.Ok(ToDto(item, project, statesById, depExternalIds, usage));
+        var dto = ToDto(item, project, statesById, depExternalIds, usage);
+        if (fallbackHistory is not null)
+        {
+            var history = await fallbackHistory.ListByWorkItemAsync(item.Id, ct);
+            if (history.Count > 0)
+                dto = dto with { FallbackHistory = history.Select(MapFallback).ToList() };
+        }
+        return Results.Ok(dto);
     }
 
-    /// <summary>
-    /// Best-effort single-item cost summary lookup. Returns null when no cost store is
-    /// registered, no rows exist for the work item, or a non-cancellation read fault is
-    /// caught (logged at Debug). OperationCanceledException is rethrown so callers can
-    /// honour cooperative cancellation on client disconnects.
-    /// </summary>
     private static async Task<WorkItemUsageSummary?> TryGetUsageSummaryAsync(
         IWorkItemCostStore? costs, WorkItemId workItemId, ILogger log, CancellationToken ct)
     {
@@ -383,11 +385,6 @@ internal static class WorkItemEndpoints
         }
     }
 
-    /// <summary>
-    /// Best-effort batched cost summary lookup for the list endpoint. Mirrors the
-    /// single-item helper's catch semantics: cancellation surfaces, other failures
-    /// log at Debug and return an empty map (usage absent for every item).
-    /// </summary>
     private static async Task<IReadOnlyDictionary<string, WorkItemUsageSummary>> TryGetUsageSummariesAsync(
         IWorkItemCostStore? costs, IReadOnlyCollection<string> workItemIds, ILogger log, CancellationToken ct)
     {
@@ -401,6 +398,18 @@ internal static class WorkItemEndpoints
             return new Dictionary<string, WorkItemUsageSummary>(StringComparer.Ordinal);
         }
     }
+
+    private static AgentFallbackDto MapFallback(AgentFallbackRecord r) =>
+        new(
+            Id: r.Id.ToString(),
+            Phase: r.Phase,
+            Iteration: r.Iteration,
+            FromAgent: r.FromAgent.Value,
+            FromModel: r.FromModel,
+            ToAgent: r.ToAgent?.Value,
+            ToModel: r.ToModel,
+            Reason: r.Reason,
+            OccurredAt: r.OccurredAt);
 
     /// <summary>
     /// List all work items that directly depend on the given item. Useful for
@@ -454,11 +463,14 @@ internal static class WorkItemEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        // Only resume from terminal-failed states. Done items have nothing
-        // to retry; non-terminal states would race the pipeline.
+        // Only resume from terminal-failed states or the parked
+        // WaitingForQuotaReset state (operator override of the scheduler).
+        // Done items have nothing to retry; other non-terminal states would
+        // race the pipeline.
         if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
-            or WorkItemState.AbandonedAfterRecoveryAttempts))
+            or WorkItemState.AbandonedAfterRecoveryAttempts
+            or WorkItemState.WaitingForQuotaReset))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
@@ -1438,15 +1450,22 @@ public sealed record WorkItemDto(
     DateTimeOffset? QuotaResetAt = null,
     DateTimeOffset? NextQuotaRetryAt = null,
     int QuotaRetryAttempts = 0,
-    // Usage / UsageTotal: per the cost-surface spec, "the entire usage object is
-    // omitted; downstream consumers treat absent == unknown." The webhook dispatcher
-    // honours this via DefaultIgnoreCondition=WhenWritingNull on its own serializer;
-    // the API uses ASP.NET's default options, so the JsonIgnore attribute targeted at
-    // these two fields keeps the two surface contracts aligned.
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     WorkItemIterationUsage? Usage = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    WorkItemUsageTotal? UsageTotal = null);
+    WorkItemUsageTotal? UsageTotal = null,
+    IReadOnlyList<AgentFallbackDto>? FallbackHistory = null);
+
+public sealed record AgentFallbackDto(
+    string Id,
+    string Phase,
+    int? Iteration,
+    string FromAgent,
+    string? FromModel,
+    string? ToAgent,
+    string? ToModel,
+    string Reason,
+    DateTimeOffset OccurredAt);
 
 public sealed record ProjectDto(
     string Id,

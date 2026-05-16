@@ -210,9 +210,13 @@ public sealed record WorkItem
         {
             State = state,
             LastError = error,
-            FailureKind = state == WorkItemState.Failed ? (failureKind ?? FailureKind) : null,
-            QuotaResetAt = state == WorkItemState.Failed ? (quotaResetAt ?? QuotaResetAt) : null,
-            NextQuotaRetryAt = state == WorkItemState.Failed ? NextQuotaRetryAt : null,
+            // Both Failed("quota") and WaitingForQuotaReset are quota-shaped
+            // states that must preserve FailureKind / QuotaResetAt /
+            // NextQuotaRetryAt so the retry scheduler can re-arm timers
+            // across host restarts.
+            FailureKind = IsQuotaShapedState(state) ? (failureKind ?? FailureKind) : null,
+            QuotaResetAt = IsQuotaShapedState(state) ? (quotaResetAt ?? QuotaResetAt) : null,
+            NextQuotaRetryAt = IsQuotaShapedState(state) ? NextQuotaRetryAt : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
             CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
             UpdatedAt = DateTimeOffset.UtcNow,
@@ -225,4 +229,7 @@ public sealed record WorkItem
             PreemptedAt = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptedAt : null,
             PreemptCheckpoint = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptCheckpoint : null,
         };
+
+    private static bool IsQuotaShapedState(WorkItemState state) =>
+        state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
 }

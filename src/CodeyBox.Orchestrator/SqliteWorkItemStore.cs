@@ -359,7 +359,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             WHERE project_id = $pid
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
+              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.WaitingForQuotaReset}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);
