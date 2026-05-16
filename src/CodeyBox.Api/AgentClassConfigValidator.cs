@@ -28,7 +28,10 @@ namespace CodeyBox.Api;
 /// </summary>
 internal sealed class AgentClassConfigValidator : IHostedService
 {
-    internal static readonly TimeSpan ValidationDeadline = TimeSpan.FromSeconds(10);
+    // Instance (not static) so tests can override via object initializer with a
+    // millisecond-scale deadline to exercise the timeout branch without sleeping
+    // for the production 10s budget.
+    internal TimeSpan ValidationDeadline { get; init; } = TimeSpan.FromSeconds(10);
 
     private readonly IOptions<CodeyBoxOptions> _options;
     private readonly IEnumerable<IAgentModelListProbe> _probes;

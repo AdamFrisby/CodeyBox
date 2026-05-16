@@ -196,6 +196,40 @@ public sealed class AgentClassConfigValidatorTests
     }
 
     [Fact]
+    public async Task ProbeHangs_HitsDeadline_LogsTimeoutWarning_HostStarts()
+    {
+        // Probe awaits on its cancellation token forever; the validator's linked
+        // CTS cancels after ValidationDeadline. The probe's OperationCanceledException
+        // then matches the validator's timeout-specific catch block.
+        var probe = new HangingModelListProbe(AgentKind.Claude);
+        var capture = new ModelListCapturingLogger();
+
+        var opts = new CodeyBoxOptions
+        {
+            AgentClasses = new[] { ClassWithMember("frontier", "claude", "claude-opus-4-7") }.ToList(),
+            ConfigValidation = new ConfigValidationOptions { FailOnUnknownModel = true },
+        };
+        var validator = new AgentClassConfigValidator(
+            Options.Create(opts),
+            new[] { probe },
+            new ModelListCapturingLoggerAdapter<AgentClassConfigValidator>(capture))
+        {
+            // Sub-second deadline keeps the test fast.
+            ValidationDeadline = TimeSpan.FromMilliseconds(50),
+        };
+
+        await validator.StartAsync(CancellationToken.None);
+
+        Assert.True(probe.CallCount > 0);
+        var warnings = capture.Records.Where(r => r.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("timed out", warnings[0].Message);
+        Assert.Contains("claude", warnings[0].Message);
+        // Timeout path must skip validation, not trigger FailOnUnknownModel —
+        // the validator should NOT throw even with that option true.
+    }
+
+    [Fact]
     public async Task NoProbeRegisteredForAgent_LogsSkipWarning()
     {
         var capture = new ModelListCapturingLogger();
@@ -263,6 +297,22 @@ internal sealed class StubModelListProbe : IAgentModelListProbe
     {
         CallCount++;
         return Task.FromResult(_result);
+    }
+}
+
+internal sealed class HangingModelListProbe : IAgentModelListProbe
+{
+    public HangingModelListProbe(AgentKind kind) { Kind = kind; }
+
+    public AgentKind Kind { get; }
+    public int CallCount { get; private set; }
+
+    public async Task<AgentModelListResult> GetModelListAsync(CancellationToken ct)
+    {
+        CallCount++;
+        await Task.Delay(Timeout.Infinite, ct);
+        // Unreachable — Task.Delay throws OperationCanceledException on cancel.
+        return AgentModelListResult.Failed("unreachable");
     }
 }
 
