@@ -183,6 +183,36 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task SummariseManyAsync_BatchesAcrossWorkItems_OmitsEntriesWithoutCosts()
+    {
+        // Pins the IN-list override: K items must come back in O(1) read
+        // connections, only entries that actually had cost rows appear in the
+        // returned map, and the unknown id is silently absent.
+        var withCostsA = Guid.NewGuid().ToString();
+        var withCostsB = Guid.NewGuid().ToString();
+        var withoutCosts = Guid.NewGuid().ToString();
+        var unknown = Guid.NewGuid().ToString();
+        SeedWorkItem(withCostsA);
+        SeedWorkItem(withCostsB);
+        SeedWorkItem(withoutCosts);
+
+        await _store.RecordAsync(MakeCost(withCostsA, "work"));
+        await _store.RecordAsync(MakeCost(withCostsB, "work"));
+
+        var summaries = await _store.SummariseManyAsync(
+            new[] { withCostsA, withCostsB, withoutCosts, unknown });
+
+        Assert.Equal(2, summaries.Count);
+        Assert.True(summaries.ContainsKey(withCostsA));
+        Assert.True(summaries.ContainsKey(withCostsB));
+        Assert.False(summaries.ContainsKey(withoutCosts));
+        Assert.False(summaries.ContainsKey(unknown));
+        // Single-row work cost: iter delta == total.
+        Assert.Equal(12345, summaries[withCostsA].Iteration.TokensInput);
+        Assert.Equal(12345, summaries[withCostsA].Total.TokensInput);
+    }
+
+    [Fact]
     public async Task GetByProjectAsync_DateRangeFilter_ExcludesOutsideRange()
     {
         var itemId = Guid.NewGuid().ToString();

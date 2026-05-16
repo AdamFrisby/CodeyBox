@@ -77,9 +77,32 @@ Every event is a JSON object POSTed as the request body.
     "displayName": "My Project",
     "repositoryUrl": "https://github.com/example/repo"
   },
-  "details": null
+  "details": null,
+  "usage": {
+    "iteration": 2,
+    "tokensInput": 8000,
+    "tokensOutput": 900,
+    "tokensReasoning": 0,
+    "tokensCached": 500,
+    "costUsd": 0.2310,
+    "elapsedMs": 6500
+  },
+  "usageTotal": {
+    "tokensInput": 16500,
+    "tokensOutput": 1590,
+    "tokensReasoning": 0,
+    "tokensCached": 500,
+    "costUsd": 0.4012,
+    "elapsedMs": 14000
+  }
 }
 ```
+
+`usage` covers the most recent iteration's contribution; `usageTotal` is the
+cumulative spend across every iteration of the work item. Both blocks are
+omitted entirely when no cost data is available (e.g. an agent without a
+registered cost extractor) — receivers should treat absent as "unknown".
+`tokensReasoning` is reserved for future model surfaces and is `0` today.
 
 ### `audit_iteration` details
 

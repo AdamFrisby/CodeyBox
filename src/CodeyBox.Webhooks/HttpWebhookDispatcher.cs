@@ -169,7 +169,9 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
             Project: evt.Project is { } proj
                 ? new WebhookProjectPayload(proj.Id.Value, proj.DisplayName, repoUrl ?? "")
                 : null,
-            Details: evt.Details);
+            Details: evt.Details,
+            Usage: evt.Usage,
+            UsageTotal: evt.UsageTotal);
 
         return JsonSerializer.Serialize(payload, JsonOptions);
     }
@@ -228,7 +230,9 @@ internal sealed record WebhookPayload(
     DateTimeOffset OccurredAt,
     WebhookWorkItemPayload? WorkItem,
     WebhookProjectPayload? Project,
-    object? Details);
+    object? Details,
+    WorkItemIterationUsage? Usage,
+    WorkItemUsageTotal? UsageTotal);
 
 internal sealed record WebhookWorkItemPayload(
     string Id,
