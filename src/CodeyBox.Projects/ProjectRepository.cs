@@ -196,6 +196,7 @@ public sealed class ProjectRepository : IProjectRepository
             Budget = ResolveBudget(pc.Budget),
             ReleaseConfig = ResolveReleaseConfig(pc.Release),
             SkipCredentialSmokeTest = pc.SkipCredentialSmokeTest ?? false,
+            MaxPriority = pc.MaxPriority,
         };
     }
 

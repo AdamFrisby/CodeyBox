@@ -385,4 +385,55 @@ public sealed class ProjectRepositoryTests
         Assert.True(p.Upstream.AutoMerge);
         Assert.Equal("[bot] {title}", p.Upstream.PullRequestTitleTemplate);
     }
+
+    [Fact]
+    public async Task MaxPriority_LoadedFromConfig()
+    {
+        // Verifies the ProjectConfig.MaxPriority field binds through to
+        // Project.MaxPriority via ProjectRepository.Resolve. Production
+        // deployments configure the cap this way (YAML/JSON), not by building
+        // Project instances in code.
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://github.com/me/alpha.git",
+                    MaxPriority = 200,
+                },
+                new ProjectConfig
+                {
+                    Id = "beta",
+                    RepositoryUrl = "https://github.com/me/beta.git",
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var alpha = await repo.GetAsync(new ProjectId("alpha"));
+        var beta = await repo.GetAsync(new ProjectId("beta"));
+        Assert.Equal(200, alpha!.MaxPriority);
+        Assert.Null(beta!.MaxPriority);
+    }
+
+    [Fact]
+    public async Task MaxPriority_BindsThroughConfigurationBuilder()
+    {
+        // End-to-end: the configuration loader (the real path used by
+        // appsettings.json deployments) populates ProjectConfig.MaxPriority,
+        // and ProjectRepository forwards it to Project.MaxPriority.
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://github.com/me/alpha.git",
+                ["CodeyBox:Projects:0:MaxPriority"] = "750",
+            })
+            .Build();
+        var bound = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        var repo = new ProjectRepository(Options.Create(bound));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.Equal(750, p!.MaxPriority);
+    }
 }
