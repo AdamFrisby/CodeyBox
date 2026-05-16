@@ -22,7 +22,12 @@ public enum AgentFailureKind
     /// <summary>Genuine work-related failure (the agent ran but reported failure).</summary>
     Normal,
 
-    /// <summary>Mid-flight quota exhaustion — fall back to the next class member.</summary>
+    /// <summary>
+    /// Mid-flight quota exhaustion — the in-iteration fallback wrapper marks
+    /// the member exhausted in the router and retries the same iteration
+    /// against the next class member. Applies to work, rework (audit-loop),
+    /// and merge phases.
+    /// </summary>
     QuotaExhausted,
 
     /// <summary>Transient network/connectivity failure that may benefit from a retry.</summary>

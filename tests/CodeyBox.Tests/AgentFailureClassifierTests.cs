@@ -71,6 +71,26 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
+    public void Quota_BeatsAuth_WhenBothPatternsPresent()
+    {
+        // Defence against a re-ordering bug: a 429 with an "invalid_api_key"
+        // tail must still classify as quota. Reversing the check order would
+        // silently misclassify quota events as auth failures, sending operators
+        // to rotate credentials rather than waiting for the quota window.
+        var c = AgentFailureClassifier.Classify(
+            stderr: "API Error: rate_limit_exceeded\nfollow-up: invalid_api_key reported");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
+    public void Auth_BeatsNetwork_WhenBothPatternsPresent()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: "API Error: 401 Unauthorized; subsequent ECONNRESET");
+        Assert.Equal(AgentFailureKind.AuthError, c.Kind);
+    }
+
+    [Fact]
     public void EmptyOutput_ClassifiedAsUnknown()
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: null);

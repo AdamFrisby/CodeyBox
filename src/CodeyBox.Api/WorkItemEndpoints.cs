@@ -318,7 +318,12 @@ internal static class WorkItemEndpoints
         return Results.Ok(list);
     }
 
-    private static async Task<IResult> GetAsync(string id, IWorkItemStore store, IProjectRepository projects, CancellationToken ct)
+    private static async Task<IResult> GetAsync(
+        string id,
+        IWorkItemStore store,
+        IProjectRepository projects,
+        IAgentFallbackHistoryStore? fallbackHistory,
+        CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
@@ -337,8 +342,27 @@ internal static class WorkItemEndpoints
         }
 
         var project = await projects.GetAsync(item.ProjectId, ct);
-        return Results.Ok(ToDto(item, project, statesById, depExternalIds));
+        var dto = ToDto(item, project, statesById, depExternalIds);
+        if (fallbackHistory is not null)
+        {
+            var history = await fallbackHistory.ListByWorkItemAsync(item.Id, ct);
+            if (history.Count > 0)
+                dto = dto with { FallbackHistory = history.Select(MapFallback).ToList() };
+        }
+        return Results.Ok(dto);
     }
+
+    private static AgentFallbackDto MapFallback(AgentFallbackRecord r) =>
+        new(
+            Id: r.Id.ToString(),
+            Phase: r.Phase,
+            Iteration: r.Iteration,
+            FromAgent: r.FromAgent.Value,
+            FromModel: r.FromModel,
+            ToAgent: r.ToAgent?.Value,
+            ToModel: r.ToModel,
+            Reason: r.Reason,
+            OccurredAt: r.OccurredAt);
 
     /// <summary>
     /// List all work items that directly depend on the given item. Useful for
@@ -392,11 +416,14 @@ internal static class WorkItemEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        // Only resume from terminal-failed states. Done items have nothing
-        // to retry; non-terminal states would race the pipeline.
+        // Only resume from terminal-failed states or the parked
+        // WaitingForQuotaReset state (operator override of the scheduler).
+        // Done items have nothing to retry; other non-terminal states would
+        // race the pipeline.
         if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
-            or WorkItemState.AbandonedAfterRecoveryAttempts))
+            or WorkItemState.AbandonedAfterRecoveryAttempts
+            or WorkItemState.WaitingForQuotaReset))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
@@ -1372,7 +1399,25 @@ public sealed record WorkItemDto(
     string? FailureKind = null,
     DateTimeOffset? QuotaResetAt = null,
     DateTimeOffset? NextQuotaRetryAt = null,
-    int QuotaRetryAttempts = 0);
+    int QuotaRetryAttempts = 0,
+    IReadOnlyList<AgentFallbackDto>? FallbackHistory = null);
+
+/// <summary>
+/// One row in <see cref="WorkItemDto.FallbackHistory"/>: a recorded
+/// in-iteration agent fallback event. <see cref="ToAgent"/> is null when the
+/// event recorded the all-eligible-members-exhausted park into
+/// WaitingForQuotaReset rather than a successful swap.
+/// </summary>
+public sealed record AgentFallbackDto(
+    string Id,
+    string Phase,
+    int? Iteration,
+    string FromAgent,
+    string? FromModel,
+    string? ToAgent,
+    string? ToModel,
+    string Reason,
+    DateTimeOffset OccurredAt);
 
 public sealed record ProjectDto(
     string Id,

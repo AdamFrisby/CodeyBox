@@ -237,6 +237,32 @@ public sealed class AgentClassRouter
     }
 
     /// <summary>
+    /// Looks up the canonical <see cref="AgentMembership"/> for a class member.
+    /// Returns null if the class is unknown or no member matches the (agent, model)
+    /// pair. Match is exact on Agent and ModelId (treating null and "" as
+    /// equivalent).
+    /// <para>
+    /// Used by the in-iteration fallback wrapper so it can call
+    /// <see cref="MarkExhausted"/> and <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
+    /// with the real catalog record (correct Billing / QualityScore /
+    /// ReasoningMode) instead of fabricating a placeholder.
+    /// </para>
+    /// </summary>
+    public AgentMembership? FindMember(string classId, AgentKind agent, string? modelId)
+    {
+        if (!_catalog.TryGetValue(classId, out var agentClass)) return null;
+        var normalisedModel = modelId ?? string.Empty;
+        foreach (var m in agentClass.Members)
+        {
+            if (m.Agent != agent) continue;
+            var memberModel = m.ModelId ?? string.Empty;
+            if (string.Equals(memberModel, normalisedModel, StringComparison.Ordinal))
+                return m;
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Returns the eligible class members for <paramref name="item"/> in the
     /// router's preferred order, *minus* members that this process has marked
     /// exhausted via <see cref="MarkExhausted"/> within the active TTL window.
@@ -262,11 +288,13 @@ public sealed class AgentClassRouter
 
         var nowUtc = _time.GetUtcNow();
         // Drop expired exhaustion entries lazily so the cache doesn't grow unbounded
-        // across long-running processes.
+        // across long-running processes. TryRemove(KeyValuePair) only removes when
+        // the value still matches what we observed — a concurrent MarkExhausted that
+        // refreshed the expiry between the read and the remove is preserved.
         foreach (var key in _exhausted.Keys.ToList())
         {
             if (_exhausted.TryGetValue(key, out var expiry) && expiry <= nowUtc)
-                _exhausted.TryRemove(key, out _);
+                _exhausted.TryRemove(new KeyValuePair<(AgentKind Agent, string ModelId), DateTimeOffset>(key, expiry));
         }
 
         return agentClass.Members
