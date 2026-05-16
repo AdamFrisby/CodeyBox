@@ -92,6 +92,56 @@ public sealed class WorkItemUsageAggregatorTests
     }
 
     [Fact]
+    public void Summarise_MergePhase_IsCaseInsensitive_FoldsIntoLatestIteration()
+    {
+        // Defence-in-depth: the comparison in BucketIteration is OrdinalIgnoreCase
+        // so callers writing "Merge" or "MERGE" still fold into the latest
+        // iteration's delta. Pinning this prevents a regression to ordinal.
+        var rows = new[]
+        {
+            MakeCost("audit", 1, 1000, 100, 0, 0.05, 1.0),
+            MakeCost("MERGE", null,  500,  50, 0, 0.01, 0.5),
+        };
+
+        var summary = WorkItemUsageAggregator.Summarise(rows)!;
+
+        // MERGE row must be in iter 1's delta, not double-counted or dropped.
+        Assert.Equal(1000 + 500, summary.Iteration.TokensInput);
+        Assert.Equal(100 + 50, summary.Iteration.TokensOutput);
+    }
+
+    [Fact]
+    public void Summarise_NegativeElapsed_IsClampedToZero()
+    {
+        // EndedAt < StartedAt would otherwise produce a negative elapsed_ms.
+        // The reducer clamps via Math.Max(0, …) to defend against clock-skew
+        // rows landing in the cost store. Removing the clamp must not pass.
+        var ended = DateTimeOffset.UtcNow;
+        var rows = new[]
+        {
+            new WorkItemCost
+            {
+                Id = "skewed",
+                WorkItemId = "wi",
+                Phase = "work",
+                AgentKind = "claude",
+                InputTokens = 1,
+                OutputTokens = 1,
+                EstimatedUsd = 0.01,
+                // Started AFTER Ended → negative span; the aggregator must
+                // clamp to 0 so totals/iteration ms stay non-negative.
+                StartedAt = ended.AddSeconds(5),
+                EndedAt = ended,
+            },
+        };
+
+        var summary = WorkItemUsageAggregator.Summarise(rows)!;
+
+        Assert.Equal(0, summary.Iteration.ElapsedMs);
+        Assert.Equal(0, summary.Total.ElapsedMs);
+    }
+
+    [Fact]
     public void Summarise_RoundsCostToFourDecimals()
     {
         // Sum of these values = 0.123456789 — should round to 0.1235.

@@ -4023,6 +4023,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         if (_costStore is null) return null;
         try { return await _costStore.SummariseAsync(id.ToString(), CancellationToken.None); }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Cost: failed to summarise usage for work item {Id}; webhook will omit usage", id);

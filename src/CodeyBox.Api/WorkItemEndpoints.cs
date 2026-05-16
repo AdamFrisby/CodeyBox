@@ -1,5 +1,7 @@
+using System.Text.Json.Serialization;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Api;
 
@@ -303,6 +305,7 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         IProjectRepository projects,
         IWorkItemCostStore? costs,
+        ILoggerFactory loggerFactory,
         CancellationToken ct)
     {
         var allProjects = (await projects.ListAsync(ct)).ToDictionary(p => p.Id.Value);
@@ -311,6 +314,13 @@ internal static class WorkItemEndpoints
         var statesById = WorkItemDependencies.BuildStateMap(allItems);
         var externalIdsById = allItems.ToDictionary(i => i.Id, i => i.ExternalId);
 
+        // Batched cost lookup: one SQL round-trip total instead of N. The store's
+        // SummariseManyAsync is keyed by work-item-id string and only contains
+        // entries for items that have cost rows; missing → "usage unknown".
+        var usageByItem = await TryGetUsageSummariesAsync(
+            costs, allItems.Select(i => i.Id.ToString()).ToList(),
+            loggerFactory.CreateLogger("CodeyBox.Api.WorkItemEndpoints"), ct);
+
         var list = new List<WorkItemDto>(allItems.Count);
         foreach (var item in allItems)
         {
@@ -318,7 +328,7 @@ internal static class WorkItemEndpoints
             var depExternalIds = item.DependsOn
                 .Where(d => externalIdsById.TryGetValue(d, out _))
                 .ToDictionary(d => d, d => externalIdsById[d]);
-            var usage = await TryGetUsageSummaryAsync(costs, item.Id, ct);
+            usageByItem.TryGetValue(item.Id.ToString(), out var usage);
             list.Add(ToDto(item, p, statesById, depExternalIds, usage));
         }
         return Results.Ok(list);
@@ -329,6 +339,7 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         IProjectRepository projects,
         IWorkItemCostStore? costs,
+        ILoggerFactory loggerFactory,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -348,21 +359,47 @@ internal static class WorkItemEndpoints
         }
 
         var project = await projects.GetAsync(item.ProjectId, ct);
-        var usage = await TryGetUsageSummaryAsync(costs, item.Id, ct);
+        var usage = await TryGetUsageSummaryAsync(
+            costs, item.Id, loggerFactory.CreateLogger("CodeyBox.Api.WorkItemEndpoints"), ct);
         return Results.Ok(ToDto(item, project, statesById, depExternalIds, usage));
     }
 
     /// <summary>
-    /// Best-effort cost summary lookup. Returns null when no cost store is
-    /// registered, no rows exist for the work item, or the read fails — every
-    /// downstream caller treats null as "usage unknown".
+    /// Best-effort single-item cost summary lookup. Returns null when no cost store is
+    /// registered, no rows exist for the work item, or a non-cancellation read fault is
+    /// caught (logged at Debug). OperationCanceledException is rethrown so callers can
+    /// honour cooperative cancellation on client disconnects.
     /// </summary>
     private static async Task<WorkItemUsageSummary?> TryGetUsageSummaryAsync(
-        IWorkItemCostStore? costs, WorkItemId workItemId, CancellationToken ct)
+        IWorkItemCostStore? costs, WorkItemId workItemId, ILogger log, CancellationToken ct)
     {
         if (costs is null) return null;
         try { return await costs.SummariseAsync(workItemId.ToString(), ct); }
-        catch { return null; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            log.LogDebug(ex, "Cost: failed to summarise usage for work item {Id}; response will omit usage", workItemId);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Best-effort batched cost summary lookup for the list endpoint. Mirrors the
+    /// single-item helper's catch semantics: cancellation surfaces, other failures
+    /// log at Debug and return an empty map (usage absent for every item).
+    /// </summary>
+    private static async Task<IReadOnlyDictionary<string, WorkItemUsageSummary>> TryGetUsageSummariesAsync(
+        IWorkItemCostStore? costs, IReadOnlyCollection<string> workItemIds, ILogger log, CancellationToken ct)
+    {
+        if (costs is null || workItemIds.Count == 0)
+            return new Dictionary<string, WorkItemUsageSummary>(StringComparer.Ordinal);
+        try { return await costs.SummariseManyAsync(workItemIds, ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            log.LogDebug(ex, "Cost: failed to summarise usage for {Count} work items; response will omit usage", workItemIds.Count);
+            return new Dictionary<string, WorkItemUsageSummary>(StringComparer.Ordinal);
+        }
     }
 
     /// <summary>
@@ -1401,7 +1438,14 @@ public sealed record WorkItemDto(
     DateTimeOffset? QuotaResetAt = null,
     DateTimeOffset? NextQuotaRetryAt = null,
     int QuotaRetryAttempts = 0,
+    // Usage / UsageTotal: per the cost-surface spec, "the entire usage object is
+    // omitted; downstream consumers treat absent == unknown." The webhook dispatcher
+    // honours this via DefaultIgnoreCondition=WhenWritingNull on its own serializer;
+    // the API uses ASP.NET's default options, so the JsonIgnore attribute targeted at
+    // these two fields keeps the two surface contracts aligned.
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     WorkItemIterationUsage? Usage = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     WorkItemUsageTotal? UsageTotal = null);
 
 public sealed record ProjectDto(

@@ -136,6 +136,67 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         return results;
     }
 
+    /// <summary>
+    /// Single-connection batched summarisation for the list endpoint. Replaces
+    /// the default N+1 implementation (one connection per work item) with a
+    /// single WHERE work_item_id IN (...) SELECT chunked into groups of
+    /// <c>ChunkSize</c> rows to stay well under SQLite's 999 host-parameter
+    /// limit. Reading rows for K items is O(1) connections regardless of K.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<string, WorkItemUsageSummary>> SummariseManyAsync(
+        IReadOnlyCollection<string> workItemIds, CancellationToken ct = default)
+    {
+        if (workItemIds.Count == 0)
+            return new Dictionary<string, WorkItemUsageSummary>(StringComparer.Ordinal);
+
+        const int ChunkSize = 500;
+
+        var rowsByItem = new Dictionary<string, List<WorkItemCost>>(StringComparer.Ordinal);
+
+        using var readConn = new SqliteConnection($"Data Source={_path};Mode=ReadOnly");
+        readConn.Open();
+
+        var distinct = workItemIds.Distinct(StringComparer.Ordinal).ToList();
+        for (var offset = 0; offset < distinct.Count; offset += ChunkSize)
+        {
+            var chunk = distinct.Skip(offset).Take(ChunkSize).ToList();
+            using var cmd = readConn.CreateCommand();
+
+            var placeholders = string.Join(",", chunk.Select((_, i) => $"$wi{i}"));
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- placeholders are $-prefixed indices, all values bound via parameters
+            cmd.CommandText = $"""
+                SELECT id, work_item_id, phase, iteration, agent_kind, model_id,
+                       input_tokens, cached_input_tokens, output_tokens,
+                       estimated_usd, started_at, ended_at, raw_metadata_json
+                FROM work_item_costs
+                WHERE work_item_id IN ({placeholders})
+                ORDER BY work_item_id, started_at
+                """;
+            for (var i = 0; i < chunk.Count; i++)
+                cmd.Parameters.AddWithValue($"$wi{i}", chunk[i]);
+
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                var row = ReadRow(reader);
+                if (!rowsByItem.TryGetValue(row.WorkItemId, out var list))
+                {
+                    list = new List<WorkItemCost>();
+                    rowsByItem[row.WorkItemId] = list;
+                }
+                list.Add(row);
+            }
+        }
+
+        var summaries = new Dictionary<string, WorkItemUsageSummary>(rowsByItem.Count, StringComparer.Ordinal);
+        foreach (var (id, rows) in rowsByItem)
+        {
+            var summary = WorkItemUsageAggregator.Summarise(rows);
+            if (summary is not null) summaries[id] = summary;
+        }
+        return summaries;
+    }
+
     public async Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
         string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
     {

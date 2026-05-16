@@ -26,8 +26,8 @@ public static class WorkItemUsageAggregator
             if (rows[i].Iteration is { } iter && iter > maxExplicit) maxExplicit = iter;
         }
 
-        int totalIn = 0, totalOut = 0, totalReason = 0, totalCached = 0;
-        int iterIn = 0, iterOut = 0, iterReason = 0, iterCached = 0;
+        int totalIn = 0, totalOut = 0, totalCached = 0;
+        int iterIn = 0, iterOut = 0, iterCached = 0;
         double totalUsd = 0.0, iterUsd = 0.0;
         long totalElapsed = 0, iterElapsed = 0;
 
@@ -41,9 +41,6 @@ public static class WorkItemUsageAggregator
             totalCached += r.CachedInputTokens;
             totalUsd += r.EstimatedUsd;
             totalElapsed += elapsedMs;
-            // totalReason left at 0 — reasoning tokens are not currently captured
-            // by any IAgentCostExtractor implementation; field kept on the wire for
-            // forward compatibility per the surface spec.
 
             var bucket = BucketIteration(r, maxExplicit);
             if (bucket == maxExplicit)
@@ -56,11 +53,14 @@ public static class WorkItemUsageAggregator
             }
         }
 
+        // TokensReasoning is hard-coded 0 below: no IAgentCostExtractor populates
+        // a reasoning-token field today, but the surface spec keeps it on the
+        // wire for forward compatibility ("0 when the model doesn't report it").
         var iteration = new WorkItemIterationUsage(
             Iteration: maxExplicit,
             TokensInput: iterIn,
             TokensOutput: iterOut,
-            TokensReasoning: iterReason,
+            TokensReasoning: 0,
             TokensCached: iterCached,
             CostUsd: Round4(iterUsd),
             ElapsedMs: iterElapsed);
@@ -68,7 +68,7 @@ public static class WorkItemUsageAggregator
         var total = new WorkItemUsageTotal(
             TokensInput: totalIn,
             TokensOutput: totalOut,
-            TokensReasoning: totalReason,
+            TokensReasoning: 0,
             TokensCached: totalCached,
             CostUsd: Round4(totalUsd),
             ElapsedMs: totalElapsed);

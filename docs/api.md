@@ -87,10 +87,12 @@ Response: `201 Created` with the work item record.
 List all work items, newest first.
 
 Each item carries a `usage` block (most recent iteration's token + cost delta)
-and a `usageTotal` block (cumulative across every iteration). Both are `null`
-when no cost data has been recorded — typically because the agent has no
-registered cost extractor. See [`webhooks.md`](webhooks.md#payload-shape) for
-the field schema; the API surface uses the same shape.
+and a `usageTotal` block (cumulative across every iteration). Both blocks are
+**omitted entirely** when no cost data has been recorded — typically because the
+agent has no registered cost extractor; downstream consumers should treat
+absence as "unknown". See [`webhooks.md`](webhooks.md#payload-shape) for the
+field schema; the API surface uses the same shape and the same absent-on-null
+semantics.
 
 ### `GET /workitems/{id}`
 
