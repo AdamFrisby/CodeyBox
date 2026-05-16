@@ -243,6 +243,36 @@ public sealed class CodexQuotaProbeTests
 
         Assert.Equal(2, callCount);
     }
+
+    [Fact]
+    public async Task InvalidateCache_ForcesRefetchOnNextCall()
+    {
+        // Direct unit test for the public InvalidateCache surface that
+        // Program.cs wires to CodexCredentialFileSource.TokenUpdated. With
+        // the same token across all calls, the probe's token-keyed cache
+        // would otherwise survive, so the only way callCount can advance
+        // after the second call is via InvalidateCache.
+        int callCount = 0;
+        var handler = UsageHandler(capture: _ => callCount++);
+
+        var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromHours(1));
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        Assert.Equal(1, callCount); // long TTL: second call cached.
+
+        probe.InvalidateCache();
+
+        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        Assert.Equal(2, callCount); // invalidation forced a refetch.
+
+        // InvalidateCache must release its lock — a missing release would
+        // deadlock the next GetAvailabilityAsync. A 2 s budget catches that.
+        probe.InvalidateCache();
+        var refetch = probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        var winner = await Task.WhenAny(refetch, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.Same(refetch, winner);
+        Assert.Equal(3, callCount);
+    }
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────────

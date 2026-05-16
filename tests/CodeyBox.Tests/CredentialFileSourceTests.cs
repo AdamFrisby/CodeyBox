@@ -87,9 +87,17 @@ public sealed class CredentialFileSourceTests : IDisposable
     public async Task QuotaProbe_RefetchesAfterTokenUpdated_WhenFileChanges()
     {
         // The cache-invalidation guarantee: a stale snapshot must be dropped
-        // when the host file is rewritten with a new token. Without this,
-        // /quota stays "HTTP 401" for the entire cache TTL.
-        var path = WriteFile("creds.json", """{"access_token":"old"}""");
+        // when the host file is rewritten. Without this, /quota stays
+        // "HTTP 401" for the entire cache TTL.
+        //
+        // Critical: the two file versions parse to the SAME access_token.
+        // ClaudeQuotaProbe already cache-keys on the token string, so a
+        // differing token would trigger a refetch even if InvalidateCache
+        // were a no-op. By keeping the token identical and only changing
+        // sibling fields, the only mechanism that can cause the second
+        // GetAvailabilityAsync to refetch is the TokenUpdated→InvalidateCache
+        // wiring this test is meant to exercise.
+        var path = WriteFile("creds.json", """{"access_token":"same","refresh_token":"r1"}""");
         using var source = new CredentialFileSource(path);
 
         int callCount = 0;
@@ -126,18 +134,65 @@ public sealed class CredentialFileSourceTests : IDisposable
         await probe.GetAvailabilityAsync(member, CancellationToken.None);
         Assert.Equal(1, callCount);
 
-        // Rewrite the file with a new token. The source must observe the change
-        // and the subscribed probe.InvalidateCache must drop the snapshot so
-        // the next probe call hits the network instead of returning cached.
-        File.WriteAllText(path, """{"access_token":"new"}""");
+        // Rewrite the file with the SAME access_token but a different
+        // refresh_token. The source must observe the change and the
+        // subscribed probe.InvalidateCache must drop the snapshot so the next
+        // probe call hits the network. Without InvalidateCache being wired
+        // up, the cache would survive (same token = same key) and callCount
+        // would stay at 1.
+        File.WriteAllText(path, """{"access_token":"same","refresh_token":"r2"}""");
         File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMilliseconds(50));
 
-        await PollAsync(() => source.GetRaw()?.Contains("new") == true ? (object?)true : null,
+        await PollAsync(() => source.GetRaw()?.Contains("r2") == true ? (object?)true : null,
             TimeSpan.FromSeconds(2));
 
         await probe.GetAvailabilityAsync(member, CancellationToken.None);
         Assert.Equal(2, callCount);
-        Assert.Equal(new[] { "Bearer old", "Bearer new" }, capturedAuths);
+        Assert.Equal(new[] { "Bearer same", "Bearer same" }, capturedAuths);
+    }
+
+    [Fact]
+    public async Task ClaudeQuotaProbe_InvalidateCache_ForcesRefetchOnNextCall()
+    {
+        // Direct unit test: with no file watcher involved, InvalidateCache()
+        // on its own must cause the next GetAvailabilityAsync to hit the
+        // network even though the supplied token is unchanged. Catches the
+        // failure modes the wiring test cannot — InvalidateCache as a no-op,
+        // deadlock from a missing lock release, or clearing the wrong field.
+        int callCount = 0;
+        var handler = new QuotaCapturingHandler(HttpStatusCode.OK,
+            "{\"rate_limit\":{\"primary_window\":{\"used_percent\":0,\"reset_at\":0}}}",
+            _ => callCount++);
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        var probe = new ClaudeQuotaProbe(
+            factory,
+            "stable-token",
+            TimeSpan.FromHours(1),
+            NullLogger<ClaudeQuotaProbe>.Instance);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Claude,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+
+        await probe.GetAvailabilityAsync(member, CancellationToken.None);
+        await probe.GetAvailabilityAsync(member, CancellationToken.None);
+        Assert.Equal(1, callCount); // long TTL: second call cached.
+
+        probe.InvalidateCache();
+
+        await probe.GetAvailabilityAsync(member, CancellationToken.None);
+        Assert.Equal(2, callCount); // invalidation forced a refetch.
+
+        // InvalidateCache must release its lock — a missing release would
+        // deadlock the next GetAvailabilityAsync. A 2 s budget catches that.
+        probe.InvalidateCache();
+        var refetch = probe.GetAvailabilityAsync(member, CancellationToken.None);
+        var winner = await Task.WhenAny(refetch, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.Same(refetch, winner);
+        Assert.Equal(3, callCount);
     }
 
     [Fact]
