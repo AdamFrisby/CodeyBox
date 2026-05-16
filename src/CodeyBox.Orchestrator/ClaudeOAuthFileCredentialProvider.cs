@@ -8,7 +8,10 @@ namespace CodeyBox.Orchestrator;
 /// Reads the Claude OAuth credentials from a JSON file on every <see
 /// cref="GetAsync"/> call. Designed for the host's
 /// <c>~/.claude/.credentials.json</c>, which the local <c>claude</c> CLI
-/// refreshes in-place. Re-reading on each pickup picks up rotated tokens
+/// refreshes in-place. Backed by a shared
+/// <see cref="CredentialFileSource"/> so the host's file-watcher picks up
+/// out-of-band token rotations (operator running <c>claude</c> on the host,
+/// scripted refresh, etc.) and every new sandbox is handed the fresh token
 /// without an orchestrator restart.
 ///
 /// <para>File format expected:</para>
@@ -36,7 +39,7 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
 {
     public const string OAuthJsonEnvVar = "CODEYBOX_CLAUDE_OAUTH_JSON";
 
-    private readonly string _filePath;
+    private readonly CredentialFileSource _source;
     private readonly string _sandboxEnvVar;
     private readonly ILogger<ClaudeOAuthFileCredentialProvider>? _log;
 
@@ -44,35 +47,30 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
         string filePath,
         string sandboxEnvVar,
         ILogger<ClaudeOAuthFileCredentialProvider>? log = null)
+        : this(new CredentialFileSource(filePath, log), sandboxEnvVar, log)
     {
-        _filePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
+    }
+
+    public ClaudeOAuthFileCredentialProvider(
+        CredentialFileSource source,
+        string sandboxEnvVar,
+        ILogger<ClaudeOAuthFileCredentialProvider>? log = null)
+    {
+        _source = source ?? throw new ArgumentNullException(nameof(source));
         _sandboxEnvVar = sandboxEnvVar ?? throw new ArgumentNullException(nameof(sandboxEnvVar));
         _log = log;
     }
 
-    public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+    public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
     {
         if (agent != AgentKind.Claude)
-            return null;
+            return Task.FromResult<AgentCredential?>(null);
 
-        if (!File.Exists(_filePath))
+        var rawContents = _source.GetRaw();
+        if (string.IsNullOrEmpty(rawContents))
         {
-            _log?.LogDebug("Claude OAuth file not found at {Path}; falling through", _filePath);
-            return null;
-        }
-
-        // Read the raw bytes once so the JSON we ship to the sandbox is
-        // identical to what we parse — avoiding a torn read if the host CLI
-        // rotates the file mid-call.
-        string rawContents;
-        try
-        {
-            rawContents = await File.ReadAllTextAsync(_filePath, ct);
-        }
-        catch (Exception ex)
-        {
-            _log?.LogWarning(ex, "Failed to read Claude OAuth file {Path}; falling through", _filePath);
-            return null;
+            _log?.LogDebug("Claude OAuth file not present or empty at {Path}; falling through", _source.FilePath);
+            return Task.FromResult<AgentCredential?>(null);
         }
 
         string token;
@@ -83,25 +81,25 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
                 !oauth.TryGetProperty("accessToken", out var tokenEl) ||
                 tokenEl.ValueKind != JsonValueKind.String)
             {
-                _log?.LogWarning("Claude OAuth file {Path} missing .claudeAiOauth.accessToken; falling through", _filePath);
-                return null;
+                _log?.LogWarning("Claude OAuth file {Path} missing .claudeAiOauth.accessToken; falling through", _source.FilePath);
+                return Task.FromResult<AgentCredential?>(null);
             }
             token = tokenEl.GetString() ?? "";
         }
         catch (Exception ex)
         {
-            _log?.LogWarning(ex, "Failed to parse Claude OAuth file {Path}; falling through", _filePath);
-            return null;
+            _log?.LogWarning(ex, "Failed to parse Claude OAuth file {Path}; falling through", _source.FilePath);
+            return Task.FromResult<AgentCredential?>(null);
         }
 
         if (string.IsNullOrEmpty(token))
-            return null;
+            return Task.FromResult<AgentCredential?>(null);
 
         var env = new Dictionary<string, string>
         {
             [_sandboxEnvVar] = token,
             [OAuthJsonEnvVar] = rawContents,
         };
-        return new AgentCredential(AgentKind.Claude, env, new Dictionary<string, string>());
+        return Task.FromResult<AgentCredential?>(new AgentCredential(AgentKind.Claude, env, new Dictionary<string, string>()));
     }
 }

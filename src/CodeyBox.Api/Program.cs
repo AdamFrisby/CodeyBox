@@ -460,26 +460,79 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 //   - IProjectAwareCredentialProvider lets PipelineRunner apply per-project
 //     CredentialProviderPriority at agent pickup time.
 //   - ChainedCredentialProvider is directly resolvable for callers that need both.
+// Resolve credential file paths once so the file-watching CredentialFileSource
+// singletons can be created up-front. A single source per file is shared between
+// the credential provider (which produces sandbox bundles for child VMs) and
+// the quota probe (which probes the upstream usage endpoint on the host). When
+// the file changes — operator running the CLI on the host, scripted refresh,
+// child-VM writeback — every consumer observes the new token within ~1 s and
+// quota probes invalidate their per-token snapshot, so a stale 401 doesn't pin
+// for the full cache TTL.
+var claudeOAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_OAUTH_FILE")
+    ?? builder.Configuration["CodeyBox:ClaudeOAuthFile"];
+var claudeOAuthProviderConfigured = !string.IsNullOrWhiteSpace(claudeOAuthFilePath);
+if (string.IsNullOrWhiteSpace(claudeOAuthFilePath))
+    claudeOAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".claude",
+        ".credentials.json");
+if (claudeOAuthFilePath!.StartsWith("~/", StringComparison.Ordinal))
+    claudeOAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        claudeOAuthFilePath[2..]);
+
+var codexOAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_CODEX_OAUTH_FILE")
+    ?? builder.Configuration["CodeyBox:CodexOAuthFile"]
+    ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".codex",
+        "auth.json");
+if (codexOAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
+    codexOAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        codexOAuthFilePath[2..]);
+
+var geminiHome = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+    ".gemini");
+var geminiOAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_FILE")
+    ?? builder.Configuration["CodeyBox:GeminiOAuthFile"]
+    ?? Path.Combine(geminiHome, "oauth_creds.json");
+if (geminiOAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
+    geminiOAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        geminiOAuthFilePath[2..]);
+var geminiSettingsFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_SETTINGS_FILE")
+    ?? builder.Configuration["CodeyBox:GeminiSettingsFile"]
+    ?? Path.Combine(geminiHome, "settings.json");
+if (geminiSettingsFilePath.StartsWith("~/", StringComparison.Ordinal))
+    geminiSettingsFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        geminiSettingsFilePath[2..]);
+
+builder.Services.AddSingleton(sp => new ClaudeCredentialFileSource(
+    claudeOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+builder.Services.AddSingleton(sp => new CodexCredentialFileSource(
+    codexOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+builder.Services.AddSingleton(sp => new GeminiOAuthCredentialFileSource(
+    geminiOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+builder.Services.AddSingleton(sp => new GeminiSettingsCredentialFileSource(
+    geminiSettingsFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+
 builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
 {
     var builtInFirst = new List<ICredentialProvider>();
     var namedPlugins = new List<(string Id, ICredentialProvider Provider)>();
     var builtInLast = new List<ICredentialProvider>();
 
-    var oauthFile =
-        Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_OAUTH_FILE")
-        ?? builder.Configuration["CodeyBox:ClaudeOAuthFile"];
-
-    if (!string.IsNullOrWhiteSpace(oauthFile))
+    if (claudeOAuthProviderConfigured)
     {
-        // Expand a leading ~ to $HOME for ergonomic config like
-        // "~/.claude/.credentials.json".
-        if (oauthFile.StartsWith("~/", StringComparison.Ordinal))
-            oauthFile = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                oauthFile[2..]);
         builtInFirst.Add(new ClaudeOAuthFileCredentialProvider(
-            oauthFile,
+            sp.GetRequiredService<ClaudeCredentialFileSource>(),
             sandboxEnvVar: "CLAUDE_CODE_OAUTH_TOKEN",
             sp.GetService<ILogger<ClaudeOAuthFileCredentialProvider>>()));
     }
@@ -490,49 +543,18 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
     // environment secret when the host process is already provisioned that way.
     builtInFirst.Add(new CodexAuthJsonEnvironmentCredentialProvider(
         sp.GetService<ILogger<CodexAuthJsonEnvironmentCredentialProvider>>()));
-    var codexOauthFile =
-        Environment.GetEnvironmentVariable("CODEYBOX_CODEX_OAUTH_FILE")
-        ?? builder.Configuration["CodeyBox:CodexOAuthFile"]
-        ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".codex",
-            "auth.json");
-    if (codexOauthFile.StartsWith("~/", StringComparison.Ordinal))
-        codexOauthFile = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            codexOauthFile[2..]);
     builtInFirst.Add(new CodexOAuthFileCredentialProvider(
-        codexOauthFile,
+        sp.GetRequiredService<CodexCredentialFileSource>(),
         sp.GetService<ILogger<CodexOAuthFileCredentialProvider>>()));
 
     // Gemini (Google AI Studio / Code Assist) OAuth files. The CLI hard-reads
     // ~/.gemini/{oauth_creds,settings}.json — there's no env-var alternative
     // for OAuth-personal — so the orchestrator ships their contents to the
     // sandbox via env vars and GeminiAgentRunner.PrepareSandboxAsync writes
-    // them back to ~/.gemini/ inside the VM. Re-read on each pickup picks up
-    // refreshed access tokens without an orchestrator restart.
-    var geminiHome = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".gemini");
-    var geminiOAuthFile =
-        Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_FILE")
-        ?? builder.Configuration["CodeyBox:GeminiOAuthFile"]
-        ?? Path.Combine(geminiHome, "oauth_creds.json");
-    if (geminiOAuthFile.StartsWith("~/", StringComparison.Ordinal))
-        geminiOAuthFile = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            geminiOAuthFile[2..]);
-    var geminiSettingsFile =
-        Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_SETTINGS_FILE")
-        ?? builder.Configuration["CodeyBox:GeminiSettingsFile"]
-        ?? Path.Combine(geminiHome, "settings.json");
-    if (geminiSettingsFile.StartsWith("~/", StringComparison.Ordinal))
-        geminiSettingsFile = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            geminiSettingsFile[2..]);
+    // them back to ~/.gemini/ inside the VM.
     builtInFirst.Add(new GeminiOAuthFileCredentialProvider(
-        geminiOAuthFile,
-        geminiSettingsFile,
+        sp.GetRequiredService<GeminiOAuthCredentialFileSource>(),
+        sp.GetRequiredService<GeminiSettingsCredentialFileSource>(),
         sp.GetService<ILogger<GeminiOAuthFileCredentialProvider>>()));
 
     // Enumerate plugin-registered ICredentialProvider types using the list captured
@@ -637,29 +659,35 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
-    return new ClaudeQuotaProbe(
+    var source = sp.GetRequiredService<ClaudeCredentialFileSource>();
+    var probe = new ClaudeQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => new AgentQuotaCredentials(
-            ReadClaudeQuotaToken(credentialLog) ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
+            ParseClaudeAccessToken(source.GetRaw(), source.FilePath, credentialLog)
+                ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<ClaudeQuotaProbe>());
+    source.TokenUpdated += probe.InvalidateCache;
+    return probe;
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
-    return
-    new CodexQuotaProbe(
+    var source = sp.GetRequiredService<CodexCredentialFileSource>();
+    var probe = new CodexQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () =>
         {
-            var codexAuth = ReadCodexQuotaAuth(credentialLog);
+            var codexAuth = ParseCodexAccessTokens(source.GetRaw(), source.FilePath, credentialLog);
             return new AgentQuotaCredentials(
                 codexAuth.AccessToken ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
         },
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CodexQuotaProbe>());
+    source.TokenUpdated += probe.InvalidateCache;
+    return probe;
 });
 // Gemini OAuth-subscription path (Code Assist Individual / AI Pro / AI Ultra).
 // API-key (PayPerApi) and Vertex paths have no analogous endpoint and stay
@@ -669,12 +697,16 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
-    return new GeminiQuotaProbe(
+    var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
+    var probe = new GeminiQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => new AgentQuotaCredentials(
-            ReadGeminiQuotaToken(credentialLog) ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")),
+            ParseGeminiAccessToken(source.GetRaw(), source.FilePath, credentialLog)
+                ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
+    source.TokenUpdated += probe.InvalidateCache;
+    return probe;
 });
 
 // --- Agent class router ------------------------------------------------------
@@ -1286,18 +1318,15 @@ finally
 }
 
 
-static string? ReadClaudeQuotaToken(ILogger log)
+// File reads happen through CredentialFileSource singletons (file-watched,
+// retry-on-IOException, JSON-validated). These helpers only parse the cached
+// raw bytes — the source has already absorbed the cost of opening the file.
+static string? ParseClaudeAccessToken(string? raw, string path, ILogger log)
 {
-    var path = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".claude",
-        ".credentials.json");
-    if (!File.Exists(path))
-        return null;
-
+    if (string.IsNullOrWhiteSpace(raw)) return null;
     try
     {
-        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        using var doc = JsonDocument.Parse(raw);
         if (doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth) &&
             oauth.TryGetProperty("accessToken", out var token) &&
             token.ValueKind == JsonValueKind.String)
@@ -1306,37 +1335,16 @@ static string? ReadClaudeQuotaToken(ILogger log)
     catch (JsonException ex)
     {
         log.LogWarning(ex, "Claude quota OAuth file '{Path}' is malformed; falling back to environment token if configured", path);
-        return null;
     }
-    catch (IOException ex)
-    {
-        log.LogWarning(ex, "Claude quota OAuth file '{Path}' could not be read; falling back to environment token if configured", path);
-        return null;
-    }
-    catch (UnauthorizedAccessException ex)
-    {
-        log.LogWarning(ex, "Claude quota OAuth file '{Path}' is not readable; falling back to environment token if configured", path);
-        return null;
-    }
-
     return null;
 }
 
-static string? ReadGeminiQuotaToken(ILogger log)
+static string? ParseGeminiAccessToken(string? raw, string path, ILogger log)
 {
-    // Gemini CLI's OAuth credentials live at ~/.gemini/oauth_creds.json
-    // (the file fallback path; the CLI also supports a keychain-backed
-    // store on first migration, but the file remains for compatibility).
-    var path = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".gemini",
-        "oauth_creds.json");
-    if (!File.Exists(path))
-        return null;
-
+    if (string.IsNullOrWhiteSpace(raw)) return null;
     try
     {
-        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        using var doc = JsonDocument.Parse(raw);
         if (doc.RootElement.TryGetProperty("access_token", out var token) &&
             token.ValueKind == JsonValueKind.String)
             return token.GetString();
@@ -1345,29 +1353,15 @@ static string? ReadGeminiQuotaToken(ILogger log)
     {
         log.LogWarning(ex, "Gemini quota auth file '{Path}' is malformed; falling back to environment token if configured", path);
     }
-    catch (IOException ex)
-    {
-        log.LogWarning(ex, "Gemini quota auth file '{Path}' could not be read; falling back to environment token if configured", path);
-    }
-    catch (UnauthorizedAccessException ex)
-    {
-        log.LogWarning(ex, "Gemini quota auth file '{Path}' is not readable; falling back to environment token if configured", path);
-    }
     return null;
 }
 
-static (string? AccessToken, string? AccountId) ReadCodexQuotaAuth(ILogger log)
+static (string? AccessToken, string? AccountId) ParseCodexAccessTokens(string? raw, string path, ILogger log)
 {
-    var path = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".codex",
-        "auth.json");
-    if (!File.Exists(path))
-        return (null, null);
-
+    if (string.IsNullOrWhiteSpace(raw)) return (null, null);
     try
     {
-        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        using var doc = JsonDocument.Parse(raw);
         if (!doc.RootElement.TryGetProperty("tokens", out var tokens))
             return (null, null);
 
@@ -1384,16 +1378,6 @@ static (string? AccessToken, string? AccountId) ReadCodexQuotaAuth(ILogger log)
     catch (JsonException ex)
     {
         log.LogWarning(ex, "Codex quota auth file '{Path}' is malformed; falling back to environment token if configured", path);
-        return (null, null);
-    }
-    catch (IOException ex)
-    {
-        log.LogWarning(ex, "Codex quota auth file '{Path}' could not be read; falling back to environment token if configured", path);
-        return (null, null);
-    }
-    catch (UnauthorizedAccessException ex)
-    {
-        log.LogWarning(ex, "Codex quota auth file '{Path}' is not readable; falling back to environment token if configured", path);
         return (null, null);
     }
 }
