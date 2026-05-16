@@ -128,4 +128,101 @@ public sealed class QuotaFailureDetectorStreamJsonTests
         var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
         Assert.InRange(diff.TotalMinutes, 149, 151);
     }
+
+    [Fact]
+    public void Detect_ClaudeRateLimitEventOverageRejected_ClassifiesQuotaWithEpochReset()
+    {
+        // Captured shape from the operator queue on 2026-05-16: the run
+        // streams an init row, a rate_limit_event with overageStatus=rejected,
+        // then a partial assistant row before the CLI exits 1. Before the fix,
+        // the classifier returned null because no error message text matched.
+        const long resetsAtEpoch = 1778937600L;
+        var rateLimitLine =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":__EPOCH__,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false}}"""
+                .Replace("__EPOCH__", resetsAtEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var stdout =
+            """{"type":"system","subtype":"init","session_id":"abc"}""" + "\n" +
+            rateLimitLine + "\n" +
+            """{"type":"assistant","message":{"model":"claude-opus-4-7","stop_reason":null}}""";
+
+        var detection = QuotaFailureDetector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(resetsAtEpoch), detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_ClaudeRateLimitEventStatusExceeded_ClassifiesQuota()
+    {
+        // status=exceeded on its own is enough — the base window is gone even
+        // if overage info isn't present.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"exceeded","resetsAt":1778937600,"rateLimitType":"five_hour"}}""";
+
+        var detection = QuotaFailureDetector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_ClaudeRateLimitEventAllowedNoOverageBlock_ReturnsNull()
+    {
+        // A healthy heartbeat — base allowed, no overage rejection. Without
+        // any other failure signal in the stream, this must not be classified
+        // as quota (would mask real errors).
+        var stdout =
+            """{"type":"system","subtype":"init","session_id":"x"}""" + "\n" +
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1778937600,"rateLimitType":"five_hour","overageStatus":"allowed","isUsingOverage":false}}""" + "\n" +
+            """{"type":"result","subtype":"success","result":"ok"}""";
+
+        Assert.Null(QuotaFailureDetector.Detect(stderr: null, stdout: stdout));
+    }
+
+    [Fact]
+    public void Detect_StreamJsonWithoutRateLimitEvent_ExitOne_NotQuota()
+    {
+        // Regression: a stream with no rate_limit_event and no error keywords
+        // (just init + assistant) must stay unclassified — the surrounding
+        // pipeline treats this as a generic failure ("other"), not quota.
+        var stdout =
+            """{"type":"system","subtype":"init","session_id":"y"}""" + "\n" +
+            """{"type":"assistant","message":{"model":"claude-opus-4-7","stop_reason":null}}""";
+
+        Assert.Null(QuotaFailureDetector.Detect(stderr: null, stdout: stdout));
+    }
+
+    [Fact]
+    public void Detect_CodexStderr429TooManyRequests_ClassifiesRateLimit()
+    {
+        // codex CLI prints the raw HTTP status to stderr before exiting 1.
+        const string stderr = "HTTP 429 Too Many Requests\nplease try again after 1h";
+
+        var detection = QuotaFailureDetector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(diff.TotalMinutes, 59, 61);
+    }
+
+    [Fact]
+    public void Detect_GeminiStderrQuotaExhaustedWithResetAfter_ClassifiesQuota()
+    {
+        // gemini-cli reports per-account exhaustion as "QUOTA_EXHAUSTED" in
+        // stderr, with the wait expressed as "reset after 7h8m8s".
+        const string stderr = "[ERROR] QUOTA_EXHAUSTED: model quota will reset after 7h8m8s";
+
+        var detection = QuotaFailureDetector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
+        // 7h8m8s = 428m + 8s — assert window of ±1 minute.
+        Assert.InRange(diff.TotalMinutes, 427, 429);
+    }
 }
