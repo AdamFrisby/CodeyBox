@@ -211,8 +211,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
-                    auditor_profile = $auditor_profile,
-                    priority = $priority
+                    auditor_profile = $auditor_profile
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -250,8 +249,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
-                    auditor_profile = $auditor_profile,
-                    priority = $priority
+                    auditor_profile = $auditor_profile
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -354,6 +352,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             yield return Read(reader);
+    }
+
+    public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM work_items WHERE state = $state;";
+        cmd.Parameters.AddWithValue("$state", (int)state);
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result is long l ? (int)l : 0;
     }
 
     public async IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(

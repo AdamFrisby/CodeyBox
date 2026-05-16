@@ -28,8 +28,17 @@ public readonly record struct PriorityUpdateResult(PriorityUpdateOutcome Outcome
 public interface IWorkItemStore
 {
     Task CreateAsync(WorkItem item, CancellationToken ct = default);
+    /// <summary>
+    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>.
+    /// Use <see cref="UpdatePriorityAsync"/> for priority changes so worker writes
+    /// from stale snapshots cannot revert a concurrent PATCH /priority update.
+    /// </summary>
     Task UpdateAsync(WorkItem item, CancellationToken ct = default);
-    /// <summary>Updates the item only when its persisted state still matches <paramref name="onlyIfState"/>. Returns true if the row was updated.</summary>
+    /// <summary>
+    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>
+    /// only when the persisted state still matches <paramref name="onlyIfState"/>.
+    /// Returns true if the row was updated.
+    /// </summary>
     Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default);
 
     /// <summary>
@@ -46,6 +55,12 @@ public interface IWorkItemStore
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the number of work items currently persisted in
+    /// <paramref name="state"/> without loading the rows.
+    /// </summary>
+    Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default);
 
     /// <summary>
     /// Sets <c>queue_position</c> for the listed Queued items in the given order

@@ -39,9 +39,11 @@ internal static class WorkItemEndpoints
         app.MapPost("/queue/resume", ResumeQueueAsync);
     }
 
-    private static IResult GetWorkerStatusAsync(OrchestratorService orchestrator)
+    private static async Task<IResult> GetWorkerStatusAsync(
+        OrchestratorService orchestrator,
+        CancellationToken ct)
     {
-        var status = orchestrator.GetStatus();
+        var status = await orchestrator.GetStatusAsync(ct);
         return Results.Ok(new
         {
             maxConcurrent = status.MaxConcurrent,
@@ -930,10 +932,14 @@ internal static class WorkItemEndpoints
                 {
                     error = $"work item transitioned to terminal state '{result.Item!.State}' before priority could be updated",
                 });
+            case PriorityUpdateOutcome.Updated:
+                break;
+            default:
+                throw new InvalidOperationException($"Unexpected priority update outcome '{result.Outcome}'.");
         }
 
         var updated = result.Item!;
-        AuditLog.WorkItemPriorityChanged(updated.Id, result.OldPriority ?? item.Priority, updated.Priority);
+        AuditLog.WorkItemPriorityChanged(updated.Id, result.OldPriority!.Value, updated.Priority);
 
         // Kick the dispatcher so the new ordering is picked up immediately when the
         // item is still Queued. Harmless for in-flight items: the dispatch loop will

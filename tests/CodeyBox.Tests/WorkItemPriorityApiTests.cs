@@ -175,5 +175,30 @@ public sealed class WorkItemPriorityApiTests : IDisposable
         Assert.Equal(terminalState, refreshed.State);
     }
 
+    [Fact]
+    public async Task WorkersStatus_ReportsPersistedQueuedCount()
+    {
+        // Regression: after the channel became a kick stream, queuedCount must
+        // reflect queued rows in the store, not buffered kick signals.
+        await _factory.Store.CreateAsync(MakeStoredItem(WorkItemState.Queued));
+        await _factory.Store.CreateAsync(MakeStoredItem(WorkItemState.Queued));
+        await _factory.Store.CreateAsync(MakeStoredItem(WorkItemState.Working));
+
+        var response = await _client.GetAsync("/workers/status");
+
+        response.EnsureSuccessStatusCode();
+        var json = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
+        Assert.Equal(2, json.GetProperty("queuedCount").GetInt32());
+    }
+
+    private static WorkItem MakeStoredItem(WorkItemState state) => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("test-project"),
+        Title = "t",
+        Prompt = "p",
+        State = state,
+    };
+
     private sealed record PriorityDto(string Id, int Priority);
 }

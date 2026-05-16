@@ -99,13 +99,14 @@ public sealed class OrchestratorService : BackgroundService
     }
 
     /// <summary>Snapshot for the /workers/status endpoint.</summary>
-    public WorkerPoolStatus GetStatus()
+    public async Task<WorkerPoolStatus> GetStatusAsync(CancellationToken ct = default)
     {
         var ticks = Interlocked.Read(ref _lastSpawnAtTicks);
+        var queuedCount = await _store.CountByStateAsync(WorkItemState.Queued, ct);
         return new(
             _opts.MaxConcurrentWorkers,
             Volatile.Read(ref _currentlyRunning),
-            _queue.Count,
+            queuedCount,
             ticks == 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero));
     }
 
@@ -273,10 +274,10 @@ public sealed class OrchestratorService : BackgroundService
     }
 
     /// <summary>
-    /// Streams the Queued items by priority order and returns the first one that
-    /// is not already in <c>_activeItems</c> or <c>_deferredItems</c> and whose
-    /// dependencies are all in terminal states. Returns null when the queue is
-    /// empty or every queued item is blocked.
+    /// Streams dispatch-eligible non-terminal items by priority order and returns
+    /// the first one that is not already in <c>_activeItems</c> or
+    /// <c>_deferredItems</c> and whose dependencies are all in terminal states.
+    /// Returns null when no eligible item exists or every candidate is blocked.
     ///
     /// Dependency satisfaction is checked in C# (the deps_satisfied is a derived
     /// property over a JSON column on each row) — for typical queue depths

@@ -4,10 +4,9 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Channel-based in-process queue. Drop-in replacement for a durable queue;
-/// loses pending work on process exit (the <see cref="IWorkItemStore"/> is
-/// the durable record — at startup the orchestrator re-enqueues anything in
-/// a non-terminal state).
+/// Channel-based in-process dispatch notification stream. The channel only
+/// carries wake-up kicks; the <see cref="IWorkItemStore"/> remains the durable
+/// source of truth for queued work.
 /// </summary>
 public sealed class InMemoryTaskQueue : ITaskQueue
 {

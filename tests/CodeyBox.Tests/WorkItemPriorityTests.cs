@@ -46,8 +46,8 @@ public sealed class WorkItemPriorityTests : IDisposable
         var read = await _store.GetAsync(item.Id);
         Assert.Equal(250, read!.Priority);
 
-        var updated = item with { Priority = -75 };
-        await _store.UpdateAsync(updated);
+        var updated = await _store.UpdatePriorityAsync(item.Id, -75, DateTimeOffset.UtcNow);
+        Assert.Equal(PriorityUpdateOutcome.Updated, updated.Outcome);
         read = await _store.GetAsync(item.Id);
         Assert.Equal(-75, read!.Priority);
     }
@@ -205,7 +205,9 @@ public sealed class WorkItemPriorityTests : IDisposable
         // Bump C's priority while A is held in the pipeline. The dispatcher's
         // next pickup must see the new value and pick C over B (FIFO older).
         var current = await _store.GetAsync(c.Id);
-        await _store.UpdateAsync(current! with { Priority = 500 });
+        Assert.NotNull(current);
+        var bump = await _store.UpdatePriorityAsync(current!.Id, 500, DateTimeOffset.UtcNow);
+        Assert.Equal(PriorityUpdateOutcome.Updated, bump.Outcome);
         await queue.EnqueueAsync(c.Id); // kick
 
         // Let A finish. The next pickup should be C, not B.
@@ -263,6 +265,33 @@ public sealed class WorkItemPriorityTests : IDisposable
         Assert.Equal(WorkItemState.Working, read.State);
         Assert.Equal(startedAt, read.StartedAt);
         Assert.Equal(3, read.RecoveryAttempts);
+    }
+
+    [Fact]
+    public async Task UpdateAsync_DoesNotStompConcurrentPriorityPatch()
+    {
+        // Worker writes often carry a stale in-memory WorkItem snapshot. Priority
+        // is intentionally updated through UpdatePriorityAsync only, so those
+        // worker writes must preserve a priority PATCH made while the item runs.
+        var item = MakeItem(priority: 0);
+        await _store.CreateAsync(item);
+
+        var patchedAt = DateTimeOffset.UtcNow;
+        var result = await _store.UpdatePriorityAsync(item.Id, 600, patchedAt);
+        Assert.Equal(PriorityUpdateOutcome.Updated, result.Outcome);
+
+        var staleWorkerSnapshot = item with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+            MergeSha = "abc123",
+        };
+        await _store.UpdateAsync(staleWorkerSnapshot);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.Equal(600, read!.Priority);
+        Assert.Equal(WorkItemState.Working, read.State);
+        Assert.Equal("abc123", read.MergeSha);
     }
 
     [Theory]
