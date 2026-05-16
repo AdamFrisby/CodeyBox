@@ -185,6 +185,17 @@ public sealed class LocalGitHost : IGitHost
         return Task.FromResult(Directory.Exists(path));
     }
 
+    public async Task<bool> BranchExistsAsync(string repositoryId, string branch, CancellationToken ct = default)
+    {
+        Validation.ValidateBranchName(branch, nameof(branch));
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            return false;
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(path, ct, "rev-parse", "--verify", "--quiet", $"refs/heads/{branch}^{{commit}}");
+        return rc.ExitCode == 0;
+    }
+
     public async Task<(string DiffStat, string FullDiff)> GetDiffAsync(
         string repositoryId, string baseBranch, string workBranch,
         CancellationToken ct = default)

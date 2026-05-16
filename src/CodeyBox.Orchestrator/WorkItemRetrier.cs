@@ -29,13 +29,14 @@ public sealed class WorkItemRetrier
         _log = log;
     }
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState)> RetryAsync(
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom)> RetryAsync(
         WorkItem item,
         string from = "work",
         string trigger = "manual",
         CancellationToken ct = default)
     {
-        var resumeState = from.Trim().ToLowerInvariant() switch
+        var requestedFrom = from.Trim().ToLowerInvariant();
+        var resumeState = requestedFrom switch
         {
             "work" => WorkItemState.Queued,
             "audit" => WorkItemState.WorkComplete,
@@ -45,14 +46,36 @@ public sealed class WorkItemRetrier
         };
 
         if (resumeState is null)
-            return (false, $"invalid 'from' value '{from}'", null);
+            return (false, $"invalid 'from' value '{from}'", null, null);
+
+        var actualFrom = requestedFrom;
 
         // For from != "work", the pipeline expects the bare repo to still be present.
         if (resumeState != WorkItemState.Queued)
         {
             var present = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!present)
-                return (false, $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists", null);
+                return (false, $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists", null, null);
+
+            // The work branch must also exist — earlier work-phase failures can
+            // leave the item in Failed without ever producing a commit, in which
+            // case the requested post-work resume would crash the pipeline with
+            // "pathspec 'codeybox/...' did not match any file(s)". Silently
+            // re-route to the work phase so the operator doesn't need to track
+            // which phase produced commits.
+            var workBranch = item.WorkBranch;
+            var branchPresent = !string.IsNullOrEmpty(workBranch)
+                && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
+            if (!branchPresent)
+            {
+                _log.LogInformation(
+                    "Retry of work item {Id} requested from='{RequestedFrom}' but work branch '{WorkBranch}' is missing in the bare repo; auto-falling back to from='work'",
+                    item.Id,
+                    requestedFrom,
+                    workBranch ?? "(unset)");
+                resumeState = WorkItemState.Queued;
+                actualFrom = "work";
+            }
         }
 
         // Reset RecoveryAttempts and increment QuotaRetryAttempts if this is an auto-retry.
@@ -67,7 +90,7 @@ public sealed class WorkItemRetrier
         var updated = await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
         {
-            return (false, "work item state changed concurrently; retry aborted", null);
+            return (false, "work item state changed concurrently; retry aborted", null, null);
         }
 
         if (_streamSummaries is not null)
@@ -76,9 +99,12 @@ public sealed class WorkItemRetrier
             catch (Exception ex) { _log.LogWarning(ex, "Failed to delete stream summaries for work item {Id}", item.Id); }
         }
 
-        AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? from : $"{from} (auto-retry: {trigger})");
+        var auditFrom = actualFrom == requestedFrom
+            ? requestedFrom
+            : $"{actualFrom} (fallback from '{requestedFrom}': work branch missing)";
+        AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
         await _queue.EnqueueAsync(resumed.Id, ct);
 
-        return (true, null, resumeState);
+        return (true, null, resumeState, actualFrom);
     }
 }
