@@ -957,49 +957,20 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         return sb.ToString();
     }
 
-    private async Task<RunResult> RunAsync(
+    private Task<RunResult> RunAsync(
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
-        WorkItemId? workItemId = null)
-    {
-        return await MultipassDaemonRetry.RunWithRetryAsync(
+        WorkItemId? workItemId = null) =>
+        MultipassDaemonRetry.RunWithRetryAsync(
             argv,
             ctInner => _runner.RunAsync(argv, stdin, ctInner),
-            ProbeMultipassDaemonAsync,
+            ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
+                _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,
             workItemId,
             ct,
             _daemonRetryPolicy);
-    }
-
-    private async Task<MultipassDaemonHealthProbeResult> ProbeMultipassDaemonAsync(CancellationToken ct)
-    {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(_daemonRetryPolicy.HealthProbeTimeout);
-        try
-        {
-            var probe = await _runner.RunAsync([_opts.MultipassBinary, "version"], stdin: null, timeout.Token);
-            if (probe.ExitCode == 0)
-                return MultipassDaemonHealthProbeResult.Healthy();
-            return MultipassDaemonHealthProbeResult.Unhealthy(
-                $"multipass version failed (exit {probe.ExitCode}): {probe.Stderr.Trim()}");
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            return MultipassDaemonHealthProbeResult.Unhealthy(
-                $"multipass version timed out after {_daemonRetryPolicy.HealthProbeTimeout.TotalSeconds:0.#}s");
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            return MultipassDaemonHealthProbeResult.Unhealthy(
-                $"multipass version probe threw {ex.GetType().Name}: {ex.Message}");
-        }
-    }
 
     private async Task TryDeleteVmAsync(string name)
     {
@@ -1215,6 +1186,47 @@ internal static class MultipassDaemonRetry
         if (stderr.Contains("socket", StringComparison.OrdinalIgnoreCase))
             return "multipass-socket-error";
         return null;
+    }
+
+    /// <summary>
+    /// Probes <c>multipass version</c> with a bounded deadline to decide whether
+    /// multipassd is reachable. Used by <see cref="RunWithRetryAsync"/> between
+    /// retries to attribute a failure to the daemon vs a transient flap.
+    /// Exposed for direct unit testing of each branch (healthy, non-zero exit,
+    /// probe timeout, caller cancellation, generic exception).
+    /// </summary>
+    internal static async Task<MultipassDaemonHealthProbeResult> ProbeDaemonAsync(
+        IProcessRunner runner,
+        string multipassBinary,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(runner);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
+        try
+        {
+            var probe = await runner.RunAsync([multipassBinary, "version"], stdin: null, timeoutCts.Token)
+                .ConfigureAwait(false);
+            if (probe.ExitCode == 0)
+                return MultipassDaemonHealthProbeResult.Healthy();
+            return MultipassDaemonHealthProbeResult.Unhealthy(
+                $"multipass version failed (exit {probe.ExitCode}): {probe.Stderr.Trim()}");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            return MultipassDaemonHealthProbeResult.Unhealthy(
+                $"multipass version timed out after {timeout.TotalSeconds:0.#}s");
+        }
+        catch (Exception ex)
+        {
+            return MultipassDaemonHealthProbeResult.Unhealthy(
+                $"multipass version probe threw {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private static void AuditTransientRetry(WorkItemId? workItemId, int attempt, string errorClass)
@@ -1690,50 +1702,21 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         }
     }
 
-    private async Task<RunResult> RunMultipassAsync(
+    private Task<RunResult> RunMultipassAsync(
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null)
-    {
-        return await MultipassDaemonRetry.RunWithRetryAsync(
+        Action<string>? stderrChunkCallback = null) =>
+        MultipassDaemonRetry.RunWithRetryAsync(
             argv,
             ctInner => _runner.RunAsync(argv, stdin, ctInner, stdoutChunkCallback, stderrChunkCallback),
-            ProbeMultipassDaemonAsync,
+            ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
+                _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,
             _workItemId,
             ct,
             _daemonRetryPolicy);
-    }
-
-    private async Task<MultipassDaemonHealthProbeResult> ProbeMultipassDaemonAsync(CancellationToken ct)
-    {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(_daemonRetryPolicy.HealthProbeTimeout);
-        try
-        {
-            var probe = await _runner.RunAsync([_opts.MultipassBinary, "version"], stdin: null, timeout.Token);
-            if (probe.ExitCode == 0)
-                return MultipassDaemonHealthProbeResult.Healthy();
-            return MultipassDaemonHealthProbeResult.Unhealthy(
-                $"multipass version failed (exit {probe.ExitCode}): {probe.Stderr.Trim()}");
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            return MultipassDaemonHealthProbeResult.Unhealthy(
-                $"multipass version timed out after {_daemonRetryPolicy.HealthProbeTimeout.TotalSeconds:0.#}s");
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            return MultipassDaemonHealthProbeResult.Unhealthy(
-                $"multipass version probe threw {ex.GetType().Name}: {ex.Message}");
-        }
-    }
 
     public async ValueTask DisposeAsync()
     {

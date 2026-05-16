@@ -2,6 +2,8 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Sandbox.Multipass;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -287,7 +289,141 @@ public sealed class MultipassDaemonRetryTests
         Assert.Equal(1, attempts);
     }
 
-    private sealed class RecordingLogger : ILogger
+    // ────────────────────────────────────────────────────────────────────
+    // RunWithRetryAsync: guard clauses
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task RunWithRetry_RejectsZeroMaxAttempts()
+    {
+        var policy = new MultipassDaemonRetryPolicy { MaxAttempts = 0 };
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            MultipassDaemonRetry.RunWithRetryAsync(
+                Argv("launch"),
+                _ => Task.FromResult(new RunResult(0, "", "")),
+                Healthy,
+                NullLogger.Instance,
+                WorkItemId.New(),
+                CancellationToken.None,
+                policy));
+    }
+
+    [Fact]
+    public async Task RunWithRetry_RejectsBackoffsShorterThanRetryCount()
+    {
+        // MaxAttempts=3 requires Backoffs.Count >= 2.
+        var policy = new MultipassDaemonRetryPolicy
+        {
+            MaxAttempts = 3,
+            Backoffs = [TimeSpan.FromMilliseconds(1)],
+        };
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            MultipassDaemonRetry.RunWithRetryAsync(
+                Argv("launch"),
+                _ => Task.FromResult(new RunResult(0, "", "")),
+                Healthy,
+                NullLogger.Instance,
+                WorkItemId.New(),
+                CancellationToken.None,
+                policy));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // ProbeDaemonAsync: each branch
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ProbeDaemon_ReturnsHealthy_OnZeroExit()
+    {
+        var runner = new StubProcessRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "multipass 1.15.0", "")));
+        var result = await MultipassDaemonRetry.ProbeDaemonAsync(
+            runner, "multipass", TimeSpan.FromSeconds(5), CancellationToken.None);
+        Assert.True(result.IsHealthy);
+    }
+
+    [Fact]
+    public async Task ProbeDaemon_ReturnsUnhealthy_OnNonZeroExit()
+    {
+        var runner = new StubProcessRunner((_, _, _) =>
+            Task.FromResult(new RunResult(1, "", "boom")));
+        var result = await MultipassDaemonRetry.ProbeDaemonAsync(
+            runner, "multipass", TimeSpan.FromSeconds(5), CancellationToken.None);
+        Assert.False(result.IsHealthy);
+        Assert.Contains("multipass version failed (exit 1)", result.Error);
+        Assert.Contains("boom", result.Error);
+    }
+
+    [Fact]
+    public async Task ProbeDaemon_ReturnsTimeoutUnhealthy_WhenRunnerExceedsDeadline()
+    {
+        // Runner cooperates with the probe's linked CT — when CancelAfter
+        // fires, Task.Delay throws OCE with the timeout token (not the
+        // caller's ct), which the probe must classify as "timed out".
+        var runner = new StubProcessRunner(async (_, _, runnerCt) =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30), runnerCt);
+            return new RunResult(0, "", "");
+        });
+        var result = await MultipassDaemonRetry.ProbeDaemonAsync(
+            runner, "multipass", TimeSpan.FromMilliseconds(5), CancellationToken.None);
+        Assert.False(result.IsHealthy);
+        Assert.Contains("timed out", result.Error);
+    }
+
+    [Fact]
+    public async Task ProbeDaemon_PropagatesCallerCancellation()
+    {
+        // The caller's ct is already cancelled when the probe starts: the
+        // OCE-when-ct-cancelled branch must rethrow instead of returning
+        // an Unhealthy "timed out" result.
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var runner = new StubProcessRunner(async (_, _, runnerCt) =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30), runnerCt);
+            return new RunResult(0, "", "");
+        });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            MultipassDaemonRetry.ProbeDaemonAsync(
+                runner, "multipass", TimeSpan.FromSeconds(5), cts.Token));
+    }
+
+    [Fact]
+    public async Task ProbeDaemon_CapturesGenericException()
+    {
+        // Runner throws something that isn't OperationCanceledException —
+        // the fallback catch must surface the exception type and message
+        // in the Unhealthy error so an operator can diagnose it.
+        var runner = new StubProcessRunner((_, _, _) =>
+            throw new InvalidOperationException("multipass binary missing"));
+        var result = await MultipassDaemonRetry.ProbeDaemonAsync(
+            runner, "multipass", TimeSpan.FromSeconds(5), CancellationToken.None);
+        Assert.False(result.IsHealthy);
+        Assert.Contains("InvalidOperationException", result.Error);
+        Assert.Contains("multipass binary missing", result.Error);
+    }
+
+    private sealed class StubProcessRunner : IProcessRunner
+    {
+        private readonly Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> _handler;
+
+        public StubProcessRunner(
+            Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> handler)
+        {
+            _handler = handler;
+        }
+
+        public Task<RunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null) =>
+            _handler(argv, stdin, ct);
+    }
+
+    private sealed class RecordingLogger : Microsoft.Extensions.Logging.ILogger
     {
         public List<(LogLevel Level, string Message)> Entries { get; } = [];
 
@@ -311,5 +447,121 @@ public sealed class MultipassDaemonRetryTests
             public static NullScope Instance { get; } = new();
             public void Dispose() { }
         }
+    }
+}
+
+/// <summary>
+/// Pins the AuditLog.SandboxLaunchTransientRetry emission on retry to a real
+/// Serilog sink. The unit-only tests above use the Microsoft.Extensions.Logging
+/// ILogger which is independent of Serilog's static <c>Log.Logger</c>, so the
+/// surface contract — the audit pipeline ACTUALLY fires for each retry with
+/// the correct workItemId/attempt/errorClass — is only verified here.
+///
+/// Wired into the GlobalSerilog collection because it mutates the static
+/// Serilog logger that other tests also touch.
+/// </summary>
+[Collection("GlobalSerilog")]
+public sealed class MultipassDaemonRetryAuditTests : IDisposable
+{
+    private readonly TestSink _sink = new();
+
+    public MultipassDaemonRetryAuditTests()
+    {
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .Enrich.With<SensitiveDataRedactionEnricher>()
+            .WriteTo.Sink(_sink)
+            .CreateLogger();
+    }
+
+    public void Dispose() => Log.CloseAndFlush();
+
+    private static IReadOnlyList<string> Argv(string command, params string[] rest) =>
+        ["/usr/bin/multipass", command, .. rest];
+
+    private static Task<MultipassDaemonHealthProbeResult> Healthy(CancellationToken _) =>
+        Task.FromResult(MultipassDaemonHealthProbeResult.Healthy());
+
+    private static MultipassDaemonRetryPolicy InstantPolicy() => new()
+    {
+        Delay = (_, _) => Task.CompletedTask,
+    };
+
+    [Fact]
+    public async Task SandboxLaunchTransientRetry_FiresForEachRetry_WithAttemptAndErrorClass()
+    {
+        var workItemId = WorkItemId.New();
+        await MultipassDaemonRetry.RunWithRetryAsync(
+            Argv("launch", "--name", "codeybox-x"),
+            _ => Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket")),
+            Healthy,
+            NullLogger.Instance,
+            workItemId,
+            CancellationToken.None,
+            InstantPolicy());
+
+        var retryEvents = _sink.Events
+            .Where(e => GetScalar<string>(e, "EventName") == "sandbox.launch_transient_retry")
+            .ToList();
+
+        // Two retries (between attempts 1→2 and 2→3); none after the final
+        // failed attempt because the retry loop breaks before auditing.
+        Assert.Equal(2, retryEvents.Count);
+
+        Assert.Equal(workItemId.ToString(), GetScalar<string>(retryEvents[0], "WorkItemId"));
+        Assert.Equal(1, GetScalar<int>(retryEvents[0], "Attempt"));
+        Assert.Equal("multipass-socket-unreachable", GetScalar<string>(retryEvents[0], "ErrorClass"));
+
+        Assert.Equal(workItemId.ToString(), GetScalar<string>(retryEvents[1], "WorkItemId"));
+        Assert.Equal(2, GetScalar<int>(retryEvents[1], "Attempt"));
+        Assert.Equal("multipass-socket-unreachable", GetScalar<string>(retryEvents[1], "ErrorClass"));
+    }
+
+    [Fact]
+    public async Task SandboxLaunchTransientRetry_DoesNotFire_OnFirstAttemptSuccess()
+    {
+        // No transient classification → return path bypasses the audit
+        // emission entirely. Guards against an accidental call before the
+        // null-check on errorClass.
+        await MultipassDaemonRetry.RunWithRetryAsync(
+            Argv("launch", "--name", "codeybox-x"),
+            _ => Task.FromResult(new RunResult(0, "ok", "")),
+            Healthy,
+            NullLogger.Instance,
+            WorkItemId.New(),
+            CancellationToken.None,
+            InstantPolicy());
+
+        Assert.DoesNotContain(_sink.Events, e =>
+            GetScalar<string>(e, "EventName") == "sandbox.launch_transient_retry");
+    }
+
+    [Fact]
+    public async Task SandboxLaunchTransientRetry_DoesNotFire_WhenWorkItemIdIsNull()
+    {
+        // Internal/maintenance callers (e.g. leak reaper) pass workItemId=null
+        // so the audit emission is suppressed but the retry still runs.
+        await MultipassDaemonRetry.RunWithRetryAsync(
+            Argv("launch", "--name", "codeybox-x"),
+            _ => Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket")),
+            Healthy,
+            NullLogger.Instance,
+            workItemId: null,
+            CancellationToken.None,
+            InstantPolicy());
+
+        Assert.DoesNotContain(_sink.Events, e =>
+            GetScalar<string>(e, "EventName") == "sandbox.launch_transient_retry");
+    }
+
+    private static T? GetScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        if (sv.Value is T t)
+            return t;
+        if (typeof(T) == typeof(int) && sv.Value is long l)
+            return (T)(object)(int)l;
+        return default;
     }
 }
