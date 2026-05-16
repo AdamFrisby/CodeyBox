@@ -213,8 +213,19 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             argv.Add("stream-json");
             argv.Add("--verbose");
         }
-        if (resume)
-            argv.Add("--resume");
+        // NOTE: We intentionally do NOT pass claude's `--resume` flag, even on
+        // the preempt-recovery path (where `resume == true`). claude's --resume
+        // requires a valid session ID; the previous implementation supplied
+        // none and relied on claude parsing the prompt-positional as a (bogus)
+        // session ID, which masked the bug. Once the prompt moved to stdin
+        // (see comment below), --resume started failing loudly with
+        // "Error: --resume requires a valid session ID". And there's no real
+        // claude-side session to resume anyway — every sandbox is a fresh
+        // clone with no ~/.claude/sessions content from prior iterations. The
+        // CodeyBox-level "resume" semantic (re-dispatch the same iteration
+        // after preemption) is handled entirely by the orchestrator;
+        // the agent CLI sees a brand-new conversation with the full prompt.
+        _ = resume;
         var effectiveModel = modelId ?? DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))
         {
