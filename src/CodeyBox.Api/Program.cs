@@ -609,6 +609,15 @@ builder.Services.AddHttpClient("agent-smoke", client =>
     client.Timeout = TimeSpan.FromSeconds(15);
 }).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
 
+// Named client for the startup model-list probes used by AgentClassConfigValidator.
+// Authorization is added per-request; headers are never logged. Per-call timeout is
+// shorter than the validator's overall 10 s deadline so a slow provider can't soak
+// the entire budget on a single probe.
+builder.Services.AddHttpClient("agent-modellist", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(5);
+}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
+
 // --- Quota probes ------------------------------------------------------------
 // Registered as IEnumerable<IAgentQuotaProbe>; the router resolves by Kind.
 // OAuth files are reread by the provider delegate on each probe pickup because
@@ -716,6 +725,54 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new GeminiSmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<GeminiSmokeProbe>()));
+
+// --- Model-list probes (used by AgentClassConfigValidator at startup) --------
+// Registered as IEnumerable<IAgentModelListProbe>; the validator resolves by Kind.
+// Copilot has no probe — its CLI does not accept a --model flag, so AgentClass
+// members never carry a Copilot ModelId in the first place.
+builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
+    return new ClaudeModelListProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        () => (
+            ReadClaudeQuotaToken(credentialLog),
+            Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
+                ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
+        loggerFactory.CreateLogger<ClaudeModelListProbe>());
+});
+builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
+    return new CodexModelListProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        () =>
+        {
+            var codexAuth = ReadCodexQuotaAuth(credentialLog);
+            return (
+                codexAuth.AccessToken,
+                codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"),
+                Environment.GetEnvironmentVariable("OPENAI_API_KEY")
+                    ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"));
+        },
+        loggerFactory.CreateLogger<CodexModelListProbe>());
+});
+builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
+    return new GeminiModelListProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        () => (
+            ReadGeminiQuotaToken(credentialLog)
+                ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN"),
+            Environment.GetEnvironmentVariable("GEMINI_API_KEY")
+                ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY")),
+        loggerFactory.CreateLogger<GeminiModelListProbe>());
+});
+builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
 {
@@ -1565,6 +1622,26 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+
+        /// <summary>
+        /// Startup config-validation knobs. Controls whether AgentClass ModelId
+        /// values are cross-checked against the provider's live model list.
+        /// </summary>
+        public ConfigValidationOptions ConfigValidation { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Startup config-validation knobs. Bound from <c>CodeyBox:ConfigValidation</c>.
+    /// </summary>
+    public sealed class ConfigValidationOptions
+    {
+        /// <summary>
+        /// When <c>true</c>, an <see cref="AgentClassOptions"/> member whose
+        /// <c>ModelId</c> is not present in the provider's live model list
+        /// throws at startup. Default <c>false</c> (warn only) so disconnected
+        /// dev/UAT hosts still come up.
+        /// </summary>
+        public bool FailOnUnknownModel { get; set; } = false;
     }
 
     public sealed class AutoRetryOnQuotaFailureConfig

@@ -170,6 +170,34 @@ webhook (see [docs/webhooks.md](webhooks.md#auto_retry-details)).
 
 ---
 
+## `ConfigValidation`
+
+Optional startup cross-check that every `AgentClass` member's `ModelId`
+actually exists on the provider's live model list. Catches typos
+(`gemini-3-flash-preview` vs. `gemini-3.1-flash-lite`) that would otherwise
+silently misroute and only surface hours later as cascading quota failures.
+
+```json
+"ConfigValidation": {
+  "FailOnUnknownModel": false
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `FailOnUnknownModel` | `false` | When `false`, an unknown `ModelId` logs a Warning naming the typoed id and the valid alternatives, but startup succeeds. When `true`, startup fails-fast with a non-zero exit code so the misconfig never reaches production. Operators flip this on in production deployments. |
+
+The validator probes each provider's model-list endpoint
+(`api.anthropic.com/v1/models`, ChatGPT-OAuth `chatgpt.com/backend-api/wham/models`
+or `api.openai.com/v1/models`, and Gemini's quota-bucket / `v1beta/models`
+endpoints) and matches each declared `ModelId` against the response. The
+total validation budget is 10 seconds; an unreachable endpoint or a slow
+network falls through to a Warning that names the agent kind and the
+reason, and the host still comes up. Members without a `ModelId` are not
+validated — they fall through to the agent's own default.
+
+---
+
 ## `AuditLog`
 
 Rolling file log configuration.
