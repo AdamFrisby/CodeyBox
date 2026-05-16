@@ -212,6 +212,47 @@ public static class AuditLog
                 workAgent.Value, auditAgent.Value);
 
     /// <summary>
+    /// Emitted when an in-flight agent invocation classified as
+    /// <see cref="AgentFailureKind.QuotaExhausted"/> and the pipeline retried
+    /// the same iteration against the next class member. Distinct from
+    /// <see cref="QuotaAuditFallthrough"/>, which fires for the audit-agent
+    /// gate at iteration *start*.
+    /// </summary>
+    public static void AgentQuotaFallback(
+        WorkItemId workItemId,
+        string phase,
+        int? iteration,
+        AgentKind fromAgent,
+        string? fromModel,
+        AgentKind toAgent,
+        string? toModel,
+        string reason) =>
+        Audit("quota_router.agent_fallback")
+            .Warning(
+                "Mid-iteration quota fallback: workItem={WorkItemId} phase={Phase} iteration={Iteration} " +
+                "from={FromAgent}/{FromModel} to={ToAgent}/{ToModel} reason={Reason}",
+                workItemId.ToString(), phase, iteration,
+                fromAgent.Value, fromModel ?? "(default)",
+                toAgent.Value, toModel ?? "(default)",
+                reason);
+
+    /// <summary>
+    /// Emitted when every eligible class member returned QuotaExhausted within
+    /// a single pickup, and the pipeline parked the item in WaitingForQuotaReset
+    /// rather than transitioning it to Failed.
+    /// </summary>
+    public static void AgentQuotaAllExhausted(
+        WorkItemId workItemId,
+        string classId,
+        string phase,
+        int memberCount) =>
+        Audit("quota_router.all_exhausted")
+            .Warning(
+                "All members of class '{ClassId}' exhausted mid-iteration for {WorkItemId} (phase={Phase}, members={MemberCount}); " +
+                "parked in WaitingForQuotaReset",
+                classId, workItemId.ToString(), phase, memberCount);
+
+    /// <summary>
     /// Emitted when the configured audit agent had insufficient quota and the
     /// pipeline fell through to the work agent. The correlation-breaking
     /// benefit of cross-review was lost for this auditor invocation.

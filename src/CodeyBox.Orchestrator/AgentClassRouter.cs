@@ -38,6 +38,12 @@ public sealed class AgentClassRouter
     private readonly IQuotaFailureStore? _quotaFailures;
     // Pre-parsed TOD modifiers: evaluated on every pickup, zero-alloc.
     private readonly IReadOnlyList<ParsedTodModifier> _todModifiers;
+    // In-process short-lived exhaustion cache populated by mid-iteration fallback.
+    // Keyed by (agent kind, model id ?? ""); value is the UTC instant at which
+    // the suppression expires. Survives only the current process lifetime —
+    // QuotaRetryScheduler / IQuotaFailureStore cover cross-restart durability.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), DateTimeOffset> _exhausted
+        = new();
 
     public AgentClassRouter(
         IReadOnlyList<AgentClass> catalog,
@@ -148,6 +154,14 @@ public sealed class AgentClassRouter
         foreach (var entry in sorted)
         {
             var member = entry.Member;
+            // Mid-iteration fallback may have marked this member exhausted in the
+            // current process. Skip it immediately so we don't burn a probe round-trip
+            // re-discovering what we just learned from a live failure.
+            if (IsExhausted(member, nowUtc))
+            {
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "in-process exhaustion cache"));
+                continue;
+            }
             if (member.Billing == AgentBilling.Subscription && _quotaFailures is not null)
             {
                 var observedAt = await _quotaFailures.GetMostRecentAsync(
@@ -220,6 +234,112 @@ public sealed class AgentClassRouter
             Chosen = fallback,
             Reason = "only PayPerApi members — firing despite apparent low quota",
         };
+    }
+
+    /// <summary>
+    /// Looks up the canonical <see cref="AgentMembership"/> for a class member.
+    /// Returns null if the class is unknown or no member matches the (agent, model)
+    /// pair. Match is exact on Agent and ModelId (treating null and "" as
+    /// equivalent).
+    /// <para>
+    /// Used by the in-iteration fallback wrapper so it can call
+    /// <see cref="MarkExhausted"/> and <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
+    /// with the real catalog record (correct Billing / QualityScore /
+    /// ReasoningMode) instead of fabricating a placeholder.
+    /// </para>
+    /// </summary>
+    public AgentMembership? FindMember(string classId, AgentKind agent, string? modelId)
+    {
+        if (!_catalog.TryGetValue(classId, out var agentClass)) return null;
+        var normalisedModel = modelId ?? string.Empty;
+        foreach (var m in agentClass.Members)
+        {
+            if (m.Agent != agent) continue;
+            var memberModel = m.ModelId ?? string.Empty;
+            if (string.Equals(memberModel, normalisedModel, StringComparison.Ordinal))
+                return m;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Returns the eligible class members for <paramref name="item"/> in the
+    /// router's preferred order, *minus* members that this process has marked
+    /// exhausted via <see cref="MarkExhausted"/> within the active TTL window.
+    ///
+    /// <para>
+    /// The pipeline calls this when a mid-iteration agent invocation classifies
+    /// as <see cref="AgentFailureKind.QuotaExhausted"/>: the next member in the
+    /// returned list is the same one a fresh pickup would have routed to, so
+    /// the caller can swap runners and retry the iteration without the work
+    /// item leaving Working.
+    /// </para>
+    /// <para>
+    /// Returns an empty list when no class is configured, the class has no
+    /// members above the work item's <see cref="WorkItem.MinModelScore"/>, or
+    /// every eligible member is currently marked exhausted in this process.
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<AgentMembership> OrderedFallbackCandidates(WorkItem item, Project? project)
+    {
+        var classId = item.AgentClassId ?? project?.DefaultAgentClass;
+        if (classId is null || !_catalog.TryGetValue(classId, out var agentClass))
+            return [];
+
+        var nowUtc = _time.GetUtcNow();
+        // Drop expired exhaustion entries lazily so the cache doesn't grow unbounded
+        // across long-running processes. TryRemove(KeyValuePair) only removes when
+        // the value still matches what we observed — a concurrent MarkExhausted that
+        // refreshed the expiry between the read and the remove is preserved.
+        foreach (var key in _exhausted.Keys.ToList())
+        {
+            if (_exhausted.TryGetValue(key, out var expiry) && expiry <= nowUtc)
+                _exhausted.TryRemove(new KeyValuePair<(AgentKind Agent, string ModelId), DateTimeOffset>(key, expiry));
+        }
+
+        return agentClass.Members
+            .Select((m, idx) => (Member: m, ConfigIndex: idx))
+            .Where(x => x.Member.QualityScore >= item.MinModelScore)
+            .Where(x => !IsExhausted(x.Member, nowUtc))
+            .Select(x => new
+            {
+                x.Member,
+                x.ConfigIndex,
+                EffectiveScore = x.Member.QualityScore + ComputeTodModifier(x.Member.Agent, nowUtc),
+            })
+            .OrderByDescending(x => x.EffectiveScore)
+            .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
+            .ThenBy(x => x.ConfigIndex)
+            .Select(x => x.Member)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Marks a class member as exhausted in this process for <paramref name="ttl"/>
+    /// (or until <paramref name="resetAt"/>, whichever is sooner). Subsequent
+    /// calls to <see cref="OrderedFallbackCandidates"/> and
+    /// <see cref="ResolveAsync"/> will skip the member while the suppression is
+    /// active. Always combine with <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
+    /// so the suppression also reaches any probe-side cache.
+    /// </summary>
+    public void MarkExhausted(AgentMembership member, TimeSpan ttl, DateTimeOffset? resetAt = null)
+    {
+        if (ttl <= TimeSpan.Zero) return;
+        var nowUtc = _time.GetUtcNow();
+        var until = nowUtc + ttl;
+        // Cap by resetAt when known — including a past resetAt, which means
+        // the agent's own reset hint says we're already through the window.
+        if (resetAt is { } reset && reset < until)
+            until = reset;
+        if (until <= nowUtc) return; // expired already; nothing to suppress
+        var key = (member.Agent, member.ModelId ?? string.Empty);
+        _exhausted.AddOrUpdate(key, until, (_, existing) => existing > until ? existing : until);
+    }
+
+    private bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
+    {
+        var key = (member.Agent, member.ModelId ?? string.Empty);
+        return _exhausted.TryGetValue(key, out var expiry) && expiry > nowUtc;
     }
 
     private Task<AgentQuotaSnapshot> ProbeAsync(AgentMembership member, CancellationToken ct)

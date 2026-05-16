@@ -633,6 +633,11 @@ builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteQuotaFailureStore(cbOpts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteAgentFallbackHistoryStore(cbOpts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
@@ -1060,7 +1065,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IStdoutBroadcaster>(),
     sp.GetService<IAgentStreamStore>(),
     sp.GetService<IQuotaFailureStore>(),
-    sp.GetRequiredService<QuotaRetryScheduler>()));
+    sp.GetRequiredService<QuotaRetryScheduler>(),
+    sp.GetService<AgentClassRouter>(),
+    sp.GetService<IAgentFallbackHistoryStore>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

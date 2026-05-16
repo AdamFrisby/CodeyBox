@@ -383,6 +383,13 @@ public sealed class OrchestratorService : BackgroundService
             };
         }
 
+        // WaitingForQuotaReset is owned by QuotaRetryScheduler; the periodic
+        // sweep re-enqueues when any member becomes available. Treat it as a
+        // resting point on startup so a routine restart doesn't burn a recovery
+        // credit or jump the queue.
+        if (item.State == WorkItemState.WaitingForQuotaReset)
+            return null;
+
         WorkItemState? targetState = item.State switch
         {
             WorkItemState.Auditing => WorkItemState.WorkComplete,
@@ -446,6 +453,16 @@ public sealed class OrchestratorService : BackgroundService
         if (item.State is WorkItemState.NeedsOperatorInput)
         {
             _log.LogWarning("Worker {WorkerId} skipping {Id}: still in NeedsOperatorInput state", workerIndex, id);
+            return;
+        }
+
+        // Items parked waiting for quota to reset must not be processed.
+        // The quota retry scheduler will re-enqueue when any class member becomes
+        // available again; running here would just repeat the exhaustion that
+        // got us into this state.
+        if (item.State is WorkItemState.WaitingForQuotaReset)
+        {
+            _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForQuotaReset", workerIndex, id);
             return;
         }
 
