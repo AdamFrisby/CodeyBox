@@ -15,15 +15,19 @@ file sealed class FakeLlmAuditor : IAuditor
 {
     private readonly Func<ISandbox, AuditContext, CancellationToken, Task<AuditResult>> _body;
 
-    public FakeLlmAuditor(string name, Func<ISandbox, AuditContext, CancellationToken, Task<AuditResult>> body)
+    public FakeLlmAuditor(
+        string name,
+        Func<ISandbox, AuditContext, CancellationToken, Task<AuditResult>> body,
+        AuditCapabilities required = AuditCapabilities.None)
     {
         Name = name;
         _body = body;
+        Required = required;
     }
 
     public string Name { get; }
     public string Kind => "llm";
-    public AuditCapabilities Required => AuditCapabilities.None;
+    public AuditCapabilities Required { get; }
 
     public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
         => _body(sandbox, context, ct);
@@ -258,6 +262,86 @@ public sealed class AuditorParallelismRespectsMaxTests : IDisposable
         var minExpectedMs = (AuditorCount - 1) * DelayMs;
         Assert.True(sw.ElapsedMilliseconds >= minExpectedMs,
             $"Expected wall-clock ≥ {minExpectedMs} ms (sequential) but got {sw.ElapsedMilliseconds} ms");
+    }
+}
+
+// ── Test: failed LLM agent execution retry / quota classification ─────────────
+
+public sealed class AuditorAgentExecutionFailureTests : IDisposable
+{
+    private readonly string _workspace;
+    public AuditorAgentExecutionFailureTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-llm-agent-fail-").FullName;
+    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+
+    [Fact]
+    public async Task LlmAgentExecutionFailure_IsRetriedOnceInFreshSandbox()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var calls = 0;
+        var sandboxIds = new List<string>();
+        var auditor = new FakeLlmAuditor("flaky-review", (sandbox, _, _) =>
+        {
+            calls++;
+            sandboxIds.Add(sandbox.Id);
+            if (calls == 1)
+            {
+                return Task.FromResult(new AuditResult(false, [new AuditFinding(
+                    "flaky-review",
+                    AuditSeverity.Error,
+                    "review agent failed to run",
+                    "transient CLI failure")],
+                    AgentSummary: "agent exited 1",
+                    AgentStderr: "transient CLI failure"));
+            }
+
+            return Task.FromResult(new AuditResult(true, []));
+        });
+
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], maxAuditIterations: 1);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, calls);
+        Assert.Equal(2, sandboxIds.Distinct().Count());
+    }
+
+    [Fact]
+    public async Task LlmAgentQuotaFailure_IsClassifiedAsQuotaFailureWithoutRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var calls = 0;
+        var auditor = new FakeLlmAuditor(
+            "quota-review",
+            (_, _, _) =>
+            {
+                calls++;
+                return Task.FromResult(new AuditResult(false, [new AuditFinding(
+                    "quota-review",
+                    AuditSeverity.Error,
+                    "review agent failed to run",
+                    "quota")],
+                    AgentSummary: "agent exited 1",
+                    AgentStdout: "hit your usage limit; reset after 1h"));
+            },
+            AuditCapabilities.AgentCredentials);
+
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], maxAuditIterations: 1);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("quota", final.FailureKind);
+        Assert.Contains("Audit agent", final.LastError);
+        Assert.Equal(1, calls);
     }
 }
 

@@ -1885,22 +1885,47 @@ public sealed class PipelineRunner : IPipelineRunner
                 var maxPar = project.Audit.MaxLlmAuditorParallelism;
                 using var sem = new SemaphoreSlim(maxPar, maxPar);
 
+                async Task<AuditorRunRecord> RunLlmPairAsync((IAuditor Auditor, IAgentRunner Runner) pair)
+                {
+                    await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+                    if (credential is not null && credential.Files.Count > 0)
+                        await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                    await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
+                    return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, workRunner, credential, ctx, ct);
+                }
+
                 var llmTasks = llmPairs.Select(async pair =>
                 {
                     await sem.WaitAsync(ct);
                     try
                     {
-                        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-                        if (credential is not null && credential.Files.Count > 0)
-                            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
-                        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
-                        return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, workRunner, credential, ctx, ct);
+                        return await RunLlmPairAsync(pair);
                     }
                     finally { sem.Release(); }
                 }).ToList();
 
                 var llmRuns = await Task.WhenAll(llmTasks);
+
+                // A nonzero review-agent exit is audit infrastructure, not a
+                // source-code finding. Retry once in a fresh sandbox to ride out
+                // transient CLI/network/process failures. Quota-shaped failures
+                // are not retried here; PostProcessAuditorRunAsync records and
+                // raises them as quota failures so the normal quota retry path can
+                // take over.
+                for (var i = 0; i < llmRuns.Length; i++)
+                {
+                    if (!IsLlmAgentExecutionFailure(llmRuns[i].Result)
+                        || DetectQuotaFailure(llmRuns[i].Result) is not null)
+                    {
+                        continue;
+                    }
+
+                    _log.LogWarning(
+                        "LLM auditor {Auditor} agent execution failed; retrying once in a fresh sandbox",
+                        llmRuns[i].Auditor.Name);
+                    llmRuns[i] = await RunLlmPairAsync((llmRuns[i].Auditor, llmRuns[i].Runner));
+                }
 
                 // Post-process in stable auditor order (same as llmPairs).
                 foreach (var run in llmRuns)
@@ -2000,6 +2025,8 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         if (needsCreds && (run.Result.AgentStderr is not null || run.Result.AgentStdout is not null))
         {
+            var quotaDetection = _quotaClassifier.Detect(
+                run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
             await _quotaClassifier.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 run.Runner.Kind,
@@ -2011,6 +2038,14 @@ public sealed class PipelineRunner : IPipelineRunner
                 ct,
                 projectId: projectId,
                 stdout: run.Result.AgentStdout);
+
+            if (quotaDetection is not null)
+            {
+                throw new TerminalQuotaError(
+                    quotaDetection.Kind,
+                    $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
+                    quotaDetection.ResetAt);
+            }
         }
 
         if (needsCreds)
@@ -2032,6 +2067,17 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditLog.AuditorRun(run.Auditor.Name, worstSeverity, run.Elapsed, run.Runner.Kind);
         await PersistAuditReportAsync(ctx, run.Auditor, run.Result, run.StartedAt, run.Elapsed, ct);
     }
+
+    private static bool IsLlmAgentExecutionFailure(AuditResult result) =>
+        !result.Passed
+        && result.AgentSummary is not null
+        && result.Findings.Any(f =>
+            string.Equals(f.Title, "review agent failed to run", StringComparison.OrdinalIgnoreCase));
+
+    private static QuotaDetection? DetectQuotaFailure(AuditResult result) =>
+        result.AgentStderr is null && result.AgentStdout is null
+            ? null
+            : QuotaFailureDetector.Detect(result.AgentStderr, result.AgentStdout);
 
     private sealed record AuditorRunRecord(
         IAuditor Auditor,
