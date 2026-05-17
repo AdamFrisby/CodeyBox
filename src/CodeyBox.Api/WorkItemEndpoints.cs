@@ -486,7 +486,7 @@ internal static class WorkItemEndpoints
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
         var from = (body?.From ?? "work").Trim().ToLowerInvariant();
-        var (success, error, resumeState) = await retrier.RetryAsync(item, from, trigger: "manual", ct);
+        var (success, error, resumeState, actualFrom) = await retrier.RetryAsync(item, from, trigger: "manual", ct);
 
         if (!success)
         {
@@ -496,7 +496,9 @@ internal static class WorkItemEndpoints
             return Results.Conflict(new { error });
         }
 
-        return Results.Accepted($"/workitems/{item.Id}", new { id = item.Id.ToString(), from, state = resumeState!.Value.ToString() });
+        return Results.Accepted(
+            $"/workitems/{item.Id}",
+            new { id = item.Id.ToString(), from, actualFrom = actualFrom!, state = resumeState!.Value.ToString() });
     }
 
     /// <summary>

@@ -61,6 +61,20 @@ public interface IGitHost
     Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default);
 
     /// <summary>
+    /// Returns true if <paramref name="branch"/> resolves to a commit in the
+    /// host bare repo. Used by the retry endpoint to decide whether a
+    /// post-work-phase resume (audit/merge/upstream) actually has the work
+    /// branch the pipeline will try to check out — when the work phase died
+    /// before producing a commit, the branch is absent and the next phase
+    /// would fail with "pathspec did not match any file(s)".
+    ///
+    /// Default returns <c>true</c> ("don't know, assume yes") so test fakes
+    /// that don't implement the check behave as before.
+    /// </summary>
+    Task<bool> BranchExistsAsync(string repositoryId, string branch, CancellationToken ct = default)
+        => Task.FromResult(true);
+
+    /// <summary>
     /// Returns <c>git diff --stat</c> and <c>git diff</c> output comparing
     /// <paramref name="baseBranch"/> and <paramref name="workBranch"/> in the
     /// host bare repo. Returns empty strings when the diff cannot be computed

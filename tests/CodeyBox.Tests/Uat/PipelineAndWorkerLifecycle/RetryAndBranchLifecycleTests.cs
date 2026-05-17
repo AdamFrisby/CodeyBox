@@ -34,20 +34,34 @@ public sealed class RetryAndBranchLifecycleTests : IDisposable
         using var store = NewStore();
         var queue = new InMemoryTaskQueue();
         var gitHost = NewGitHost();
-        var item = PipelineLifecycleUatHelpers.NewItem("feature/retry-" + from) with
+        var workBranch = "feature/retry-" + from;
+        var item = PipelineLifecycleUatHelpers.NewItem(workBranch) with
         {
             State = WorkItemState.Failed,
             LastError = "previous failure",
             RecoveryAttempts = 2,
         };
         await store.CreateAsync(item);
-        await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        if (from != "work")
+        {
+            // Post-work resumes require the work branch to exist in the bare repo;
+            // missing branches now auto-fall-back to from='work'.
+            await PipelineLifecycleUatHelpers.CommitToBareBranchAsync(
+                _workspace,
+                gitHost.GetRepoPath(repoId),
+                workBranch,
+                "artifact.txt",
+                "previous attempt artifact\n",
+                "previous attempt");
+        }
         var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
 
         var result = await retrier.RetryAsync(item, from);
 
         Assert.True(result.Success, result.Error);
         Assert.Equal(expected, result.ResumeState);
+        Assert.Equal(from, result.ActualFrom);
         var stored = await store.GetAsync(item.Id);
         Assert.Equal(expected, stored!.State);
         Assert.Null(stored.LastError);
@@ -74,6 +88,90 @@ public sealed class RetryAndBranchLifecycleTests : IDisposable
         Assert.Contains("bare repo", result.Error);
         Assert.Equal(0, queue.Count);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task RetryFromAuditWithMissingWorkBranch_FallsBackToWorkAndEnqueues()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        // Item has WorkBranch set (the work phase recorded it before failing),
+        // but the bare repo never received a commit on that branch.
+        var item = PipelineLifecycleUatHelpers.NewItem("codeybox/missingbr") with
+        {
+            State = WorkItemState.Failed,
+            LastError = "agent killed before first commit",
+        };
+        await store.CreateAsync(item);
+        await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+
+        var result = await retrier.RetryAsync(item, "audit");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.ResumeState);
+        Assert.Equal("work", result.ActualFrom);
+        var stored = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RetryFromAuditWithExistingWorkBranch_BehavesAsToday()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        const string workBranch = "codeybox/withcommit";
+        var item = PipelineLifecycleUatHelpers.NewItem(workBranch) with
+        {
+            State = WorkItemState.AuditFailed,
+        };
+        await store.CreateAsync(item);
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await PipelineLifecycleUatHelpers.CommitToBareBranchAsync(
+            _workspace,
+            barePath,
+            workBranch,
+            "work.txt",
+            "previous attempt artifact\n",
+            "previous attempt");
+        var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+
+        var result = await retrier.RetryAsync(item, "audit");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.WorkComplete, result.ResumeState);
+        Assert.Equal("audit", result.ActualFrom);
+        var stored = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, stored!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RetryFromWorkIsUnaffectedByBranchExistenceCheck()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var item = PipelineLifecycleUatHelpers.NewItem("codeybox/noworkbr") with
+        {
+            State = WorkItemState.Failed,
+        };
+        await store.CreateAsync(item);
+        await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+
+        var result = await retrier.RetryAsync(item, "work");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.ResumeState);
+        Assert.Equal("work", result.ActualFrom);
     }
 
     [Fact]
