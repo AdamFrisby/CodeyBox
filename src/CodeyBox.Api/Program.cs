@@ -771,10 +771,11 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
+    var source = sp.GetRequiredService<ClaudeCredentialFileSource>();
     return new ClaudeModelListProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => (
-            ReadClaudeQuotaToken(credentialLog),
+            ParseClaudeAccessToken(source.GetRaw(), source.FilePath, credentialLog),
             Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         loggerFactory.CreateLogger<ClaudeModelListProbe>());
@@ -783,11 +784,12 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
+    var source = sp.GetRequiredService<CodexCredentialFileSource>();
     return new CodexModelListProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () =>
         {
-            var codexAuth = ReadCodexQuotaAuth(credentialLog);
+            var codexAuth = ParseCodexAccessTokens(source.GetRaw(), source.FilePath, credentialLog);
             return (
                 codexAuth.AccessToken,
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"),
@@ -800,10 +802,11 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
+    var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
     return new GeminiModelListProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => (
-            ReadGeminiQuotaToken(credentialLog)
+            ParseGeminiAccessToken(source.GetRaw(), source.FilePath, credentialLog)
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN"),
             Environment.GetEnvironmentVariable("GEMINI_API_KEY")
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY")),
