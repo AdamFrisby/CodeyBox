@@ -37,6 +37,13 @@ public sealed class ProjectConfig
     public ProjectBudgetConfig? Budget { get; set; }
     public ProjectReleaseConfigOptions? Release { get; set; }
     public bool? SkipCredentialSmokeTest { get; set; }
+
+    /// <summary>
+    /// Optional per-project cap on the priority accepted by the API. Maps to
+    /// <see cref="CodeyBox.Core.Project.MaxPriority"/>. Null = no additional
+    /// project-level cap (the global [-1000, 1000] bound still applies).
+    /// </summary>
+    public int? MaxPriority { get; set; }
 }
 
 /// <summary>

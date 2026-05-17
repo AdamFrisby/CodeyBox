@@ -758,6 +758,19 @@ Only fields provided (non-null) in the body are updated.
 * Returns `409 Conflict` when the item is not in `Queued` state (in-flight items are read-only).
 * Validation rules for `title`, `prompt`, and `agent` are identical to `POST /workitems`.
 
+### `PATCH /workitems/{id}/priority`
+
+Update the dispatch priority of a work item. Higher values pick up first; ties break by `createdAt` ascending (FIFO). Priority must be in `[-1000, 1000]` and may be further bounded by a per-project `MaxPriority` cap (default unset, meaning no extra project cap).
+
+```json
+{ "priority": 250 }
+```
+
+* Returns `200 OK` with `{ "id", "priority" }`. Returns `{ ..., "status": "no-op" }` when the value is unchanged.
+* Returns `400 Bad Request` when `priority` is outside the global range or exceeds the project cap.
+* Allowed in any state, but only affects pickup order while the item is `Queued`. In-flight items run to terminal state regardless of priority changes.
+* When the item is `Queued`, the orchestrator is kicked so the new ordering takes effect on the next dispatch tick — a mid-queue bump jumps the item ahead immediately.
+
 ### `POST /workitems/reorder`
 
 Reorder the set of **Queued** work items. The body must list **exactly** the current queued item IDs (no more, no fewer). Any mismatch indicates a stale view and is rejected with `400`.
@@ -1037,7 +1050,8 @@ The orchestrator never broadcasts the work item prompt over the hub.
   "dependsOn": [],
   "dependsOnSatisfied": true,
   "dependsOnExternalIds": {},
-  "queuePosition": 0
+  "queuePosition": 0,
+  "priority": 0
 }
 ```
 
@@ -1051,6 +1065,8 @@ The orchestrator never broadcasts the work item prompt over the hub.
 for displaying human-readable dependency labels.
 
 `queuePosition` is an ordering hint for Queued items set by `POST /workitems/reorder`. Smaller values sort first. Items not yet explicitly reordered have a position derived from their creation timestamp and sort after explicitly positioned items.
+
+`priority` is the dispatch priority used by the orchestrator (higher wins; ties break by `createdAt` ASC so equal-priority items remain FIFO). Default `0`. May be set on creation and updated via `PATCH /workitems/{id}/priority`. The accepted range is `[-1000, 1000]`, optionally further bounded per project by `Project.MaxPriority` (default unset, meaning no extra project cap). Priority affects only pickup ORDER; pause, dependency, budget, and quota gates still run after pickup.
 
 `state` is one of: `Queued`, `Working`, `WorkComplete`, `Auditing`,
 `AuditPassed`, `Reworking`, `AuditFailed`, `Merging`, `Merged`,

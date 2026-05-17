@@ -154,6 +154,14 @@ public sealed record WorkItem
     public long QueuePosition { get; init; } = 0;
 
     /// <summary>
+    /// Dispatch priority for Queued items. Higher values pick up first; ties break by
+    /// <see cref="CreatedAt"/> ascending so equal-priority items remain FIFO. Default 0;
+    /// negative values sort behind defaults, positive values ahead. The API clamps to
+    /// the range [-1000, 1000] and may apply a per-project cap.
+    /// </summary>
+    public int Priority { get; init; } = 0;
+
+    /// <summary>
     /// UTC timestamp when this work item was first picked up by a worker
     /// (transitioned out of Queued state). Null until the worker commits to
     /// running it. Used for per-project budget window calculations.

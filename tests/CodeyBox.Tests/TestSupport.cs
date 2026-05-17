@@ -3,6 +3,9 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Gemini;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
@@ -140,7 +143,13 @@ internal static class TestSupport
             NullLogger<PipelineRunner>.Instance,
             timingStore: timingStore,
             auditReports: auditReportStore,
-            agentStreams: agentStreams);
+            agentStreams: agentStreams,
+            quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[]
+            {
+                new ClaudeQuotaFailureDetector(),
+                new CodexQuotaFailureDetector(),
+                new GeminiQuotaFailureDetector(),
+            }));
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

@@ -166,6 +166,14 @@ public sealed record Project
     /// are ever created. Opt in by setting Enabled=true.
     /// </summary>
     public ProjectReleaseConfig ReleaseConfig { get; init; } = new();
+
+    /// <summary>
+    /// Per-project cap on <see cref="WorkItem.Priority"/>. Requests above this cap
+    /// are rejected with 400. Null means no additional project-level cap beyond
+    /// the global priority bounds. Negative priorities are not constrained by
+    /// this cap (lowering priority is always allowed).
+    /// </summary>
+    public int? MaxPriority { get; init; }
 }
 
 /// <summary>

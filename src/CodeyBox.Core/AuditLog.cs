@@ -97,6 +97,16 @@ public static class AuditLog
             .Information("Work item {WorkItemId} patched: title={TitleChanged} prompt={PromptChanged} agent={AgentChanged}",
                 id.ToString(), titleChanged, promptChanged, agentChanged);
 
+    /// <summary>
+    /// Distinct audit event for priority changes. Records the previous and new
+    /// priority values explicitly so the audit trail captures the mutation —
+    /// <see cref="WorkItemPatched"/>'s flags-only shape would otherwise erase it.
+    /// </summary>
+    public static void WorkItemPriorityChanged(WorkItemId id, int oldPriority, int newPriority) =>
+        Audit("work_item.priority_changed")
+            .Information("Work item {WorkItemId} priority changed: {OldPriority} → {NewPriority}",
+                id.ToString(), oldPriority, newPriority);
+
     public static void WorkItemReordered(int count) =>
         Audit("work_item.reordered")
             .Information("Queue reordered: {Count} items repositioned", count);

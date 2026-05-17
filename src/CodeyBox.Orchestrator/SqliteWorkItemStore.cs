@@ -127,6 +127,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Additive migration: optional per-work-item audit profile override.
         // NULL means use the project's default audit profile.
         RunMigration("ALTER TABLE work_items ADD COLUMN auditor_profile TEXT;");
+
+        // Additive migration: dispatch priority. Default 0 preserves FIFO behaviour
+        // for existing rows. Higher values pick up first; ties break by created_at ASC.
+        RunMigration("ALTER TABLE work_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;");
+
+        // Index for the priority-aware pickup query: state filter first, then priority,
+        // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
+        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
     }
 
     private void RunMigration(string sql)
@@ -156,11 +164,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                     stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                     min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
-                    failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, auditor_profile)
+                    failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, auditor_profile, priority)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                     $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                     $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
-                    $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $auditor_profile);
+                    $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $auditor_profile, $priority);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -263,6 +271,54 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         return await reader.ReadAsync(ct) ? Read(reader) : null;
     }
 
+    public async Task<PriorityUpdateResult> UpdatePriorityAsync(
+        WorkItemId id,
+        int priority,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            // Read current row under the write lock so a concurrent worker can't
+            // transition the row between the read and the partial UPDATE below.
+            WorkItem? current;
+            using (var read = _conn.CreateCommand())
+            {
+                read.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                read.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await read.ExecuteReaderAsync(ct);
+                current = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+
+            if (current is null)
+                return new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null);
+
+            if (WorkItemDependencies.TerminalStates.Contains(current.State))
+                return new PriorityUpdateResult(PriorityUpdateOutcome.TerminalState, current, current.Priority);
+
+            // Partial UPDATE: touch only priority + updated_at. Crucially does NOT
+            // write state/started_at/recovery_attempts/etc, so a worker that picks
+            // the item up concurrently isn't stomped.
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET priority = $priority, updated_at = $updated_at
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$priority", priority);
+            cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            var updated = current with { Priority = priority, UpdatedAt = updatedAt };
+            return new PriorityUpdateResult(PriorityUpdateOutcome.Updated, updated, current.Priority);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         using var cmd = _conn.CreateCommand();
@@ -296,6 +352,46 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             yield return Read(reader);
+    }
+
+    public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM work_items WHERE state = $state;";
+        cmd.Parameters.AddWithValue("$state", (int)state);
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result is long l ? (int)l : 0;
+    }
+
+    public async IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
+        IReadOnlySet<WorkItemId> skipIds,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        // Exclude terminal states and parked NeedsOperatorInput. The remaining set
+        // mirrors what the FIFO dispatcher used to process via the channel:
+        // Queued plus the mid-pipeline resumable states (Working, WorkComplete,
+        // Auditing, Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
+        cmd.CommandText = $"""
+            SELECT * FROM work_items
+            WHERE state NOT IN (
+                {(int)WorkItemState.Done},
+                {(int)WorkItemState.Failed},
+                {(int)WorkItemState.Cancelled},
+                {(int)WorkItemState.AuditFailed},
+                {(int)WorkItemState.MergeConflictResolutionFailed},
+                {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
+                {(int)WorkItemState.NeedsOperatorInput}
+            )
+            ORDER BY priority DESC, created_at ASC;
+            """;
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var item = Read(reader);
+            if (skipIds.Contains(item.Id)) continue;
+            yield return item;
+        }
     }
 
     public async Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default)
@@ -524,6 +620,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$next_quota_retry_at", (object?)item.NextQuotaRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
         cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$priority", item.Priority);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -562,6 +659,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         NextQuotaRetryAt = ReadNullableDateTimeOffset(r, "next_quota_retry_at"),
         QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),
+        Priority = ReadInt32OrDefault(r, "priority", defaultValue: 0),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)

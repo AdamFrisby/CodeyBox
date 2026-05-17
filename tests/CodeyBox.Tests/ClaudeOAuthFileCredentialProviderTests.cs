@@ -163,3 +163,62 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         }
     }
 }
+
+public sealed class ClaudeEnvironmentCredentialProviderTests : IDisposable
+{
+    private const string CodeyBoxEnv = "CODEYBOX_TEST_CLAUDE_API_KEY";
+    private const string AnthropicEnv = "ANTHROPIC_TEST_API_KEY";
+
+    public void Dispose()
+    {
+        Environment.SetEnvironmentVariable(CodeyBoxEnv, null);
+        Environment.SetEnvironmentVariable(AnthropicEnv, null);
+    }
+
+    [Fact]
+    public async Task CodeyBoxApiKey_IsExposedAsAnthropicApiKey()
+    {
+        Environment.SetEnvironmentVariable(CodeyBoxEnv, "sk-ant-api03-test");
+        var provider = new ClaudeEnvironmentCredentialProvider(CodeyBoxEnv, AnthropicEnv);
+
+        var cred = await provider.GetAsync(AgentKind.Claude);
+
+        Assert.NotNull(cred);
+        Assert.Equal("sk-ant-api03-test", cred!.EnvironmentVariables["ANTHROPIC_API_KEY"]);
+        Assert.DoesNotContain("CLAUDE_CODE_OAUTH_TOKEN", cred.EnvironmentVariables.Keys);
+    }
+
+    [Fact]
+    public async Task CodeyBoxOAuthToken_IsExposedAsClaudeOAuthToken()
+    {
+        Environment.SetEnvironmentVariable(CodeyBoxEnv, "sk-ant-oat01-test");
+        var provider = new ClaudeEnvironmentCredentialProvider(CodeyBoxEnv, AnthropicEnv);
+
+        var cred = await provider.GetAsync(AgentKind.Claude);
+
+        Assert.NotNull(cred);
+        Assert.Equal("sk-ant-oat01-test", cred!.EnvironmentVariables["CLAUDE_CODE_OAUTH_TOKEN"]);
+        Assert.DoesNotContain("ANTHROPIC_API_KEY", cred.EnvironmentVariables.Keys);
+    }
+
+    [Fact]
+    public async Task ConventionalAnthropicApiKey_IsAccepted()
+    {
+        Environment.SetEnvironmentVariable(AnthropicEnv, "sk-ant-api03-direct");
+        var provider = new ClaudeEnvironmentCredentialProvider(CodeyBoxEnv, AnthropicEnv);
+
+        var cred = await provider.GetAsync(AgentKind.Claude);
+
+        Assert.NotNull(cred);
+        Assert.Equal("sk-ant-api03-direct", cred!.EnvironmentVariables["ANTHROPIC_API_KEY"]);
+    }
+
+    [Fact]
+    public async Task ReturnsNullForNonClaudeAgents()
+    {
+        Environment.SetEnvironmentVariable(CodeyBoxEnv, "sk-ant-api03-test");
+        var provider = new ClaudeEnvironmentCredentialProvider(CodeyBoxEnv, AnthropicEnv);
+
+        Assert.Null(await provider.GetAsync(AgentKind.Codex));
+    }
+}

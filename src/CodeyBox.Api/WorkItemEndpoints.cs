@@ -20,6 +20,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/dependents", GetDependentsAsync);
         group.MapGet("/{id}/replays", GetReplaysAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
+        group.MapPatch("/{id}/priority", PatchPriorityAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
         group.MapGet("/{id}/questions", GetQuestionsAsync);
         group.MapPost("/{id}/answer", AnswerQuestionAsync);
@@ -38,9 +39,11 @@ internal static class WorkItemEndpoints
         app.MapPost("/queue/resume", ResumeQueueAsync);
     }
 
-    private static IResult GetWorkerStatusAsync(OrchestratorService orchestrator)
+    private static async Task<IResult> GetWorkerStatusAsync(
+        OrchestratorService orchestrator,
+        CancellationToken ct)
     {
-        var status = orchestrator.GetStatus();
+        var status = await orchestrator.GetStatusAsync(ct);
         return Results.Ok(new
         {
             maxConcurrent = status.MaxConcurrent,
@@ -232,6 +235,14 @@ internal static class WorkItemEndpoints
             agentClassId = req.AgentClassId.Trim();
         }
 
+        int priority = 0;
+        if (req.Priority is { } p)
+        {
+            var priorityError = ValidatePriority(p, project);
+            if (priorityError is not null) return priorityError;
+            priority = p;
+        }
+
         // Use creation timestamp as default queue position so new items sort after
         // any explicitly reordered items (which get small integers 1, 2, 3 …).
         var item = new WorkItem
@@ -248,6 +259,7 @@ internal static class WorkItemEndpoints
             PushUpstream = req.PushUpstream ?? true,
             DependsOn = dependsOnIds,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
+            Priority = priority,
             ExternalId = externalId,
             ReleaseId = releaseId,
         };
@@ -870,6 +882,75 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
+    /// Update the dispatch priority of a work item. Allowed for non-terminal
+    /// states; only affects pickup order while the item is still Queued —
+    /// in-flight items run to terminal state regardless of priority changes.
+    /// Terminal items (Done / Failed / Cancelled / AuditFailed /
+    /// MergeConflictResolutionFailed / AbandonedAfterRecoveryAttempts) reject
+    /// with 409 because priority cannot affect them and silently mutating
+    /// closed history is undesirable. The write goes through a partial UPDATE
+    /// touching only the priority and updated_at columns, so a concurrent
+    /// worker picking the item up between the read and the write is not
+    /// stomped (TOCTOU-safe).
+    /// </summary>
+    private static async Task<IResult> PatchPriorityAsync(
+        string id,
+        PatchPriorityRequest body,
+        IWorkItemStore store,
+        IProjectRepository projects,
+        ITaskQueue queue,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var project = await projects.GetAsync(item!.ProjectId, ct);
+        if (project is null)
+            return Results.BadRequest(new { error = $"unknown project '{item.ProjectId}'" });
+
+        var priorityError = ValidatePriority(body.Priority, project);
+        if (priorityError is not null) return priorityError;
+
+        if (WorkItemDependencies.TerminalStates.Contains(item.State))
+            return Results.Conflict(new
+            {
+                error = $"cannot change priority of work item in terminal state '{item.State}'",
+            });
+
+        if (item.Priority == body.Priority)
+            return Results.Ok(new { id = item.Id.ToString(), priority = body.Priority, status = "no-op" });
+
+        var result = await store.UpdatePriorityAsync(item.Id, body.Priority, DateTimeOffset.UtcNow, ct);
+        switch (result.Outcome)
+        {
+            case PriorityUpdateOutcome.NotFound:
+                return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+            case PriorityUpdateOutcome.TerminalState:
+                // The item raced into a terminal state between the read above and
+                // the partial UPDATE; surface 409 like the pre-check would have.
+                return Results.Conflict(new
+                {
+                    error = $"work item transitioned to terminal state '{result.Item!.State}' before priority could be updated",
+                });
+            case PriorityUpdateOutcome.Updated:
+                break;
+            default:
+                throw new InvalidOperationException($"Unexpected priority update outcome '{result.Outcome}'.");
+        }
+
+        var updated = result.Item!;
+        AuditLog.WorkItemPriorityChanged(updated.Id, result.OldPriority!.Value, updated.Priority);
+
+        // Kick the dispatcher so the new ordering is picked up immediately when the
+        // item is still Queued. Harmless for in-flight items: the dispatch loop will
+        // re-pick from the store and find the highest-priority eligible item.
+        if (updated.State == WorkItemState.Queued)
+            await queue.EnqueueAsync(updated.Id, ct);
+
+        return Results.Ok(new { id = updated.Id.ToString(), priority = updated.Priority });
+    }
+
+    /// <summary>
     /// Reorder the Queued items. The request body must list exactly the current
     /// set of Queued item IDs; any mismatch (stale view) is rejected with 400.
     /// </summary>
@@ -1275,7 +1356,8 @@ internal static class WorkItemEndpoints
             NextQuotaRetryAt: item.NextQuotaRetryAt,
             QuotaRetryAttempts: item.QuotaRetryAttempts,
             Usage: usage?.Iteration,
-            UsageTotal: usage?.Total);
+            UsageTotal: usage?.Total,
+            Priority: item.Priority);
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -1291,6 +1373,28 @@ internal static class WorkItemEndpoints
             audit.Languages,
             audit.AuditTypes,
             audit.MaxIterations);
+    }
+
+    private const int GlobalMinPriority = -1000;
+    private const int GlobalMaxPriority = 1000;
+
+    /// <summary>
+    /// Validates a requested priority against the global cap and the project's
+    /// per-project ceiling. Returns null on success or a 400 result on failure.
+    /// </summary>
+    private static IResult? ValidatePriority(int priority, Project project)
+    {
+        if (priority < GlobalMinPriority || priority > GlobalMaxPriority)
+            return Results.BadRequest(new
+            {
+                error = $"priority must be within [{GlobalMinPriority}, {GlobalMaxPriority}]",
+            });
+        if (project.MaxPriority is { } maxPriority && priority > maxPriority)
+            return Results.BadRequest(new
+            {
+                error = $"priority {priority} exceeds project '{project.Id}' max priority {maxPriority}",
+            });
+        return null;
     }
 
     private static bool AuditProfileExists(ProjectAudit audit, string profile)
@@ -1404,7 +1508,8 @@ public sealed record CreateWorkItemRequest(
     string? ExternalId = null,
     string[]? DependsOn = null,
     int? MinModelScore = null,
-    string? ReleaseId = null);
+    string? ReleaseId = null,
+    int? Priority = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -1412,6 +1517,8 @@ public sealed record PatchWorkItemRequest(
     string? Title = null,
     string? Prompt = null,
     string? Agent = null);
+
+public sealed record PatchPriorityRequest(int Priority);
 
 public sealed record ReorderWorkItemsRequest(string[]? Ids = null);
 
@@ -1454,7 +1561,8 @@ public sealed record WorkItemDto(
     WorkItemIterationUsage? Usage = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     WorkItemUsageTotal? UsageTotal = null,
-    IReadOnlyList<AgentFallbackDto>? FallbackHistory = null);
+    IReadOnlyList<AgentFallbackDto>? FallbackHistory = null,
+    int Priority = 0);
 
 public sealed record AgentFallbackDto(
     string Id,
