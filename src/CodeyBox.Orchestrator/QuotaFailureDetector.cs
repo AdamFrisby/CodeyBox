@@ -13,10 +13,14 @@ public static class QuotaFailureDetector
         // Codex / ChatGPT
         ("hit your usage limit", QuotaFailureKind.LimitReached),
         ("hit your limit", QuotaFailureKind.LimitReached),
+        // Codex CLI sometimes prints the raw HTTP status to stderr on quota
+        // exhaustion before exiting non-zero, with no other quota keywords.
+        ("429 Too Many Requests", QuotaFailureKind.RateLimitExceeded),
         // Anthropic / OpenAI rate limits
         ("rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded),
         // Google / Gemini Code Assist
         ("RESOURCE_EXHAUSTED", QuotaFailureKind.RateLimitExceeded),
+        ("QUOTA_EXHAUSTED", QuotaFailureKind.LimitReached),
         ("exceeded the rate limit", QuotaFailureKind.RateLimitExceeded),
         ("quota exceeded", QuotaFailureKind.RateLimitExceeded),
         // Gemini per-model wall: "[API Error: You have exhausted your capacity on this model. ...]"
@@ -38,6 +42,13 @@ public static class QuotaFailureDetector
     {
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return null;
+
+        // Claude CLI stream-json carries an explicit rate_limit_event row whose
+        // structured fields (overageStatus / status / resetsAt) classify the
+        // failure on their own — no substring match needed, and resetsAt is a
+        // unix epoch we can use directly without duration parsing.
+        var structured = ScanStreamJsonRateLimitEvents(stdout);
+        if (structured is not null) return structured;
 
         // Stream-json events embedded in stdout often carry the error message
         // inside an `error.message` (or `result`) field rather than at the top
@@ -86,6 +97,68 @@ public static class QuotaFailureDetector
 
             if (h > 0 || m > 0 || s > 0)
                 return DateTimeOffset.UtcNow.Add(new TimeSpan(h, m, s));
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Walks NDJSON lines in <paramref name="stdout"/> looking for the Claude
+    /// CLI's <c>rate_limit_event</c> row. Returns a <see cref="QuotaDetection"/>
+    /// when the embedded <c>rate_limit_info</c> indicates the iteration cannot
+    /// proceed under the current subscription state, namely any of:
+    /// <list type="bullet">
+    ///   <item><c>status == "exceeded"</c> — base quota window is fully spent</item>
+    ///   <item><c>overageStatus == "rejected"</c> — overage was requested and refused</item>
+    ///   <item><c>overageDisabledReason</c> non-empty — overage is disabled (e.g. org-level)</item>
+    /// </list>
+    /// The <c>resetsAt</c> unix-seconds field, when present, is propagated to
+    /// <see cref="QuotaDetection.ResetAt"/> so the work item's QuotaResetAt
+    /// timer fires at the correct moment. Returns null if no qualifying event
+    /// is present. Never throws.
+    /// </summary>
+    internal static QuotaDetection? ScanStreamJsonRateLimitEvents(string? stdout)
+    {
+        if (string.IsNullOrWhiteSpace(stdout)) return null;
+
+        var first = stdout.AsSpan().TrimStart();
+        if (first.IsEmpty || first[0] != '{') return null;
+
+        foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!line.StartsWith('{')) continue;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object) continue;
+                if (!root.TryGetProperty("type", out var typeProp)) continue;
+                if (!string.Equals(typeProp.GetString(), "rate_limit_event", StringComparison.Ordinal)) continue;
+                if (!root.TryGetProperty("rate_limit_info", out var info) || info.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var status = ReadString(info, "status");
+                var overageStatus = ReadString(info, "overageStatus");
+                var overageDisabledReason = ReadString(info, "overageDisabledReason");
+
+                var blocked = string.Equals(status, "exceeded", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(overageStatus, "rejected", StringComparison.OrdinalIgnoreCase)
+                    || !string.IsNullOrEmpty(overageDisabledReason);
+                if (!blocked) continue;
+
+                DateTimeOffset? resetAt = null;
+                if (info.TryGetProperty("resetsAt", out var resetProp)
+                    && resetProp.ValueKind == JsonValueKind.Number
+                    && resetProp.TryGetInt64(out var epoch)
+                    && epoch > 0)
+                {
+                    resetAt = DateTimeOffset.FromUnixTimeSeconds(epoch);
+                }
+
+                return new QuotaDetection(QuotaFailureKind.LimitReached, resetAt);
+            }
+            catch (JsonException) { }
+            catch (InvalidOperationException) { }
         }
 
         return null;
