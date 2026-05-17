@@ -35,8 +35,24 @@ public static class AgentStreamParserSelection
     private const int MaxSniffLines = 20;
     private const int MaxSniffLineBytes = 64 * 1024 * 1024;
 
-    public static async Task<AgentKind?> SniffKindAsync(Stream jsonlFile, CancellationToken ct = default)
+    /// <summary>
+    /// Reads up to <see cref="MaxSniffLines"/> NDJSON lines and dispatches each
+    /// to the registered <see cref="IAgentStreamParser"/>s, returning the
+    /// <see cref="AgentKind"/> of the first parser that claims a line. The
+    /// orchestrator itself never inspects provider-specific JSON properties —
+    /// each parser owns its own recognition logic in its provider library.
+    /// </summary>
+    public static async Task<AgentKind?> SniffKindAsync(
+        Stream jsonlFile,
+        IEnumerable<IAgentStreamParser> parsers,
+        CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(parsers);
+        var orderedParsers = parsers as IReadOnlyList<IAgentStreamParser>
+            ?? parsers.ToList();
+        if (orderedParsers.Count == 0)
+            return null;
+
         var read = 0;
         try
         {
@@ -51,8 +67,11 @@ public static class AgentStreamParserSelection
                 try
                 {
                     using var doc = JsonDocument.Parse(line, new JsonDocumentOptions { MaxDepth = 64 });
-                    if (SniffKind(doc.RootElement) is { } kind)
-                        return kind;
+                    foreach (var parser in orderedParsers)
+                    {
+                        if (parser.TryClaim(doc.RootElement))
+                            return parser.Kind;
+                    }
                 }
                 catch (JsonException)
                 {
@@ -126,54 +145,6 @@ public static class AgentStreamParserSelection
     }
 
     public static AgentStreamSummary UnsupportedSummary() => AgentStreamSummary.Unsupported();
-
-    private static AgentKind? SniffKind(JsonElement root)
-    {
-        var type = FirstString(root, "type", "event", "name");
-        if (type is not null
-            && (type.StartsWith("thread.", StringComparison.OrdinalIgnoreCase)
-                || type.StartsWith("turn.", StringComparison.OrdinalIgnoreCase)
-                || type.StartsWith("item.", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(type, "response_item", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(type, "raw_response_item", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(type, "event_msg", StringComparison.OrdinalIgnoreCase)))
-            return AgentKind.Codex;
-
-        if (TryGet(root, out _, "item"))
-            return AgentKind.Codex;
-
-        if (TryGet(root, out var payload, "payload")
-            && IsCodexPayload(payload))
-            return AgentKind.Codex;
-
-        if (TryGet(root, out _, "usageMetadata", "usage_metadata", "candidates", "functionCall", "function_call"))
-            return AgentKind.Gemini;
-
-        if (type is "assistant" or "user" or "result" or "tool_use" or "tool_result")
-            return AgentKind.Claude;
-
-        return null;
-    }
-
-    private static bool IsCodexPayload(JsonElement payload)
-    {
-        var type = FirstString(payload, "type", "event", "name", "kind");
-        if (type is null)
-            return false;
-
-        return string.Equals(type, "function_call", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "function_call_output", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "message", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "agent_message", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "token_count", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "turn_complete", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "task_complete", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "exec_command_begin", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "exec_command_end", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(type, "command_execution", StringComparison.OrdinalIgnoreCase)
-            || type.StartsWith("response.", StringComparison.OrdinalIgnoreCase)
-            || type.StartsWith("conversation.", StringComparison.OrdinalIgnoreCase);
-    }
 
     private static AgentKind? Canonicalize(AgentKind kind) => Canonicalize(kind.Value);
 

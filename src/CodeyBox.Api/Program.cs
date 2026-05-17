@@ -1011,6 +1011,16 @@ builder.Services.AddSingleton<IAgentStreamParser, CodexStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
+// Per-provider buffered-stdout tool-call counters. Used by the orchestrator
+// to emit agent.tool_call.<name> telemetry when the agent runs without
+// structured-stream capture; the dictionary lookup keeps the orchestrator
+// from referencing any provider's stream-json shape directly.
+builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>(sp =>
+    new Dictionary<AgentKind, IAgentToolCallCounter>
+    {
+        [AgentKind.Claude] = new ClaudeToolCallCounter(),
+    });
+
 // Per-provider quota-failure detectors. Each agent library owns its own
 // patterns + stream-json shape; the orchestrator dispatches by AgentKind.
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, ClaudeQuotaFailureDetector>();
@@ -1069,7 +1079,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<IAgentStreamStore>(),
     sp.GetService<IQuotaFailureStore>(),
     sp.GetRequiredService<QuotaRetryScheduler>(),
-    sp.GetRequiredService<IQuotaFailureClassifier>()));
+    sp.GetRequiredService<IQuotaFailureClassifier>(),
+    sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

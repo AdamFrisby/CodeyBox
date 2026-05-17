@@ -163,6 +163,14 @@ public sealed class ClaudeStreamParserTests
 
 public sealed class CodexStreamParserTests
 {
+    private static IReadOnlyList<IAgentStreamParser> TestParsers() =>
+    [
+        new ClaudeStreamParser(),
+        new CodexStreamParser(),
+        new GeminiStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
     [Fact]
     public async Task SniffKindAsync_RecognizesInstalledPayloadResponseItemShape()
     {
@@ -170,7 +178,7 @@ public sealed class CodexStreamParserTests
             {"type":"response_item","payload":{"type":"function_call","call_id":"call_1","name":"unified_exec","arguments":"{\"cmd\":\"dotnet test\"}"}}
             """);
 
-        var kind = await AgentStreamParserSelection.SniffKindAsync(stream);
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, TestParsers());
 
         Assert.Equal(AgentKind.Codex, kind);
     }

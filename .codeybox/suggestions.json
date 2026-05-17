@@ -1,0 +1,64 @@
+{
+  "suggestions": [
+    {
+      "title": "ProcFsAgentActivitySource hardcodes agent binary names",
+      "rationale": "ProcFsAgentActivitySource.cs lists known agent process names in a private 'claude', 'codex', 'gemini', 'copilot' array. Adding a fourth runtime provider (e.g. Mistral) requires editing this Orchestrator file — the same loose-coupling smell the IAgentQuotaFailureDetector refactor just removed. The right shape is an IAgentProcessFingerprint interface implemented per-provider library (returning its CLI's basename + ancestor heuristic) and dispatched by a composite the orchestrator consumes. Out of scope for the current task; surfaced for triage.",
+      "category": "refactor",
+      "severity": "notable",
+      "estimatedEffort": "medium",
+      "filesReferenced": ["src/CodeyBox.Orchestrator/ProcFsAgentActivitySource.cs"]
+    },
+    {
+      "title": "Project.cs hardcodes Anthropic-specific defaults",
+      "rationale": "ProjectPrDescription defaults GeneratorAgent to 'claude' and AgentAllowedHosts to ['api.anthropic.com']. These two defaults are coupled — if an operator changes GeneratorAgent without overriding AgentAllowedHosts, the sandbox cannot reach the chosen agent's API. A per-provider host-list resolver (e.g. IAgentDefaultAllowedHosts on the agent library) would keep the defaults consistent. Out of scope for the current task; surfaced for triage.",
+      "category": "refactor",
+      "severity": "minor",
+      "estimatedEffort": "small",
+      "filesReferenced": ["src/CodeyBox.Core/Project.cs"]
+    },
+    {
+      "title": "WorkItemCost.AgentKind doc enumerates supported providers",
+      "rationale": "The XML doc-comment on WorkItemCost.AgentKind says 'claude | codex | gemini | copilot' verbatim. The field is a free-form string, so adding a provider does not break the contract, but the doc-comment will quietly rot. Either drop the enumeration from the comment or link to AgentKind so the source of truth lives in one place.",
+      "category": "docs",
+      "severity": "minor",
+      "estimatedEffort": "tiny",
+      "filesReferenced": ["src/CodeyBox.Core/WorkItemCost.cs"]
+    },
+    {
+      "title": "Provider-specific OAuth credential providers live in Orchestrator",
+      "rationale": "ClaudeOAuthFileCredentialProvider.cs, CodexOAuthFileCredentialProvider.cs, and GeminiOAuthFileCredentialProvider.cs all live under src/CodeyBox.Orchestrator. They hardcode CLI-specific paths (e.g. CodexHomeSandboxPath = '/home/ubuntu/.codex') and JSON shapes (e.g. 'claudeAiOauth.accessToken'). Same architectural smell as the cost/stream extractors that were just moved — each belongs in its provider's Agents.* library, with the chaining + DI glue staying in Orchestrator. Larger surgery than the cost extractors because credential providers are referenced via ICredentialProvider (chained) and consumed by the smoke gate; needs careful staging.",
+      "category": "refactor",
+      "severity": "notable",
+      "estimatedEffort": "large",
+      "filesReferenced": [
+        "src/CodeyBox.Orchestrator/ClaudeOAuthFileCredentialProvider.cs",
+        "src/CodeyBox.Orchestrator/CodexOAuthFileCredentialProvider.cs",
+        "src/CodeyBox.Orchestrator/GeminiOAuthFileCredentialProvider.cs"
+      ]
+    },
+    {
+      "title": "AgentCostCalculator hardcodes default per-provider pricing rates",
+      "rationale": "AgentCostCalculator.cs has a built-in DefaultRates dictionary keyed by 'claude', 'codex', 'gemini'. When a new provider is added, the operator must either supply rates in config or live with $0 estimates silently. Either move provider defaults into each Agents.* library (e.g. IAgentDefaultPricing) so a new provider self-registers a sensible default, or drop the built-in defaults and require explicit configuration.",
+      "category": "refactor",
+      "severity": "minor",
+      "estimatedEffort": "small",
+      "filesReferenced": ["src/CodeyBox.Orchestrator/AgentCostCalculator.cs"]
+    },
+    {
+      "title": "AgentStreamParserSelection.Canonicalize still references provider enum literals",
+      "rationale": "After the SniffKind composite-dispatch refactor (cb-restore-loose-coupling rework iteration 1), the only remaining cross-provider enumeration in src/CodeyBox.Orchestrator/AgentStreamAnalysis.cs is the private Canonicalize helper at lines 156-161, which case-folds an incoming AgentKind value against the three known enum literals (AgentKind.Claude / Codex / Gemini). This is technically allowed by the acceptance criterion (enum-literal references on a Core type), but adding a 4th provider still requires editing this helper. A cleaner shape would be to pass the registered IAgentStreamParser set into ResolveKind and canonicalize against parser.Kind values. Surfaced for triage.",
+      "category": "refactor",
+      "severity": "minor",
+      "estimatedEffort": "small",
+      "filesReferenced": ["src/CodeyBox.Orchestrator/AgentStreamAnalysis.cs"]
+    },
+    {
+      "title": "Adopt a Roslyn analyzer to fail builds on new provider literals in Orchestrator/Core",
+      "rationale": "Listed as a nice-to-have in the architecture-violation task. Now that the per-provider IAgentQuotaFailureDetector + composite pattern is in place, an analyzer that rejects 'claude'/'codex'/'gemini' string literals in src/CodeyBox.Orchestrator and src/CodeyBox.Core (excluding AgentKind static initialisers, DI registration glue, and the enums-as-string consts) would keep the boundary honest. Without it the boundary will erode again over time.",
+      "category": "other",
+      "severity": "notable",
+      "estimatedEffort": "medium",
+      "filesReferenced": ["src/CodeyBox.Orchestrator", "src/CodeyBox.Core"]
+    }
+  ]
+}

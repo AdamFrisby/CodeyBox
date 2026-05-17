@@ -9,6 +9,15 @@ public interface IAgentStreamParser
 {
     AgentKind Kind { get; }
     Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns true when the parser recognises <paramref name="line"/> as one of
+    /// its own provider-specific NDJSON event shapes. Used by the orchestrator's
+    /// stream-kind sniffer to pick a parser without itself knowing the per-provider
+    /// JSON vocabulary. Default returns false so unknown / catch-all parsers do not
+    /// claim arbitrary lines.
+    /// </summary>
+    bool TryClaim(System.Text.Json.JsonElement line) => false;
 }
 
 public interface IAgentStreamParserWithContext : IAgentStreamParser
@@ -148,6 +157,14 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
     }
 
     public AgentKind Kind { get; }
+
+    /// <summary>
+    /// Provider-specific NDJSON-event-shape recognition. Concrete provider
+    /// parsers override this so the orchestrator's sniffer can dispatch by
+    /// asking "does any registered parser claim this line?" without needing
+    /// to know each provider's JSON vocabulary.
+    /// </summary>
+    public virtual bool TryClaim(JsonElement line) => false;
 
     public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
         ParseAsync(jsonlFile, context: null, ct);

@@ -11,6 +11,70 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
     {
     }
 
+    /// <summary>
+    /// Codex CLI emits <c>thread.*</c>/<c>turn.*</c>/<c>item.*</c> event types and
+    /// <c>response_item</c>/<c>raw_response_item</c>/<c>event_msg</c> wrappers, plus
+    /// nested <c>item</c>/<c>payload</c> objects carrying Codex-specific payload
+    /// shapes. Owning this recognition here keeps the orchestrator's sniffer free
+    /// of Codex-specific vocabulary.
+    /// </summary>
+    public override bool TryClaim(JsonElement line)
+    {
+        if (line.ValueKind != JsonValueKind.Object) return false;
+
+        if (line.TryGetProperty("type", out var typeProp)
+            && typeProp.ValueKind == JsonValueKind.String)
+        {
+            var type = typeProp.GetString();
+            if (type is not null
+                && (type.StartsWith("thread.", StringComparison.OrdinalIgnoreCase)
+                    || type.StartsWith("turn.", StringComparison.OrdinalIgnoreCase)
+                    || type.StartsWith("item.", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(type, "response_item", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(type, "raw_response_item", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(type, "event_msg", StringComparison.OrdinalIgnoreCase)))
+                return true;
+        }
+
+        if (line.TryGetProperty("item", out _)) return true;
+
+        if (line.TryGetProperty("payload", out var payload) && IsCodexPayload(payload))
+            return true;
+
+        return false;
+    }
+
+    private static bool IsCodexPayload(JsonElement payload)
+    {
+        if (payload.ValueKind != JsonValueKind.Object) return false;
+
+        string? type = null;
+        foreach (var name in new[] { "type", "event", "name", "kind" })
+        {
+            if (payload.TryGetProperty(name, out var value)
+                && value.ValueKind == JsonValueKind.String)
+            {
+                type = value.GetString();
+                if (type is not null) break;
+            }
+        }
+
+        if (type is null) return false;
+
+        return string.Equals(type, "function_call", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "function_call_output", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "message", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "agent_message", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "token_count", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "turn_complete", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "task_complete", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "exec_command_begin", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "exec_command_end", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "command_execution", StringComparison.OrdinalIgnoreCase)
+            || type.StartsWith("response.", StringComparison.OrdinalIgnoreCase)
+            || type.StartsWith("conversation.", StringComparison.OrdinalIgnoreCase);
+    }
+
     protected override ParsedEvent ParseEvent(JsonElement root)
     {
         var type = FirstString(root, "type", "event", "name") ?? "unknown";

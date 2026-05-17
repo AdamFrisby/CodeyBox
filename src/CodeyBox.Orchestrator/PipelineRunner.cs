@@ -54,6 +54,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly ITimingStore? _timings;
     private readonly IWorkItemCostStore? _costStore;
     private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? _costExtractors;
+    private readonly IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? _toolCallCounters;
     private readonly AgentCostCalculator? _costCalculator;
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     private readonly IAgentStreamStore? _agentStreams;
@@ -115,7 +116,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentStreamStore? agentStreams = null,
         IQuotaFailureStore? quotaFailures = null,
         QuotaRetryScheduler? retryScheduler = null,
-        IQuotaFailureClassifier? quotaClassifier = null)
+        IQuotaFailureClassifier? quotaClassifier = null,
+        IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -135,7 +137,22 @@ public sealed class PipelineRunner : IPipelineRunner
         _stdoutBroadcaster = stdoutBroadcaster;
         _agentStreams = agentStreams;
         _quotaFailures = quotaFailures;
-        _quotaClassifier = quotaClassifier ?? new CompositeQuotaFailureClassifier(Array.Empty<IAgentQuotaFailureDetector>());
+        if (quotaClassifier is null)
+        {
+            // No classifier wired — fall back to an empty composite so the pipeline
+            // still runs (some test bootstraps don't care about quota detection),
+            // but log a warning so a misconfigured production DI graph is visible
+            // instead of silently losing every quota-failure observation.
+            log.LogWarning(
+                "PipelineRunner constructed without an IQuotaFailureClassifier; " +
+                "quota-failure detection is disabled. Wire CompositeQuotaFailureClassifier in DI.");
+            _quotaClassifier = new CompositeQuotaFailureClassifier(Array.Empty<IAgentQuotaFailureDetector>());
+        }
+        else
+        {
+            _quotaClassifier = quotaClassifier;
+        }
+        _toolCallCounters = toolCallCounters;
         _retryScheduler = retryScheduler;
         _log = log;
         _smokeGate = smokeGate;
@@ -1181,7 +1198,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var observedModelId = ResolveObservedModelId(runner, item.ModelId);
         var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
         if (streamCapture is null)
-            await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
+            await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt);
         agentSw.Stop();
@@ -1953,7 +1970,7 @@ public sealed class PipelineRunner : IPipelineRunner
             ctx.WorkItemId, ctx.Iteration, run.StartedAt);
         if (!run.CapturedStructuredStream)
         {
-            await EmitToolCallCountsAsync(run.Result.RawOutput, ctx.WorkItemId, "audit",
+            await EmitToolCallCountsAsync(run.Runner.Kind, run.Result.RawOutput, ctx.WorkItemId, "audit",
                 run.ScopeElapsedMs, ct, iteration: ctx.Iteration);
         }
         var worstSeverity = run.Result.Findings.Count > 0
@@ -2301,7 +2318,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var observedModelId = ResolveObservedModelId(runner, item.ModelId);
         var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecElapsedMs);
         if (!mergeStructuredStreamCaptured)
-            await EmitToolCallCountsAsync(agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
+            await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt);
         mergeSw.Stop();
@@ -3572,13 +3589,16 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private async Task EmitToolCallCountsAsync(
+        AgentKind agentKind,
         string? stdout, WorkItemId itemId, string phase, long agentExecDurationMs, CancellationToken ct,
         int? iteration = null)
     {
         if (_timings is null) return;
+        if (_toolCallCounters is null) return;
+        if (!_toolCallCounters.TryGetValue(agentKind, out var counter)) return;
 
-        var parsed = AgentStreamJsonParser.TryParse(stdout);
-        if (parsed is null) return; // Not stream-json output; skip silently.
+        var parsed = counter.TryCount(stdout);
+        if (parsed is null) return; // Not recognisable stream-json output; skip silently.
 
         // Compute the approximate window the agent exec occupied.
         // now ≈ agent exec end; startedAt ≈ agent exec start.

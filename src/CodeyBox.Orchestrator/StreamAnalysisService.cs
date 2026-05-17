@@ -109,7 +109,7 @@ public sealed class StreamAnalysisService : BackgroundService
         await using var stream = await _streams.OpenReadAsync(id, fileName, ct).ConfigureAwait(false);
         return stream is null
             ? null
-            : await AgentStreamParserSelection.SniffKindAsync(stream, ct).ConfigureAwait(false);
+            : await AgentStreamParserSelection.SniffKindAsync(stream, _parsers.Values, ct).ConfigureAwait(false);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
