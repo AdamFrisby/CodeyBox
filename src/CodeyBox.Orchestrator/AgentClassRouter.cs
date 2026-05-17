@@ -231,6 +231,58 @@ public sealed class AgentClassRouter
         return _nullProbe.GetAvailabilityAsync(member, ct);
     }
 
+    /// <summary>
+    /// Returns the earliest known reset time across all currently-exhausted
+    /// subscription members of the class that <paramref name="item"/> would route
+    /// to. Used by the quota retry scheduler to set <c>NextQuotaRetryAt</c> to the
+    /// soonest moment any class member can plausibly become eligible — rather
+    /// than the last-tried agent's reset, which is often the latest reset and
+    /// can leave items idle for many hours after an earlier-refilling member
+    /// (e.g. claude's 5h cap) clears.
+    /// </summary>
+    /// <returns>
+    /// The minimum <see cref="EffectiveQuota.ResetAt"/> across exhausted members
+    /// with a known reset, or <c>null</c> when no useful reset is known (no
+    /// class configured, no probes returned a reset, or all members are
+    /// available).
+    /// </returns>
+    public async Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
+        WorkItem item, Project? project, CancellationToken ct)
+    {
+        var classId = item.AgentClassId ?? project?.DefaultAgentClass;
+        if (classId is null) return null;
+        if (!_catalog.TryGetValue(classId, out var agentClass)) return null;
+
+        DateTimeOffset? earliest = null;
+        foreach (var member in agentClass.Members)
+        {
+            // PayPerApi members never park on quota.
+            if (member.Billing == AgentBilling.PayPerApi) continue;
+
+            AgentQuotaSnapshot snapshot;
+            try
+            {
+                snapshot = await ProbeAsync(member, ct);
+            }
+            catch
+            {
+                continue;
+            }
+
+            var quota = ResolveMemberQuota(snapshot, member);
+            // Skip unknown (probe failed / no data) and members above the
+            // threshold (would have been chosen by the router and so don't
+            // need to gate park-time).
+            if (quota.AvailablePct < 0) continue;
+            if (quota.AvailablePct >= _opts.MinQuotaPct) continue;
+            if (quota.ResetAt is not { } resetAt) continue;
+
+            if (earliest is null || resetAt < earliest.Value)
+                earliest = resetAt;
+        }
+        return earliest;
+    }
+
     private async Task<QuotaGateDecision> EvaluateGateAsync(AgentMembership member, ProjectId projectId, double availablePct, CancellationToken ct)
     {
         if (availablePct >= _opts.MinQuotaPct)

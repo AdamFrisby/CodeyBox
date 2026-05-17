@@ -211,6 +211,106 @@ public sealed class AgentClassRouterTests
         Assert.Null(decision.Chosen);
         Assert.False(decision.ShouldWait);
     }
+
+    // ── ComputeEarliestExhaustedResetAsync ───────────────────────────────────
+
+    [Fact]
+    public async Task ComputeEarliestExhaustedReset_TakesMinAcrossExhaustedMembers()
+    {
+        // Three exhausted members with very different reset times: claude (~5h),
+        // gemini (~24h), codex (~1h). MIN must be the codex reset, NOT the
+        // last-tried agent's reset.
+        var now = DateTimeOffset.UtcNow;
+        var claudeReset = now.AddHours(5);
+        var geminiReset = now.AddHours(24);
+        var codexReset = now.AddHours(1);
+
+        var cls = FrontierClass(Sub(Claude), Sub(Codex), Sub(AgentKind.Gemini));
+        var router = BuildRouter([cls],
+        [
+            new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = claudeReset }),
+            new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = codexReset }),
+            new FakeProbe(AgentKind.Gemini, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = geminiReset }),
+        ]);
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(codexReset, earliest);
+    }
+
+    [Fact]
+    public async Task ComputeEarliestExhaustedReset_IgnoresAvailableMembers()
+    {
+        // One available (50%), one exhausted with known reset. Only the
+        // exhausted one constrains the park time.
+        var now = DateTimeOffset.UtcNow;
+        var geminiReset = now.AddHours(10);
+
+        var cls = FrontierClass(Sub(Claude), Sub(AgentKind.Gemini));
+        var router = BuildRouter([cls],
+        [
+            new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 50, ResetAt = now.AddHours(2) }),
+            new FakeProbe(AgentKind.Gemini, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = geminiReset }),
+        ]);
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(geminiReset, earliest);
+    }
+
+    [Fact]
+    public async Task ComputeEarliestExhaustedReset_SkipsUnknownAndNoResetAt()
+    {
+        // Mixed bag: unknown probe (-1), exhausted but no ResetAt, exhausted with reset.
+        // Only the last contributes.
+        var now = DateTimeOffset.UtcNow;
+        var claudeReset = now.AddHours(3);
+
+        var cls = FrontierClass(Sub(Claude), Sub(Codex), Sub(AgentKind.Gemini));
+        var router = BuildRouter([cls],
+        [
+            new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = claudeReset }),
+            new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = -1 }), // unknown
+            new FakeProbe(AgentKind.Gemini, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = null }), // exhausted but no reset
+        ]);
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(claudeReset, earliest);
+    }
+
+    [Fact]
+    public async Task ComputeEarliestExhaustedReset_IgnoresPayPerApiMembers()
+    {
+        // PayPerApi never parks on quota — exclude it even if a custom probe
+        // reports it exhausted.
+        var now = DateTimeOffset.UtcNow;
+        var claudeReset = now.AddHours(2);
+
+        var cls = FrontierClass(Sub(Claude), Api(Codex));
+        var router = BuildRouter([cls],
+        [
+            new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = claudeReset }),
+        ]);
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(claudeReset, earliest);
+    }
+
+    [Fact]
+    public async Task ComputeEarliestExhaustedReset_NoClassConfigured_ReturnsNull()
+    {
+        var router = BuildRouter([], []);
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem(classId: null), MakeProject(defaultClass: null), CancellationToken.None);
+
+        Assert.Null(earliest);
+    }
 }
 
 /// <summary>Fake probe that always returns a fixed AvailablePct.</summary>
