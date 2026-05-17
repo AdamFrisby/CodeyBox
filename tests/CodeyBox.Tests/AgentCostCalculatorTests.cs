@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 

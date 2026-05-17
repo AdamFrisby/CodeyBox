@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -10,6 +11,12 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
 {
     private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-quota-breaker-{Guid.NewGuid():N}.db");
     private readonly SqliteQuotaFailureStore _failures;
+    private readonly IQuotaFailureClassifier _classifier = new CompositeQuotaFailureClassifier(
+    [
+        new ClaudeQuotaFailureDetector(),
+        new CodexQuotaFailureDetector(),
+        new GeminiQuotaFailureDetector(),
+    ]);
 
     public ObservedFailureCircuitBreakerTests() => _failures = new SqliteQuotaFailureStore(_dbPath);
 
@@ -33,7 +40,7 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     public async Task ProjectTaggedQuotaFailure_BlocksDifferentProject()
     {
         var now = DateTimeOffset.UtcNow;
-        await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+        await _classifier.RecordIfQuotaFailureAsync(
             _failures,
             AgentKind.Claude,
             "claude-opus-4-7",
@@ -144,21 +151,29 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     }
 
     [Theory]
-    [InlineData("You have hit your usage limit", QuotaFailureKind.LimitReached)]
-    [InlineData("error: rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded)]
-    [InlineData("API Error: 401 unauthorized", QuotaFailureKind.Unauthorized)]
-    public void Detector_MatchesDocumentedQuotaPatternsOnly(string stderr, QuotaFailureKind expected)
+    [InlineData(nameof(AgentKind.Codex), "You have hit your usage limit", QuotaFailureKind.LimitReached)]
+    [InlineData(nameof(AgentKind.Claude), "error: rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded)]
+    [InlineData(nameof(AgentKind.Claude), "API Error: 401 unauthorized", QuotaFailureKind.Unauthorized)]
+    public void Detector_MatchesDocumentedQuotaPatternsOnly(string agentName, string stderr, QuotaFailureKind expected)
     {
-        var detection = QuotaFailureDetector.Detect(stderr);
+        var agent = agentName switch
+        {
+            nameof(AgentKind.Claude) => AgentKind.Claude,
+            nameof(AgentKind.Codex) => AgentKind.Codex,
+            nameof(AgentKind.Gemini) => AgentKind.Gemini,
+            _ => throw new ArgumentOutOfRangeException(nameof(agentName)),
+        };
+
+        var detection = _classifier.Detect(agent, stderr, stdout: null);
         Assert.Equal(expected, detection?.Kind);
-        Assert.Null(QuotaFailureDetector.Detect("ordinary model error"));
+        Assert.Null(_classifier.Detect(agent, "ordinary model error", stdout: null));
     }
 
     [Fact]
     public async Task RecordIfQuotaFailure_RequiresAgentExitedOne()
     {
         var now = DateTimeOffset.UtcNow;
-        await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+        await _classifier.RecordIfQuotaFailureAsync(
             _failures,
             AgentKind.Claude,
             "claude-opus-4-7",
@@ -174,7 +189,7 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
             TimeSpan.FromMinutes(10),
             now));
 
-        await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+        await _classifier.RecordIfQuotaFailureAsync(
             _failures,
             AgentKind.Claude,
             "claude-opus-4-7",

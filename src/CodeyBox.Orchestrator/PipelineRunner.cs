@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -63,6 +64,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly QuotaRouterOptions _auditQuotaOptions;
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
+    private readonly IQuotaFailureClassifier _quotaClassifier;
     private readonly string _disabledHostHooksPath;
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
@@ -112,7 +114,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IStdoutBroadcaster? stdoutBroadcaster = null,
         IAgentStreamStore? agentStreams = null,
         IQuotaFailureStore? quotaFailures = null,
-        QuotaRetryScheduler? retryScheduler = null)
+        QuotaRetryScheduler? retryScheduler = null,
+        IQuotaFailureClassifier? quotaClassifier = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -132,6 +135,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _stdoutBroadcaster = stdoutBroadcaster;
         _agentStreams = agentStreams;
         _quotaFailures = quotaFailures;
+        _quotaClassifier = quotaClassifier ?? new CompositeQuotaFailureClassifier(Array.Empty<IAgentQuotaFailureDetector>());
         _retryScheduler = retryScheduler;
         _log = log;
         _smokeGate = smokeGate;
@@ -1190,10 +1194,10 @@ public sealed class PipelineRunner : IPipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
-            var detection = QuotaFailureDetector.Detect(agentResult.Stderr, agentResult.Stdout);
+            var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
             if (detection is not null)
             {
-                await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+                await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     runner.Kind,
                     observedModelId,
@@ -1208,7 +1212,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 throw new TerminalQuotaError(detection.Kind, $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
             }
 
-            await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+            await _quotaClassifier.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 runner.Kind,
                 observedModelId,
@@ -1926,7 +1930,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         if (needsCreds && (run.Result.AgentStderr is not null || run.Result.AgentStdout is not null))
         {
-            await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+            await _quotaClassifier.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 run.Runner.Kind,
                 ResolveObservedModelId(run.Runner, modelId: null),
@@ -2306,10 +2310,10 @@ public sealed class PipelineRunner : IPipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
-            var detection = QuotaFailureDetector.Detect(agentResult.Stderr, agentResult.Stdout);
+            var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
             if (detection is not null)
             {
-                await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+                await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     runner.Kind,
                     observedModelId,
@@ -2323,7 +2327,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 throw new TerminalQuotaError(detection.Kind, $"Merge agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
             }
 
-            await QuotaFailureDetector.RecordIfQuotaFailureAsync(
+            await _quotaClassifier.RecordIfQuotaFailureAsync(
                 _quotaFailures,
                 runner.Kind,
                 observedModelId,

@@ -1011,6 +1011,14 @@ builder.Services.AddSingleton<IAgentStreamParser, CodexStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
+// Per-provider quota-failure detectors. Each agent library owns its own
+// patterns + stream-json shape; the orchestrator dispatches by AgentKind.
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, ClaudeQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, CodexQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, GeminiQuotaFailureDetector>();
+builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
+    new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
+
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1060,7 +1068,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IStdoutBroadcaster>(),
     sp.GetService<IAgentStreamStore>(),
     sp.GetService<IQuotaFailureStore>(),
-    sp.GetRequiredService<QuotaRetryScheduler>()));
+    sp.GetRequiredService<QuotaRetryScheduler>(),
+    sp.GetRequiredService<IQuotaFailureClassifier>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

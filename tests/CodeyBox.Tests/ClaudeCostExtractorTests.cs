@@ -1,5 +1,6 @@
+using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
-using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
