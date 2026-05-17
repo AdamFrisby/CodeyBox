@@ -1659,7 +1659,7 @@ namespace CodeyBox.Api
     public sealed class AutoRetryOnQuotaFailureConfig
     {
         public bool Enabled { get; set; } = false;
-        public string PeriodicCheckInterval { get; set; } = "01:00:00";
+        public string PeriodicCheckInterval { get; set; } = "00:05:00";
         public string ClockDriftSafetyMargin { get; set; } = "00:02:00";
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
     }

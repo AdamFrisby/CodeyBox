@@ -321,6 +321,126 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task NotifyQuotaFailure_UsesMinResetAcrossExhaustedClassMembers()
+    {
+        // Build a router with three exhausted subscription members. The failing
+        // agent (Gemini) has a 21h reset, but Claude refills in 5h. Park time
+        // must be Claude's 5h reset + drift, NOT Gemini's 21h reset.
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projects = new InMemoryProjectRepository(new Project { Id = new ProjectId("test-project"), DisplayName = "Test", RepositoryUrl = "http://fake", DefaultAgent = AgentKind.Claude });
+        var opts = new OrchestratorOptions
+        {
+            AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+            {
+                Enabled = true,
+                PeriodicCheckInterval = TimeSpan.FromMinutes(5),
+                ClockDriftSafetyMargin = TimeSpan.FromMinutes(2),
+                MaxAutoRetriesPerWorkItem = 3,
+            }
+        };
+        var now = _time.Now;
+        var claudeReset = now.AddHours(5);
+        var codexReset = now.AddHours(1);
+        var geminiReset = now.AddHours(21);
+
+        var classOptions = new List<AgentClass>
+        {
+            new AgentClass
+            {
+                Id = "codex-xhigh",
+                DisplayName = "codex-xhigh",
+                Members =
+                [
+                    new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    new AgentMembership { Agent = AgentKind.Gemini, Billing = AgentBilling.Subscription, QualityScore = 95, ReasoningMode = "high" },
+                ]
+            }
+        };
+        var probes = new List<IAgentQuotaProbe>
+        {
+            new StaticProbe(AgentKind.Codex, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = codexReset }),
+            new StaticProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = claudeReset }),
+            new StaticProbe(AgentKind.Gemini, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = geminiReset }),
+        };
+        var router = new AgentClassRouter(classOptions, probes, new QuotaRouterOptions(), NullLogger<AgentClassRouter>.Instance, _time);
+        var scheduler = new QuotaRetryScheduler(store, retrier, opts, NullLogger<QuotaRetryScheduler>.Instance, router, projects, null, null, _time);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.Failed,
+            FailureKind = "quota",
+            AgentClassId = "codex-xhigh",
+            Agent = AgentKind.Gemini,
+            QuotaResetAt = geminiReset, // last-tried agent
+        };
+        await store.CreateAsync(item);
+
+        await scheduler.NotifyQuotaFailureAsync(item);
+
+        var updated = await store.GetAsync(item.Id);
+        Assert.NotNull(updated!.NextQuotaRetryAt);
+        // Earliest exhausted reset is codex's 1h, + 2 min drift margin.
+        var expected = codexReset + TimeSpan.FromMinutes(2);
+        Assert.Equal(expected, updated.NextQuotaRetryAt);
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_RetriesEvenWhenNextQuotaRetryAtIsInFuture()
+    {
+        // Item parked with NextQuotaRetryAt 20h out (gemini's daily). Periodic
+        // sweep must still call the router; if the router says ok, retry.
+        var agent = new QuotaFailingAgent();
+        var (_, store, scheduler, webhooks) = BuildPipeline(agent);
+        using var _ = store;
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.Failed,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "test-class",
+            NextQuotaRetryAt = _time.Now.AddHours(20), // far-future
+        };
+        await store.CreateAsync(item);
+
+        var sweepMethod = typeof(QuotaRetryScheduler).GetMethod("RunPeriodicSweepAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        await (Task)sweepMethod!.Invoke(scheduler, [CancellationToken.None])!;
+
+        var retried = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Contains(webhooks.Events, e => e.Event == "work_item.auto_retry");
+    }
+
+    private sealed class StaticProbe : IAgentQuotaProbe
+    {
+        private readonly AgentQuotaSnapshot _snapshot;
+        public StaticProbe(AgentKind kind, AgentQuotaSnapshot snapshot)
+        {
+            Kind = kind;
+            _snapshot = snapshot;
+        }
+        public AgentKind Kind { get; }
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
+            Task.FromResult(_snapshot);
+    }
+
+    [Fact]
     public async Task Scheduler_Rearm_LoadsTimersFromDb()
     {
         var agent = new QuotaFailingAgent();

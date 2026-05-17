@@ -103,6 +103,13 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         _log.LogInformation("Re-armed {Count} quota retry timers", count);
     }
 
+    // The periodic sweep is the safety net: it walks every Failed/quota item
+    // and asks the router whether it could run now, ignoring NextQuotaRetryAt
+    // entirely. NextQuotaRetryAt is an *optimisation* (drives the targeted
+    // timer), not a "don't even try" gate — probe caches can be stale, the
+    // park-time estimate can be wrong, and class members can refill earlier
+    // than predicted. Keeping the sweep router-driven means we recover even
+    // when those estimates miss.
     private async Task RunPeriodicSweepAsync(CancellationToken ct)
     {
         _log.LogDebug("Starting periodic quota retry sweep");
@@ -255,11 +262,38 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         var isWaitingReset = item.State == WorkItemState.WaitingForQuotaReset;
         if (!isQuotaFailed && !isWaitingReset) return;
 
-        // Compute next retry: prefer a parsed reset-window plus the operator's
-        // safety margin; fall back to the existing NextQuotaRetryAt if already
-        // set by the pipeline; otherwise wake on the next periodic sweep.
-        DateTimeOffset? nextRetryAt = item.QuotaResetAt is { } reset
-            ? reset.Add(_opts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin)
+        // Park time should be the soonest any class member can plausibly become
+        // eligible — MIN(resetAt) across exhausted members — not the last-tried
+        // agent's reset (which is often the latest, e.g. gemini's per-model
+        // daily window of 21–24h vs claude's 5h rolling cap).
+        DateTimeOffset? resetAt = null;
+        if (_router is not null && _projects is not null)
+        {
+            try
+            {
+                var project = await _projects.GetAsync(item.ProjectId, CancellationToken.None);
+                resetAt = await _router.ComputeEarliestExhaustedResetAsync(item, project, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Failed to compute earliest class-member reset for {Id}; falling back to failing-agent reset", item.Id);
+            }
+        }
+
+        // Always consider the failing agent's own reset: probe caches may be
+        // stale, and the failure provides fresh information the probe doesn't
+        // have yet. Take the earliest across both sources.
+        if (item.QuotaResetAt is { } failingReset
+            && (resetAt is null || failingReset < resetAt.Value))
+        {
+            resetAt = failingReset;
+        }
+
+        // Fall back to a pipeline-supplied NextQuotaRetryAt if neither
+        // earliest-member-reset nor failing-agent reset is available (covers the
+        // WaitingForQuotaReset path where the pipeline already computed a wake time).
+        DateTimeOffset? nextRetryAt = resetAt.HasValue
+            ? resetAt.Value.Add(_opts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin)
             : item.NextQuotaRetryAt;
         if (nextRetryAt is null) return;
 
