@@ -48,6 +48,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private readonly MultipassSandboxOptions _opts;
     private readonly ILogger<MultipassSandboxProvider> _log;
     private readonly IProcessRunner _runner;
+    private readonly MultipassDaemonRetryPolicy _daemonRetryPolicy;
     private readonly string _stagingRoot;
     private readonly ITimingStore? _timings;
     // Per-baseline-name semaphore: serialises bake operations so two
@@ -73,11 +74,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     }
 
     internal MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
-        ITimingStore? timings, IProcessRunner runner)
+        ITimingStore? timings, IProcessRunner runner, MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
     {
         _opts = opts;
         _log = log;
         _runner = runner;
+        _daemonRetryPolicy = daemonRetryPolicy ?? MultipassDaemonRetryPolicy.Default;
         _timings = timings;
         _stagingRoot = ResolveStagingRoot(opts);
         Directory.CreateDirectory(_stagingRoot);
@@ -161,6 +163,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // Resolve timing context from the spec (null → no timing emitted).
         var timingStore = _timings is not null && spec.TimingWorkItemId.HasValue ? _timings : null;
         var timingItemId = spec.TimingWorkItemId.GetValueOrDefault();
+        var workItemId = spec.TimingWorkItemId;
         var timingPhase = spec.TimingPhase ?? "work";
 
         try
@@ -180,10 +183,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // the clone path skips the start (clone is born Stopped).
             if (useBaseline)
             {
-                var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, ct);
+                var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, workItemId, ct);
                 await using var cloneScope = await TimingScope.BeginAsync(
                     timingStore, timingItemId, timingPhase, "vm.clone", log: _log);
-                await CloneFromBaselineAsync(name, baselineName, ct);
+                await CloneFromBaselineAsync(name, baselineName, workItemId, ct);
                 // Clone is Stopped after `multipass clone`; no start yet.
             }
             else
@@ -194,30 +197,30 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                 await using (var launchScope = await TimingScope.BeginAsync(
                     timingStore, timingItemId, timingPhase, "vm.launch", log: _log))
                 {
-                    await LaunchAsync(name, spec, cloudInitPath, ct);
-                    await WaitForRunningAsync(name, ct);
+                    await LaunchAsync(name, spec, cloudInitPath, workItemId, ct);
+                    await WaitForRunningAsync(name, workItemId, ct);
                 }
                 // Stop the freshly-launched VM so we can mount (outside vm.launch scope).
                 var stop = await RunAsync([_opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
                 if (stop.ExitCode != 0)
                     throw new InvalidOperationException($"multipass stop (for mount) failed: {stop.Stderr}");
-                await WaitForStoppedAsync(name, ct);
+                await WaitForStoppedAsync(name, workItemId, ct);
             }
 
             // Apply native mounts while VM is Stopped, then start.
             await using (var mountScope = await TimingScope.BeginAsync(
                 timingStore, timingItemId, timingPhase, "vm.mount", log: _log))
             {
-                await ApplyMountsAsync(name, bindMounts, ct);
+                await ApplyMountsAsync(name, bindMounts, workItemId, ct);
             }
 
             await using (var startScope = await TimingScope.BeginAsync(
                 timingStore, timingItemId, timingPhase, "vm.start", log: _log))
             {
-                await StartAndWaitForRunningAsync(name, ct);
+                await StartAndWaitForRunningAsync(name, workItemId, ct);
             }
 
-            await TransferEnvAsync(name, spec.Environment, sandboxRoot, ct);
+            await TransferEnvAsync(name, spec.Environment, sandboxRoot, workItemId, ct);
             AuditLog.SandboxCreated(name, spec.Network.ProfileName);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files); on the clone path it's
@@ -230,7 +233,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             _listCacheExpiry = DateTimeOffset.MinValue;
             return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log, timingStore, timingItemId, timingPhase,
                 onDisposed: n => { _activeSandboxNames.TryRemove(n, out _); _listCacheExpiry = DateTimeOffset.MinValue; },
-                runner: _runner);
+                runner: _runner,
+                daemonRetryPolicy: _daemonRetryPolicy);
         }
         catch
         {
@@ -417,7 +421,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// <c>cb-net</c>. Per-profile baselines also cleanly isolate "what each
     /// profile installed" if profiles ever need different toolchains.
     /// </summary>
-    private async Task<string> EnsureBaselineForProfileAsync(string profileName, CancellationToken ct)
+    private async Task<string> EnsureBaselineForProfileAsync(
+        string profileName,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
         if (!_opts.NetworkProfiles.TryGetValue(profileName, out _))
             throw new InvalidOperationException(
@@ -443,9 +450,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         await sem.WaitAsync(ct);
         try
         {
-            if (await BaselineVmExistsAsync(baselineName, ct))
+            if (await BaselineVmExistsAsync(baselineName, workItemId, ct))
                 return baselineName;
-            await BakeBaselineAsync(baselineName, profileName, ct);
+            await BakeBaselineAsync(baselineName, profileName, workItemId, ct);
             return baselineName;
         }
         finally
@@ -467,13 +474,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         }
     }
 
-    private async Task<bool> BaselineVmExistsAsync(string name, CancellationToken ct)
+    private async Task<bool> BaselineVmExistsAsync(string name, WorkItemId? workItemId, CancellationToken ct)
     {
-        var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct);
+        var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
         return info.ExitCode == 0;
     }
 
-    private async Task BakeBaselineAsync(string baselineName, string profileName, CancellationToken ct)
+    private async Task BakeBaselineAsync(
+        string baselineName,
+        string profileName,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
         var bridge = _opts.NetworkProfiles[profileName];
         _log.LogInformation(
@@ -515,14 +526,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
         try
         {
-            var run = await RunAsync(argv, stdin: null, ct: ct);
+            var run = await RunAsync(argv, stdin: null, ct: ct, workItemId: workItemId);
             if (run.ExitCode != 0)
                 throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
 
             // Wait for the (now-minimal) cloud-init to finish — write_files
             // and the route service install. Doesn't include the heavy
             // installs, so should be fast.
-            await WaitForRunningAsync(baselineName, ct);
+            await WaitForRunningAsync(baselineName, workItemId, ct);
 
             // Run the install commands now, via multipass exec under sudo.
             // Each entry in ExtraRuncmd is a single shell command.
@@ -533,7 +544,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                 _log.LogInformation("Baseline install step {N}/{Total}", i + 1, _opts.ExtraRuncmd.Count);
                 var execRun = await RunAsync(
                     [_opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", cmd],
-                    stdin: null, ct: ct);
+                    stdin: null, ct: ct, workItemId: workItemId);
                 if (execRun.ExitCode != 0)
                     throw new InvalidOperationException(
                         $"baseline install step {i + 1} failed (exit {execRun.ExitCode}):\n" +
@@ -546,7 +557,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             var stop = await RunAsync([_opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
             if (stop.ExitCode != 0)
                 throw new InvalidOperationException($"baseline stop failed: {stop.Stderr}");
-            await WaitForStoppedAsync(baselineName, ct);
+            await WaitForStoppedAsync(baselineName, workItemId, ct);
 
             _log.LogInformation("Baseline {Name} baked and stopped, ready to clone", baselineName);
         }
@@ -560,7 +571,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         }
     }
 
-    private async Task CloneFromBaselineAsync(string newName, string baselineName, CancellationToken ct)
+    private async Task CloneFromBaselineAsync(
+        string newName,
+        string baselineName,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
         // Defensive: ensure source is fully stopped before clone. Multipass
         // clone requires it, but the baseline can get inadvertently
@@ -569,12 +584,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // already stopped — and we wait for the state to flip because
         // `multipass stop` returns when the request is queued.
         await RunAsync([_opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
-        await WaitForStoppedAsync(baselineName, ct);
+        await WaitForStoppedAsync(baselineName, workItemId, ct);
 
         _log.LogInformation("Cloning {New} from baseline {Baseline}", newName, baselineName);
         var clone = await RunAsync(
             [_opts.MultipassBinary, "clone", baselineName, "--name", newName],
-            stdin: null, ct: ct);
+            stdin: null, ct: ct, workItemId: workItemId);
         if (clone.ExitCode != 0)
             throw new InvalidOperationException($"multipass clone failed: {clone.Stderr}");
 
@@ -621,18 +636,23 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         return argv;
     }
 
-    private async Task LaunchAsync(string name, SandboxSpec spec, string cloudInitPath, CancellationToken ct)
+    private async Task LaunchAsync(
+        string name,
+        SandboxSpec spec,
+        string cloudInitPath,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
         var argv = BuildLaunchArgv(name, spec, cloudInitPath);
         if (!string.IsNullOrWhiteSpace(spec.Network.ProfileName))
             _log.LogInformation("Sandbox {Name}: host-enforced network profile {Profile}", name, spec.Network.ProfileName);
         _log.LogInformation("Launching multipass VM {Name} (this takes 10-30s)", name);
-        var run = await RunAsync(argv, stdin: null, ct: ct);
+        var run = await RunAsync(argv, stdin: null, ct: ct, workItemId: workItemId);
         if (run.ExitCode != 0)
             throw new InvalidOperationException($"multipass launch failed: {run.Stderr}");
     }
 
-    private async Task WaitForRunningAsync(string name, CancellationToken ct)
+    private async Task WaitForRunningAsync(string name, WorkItemId? workItemId, CancellationToken ct)
     {
         // Two waits: first the VM enters "Running" state, then cloud-init
         // finishes applying runcmd (which installs the exec wrapper and
@@ -644,7 +664,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
-            var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct);
+            var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
             if (info.ExitCode == 0 && info.Stdout.Contains("Running", StringComparison.Ordinal))
                 break;
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
@@ -658,7 +678,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // exec) will surface concrete problems.
         await RunAsync(
             [_opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
-            stdin: null, ct: ct);
+            stdin: null, ct: ct, workItemId: workItemId);
     }
 
     /// <summary>
@@ -668,13 +688,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// — and `multipass mount --type=native` rejects any other state
     /// with "Please stop the instance ... before attempting native mounts".
     /// </summary>
-    private async Task WaitForStoppedAsync(string name, CancellationToken ct)
+    private async Task WaitForStoppedAsync(string name, WorkItemId? workItemId, CancellationToken ct)
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
-            var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct);
+            var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
             if (info.ExitCode == 0 && info.Stdout.Contains("Stopped", StringComparison.Ordinal))
                 return;
             await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
@@ -693,26 +713,30 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// mount because classic requires the multipass-sshfs snap inside
     /// the guest, and our host firewall typically blocks the snap store.
     /// </summary>
-    private async Task ApplyMountsAsync(string name, List<(string Host, string Sandbox)> binds, CancellationToken ct)
+    private async Task ApplyMountsAsync(
+        string name,
+        List<(string Host, string Sandbox)> binds,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
         if (binds.Count == 0) return;
-        await WaitForStoppedAsync(name, ct);
+        await WaitForStoppedAsync(name, workItemId, ct);
         foreach (var (host, sandbox) in binds)
         {
             var run = await RunAsync(
                 [_opts.MultipassBinary, "mount", "--type=native", host, $"{name}:{sandbox}"],
-                stdin: null, ct: ct);
+                stdin: null, ct: ct, workItemId: workItemId);
             if (run.ExitCode != 0)
                 throw new InvalidOperationException($"multipass mount {host} -> {name}:{sandbox} failed: {run.Stderr}");
         }
     }
 
-    private async Task StartAndWaitForRunningAsync(string name, CancellationToken ct)
+    private async Task StartAndWaitForRunningAsync(string name, WorkItemId? workItemId, CancellationToken ct)
     {
-        var start = await RunAsync([_opts.MultipassBinary, "start", name], stdin: null, ct: ct);
+        var start = await RunAsync([_opts.MultipassBinary, "start", name], stdin: null, ct: ct, workItemId: workItemId);
         if (start.ExitCode != 0)
             throw new InvalidOperationException($"multipass start failed: {start.Stderr}");
-        await WaitForRunningAsync(name, ct);
+        await WaitForRunningAsync(name, workItemId, ct);
     }
 
     /// <summary>
@@ -735,7 +759,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// to retry the underlying SCP/SFTP transfer rather than block every
     /// healthy creation on a fixed sleep.
     /// </summary>
-    private async Task<string> TransferEnvAsync(string name, IReadOnlyDictionary<string, string> env, string sandboxRoot, CancellationToken ct)
+    private async Task<string> TransferEnvAsync(
+        string name,
+        IReadOnlyDictionary<string, string> env,
+        string sandboxRoot,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
         var envPath = Path.Combine(sandboxRoot, "env");
         await File.WriteAllTextAsync(envPath, BuildEnvironmentFileContent(env), ct);
@@ -754,7 +783,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
         var perms = await RunAsync(
             [_opts.MultipassBinary, "exec", name, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"],
-            stdin: null, ct: ct);
+            stdin: null, ct: ct, workItemId: workItemId);
         if (perms.ExitCode != 0)
             throw new InvalidOperationException($"failed to chmod env file in VM: {perms.Stderr}");
 
@@ -928,10 +957,20 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         return sb.ToString();
     }
 
-    private async Task<RunResult> RunAsync(IReadOnlyList<string> argv, string? stdin, CancellationToken ct)
-    {
-        return await _runner.RunAsync(argv, stdin, ct);
-    }
+    private Task<RunResult> RunAsync(
+        IReadOnlyList<string> argv,
+        string? stdin,
+        CancellationToken ct,
+        WorkItemId? workItemId = null) =>
+        MultipassDaemonRetry.RunWithRetryAsync(
+            argv,
+            ctInner => _runner.RunAsync(argv, stdin, ctInner),
+            ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
+                _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
+            _log,
+            workItemId,
+            ct,
+            _daemonRetryPolicy);
 
     private async Task TryDeleteVmAsync(string name)
     {
@@ -1026,6 +1065,186 @@ internal sealed class DefaultProcessRunner : IProcessRunner
 }
 
 internal readonly record struct RunResult(int ExitCode, string Stdout, string Stderr);
+
+internal sealed class MultipassDaemonRetryPolicy
+{
+    public static MultipassDaemonRetryPolicy Default { get; } = new();
+
+    public int MaxAttempts { get; init; } = 3;
+    public IReadOnlyList<TimeSpan> Backoffs { get; init; } =
+        [TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15)];
+    public TimeSpan HealthProbeTimeout { get; init; } = TimeSpan.FromSeconds(5);
+    public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } =
+        static (delay, ct) => Task.Delay(delay, ct);
+}
+
+internal readonly record struct MultipassDaemonHealthProbeResult(bool IsHealthy, string Error)
+{
+    public static MultipassDaemonHealthProbeResult Healthy() => new(true, "");
+    public static MultipassDaemonHealthProbeResult Unhealthy(string error) => new(false, error);
+}
+
+/// <summary>
+/// Retries multipass CLI operations when multipassd itself is temporarily
+/// unreachable or reports a qemu crash. These failures can occur while the
+/// daemon restarts after a host-side crash; retrying here keeps recoverable
+/// sandbox launches from immediately failing the work item.
+/// </summary>
+internal static class MultipassDaemonRetry
+{
+    private static readonly HashSet<string> RetryableCommands = new(StringComparer.Ordinal)
+    {
+        "launch",
+        "start",
+        "exec",
+        "info",
+        "clone",
+        "mount",
+    };
+
+    internal static async Task<RunResult> RunWithRetryAsync(
+        IReadOnlyList<string> argv,
+        Func<CancellationToken, Task<RunResult>> action,
+        Func<CancellationToken, Task<MultipassDaemonHealthProbeResult>> healthProbe,
+        ILogger log,
+        WorkItemId? workItemId,
+        CancellationToken ct,
+        MultipassDaemonRetryPolicy? policy = null)
+    {
+        ArgumentNullException.ThrowIfNull(argv);
+        ArgumentNullException.ThrowIfNull(action);
+        ArgumentNullException.ThrowIfNull(healthProbe);
+        ArgumentNullException.ThrowIfNull(log);
+
+        policy ??= MultipassDaemonRetryPolicy.Default;
+        if (policy.MaxAttempts < 1) throw new ArgumentOutOfRangeException(nameof(policy.MaxAttempts));
+        if (policy.Backoffs.Count < policy.MaxAttempts - 1)
+            throw new ArgumentException("Backoffs must contain one delay per retry.", nameof(policy));
+
+        RunResult result = default;
+        string? errorClass = null;
+        var description = Describe(argv);
+
+        for (var attempt = 1; attempt <= policy.MaxAttempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            result = await action(ct).ConfigureAwait(false);
+            errorClass = ClassifyTransient(argv, result);
+            if (errorClass is null)
+                return result;
+
+            if (attempt == policy.MaxAttempts)
+                break;
+
+            var retryOrdinal = attempt;
+            var probe = await healthProbe(ct).ConfigureAwait(false);
+            var delay = policy.Backoffs[attempt - 1];
+            AuditTransientRetry(workItemId, retryOrdinal, errorClass);
+
+            if (retryOrdinal == 1)
+            {
+                log.LogInformation(
+                    "{Description}: transient multipass daemon error ({ErrorClass}) on attempt {Attempt}/{MaxAttempts}; healthProbe={HealthProbe}; retrying after {Delay}",
+                    description, errorClass, attempt, policy.MaxAttempts, FormatProbe(probe), delay);
+            }
+            else
+            {
+                log.LogWarning(
+                    "{Description}: transient multipass daemon error ({ErrorClass}) on attempt {Attempt}/{MaxAttempts}; healthProbe={HealthProbe}; retrying after {Delay}",
+                    description, errorClass, attempt, policy.MaxAttempts, FormatProbe(probe), delay);
+            }
+
+            await policy.Delay(delay, ct).ConfigureAwait(false);
+        }
+
+        var retries = policy.MaxAttempts - 1;
+        var finalProbe = await healthProbe(ct).ConfigureAwait(false);
+        var stderr = result.Stderr.Trim();
+        var message = finalProbe.IsHealthy
+            ? $"multipass transient daemon error after {retries} retries ({errorClass}) during {description}: {stderr}"
+            : $"multipass daemon unreachable after {retries} retries ({errorClass}) during {description}; health probe failed: {finalProbe.Error}; last stderr: {stderr}";
+        log.LogError("{Message}", message);
+        return result with { Stderr = message };
+    }
+
+    internal static string? ClassifyTransient(IReadOnlyList<string> argv, RunResult result)
+    {
+        if (result.ExitCode == 0 || argv.Count < 2)
+            return null;
+        var command = argv[1];
+        if (!RetryableCommands.Contains(command))
+            return null;
+
+        var stderr = result.Stderr ?? "";
+        if (stderr.Contains("qemu-system-x86_64; error: Process crashed", StringComparison.OrdinalIgnoreCase))
+            return "qemu-process-crashed";
+        if (stderr.Contains("cannot connect to the multipass socket", StringComparison.OrdinalIgnoreCase))
+            return "multipass-socket-unreachable";
+        if ((command == "launch" || command == "start")
+            && stderr.Contains("cannot connect to", StringComparison.OrdinalIgnoreCase))
+            return "multipass-daemon-unreachable";
+        if (stderr.Contains("socket", StringComparison.OrdinalIgnoreCase))
+            return "multipass-socket-error";
+        return null;
+    }
+
+    /// <summary>
+    /// Probes <c>multipass version</c> with a bounded deadline to decide whether
+    /// multipassd is reachable. Used by <see cref="RunWithRetryAsync"/> between
+    /// retries to attribute a failure to the daemon vs a transient flap.
+    /// Exposed for direct unit testing of each branch (healthy, non-zero exit,
+    /// probe timeout, caller cancellation, generic exception).
+    /// </summary>
+    internal static async Task<MultipassDaemonHealthProbeResult> ProbeDaemonAsync(
+        IProcessRunner runner,
+        string multipassBinary,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(runner);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
+        try
+        {
+            var probe = await runner.RunAsync([multipassBinary, "version"], stdin: null, timeoutCts.Token)
+                .ConfigureAwait(false);
+            if (probe.ExitCode == 0)
+                return MultipassDaemonHealthProbeResult.Healthy();
+            return MultipassDaemonHealthProbeResult.Unhealthy(
+                $"multipass version failed (exit {probe.ExitCode}): {probe.Stderr.Trim()}");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            return MultipassDaemonHealthProbeResult.Unhealthy(
+                $"multipass version timed out after {timeout.TotalSeconds:0.#}s");
+        }
+        catch (Exception ex)
+        {
+            return MultipassDaemonHealthProbeResult.Unhealthy(
+                $"multipass version probe threw {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static void AuditTransientRetry(WorkItemId? workItemId, int attempt, string errorClass)
+    {
+        if (workItemId.HasValue)
+            AuditLog.SandboxLaunchTransientRetry(workItemId.Value, attempt, errorClass);
+    }
+
+    private static string Describe(IReadOnlyList<string> argv)
+    {
+        if (argv.Count >= 2)
+            return $"{Path.GetFileName(argv[0])} {argv[1]}";
+        return argv.Count == 1 ? Path.GetFileName(argv[0]) : "multipass";
+    }
+
+    private static string FormatProbe(MultipassDaemonHealthProbeResult probe) =>
+        probe.IsHealthy ? "healthy" : "unreachable: " + probe.Error;
+}
 
 /// <summary>
 /// Retries a multipass-CLI call when its stderr indicates the in-VM SSH
@@ -1274,8 +1493,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     private readonly MultipassSandboxOptions _opts;
     private readonly ILogger _log;
     private readonly IProcessRunner _runner;
+    private readonly MultipassDaemonRetryPolicy _daemonRetryPolicy;
     private readonly ITimingStore? _timings;
     private readonly WorkItemId _timingItemId;
+    private readonly WorkItemId? _workItemId;
     private readonly string _timingPhase;
     private readonly Action<string>? _onDisposed;
     private int _firstExecEmitted;
@@ -1284,7 +1505,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
-        Action<string>? onDisposed = null, IProcessRunner? runner = null)
+        Action<string>? onDisposed = null, IProcessRunner? runner = null,
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -1292,8 +1514,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         _opts = opts;
         _log = log;
         _runner = runner ?? new DefaultProcessRunner();
+        _daemonRetryPolicy = daemonRetryPolicy ?? MultipassDaemonRetryPolicy.Default;
         _timings = timings;
         _timingItemId = timingItemId;
+        _workItemId = timingItemId.Value == Guid.Empty ? null : timingItemId;
         _timingPhase = timingPhase;
         _onDisposed = onDisposed;
         Id = name;
@@ -1338,7 +1562,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
             : null;
         try
         {
-            var result = await _runner.RunAsync(
+            var result = await RunMultipassAsync(
                 argv,
                 exec.Stdin,
                 ct,
@@ -1455,7 +1679,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
 
     private async Task RunVmCommandAsync(IReadOnlyList<string> command, CancellationToken ct)
     {
-        var result = await _runner.RunAsync(
+        var result = await RunMultipassAsync(
             [_opts.MultipassBinary, "exec", _name, "--", .. command],
             stdin: null,
             ct: ct);
@@ -1467,7 +1691,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     {
         try
         {
-            _ = await _runner.RunAsync(
+            _ = await RunMultipassAsync(
                 [_opts.MultipassBinary, "exec", _name, "--", "rm", "-f", .. vmPaths],
                 stdin: null,
                 ct: CancellationToken.None);
@@ -1477,6 +1701,22 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
             _log.LogDebug(ex, "Failed to clean transferred multipass exec files for {Name}", _name);
         }
     }
+
+    private Task<RunResult> RunMultipassAsync(
+        IReadOnlyList<string> argv,
+        string? stdin,
+        CancellationToken ct,
+        Action<string>? stdoutChunkCallback = null,
+        Action<string>? stderrChunkCallback = null) =>
+        MultipassDaemonRetry.RunWithRetryAsync(
+            argv,
+            ctInner => _runner.RunAsync(argv, stdin, ctInner, stdoutChunkCallback, stderrChunkCallback),
+            ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
+                _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
+            _log,
+            _workItemId,
+            ct,
+            _daemonRetryPolicy);
 
     public async ValueTask DisposeAsync()
     {
