@@ -914,7 +914,12 @@ public sealed class AgentStreamParserSelectionTests
             },
         };
 
-        var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind: null, costs);
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: null,
+            costs,
+            new[] { AgentKind.Claude, AgentKind.Codex, AgentKind.Gemini });
 
         Assert.Equal(AgentKind.Claude, kind);
     }
@@ -939,7 +944,12 @@ public sealed class AgentStreamParserSelectionTests
             null,
             DateTimeOffset.UtcNow);
 
-        var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind: null, []);
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: null,
+            costs: [],
+            knownKinds: new[] { AgentKind.Claude, AgentKind.Codex, AgentKind.Gemini });
 
         Assert.Equal(AgentKind.Gemini, kind);
     }

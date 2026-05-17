@@ -69,7 +69,7 @@ public sealed class StreamAnalysisService : BackgroundService
             }
 
             var sniffedKind = await SniffKindAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
-            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs);
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs, _parsers.Keys);
             if (!_parsers.TryGetValue(kind, out var parser))
                 parser = _parsers.Values.FirstOrDefault(p => p.Kind.Value == "unknown") ?? new UnknownAgentStreamParser();
 

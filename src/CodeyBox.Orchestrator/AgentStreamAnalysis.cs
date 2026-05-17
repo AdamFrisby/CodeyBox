@@ -88,14 +88,26 @@ public static class AgentStreamParserSelection
         return null;
     }
 
+    /// <summary>
+    /// Resolves the canonical <see cref="AgentKind"/> for a stream file using
+    /// (in order) the sniffed kind, recorded cost rows, and the work item's
+    /// declared agent. Only kinds present in <paramref name="knownKinds"/> are
+    /// canonicalised — anything else falls through to "unknown". Callers should
+    /// pass the kinds of their registered <see cref="IAgentStreamParser"/>s so
+    /// adding a new provider library is purely additive.
+    /// </summary>
     public static AgentKind ResolveKind(
         WorkItem item,
         AgentStreamFile file,
         AgentKind? sniffedKind,
-        IReadOnlyList<WorkItemCost> costs)
+        IReadOnlyList<WorkItemCost> costs,
+        IEnumerable<AgentKind> knownKinds)
     {
+        ArgumentNullException.ThrowIfNull(knownKinds);
+        var known = knownKinds as IReadOnlyCollection<AgentKind> ?? knownKinds.ToList();
+
         if (sniffedKind is not null)
-            return Canonicalize(sniffedKind.Value) ?? sniffedKind.Value;
+            return Canonicalize(sniffedKind.Value, known) ?? sniffedKind.Value;
 
         foreach (var cost in costs
                      .Where(c => string.Equals(c.WorkItemId, item.Id.ToString(), StringComparison.OrdinalIgnoreCase))
@@ -104,11 +116,11 @@ public static class AgentStreamParserSelection
                      .OrderByDescending(c => string.Equals(c.Phase, file.Phase, StringComparison.OrdinalIgnoreCase))
                      .ThenByDescending(c => c.StartedAt))
         {
-            if (Canonicalize(cost.AgentKind) is { } costKind)
+            if (Canonicalize(cost.AgentKind, known) is { } costKind)
                 return costKind;
         }
 
-        if (item.Agent.HasValue && Canonicalize(item.Agent.Value) is { } itemKind)
+        if (item.Agent.HasValue && Canonicalize(item.Agent.Value, known) is { } itemKind)
             return itemKind;
 
         return new AgentKind("unknown");
@@ -146,19 +158,19 @@ public static class AgentStreamParserSelection
 
     public static AgentStreamSummary UnsupportedSummary() => AgentStreamSummary.Unsupported();
 
-    private static AgentKind? Canonicalize(AgentKind kind) => Canonicalize(kind.Value);
+    private static AgentKind? Canonicalize(AgentKind kind, IReadOnlyCollection<AgentKind> known) =>
+        Canonicalize(kind.Value, known);
 
-    private static AgentKind? Canonicalize(string? value)
+    private static AgentKind? Canonicalize(string? value, IReadOnlyCollection<AgentKind> known)
     {
         if (value is null)
             return null;
 
-        if (value.Equals(AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase))
-            return AgentKind.Claude;
-        if (value.Equals(AgentKind.Codex.Value, StringComparison.OrdinalIgnoreCase))
-            return AgentKind.Codex;
-        if (value.Equals(AgentKind.Gemini.Value, StringComparison.OrdinalIgnoreCase))
-            return AgentKind.Gemini;
+        foreach (var k in known)
+        {
+            if (value.Equals(k.Value, StringComparison.OrdinalIgnoreCase))
+                return k;
+        }
 
         return null;
     }

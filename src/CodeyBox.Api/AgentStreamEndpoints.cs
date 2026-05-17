@@ -86,7 +86,7 @@ internal static class AgentStreamEndpoints
             if (sniffStream is null) return Results.NotFound();
             var sniffedKind = await AgentStreamParserSelection.SniffKindAsync(sniffStream, parsers, analysisCt);
             var costRows = await costs.GetByWorkItemAsync(item.Id.ToString(), analysisCt);
-            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows);
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows, parsers.Select(p => p.Kind));
             var parser = parsers.FirstOrDefault(p => p.Kind == kind)
                 ?? parsers.FirstOrDefault(p => p.Kind.Value == "unknown")
                 ?? new UnknownAgentStreamParser();
