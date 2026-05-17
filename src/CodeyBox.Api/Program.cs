@@ -949,15 +949,6 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp => new DeadWorkerReaper(
     sp.GetRequiredService<IWebhookDispatcher>()));
 
 // --- Agent cost extractors + calculator ------------------------------------
-builder.Services.AddSingleton<AgentCostCalculator>(sp =>
-{
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
-    var pricing = opts.AgentPricing;
-    AgentCostCalculator.ValidateAtStartup(pricing,
-        sp.GetRequiredService<IAgentRegistry>().Available, startupLog);
-    return new AgentCostCalculator(pricing);
-});
 builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(sp =>
 {
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentCosts");
@@ -976,6 +967,16 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
                 "No cost extractor registered for agent '{Agent}'; cost data will not be captured for this agent", kind.Value);
     }
     return extractors;
+});
+builder.Services.AddSingleton<AgentCostCalculator>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
+    var pricing = opts.AgentPricing;
+    var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
+    AgentCostCalculator.ValidateAtStartup(pricing,
+        sp.GetRequiredService<IAgentRegistry>().Available, extractors, startupLog);
+    return new AgentCostCalculator(pricing, extractors);
 });
 builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
 {

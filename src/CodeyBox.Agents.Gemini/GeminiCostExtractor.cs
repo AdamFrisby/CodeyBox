@@ -17,6 +17,13 @@ public sealed class GeminiCostExtractor : IAgentCostExtractor
 {
     public AgentKind Kind => AgentKind.Gemini;
 
+    public ModelRateConfig? DefaultPricing { get; } = new()
+    {
+        InputPerMillion = 7.0,
+        CachedInputPerMillion = 0.70,
+        OutputPerMillion = 21.0,
+    };
+
     private static readonly Regex PromptPattern = new(
         @"[Pp]rompt\s+tokens?[:\s]+(\d[\d,]*)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);

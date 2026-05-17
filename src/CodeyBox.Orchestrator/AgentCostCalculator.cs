@@ -5,16 +5,6 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Per-model price configuration. All rates are in USD per million tokens.
-/// </summary>
-public sealed class ModelRateConfig
-{
-    public double InputPerMillion { get; set; }
-    public double CachedInputPerMillion { get; set; }
-    public double OutputPerMillion { get; set; }
-}
-
-/// <summary>
 /// Pricing configuration loaded from the <c>AgentPricing</c> config section.
 ///
 /// Structure:
@@ -45,12 +35,14 @@ public sealed class AgentPricingOptions
 /// Calculates estimated USD cost for a single agent invocation given a pricing configuration.
 ///
 /// Lookup order:
-///   1. <c>Rates[agentKind][modelId]</c>
-///   2. <c>DefaultRates[agentKind]</c>
-///   3. Built-in conservative fallback constants (e.g. claude $15/$75 per million,
-///      codex $5/$25, gemini $7/$21) — applies to known agent kinds with no config;
-///      callers decide whether to warn the operator about missing pricing.
-///      Returns null (→ zero cost) only for completely unknown agent kinds.
+///   1. <c>Rates[agentKind][modelId]</c> from configuration.
+///   2. <c>DefaultRates[agentKind]</c> from configuration.
+///   3. <see cref="IAgentCostExtractor.DefaultPricing"/> owned by the per-provider library
+///      (conservative built-in fallback the provider declares for itself).
+///   4. Returns null (→ zero cost) when no source supplies a rate.
+///
+/// The orchestrator no longer hardcodes provider-specific rates — adding a new provider
+/// only requires that provider's cost extractor to expose its own <c>DefaultPricing</c>.
 ///
 /// For subscription plans, <c>estimatedUsd</c> is the equivalent pay-per-API value, not a
 /// real charge. See docs/cost-reporting.md §"Subscription equivalent USD".
@@ -58,22 +50,14 @@ public sealed class AgentPricingOptions
 public sealed class AgentCostCalculator
 {
     private readonly AgentPricingOptions _opts;
+    private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor> _extractors;
 
-    /// <summary>
-    /// Conservative fallback rates used when no pricing config is available for an agent.
-    /// Intentionally over-estimates to flag unexpectedly expensive runs.
-    /// </summary>
-    private static readonly Dictionary<string, ModelRateConfig> BuiltInFallbacks = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["claude"] = new() { InputPerMillion = 15.0, CachedInputPerMillion = 1.50, OutputPerMillion = 75.0 },
-        ["codex"] = new() { InputPerMillion = 5.0, CachedInputPerMillion = 0.50, OutputPerMillion = 25.0 },
-        ["gemini"] = new() { InputPerMillion = 7.0, CachedInputPerMillion = 0.70, OutputPerMillion = 21.0 },
-        ["copilot"] = new() { InputPerMillion = 0.0, CachedInputPerMillion = 0.0, OutputPerMillion = 0.0 },
-    };
-
-    public AgentCostCalculator(AgentPricingOptions opts)
+    public AgentCostCalculator(
+        AgentPricingOptions opts,
+        IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null)
     {
         _opts = opts;
+        _extractors = extractors ?? new Dictionary<AgentKind, IAgentCostExtractor>();
     }
 
     /// <summary>
@@ -100,7 +84,7 @@ public sealed class AgentCostCalculator
     {
         var agentKey = kind.Value;
 
-        // 1. Model-specific rate
+        // 1. Model-specific rate from config.
         if (!string.IsNullOrEmpty(modelId)
             && _opts.Rates.TryGetValue(agentKey, out var modelMap)
             && modelMap.TryGetValue(modelId, out var modelRate))
@@ -108,13 +92,13 @@ public sealed class AgentCostCalculator
             return modelRate;
         }
 
-        // 2. Agent-level default from config
+        // 2. Agent-level default from config.
         if (_opts.DefaultRates.TryGetValue(agentKey, out var defaultRate))
             return defaultRate;
 
-        // 3. Built-in fallback constant
-        if (BuiltInFallbacks.TryGetValue(agentKey, out var builtin))
-            return builtin;
+        // 3. Per-provider built-in fallback (owned by the provider's cost extractor).
+        if (_extractors.TryGetValue(kind, out var extractor) && extractor.DefaultPricing is { } providerDefault)
+            return providerDefault;
 
         return null;
     }
@@ -127,21 +111,24 @@ public sealed class AgentCostCalculator
     public static void ValidateAtStartup(
         AgentPricingOptions opts,
         IEnumerable<AgentKind> registeredAgents,
+        IReadOnlyDictionary<AgentKind, IAgentCostExtractor> extractors,
         ILogger log)
     {
         foreach (var kind in registeredAgents)
         {
             var key = kind.Value;
             var hasRates = opts.Rates.ContainsKey(key) || opts.DefaultRates.ContainsKey(key);
-            if (!hasRates && BuiltInFallbacks.ContainsKey(key))
+            var hasProviderDefault = extractors.TryGetValue(kind, out var extractor)
+                && extractor.DefaultPricing is not null;
+            if (!hasRates && hasProviderDefault)
             {
                 log.LogWarning(
-                    "AgentPricing: no config for agent '{Agent}'; using built-in fallback rates", key);
+                    "AgentPricing: no config for agent '{Agent}'; using provider built-in fallback rates", key);
             }
             else if (!hasRates)
             {
                 log.LogWarning(
-                    "AgentPricing: no rates configured for agent '{Agent}' and no built-in fallback; estimated_usd will be 0", key);
+                    "AgentPricing: no rates configured for agent '{Agent}' and no provider fallback; estimated_usd will be 0", key);
             }
         }
 

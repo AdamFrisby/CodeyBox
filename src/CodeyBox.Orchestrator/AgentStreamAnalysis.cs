@@ -166,26 +166,6 @@ public static class AgentStreamParserSelection
     private static bool PhaseMatches(string filePhase, string costPhase) =>
         string.Equals(filePhase, costPhase, StringComparison.OrdinalIgnoreCase)
         || filePhase.StartsWith(costPhase + "-", StringComparison.OrdinalIgnoreCase);
-
-    private static string? FirstString(JsonElement el, params string[] names)
-    {
-        foreach (var name in names)
-            if (TryGet(el, out var value, name) && value.ValueKind == JsonValueKind.String)
-                return value.GetString();
-        return null;
-    }
-
-    private static bool TryGet(JsonElement el, out JsonElement value, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty(name, out value))
-                return true;
-        }
-
-        value = default;
-        return false;
-    }
 }
 
 public static class AgentStreamAnalytics

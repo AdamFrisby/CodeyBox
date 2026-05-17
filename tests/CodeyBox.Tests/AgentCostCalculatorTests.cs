@@ -1,5 +1,8 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -7,6 +10,14 @@ namespace CodeyBox.Tests;
 
 public sealed class AgentCostCalculatorTests
 {
+    private static IReadOnlyDictionary<AgentKind, IAgentCostExtractor> AllExtractors() =>
+        new Dictionary<AgentKind, IAgentCostExtractor>
+        {
+            [AgentKind.Claude] = new ClaudeCostExtractor(),
+            [AgentKind.Codex] = new CodexCostExtractor(),
+            [AgentKind.Gemini] = new GeminiCostExtractor(),
+        };
+
     private static AgentPricingOptions MakeOpts() => new()
     {
         Rates = new()
@@ -52,17 +63,30 @@ public sealed class AgentCostCalculatorTests
     }
 
     [Fact]
-    public void UnknownModelAndNoDefaultRate_FallsBackToBuiltIn()
+    public void UnknownModelAndNoDefaultRate_FallsBackToProviderDefault()
     {
         var opts = new AgentPricingOptions();
-        var calculator = new AgentCostCalculator(opts);
+        var calculator = new AgentCostCalculator(opts, AllExtractors());
         var snapshot = new AgentCostSnapshot(InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 500, ModelId: null);
 
         var result = calculator.Calculate(snapshot, AgentKind.Claude);
 
-        // Built-in claude: input 15.0, output 75.0
+        // Provider default for claude: input 15.0, output 75.0
         // 1000 * 15.0 / 1_000_000 + 500 * 75.0 / 1_000_000 = 0.015 + 0.0375 = 0.0525
         Assert.Equal(0.0525m, result);
+    }
+
+    [Fact]
+    public void NoConfigAndNoExtractor_ReturnsZero()
+    {
+        // Without an extractor wired in (test bootstrap) and no config, the calculator
+        // returns 0 rather than silently falling back to a hardcoded provider rate.
+        var calculator = new AgentCostCalculator(new AgentPricingOptions());
+        var snapshot = new AgentCostSnapshot(InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 500, ModelId: null);
+
+        var result = calculator.Calculate(snapshot, AgentKind.Claude);
+
+        Assert.Equal(0m, result);
     }
 
     [Fact]
@@ -91,7 +115,7 @@ public sealed class AgentCostCalculatorTests
         };
 
         Assert.Throws<InvalidOperationException>(() =>
-            AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Claude], NullLogger.Instance));
+            AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Claude], AllExtractors(), NullLogger.Instance));
     }
 
     [Fact]
@@ -106,16 +130,16 @@ public sealed class AgentCostCalculatorTests
         };
 
         Assert.Throws<InvalidOperationException>(() =>
-            AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Gemini], NullLogger.Instance));
+            AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Gemini], AllExtractors(), NullLogger.Instance));
     }
 
     [Fact]
     public void MissingPricing_ValidateAtStartupDoesNotThrow()
     {
-        // Gemini has no registered pricing; built-in fallback exists so only a Warning is emitted.
+        // Gemini has no registered pricing; provider built-in fallback exists so only a Warning is emitted.
         // Should not throw.
         var opts = new AgentPricingOptions();
 
-        AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Gemini], NullLogger.Instance);
+        AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Gemini], AllExtractors(), NullLogger.Instance);
     }
 }

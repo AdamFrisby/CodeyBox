@@ -17,6 +17,13 @@ public interface IAgentCostExtractor
     /// Never throws.
     /// </summary>
     AgentCostSnapshot? TryExtract(string? agentStdout, string? agentStderr);
+
+    /// <summary>
+    /// Conservative built-in fallback rate the provider library owns. Used by the
+    /// cost calculator when no model-specific or agent-level rate is configured.
+    /// Return <c>null</c> to opt out (callers treat the cost as $0 in that case).
+    /// </summary>
+    ModelRateConfig? DefaultPricing { get; }
 }
 
 /// <summary>

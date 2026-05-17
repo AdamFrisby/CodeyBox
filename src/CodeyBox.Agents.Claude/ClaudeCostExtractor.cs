@@ -20,6 +20,13 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
 {
     public AgentKind Kind => AgentKind.Claude;
 
+    public ModelRateConfig? DefaultPricing { get; } = new()
+    {
+        InputPerMillion = 15.0,
+        CachedInputPerMillion = 1.50,
+        OutputPerMillion = 75.0,
+    };
+
     private static readonly Regex InputPattern = new(
         @"(\d[\d,]*)\s+input\s+tokens?",
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);

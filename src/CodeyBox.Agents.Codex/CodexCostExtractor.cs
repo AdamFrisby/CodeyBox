@@ -16,6 +16,13 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
 {
     public AgentKind Kind => AgentKind.Codex;
 
+    public ModelRateConfig? DefaultPricing { get; } = new()
+    {
+        InputPerMillion = 5.0,
+        CachedInputPerMillion = 0.50,
+        OutputPerMillion = 25.0,
+    };
+
     private static readonly Regex UsagePromptPattern = new(
         @"[Pp]rompt\s+tokens?[:\s]+(\d[\d,]*)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
