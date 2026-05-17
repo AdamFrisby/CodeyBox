@@ -1916,7 +1916,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 for (var i = 0; i < llmRuns.Length; i++)
                 {
                     if (!IsLlmAgentExecutionFailure(llmRuns[i].Result)
-                        || DetectQuotaFailure(llmRuns[i].Result) is not null)
+                        || _quotaClassifier.Detect(
+                            llmRuns[i].Runner.Kind,
+                            llmRuns[i].Result.AgentStderr,
+                            llmRuns[i].Result.AgentStdout) is not null)
                     {
                         continue;
                     }
@@ -2073,11 +2076,6 @@ public sealed class PipelineRunner : IPipelineRunner
         && result.AgentSummary is not null
         && result.Findings.Any(f =>
             string.Equals(f.Title, "review agent failed to run", StringComparison.OrdinalIgnoreCase));
-
-    private static QuotaDetection? DetectQuotaFailure(AuditResult result) =>
-        result.AgentStderr is null && result.AgentStdout is null
-            ? null
-            : QuotaFailureDetector.Detect(result.AgentStderr, result.AgentStdout);
 
     private sealed record AuditorRunRecord(
         IAuditor Auditor,

@@ -326,7 +326,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
                     "review agent failed to run",
                     "quota")],
                     AgentSummary: "agent exited 1",
-                    AgentStdout: "hit your usage limit; reset after 1h"));
+                    AgentStdout: "rate_limit_exceeded; reset after 1h"));
             },
             AuditCapabilities.AgentCredentials);
 
