@@ -1,8 +1,8 @@
-using CodeyBox.Orchestrator;
+using CodeyBox.Agents.Claude;
 
 namespace CodeyBox.Tests;
 
-public sealed class AgentStreamJsonParserTests
+public sealed class ClaudeToolCallCounterTests
 {
     private const string SampleStreamJson = """
         {"type":"system","subtype":"init","sessionId":"s1"}
@@ -17,7 +17,7 @@ public sealed class AgentStreamJsonParserTests
     [Fact]
     public void TryParse_ValidStreamJson_ExtractsToolCounts()
     {
-        var result = AgentStreamJsonParser.TryParse(SampleStreamJson);
+        var result = ClaudeToolCallCounter.TryParse(SampleStreamJson);
 
         Assert.NotNull(result);
         Assert.Equal(2, result!.ToolCallCounts["Bash"]);
@@ -27,7 +27,7 @@ public sealed class AgentStreamJsonParserTests
     [Fact]
     public void TryParse_ValidStreamJson_ExtractsFinalText()
     {
-        var result = AgentStreamJsonParser.TryParse(SampleStreamJson);
+        var result = ClaudeToolCallCounter.TryParse(SampleStreamJson);
 
         Assert.NotNull(result);
         Assert.Equal("I have completed the task.", result!.FinalText);
@@ -36,20 +36,20 @@ public sealed class AgentStreamJsonParserTests
     [Fact]
     public void TryParse_PlainText_ReturnsNull()
     {
-        var result = AgentStreamJsonParser.TryParse("This is plain text output from the agent.");
+        var result = ClaudeToolCallCounter.TryParse("This is plain text output from the agent.");
         Assert.Null(result);
     }
 
     [Fact]
     public void TryParse_Null_ReturnsNull()
     {
-        Assert.Null(AgentStreamJsonParser.TryParse(null));
+        Assert.Null(ClaudeToolCallCounter.TryParse(null));
     }
 
     [Fact]
     public void TryParse_EmptyString_ReturnsNull()
     {
-        Assert.Null(AgentStreamJsonParser.TryParse(""));
+        Assert.Null(ClaudeToolCallCounter.TryParse(""));
     }
 
     [Fact]
@@ -59,7 +59,7 @@ public sealed class AgentStreamJsonParserTests
             {this is not valid json}
             {"type":"result","subtype":"success","result":"Done!"}
             """;
-        var result = AgentStreamJsonParser.TryParse(input);
+        var result = ClaudeToolCallCounter.TryParse(input);
         Assert.NotNull(result);
         Assert.Equal("Done!", result!.FinalText);
         Assert.Empty(result.ToolCallCounts);
@@ -71,7 +71,7 @@ public sealed class AgentStreamJsonParserTests
         var input = """
             {"type":"system","subtype":"init","sessionId":"x"}
             """;
-        Assert.Null(AgentStreamJsonParser.TryParse(input));
+        Assert.Null(ClaudeToolCallCounter.TryParse(input));
     }
 
     [Fact]
@@ -81,7 +81,7 @@ public sealed class AgentStreamJsonParserTests
             {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"/foo"}}],"stop_reason":"tool_use"}}
             {"type":"result","subtype":"success","result":"ok"}
             """;
-        var result = AgentStreamJsonParser.TryParse(input);
+        var result = ClaudeToolCallCounter.TryParse(input);
         Assert.NotNull(result);
         Assert.Equal(1, result!.ToolCallCounts["Read"]);
     }
@@ -93,7 +93,7 @@ public sealed class AgentStreamJsonParserTests
             {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn"}}
             {"type":"result","subtype":"success","result":"hello"}
             """;
-        var result = AgentStreamJsonParser.TryParse(input);
+        var result = ClaudeToolCallCounter.TryParse(input);
         Assert.NotNull(result);
         Assert.Empty(result!.ToolCallCounts);
         Assert.Equal("hello", result.FinalText);

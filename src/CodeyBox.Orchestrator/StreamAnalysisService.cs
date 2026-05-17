@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -68,7 +69,7 @@ public sealed class StreamAnalysisService : BackgroundService
             }
 
             var sniffedKind = await SniffKindAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
-            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs);
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs, _parsers.Keys);
             if (!_parsers.TryGetValue(kind, out var parser))
                 parser = _parsers.Values.FirstOrDefault(p => p.Kind.Value == "unknown") ?? new UnknownAgentStreamParser();
 
@@ -108,7 +109,7 @@ public sealed class StreamAnalysisService : BackgroundService
         await using var stream = await _streams.OpenReadAsync(id, fileName, ct).ConfigureAwait(false);
         return stream is null
             ? null
-            : await AgentStreamParserSelection.SniffKindAsync(stream, ct).ConfigureAwait(false);
+            : await AgentStreamParserSelection.SniffKindAsync(stream, _parsers.Values, ct).ConfigureAwait(false);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

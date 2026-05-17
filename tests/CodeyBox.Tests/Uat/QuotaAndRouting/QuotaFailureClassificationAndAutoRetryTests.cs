@@ -1,4 +1,7 @@
 using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -27,25 +30,25 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     }
 
     [Theory]
-    [InlineData("You hit your usage limit. Try again after 5m.", QuotaFailureKind.LimitReached)]
-    [InlineData("rate_limit_exceeded reset after 1h", QuotaFailureKind.RateLimitExceeded)]
-    [InlineData("RESOURCE_EXHAUSTED reset after 20m", QuotaFailureKind.RateLimitExceeded)]
-    [InlineData("API Error: 401 unauthorized", QuotaFailureKind.Unauthorized)]
-    public void DetectorClassifiesQuotaTextFromAgentOutput(string stderr, QuotaFailureKind expected)
+    [InlineData(nameof(AgentKind.Codex), "You hit your usage limit. Try again after 5m.", QuotaFailureKind.LimitReached)]
+    [InlineData(nameof(AgentKind.Claude), "rate_limit_exceeded reset after 1h", QuotaFailureKind.RateLimitExceeded)]
+    [InlineData(nameof(AgentKind.Gemini), "RESOURCE_EXHAUSTED reset after 20m", QuotaFailureKind.RateLimitExceeded)]
+    [InlineData(nameof(AgentKind.Claude), "API Error: 401 unauthorized", QuotaFailureKind.Unauthorized)]
+    public void DetectorClassifiesQuotaTextFromAgentOutput(string agentName, string stderr, QuotaFailureKind expected)
     {
-        var detection = QuotaFailureDetector.Detect(stderr, stdout: null);
+        var detection = BuildClassifier().Detect(ResolveAgent(agentName), stderr, stdout: null);
 
         Assert.NotNull(detection);
         Assert.Equal(expected, detection!.Kind);
     }
 
     [Theory]
-    [InlineData("""{"msg":{"type":"error","message":"You hit your usage limit. Try again after 5m17s."}}""")]
-    [InlineData("""{"type":"result","subtype":"error","is_error":true,"result":"Error: rate_limit_exceeded retry after 30m"}""")]
-    [InlineData("""{"type":"result","status":"error","error":{"message":"[API Error: You have exhausted your capacity on this model. Your quota will reset after 21h41m24s.]"}}""")]
-    public void StructuredStreamJsonWrappedErrorsAreExtracted(string stdout)
+    [InlineData(nameof(AgentKind.Codex), """{"msg":{"type":"error","message":"You hit your usage limit. Try again after 5m17s."}}""")]
+    [InlineData(nameof(AgentKind.Claude), """{"type":"result","subtype":"error","is_error":true,"result":"Error: rate_limit_exceeded retry after 30m"}""")]
+    [InlineData(nameof(AgentKind.Gemini), """{"type":"result","status":"error","error":{"message":"[API Error: You have exhausted your capacity on this model. Your quota will reset after 21h41m24s.]"}}""")]
+    public void StructuredStreamJsonWrappedErrorsAreExtracted(string agentName, string stdout)
     {
-        var detection = QuotaFailureDetector.Detect(stderr: null, stdout);
+        var detection = BuildClassifier().Detect(ResolveAgent(agentName), stderr: null, stdout);
 
         Assert.NotNull(detection);
         Assert.NotNull(detection!.ResetAt);
@@ -54,7 +57,8 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     [Fact]
     public void ResetDuration_IsDetectedFromQuotaMessage()
     {
-        var detection = QuotaFailureDetector.Detect(stderr: "RESOURCE_EXHAUSTED reset after 20h31m6s", stdout: null);
+        var detection = BuildClassifier().Detect(AgentKind.Gemini,
+            stderr: "RESOURCE_EXHAUSTED reset after 20h31m6s", stdout: null);
 
         Assert.NotNull(detection);
         Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
@@ -70,11 +74,27 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
             quota exceeded retry after 10m
             """;
 
-        var detection = QuotaFailureDetector.Detect(stderr: null, stdout);
+        var detection = BuildClassifier().Detect(AgentKind.Gemini, stderr: null, stdout);
 
         Assert.NotNull(detection);
         Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
     }
+
+    private static IQuotaFailureClassifier BuildClassifier() =>
+        new CompositeQuotaFailureClassifier(
+        [
+            new ClaudeQuotaFailureDetector(),
+            new CodexQuotaFailureDetector(),
+            new GeminiQuotaFailureDetector(),
+        ]);
+
+    private static AgentKind ResolveAgent(string name) => name switch
+    {
+        nameof(AgentKind.Claude) => AgentKind.Claude,
+        nameof(AgentKind.Codex) => AgentKind.Codex,
+        nameof(AgentKind.Gemini) => AgentKind.Gemini,
+        _ => throw new ArgumentOutOfRangeException(nameof(name)),
+    };
 
     [Fact]
     public async Task PipelinePersistsQuotaResetAndNextRetryAfterAgentFailure()
@@ -309,7 +329,8 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            retryScheduler: retryScheduler);
+            retryScheduler: retryScheduler,
+            quotaClassifier: BuildClassifier());
 
         return new PipelineContext(pipeline, store);
     }

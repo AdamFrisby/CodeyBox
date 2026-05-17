@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -83,9 +84,9 @@ internal static class AgentStreamEndpoints
 
             await using var sniffStream = await streams.OpenReadAsync(item.Id, fileName, analysisCt);
             if (sniffStream is null) return Results.NotFound();
-            var sniffedKind = await AgentStreamParserSelection.SniffKindAsync(sniffStream, analysisCt);
+            var sniffedKind = await AgentStreamParserSelection.SniffKindAsync(sniffStream, parsers, analysisCt);
             var costRows = await costs.GetByWorkItemAsync(item.Id.ToString(), analysisCt);
-            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows);
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows, parsers.Select(p => p.Kind));
             var parser = parsers.FirstOrDefault(p => p.Kind == kind)
                 ?? parsers.FirstOrDefault(p => p.Kind.Value == "unknown")
                 ?? new UnknownAgentStreamParser();

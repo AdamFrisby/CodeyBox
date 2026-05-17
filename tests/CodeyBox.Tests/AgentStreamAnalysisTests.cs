@@ -2,6 +2,10 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Hosting;
@@ -159,6 +163,14 @@ public sealed class ClaudeStreamParserTests
 
 public sealed class CodexStreamParserTests
 {
+    private static IReadOnlyList<IAgentStreamParser> TestParsers() =>
+    [
+        new ClaudeStreamParser(),
+        new CodexStreamParser(),
+        new GeminiStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
     [Fact]
     public async Task SniffKindAsync_RecognizesInstalledPayloadResponseItemShape()
     {
@@ -166,7 +178,7 @@ public sealed class CodexStreamParserTests
             {"type":"response_item","payload":{"type":"function_call","call_id":"call_1","name":"unified_exec","arguments":"{\"cmd\":\"dotnet test\"}"}}
             """);
 
-        var kind = await AgentStreamParserSelection.SniffKindAsync(stream);
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, TestParsers());
 
         Assert.Equal(AgentKind.Codex, kind);
     }
@@ -902,7 +914,12 @@ public sealed class AgentStreamParserSelectionTests
             },
         };
 
-        var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind: null, costs);
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: null,
+            costs,
+            new[] { AgentKind.Claude, AgentKind.Codex, AgentKind.Gemini });
 
         Assert.Equal(AgentKind.Claude, kind);
     }
@@ -927,7 +944,12 @@ public sealed class AgentStreamParserSelectionTests
             null,
             DateTimeOffset.UtcNow);
 
-        var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind: null, []);
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: null,
+            costs: [],
+            knownKinds: new[] { AgentKind.Claude, AgentKind.Codex, AgentKind.Gemini });
 
         Assert.Equal(AgentKind.Gemini, kind);
     }

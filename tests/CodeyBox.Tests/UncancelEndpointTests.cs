@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.DependencyInjection;

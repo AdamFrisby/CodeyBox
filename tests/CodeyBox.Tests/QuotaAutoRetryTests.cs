@@ -1,5 +1,8 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -125,30 +128,39 @@ public sealed class QuotaAutoRetryTests : IDisposable
             projects, new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, webhooks, new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            retryScheduler: scheduler);
+            retryScheduler: scheduler,
+            quotaClassifier: BuildQuotaClassifier());
 
         return (pipeline, store, scheduler, webhooks);
     }
 
     [Fact]
-    public void QuotaFailureDetector_DetectsResetTime()
+    public void QuotaFailureClassifier_DetectsResetTime()
     {
-        var stdout = "rate_limit_exceeded reset after 1h";
-        var detection = QuotaFailureDetector.Detect(null, stdout);
+        var classifier = BuildQuotaClassifier();
+
+        var detection = classifier.Detect(AgentKind.Claude, stderr: null, stdout: "rate_limit_exceeded reset after 1h");
         Assert.NotNull(detection);
         Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
         Assert.NotNull(detection.ResetAt);
         var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
         Assert.True(diff.TotalMinutes > 59 && diff.TotalMinutes < 61);
 
-        var stderr = "RESOURCE_EXHAUSTED reset after 20h31m6s";
-        detection = QuotaFailureDetector.Detect(stderr, null);
+        detection = classifier.Detect(AgentKind.Gemini, stderr: "RESOURCE_EXHAUSTED reset after 20h31m6s", stdout: null);
         Assert.NotNull(detection);
         Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
         Assert.NotNull(detection.ResetAt);
         diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
         Assert.True(diff.TotalHours > 20 && diff.TotalHours < 21);
     }
+
+    private static IQuotaFailureClassifier BuildQuotaClassifier() =>
+        new CompositeQuotaFailureClassifier(
+        [
+            new ClaudeQuotaFailureDetector(),
+            new CodexQuotaFailureDetector(),
+            new GeminiQuotaFailureDetector(),
+        ]);
 
     [Fact]
     public async Task Pipeline_CapturesQuotaFailure_AndNotifiesScheduler()
