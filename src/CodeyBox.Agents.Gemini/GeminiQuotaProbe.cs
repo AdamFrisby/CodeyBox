@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -23,18 +24,34 @@ namespace CodeyBox.Agents.Gemini;
 ///
 /// Any network error, expired token, or unrecognised shape returns
 /// <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1.
+///
+/// <para>
+/// When the membership's ModelId is the <c>auto</c> sentinel
+/// (<see cref="GeminiKnownModels.AutoSentinel"/>), the probe additionally
+/// fans out <c>:generateContent</c> calls across the known bucket list to
+/// ground-truth per-model availability — the per-model rate-limit
+/// fragmentation Code Assist exhibits (e.g. <c>gemini-2.5-pro</c> 200, but
+/// <c>gemini-2.5-flash</c> 429) is invisible to the aggregated
+/// retrieveUserQuota fraction.
+/// </para>
 /// </summary>
 public sealed class GeminiQuotaProbe : IAgentQuotaProbe
 {
     internal const string UsageEndpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+    internal const string GenerateContentEndpoint = "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+
+    /// <summary>Bounded concurrency for the auto-sentinel fan-out.</summary>
+    internal const int AutoFanOutConcurrency = 2;
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly Func<AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<GeminiQuotaProbe> _log;
 
-    // Single-entry cache: (token, snapshot, expiry). Protected by _lock.
-    private (string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
+    // Cache keyed by (token, modelKey). modelKey = "" for default, "auto" for
+    // the auto-sentinel fan-out result. Two members on the same account using
+    // different sentinels don't clobber each other.
+    private readonly Dictionary<(string Token, string ModelKey), CacheEntry> _cache = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public AgentKind Kind => AgentKind.Gemini;
@@ -58,16 +75,19 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
 
+        var modelKey = GeminiKnownModels.IsAuto(member.ModelId) ? GeminiKnownModels.AutoSentinel : "";
+
         await _lock.WaitAsync(ct);
         try
         {
-            if (_cache is { } entry
-                && string.Equals(entry.AccessToken, token, StringComparison.Ordinal)
+            if (_cache.TryGetValue((token, modelKey), out var entry)
                 && DateTimeOffset.UtcNow < entry.ExpiresAt)
                 return entry.Snapshot;
 
-            var snapshot = await FetchAsync(token, ct);
-            _cache = (token, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
+            var snapshot = modelKey == GeminiKnownModels.AutoSentinel
+                ? await FetchAutoAsync(token, ct)
+                : await FetchAsync(token, ct);
+            _cache[(token, modelKey)] = new CacheEntry(snapshot, DateTimeOffset.UtcNow + _cacheTtl);
             return snapshot;
         }
         finally
@@ -111,6 +131,130 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             _log.LogDebug(ex, "Gemini quota probe failed; treating quota as unknown");
             return Unknown("network error");
         }
+    }
+
+    /// <summary>
+    /// Auto-sentinel ground-truth probe: fans out :generateContent across the
+    /// known bucket list (bounded concurrency) and aggregates per-model results.
+    /// Any 200 → AvailablePct=100; all 429 → AvailablePct=0 with min reset;
+    /// mixed → still 100 (Gemini's ModelRouterService will pick whichever
+    /// model is up at run time). Non-2xx/429 statuses are treated as "unknown
+    /// for that model" and excluded from the aggregate; if every model is
+    /// unknown the snapshot is Unknown.
+    /// </summary>
+    internal async Task<AgentQuotaSnapshot> FetchAutoAsync(string token, CancellationToken ct)
+    {
+        var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
+        using var sem = new SemaphoreSlim(AutoFanOutConcurrency, AutoFanOutConcurrency);
+        var tasks = GeminiKnownModels.All.Select(async modelId =>
+        {
+            await sem.WaitAsync(ct);
+            try
+            {
+                return (ModelId: modelId, Result: await ProbeOneAsync(token, modelId, ct));
+            }
+            finally
+            {
+                sem.Release();
+            }
+        }).ToList();
+
+        var results = await Task.WhenAll(tasks);
+
+        string? routedVia = null;
+        DateTimeOffset? earliestReset = null;
+        int knownCount = 0;
+        bool anyOk = false;
+
+        foreach (var (modelId, result) in results)
+        {
+            if (result.Status is null)
+            {
+                // Transient — not a definitive answer for this model; omit.
+                continue;
+            }
+            if (result.Status == HttpStatusCode.OK)
+            {
+                knownCount++;
+                anyOk = true;
+                routedVia ??= modelId;
+                perModel[modelId] = new ModelQuota { AvailablePct = 100.0, ResetAt = null, Window = "REQUESTS" };
+            }
+            else if (result.Status == HttpStatusCode.TooManyRequests)
+            {
+                knownCount++;
+                perModel[modelId] = new ModelQuota { AvailablePct = 0.0, ResetAt = result.ResetAt, Window = "REQUESTS" };
+                if (result.ResetAt is { } r && (earliestReset is null || r < earliestReset))
+                    earliestReset = r;
+            }
+            // else: 4xx/5xx other than 429 — treat as unknown for that model
+            // (not counted toward knownCount, omitted from perModel).
+        }
+
+        // Treat the run as Unknown if no model returned a definitive 200/429.
+        // Guarding on perModel.Count is equivalent (only 200/429 populate it) and
+        // protects against future regressions of the knownCount++ placement.
+        if (perModel.Count == 0)
+            return Unknown("auto fan-out: no definitive responses");
+
+        var notes = anyOk
+            ? $"auto routed via {routedVia}"
+            : "auto fan-out: all models rate-limited";
+
+        return new AgentQuotaSnapshot
+        {
+            AvailablePct = anyOk ? 100.0 : 0.0,
+            ResetAt = anyOk ? null : earliestReset,
+            Notes = notes,
+            PerModel = perModel,
+        };
+    }
+
+    internal async Task<ProbeOneResult> ProbeOneAsync(string token, string modelId, CancellationToken ct)
+    {
+        try
+        {
+            var client = _httpClientFactory.CreateClient("agent-quota");
+            using var request = new HttpRequestMessage(HttpMethod.Post, GenerateContentEndpoint);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            // Minimum-cost body that exercises the per-model quota path. The
+            // response content is discarded — we only care about status.
+            var body = "{\"model\":\"models/" + modelId
+                + "\",\"request\":{\"contents\":[{\"parts\":[{\"text\":\"ping\"}]}],"
+                + "\"generationConfig\":{\"maxOutputTokens\":1}}}";
+            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+
+            using var response = await client.SendAsync(request, ct);
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                var reset = TryParseRetryAfter(response, DateTimeOffset.UtcNow);
+                return new ProbeOneResult(response.StatusCode, reset);
+            }
+            return new ProbeOneResult(response.StatusCode, null);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Gemini auto-fan-out probe of {ModelId} failed; treating as unknown", modelId);
+            return new ProbeOneResult(null, null);
+        }
+    }
+
+    internal record struct ProbeOneResult(HttpStatusCode? Status, DateTimeOffset? ResetAt);
+
+    private static DateTimeOffset? TryParseRetryAfter(HttpResponseMessage response, DateTimeOffset now)
+    {
+        // Prefer the Retry-After header (delta-seconds or HTTP-date).
+        var ra = response.Headers.RetryAfter;
+        if (ra is not null)
+        {
+            if (ra.Delta is { } delta) return now + delta;
+            if (ra.Date is { } when) return when;
+        }
+        return null;
     }
 
     private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
@@ -211,4 +355,6 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
 
     private static AgentQuotaSnapshot Unknown(string reason) =>
         new() { AvailablePct = -1, Notes = reason };
+
+    private sealed record CacheEntry(AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt);
 }
