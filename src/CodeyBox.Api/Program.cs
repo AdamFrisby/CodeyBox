@@ -288,6 +288,7 @@ static IReadOnlyList<AgentClass> BuildAndValidateAgentClasses(
                     $"AgentClass '{classOpts.Id}': Gemini member with QualityScore={score} (≥90) requires " +
                     $"ReasoningMode=\"high\". Either set ReasoningMode=\"high\" (requires @google/gemini-cli ≥0.1.9 " +
                     $"with --thinking support; install via MultipassExtraRuncmd) or lower QualityScore below 90.");
+            GeminiKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, agentKind, m.ModelId, log);
             members.Add(new AgentMembership
             {
                 Agent = agentKind,
