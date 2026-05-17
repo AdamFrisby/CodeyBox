@@ -23,6 +23,13 @@ public sealed class CodexQuotaFailureDetector : IAgentQuotaFailureDetector
     [
         ("hit your usage limit", QuotaFailureKind.LimitReached),
         ("hit your limit", QuotaFailureKind.LimitReached),
+        // Codex CLI relays OpenAI's API errors verbatim; rate_limit_exceeded is the
+        // canonical token for both Anthropic + OpenAI 429s. Without this pattern the
+        // pipeline's mid-iteration fallback (CB-12) doesn't trigger on codex 429s.
+        ("rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded),
+        // Codex CLI sometimes prints the raw HTTP status to stderr on quota
+        // exhaustion before exiting non-zero, with no other quota keywords.
+        ("429 Too Many Requests", QuotaFailureKind.RateLimitExceeded),
         ("API Error: 401", QuotaFailureKind.Unauthorized),
     ];
 

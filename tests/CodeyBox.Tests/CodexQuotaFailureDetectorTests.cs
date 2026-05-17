@@ -47,11 +47,9 @@ public sealed class CodexQuotaFailureDetectorTests
         Assert.Null(_detector.Detect(stderr: "ordinary model error", stdout: null));
     }
 
-    [Fact]
-    public void Detect_ClaudeRateLimitText_ReturnsNull()
-    {
-        // Codex detector must not match claude's rate_limit_exceeded —
-        // it would mask a real codex-vs-claude routing decision.
-        Assert.Null(_detector.Detect(stderr: "rate_limit_exceeded", stdout: null));
-    }
+    // Removed: Detect_ClaudeRateLimitText_ReturnsNull. The original assumption
+    // (that rate_limit_exceeded is claude-only) was wrong — OpenAI's codex CLI
+    // surfaces the same canonical string on 429s. Both detectors intentionally
+    // match it. The composite dispatches by AgentKind, so there's no routing
+    // ambiguity from sharing the vocabulary.
 }

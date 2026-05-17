@@ -121,6 +121,9 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         // Don't override an already-unknown snapshot — the existing notes are more useful.
         if (snapshot.AvailablePct < 0) return snapshot;
         if (string.IsNullOrWhiteSpace(member.ModelId)) return snapshot;
+        // The "auto" sentinel routes via FetchAutoAsync — there is no single model
+        // to check against PerModel; the fan-out result IS the answer.
+        if (GeminiKnownModels.IsAuto(member.ModelId)) return snapshot;
         if (snapshot.PerModel.ContainsKey(member.ModelId)) return snapshot;
 
         var modelList = snapshot.PerModel.Count == 0
