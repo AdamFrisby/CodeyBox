@@ -275,6 +275,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         public AgentCostSnapshot? TryExtract(string? stdout, string? stderr)
             => new(InputTokens: 1000, CachedInputTokens: 100, OutputTokens: 200, ModelId: "fake-model");
+
+        public ModelRateConfig? DefaultPricing => null;
     }
 
     // ── Recording cost store ──────────────────────────────────────────────────

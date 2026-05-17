@@ -1056,15 +1056,6 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp => new DeadWorkerReaper(
     sp.GetRequiredService<IWebhookDispatcher>()));
 
 // --- Agent cost extractors + calculator ------------------------------------
-builder.Services.AddSingleton<AgentCostCalculator>(sp =>
-{
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
-    var pricing = opts.AgentPricing;
-    AgentCostCalculator.ValidateAtStartup(pricing,
-        sp.GetRequiredService<IAgentRegistry>().Available, startupLog);
-    return new AgentCostCalculator(pricing);
-});
 builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(sp =>
 {
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentCosts");
@@ -1083,6 +1074,16 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
                 "No cost extractor registered for agent '{Agent}'; cost data will not be captured for this agent", kind.Value);
     }
     return extractors;
+});
+builder.Services.AddSingleton<AgentCostCalculator>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
+    var pricing = opts.AgentPricing;
+    var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
+    AgentCostCalculator.ValidateAtStartup(pricing,
+        sp.GetRequiredService<IAgentRegistry>().Available, extractors, startupLog);
+    return new AgentCostCalculator(pricing, extractors);
 });
 builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
 {
@@ -1117,6 +1118,24 @@ builder.Services.AddSingleton<IAgentStreamParser, ClaudeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CodexStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
+
+// Per-provider buffered-stdout tool-call counters. Used by the orchestrator
+// to emit agent.tool_call.<name> telemetry when the agent runs without
+// structured-stream capture; the dictionary lookup keeps the orchestrator
+// from referencing any provider's stream-json shape directly.
+builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>(sp =>
+    new Dictionary<AgentKind, IAgentToolCallCounter>
+    {
+        [AgentKind.Claude] = new ClaudeToolCallCounter(),
+    });
+
+// Per-provider quota-failure detectors. Each agent library owns its own
+// patterns + stream-json shape; the orchestrator dispatches by AgentKind.
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, ClaudeQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, CodexQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, GeminiQuotaFailureDetector>();
+builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
+    new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
 
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
@@ -1169,7 +1188,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<IQuotaFailureStore>(),
     sp.GetRequiredService<QuotaRetryScheduler>(),
     sp.GetService<AgentClassRouter>(),
-    sp.GetService<IAgentFallbackHistoryStore>()));
+    sp.GetService<IAgentFallbackHistoryStore>(),
+    sp.GetRequiredService<IQuotaFailureClassifier>(),
+    sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

@@ -201,6 +201,7 @@ public sealed class PipelineRunnerUsagePublishTests : IDisposable
         public AgentKind Kind => AgentKind.Claude;
         public AgentCostSnapshot? TryExtract(string? stdout, string? stderr)
             => new(InputTokens: 1000, CachedInputTokens: 100, OutputTokens: 200, ModelId: "fake-model");
+        public ModelRateConfig? DefaultPricing => null;
     }
 
     private sealed class OnceFailingAuditor : IAuditor

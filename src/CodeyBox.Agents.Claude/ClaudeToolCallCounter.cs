@@ -1,6 +1,8 @@
 using System.Text.Json;
+using CodeyBox.Agents;
+using CodeyBox.Core;
 
-namespace CodeyBox.Orchestrator;
+namespace CodeyBox.Agents.Claude;
 
 /// <summary>
 /// Best-effort parser for Claude Code's <c>--output-format stream-json</c> stdout.
@@ -10,18 +12,18 @@ namespace CodeyBox.Orchestrator;
 /// persists stream-json losslessly and intentionally skips this immediate
 /// parser; a follow-up analyzer reads the persisted files.
 /// </summary>
-public static class AgentStreamJsonParser
+public sealed class ClaudeToolCallCounter : IAgentToolCallCounter
 {
-    public sealed record ParseResult(
-        IReadOnlyDictionary<string, int> ToolCallCounts,
-        string? FinalText);
+    public AgentKind Kind => AgentKind.Claude;
+
+    public AgentToolCallCounts? TryCount(string? bufferedStdout) => TryParse(bufferedStdout);
 
     /// <summary>
     /// Attempts to parse <paramref name="stdout"/> as Claude stream-json NDJSON.
     /// Returns null if the content is not recognisable as stream-json.
     /// Malformed individual lines are silently skipped.
     /// </summary>
-    public static ParseResult? TryParse(string? stdout)
+    public static AgentToolCallCounts? TryParse(string? stdout)
     {
         if (string.IsNullOrWhiteSpace(stdout)) return null;
 
@@ -44,7 +46,6 @@ public static class AgentStreamJsonParser
 
                 if (type == "assistant")
                 {
-                    // Extract tool_use items from message.content array.
                     if (!root.TryGetProperty("message", out var msg)) continue;
                     if (!msg.TryGetProperty("content", out var content)) continue;
                     if (content.ValueKind != JsonValueKind.Array) continue;
@@ -66,16 +67,13 @@ public static class AgentStreamJsonParser
             }
             catch (JsonException)
             {
-                // Skip malformed JSON lines — best-effort, never throw.
             }
             catch (InvalidOperationException)
             {
-                // Skip lines where a JSON element type doesn't match expected.
             }
         }
 
-        // Only return a result if we found at least something recognisable.
         if (toolCounts.Count == 0 && finalText is null) return null;
-        return new ParseResult(toolCounts, finalText);
+        return new AgentToolCallCounts(toolCounts, finalText);
     }
 }

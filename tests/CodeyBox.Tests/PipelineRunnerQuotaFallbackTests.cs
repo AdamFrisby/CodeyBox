@@ -371,6 +371,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         public FakeFallbackExtractor(AgentKind kind) { Kind = kind; }
         public AgentCostSnapshot? TryExtract(string? stdout, string? stderr)
             => new(InputTokens: 100, CachedInputTokens: 0, OutputTokens: 50, ModelId: $"fake-{Kind.Value}");
+        public ModelRateConfig? DefaultPricing => null;
     }
 
     private ThreeMemberFixture BuildPipelineThreeMembers(string seedRepoUrl)
