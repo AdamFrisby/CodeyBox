@@ -64,11 +64,13 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
     [Fact]
     public async Task AutoMember_AllRateLimited_Reports0PctWithEarliestReset()
     {
-        var earliest = new DateTimeOffset(2026, 5, 17, 11, 0, 0, TimeSpan.Zero);
-        var later = new DateTimeOffset(2026, 5, 17, 14, 0, 0, TimeSpan.Zero);
+        // Use relative offsets from now so the test stays valid as wall-clock advances.
+        var now = DateTimeOffset.UtcNow;
+        var earliest = now + TimeSpan.FromMinutes(10);
+        var later = now + TimeSpan.FromMinutes(30);
 
         var handler = new GeminiAutoFanOutHandler(
-            modelStatus: _ => (HttpStatusCode)429,
+            modelStatus: _ => HttpStatusCode.TooManyRequests,
             // Vary Retry-After so the aggregation has to pick the min.
             retryAfterFor: modelId => modelId == "gemini-2.5-pro" ? later : earliest);
 
@@ -90,7 +92,7 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
         // Two of the known models 200, two 429 — auto-routing will land on
         // whichever is up, so the aggregate stays "available".
         var handler = new GeminiAutoFanOutHandler(modelStatus: modelId =>
-            modelId.Contains("pro") ? HttpStatusCode.OK : (HttpStatusCode)429);
+            modelId.Contains("pro") ? HttpStatusCode.OK : HttpStatusCode.TooManyRequests);
 
         var probe = BuildProbe(handler);
         var snapshot = await probe.GetAvailabilityAsync(AutoMember, CancellationToken.None);
@@ -159,6 +161,77 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
         Assert.Equal(totalAfterPopulate, handler.Requests.Count);
     }
 
+    [Fact]
+    public async Task AutoMember_AllOtherErrors_ReportsUnknownNotRateLimited()
+    {
+        // Every model returns 500: previous bug counted these toward knownCount
+        // and the snapshot fell through to AvailablePct=0 "all models rate-limited".
+        // Correct behaviour: snapshot is Unknown (AvailablePct=-1).
+        var handler = new GeminiAutoFanOutHandler(modelStatus: _ => HttpStatusCode.InternalServerError);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(AutoMember, CancellationToken.None);
+
+        Assert.Equal(-1, snapshot.AvailablePct);
+        Assert.NotNull(snapshot.Notes);
+        Assert.Contains("no definitive", snapshot.Notes!);
+        Assert.Empty(snapshot.PerModel);
+    }
+
+    [Fact]
+    public async Task AutoMember_AllTransientThrows_ReportsUnknown()
+    {
+        // ProbeOneAsync catches transport exceptions and returns (Status=null, Reset=null).
+        // When every model throws, the aggregate must be Unknown rather than 0% or 100%.
+        var handler = new GeminiAutoFanOutHandler(
+            modelStatus: _ => HttpStatusCode.OK,
+            throwFor: _ => true);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(AutoMember, CancellationToken.None);
+
+        Assert.Equal(-1, snapshot.AvailablePct);
+        Assert.NotNull(snapshot.Notes);
+        Assert.Contains("no definitive", snapshot.Notes!);
+    }
+
+    [Fact]
+    public async Task AutoMember_OneThrows_RestAggregateNormally()
+    {
+        // One model raises (treated as transient/unknown); the other three return 200.
+        // Aggregate should still surface AvailablePct=100 from the survivors.
+        var handler = new GeminiAutoFanOutHandler(
+            modelStatus: _ => HttpStatusCode.OK,
+            throwFor: modelId => modelId == "gemini-2.5-pro");
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(AutoMember, CancellationToken.None);
+
+        Assert.Equal(100, snapshot.AvailablePct);
+        Assert.StartsWith("auto routed via ", snapshot.Notes!);
+        // The throwing model is not present in PerModel; the other three are.
+        Assert.DoesNotContain("gemini-2.5-pro", snapshot.PerModel.Keys);
+        Assert.Contains("gemini-2.5-flash", snapshot.PerModel.Keys);
+    }
+
+    [Fact]
+    public async Task AutoMember_MixedOkAnd500_AggregatesOnlyDefinitive()
+    {
+        // 200 + 500 mix: the 500 must be excluded from PerModel and from the
+        // 'rate-limited' aggregate. With at least one 200, AvailablePct=100.
+        var handler = new GeminiAutoFanOutHandler(modelStatus: modelId =>
+            modelId.Contains("flash") ? HttpStatusCode.InternalServerError : HttpStatusCode.OK);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(AutoMember, CancellationToken.None);
+
+        Assert.Equal(100, snapshot.AvailablePct);
+        Assert.StartsWith("auto routed via ", snapshot.Notes!);
+        // Only 200 responses populate PerModel; the 500s are dropped as Unknown.
+        Assert.Contains("gemini-2.5-pro", snapshot.PerModel.Keys);
+        Assert.DoesNotContain("gemini-2.5-flash", snapshot.PerModel.Keys);
+    }
+
     /// <summary>
     /// Routes by request URL: the retrieveUserQuota POST is answered with
     /// <c>usageBody</c>; per-model generateContent POSTs are answered using
@@ -171,15 +244,18 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
 
         private readonly Func<string, HttpStatusCode> _modelStatus;
         private readonly Func<string, DateTimeOffset>? _retryAfterFor;
+        private readonly Func<string, bool>? _throwFor;
         private readonly string _usageBody;
 
         public GeminiAutoFanOutHandler(
             Func<string, HttpStatusCode> modelStatus,
             Func<string, DateTimeOffset>? retryAfterFor = null,
+            Func<string, bool>? throwFor = null,
             string usageBody = """{"buckets":[]}""")
         {
             _modelStatus = modelStatus;
             _retryAfterFor = retryAfterFor;
+            _throwFor = throwFor;
             _usageBody = usageBody;
         }
 
@@ -198,12 +274,15 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
 
             // generateContent — pull the model id from the body.
             var modelId = ParseModelId(body);
+            if (_throwFor is not null && _throwFor(modelId))
+                throw new HttpRequestException($"simulated transport failure for {modelId}");
+
             var status = _modelStatus(modelId);
             var response = new HttpResponseMessage(status)
             {
                 Content = new StringContent(status == HttpStatusCode.OK ? "{}" : "{\"error\":\"quota\"}"),
             };
-            if ((int)status == 429 && _retryAfterFor is not null)
+            if (status == HttpStatusCode.TooManyRequests && _retryAfterFor is not null)
             {
                 var when = _retryAfterFor(modelId);
                 var delta = when - DateTimeOffset.UtcNow;

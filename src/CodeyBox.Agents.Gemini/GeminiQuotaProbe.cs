@@ -173,27 +173,28 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
                 // Transient — not a definitive answer for this model; omit.
                 continue;
             }
-            knownCount++;
             if (result.Status == HttpStatusCode.OK)
             {
+                knownCount++;
                 anyOk = true;
                 routedVia ??= modelId;
                 perModel[modelId] = new ModelQuota { AvailablePct = 100.0, ResetAt = null, Window = "REQUESTS" };
             }
-            else if ((int)result.Status == 429)
+            else if (result.Status == HttpStatusCode.TooManyRequests)
             {
+                knownCount++;
                 perModel[modelId] = new ModelQuota { AvailablePct = 0.0, ResetAt = result.ResetAt, Window = "REQUESTS" };
                 if (result.ResetAt is { } r && (earliestReset is null || r < earliestReset))
                     earliestReset = r;
             }
-            else
-            {
-                // 4xx/5xx other than 429 — treat as unknown for that model.
-                continue;
-            }
+            // else: 4xx/5xx other than 429 — treat as unknown for that model
+            // (not counted toward knownCount, omitted from perModel).
         }
 
-        if (knownCount == 0)
+        // Treat the run as Unknown if no model returned a definitive 200/429.
+        // Guarding on perModel.Count is equivalent (only 200/429 populate it) and
+        // protects against future regressions of the knownCount++ placement.
+        if (perModel.Count == 0)
             return Unknown("auto fan-out: no definitive responses");
 
         var notes = anyOk
@@ -224,7 +225,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             request.Content = new StringContent(body, Encoding.UTF8, "application/json");
 
             using var response = await client.SendAsync(request, ct);
-            if ((int)response.StatusCode == 429)
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
                 var reset = TryParseRetryAfter(response, DateTimeOffset.UtcNow);
                 return new ProbeOneResult(response.StatusCode, reset);
