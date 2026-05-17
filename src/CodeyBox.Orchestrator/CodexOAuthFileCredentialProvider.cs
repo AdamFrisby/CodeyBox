@@ -23,43 +23,41 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
 {
-    private readonly string _filePath;
+    private readonly CredentialFileSource _source;
     private readonly ILogger<CodexOAuthFileCredentialProvider>? _log;
 
     public CodexOAuthFileCredentialProvider(
         string filePath,
         ILogger<CodexOAuthFileCredentialProvider>? log = null)
+        : this(new CredentialFileSource(
+            filePath ?? throw new ArgumentNullException(nameof(filePath)), log), log)
     {
-        _filePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
+    }
+
+    public CodexOAuthFileCredentialProvider(
+        CredentialFileSource source,
+        ILogger<CodexOAuthFileCredentialProvider>? log = null)
+    {
+        _source = source ?? throw new ArgumentNullException(nameof(source));
         _log = log;
     }
 
-    public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+    public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
     {
         if (agent != AgentKind.Codex)
-            return null;
+            return Task.FromResult<AgentCredential?>(null);
 
-        if (!File.Exists(_filePath))
+        var raw = _source.GetRaw();
+        if (string.IsNullOrWhiteSpace(raw))
         {
-            _log?.LogDebug("Codex OAuth file not found at {Path}; falling through", _filePath);
-            return null;
-        }
-
-        string raw;
-        try
-        {
-            raw = await File.ReadAllTextAsync(_filePath, ct);
-        }
-        catch (Exception ex)
-        {
-            _log?.LogWarning(ex, "Failed to read Codex OAuth file {Path}; falling through", _filePath);
-            return null;
+            _log?.LogDebug("Codex OAuth file not present or empty at {Path}; falling through", _source.FilePath);
+            return Task.FromResult<AgentCredential?>(null);
         }
 
         if (!CodexAuthJsonCredential.TryCreate(raw, out var credential))
         {
-            _log?.LogWarning("Codex OAuth file {Path} has neither tokens.access_token nor OPENAI_API_KEY; falling through", _filePath);
-            return null;
+            _log?.LogWarning("Codex OAuth file {Path} has neither tokens.access_token nor OPENAI_API_KEY; falling through", _source.FilePath);
+            return Task.FromResult<AgentCredential?>(null);
         }
 
         // Mount the host directory containing auth.json into the sandbox at the
@@ -73,7 +71,7 @@ public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
         // Sandbox providers that don't support host-path bind-mounts ignore
         // this entry; the CODEX_AUTH_JSON env var still materialises the file
         // as a fallback (see CodexAgentRunner.PrepareSandboxAsync).
-        var hostDir = Path.GetDirectoryName(_filePath);
+        var hostDir = Path.GetDirectoryName(_source.FilePath);
         if (!string.IsNullOrEmpty(hostDir) && Directory.Exists(hostDir))
         {
             credential = credential with
@@ -86,7 +84,7 @@ public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
                 }],
             };
         }
-        return credential;
+        return Task.FromResult<AgentCredential?>(credential);
     }
 
     /// <summary>

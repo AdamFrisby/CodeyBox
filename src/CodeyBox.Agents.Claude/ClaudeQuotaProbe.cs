@@ -126,6 +126,21 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         };
     }
 
+    /// <summary>
+    /// Drops the in-process snapshot so the next
+    /// <see cref="GetAvailabilityAsync"/> call refetches against the upstream
+    /// usage endpoint. Wire to <see cref="CodeyBox.Orchestrator.CredentialFileSource.TokenUpdated"/>
+    /// so an out-of-band host token rotation (operator running the CLI, child
+    /// sandbox writeback, scripted refresh) doesn't leave a stale 401 pinned
+    /// for the full cache TTL.
+    /// </summary>
+    public void InvalidateCache()
+    {
+        _lock.Wait();
+        try { _cache = null; }
+        finally { _lock.Release(); }
+    }
+
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
 
     private async Task<AgentQuotaSnapshot> FetchAsync(string token, CancellationToken ct)
