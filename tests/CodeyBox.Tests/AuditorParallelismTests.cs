@@ -46,9 +46,13 @@ file sealed class FixedQuotaProbe : IAgentQuotaProbe
     }
 
     public AgentKind Kind { get; }
+    public int CallCount { get; private set; }
 
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = _resetAt });
+    {
+        CallCount++;
+        return Task.FromResult(new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = _resetAt });
+    }
 }
 
 file sealed class ExhaustedNoResetQuotaProbe : IAgentQuotaProbe
@@ -378,8 +382,8 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         Assert.NotNull(final.NextQuotaRetryAt);
         Assert.InRange(
             final.QuotaResetAt.Value,
-            beforeFailure.Add(PipelineRunner.DefaultQuotaFailurePause),
-            afterFailure.Add(PipelineRunner.DefaultQuotaFailurePause));
+            beforeFailure.AddMinutes(5),
+            afterFailure.AddMinutes(5));
         Assert.Equal(final.QuotaResetAt, final.NextQuotaRetryAt);
         Assert.Contains("Audit agent", final.LastError);
         Assert.Equal(1, calls);
@@ -389,6 +393,27 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
     public async Task LlmAgentQuotaFailure_UsesParsedResetMarkerBeforeDefaultFallback()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var probe = new FixedQuotaProbe(AgentKind.Claude, DateTimeOffset.UtcNow.AddHours(1));
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                },
+            ],
+        };
+        var router = new AgentClassRouter(
+            [frontier],
+            [probe],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance);
+
         var auditor = new FakeLlmAuditor(
             "quota-review",
             (_, _, _) => Task.FromResult(new AuditResult(false, [new AuditFinding(
@@ -400,10 +425,15 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
                 AgentStdout: "rate_limit_exceeded; retry after 13m")),
             AuditCapabilities.AgentCredentials);
 
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], maxAuditIterations: 1);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            classRouter: router);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
-        var item = AuditorTestHelpers.NewItem();
+        var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
         await tp.Store.CreateAsync(item);
         var beforeFailure = DateTimeOffset.UtcNow;
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
@@ -414,6 +444,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         Assert.Equal("quota", final.FailureKind);
         Assert.NotNull(final.QuotaResetAt);
         Assert.NotNull(final.NextQuotaRetryAt);
+        Assert.Equal(0, probe.CallCount);
         Assert.InRange(
             final.QuotaResetAt.Value,
             beforeFailure.AddMinutes(13),
@@ -534,8 +565,8 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         Assert.NotNull(final.NextQuotaRetryAt);
         Assert.InRange(
             final.QuotaResetAt.Value,
-            beforeFailure.Add(PipelineRunner.DefaultQuotaFailurePause),
-            afterFailure.Add(PipelineRunner.DefaultQuotaFailurePause));
+            beforeFailure.AddMinutes(5),
+            afterFailure.AddMinutes(5));
         Assert.Equal(final.QuotaResetAt, final.NextQuotaRetryAt);
     }
 }
