@@ -342,6 +342,8 @@ public sealed class PipelineRunner : IPipelineRunner
             // -------- Phase 1: Work --------
             if (!skipWork)
             {
+                await PublishIterationStartedAsync(item, project, IterationPhase.Work, iteration: 1, ct);
+                var workIterationStart = DateTimeOffset.UtcNow;
                 await Transition(item, WorkItemState.Working, ct, project);
                 string? workAgentStdout = null;
                 using (var workPhase = new PhaseCancellation("work", ct, _opts.TimeProvider))
@@ -375,6 +377,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
+                await PublishIterationCompletedAsync(item, project, IterationPhase.Work, iteration: 1,
+                    repoId, workBranch, workIterationStart, ct);
                 if (resumingPreempt)
                 {
                     await ClearPreemptAsync(item, ct);
@@ -391,6 +395,8 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             else if (resumingPreempt && entry is WorkItemState.Reworking)
             {
+                await PublishIterationStartedAsync(item, project, IterationPhase.Rework, iteration: 1, ct);
+                var resumeReworkStart = DateTimeOffset.UtcNow;
                 await Transition(item, WorkItemState.Reworking, ct, project);
                 string? reworkStdout = null;
                 using (var reworkPhase = new PhaseCancellation("rework-resume", ct, _opts.TimeProvider))
@@ -422,6 +428,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
+                await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, iteration: 1,
+                    repoId, workBranch, resumeReworkStart, ct);
                 await ClearPreemptAsync(item, ct);
                 item = item with { PreemptedAt = null, PreemptCheckpoint = null };
 
@@ -468,6 +476,7 @@ public sealed class PipelineRunner : IPipelineRunner
             string? agentStdout = null;
             if (!skipMerge)
             {
+                await PublishMergeStartedAsync(item, project, baseBranch, workBranch, ct);
                 await Transition(item, WorkItemState.Merging, ct, project);
                 using (var mergePhase = new PhaseCancellation("merge", ct, _opts.TimeProvider))
                 {
@@ -496,6 +505,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
                 await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
                 await Transition(item, WorkItemState.Merged, ct, project);
+                await PublishMergeCompletedAsync(item, project, baseBranch, workBranch, mergeSha, ct);
             }
 
             // -------- Phase 3: Upstream push (separate atomic unit) --------
@@ -1849,6 +1859,8 @@ public sealed class PipelineRunner : IPipelineRunner
             if (hostShutdownToken.IsCancellationRequested)
                 throw new OperationCanceledException(hostShutdownToken);
 
+            await PublishAuditStartedAsync(item, project, iteration, auditors, ct);
+            var auditPhaseStart = DateTimeOffset.UtcNow;
             await Transition(item, WorkItemState.Auditing, ct, project);
             using var auditPhase = new PhaseCancellation("audit", ct, _opts.TimeProvider);
             auditPhase.SetPhaseTimeout(project.Audit.PerIterationTimeout);
@@ -1894,6 +1906,8 @@ public sealed class PipelineRunner : IPipelineRunner
             CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
                 new KeyValuePair<string, object?>("iteration", iteration.ToString()));
 
+            await PublishAuditFindingsEmittedAsync(item, project, iteration, findings, blocking.Count, nonBlocking);
+
             var iterUsage = await TryGetUsageSummaryAsync(item.Id);
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -1906,6 +1920,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 Usage = iterUsage?.Iteration,
                 UsageTotal = iterUsage?.Total,
             }, CancellationToken.None);
+
+            var auditVerdict = blocking.Count == 0 ? AuditVerdict.Pass : AuditVerdict.Fail;
+            await PublishAuditCompletedAsync(item, project, iteration, auditVerdict, auditPhaseStart);
 
             if (blocking.Count == 0)
             {
@@ -1929,6 +1946,11 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "reworking"));
+            // Rework following audit iteration N is the input that will be
+            // evaluated by audit iteration N+1, so emit it as iteration N+1.
+            var reworkIterationNumber = iteration + 1;
+            await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
+            var reworkStart = DateTimeOffset.UtcNow;
             await Transition(item, WorkItemState.Reworking, ct, project);
             var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
@@ -1961,6 +1983,8 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 throw reworkPhase.Wrap(oce);
             }
+            await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
+                repoId, workBranch, reworkStart, ct);
             if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
             {
                 var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
@@ -4941,6 +4965,220 @@ public sealed class PipelineRunner : IPipelineRunner
         if (thresholdMinutes < 1)
             _log.LogWarning("Stuck probe: threshold {Min}min is below minimum 1 min for phase '{Phase}'",
                 thresholdMinutes, phase);
+    }
+
+    // ── Intermediate webhook events ──────────────────────────────────────────
+    //
+    // Fire-and-forget signals that surface intra-pipeline progress to webhook
+    // subscribers (work-item.* terminal events still cover the boundary
+    // outcomes). Every helper here is best-effort: failures must NEVER bubble
+    // out of the pipeline, so we swallow exceptions and log at Debug.
+
+    private async Task PublishIterationStartedAsync(
+        WorkItem item, Project project, string phase, int iteration, CancellationToken ct)
+    {
+        try
+        {
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "iteration.started",
+                WorkItem = current,
+                Project = project,
+                Details = new IterationStartedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    Iteration = iteration,
+                    Phase = phase,
+                    DispatchedAt = DateTimeOffset.UtcNow,
+                },
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "iteration.started webhook publish failed for {Id}", item.Id);
+        }
+    }
+
+    private async Task PublishIterationCompletedAsync(
+        WorkItem item, Project project, string phase, int iteration,
+        string repoId, string workBranch, DateTimeOffset startedAt, CancellationToken ct)
+    {
+        try
+        {
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
+            var commitSha = await TryResolveBranchTipAsync(repoId, workBranch, ct);
+            var durationMs = (long)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "iteration.completed",
+                WorkItem = current,
+                Project = project,
+                Details = new IterationCompletedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    Iteration = iteration,
+                    Phase = phase,
+                    CommitSha = commitSha,
+                    DurationMs = durationMs,
+                    Success = true,
+                },
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "iteration.completed webhook publish failed for {Id}", item.Id);
+        }
+    }
+
+    private async Task PublishAuditStartedAsync(
+        WorkItem item, Project project, int iteration, IReadOnlyList<IAuditor> auditors, CancellationToken ct)
+    {
+        try
+        {
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "audit.started",
+                WorkItem = current,
+                Project = project,
+                Details = new AuditStartedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    Iteration = iteration,
+                    AuditorsScheduled = auditors.Select(a => a.Name).ToList(),
+                },
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "audit.started webhook publish failed for {Id}", item.Id);
+        }
+    }
+
+    private async Task PublishAuditFindingsEmittedAsync(
+        WorkItem item, Project project, int iteration,
+        IReadOnlyList<AuditFinding> findings, int blocking, int nonBlocking)
+    {
+        try
+        {
+            var payload = findings.Select(f => new AuditFindingPayload
+            {
+                Auditor = f.AuditorName,
+                Severity = f.Severity.ToString(),
+                Title = f.Title,
+                Location = f.Location,
+                Description = f.Description,
+            }).ToList();
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "audit.findings.emitted",
+                WorkItem = item,
+                Project = project,
+                Details = new AuditFindingsEmittedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    Iteration = iteration,
+                    Findings = payload,
+                    Blocking = blocking,
+                    NonBlocking = nonBlocking,
+                },
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "audit.findings.emitted webhook publish failed for {Id}", item.Id);
+        }
+    }
+
+    private async Task PublishAuditCompletedAsync(
+        WorkItem item, Project project, int iteration, string verdict, DateTimeOffset startedAt)
+    {
+        try
+        {
+            var durationMs = (long)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "audit.completed",
+                WorkItem = item,
+                Project = project,
+                Details = new AuditCompletedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    Iteration = iteration,
+                    Verdict = verdict,
+                    DurationMs = durationMs,
+                },
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "audit.completed webhook publish failed for {Id}", item.Id);
+        }
+    }
+
+    private async Task PublishMergeStartedAsync(
+        WorkItem item, Project project, string baseBranch, string workBranch, CancellationToken ct)
+    {
+        try
+        {
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "merge.started",
+                WorkItem = current,
+                Project = project,
+                Details = new MergeStartedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    BaseBranch = baseBranch,
+                    WorkBranch = workBranch,
+                },
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "merge.started webhook publish failed for {Id}", item.Id);
+        }
+    }
+
+    private async Task PublishMergeCompletedAsync(
+        WorkItem item, Project project, string baseBranch, string workBranch,
+        string? mergeSha, CancellationToken ct)
+    {
+        try
+        {
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "merge.completed",
+                WorkItem = current,
+                Project = project,
+                Details = new MergeCompletedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    BaseBranch = baseBranch,
+                    WorkBranch = workBranch,
+                    MergeSha = mergeSha,
+                    Conflicts = null,
+                },
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "merge.completed webhook publish failed for {Id}", item.Id);
+        }
+    }
+
+    private async Task<string?> TryResolveBranchTipAsync(string repoId, string branch, CancellationToken ct)
+    {
+        try { return await _gitHost.ResolveCommitAsync(repoId, branch, ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Failed to resolve commit SHA for branch {Branch} in repo {Repo}", branch, repoId);
+            return null;
+        }
     }
 
     private async Task Transition(WorkItem item, WorkItemState state, CancellationToken ct, Project? project = null)

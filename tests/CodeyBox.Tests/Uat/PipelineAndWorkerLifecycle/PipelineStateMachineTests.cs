@@ -43,7 +43,10 @@ public sealed class PipelineStateMachineTests : IDisposable
         Assert.False(string.IsNullOrWhiteSpace(final.MergeSha));
         var lifecycleEvents = context.Webhooks.Events
             .Select(e => e.Event)
-            .Where(e => e != "work_item.audit_iteration")
+            .Where(e => e != "work_item.audit_iteration"
+                && !e.StartsWith("iteration.", StringComparison.Ordinal)
+                && !e.StartsWith("audit.", StringComparison.Ordinal)
+                && !e.StartsWith("merge.", StringComparison.Ordinal))
             .ToArray();
         Assert.Equal(
             [

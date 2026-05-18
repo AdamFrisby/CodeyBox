@@ -44,6 +44,13 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `sandbox.leak_detected` | A leaked `codeybox-*` Multipass VM was detected (see [Details](#sandbox_leak-details)) |
 | `sandbox.leak_disposed` | A leaked sandbox was successfully auto-disposed |
 | `sandbox.leak_dispose_failed` | Auto-disposal of a leaked sandbox failed |
+| `iteration.started` | A work or rework iteration was dispatched to the agent (see [Intermediate events](#intermediate-progress-events)) |
+| `iteration.completed` | A work or rework iteration finished and committed |
+| `audit.started` | An audit iteration started; carries the scheduled auditor list |
+| `audit.findings.emitted` | Audit iteration produced findings; carries the full finding list so trackers can render comments without polling |
+| `audit.completed` | Audit iteration finished with a `pass` or `fail` verdict |
+| `merge.started` | Merge phase started |
+| `merge.completed` | Merge phase succeeded; carries the merge commit SHA |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -55,6 +62,7 @@ Every event is a JSON object POSTed as the request body.
 
 ```json
 {
+  "eventSchemaVersion": "1.0",
   "event": "work_item.audit_passed",
   "occurredAt": "2026-04-29T12:34:56.789+00:00",
   "workItem": {
@@ -103,6 +111,12 @@ cumulative spend across every iteration of the work item. Both blocks are
 omitted entirely when no cost data is available (e.g. an agent without a
 registered cost extractor) — receivers should treat absent as "unknown".
 `tokensReasoning` is reserved for future model surfaces and is `0` today.
+
+`eventSchemaVersion` is stamped on every payload and identifies the envelope
+contract version (top-level fields, identifier semantics, signing). New event
+types or new optional `details` fields are additive and do **not** bump this
+version. Receivers should treat unknown event names as a no-op and ignore any
+unknown fields inside `details`.
 
 ### `audit_iteration` details
 
@@ -438,6 +452,191 @@ sandboxes are not associated with a specific work item.
 | `reason` | string | all | Stable classification reason code (added in event schema `1.1`), e.g. `untracked_sandbox_age_threshold_exceeded` or `untracked_sandbox_missing_creation_metadata` |
 | `disposedAt` | ISO-8601 | `sandbox.leak_disposed` | Timestamp when the sandbox was successfully disposed |
 | `error` | string | `sandbox.leak_dispose_failed` | Human-readable failure reason (e.g. `"timeout"` or multipass error) |
+
+---
+
+## Intermediate progress events
+
+In addition to the terminal `work_item.<state>` transitions, the pipeline emits
+fine-grained progress events at every internal state-machine boundary. Trackers
+(Jira, Linear, etc.) can subscribe to these to surface live progress comments
+on issues without polling the audit-findings or work-item endpoints.
+
+All events are **additive**: existing subscribers that filter on `work_item.*`
+keep working unchanged. To opt in, add the desired event names to the endpoint's
+`EventFilter` array. Receivers should ignore unknown event names so future
+additions don't require downstream changes.
+
+The events fire in this order across one successful lifecycle:
+
+```
+iteration.started(work)
+iteration.completed(work)
+audit.started
+audit.findings.emitted
+audit.completed             ← repeats from iteration.started(rework) if blocking findings
+merge.started
+merge.completed
+```
+
+When audit iteration N produces blocking findings and rework is permitted,
+`iteration.started(rework)` and `iteration.completed(rework)` fire with
+`iteration = N + 1` (the rework is the "next attempt", evaluated by audit
+iteration N+1). The audit phase events use the audit iteration number directly.
+
+### `iteration.started` details
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "iteration": 1,
+    "phase": "work",
+    "dispatchedAt": "2026-05-18T12:00:00.000+00:00"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `iteration` | int | 1-indexed iteration number; aligns with the audit iteration that will evaluate this attempt |
+| `phase` | string | `"work"` for the initial attempt, `"rework"` for subsequent attempts driven by audit findings |
+| `dispatchedAt` | ISO-8601 | When the iteration was dispatched to the agent |
+
+### `iteration.completed` details
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "iteration": 1,
+    "phase": "work",
+    "commitSha": "abc123def456...",
+    "durationMs": 18234,
+    "success": true
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `iteration` | int | Matches the `iteration` from the paired `iteration.started` |
+| `phase` | string | `"work"` or `"rework"` |
+| `commitSha` | string\|null | Tip of the work branch after the iteration committed; null when the host could not resolve it |
+| `durationMs` | int | Wall-clock duration from `iteration.started` to this event |
+| `success` | bool | `true` when the iteration produced a commit. Failed iterations surface via `work_item.failed` and do not fire this event today. |
+
+### `audit.started` details
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "iteration": 1,
+    "auditorsScheduled": ["build", "lint", "llm-review"]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `iteration` | int | Audit iteration number, 1-indexed |
+| `auditorsScheduled` | string[] | Names of the auditors that will run this iteration, in stable order |
+
+### `audit.findings.emitted` details
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "iteration": 1,
+    "findings": [
+      {
+        "auditor": "build",
+        "severity": "Error",
+        "title": "compilation failed",
+        "location": "src/Foo.cs:42",
+        "description": "expected ';' after expression"
+      }
+    ],
+    "blocking": 1,
+    "nonBlocking": 0
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `iteration` | int | Audit iteration number |
+| `findings` | array | Full finding list. May be empty when the audit produced no findings. |
+| `findings[].auditor` | string | Name of the auditor that produced the finding |
+| `findings[].severity` | string | `"Info"`, `"Warning"`, or `"Error"` |
+| `findings[].title` | string | Short label suitable as a comment heading |
+| `findings[].location` | string\|null | `path:line` hint, or `null` when the auditor didn't point at a location |
+| `findings[].description` | string | Free-form description of the finding |
+| `blocking` | int | Findings whose severity is ≥ the project's `FailingSeverity` |
+| `nonBlocking` | int | Findings below the failing severity |
+
+`audit.findings.emitted` fires for every iteration, including ones with zero
+findings — receivers can use it as a "this iteration emitted no comments" signal.
+
+### `audit.completed` details
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "iteration": 1,
+    "verdict": "fail",
+    "durationMs": 7123
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `iteration` | int | Audit iteration number |
+| `verdict` | string | `"pass"` when no blocking findings; `"fail"` when blocking findings drove rework or the final-iteration failure |
+| `durationMs` | int | Wall-clock duration from `audit.started` to this event |
+
+### `merge.started` details
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "baseBranch": "main",
+    "workBranch": "codeybox/a1b2c3d4"
+  }
+}
+```
+
+### `merge.completed` details
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "baseBranch": "main",
+    "workBranch": "codeybox/a1b2c3d4",
+    "mergeSha": "abc123def456...",
+    "conflicts": null
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `baseBranch` | string | Branch the work branch was merged into |
+| `workBranch` | string | The merged feature branch |
+| `mergeSha` | string\|null | Resulting merge commit on the work branch |
+| `conflicts` | string[]\|null | Conflicted paths the agent resolved; currently always `null` (reserved for future surface) |
 
 ---
 
