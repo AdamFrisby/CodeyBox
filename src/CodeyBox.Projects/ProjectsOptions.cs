@@ -181,6 +181,21 @@ public static class ProjectsOptionsBinder
     public static ProjectsOptions Bind(IConfiguration section)
     {
         var options = section.Get<ProjectsOptions>() ?? new ProjectsOptions();
+        ApplyCustomMaps(options, section);
+        return options;
+    }
+
+    /// <summary>
+    /// Applies the map-shaped binding (audit-type / language overrides /
+    /// profile inheritance) that the framework's default <c>section.Bind()</c>
+    /// can't reach. Idempotent: callable from a
+    /// <see cref="Microsoft.Extensions.Options.IPostConfigureOptions{T}"/>
+    /// after the standard Bind has already run, so hot-reload through
+    /// <c>IOptionsMonitor&lt;ProjectsOptions&gt;</c> re-applies these on
+    /// every change.
+    /// </summary>
+    public static void ApplyCustomMaps(ProjectsOptions options, IConfiguration section)
+    {
         ApplyAuditMaps(section.GetSection("Defaults:Audit"), options.Defaults.Audit);
 
         var projectSections = section.GetSection("Projects").GetChildren().ToList();
@@ -188,8 +203,6 @@ public static class ProjectsOptionsBinder
         {
             ApplyAuditMaps(projectSections[i].GetSection("Audit"), options.Projects[i].Audit);
         }
-
-        return options;
     }
 
     private static void ApplyAuditMaps(IConfigurationSection auditSection, ProjectAuditConfig? audit)

@@ -8,17 +8,27 @@ namespace CodeyBox.Projects;
 
 /// <summary>
 /// Config-backed <see cref="IProjectRepository"/>. Reads
-/// <see cref="ProjectsOptions"/> at construction, merges each project with
-/// the configured defaults, and caches the resolved list.
+/// <see cref="ProjectsOptions"/>, merges each project with the configured
+/// defaults, and caches the resolved list.
 ///
-/// Intentionally immutable after startup: changes to appsettings.json
-/// require a restart. A future SQLite-backed CRUD impl can swap behind the
-/// same interface; the orchestrator never needs to know the difference.
+/// When constructed with <see cref="IOptionsMonitor{ProjectsOptions}"/>
+/// the resolved view is rebuilt whenever the configuration changes
+/// (e.g. <c>appsettings.json</c> edit picked up by the framework's
+/// file watcher). Reads return the latest atomically-swapped snapshot.
+/// Rebuilds that throw (validation failures, duplicate ids) are logged
+/// and the prior snapshot is retained — the framework's
+/// <see cref="IValidateOptions{TOptions}"/> machinery is responsible for
+/// keeping bad updates from reaching this layer in the first place.
+///
+/// A future SQLite-backed CRUD impl can swap behind the same interface;
+/// the orchestrator never needs to know the difference.
 /// </summary>
-public sealed class ProjectRepository : IProjectRepository
+public sealed class ProjectRepository : IProjectRepository, IDisposable
 {
-    private readonly Dictionary<string, Project> _byId;
-    private readonly IReadOnlyList<Project> _list;
+    private readonly ILogger<ProjectRepository> _logger;
+    private readonly PresetCatalogOptions? _presetCatalogOptions;
+    private readonly IDisposable? _changeSubscription;
+    private Snapshot _snapshot;
 
     public ProjectRepository(IOptions<ProjectsOptions> options)
         : this(options, NullLogger<ProjectRepository>.Instance) { }
@@ -31,7 +41,51 @@ public sealed class ProjectRepository : IProjectRepository
         ILogger<ProjectRepository> logger,
         PresetCatalogOptions? presetCatalogOptions)
     {
-        var opts = options.Value;
+        _logger = logger;
+        _presetCatalogOptions = presetCatalogOptions;
+        _snapshot = Build(options.Value, presetCatalogOptions);
+    }
+
+    public ProjectRepository(
+        IOptionsMonitor<ProjectsOptions> monitor,
+        ILogger<ProjectRepository> logger,
+        PresetCatalogOptions? presetCatalogOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(monitor);
+        _logger = logger;
+        _presetCatalogOptions = presetCatalogOptions;
+        _snapshot = Build(monitor.CurrentValue, presetCatalogOptions);
+        _changeSubscription = monitor.OnChange(Reload);
+    }
+
+    private void Reload(ProjectsOptions opts)
+    {
+        try
+        {
+            var next = Build(opts, _presetCatalogOptions);
+            Volatile.Write(ref _snapshot, next);
+            _logger.LogInformation(
+                "ProjectRepository reloaded: {Count} project(s) [{Ids}]",
+                next.List.Count, string.Join(",", next.List.Select(p => p.Id.Value)));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "ProjectRepository reload rejected; keeping prior snapshot. " +
+                "Fix the configuration error and re-save to retry.");
+        }
+    }
+
+    public Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+        => Task.FromResult(Volatile.Read(ref _snapshot).ById.TryGetValue(id.Value, out var p) ? p : null);
+
+    public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
+        => Task.FromResult(Volatile.Read(ref _snapshot).List);
+
+    public void Dispose() => _changeSubscription?.Dispose();
+
+    private Snapshot Build(ProjectsOptions opts, PresetCatalogOptions? presetCatalogOptions)
+    {
         var defaults = opts.Defaults ?? new ProjectDefaultsConfig();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var resolved = new List<Project>(opts.Projects.Count);
@@ -43,15 +97,12 @@ public sealed class ProjectRepository : IProjectRepository
             ValidateAuditPresetConfiguration(project, presetCatalogOptions);
             resolved.Add(project);
         }
-        _list = resolved;
-        _byId = resolved.ToDictionary(p => p.Id.Value, StringComparer.Ordinal);
+        return new Snapshot(
+            resolved,
+            resolved.ToDictionary(p => p.Id.Value, StringComparer.Ordinal));
     }
 
-    public Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
-        => Task.FromResult(_byId.TryGetValue(id.Value, out var p) ? p : null);
-
-    public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
-        => Task.FromResult(_list);
+    private sealed record Snapshot(IReadOnlyList<Project> List, IReadOnlyDictionary<string, Project> ById);
 
     private static void ValidateAuditPresetConfiguration(Project project, PresetCatalogOptions? presetCatalogOptions)
     {

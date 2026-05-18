@@ -46,7 +46,15 @@ namespace CodeyBox.Sandbox.Multipass;
 /// </summary>
 public sealed class MultipassSandboxProvider : ISandboxProvider
 {
-    private readonly MultipassSandboxOptions _opts;
+    // Options are resolved through a delegate on every read so an operator can
+    // edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles / UseBaselineImages
+    // in appsettings.json and have the change land on the next sandbox launch
+    // without restarting CodeyBox. Sandboxes already running keep the snapshot
+    // they were constructed with (pickup-snapshot semantics). Operators editing
+    // immutable fields (StagingDirectory, MultipassBinary, etc.) still need to
+    // restart — _stagingRoot below is fixed at provider construction.
+    private readonly Func<MultipassSandboxOptions> _optsAccessor;
+    private MultipassSandboxOptions _opts => _optsAccessor();
     private readonly ILogger<MultipassSandboxProvider> _log;
     private readonly IProcessRunner _runner;
     private readonly MultipassDaemonRetryPolicy _daemonRetryPolicy;
@@ -70,19 +78,35 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings = null)
-        : this(opts, log, timings, new DefaultProcessRunner())
+        : this(() => opts, log, timings, new DefaultProcessRunner())
+    {
+    }
+
+    public MultipassSandboxProvider(Func<MultipassSandboxOptions> optionsAccessor,
+        ILogger<MultipassSandboxProvider> log, ITimingStore? timings = null)
+        : this(optionsAccessor, log, timings, new DefaultProcessRunner())
     {
     }
 
     internal MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings, IProcessRunner runner, MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
+        : this(() => opts, log, timings, runner, daemonRetryPolicy)
     {
-        _opts = opts;
+    }
+
+    internal MultipassSandboxProvider(Func<MultipassSandboxOptions> optionsAccessor,
+        ILogger<MultipassSandboxProvider> log, ITimingStore? timings, IProcessRunner runner,
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
+    {
+        _optsAccessor = optionsAccessor;
         _log = log;
         _runner = runner;
         _daemonRetryPolicy = daemonRetryPolicy ?? MultipassDaemonRetryPolicy.Default;
         _timings = timings;
-        _stagingRoot = ResolveStagingRoot(opts);
+        // StagingDirectory is captured once: the provider keeps the directory open
+        // for the lifetime of the process. Re-binding it at runtime would orphan
+        // already-staged sandboxes.
+        _stagingRoot = ResolveStagingRoot(optionsAccessor());
         Directory.CreateDirectory(_stagingRoot);
         // 0700 on the staging root: only the orchestrator user can read or
         // list its contents. Per-sandbox subdirs sit under here, each
