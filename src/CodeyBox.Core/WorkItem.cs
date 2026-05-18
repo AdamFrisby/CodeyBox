@@ -82,6 +82,13 @@ public sealed record WorkItem
     public int QuotaRetryAttempts { get; init; }
 
     /// <summary>
+    /// Pipeline entry point the quota retry scheduler should use when the quota
+    /// window opens. Values match the manual retry API: "work", "audit",
+    /// "merge", or "upstream".
+    /// </summary>
+    public string? QuotaRetryFrom { get; init; }
+
+    /// <summary>
     /// Why the item was cancelled. Only populated when <see cref="State"/> is
     /// <see cref="WorkItemState.Cancelled"/>; null for all other states and for
     /// legacy rows written before this column existed.
@@ -226,6 +233,7 @@ public sealed record WorkItem
             FailureKind = IsQuotaShapedState(state) ? (failureKind ?? FailureKind) : null,
             QuotaResetAt = IsQuotaShapedState(state) ? (quotaResetAt ?? QuotaResetAt) : null,
             NextQuotaRetryAt = IsQuotaShapedState(state) ? NextQuotaRetryAt : null,
+            QuotaRetryFrom = IsQuotaShapedState(state) ? QuotaRetryFrom : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
             CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
             UpdatedAt = DateTimeOffset.UtcNow,

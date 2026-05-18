@@ -218,12 +218,13 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
 
     private async Task PerformRetryAsync(WorkItem item, string trigger, CancellationToken ct)
     {
+        var retryFrom = NormalizeRetryFrom(item.QuotaRetryFrom);
         _log.LogInformation("Triggering quota auto-retry ({Trigger}) for work item {Id} (attempt {Attempt})",
             trigger, item.Id, item.QuotaRetryAttempts + 1);
 
         // Re-use logic from shared WorkItemRetrier to ensure identical side effects,
         // audit logs, and conditional state updates (prevents race conditions).
-        var (success, error, _, _) = await _retrier.RetryAsync(item, from: "work", trigger, ct);
+        var (success, error, _, actualFrom) = await _retrier.RetryAsync(item, from: retryFrom, trigger, ct);
 
         if (!success)
         {
@@ -245,11 +246,21 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
                     workItemId = item.Id.ToString(),
                     reason = "quota",
                     attemptNumber = (updated?.QuotaRetryAttempts ?? item.QuotaRetryAttempts + 1),
-                    triggeredBy = trigger
+                    triggeredBy = trigger,
+                    from = retryFrom,
+                    actualFrom
                 }
             }, CancellationToken.None);
         }
     }
+
+    private static string NormalizeRetryFrom(string? retryFrom) => retryFrom?.Trim().ToLowerInvariant() switch
+    {
+        "audit" => "audit",
+        "merge" => "merge",
+        "upstream" => "upstream",
+        _ => "work",
+    };
 
     /// <summary>
     /// Notifies the scheduler that a work item has failed with a quota error,
