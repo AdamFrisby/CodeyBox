@@ -376,10 +376,11 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         var afterFailure = DateTimeOffset.UtcNow;
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.Equal("quota", final.FailureKind);
         Assert.NotNull(final.QuotaResetAt);
         Assert.NotNull(final.NextQuotaRetryAt);
+        Assert.Equal("audit", final.QuotaRetryFrom);
         Assert.InRange(
             final.QuotaResetAt.Value,
             beforeFailure.AddMinutes(5),
@@ -440,10 +441,11 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         var afterFailure = DateTimeOffset.UtcNow;
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.Equal("quota", final.FailureKind);
         Assert.NotNull(final.QuotaResetAt);
         Assert.NotNull(final.NextQuotaRetryAt);
+        Assert.Equal("audit", final.QuotaRetryFrom);
         Assert.Equal(0, probe.CallCount);
         Assert.InRange(
             final.QuotaResetAt.Value,
@@ -501,10 +503,11 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.Equal("quota", final.FailureKind);
         Assert.Equal(resetAt, final.QuotaResetAt);
         Assert.Equal(resetAt, final.NextQuotaRetryAt);
+        Assert.Equal("audit", final.QuotaRetryFrom);
     }
 
     [Fact]
@@ -558,11 +561,12 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         var afterFailure = DateTimeOffset.UtcNow;
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.Equal("quota", final.FailureKind);
         Assert.True(probe.CallCount > 0, "quota fallback should query the class router probe before defaulting");
         Assert.NotNull(final.QuotaResetAt);
         Assert.NotNull(final.NextQuotaRetryAt);
+        Assert.Equal("audit", final.QuotaRetryFrom);
         Assert.InRange(
             final.QuotaResetAt.Value,
             beforeFailure.AddMinutes(5),

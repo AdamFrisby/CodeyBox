@@ -546,8 +546,22 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (TerminalQuotaError ex)
         {
-            _log.LogWarning("Work item {Id} failed due to quota: {Error}", item.Id, ex.Message);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "quota", quotaResetAt: ex.ResetAt);
+            _log.LogWarning("Work item {Id} hit quota: {Error}", item.Id, ex.Message);
+            var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+            if (current.State == WorkItemState.Auditing)
+            {
+                await TransitionWaitingForQuotaResetAsync(
+                    item,
+                    ex.Message,
+                    phase: "audit",
+                    quotaResetAt: ex.ResetAt,
+                    project: project,
+                    iteration: null);
+            }
+            else
+            {
+                await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "quota", quotaResetAt: ex.ResetAt);
+            }
         }
         catch (Exception ex)
         {
@@ -1710,7 +1724,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt,
                 ModelId: item.ModelId, ReasoningMode: item.ReasoningMode);
-            var collectTask = CollectFindingsAsync(project, runner, auditors, repoId, ctx, auditCts.Token);
+            var collectTask = CollectFindingsAsync(item, project, runner, auditors, repoId, ctx, auditCts.Token);
             var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
             if (completedAuditTask != collectTask)
             {
@@ -1805,6 +1819,7 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(
+        WorkItem item,
         Project project,
         IAgentRunner workRunner,
         IReadOnlyList<IAuditor> auditors,
@@ -1899,14 +1914,95 @@ public sealed class PipelineRunner : IPipelineRunner
                 var maxPar = project.Audit.MaxLlmAuditorParallelism;
                 using var sem = new SemaphoreSlim(maxPar, maxPar);
 
-                async Task<AuditorRunRecord> RunLlmPairAsync((IAuditor Auditor, IAgentRunner Runner) pair)
+                SandboxSpec BuildLlmSandboxSpec(AgentCredential? candidateCredential)
                 {
-                    await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-                    if (credential is not null && credential.Files.Count > 0)
-                        await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                    var candidateSpec = BuildSandboxSpec(access,
+                        includeAgentCredential: candidateCredential,
+                        allowAgentNetwork: needsNetwork,
+                        hostNetworkProfile: sandboxTarget.NetworkProfile,
+                        timingWorkItemId: ctx.WorkItemId,
+                        timingPhase: "audit",
+                        flavor: sandboxTarget.Flavor);
+                    return candidateSpec with
+                    {
+                        Mounts =
+                        [
+                            .. candidateSpec.Mounts,
+                            new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 },
+                        ],
+                    };
+                }
+
+                async Task<AuditorRunRecord> RunLlmPairOnceAsync(
+                    (IAuditor Auditor, IAgentRunner Runner) pair,
+                    IAgentRunner candidateRunner,
+                    WorkItem trialItem)
+                {
+                    var candidateCredential = needsCreds
+                        ? await ResolveAgentCredentialAsync(candidateRunner.Kind, project, ct)
+                        : null;
+                    var candidateSpec = BuildLlmSandboxSpec(candidateCredential);
+                    await using var sandbox = await _sandboxes.CreateAsync(candidateSpec, ct);
+                    if (candidateCredential is not null && candidateCredential.Files.Count > 0)
+                        await MaterialiseCredentialFilesAsync(sandbox, candidateCredential, ct);
                     await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
                     await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
-                    return await ExecAuditorAsync(sandbox, pair.Auditor, pair.Runner, workRunner, credential, ctx, ct);
+                    var candidateCtx = ctx with
+                    {
+                        ModelId = trialItem.ModelId,
+                        ReasoningMode = trialItem.ReasoningMode,
+                    };
+                    return await ExecAuditorAsync(
+                        sandbox,
+                        pair.Auditor,
+                        candidateRunner,
+                        workRunner,
+                        candidateCredential,
+                        candidateCtx,
+                        ct);
+                }
+
+                async Task<AuditorRunRecord> RunLlmPairAttemptAsync(
+                    (IAuditor Auditor, IAgentRunner Runner) pair,
+                    IAgentRunner candidateRunner,
+                    WorkItem trialItem)
+                {
+                    var run = await RunLlmPairOnceAsync(pair, candidateRunner, trialItem);
+
+                    // A nonzero review-agent exit is audit infrastructure, not a
+                    // source-code finding. Retry once in a fresh sandbox to ride out
+                    // transient CLI/network/process failures. Quota-shaped failures
+                    // are handled by the quota fallback wrapper below.
+                    if (IsLlmAgentExecutionFailure(run.Result)
+                        && _quotaClassifier.Detect(
+                            run.Runner.Kind,
+                            run.Result.AgentStderr,
+                            run.Result.AgentStdout) is null)
+                    {
+                        _log.LogWarning(
+                            "LLM auditor {Auditor} agent execution failed; retrying once in a fresh sandbox",
+                            run.Auditor.Name);
+                        run = await RunLlmPairOnceAsync(pair, candidateRunner, trialItem);
+                    }
+
+                    await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, ct);
+                    return run;
+                }
+
+                Task<AuditorRunRecord> RunLlmPairAsync((IAuditor Auditor, IAgentRunner Runner) pair)
+                {
+                    return InvokeAgentWithQuotaFallbackAsync(
+                        item,
+                        project,
+                        "audit",
+                        iteration: ctx.Iteration,
+                        (candidateRunner, trialItem) => RunLlmPairAttemptAsync(pair, candidateRunner, trialItem),
+                        ct,
+                        initialRunnerOverride: pair.Runner,
+                        initialMemberOverride: _classRouter?.FindMember(
+                            item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
+                            pair.Runner.Kind,
+                            modelId: null));
                 }
 
                 var llmTasks = llmPairs.Select(async pair =>
@@ -1920,29 +2016,6 @@ public sealed class PipelineRunner : IPipelineRunner
                 }).ToList();
 
                 var llmRuns = await Task.WhenAll(llmTasks);
-
-                // A nonzero review-agent exit is audit infrastructure, not a
-                // source-code finding. Retry once in a fresh sandbox to ride out
-                // transient CLI/network/process failures. Quota-shaped failures
-                // are not retried here; PostProcessAuditorRunAsync records and
-                // raises them as quota failures so the normal quota retry path can
-                // take over.
-                for (var i = 0; i < llmRuns.Length; i++)
-                {
-                    if (!IsLlmAgentExecutionFailure(llmRuns[i].Result)
-                        || _quotaClassifier.Detect(
-                            llmRuns[i].Runner.Kind,
-                            llmRuns[i].Result.AgentStderr,
-                            llmRuns[i].Result.AgentStdout) is not null)
-                    {
-                        continue;
-                    }
-
-                    _log.LogWarning(
-                        "LLM auditor {Auditor} agent execution failed; retrying once in a fresh sandbox",
-                        llmRuns[i].Auditor.Name);
-                    llmRuns[i] = await RunLlmPairAsync((llmRuns[i].Auditor, llmRuns[i].Runner));
-                }
 
                 // Post-process in stable auditor order (same as llmPairs).
                 foreach (var run in llmRuns)
@@ -2040,30 +2113,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditContext ctx,
         CancellationToken ct)
     {
-        if (needsCreds && (run.Result.AgentStderr is not null || run.Result.AgentStdout is not null))
-        {
-            var quotaDetection = _quotaClassifier.Detect(
-                run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
-            await _quotaClassifier.RecordIfQuotaFailureAsync(
-                _quotaFailures,
-                run.Runner.Kind,
-                ResolveObservedModelId(run.Runner, modelId: null),
-                run.Result.AgentSummary,
-                run.Result.AgentStderr,
-                DateTimeOffset.UtcNow,
-                _auditQuotaOptions.ObservedFailureRetention,
-                ct,
-                projectId: projectId,
-                stdout: run.Result.AgentStdout);
-
-            if (quotaDetection is not null)
-            {
-                throw new TerminalQuotaError(
-                    quotaDetection.Kind,
-                    $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
-                    quotaDetection.ResetAt);
-            }
-        }
+        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, projectId, ct);
 
         if (needsCreds)
         {
@@ -2083,6 +2133,38 @@ public sealed class PipelineRunner : IPipelineRunner
             : "none";
         AuditLog.AuditorRun(run.Auditor.Name, worstSeverity, run.Elapsed, run.Runner.Kind);
         await PersistAuditReportAsync(ctx, run.Auditor, run.Result, run.StartedAt, run.Elapsed, ct);
+    }
+
+    private async Task ThrowIfAuditorRunQuotaAsync(
+        AuditorRunRecord run,
+        bool needsCreds,
+        ProjectId projectId,
+        CancellationToken ct)
+    {
+        if (!needsCreds || (run.Result.AgentStderr is null && run.Result.AgentStdout is null))
+            return;
+
+        var quotaDetection = _quotaClassifier.Detect(
+            run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
+        await _quotaClassifier.RecordIfQuotaFailureAsync(
+            _quotaFailures,
+            run.Runner.Kind,
+            ResolveObservedModelId(run.Runner, modelId: null),
+            run.Result.AgentSummary,
+            run.Result.AgentStderr,
+            DateTimeOffset.UtcNow,
+            _auditQuotaOptions.ObservedFailureRetention,
+            ct,
+            projectId: projectId,
+            stdout: run.Result.AgentStdout);
+
+        if (quotaDetection is not null)
+        {
+            throw new TerminalQuotaError(
+                quotaDetection.Kind,
+                $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
+                quotaDetection.ResetAt);
+        }
     }
 
     private static bool IsLlmAgentExecutionFailure(AuditResult result) =>
@@ -2204,9 +2286,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         // Credential check: if the audit agent has no credentials configured,
         // fall back gracefully — operators may configure agents incrementally.
-        var cred = _credentials is IProjectAwareCredentialProvider pac
-            ? await pac.GetAsync(kind.Value, project.CredentialProviderPriority, ct)
-            : await _credentials.GetAsync(kind.Value, ct);
+        var cred = await ResolveAgentCredentialAsync(kind.Value, project, ct);
         if (cred is null)
         {
             _log.LogWarning(
@@ -2257,6 +2337,11 @@ public sealed class PipelineRunner : IPipelineRunner
         return auditRunner;
     }
 
+    private Task<AgentCredential?> ResolveAgentCredentialAsync(AgentKind kind, Project project, CancellationToken ct)
+        => _credentials is IProjectAwareCredentialProvider pac
+            ? pac.GetAsync(kind, project.CredentialProviderPriority, ct)
+            : _credentials.GetAsync(kind, ct);
+
     /// <summary>
     /// Runs <paramref name="invoker"/> with the work item's chosen agent runner;
     /// if the invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>
@@ -2286,21 +2371,38 @@ public sealed class PipelineRunner : IPipelineRunner
         string phase,
         int? iteration,
         Func<IAgentRunner, WorkItem, Task<TResult>> invoker,
-        CancellationToken ct)
+        CancellationToken ct,
+        IAgentRunner? initialRunnerOverride = null,
+        AgentMembership? initialMemberOverride = null)
     {
         // Resolve the initial member from the work item's currently-selected agent.
         // OrchestratorService writes Agent / ModelId / ReasoningMode onto item before
         // calling Pipeline.RunAsync; we trust those as the first-attempt picks.
-        var initialAgent = item.Agent ?? project.DefaultAgent;
-        if (!_agents.TryGet(initialAgent, out var initialRunner))
+        var initialAgent = initialRunnerOverride?.Kind ?? item.Agent ?? project.DefaultAgent;
+        IAgentRunner initialRunner;
+        if (initialRunnerOverride is not null)
+        {
+            initialRunner = initialRunnerOverride;
+        }
+        else if (!_agents.TryGet(initialAgent, out initialRunner))
+        {
             throw new InvalidOperationException($"No runner registered for agent '{initialAgent}'");
+        }
+        var initialItem = initialRunnerOverride is null
+            ? item
+            : item with
+            {
+                Agent = initialAgent,
+                ModelId = initialMemberOverride?.ModelId ?? item.ModelId,
+                ReasoningMode = initialMemberOverride?.ReasoningMode ?? item.ReasoningMode,
+            };
 
         // Single-attempt path when fallback is not wired (no class, no router).
         // The behaviour matches the legacy code: TerminalQuotaError bubbles out.
         if (_classRouter is null
             || (item.AgentClassId is null && project.DefaultAgentClass is null))
         {
-            return await invoker(initialRunner, item);
+            return await invoker(initialRunner, initialItem);
         }
 
         var classId = item.AgentClassId ?? project.DefaultAgentClass!;
@@ -2308,12 +2410,13 @@ public sealed class PipelineRunner : IPipelineRunner
         var triedCount = 0;
         DateTimeOffset? earliestReset = null;
         var currentRunner = initialRunner;
-        var currentItem = item;
+        var currentItem = initialItem;
         // Prefer the catalog's real AgentMembership (correct Billing / QualityScore /
         // ReasoningMode) so probe write-backs receive an accurate record. Only fall
         // back to a synthesised placeholder when the catalog has no matching row —
         // e.g. tests that exercise the wrapper without a fully-populated class.
-        var currentMember = _classRouter.FindMember(classId, initialAgent, item.ModelId)
+        var currentMember = initialMemberOverride
+            ?? _classRouter.FindMember(classId, initialAgent, item.ModelId)
             ?? new AgentMembership
             {
                 Agent = initialAgent,
@@ -4526,18 +4629,30 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem item,
         AgentClassExhaustedException ex,
         Project? project)
+        => await TransitionWaitingForQuotaResetAsync(
+            item,
+            ex.Message,
+            ex.Phase,
+            ex.EarliestResetAt,
+            project,
+            iteration: null);
+
+    private async Task TransitionWaitingForQuotaResetAsync(
+        WorkItem item,
+        string error,
+        string phase,
+        DateTimeOffset? quotaResetAt,
+        Project? project,
+        int? iteration)
     {
         var ct = CancellationToken.None;
         var current = await _store.GetAsync(item.Id, ct) ?? item;
-        // Schedule the next retry attempt: prefer the earliest reset-window
-        // hint extracted from the failing agents' output; otherwise fall back
-        // to one cache-TTL window so the periodic sweep eventually rediscovers
-        // availability without burning the work-item budget on tight retries.
-        var nextRetryAt = ex.EarliestResetAt ?? DateTimeOffset.UtcNow.Add(QuotaExhaustionFallbackTtl);
-        var next = current.With(WorkItemState.WaitingForQuotaReset, ex.Message,
-            failureKind: "quota", quotaResetAt: ex.EarliestResetAt) with
+        var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, ct);
+        var next = current.With(WorkItemState.WaitingForQuotaReset, error,
+            failureKind: "quota", quotaResetAt: effectiveResetAt) with
         {
-            NextQuotaRetryAt = nextRetryAt,
+            NextQuotaRetryAt = effectiveResetAt,
+            QuotaRetryFrom = RetryFromForQuotaPhase(phase),
         };
 
         var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
@@ -4566,15 +4681,23 @@ public sealed class PipelineRunner : IPipelineRunner
             Project = effectiveProject,
             Details = new AgentFallbackDetails(
                 WorkItemId: item.Id.ToString(),
-                Phase: ex.Phase,
-                Iteration: null,
+                Phase: phase,
+                Iteration: iteration,
                 FromAgent: (item.Agent ?? effectiveProject.DefaultAgent).Value,
                 FromModel: item.ModelId,
                 ToAgent: null,
                 ToModel: null,
-                Reason: ex.Message),
+                Reason: error),
         }, ct);
     }
+
+    private static string RetryFromForQuotaPhase(string phase) => phase switch
+    {
+        "audit" => "audit",
+        "merge" => "merge",
+        "upstream" => "upstream",
+        _ => "work",
+    };
 
     private static string StateToEventName(WorkItemState state) => state switch
     {
