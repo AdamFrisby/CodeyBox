@@ -15,10 +15,11 @@ namespace CodeyBox.Projects;
 /// the resolved view is rebuilt whenever the configuration changes
 /// (e.g. <c>appsettings.json</c> edit picked up by the framework's
 /// file watcher). Reads return the latest atomically-swapped snapshot.
-/// Rebuilds that throw (validation failures, duplicate ids) are logged
-/// and the prior snapshot is retained — the framework's
-/// <see cref="IValidateOptions{TOptions}"/> machinery is responsible for
-/// keeping bad updates from reaching this layer in the first place.
+/// Rebuilds that throw (for example, duplicate ids) are logged and the
+/// prior snapshot is retained. If a registered
+/// <see cref="IValidateOptions{TOptions}"/> rejects a reload candidate, the
+/// framework does not invoke this repository's change callback at all; the
+/// existing snapshot remains in place because it is held independently here.
 ///
 /// A future SQLite-backed CRUD impl can swap behind the same interface;
 /// the orchestrator never needs to know the difference.

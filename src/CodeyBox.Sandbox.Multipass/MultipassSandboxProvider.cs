@@ -46,15 +46,14 @@ namespace CodeyBox.Sandbox.Multipass;
 /// </summary>
 public sealed class MultipassSandboxProvider : ISandboxProvider
 {
-    // Options are resolved through a delegate on every read so an operator can
-    // edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles / UseBaselineImages
-    // in appsettings.json and have the change land on the next sandbox launch
-    // without restarting CodeyBox. Sandboxes already running keep the snapshot
-    // they were constructed with (pickup-snapshot semantics). Operators editing
+    // Options are resolved through a delegate once per public operation so an
+    // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
+    // UseBaselineImages in appsettings.json and have the change land on the next
+    // sandbox launch without restarting CodeyBox. Each in-flight launch and each
+    // constructed sandbox keep the snapshot they started with. Operators editing
     // immutable fields (StagingDirectory, MultipassBinary, etc.) still need to
     // restart — _stagingRoot below is fixed at provider construction.
     private readonly Func<MultipassSandboxOptions> _optsAccessor;
-    private MultipassSandboxOptions _opts => _optsAccessor();
     private readonly ILogger<MultipassSandboxProvider> _log;
     private readonly IProcessRunner _runner;
     private readonly MultipassDaemonRetryPolicy _daemonRetryPolicy;
@@ -106,7 +105,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // StagingDirectory is captured once: the provider keeps the directory open
         // for the lifetime of the process. Re-binding it at runtime would orphan
         // already-staged sandboxes.
-        _stagingRoot = ResolveStagingRoot(optionsAccessor());
+        _stagingRoot = ResolveStagingRoot(ReadOptions());
         Directory.CreateDirectory(_stagingRoot);
         // 0700 on the staging root: only the orchestrator user can read or
         // list its contents. Per-sandbox subdirs sit under here, each
@@ -158,6 +157,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
+        var opts = ReadOptions();
         var name = $"codeybox-{Guid.NewGuid():N}"[..23]; // multipass max name length is 24
         var sandboxRoot = Path.Combine(_stagingRoot, name);
         Directory.CreateDirectory(sandboxRoot);
@@ -200,7 +200,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             //     install runcmd cost once per profile instead of per sandbox.
             //   - Launch path (default): every VM goes through cloud-init.
             //     Slower per VM but works without prior baking.
-            var useBaseline = _opts.UseBaselineImages
+            var useBaseline = opts.UseBaselineImages
                 && !string.IsNullOrWhiteSpace(spec.Network.ProfileName);
 
             // After this block the VM is in Stopped state, ready for native
@@ -208,44 +208,44 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // the clone path skips the start (clone is born Stopped).
             if (useBaseline)
             {
-                var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, spec.Flavor, workItemId, ct);
+                var baselineName = await EnsureBaselineForProfileAsync(opts, spec.Network.ProfileName!, spec.Flavor, workItemId, ct);
                 await using var cloneScope = await TimingScope.BeginAsync(
                     timingStore, timingItemId, timingPhase, "vm.clone", log: _log);
-                await CloneFromBaselineAsync(name, baselineName, workItemId, ct);
+                await CloneFromBaselineAsync(opts, name, baselineName, workItemId, ct);
                 // Clone is Stopped after `multipass clone`; no start yet.
             }
             else
             {
-                var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit, spec.Flavor);
+                var cloudInit = BuildCloudInit(opts.ExtraRuncmd, opts.ExtraCloudInit, spec.Flavor);
                 var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
                 await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
                 await using (var launchScope = await TimingScope.BeginAsync(
                     timingStore, timingItemId, timingPhase, "vm.launch", log: _log))
                 {
-                    await LaunchAsync(name, spec, cloudInitPath, workItemId, ct);
-                    await WaitForRunningAsync(name, workItemId, ct);
+                    await LaunchAsync(opts, name, spec, cloudInitPath, workItemId, ct);
+                    await WaitForRunningAsync(opts, name, workItemId, ct);
                 }
                 // Stop the freshly-launched VM so we can mount (outside vm.launch scope).
-                var stop = await RunAsync([_opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
+                var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
                 if (stop.ExitCode != 0)
                     throw new InvalidOperationException($"multipass stop (for mount) failed: {stop.Stderr}");
-                await WaitForStoppedAsync(name, workItemId, ct);
+                await WaitForStoppedAsync(opts, name, workItemId, ct);
             }
 
             // Apply native mounts while VM is Stopped, then start.
             await using (var mountScope = await TimingScope.BeginAsync(
                 timingStore, timingItemId, timingPhase, "vm.mount", log: _log))
             {
-                await ApplyMountsAsync(name, bindMounts, workItemId, ct);
+                await ApplyMountsAsync(opts, name, bindMounts, workItemId, ct);
             }
 
             await using (var startScope = await TimingScope.BeginAsync(
                 timingStore, timingItemId, timingPhase, "vm.start", log: _log))
             {
-                await StartAndWaitForRunningAsync(name, workItemId, ct);
+                await StartAndWaitForRunningAsync(opts, name, workItemId, ct);
             }
 
-            await TransferEnvAsync(name, spec.Environment, sandboxRoot, workItemId, ct);
+            await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
             AuditLog.SandboxCreated(name, spec.Network.ProfileName);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files); on the clone path it's
@@ -256,7 +256,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // Invalidate the list cache so the next ListAllManagedAsync call reflects
             // the newly created sandbox immediately rather than serving stale data.
             _listCacheExpiry = DateTimeOffset.MinValue;
-            return new MultipassSandbox(name, sandboxRoot, spec, _opts, _log, timingStore, timingItemId, timingPhase,
+            return new MultipassSandbox(name, sandboxRoot, spec, opts, _log, timingStore, timingItemId, timingPhase,
                 onDisposed: n => { _activeSandboxNames.TryRemove(n, out _); _listCacheExpiry = DateTimeOffset.MinValue; },
                 runner: _runner,
                 daemonRetryPolicy: _daemonRetryPolicy);
@@ -264,7 +264,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         catch
         {
             // Best-effort cleanup if launch / mount / transfer half-succeeded.
-            await TryDeleteVmAsync(name);
+            await TryDeleteVmAsync(opts, name);
             try { Directory.Delete(sandboxRoot, recursive: true); } catch { }
             throw;
         }
@@ -273,6 +273,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// <inheritdoc/>
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
     {
+        var opts = ReadOptions();
         await _listLock.WaitAsync(ct);
         try
         {
@@ -280,7 +281,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             if (_listCache is not null && now < _listCacheExpiry)
                 return _listCache;
 
-            var result = await FetchManagedSandboxesAsync(ct);
+            var result = await FetchManagedSandboxesAsync(opts, ct);
             _listCache = result;
             _listCacheExpiry = now + _listCacheTtl;
             return result;
@@ -294,6 +295,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// <inheritdoc/>
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
+        var opts = ReadOptions();
         // Explicit allowlist before any filesystem or shell operation: VM names must
         // be alphanumeric-and-hyphen only. This blocks path-traversal strings such as
         // "codeybox-a/../../../sensitive" that start with the required prefix but
@@ -302,7 +304,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
 
         _log.LogInformation("SandboxLeakReaper: purging leaked VM {Name}", name);
-        var run = await RunAsync([_opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: ct);
+        var run = await RunAsync(opts, [opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: ct);
         if (run.ExitCode != 0)
             throw new InvalidOperationException($"multipass delete --purge {name} failed (exit {run.ExitCode}): {run.Stderr}");
         // Clean up staging dir if it still exists.
@@ -314,9 +316,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         _listCacheExpiry = DateTimeOffset.MinValue;
     }
 
-    private async Task<IReadOnlyList<ManagedSandboxInfo>> FetchManagedSandboxesAsync(CancellationToken ct)
+    private async Task<IReadOnlyList<ManagedSandboxInfo>> FetchManagedSandboxesAsync(MultipassSandboxOptions opts, CancellationToken ct)
     {
-        var listRun = await RunAsync([_opts.MultipassBinary, "list", "--format", "json"], stdin: null, ct: ct);
+        var listRun = await RunAsync(opts, [opts.MultipassBinary, "list", "--format", "json"], stdin: null, ct: ct);
         if (listRun.ExitCode != 0)
         {
             _log.LogWarning("multipass list failed (exit {ExitCode}): {Stderr}", listRun.ExitCode, listRun.Stderr);
@@ -350,7 +352,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         if (vmNames.Count == 0) return [];
 
         // Fetch disk usage for all discovered codeybox VMs in a single multipass info call.
-        var diskByName = await FetchDiskInfoAsync(vmNames, ct);
+        var diskByName = await FetchDiskInfoAsync(opts, vmNames, ct);
 
         var infos = new List<ManagedSandboxInfo>(vmNames.Count);
         foreach (var name in vmNames)
@@ -382,12 +384,15 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// a map of VM name → disk-used bytes. Returns an empty dictionary on any failure
     /// so that missing disk info degrades gracefully to null in the caller.
     /// </summary>
-    private async Task<Dictionary<string, long>> FetchDiskInfoAsync(List<string> names, CancellationToken ct)
+    private async Task<Dictionary<string, long>> FetchDiskInfoAsync(
+        MultipassSandboxOptions opts,
+        List<string> names,
+        CancellationToken ct)
     {
-        var argv = new List<string> { _opts.MultipassBinary, "info", "--format", "json" };
+        var argv = new List<string> { opts.MultipassBinary, "info", "--format", "json" };
         argv.AddRange(names);
 
-        var run = await RunAsync(argv, stdin: null, ct: ct);
+        var run = await RunAsync(opts, argv, stdin: null, ct: ct);
         if (run.ExitCode != 0)
         {
             _log.LogWarning("multipass info failed (exit {ExitCode}): {Stderr}", run.ExitCode, run.Stderr);
@@ -449,17 +454,18 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// profile.
     /// </summary>
     private async Task<string> EnsureBaselineForProfileAsync(
+        MultipassSandboxOptions opts,
         string profileName,
         SandboxProfileFlavor flavor,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
-        if (!_opts.NetworkProfiles.TryGetValue(profileName, out _))
+        if (!opts.NetworkProfiles.TryGetValue(profileName, out _))
             throw new InvalidOperationException(
                 $"Network profile '{profileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
-                $"Configured profiles: [{string.Join(", ", _opts.NetworkProfiles.Keys)}]");
+                $"Configured profiles: [{string.Join(", ", opts.NetworkProfiles.Keys)}]");
 
-        var baselineName = _opts.BaselineNamePrefix + BuildBaselineKey(profileName, flavor);
+        var baselineName = opts.BaselineNamePrefix + BuildBaselineKey(profileName, flavor);
         // multipass instance names cap at 24 chars; trim if a long profile
         // name pushes us over. We use a STABLE hash (SHA-256, first 6 hex
         // chars) for uniqueness so two long profile names don't collide.
@@ -478,9 +484,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         await sem.WaitAsync(ct);
         try
         {
-            if (await BaselineVmExistsAsync(baselineName, workItemId, ct))
+            if (await BaselineVmExistsAsync(opts, baselineName, workItemId, ct))
                 return baselineName;
-            await BakeBaselineAsync(baselineName, profileName, flavor, workItemId, ct);
+            await BakeBaselineAsync(opts, baselineName, profileName, flavor, workItemId, ct);
             return baselineName;
         }
         finally
@@ -512,20 +518,25 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             : "graphical-" + profileName;
     }
 
-    private async Task<bool> BaselineVmExistsAsync(string name, WorkItemId? workItemId, CancellationToken ct)
+    private async Task<bool> BaselineVmExistsAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
-        var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
+        var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
         return info.ExitCode == 0;
     }
 
     private async Task BakeBaselineAsync(
+        MultipassSandboxOptions opts,
         string baselineName,
         string profileName,
         SandboxProfileFlavor flavor,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
-        var bridge = _opts.NetworkProfiles[profileName];
+        var bridge = opts.NetworkProfiles[profileName];
         _log.LogInformation(
             "Baking Multipass baseline {Name} for profile {Profile} on bridge {Bridge} — one-time, ~5-10 minutes",
             baselineName, profileName, bridge);
@@ -540,7 +551,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // slow, and possibly disk-filling.
         var cloudInit = BuildCloudInit(
             extraRuncmd: null,
-            extraCloudInit: _opts.ExtraCloudInit,
+            extraCloudInit: opts.ExtraCloudInit,
             flavor: flavor,
             startRouteService: true,
             includeGraphicalInstall: false);
@@ -551,7 +562,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
 
         var argv = new List<string> {
-            _opts.MultipassBinary, "launch", "--name", baselineName,
+            opts.MultipassBinary, "launch", "--name", baselineName,
             "--cloud-init", cloudInitPath,
             "--network", $"name={bridge},mode=auto",
             // Multipass defaults (5G disk / 1G RAM / 1 vCPU) are tight for
@@ -561,34 +572,35 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // raise them if your install runs OOM or run out of disk
             // mid-bake. qcow2 disks are sparse so unused disk space costs
             // nothing on the host until written.
-            "--disk", $"{_opts.BaselineDiskGB}G",
-            "--memory", $"{_opts.BaselineMemoryGB}G",
-            "--cpus", _opts.BaselineCpus.ToString(),
+            "--disk", $"{opts.BaselineDiskGB}G",
+            "--memory", $"{opts.BaselineMemoryGB}G",
+            "--cpus", opts.BaselineCpus.ToString(),
         };
-        if (!string.IsNullOrWhiteSpace(_opts.DefaultImage))
-            argv.Add(_opts.DefaultImage);
+        if (!string.IsNullOrWhiteSpace(opts.DefaultImage))
+            argv.Add(opts.DefaultImage);
 
         try
         {
-            var run = await RunAsync(argv, stdin: null, ct: ct, workItemId: workItemId);
+            var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
             if (run.ExitCode != 0)
                 throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
 
             // Wait for the (now-minimal) cloud-init to finish — write_files
             // and the route service install. Doesn't include the heavy
             // installs, so should be fast.
-            await WaitForRunningAsync(baselineName, workItemId, ct);
+            await WaitForRunningAsync(opts, baselineName, workItemId, ct);
 
             // Run the install commands now, via multipass exec under sudo.
             // Each entry in ExtraRuncmd is a single shell command.
-            var installCommands = BuildFirstBootRuncmd(flavor);
+            var installCommands = BuildFirstBootRuncmd(opts, flavor);
             for (var i = 0; i < installCommands.Count; i++)
             {
                 var cmd = installCommands[i];
                 if (string.IsNullOrWhiteSpace(cmd)) continue;
                 _log.LogInformation("Baseline install step {N}/{Total}", i + 1, installCommands.Count);
                 var execRun = await RunAsync(
-                    [_opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", cmd],
+                    opts,
+                    [opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", cmd],
                     stdin: null, ct: ct, workItemId: workItemId);
                 if (execRun.ExitCode != 0)
                     throw new InvalidOperationException(
@@ -599,10 +611,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // Stop the baseline so `multipass clone` can use it as a source
             // (clone requires source stopped). Wait for the state to flip
             // so a subsequent clone doesn't race a still-Stopping VM.
-            var stop = await RunAsync([_opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+            var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
             if (stop.ExitCode != 0)
                 throw new InvalidOperationException($"baseline stop failed: {stop.Stderr}");
-            await WaitForStoppedAsync(baselineName, workItemId, ct);
+            await WaitForStoppedAsync(opts, baselineName, workItemId, ct);
 
             _log.LogInformation("Baseline {Name} baked and stopped, ready to clone", baselineName);
         }
@@ -617,6 +629,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     }
 
     private async Task CloneFromBaselineAsync(
+        MultipassSandboxOptions opts,
         string newName,
         string baselineName,
         WorkItemId? workItemId,
@@ -628,12 +641,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // auto-starts stopped instances). Stop is idempotent — exits 0 if
         // already stopped — and we wait for the state to flip because
         // `multipass stop` returns when the request is queued.
-        await RunAsync([_opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
-        await WaitForStoppedAsync(baselineName, workItemId, ct);
+        await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+        await WaitForStoppedAsync(opts, baselineName, workItemId, ct);
 
         _log.LogInformation("Cloning {New} from baseline {Baseline}", newName, baselineName);
         var clone = await RunAsync(
-            [_opts.MultipassBinary, "clone", baselineName, "--name", newName],
+            opts,
+            [opts.MultipassBinary, "clone", baselineName, "--name", newName],
             stdin: null, ct: ct, workItemId: workItemId);
         if (clone.ExitCode != 0)
             throw new InvalidOperationException($"multipass clone failed: {clone.Stderr}");
@@ -646,8 +660,15 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     }
 
     internal IReadOnlyList<string> BuildLaunchArgv(string name, SandboxSpec spec, string cloudInitPath)
+        => BuildLaunchArgv(ReadOptions(), name, spec, cloudInitPath);
+
+    private static IReadOnlyList<string> BuildLaunchArgv(
+        MultipassSandboxOptions opts,
+        string name,
+        SandboxSpec spec,
+        string cloudInitPath)
     {
-        var argv = new List<string> { _opts.MultipassBinary, "launch", "--name", name };
+        var argv = new List<string> { opts.MultipassBinary, "launch", "--name", name };
         if (spec.Limits.CpuCount is { } cpus) argv.AddRange(["--cpus", cpus.ToString()]);
         if (spec.Limits.MemoryBytes is { } mem) argv.AddRange(["--memory", $"{mem / (1024 * 1024)}M"]);
         if (spec.Limits.DiskBytes is { } disk) argv.AddRange(["--disk", $"{disk / (1024 * 1024)}M"]);
@@ -664,10 +685,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // it so it doesn't carry user traffic.
         if (!string.IsNullOrWhiteSpace(spec.Network.ProfileName))
         {
-            if (!_opts.NetworkProfiles.TryGetValue(spec.Network.ProfileName, out var bridge))
+            if (!opts.NetworkProfiles.TryGetValue(spec.Network.ProfileName, out var bridge))
                 throw new InvalidOperationException(
                     $"Network profile '{spec.Network.ProfileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
-                    $"Configured profiles: [{string.Join(", ", _opts.NetworkProfiles.Keys)}]. " +
+                    $"Configured profiles: [{string.Join(", ", opts.NetworkProfiles.Keys)}]. " +
                     "Either add the profile to options or run setup-host-networks.sh and update appsettings.");
             argv.AddRange(["--network", $"name={bridge},mode=auto"]);
         }
@@ -675,29 +696,34 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // ImageReference: empty/null => multipass picks the default image.
         if (!string.IsNullOrWhiteSpace(spec.ImageReference) && spec.ImageReference != "ignored")
             argv.Add(spec.ImageReference);
-        else if (!string.IsNullOrWhiteSpace(_opts.DefaultImage))
-            argv.Add(_opts.DefaultImage);
+        else if (!string.IsNullOrWhiteSpace(opts.DefaultImage))
+            argv.Add(opts.DefaultImage);
 
         return argv;
     }
 
     private async Task LaunchAsync(
+        MultipassSandboxOptions opts,
         string name,
         SandboxSpec spec,
         string cloudInitPath,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
-        var argv = BuildLaunchArgv(name, spec, cloudInitPath);
+        var argv = BuildLaunchArgv(opts, name, spec, cloudInitPath);
         if (!string.IsNullOrWhiteSpace(spec.Network.ProfileName))
             _log.LogInformation("Sandbox {Name}: host-enforced network profile {Profile}", name, spec.Network.ProfileName);
         _log.LogInformation("Launching multipass VM {Name} (this takes 10-30s)", name);
-        var run = await RunAsync(argv, stdin: null, ct: ct, workItemId: workItemId);
+        var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
         if (run.ExitCode != 0)
             throw new InvalidOperationException($"multipass launch failed: {run.Stderr}");
     }
 
-    private async Task WaitForRunningAsync(string name, WorkItemId? workItemId, CancellationToken ct)
+    private async Task WaitForRunningAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
         // Two waits: first the VM enters "Running" state, then cloud-init
         // finishes applying runcmd (which installs the exec wrapper and
@@ -709,7 +735,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
-            var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
+            var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
             if (info.ExitCode == 0 && info.Stdout.Contains("Running", StringComparison.Ordinal))
                 break;
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
@@ -721,7 +747,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // Exit code is non-zero on failure, which matters for graphical
         // launch because the desktop toolchain may be installed from runcmd.
         var cloudInit = await RunAsync(
-            [_opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
+            opts,
+            [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
             stdin: null, ct: ct, workItemId: workItemId);
         if (cloudInit.ExitCode != 0)
             throw new InvalidOperationException($"cloud-init failed for multipass VM {name}: {cloudInit.Stderr}");
@@ -734,13 +761,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// — and `multipass mount --type=native` rejects any other state
     /// with "Please stop the instance ... before attempting native mounts".
     /// </summary>
-    private async Task WaitForStoppedAsync(string name, WorkItemId? workItemId, CancellationToken ct)
+    private async Task WaitForStoppedAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
-            var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
+            var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
             if (info.ExitCode == 0 && info.Stdout.Contains("Stopped", StringComparison.Ordinal))
                 return;
             await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
@@ -760,29 +791,35 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// the guest, and our host firewall typically blocks the snap store.
     /// </summary>
     private async Task ApplyMountsAsync(
+        MultipassSandboxOptions opts,
         string name,
         List<(string Host, string Sandbox)> binds,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
         if (binds.Count == 0) return;
-        await WaitForStoppedAsync(name, workItemId, ct);
+        await WaitForStoppedAsync(opts, name, workItemId, ct);
         foreach (var (host, sandbox) in binds)
         {
             var run = await RunAsync(
-                [_opts.MultipassBinary, "mount", "--type=native", host, $"{name}:{sandbox}"],
+                opts,
+                [opts.MultipassBinary, "mount", "--type=native", host, $"{name}:{sandbox}"],
                 stdin: null, ct: ct, workItemId: workItemId);
             if (run.ExitCode != 0)
                 throw new InvalidOperationException($"multipass mount {host} -> {name}:{sandbox} failed: {run.Stderr}");
         }
     }
 
-    private async Task StartAndWaitForRunningAsync(string name, WorkItemId? workItemId, CancellationToken ct)
+    private async Task StartAndWaitForRunningAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
     {
-        var start = await RunAsync([_opts.MultipassBinary, "start", name], stdin: null, ct: ct, workItemId: workItemId);
+        var start = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct, workItemId: workItemId);
         if (start.ExitCode != 0)
             throw new InvalidOperationException($"multipass start failed: {start.Stderr}");
-        await WaitForRunningAsync(name, workItemId, ct);
+        await WaitForRunningAsync(opts, name, workItemId, ct);
     }
 
     /// <summary>
@@ -806,6 +843,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// healthy creation on a fixed sleep.
     /// </summary>
     private async Task<string> TransferEnvAsync(
+        MultipassSandboxOptions opts,
         string name,
         IReadOnlyDictionary<string, string> env,
         string sandboxRoot,
@@ -819,7 +857,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
         var tx = await MultipassRetry.RunWithRetryAsync(
             ctInner => RunAsync(
-                [_opts.MultipassBinary, "transfer", envPath, $"{name}:.codeybox-env"],
+                opts,
+                [opts.MultipassBinary, "transfer", envPath, $"{name}:.codeybox-env"],
                 stdin: null, ct: ctInner),
             _log,
             description: $"multipass transfer env file -> {name}",
@@ -828,7 +867,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             throw new InvalidOperationException($"multipass transfer env file failed: {tx.Stderr}");
 
         var perms = await RunAsync(
-            [_opts.MultipassBinary, "exec", name, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"],
+            opts,
+            [opts.MultipassBinary, "exec", name, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"],
             stdin: null, ct: ct, workItemId: workItemId);
         if (perms.ExitCode != 0)
             throw new InvalidOperationException($"failed to chmod env file in VM: {perms.Stderr}");
@@ -1155,20 +1195,25 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             sb.Append("      ").AppendLine(line);
     }
 
-    private IReadOnlyList<string> BuildFirstBootRuncmd(SandboxProfileFlavor flavor)
+    private MultipassSandboxOptions ReadOptions() => _optsAccessor();
+
+    private static IReadOnlyList<string> BuildFirstBootRuncmd(
+        MultipassSandboxOptions opts,
+        SandboxProfileFlavor flavor)
     {
         if (flavor != SandboxProfileFlavor.Graphical)
-            return _opts.ExtraRuncmd;
+            return opts.ExtraRuncmd;
 
-        var commands = new List<string>(_opts.ExtraRuncmd.Count + 1)
+        var commands = new List<string>(opts.ExtraRuncmd.Count + 1)
         {
             GraphicalInstallRuncmd,
         };
-        commands.AddRange(_opts.ExtraRuncmd);
+        commands.AddRange(opts.ExtraRuncmd);
         return commands;
     }
 
     private Task<RunResult> RunAsync(
+        MultipassSandboxOptions opts,
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
@@ -1177,17 +1222,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             argv,
             ctInner => _runner.RunAsync(argv, stdin, ctInner),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
-                _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
+                _runner, opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,
             workItemId,
             ct,
             _daemonRetryPolicy);
 
-    private async Task TryDeleteVmAsync(string name)
+    private async Task TryDeleteVmAsync(MultipassSandboxOptions opts, string name)
     {
         try
         {
-            await RunAsync([_opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: CancellationToken.None);
+            await RunAsync(opts, [opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: CancellationToken.None);
         }
         catch { /* best-effort */ }
     }

@@ -87,12 +87,82 @@ public sealed class HotReloadConfigTests
 
         var after = await repo.GetAsync(new ProjectId("alpha"));
         Assert.Equal(TimeSpan.FromMinutes(25), after!.Audit.PerIterationTimeout);
+    }
 
-        // PipelineRunner.RunAsync captures Project once at pickup time, then uses
-        // the captured immutable record for the rest of the run. The "before"
-        // reference here represents that pickup-time snapshot: changing the
-        // monitor mid-run must NOT mutate the value held by the running pipeline.
-        Assert.Equal(TimeSpan.FromMinutes(10), before.Audit.PerIterationTimeout);
+    [Fact]
+    public async Task PipelineRunner_PinsAuditTimeoutAtPickup_WhenProjectReloadsMidRun()
+    {
+        var workspace = Path.Combine(Path.GetTempPath(), $"codeybox-pickup-snapshot-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workspace);
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(workspace);
+            var project = new Project
+            {
+                Id = new ProjectId("test-project"),
+                DisplayName = "Test Project",
+                RepositoryUrl = seed,
+                DefaultBaseBranch = "main",
+                DefaultAgent = AgentKind.Claude,
+                Audit = new ProjectAudit
+                {
+                    MaxIterations = 1,
+                    PerIterationTimeout = TimeSpan.FromMinutes(1),
+                    AuditTypes = ["scripted"],
+                },
+            };
+            var repo = new MutableProjectRepository(project);
+            var auditor = new SlowPassingAuditor(TimeSpan.FromMilliseconds(150));
+            using var fixture = TestSupport.BuildPipeline(
+                workspace,
+                seed,
+                auditors: [auditor],
+                maxAuditIterations: 1,
+                projectRepository: repo);
+
+            var workStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseWork = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            fixture.Agent.BeforeWorkAsync = async (_, _, ct) =>
+            {
+                workStarted.TrySetResult();
+                await releaseWork.Task.WaitAsync(ct);
+            };
+            fixture.Agent.WorkPlan.Enqueue(new FileWrite("feature.txt", "hello\n"));
+
+            var item = new WorkItem
+            {
+                Id = WorkItemId.New(),
+                ProjectId = new ProjectId("test-project"),
+                Title = "hot reload pickup snapshot",
+                Prompt = "write a file",
+                PushUpstream = false,
+            };
+            await fixture.Store.CreateAsync(item);
+
+            var runTask = fixture.Pipeline.RunAsync(item, CancellationToken.None);
+            await workStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            var working = await fixture.Store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Working, working!.State);
+
+            // A zero-minute timeout would cancel the audit immediately if the
+            // runner re-read project config after pickup instead of using the
+            // project snapshot captured at the start of RunAsync.
+            repo.Set(project with
+            {
+                Audit = project.Audit with { PerIterationTimeout = TimeSpan.Zero },
+            });
+            releaseWork.TrySetResult();
+
+            await runTask.WaitAsync(TimeSpan.FromSeconds(20));
+
+            Assert.True(auditor.Completed);
+            var finished = await fixture.Store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Done, finished!.State);
+        }
+        finally
+        {
+            try { Directory.Delete(workspace, recursive: true); } catch { }
+        }
     }
 
     [Fact]
@@ -134,6 +204,40 @@ public sealed class HotReloadConfigTests
 
         Assert.True(result.Failed);
         Assert.Contains("StateDatabasePath", result.FailureMessage);
+    }
+
+    [Fact]
+    public void CodeyBoxOptionsMonitor_KeepsStartupValue_AfterRejectedStateDatabasePathReload()
+    {
+        var startupPath = Path.Combine(Path.GetTempPath(), $"codeybox-startup-{Guid.NewGuid():N}.db");
+        var rejectedPath = Path.Combine(Path.GetTempPath(), $"codeybox-rejected-{Guid.NewGuid():N}.db");
+        var values = new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "multipass",
+            ["CodeyBox:StateDatabasePath"] = startupPath,
+            ["CodeyBox:GitRootDirectory"] = Path.Combine(Path.GetTempPath(), "codeybox-repos"),
+            ["CodeyBox:AgentStreams:Path"] = Path.Combine(Path.GetTempPath(), "codeybox-agent-streams"),
+        };
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(values)
+            .Build();
+        var startup = config.GetSection("CodeyBox").Get<CodeyBoxOptions>() ?? new CodeyBoxOptions();
+
+        var services = new ServiceCollection();
+        services.Configure<CodeyBoxOptions>(config.GetSection("CodeyBox"));
+        services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
+            _ => new RetainingOptionsMonitorCache<CodeyBoxOptions>(startup));
+        services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
+            _ => new ImmutableCodeyBoxOptionsValidator(startup));
+        using var provider = services.BuildServiceProvider();
+        var monitor = provider.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+
+        Assert.Equal(startupPath, monitor.CurrentValue.StateDatabasePath);
+
+        config["CodeyBox:StateDatabasePath"] = rejectedPath;
+        _ = Record.Exception(((IConfigurationRoot)config).Reload);
+
+        Assert.Equal(startupPath, monitor.CurrentValue.StateDatabasePath);
     }
 
     [Fact]
@@ -315,31 +419,33 @@ public sealed class HotReloadConfigTests
     }
 
     [Fact]
-    public void MultipassSandboxProvider_FuncAccessor_IsInvokedOnEachOptionsRead()
+    public void MultipassSandboxProvider_FuncAccessor_IsInvokedForLaunchOptionsRead()
     {
-        // The provider must call its options accessor on each read so an
-        // operator edit to MultipassExtraRuncmd / ExtraCloudInit lands on the
-        // next sandbox launch without restart. Use the read-only accessor to
-        // verify wiring without spinning up a real Multipass VM.
         var calls = 0;
-        var current = new MultipassSandboxOptions { ExtraRuncmd = new[] { "echo v1" } };
+        var current = MultipassOptions(defaultImage: "ubuntu-v1", bridge: "br-v1");
         var provider = new MultipassSandboxProvider(
             () => { calls++; return current; },
             NullLogger<MultipassSandboxProvider>.Instance);
 
-        Assert.True(calls >= 1); // at least one read during construction (staging root)
-        var before = calls;
+        var afterConstruction = calls;
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy { ProfileName = "egress" },
+        };
 
-        // Swap to "v2" and trigger a read that the provider would do at launch
-        // — Name is a fixed property and doesn't call the accessor, so use
-        // the disposal path which reads opts when listing managed sandboxes.
-        // (We can't easily trigger CreateAsync in a unit test; instead we
-        // verify by spec: the accessor is a property getter, and the test
-        // above demonstrated the accessor is called at least once at
-        // construction, which would be true after a hot-reload.)
-        current = new MultipassSandboxOptions { ExtraRuncmd = new[] { "echo v2" } };
-        _ = provider.Name;
-        Assert.True(calls >= before, "accessor should be invoked on subsequent reads");
+        var first = provider.BuildLaunchArgv("vm-one", spec, "/tmp/cloud-init.yaml");
+        Assert.True(calls > afterConstruction, "launch argv construction should read current options");
+        Assert.Contains("ubuntu-v1", first);
+        Assert.Contains("name=br-v1,mode=auto", first);
+
+        var beforeSecondRead = calls;
+        current = MultipassOptions(defaultImage: "ubuntu-v2", bridge: "br-v2");
+
+        var second = provider.BuildLaunchArgv("vm-two", spec, "/tmp/cloud-init.yaml");
+        Assert.True(calls > beforeSecondRead, "subsequent launch argv construction should re-read options");
+        Assert.Contains("ubuntu-v2", second);
+        Assert.Contains("name=br-v2,mode=auto", second);
     }
 
     [Fact]
@@ -392,6 +498,15 @@ public sealed class HotReloadConfigTests
         }
     }
 
+    private static MultipassSandboxOptions MultipassOptions(string defaultImage, string bridge) => new()
+    {
+        DefaultImage = defaultImage,
+        NetworkProfiles = new Dictionary<string, string>
+        {
+            ["egress"] = bridge,
+        },
+    };
+
     private static WorkItem NewItem(string _, string projectId, WorkItemState state) => new()
     {
         Id = WorkItemId.New(),
@@ -400,6 +515,44 @@ public sealed class HotReloadConfigTests
         Prompt = "test",
         State = state,
     };
+
+    private sealed class SlowPassingAuditor(TimeSpan delay) : IAuditor
+    {
+        public string Name => "scripted:slow-pass";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public bool Completed { get; private set; }
+
+        public async Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            await Task.Delay(delay, ct);
+            Completed = true;
+            return new AuditResult(true, []);
+        }
+    }
+
+    private sealed class MutableProjectRepository(Project initial) : IProjectRepository
+    {
+        private Project _current = initial;
+
+        public void Set(Project project) => Volatile.Write(ref _current, project);
+
+        public Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+        {
+            var current = Volatile.Read(ref _current);
+            return Task.FromResult<Project?>(current.Id == id ? current : null);
+        }
+
+        public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Project>>([Volatile.Read(ref _current)]);
+    }
 
     /// <summary>
     /// Minimal <see cref="IOptionsMonitor{T}"/> stub that lets tests synchronously

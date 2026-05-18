@@ -179,13 +179,21 @@ builder.Services.AddOptions<ProjectsOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
     .PostConfigure(opts => ProjectsOptionsBinder.ApplyCustomMaps(opts, builder.Configuration.GetSection("CodeyBox")));
 
-// Immutable-field guard for CodeyBoxOptions. Lazily captures the
-// first-validated value (which already includes every layered configuration
-// source — file overlays, env vars, test ConfigureAppConfiguration hooks)
-// as the startup snapshot; any subsequent reload that changes one of those
-// fields triggers an OptionsValidationException and the framework retains
-// the prior value. See HotReloadGuards.cs for the guarded field list.
-builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, ImmutableCodeyBoxOptionsValidator>();
+// Immutable-field guard for CodeyBoxOptions. The startup snapshot is bound from
+// IConfiguration when the service provider resolves it, after test/host
+// ConfigureAppConfiguration hooks have had a chance to add their final sources.
+// The retaining monitor cache is deliberate: stock IOptionsMonitor drops its
+// prior cached value before validating a reload candidate, so a rejected edit
+// would make CurrentValue throw until the next successful reload.
+builder.Services.AddSingleton(sp => new CodeyBoxOptionsStartupSnapshot(
+    sp.GetRequiredService<IConfiguration>().GetSection("CodeyBox").Get<CodeyBoxOptions>()
+    ?? new CodeyBoxOptions()));
+builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
+    sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
+        sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
+builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
+    sp => new ImmutableCodeyBoxOptionsValidator(
+        sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
 
 // Rejects ProjectsOptions reloads that remove a project still holding
 // non-terminal work items. Adding new projects passes cleanly.
@@ -1357,6 +1365,10 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>
 preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
 
 var app = builder.Build();
+
+// Force the immutable-options baseline and retaining monitor cache to exist
+// before the host starts observing file-change reloads.
+_ = app.Services.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
 
 app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
 

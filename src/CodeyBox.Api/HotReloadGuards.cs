@@ -3,15 +3,26 @@ using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
 
+public sealed class CodeyBoxOptionsStartupSnapshot
+{
+    public CodeyBoxOptionsStartupSnapshot(CodeyBoxOptions value)
+    {
+        Value = value;
+    }
+
+    public CodeyBoxOptions Value { get; }
+}
+
 /// <summary>
 /// Captures the startup snapshot of CodeyBoxOptions fields that cannot be
 /// rebound safely at runtime and rejects subsequent reloads that change them.
 ///
-/// The framework's <see cref="IOptionsMonitor{TOptions}"/> still surfaces the
-/// rejection — consumers reading CurrentValue see the previous, validated
-/// value. Operators see an OptionsValidationException in the log, the message
-/// names the offending field, and they know a restart is required to apply
-/// the change.
+/// The validator only rejects the candidate value; vanilla
+/// <see cref="IOptionsMonitor{TOptions}"/> does not retain the prior value after
+/// that rejection. Production wiring pairs this validator with
+/// <see cref="RetainingOptionsMonitorCache{TOptions}"/> so runtime consumers keep
+/// reading the startup value while the reload callback still surfaces an
+/// OptionsValidationException naming the field that requires a restart.
 ///
 /// Fields guarded here are the ones whose value is captured by open file
 /// handles, long-lived listeners, or singleton constructors elsewhere in the
@@ -19,11 +30,9 @@ namespace CodeyBox.Api;
 /// resource or quietly continue using the stale value, which is worse than
 /// rejecting the change outright.
 ///
-/// The startup snapshot is captured on the first call to
-/// <see cref="Validate"/> so it reflects every layered configuration source
-/// (file overlays, environment variables, test ConfigureAppConfiguration
-/// hooks) rather than just whatever the builder had bound when the validator
-/// was registered.
+/// Production passes an eager startup snapshot into the constructor after all
+/// layered configuration sources are registered. The parameterless constructor
+/// remains for tests that need to exercise the lazy-capture path directly.
 /// </summary>
 public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
 {
@@ -37,9 +46,8 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
     public ImmutableCodeyBoxOptionsValidator() { }
 
     /// <summary>
-    /// Explicit-snapshot constructor for unit tests: pass the values to treat as
-    /// the captured startup snapshot. Production wiring should prefer the
-    /// parameterless constructor.
+    /// Explicit-snapshot constructor: pass the values to treat as the captured
+    /// startup snapshot.
     /// </summary>
     public ImmutableCodeyBoxOptionsValidator(CodeyBoxOptions startupSnapshot)
     {
