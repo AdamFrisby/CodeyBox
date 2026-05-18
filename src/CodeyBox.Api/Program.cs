@@ -1461,6 +1461,8 @@ app.MapGet("/quota", async (
     });
 });
 
+app.MapGet("/events/schema", () => Results.Ok(EventSchema.GetSchema()));
+
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
 try

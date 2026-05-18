@@ -152,6 +152,9 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
         request.Headers.Add("X-CodeyBox-Event", evt.Event);
         request.Headers.Add("X-CodeyBox-Delivery", evt.DeliveryId.ToString());
+        // Exposed as a header so schema-version-strict trackers can reject
+        // unknown majors before parsing the JSON body.
+        request.Headers.Add("X-CodeyBox-Schema-Version", evt.EventSchemaVersion);
         if (signature is not null)
             request.Headers.Add("X-CodeyBox-Signature", $"sha256={signature}");
         return request;
@@ -161,6 +164,9 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
     {
         var repoUrl = evt.Project?.RepositoryUrl is { } url ? StripUserInfo(url) : null;
         var payload = new WebhookPayload(
+            EventSchemaVersion: evt.EventSchemaVersion,
+            EventType: evt.Event,
+            EmittedAt: evt.EmittedAt,
             Event: evt.Event,
             OccurredAt: evt.OccurredAt,
             WorkItem: evt.WorkItem is { } wi && evt.Project is { } p
@@ -226,6 +232,9 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
 // ── Internal payload DTOs ────────────────────────────────────────────────────
 
 internal sealed record WebhookPayload(
+    string EventSchemaVersion,
+    string EventType,
+    DateTimeOffset EmittedAt,
     string Event,
     DateTimeOffset OccurredAt,
     WebhookWorkItemPayload? WorkItem,

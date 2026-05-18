@@ -23,6 +23,13 @@ public sealed class WebhookEventBroadcaster
     private readonly LinkedList<Subscriber> _subscribers = new();
     private readonly object _lock = new();
 
+    /// <summary>
+    /// When true, every <see cref="Publish"/> runs <see cref="EventSchema.ValidateEnvelope"/>
+    /// and throws on a missing required field. Off by default so production never
+    /// observes the cost; tests set it to fail fast on schema drift.
+    /// </summary>
+    public static bool StrictSchemaValidationForTests { get; set; }
+
     /// <summary>Test-only hook: count of live subscribers.</summary>
     internal int SubscriberCount { get { lock (_lock) return _subscribers.Count; } }
 
@@ -44,6 +51,12 @@ public sealed class WebhookEventBroadcaster
     public BroadcastedEvent Publish(WebhookEvent evt)
     {
         ArgumentNullException.ThrowIfNull(evt);
+        if (StrictSchemaValidationForTests)
+        {
+            var err = EventSchema.ValidateEnvelope(evt);
+            if (err is not null)
+                throw new InvalidOperationException("Webhook event failed schema validation: " + err);
+        }
         var workItemKey = evt.WorkItem?.Id.ToString();
 
         BroadcastedEvent broadcasted;
