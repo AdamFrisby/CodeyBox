@@ -817,8 +817,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         var sb = new StringBuilder();
         foreach (var (k, v) in env)
         {
-            if (k.Contains('=') || k.Contains('\n'))
+            if (k.Contains('=') || k.Contains('\n') || k.Contains('\0'))
                 throw new ArgumentException($"Invalid env key: {k}");
+            // /bin/sh dot-source has undefined behaviour on NUL bytes —
+            // some implementations truncate the file at the NUL, others
+            // fail with "syntax error". Either way the wrapper would
+            // exit 126 with no useful diagnostic, so reject up front.
+            if (v.Contains('\0'))
+                throw new ArgumentException($"Env value for '{k}' contains NUL byte");
             sb.Append(k).Append('=').Append(ShellSingleQuote(v)).Append('\n');
         }
 
@@ -835,7 +841,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// mode 0755 so the agent (running as the unprivileged ubuntu user
     /// without sudo) can run but cannot modify it.
     /// </summary>
-    private const string ExecWrapperScript = """
+    internal const string ExecWrapperScript = """
         #!/bin/sh
         # Non-interactive defaults. Set BEFORE sourcing user env so user env
         # can override if needed. CI=true is respected by many CLIs to skip
@@ -858,15 +864,39 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             keep_stdin=1
             shift
         fi
-        cd "$1" || exit 127
+        # Capture stderr from cd / --env-file source into a tempfile so that
+        # a bare exit 126/127 is never silent: without this, the wrapper
+        # exits with no context and the orchestrator's lastError is useless
+        # for root-causing the failure.
+        codeybox_err_file=$(mktemp 2>/dev/null) || codeybox_err_file="/tmp/codeybox-exec-err.$$"
+        cd "$1" 2>"$codeybox_err_file"
+        codeybox_cd_rc=$?
+        if [ "$codeybox_cd_rc" -ne 0 ]; then
+            echo "codeybox-exec: failed to cd to '$1' (exit $codeybox_cd_rc):" >&2
+            cat "$codeybox_err_file" >&2 2>/dev/null
+            rm -f "$codeybox_err_file"
+            exit 127
+        fi
         shift
         if [ "${1:-}" = "--env-file" ]; then
-            [ "$#" -ge 2 ] || exit 127
+            if [ "$#" -lt 2 ]; then
+                echo "codeybox-exec: --env-file requires a path argument" >&2
+                rm -f "$codeybox_err_file"
+                exit 127
+            fi
             set -a
-            . "$2" || exit 126
+            . "$2" 2>"$codeybox_err_file"
+            codeybox_src_rc=$?
             set +a
+            if [ "$codeybox_src_rc" -ne 0 ]; then
+                echo "codeybox-exec: failed to source env file '$2' (exit $codeybox_src_rc):" >&2
+                cat "$codeybox_err_file" >&2 2>/dev/null
+                rm -f "$codeybox_err_file"
+                exit 126
+            fi
             shift 2
         fi
+        rm -f "$codeybox_err_file"
         if [ "$keep_stdin" = "1" ]; then
             exec "$@"
         else
