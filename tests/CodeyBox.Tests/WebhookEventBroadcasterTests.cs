@@ -76,10 +76,12 @@ public sealed class WebhookEventBroadcasterTests
     public async Task LastEventId_ReplaysOnlyNewerBufferedEvents()
     {
         var bc = new WebhookEventBroadcaster();
-        // Publish 3 events before any subscriber exists.
-        bc.Publish(Evt("a")); // id 1
-        bc.Publish(Evt("b")); // id 2
-        bc.Publish(Evt("c")); // id 3
+        // Publish 3 events before any subscriber exists. Distinct real event
+        // names (must be in EventSchema.KnownEventTypes so strict-mode
+        // validation accepts them); only the ordering matters here.
+        bc.Publish(Evt("work_item.working")); // id 1
+        bc.Publish(Evt("work_item.work_complete")); // id 2
+        bc.Publish(Evt("work_item.done")); // id 3
 
         // Reconnecting client claims it last received id 2 — should get only id 3.
         await using var sub = bc.Subscribe(new SubscriptionFilter(), lastEventId: 2);
@@ -95,15 +97,15 @@ public sealed class WebhookEventBroadcasterTests
 
         var single = Assert.Single(got);
         Assert.Equal(3, single.SequenceId);
-        Assert.Equal("c", single.Event.Event);
+        Assert.Equal("work_item.done", single.Event.Event);
     }
 
     [Fact]
     public async Task LastEventId_ZeroReplaysEverythingInBuffer()
     {
         var bc = new WebhookEventBroadcaster();
-        bc.Publish(Evt("a"));
-        bc.Publish(Evt("b"));
+        bc.Publish(Evt("work_item.working"));
+        bc.Publish(Evt("work_item.done"));
 
         await using var sub = bc.Subscribe(new SubscriptionFilter(), lastEventId: 0);
 
@@ -123,11 +125,11 @@ public sealed class WebhookEventBroadcasterTests
     public async Task RingBuffer_EvictsOldestAtCapacity()
     {
         var bc = new WebhookEventBroadcaster(ringBufferCapacity: 3);
-        bc.Publish(Evt("e1"));
-        bc.Publish(Evt("e2"));
-        bc.Publish(Evt("e3"));
-        bc.Publish(Evt("e4"));
-        bc.Publish(Evt("e5"));
+        bc.Publish(Evt("work_item.working"));
+        bc.Publish(Evt("work_item.work_complete"));
+        bc.Publish(Evt("work_item.auditing"));
+        bc.Publish(Evt("work_item.audit_iteration"));
+        bc.Publish(Evt("work_item.done"));
 
         await using var sub = bc.Subscribe(new SubscriptionFilter(), lastEventId: 0);
 
@@ -148,14 +150,14 @@ public sealed class WebhookEventBroadcasterTests
     public async Task Subscribe_DoesNotDuplicateBufferAndLiveEvents()
     {
         var bc = new WebhookEventBroadcaster();
-        bc.Publish(Evt("a"));
-        bc.Publish(Evt("b"));
+        bc.Publish(Evt("work_item.working"));
+        bc.Publish(Evt("work_item.work_complete"));
 
         await using var sub = bc.Subscribe(new SubscriptionFilter(), lastEventId: 0);
 
         // Publish more events after subscribing — must not duplicate the replay slice.
-        bc.Publish(Evt("c"));
-        bc.Publish(Evt("d"));
+        bc.Publish(Evt("work_item.auditing"));
+        bc.Publish(Evt("work_item.done"));
 
         var got = new List<long>();
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
@@ -184,20 +186,20 @@ public sealed class WebhookEventBroadcasterTests
             new SubscriptionFilter { WorkItemId = wantedId.ToString() },
             lastEventId: null);
 
-        bc.Publish(Evt("other", id: otherId));
-        bc.Publish(Evt("wanted", id: wantedId));
+        bc.Publish(Evt("work_item.working", id: otherId));
+        bc.Publish(Evt("work_item.done", id: wantedId));
 
-        var got = new List<string>();
+        var got = new List<WorkItemId?>();
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         try
         {
             await foreach (var e in sub.ReadAsync(cts.Token))
-                got.Add(e.Event.Event);
+                got.Add(e.Event.WorkItem?.Id);
         }
         catch (OperationCanceledException) { }
 
         var single = Assert.Single(got);
-        Assert.Equal("wanted", single);
+        Assert.Equal(wantedId, single);
     }
 
     [Fact]
@@ -208,20 +210,20 @@ public sealed class WebhookEventBroadcasterTests
             new SubscriptionFilter { ProjectId = "proj-a" },
             lastEventId: null);
 
-        bc.Publish(Evt("a", projectId: "proj-b"));
-        bc.Publish(Evt("b", projectId: "proj-a"));
+        bc.Publish(Evt("work_item.working", projectId: "proj-b"));
+        bc.Publish(Evt("work_item.done", projectId: "proj-a"));
 
-        var got = new List<string>();
+        var got = new List<string?>();
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         try
         {
             await foreach (var e in sub.ReadAsync(cts.Token))
-                got.Add(e.Event.Event);
+                got.Add(e.Event.Project?.Id.Value);
         }
         catch (OperationCanceledException) { }
 
         var single = Assert.Single(got);
-        Assert.Equal("b", single);
+        Assert.Equal("proj-a", single);
     }
 
     [Fact]
@@ -259,6 +261,6 @@ public sealed class WebhookEventBroadcasterTests
 
         // Subsequent publishes must not throw and must not crash on the
         // disposed subscriber. (No assertion needed — absence of throw is the test.)
-        bc.Publish(Evt("a"));
+        bc.Publish(Evt("work_item.working"));
     }
 }

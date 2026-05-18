@@ -55,7 +55,7 @@ public class CredentialFileSource : IDisposable
     {
         FilePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
         _log = log;
-        TryReload(out _);
+        TryReload(force: false, out _);
         StartWatcher();
     }
 
@@ -68,46 +68,52 @@ public class CredentialFileSource : IDisposable
     public string? GetRaw()
     {
         if (_disposed) return null;
-        var changed = TryReload(out var current);
-        if (changed) RaiseTokenUpdated();
+        TryReload(force: false, out var current);
         return current;
     }
 
     internal void Reload()
     {
-        var changed = TryReload(out _);
-        if (changed) RaiseTokenUpdated();
+        // Called from FileSystemWatcher events: bypass the mtime/length
+        // short-circuit because watcher delivery is itself proof a change
+        // occurred. Skipping the stat check matters on filesystems with
+        // coarse (second-resolution) mtime — two rapid writes whose final
+        // bytes happen to share length would otherwise be invisible.
+        TryReload(force: true, out _);
     }
 
-    private bool TryReload(out string? current)
+    private bool TryReload(bool force, out string? current)
     {
-        DateTime mtime;
-        long length;
-        try
+        DateTime mtime = DateTime.MinValue;
+        long length = -1;
+        if (!force)
         {
-            if (!File.Exists(FilePath))
+            try
+            {
+                if (!File.Exists(FilePath))
+                {
+                    lock (_gate) current = _cached;
+                    return false;
+                }
+                var info = new FileInfo(FilePath);
+                mtime = info.LastWriteTimeUtc;
+                length = info.Length;
+            }
+            catch (IOException)
             {
                 lock (_gate) current = _cached;
                 return false;
             }
-            var info = new FileInfo(FilePath);
-            mtime = info.LastWriteTimeUtc;
-            length = info.Length;
-        }
-        catch (IOException)
-        {
-            lock (_gate) current = _cached;
-            return false;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            lock (_gate) current = _cached;
-            return false;
+            catch (UnauthorizedAccessException)
+            {
+                lock (_gate) current = _cached;
+                return false;
+            }
         }
 
         lock (_gate)
         {
-            if (mtime == _cachedMtimeUtc && length == _cachedLength && _cached is not null)
+            if (!force && mtime == _cachedMtimeUtc && length == _cachedLength && _cached is not null)
             {
                 current = _cached;
                 return false;
@@ -133,6 +139,13 @@ public class CredentialFileSource : IDisposable
             var contentChanged = !string.Equals(_cached, next, StringComparison.Ordinal);
             _cached = next;
             current = _cached;
+            // Raise the notification while still holding the lock so a
+            // concurrent reader cannot observe the new `_cached` value via
+            // GetRaw() before the TokenUpdated subscribers have run. The lock
+            // is a Monitor (reentrant on the same thread), so a subscriber that
+            // calls back into GetRaw/Reload won't deadlock; cross-thread
+            // callers serialise behind the lock as they would otherwise.
+            if (contentChanged) RaiseTokenUpdated();
             return contentChanged;
         }
     }

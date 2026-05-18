@@ -446,6 +446,7 @@ sandboxes are not associated with a specific work item.
 | `Content-Type` | `application/json; charset=utf-8` |
 | `X-CodeyBox-Event` | Event name, e.g. `work_item.done` |
 | `X-CodeyBox-Delivery` | Random UUID, unique per delivery attempt batch |
+| `X-CodeyBox-Schema-Version` | Event-payload schema version (semver), e.g. `1.0`. See [`EVENT_SCHEMA.md`](EVENT_SCHEMA.md) for evolution rules. |
 | `X-CodeyBox-Signature` | `sha256=<hex>` — only present when `SecretEnvVar` is configured |
 
 ---

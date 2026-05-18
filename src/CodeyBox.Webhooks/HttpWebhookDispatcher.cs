@@ -152,6 +152,9 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
         request.Headers.Add("X-CodeyBox-Event", evt.Event);
         request.Headers.Add("X-CodeyBox-Delivery", evt.DeliveryId.ToString());
+        // Exposed as a header so schema-version-strict trackers can reject
+        // unknown majors before parsing the JSON body.
+        request.Headers.Add("X-CodeyBox-Schema-Version", evt.EventSchemaVersion);
         if (signature is not null)
             request.Headers.Add("X-CodeyBox-Signature", $"sha256={signature}");
         return request;
@@ -161,6 +164,9 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
     {
         var repoUrl = evt.Project?.RepositoryUrl is { } url ? StripUserInfo(url) : null;
         var payload = new WebhookPayload(
+            EventSchemaVersion: evt.EventSchemaVersion,
+            EventType: evt.Event,
+            EmittedAt: evt.EmittedAt,
             Event: evt.Event,
             OccurredAt: evt.OccurredAt,
             WorkItem: evt.WorkItem is { } wi && evt.Project is { } p
@@ -169,12 +175,25 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
             Project: evt.Project is { } proj
                 ? new WebhookProjectPayload(proj.Id.Value, proj.DisplayName, repoUrl ?? "")
                 : null,
+            Release: evt.Release is { } rel ? MapRelease(rel) : null,
             Details: evt.Details,
             Usage: evt.Usage,
             UsageTotal: evt.UsageTotal);
 
         return JsonSerializer.Serialize(payload, JsonOptions);
     }
+
+    private static WebhookReleasePayload MapRelease(Release release) => new(
+        Id: release.Id.ToString(),
+        ProjectId: release.ProjectId.Value,
+        Name: release.Name,
+        State: release.State.ToString(),
+        BranchName: release.BranchName,
+        CreatedAt: release.CreatedAt,
+        ClosedAt: release.ClosedAt,
+        ReleasedAt: release.ReleasedAt,
+        FailedReason: release.FailedReason,
+        TargetTag: release.TargetTag);
 
     private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string? repositoryUrl, AgentKind projectDefaultAgent) => new(
         Id: item.Id.ToString(),
@@ -226,10 +245,14 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
 // ── Internal payload DTOs ────────────────────────────────────────────────────
 
 internal sealed record WebhookPayload(
+    string EventSchemaVersion,
+    string EventType,
+    DateTimeOffset EmittedAt,
     string Event,
     DateTimeOffset OccurredAt,
     WebhookWorkItemPayload? WorkItem,
     WebhookProjectPayload? Project,
+    WebhookReleasePayload? Release,
     object? Details,
     WorkItemIterationUsage? Usage,
     WorkItemUsageTotal? UsageTotal);
@@ -253,3 +276,15 @@ internal sealed record WebhookProjectPayload(
     string Id,
     string DisplayName,
     string RepositoryUrl);
+
+internal sealed record WebhookReleasePayload(
+    string Id,
+    string ProjectId,
+    string Name,
+    string State,
+    string? BranchName,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? ClosedAt,
+    DateTimeOffset? ReleasedAt,
+    string? FailedReason,
+    string? TargetTag);

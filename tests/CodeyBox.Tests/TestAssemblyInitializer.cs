@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -20,5 +21,10 @@ internal static class TestAssemblyInitializer
     {
         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
             Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://127.0.0.1:0");
+
+        // Fail fast in CI on schema drift: every WebhookEvent that goes
+        // through the broadcaster is validated for the three required
+        // envelope fields. Production code path keeps this off.
+        WebhookEventBroadcaster.StrictSchemaValidationForTests = true;
     }
 }

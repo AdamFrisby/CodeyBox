@@ -128,7 +128,7 @@ public sealed class SseEndpointsTests : IDisposable
         // Publish 3 events before any client connects; their server-assigned
         // ids will be N+1, N+2, N+3 — capture N to make the test stable
         // regardless of any startup-time events published by background services.
-        var baseEvt = broadcaster.Publish(EventFor(item, "warmup"));
+        var baseEvt = broadcaster.Publish(EventFor(item, "work_item.auditing"));
         long baseId = baseEvt.SequenceId;
         var e1 = broadcaster.Publish(EventFor(item, "work_item.working"));
         var e2 = broadcaster.Publish(EventFor(item, "work_item.audit_passed"));
