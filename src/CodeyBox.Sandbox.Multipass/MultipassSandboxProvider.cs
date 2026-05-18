@@ -744,14 +744,25 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             throw new InvalidOperationException($"multipass VM {name} did not reach Running state within 3 minutes");
 
         // `cloud-init status --wait` blocks until cloud-init has finished.
-        // Exit code is non-zero on failure, which matters for graphical
-        // launch because the desktop toolchain may be installed from runcmd.
+        // Exit codes (from cloud-init docs):
+        //   0  = done
+        //   1  = not run
+        //   2  = degraded done (recoverable warnings — e.g. schema-validation
+        //        warnings on octal permissions that multipass re-emits as
+        //        decimal integers). The VM is still functional.
+        //   >2 = genuine error.
+        // We accept 0 and 2; only >2 (or 1) is a hard failure. Without this
+        // tolerance every VM launch fails because multipass's YAML round-trip
+        // strips quotes from `permissions: '0755'` and cloud-init then warns
+        // that 493 isn't a string. (Regression introduced in the graphical-VM
+        // merge — pre-60b9eb4 there was no exit-code check here at all.)
         var cloudInit = await RunAsync(
             opts,
             [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
             stdin: null, ct: ct, workItemId: workItemId);
-        if (cloudInit.ExitCode != 0)
-            throw new InvalidOperationException($"cloud-init failed for multipass VM {name}: {cloudInit.Stderr}");
+        if (cloudInit.ExitCode != 0 && cloudInit.ExitCode != 2)
+            throw new InvalidOperationException(
+                $"cloud-init failed for multipass VM {name} (exit {cloudInit.ExitCode}): {cloudInit.Stderr}");
     }
 
     /// <summary>
