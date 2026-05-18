@@ -339,12 +339,14 @@ public sealed class PipelineRunner : IPipelineRunner
                     // In-iteration quota fallback: if the chosen agent hits quota
                     // mid-flight, swap to the next class member and retry. Audit,
                     // rework, and merge phases are wrapped equivalently below.
+                    var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
                     workAgentStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "work", iteration: null,
                         async (runner, trialItem) =>
                             await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "work", workCts, ct, phaseCt =>
                                 RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
                                     BuildInitialWorkPrompt(trialItem.Prompt, project.AllowAgentQuestions, auditors), isInitial: true,
-                                    networkProfile: project.NetworkProfiles.Work,
+                                    networkProfile: sandboxTarget.NetworkProfile,
+                                    sandboxFlavor: sandboxTarget.Flavor,
                                     project: project,
                                     phaseCt,
                                     hostShutdownToken)),
@@ -373,13 +375,15 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     reworkCts.CancelAfter(item.WorkTimeout);
                     using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
+                    var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
                     reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
                         async (runner, trialItem) =>
                             await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "rework", reworkCts, ct,
                                 phaseCt => RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
                                     BuildInterruptedReworkResumePrompt(trialItem.Prompt, trialItem.PreemptCheckpoint!),
                                     isInitial: false,
-                                    networkProfile: project.NetworkProfiles.Rework,
+                                    networkProfile: sandboxTarget.NetworkProfile,
+                                    sandboxFlavor: sandboxTarget.Flavor,
                                     project: project,
                                     phaseCt,
                                     hostShutdownToken)),
@@ -1071,6 +1075,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string prompt,
         bool isInitial,
         string? networkProfile,
+        SandboxProfileFlavor sandboxFlavor,
         Project project,
         CancellationToken ct,
         CancellationToken hostShutdownToken,
@@ -1086,7 +1091,8 @@ public sealed class PipelineRunner : IPipelineRunner
         var access = _gitHost.GetSandboxAccess(repoId);
         var agentPhase = isInitial ? "work" : "rework";
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
-            hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase);
+            hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase,
+            flavor: sandboxFlavor);
 
         var sandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
@@ -1773,12 +1779,14 @@ public sealed class PipelineRunner : IPipelineRunner
             using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reworkCts.CancelAfter(item.WorkTimeout);
             using var reworkShutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
+            var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
             var reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: iteration,
                 async (workerRunner, trialItem) =>
                     await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkCts, ct,
                         phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
                             reworkPrompt, isInitial: false,
-                            networkProfile: project.NetworkProfiles.Rework,
+                            networkProfile: sandboxTarget.NetworkProfile,
+                            sandboxFlavor: sandboxTarget.Flavor,
                             project: project,
                             phaseCt,
                             hostShutdownToken,
@@ -1844,9 +1852,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     : await _credentials.GetAsync(groupRunner.Kind, ct))
                 : null;
             var access = _gitHost.GetSandboxAccess(repoId);
-            var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
+            var sandboxTarget = SandboxTargetResolver.ResolveAudit(
+                needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
+                group.Key.Caps);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
-                hostNetworkProfile: profile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit");
+                hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
+                flavor: sandboxTarget.Flavor);
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
 
             // Within each capability group, split by Kind so tool auditors stay
@@ -4050,7 +4061,8 @@ public sealed class PipelineRunner : IPipelineRunner
         bool allowAgentNetwork,
         string? hostNetworkProfile = null,
         WorkItemId? timingWorkItemId = null,
-        string? timingPhase = null)
+        string? timingPhase = null,
+        SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
@@ -4090,6 +4102,7 @@ public sealed class PipelineRunner : IPipelineRunner
             Mounts = mounts,
             Environment = env,
             Network = net,
+            Flavor = flavor,
             WorkingDirectory = SandboxConventions.WorkDir,
             TimingWorkItemId = timingWorkItemId,
             TimingPhase = timingPhase,

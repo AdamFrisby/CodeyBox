@@ -127,7 +127,9 @@ public sealed class MultipassArgvOverflowTests : IDisposable
             string? stdin,
             CancellationToken ct,
             Action<string>? stdoutChunkCallback = null,
-            Action<string>? stderrChunkCallback = null)
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null)
         {
             Calls.Add(new RecordedCall(argv.ToArray(), stdin));
             if (argv is ["multipass", "transfer", var source, var destination])

@@ -96,3 +96,23 @@ tool and re-run audit to get enforcement.
   }
 }
 ```
+
+## Security Tooling
+
+The `security:gitleaks` and `security:semgrep` auditors skip with an Info
+finding when their tools are missing. Bake them into the audit sandbox so
+they enforce instead of skipping:
+
+```json
+{
+  "CodeyBox": {
+    "MultipassExtraRuncmd": [
+      "apt-get update",
+      "apt-get install -y curl ca-certificates python3 python3-pip",
+      "curl -fsSL -o /usr/local/bin/gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_linux_x64.tar.gz",
+      "tar -xzf /usr/local/bin/gitleaks.tgz -C /usr/local/bin gitleaks && rm /usr/local/bin/gitleaks.tgz",
+      "python3 -m pip install --break-system-packages semgrep"
+    ]
+  }
+}
+```

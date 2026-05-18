@@ -14,4 +14,13 @@ public static class SandboxConventions
 
     /// <summary>Default tmpfs size for credentials.</summary>
     public const long CredentialsTmpfsBytes = 4L * 1024 * 1024;
+
+    /// <summary>Logical network profile used by opt-in graphical sandboxes.</summary>
+    public const string GraphicalNetworkProfile = "graphical";
+
+    /// <summary>X display exposed by the graphical Multipass flavor.</summary>
+    public const string GraphicalDisplay = ":0";
+
+    /// <summary>Known VNC port exposed by the graphical Multipass flavor.</summary>
+    public const int GraphicalVncPort = 5900;
 }

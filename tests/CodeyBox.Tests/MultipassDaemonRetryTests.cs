@@ -419,7 +419,9 @@ public sealed class MultipassDaemonRetryTests
             string? stdin,
             CancellationToken ct,
             Action<string>? stdoutChunkCallback = null,
-            Action<string>? stderrChunkCallback = null) =>
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null) =>
             _handler(argv, stdin, ct);
     }
 

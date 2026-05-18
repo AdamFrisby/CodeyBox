@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 
 namespace CodeyBox.Tests;
@@ -60,6 +61,49 @@ public sealed class MultipassIntegrationTests : IDisposable
     private MultipassSandboxProvider NewProvider() => new(
         new MultipassSandboxOptions(),
         NullLogger<MultipassSandboxProvider>.Instance);
+
+    private MultipassSandboxProvider NewGraphicalProvider() => new(
+        new MultipassSandboxOptions
+        {
+            NetworkProfiles = new Dictionary<string, string>
+            {
+                [SandboxConventions.GraphicalNetworkProfile] = "cb-graphical",
+            },
+            UseBaselineImages = true,
+        },
+        NullLogger<MultipassSandboxProvider>.Instance);
+
+    private static string? MultipassNetworkUnavailableReason(string bridge)
+    {
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo
+            {
+                FileName = "multipass",
+                ArgumentList = { "networks" },
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            });
+            if (p is null) return "failed to start `multipass networks`";
+            if (!p.WaitForExit(5_000))
+            {
+                try { p.Kill(entireProcessTree: true); } catch { }
+                return "`multipass networks` timed out";
+            }
+            var stdout = p.StandardOutput.ReadToEnd();
+            var stderr = p.StandardError.ReadToEnd();
+            if (p.ExitCode != 0)
+                return $"`multipass networks` exited {p.ExitCode}: {stderr}";
+            if (!stdout.Contains(bridge, StringComparison.Ordinal))
+                return $"`multipass networks` did not list required bridge '{bridge}'";
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return $"`multipass networks` failed: {ex.Message}";
+        }
+    }
 
     /// <summary>
     /// Minimal end-to-end: launch a VM, exec a command, verify a host
@@ -137,6 +181,204 @@ public sealed class MultipassIntegrationTests : IDisposable
         });
         Assert.True(spawnSpy.Success, spawnSpy.Stderr);
         Assert.Equal("0", spawnSpy.Stdout.Trim());
+    }
+
+    [Fact]
+    [Trait("requires_multipass", "true")]
+    public async Task Multipass_GraphicalScreenshotAndInput_EndToEnd()
+    {
+        if (!_multipassAvailable) return;
+        var networkUnavailableReason = MultipassNetworkUnavailableReason("cb-graphical");
+        if (networkUnavailableReason is not null) return;
+
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Flavor = SandboxProfileFlavor.Graphical,
+            Network = new SandboxNetworkPolicy { ProfileName = SandboxConventions.GraphicalNetworkProfile },
+            Mounts = [new SandboxMount { SandboxPath = "/work", Tmpfs = true }],
+            Limits = new SandboxResourceLimits
+            {
+                CpuCount = 2,
+                MemoryBytes = 4L * 1024 * 1024 * 1024,
+                DiskBytes = 20L * 1024 * 1024 * 1024,
+            },
+            WorkingDirectory = "/work",
+        };
+
+        await using var sb = await NewGraphicalProvider().CreateAsync(spec, CancellationToken.None);
+        var dialog = await sb.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                "xmessage -name codeybox-smoke -buttons OK:0 -geometry 420x160+120+120 'CodeyBox graphical smoke' >/tmp/codeybox-xmessage.log 2>&1 &",
+            ],
+        });
+        Assert.True(dialog.Success, dialog.Stderr);
+
+        await Task.Delay(TimeSpan.FromSeconds(5));
+        var before = await sb.GetScreenshotAsync();
+        AssertPngSignature(before);
+        var (x, y) = await FindDialogOkButtonAsync(sb);
+        await sb.SynthesizeInputAsync(
+            [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = x, Y = y }],
+            CancellationToken.None);
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        var after = await sb.GetScreenshotAsync();
+        AssertPngSignature(after);
+
+        Assert.False(before.SequenceEqual(after), "clicking the graphical dialog should change the screenshot");
+
+        await AssertGraphicalInputEventsAffectDesktopAsync(sb);
+    }
+
+    private static async Task AssertGraphicalInputEventsAffectDesktopAsync(ISandbox sandbox)
+    {
+        var startXev = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                "rm -f /tmp/codeybox-xev.log; xev -name codeybox-input-e2e -geometry 500x300+80+80 -event keyboard -event mouse >/tmp/codeybox-xev.log 2>&1 &",
+            ],
+        });
+        Assert.True(startXev.Success, startXev.Stderr);
+        await WaitForWindowAsync(sandbox, "codeybox-input-e2e");
+
+        var (x, y) = await FindWindowCenterAsync(sandbox, "codeybox-input-e2e", fallback: (330, 230));
+        await sandbox.SynthesizeInputAsync(
+            [
+                new SandboxInputEvent { Type = SandboxInputEventType.Move, X = x, Y = y },
+                new SandboxInputEvent { Type = SandboxInputEventType.Click, X = x, Y = y },
+                new SandboxInputEvent { Type = SandboxInputEventType.Scroll, Y = 1 },
+                new SandboxInputEvent { Type = SandboxInputEventType.Type, Text = "ab" },
+                new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Return" },
+            ],
+            CancellationToken.None);
+
+        var log = await ReadXevLogUntilAsync(
+            sandbox,
+            text => text.Contains("MotionNotify", StringComparison.Ordinal)
+                && text.Contains("button 5", StringComparison.Ordinal)
+                && text.Contains("keysym 0x61, a", StringComparison.Ordinal)
+                && text.Contains("keysym 0xff0d, Return", StringComparison.Ordinal),
+            TimeSpan.FromSeconds(10));
+
+        Assert.Contains("MotionNotify", log, StringComparison.Ordinal);
+        Assert.Contains("button 5", log, StringComparison.Ordinal);
+        Assert.Contains("keysym 0x61, a", log, StringComparison.Ordinal);
+        Assert.Contains("keysym 0xff0d, Return", log, StringComparison.Ordinal);
+    }
+
+    private static async Task WaitForWindowAsync(ISandbox sandbox, string windowName)
+    {
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            var found = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-lc", $"xdotool search --name '{windowName}' >/dev/null 2>&1"],
+            });
+            if (found.Success)
+                return;
+            await Task.Delay(TimeSpan.FromMilliseconds(250));
+        }
+
+        Assert.Fail($"Window '{windowName}' did not appear.");
+    }
+
+    private static async Task<string> ReadXevLogUntilAsync(
+        ISandbox sandbox,
+        Func<string, bool> predicate,
+        TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        string log = "";
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var read = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-lc", "cat /tmp/codeybox-xev.log 2>/dev/null || true"],
+            });
+            Assert.True(read.Success, read.Stderr);
+            log = read.Stdout;
+            if (predicate(log))
+                return log;
+            await Task.Delay(TimeSpan.FromMilliseconds(250));
+        }
+
+        return log;
+    }
+
+    private static async Task<(int X, int Y)> FindDialogOkButtonAsync(ISandbox sandbox)
+    {
+        var geom = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                "xdotool search --name 'CodeyBox graphical smoke' getwindowgeometry --shell 2>/dev/null | head -n 4",
+            ],
+        });
+        if (!geom.Success)
+            return (330, 260);
+
+        var values = geom.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => line.Split('=', 2))
+            .Where(parts => parts.Length == 2 && int.TryParse(parts[1], out _))
+            .ToDictionary(parts => parts[0], parts => int.Parse(parts[1]), StringComparer.Ordinal);
+
+        if (!values.TryGetValue("X", out var x)
+            || !values.TryGetValue("Y", out var y)
+            || !values.TryGetValue("WIDTH", out var width)
+            || !values.TryGetValue("HEIGHT", out var height))
+        {
+            return (330, 260);
+        }
+
+        return (x + width / 2, y + Math.Max(20, height - 25));
+    }
+
+    private static async Task<(int X, int Y)> FindWindowCenterAsync(
+        ISandbox sandbox,
+        string windowName,
+        (int X, int Y) fallback)
+    {
+        var geom = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                $"xdotool search --name '{windowName}' getwindowgeometry --shell 2>/dev/null | head -n 4",
+            ],
+        });
+        if (!geom.Success)
+            return fallback;
+
+        var values = geom.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => line.Split('=', 2))
+            .Where(parts => parts.Length == 2 && int.TryParse(parts[1], out _))
+            .ToDictionary(parts => parts[0], parts => int.Parse(parts[1]), StringComparer.Ordinal);
+
+        if (!values.TryGetValue("X", out var x)
+            || !values.TryGetValue("Y", out var y)
+            || !values.TryGetValue("WIDTH", out var width)
+            || !values.TryGetValue("HEIGHT", out var height))
+        {
+            return fallback;
+        }
+
+        return (x + width / 2, y + height / 2);
+    }
+
+    private static void AssertPngSignature(byte[] bytes)
+    {
+        byte[] signature = [137, 80, 78, 71, 13, 10, 26, 10];
+        Assert.True(
+            bytes.Length >= signature.Length && bytes.AsSpan(0, signature.Length).SequenceEqual(signature),
+            "screenshot bytes must start with the PNG signature");
     }
 
     // Egress enforcement is exercised by local/verify-host-firewall.sh

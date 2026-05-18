@@ -57,7 +57,8 @@ internal static class ReleaseTestHelper
         IChangelogGenerator? changelog = null,
         IAgentRegistry? agents = null,
         IAgentStreamStore? agentStreams = null,
-        PipelineOptions? pipelineOptions = null)
+        PipelineOptions? pipelineOptions = null,
+        ICredentialProvider? credentials = null)
     {
         return new ReleaseService(
             releaseStore,
@@ -67,7 +68,7 @@ internal static class ReleaseTestHelper
             sandboxes ?? new NullSandboxProvider(),
             gitHost ?? new NullGitHost(),
             agents ?? new EmptyAgentRegistry(),
-            new StaticCredentialProvider(),
+            credentials ?? new StaticCredentialProvider(),
             upstreamFactory ?? new TestUpstreamFactory(),
             deepAuditors ?? [],
             changelog ?? new NullChangelogGenerator(),

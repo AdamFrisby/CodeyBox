@@ -519,7 +519,9 @@ public sealed class ReleaseService
             if (credential is not null)
                 foreach (var (k, v) in credential.EnvironmentVariables) env[k] = v;
 
-            var profile = needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool;
+            var sandboxTarget = SandboxTargetResolver.ResolveAudit(
+                needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
+                group.Key);
             var spec = new SandboxSpec
             {
                 ImageReference = _pipelineOpts.SandboxImageReference,
@@ -533,8 +535,9 @@ public sealed class ReleaseService
                             : _pipelineOpts.AuditToolAllowedHosts
                         : [],
                     HostGitEndpoint = access.Network.HostGitEndpoint,
-                    ProfileName = profile,
+                    ProfileName = sandboxTarget.NetworkProfile,
                 },
+                Flavor = sandboxTarget.Flavor,
                 WorkingDirectory = "/work",
             };
 
