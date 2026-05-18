@@ -254,6 +254,34 @@ public sealed class HotReloadConfigTests
     }
 
     [Fact]
+    public void ImmutableCodeyBoxOptionsValidator_RejectsGitRootDirectoryChange()
+    {
+        var startup = new CodeyBoxOptions { GitRootDirectory = "/var/lib/codeybox/repos" };
+        var validator = new ImmutableCodeyBoxOptionsValidator(startup);
+
+        var candidate = new CodeyBoxOptions { GitRootDirectory = "/tmp/different-repos" };
+        var result = validator.Validate(name: null, candidate);
+
+        Assert.True(result.Failed);
+        Assert.Contains("GitRootDirectory", result.FailureMessage);
+    }
+
+    [Fact]
+    public void ImmutableCodeyBoxOptionsValidator_RejectsAgentStreamsPathChange()
+    {
+        var startup = new CodeyBoxOptions();
+        startup.AgentStreams.Path = "logs/agents";
+        var validator = new ImmutableCodeyBoxOptionsValidator(startup);
+
+        var candidate = new CodeyBoxOptions();
+        candidate.AgentStreams.Path = "logs/agents-relocated";
+        var result = validator.Validate(name: null, candidate);
+
+        Assert.True(result.Failed);
+        Assert.Contains("AgentStreams:Path", result.FailureMessage);
+    }
+
+    [Fact]
     public void ImmutableCodeyBoxOptionsValidator_PassesWhenAllImmutableFieldsMatch()
     {
         var startup = new CodeyBoxOptions
