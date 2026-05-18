@@ -26,8 +26,9 @@ Hot-reloadable today:
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
 - `MultipassExtraRuncmd` / `MultipassExtraCloudInit` / `SandboxNetworkProfiles` /
-  `MultipassUseBaselineImages` — re-read on every sandbox launch. VMs already
-  running keep the snapshot they booted with.
+  `MultipassUseBaselineImages` / `MultipassSandbox.CloudInitReadyRetryAttempts`
+  — re-read on every sandbox launch. VMs already running keep the snapshot they
+  booted with.
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
 
@@ -58,6 +59,7 @@ startup); we add explicit guards as we tighten the contract.
 | `AuditToolAllowedHosts` | string[] | public package/vulnerability registries | Egress allowlist for network-capable tool auditors such as `deps-cve-scan`; keep this separate from agent API hosts. |
 | `SandboxProvider` | string | — | One of `multipass`, `bubblewrap`, `process`. Required in non-Development environments. |
 | `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Conventional bridge mapping for projects that explicitly select the `graphical` network profile; create it with `scripts/setup-host-networks.sh`. |
+| `MultipassSandbox.CloudInitReadyRetryAttempts` | int | `3` | Number of `cloud-init status --wait` attempts before probing VM readiness when cloud-init returns exit 1. |
 | `DangerouslyAllowProcessSandbox` | bool | `false` | Allow process sandbox outside Development. Do not use in production. |
 | `UpstreamPushMaxAttempts` | int | `5` | Retry count for upstream push (GitHub PR creation). |
 | `UpstreamPushBackoffSeconds` | int | `15` | Seconds between upstream push retries. |

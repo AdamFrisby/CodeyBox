@@ -308,6 +308,22 @@ public sealed class HotReloadConfigTests
     }
 
     [Fact]
+    public void CodeyBoxOptions_BindsMultipassSandboxCloudInitRetryAttempts()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:MultipassSandbox:CloudInitReadyRetryAttempts"] = "5",
+            })
+            .Build();
+
+        var options = config.GetSection("CodeyBox").Get<CodeyBoxOptions>();
+
+        Assert.NotNull(options);
+        Assert.Equal(5, options.MultipassSandbox.CloudInitReadyRetryAttempts);
+    }
+
+    [Fact]
     public void ProjectsOptionsRemovalValidator_RejectsRemovalWithInFlightItem()
     {
         var store = new InMemoryWorkItemStore();

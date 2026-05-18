@@ -743,26 +743,104 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         if (DateTime.UtcNow >= deadline)
             throw new InvalidOperationException($"multipass VM {name} did not reach Running state within 3 minutes");
 
+        await WaitForCloudInitReadyAsync(opts, name, workItemId, ct);
+    }
+
+    private async Task WaitForCloudInitReadyAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
         // `cloud-init status --wait` blocks until cloud-init has finished.
         // Exit codes (from cloud-init docs):
         //   0  = done
-        //   1  = not run
+        //   1  = not run / status unavailable. This can be transient, and on
+        //        some images the status command bails out even though userdata
+        //        has been applied.
         //   2  = degraded done (recoverable warnings — e.g. schema-validation
         //        warnings on octal permissions that multipass re-emits as
         //        decimal integers). The VM is still functional.
         //   >2 = genuine error.
-        // We accept 0 and 2; only >2 (or 1) is a hard failure. Without this
-        // tolerance every VM launch fails because multipass's YAML round-trip
-        // strips quotes from `permissions: '0755'` and cloud-init then warns
-        // that 493 isn't a string. (Regression introduced in the graphical-VM
-        // merge — pre-60b9eb4 there was no exit-code check here at all.)
-        var cloudInit = await RunAsync(
+        // We accept 0 and 2. Exit 1 gets a bounded retry, then a marker probe
+        // before we decide the VM is actually unusable.
+        var attempts = Math.Max(1, opts.CloudInitReadyRetryAttempts);
+        var retryDelay = opts.CloudInitReadyRetryDelay < TimeSpan.Zero
+            ? TimeSpan.Zero
+            : opts.CloudInitReadyRetryDelay;
+        RunResult cloudInit = default;
+
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            cloudInit = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
+                stdin: null, ct: ct, workItemId: workItemId);
+
+            if (cloudInit.ExitCode is 0 or 2)
+                return;
+
+            if (cloudInit.ExitCode != 1)
+                throw new InvalidOperationException(
+                    $"cloud-init failed for multipass VM {name} (exit {cloudInit.ExitCode}): {cloudInit.Stderr}");
+
+            if (attempt == attempts)
+                break;
+
+            _log.LogInformation(
+                "cloud-init status returned exit 1 for multipass VM {Name} (attempt {Attempt}/{Attempts}); retrying after {Delay}. stderr: {Stderr}",
+                name, attempt, attempts, retryDelay, DiagnosticText(cloudInit.Stderr));
+            await Task.Delay(retryDelay, ct);
+        }
+
+        var probe = await ProbeCloudInitReadinessAsync(opts, name, workItemId, ct);
+        if (probe.ExitCode == 0)
+        {
+            _log.LogWarning(
+                "cloud-init status kept returning exit 1 for multipass VM {Name} after {Attempts} attempt(s), but readiness probe passed ({ProbeStdout}); proceeding. Last stderr: {Stderr}",
+                name, attempts, DiagnosticText(probe.Stdout), DiagnosticText(cloudInit.Stderr));
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"cloud-init did not report ready for multipass VM {name} after {attempts} attempt(s) " +
+            $"(last exit 1 stderr: {DiagnosticText(cloudInit.Stderr)}). " +
+            $"readiness probe failed (exit {probe.ExitCode}; stdout: {DiagnosticText(probe.Stdout)}; stderr: {DiagnosticText(probe.Stderr)}). " +
+            "Expected /work and /usr/local/bin/codeybox-exec to exist.");
+    }
+
+    private Task<RunResult> ProbeCloudInitReadinessAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        const string script = """
+work=missing
+exec_wrapper=missing
+if test -e /work; then work=present; fi
+if test -e /usr/local/bin/codeybox-exec; then exec_wrapper=present; fi
+printf '/work=%s /usr/local/bin/codeybox-exec=%s\n' "$work" "$exec_wrapper"
+test "$work" = present && test "$exec_wrapper" = present
+""";
+
+        return RunAsync(
             opts,
-            [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
+            [opts.MultipassBinary, "exec", name, "--", "bash", "-c", script],
             stdin: null, ct: ct, workItemId: workItemId);
-        if (cloudInit.ExitCode != 0 && cloudInit.ExitCode != 2)
-            throw new InvalidOperationException(
-                $"cloud-init failed for multipass VM {name} (exit {cloudInit.ExitCode}): {cloudInit.Stderr}");
+    }
+
+    private static string SingleLine(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "";
+        return value.Trim().Replace("\r", "\\r", StringComparison.Ordinal)
+            .Replace("\n", "\\n", StringComparison.Ordinal);
+    }
+
+    private static string DiagnosticText(string? value)
+    {
+        var singleLine = SingleLine(value);
+        return singleLine.Length == 0 ? "<empty>" : singleLine;
     }
 
     /// <summary>
@@ -1175,6 +1253,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // first boot's traffic uses the profile bridge before any package
         // installation or caller extraRuncmd runs.
         sb.AppendLine("  - systemctl daemon-reload");
+        sb.AppendLine("  - mkdir -p /work");
         sb.AppendLine(startRouteService
             ? "  - systemctl enable --now codeybox-route.service"
             : "  - systemctl enable codeybox-route.service");
@@ -1720,6 +1799,9 @@ internal static class MultipassRetry
 
 public sealed record MultipassSandboxOptions
 {
+    public const int DefaultCloudInitReadyRetryAttempts = 3;
+    public static readonly TimeSpan DefaultCloudInitReadyRetryDelay = TimeSpan.FromSeconds(10);
+
     public string MultipassBinary { get; init; } = "multipass";
 
     /// <summary>
@@ -1760,6 +1842,17 @@ public sealed record MultipassSandboxOptions
     /// only if your Multipass install reads a different prefix.
     /// </summary>
     public string? StagingDirectory { get; init; }
+
+    /// <summary>
+    /// Number of <c>cloud-init status --wait</c> attempts before falling back
+    /// to the VM readiness probe when the status command returns exit 1.
+    /// </summary>
+    public int CloudInitReadyRetryAttempts { get; init; } = DefaultCloudInitReadyRetryAttempts;
+
+    /// <summary>
+    /// Delay between retries when <c>cloud-init status --wait</c> returns exit 1.
+    /// </summary>
+    public TimeSpan CloudInitReadyRetryDelay { get; init; } = DefaultCloudInitReadyRetryDelay;
 
     /// <summary>
     /// Maps logical network-profile names (selected via

@@ -35,6 +35,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("path: /usr/local/bin/codeybox-exec", cloudInit);
         Assert.Contains("path: /usr/local/sbin/codeybox-route", cloudInit);
         Assert.Contains("path: /etc/systemd/system/codeybox-route.service", cloudInit);
+        Assert.Contains("mkdir -p /work", cloudInit);
         Assert.Contains("systemctl enable --now codeybox-route.service", cloudInit);
         Assert.Contains("apt-get update", cloudInit);
         Assert.Contains("npm install -g @anthropic-ai/claude-code", cloudInit);
@@ -810,6 +811,247 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_RetriesCloudInitExitOneAndAcceptsRecoveredStatus()
+    {
+        var staging = Path.Combine(_workspace, "staging-cloud-init-exit-one-retry");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var cloudInitCalls = 0;
+        var probeCalls = 0;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new RunResult(0, state, ""))
+                    : Task.FromResult(new RunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                states[argv[3]] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+            {
+                cloudInitCalls++;
+                return Task.FromResult(cloudInitCalls == 1
+                    ? new RunResult(1, "", "")
+                    : new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "bash", "-c", _])
+            {
+                probeCalls++;
+                return Task.FromResult(new RunResult(99, "", "readiness probe should not run after recovered cloud-init status"));
+            }
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            cloudInitReadyRetryDelay: TimeSpan.Zero);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
+
+        Assert.Equal(3, cloudInitCalls);
+        Assert.Equal(0, probeCalls);
+    }
+
+    [Fact]
+    public async Task CreateAsync_CloudInitExitOneAfterRetriesUsesReadinessProbe()
+    {
+        var staging = Path.Combine(_workspace, "staging-cloud-init-probe-success");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var cloudInitCalls = 0;
+        var probeCalls = 0;
+        var logger = new RecordingLogger<MultipassSandboxProvider>();
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new RunResult(0, state, ""))
+                    : Task.FromResult(new RunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                states[argv[3]] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+            {
+                cloudInitCalls++;
+                return Task.FromResult(new RunResult(1, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "bash", "-c", var command])
+            {
+                probeCalls++;
+                Assert.Contains("test -e /work", command, StringComparison.Ordinal);
+                Assert.Contains("test -e /usr/local/bin/codeybox-exec", command, StringComparison.Ordinal);
+                return Task.FromResult(new RunResult(
+                    0,
+                    "/work=present /usr/local/bin/codeybox-exec=present\n",
+                    ""));
+            }
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            logger: logger,
+            cloudInitReadyRetryAttempts: 2,
+            cloudInitReadyRetryDelay: TimeSpan.Zero);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
+
+        Assert.Equal(4, cloudInitCalls);
+        Assert.Equal(2, probeCalls);
+        Assert.Contains(logger.Entries, e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Warning
+            && e.Message.Contains("readiness probe passed", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CreateAsync_CloudInitExitOneAfterRetriesThrowsWhenReadinessProbeFails()
+    {
+        var staging = Path.Combine(_workspace, "staging-cloud-init-probe-failure");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        string? launchedName = null;
+        string? deletedName = null;
+        var cloudInitCalls = 0;
+        var probeCalls = 0;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new RunResult(0, state, ""))
+                    : Task.FromResult(new RunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                launchedName = argv[3];
+                states[launchedName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+            {
+                cloudInitCalls++;
+                return Task.FromResult(new RunResult(1, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "bash", "-c", var command])
+            {
+                probeCalls++;
+                Assert.Contains("test -e /work", command, StringComparison.Ordinal);
+                Assert.Contains("test -e /usr/local/bin/codeybox-exec", command, StringComparison.Ordinal);
+                return Task.FromResult(new RunResult(
+                    1,
+                    "/work=missing /usr/local/bin/codeybox-exec=missing\n",
+                    ""));
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deletedName = deleteName;
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            cloudInitReadyRetryDelay: TimeSpan.Zero);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        Assert.Equal(MultipassSandboxOptions.DefaultCloudInitReadyRetryAttempts, cloudInitCalls);
+        Assert.Equal(1, probeCalls);
+        Assert.Contains("readiness probe failed", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("/work=missing", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("/usr/local/bin/codeybox-exec=missing", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Expected /work and /usr/local/bin/codeybox-exec to exist", ex.Message, StringComparison.Ordinal);
+        Assert.NotNull(launchedName);
+        Assert.Equal(launchedName, deletedName);
+        Assert.False(
+            Directory.Exists(Path.Combine(staging, launchedName!)),
+            "staging directory for failed sandbox must be removed during cleanup");
+    }
+
+    [Fact]
     public async Task CreateAsync_ThrowsAndCleansUpWhenCloudInitWaitReturnsNonZero()
     {
         // WaitForVmReadyAsync surfaces cloud-init failures so a half-installed
@@ -930,7 +1172,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         IReadOnlyList<string>? extraRuncmd = null,
         RecordingMultipassRunner? runner = null,
         RecordingLogger<MultipassSandboxProvider>? logger = null,
-        MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
+        int? cloudInitReadyRetryAttempts = null,
+        TimeSpan? cloudInitReadyRetryDelay = null)
     {
         var options = new MultipassSandboxOptions
         {
@@ -939,6 +1183,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             NetworkProfiles = networkProfiles ?? new Dictionary<string, string>(),
             UseBaselineImages = useBaselineImages,
             ExtraRuncmd = extraRuncmd ?? [],
+            CloudInitReadyRetryAttempts = cloudInitReadyRetryAttempts
+                ?? MultipassSandboxOptions.DefaultCloudInitReadyRetryAttempts,
+            CloudInitReadyRetryDelay = cloudInitReadyRetryDelay
+                ?? MultipassSandboxOptions.DefaultCloudInitReadyRetryDelay,
         };
         Microsoft.Extensions.Logging.ILogger<MultipassSandboxProvider> resolvedLogger = logger is not null
             ? logger

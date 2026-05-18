@@ -272,12 +272,14 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             () =>
             {
                 var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+                var multipassSandbox = live.MultipassSandbox ?? new MultipassSandboxConfig();
                 return new MultipassSandboxOptions
                 {
                     ExtraCloudInit = live.MultipassExtraCloudInit,
                     ExtraRuncmd = live.MultipassExtraRuncmd,
                     NetworkProfiles = live.SandboxNetworkProfiles,
                     UseBaselineImages = live.MultipassUseBaselineImages,
+                    CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
                 };
             },
             loggerFactory.CreateLogger<MultipassSandboxProvider>(),
@@ -1546,6 +1548,16 @@ static (string? AccessToken, string? AccountId) ParseCodexAccessTokens(string? r
 
 namespace CodeyBox.Api
 {
+    public sealed class MultipassSandboxConfig
+    {
+        /// <summary>
+        /// Number of <c>cloud-init status --wait</c> attempts before falling
+        /// back to the Multipass readiness probe for exit 1.
+        /// </summary>
+        public int CloudInitReadyRetryAttempts { get; set; } =
+            MultipassSandboxOptions.DefaultCloudInitReadyRetryAttempts;
+    }
+
     public sealed class CodeyBoxOptions
     {
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
@@ -1607,6 +1619,9 @@ namespace CodeyBox.Api
         /// the agent CLI).
         /// </summary>
         public string? MultipassExtraCloudInit { get; set; }
+
+        /// <summary>Multipass sandbox launch-time readiness tuning.</summary>
+        public MultipassSandboxConfig MultipassSandbox { get; set; } = new();
 
         /// <summary>
         /// Maps logical network-profile names → host bridge names. Operators
