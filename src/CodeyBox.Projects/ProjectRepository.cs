@@ -197,6 +197,7 @@ public sealed class ProjectRepository : IProjectRepository
             ReleaseConfig = ResolveReleaseConfig(pc.Release),
             SkipCredentialSmokeTest = pc.SkipCredentialSmokeTest ?? false,
             MaxPriority = pc.MaxPriority,
+            GraphicalSandbox = pc.GraphicalSandbox ?? defaults.GraphicalSandbox ?? false,
         };
     }
 

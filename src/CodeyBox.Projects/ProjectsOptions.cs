@@ -21,6 +21,7 @@ public sealed class ProjectDefaultsConfig
     public string? BaseBranch { get; set; }
     public ProjectAuditConfig? Audit { get; set; }
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
+    public bool? GraphicalSandbox { get; set; }
 }
 
 public sealed class ProjectConfig
@@ -44,6 +45,8 @@ public sealed class ProjectConfig
     /// project-level cap (the global [-1000, 1000] bound still applies).
     /// </summary>
     public int? MaxPriority { get; set; }
+
+    public bool? GraphicalSandbox { get; set; }
 }
 
 /// <summary>

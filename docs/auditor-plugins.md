@@ -125,7 +125,7 @@ public sealed class NoVarAuditor : IAuditor, IPluginInitializer
 |---|---|
 | `Name` | Stable identifier used in log messages, audit findings, and `PerAuditorAgent` keys. Use `"myorg:short-name"` convention. |
 | `Kind` | One of `"tool"`, `"shell"`, `"llm"`, `"diff-pattern"`. Persisted in observability storage. |
-| `Required` | `AuditCapabilities` flags. `None` = most restrictive sandbox; `AgentCredentials | Network` = same sandbox as LLM auditors. |
+| `Required` | `AuditCapabilities` flags. `None` = most restrictive sandbox; `AgentCredentials | Network` = same sandbox as LLM auditors; `Graphical` = desktop-capable sandbox for screenshot/input APIs. |
 | `RunAsync` | Produces an `AuditResult(Passed, Findings)`. Return `Passed: false` to trigger rework. |
 
 ### Optional interfaces

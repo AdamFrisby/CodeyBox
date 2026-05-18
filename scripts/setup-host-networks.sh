@@ -29,6 +29,7 @@
 #   codex            cb-codex        10.99.3.0/24   api.openai.com
 #   multi-llm        cb-multi-llm    10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
 #   internet-only    cb-net          10.99.5.0/24   internet
+#   graphical        cb-graphical    10.99.6.0/24   internet
 #
 # allowed-hosts column accepts:
 #   "-"                     — no egress (only DNS + loopback + replies)
@@ -55,6 +56,7 @@ CONFIG_FILE="${1:-/etc/codeybox/networks.conf}"
 NFT_FILE="/etc/nftables.d/codeybox.nft"
 NETWORKD_DIR="/etc/systemd/network"
 MULTIPASS_DEFAULT_IFACE="${CODEYBOX_MULTIPASS_DEFAULT_IFACE:-mpqemubr0}"
+VNC_HELPER="/usr/local/bin/codeybox-vnc-loopback"
 
 if [[ ! -r "$CONFIG_FILE" ]]; then
     cat >&2 <<EOF
@@ -66,6 +68,7 @@ Example:
   # name           bridge          subnet         allowed-hosts
   isolated         cb-iso          10.99.1.0/24   -
   claude           cb-claude       10.99.2.0/24   api.anthropic.com
+  graphical        cb-graphical    10.99.6.0/24   internet
 
 Then re-run: sudo $0 [path/to/config]
 EOF
@@ -81,7 +84,7 @@ mkdir -p "$NETWORKD_DIR" "$(dirname "$NFT_FILE")"
 # ---------------------------------------------------------------------------
 # Parse the config file.
 # ---------------------------------------------------------------------------
-declare -a NAMES BRIDGES SUBNETS HOSTS
+declare -a NAMES BRIDGES SUBNETS HOSTS CHAINS
 while IFS= read -r raw; do
     # Strip comments and surrounding whitespace.
     line="${raw%%#*}"
@@ -94,7 +97,8 @@ while IFS= read -r raw; do
     if [[ -z "$name" || -z "$bridge" || -z "$subnet" || -z "$hosts" ]]; then
         echo "invalid line: $raw" >&2; exit 1
     fi
-    NAMES+=("$name"); BRIDGES+=("$bridge"); SUBNETS+=("$subnet"); HOSTS+=("$hosts")
+    idx=${#NAMES[@]}
+    NAMES+=("$name"); BRIDGES+=("$bridge"); SUBNETS+=("$subnet"); HOSTS+=("$hosts"); CHAINS+=("cb_p${idx}")
 done < "$CONFIG_FILE"
 
 if [[ ${#NAMES[@]} -eq 0 ]]; then
@@ -155,20 +159,22 @@ table inet codeybox {
         # Multipass's default bridge — drop ALL forwarded traffic. The
         # multipass control plane uses INPUT (host -> guest), not FORWARD,
         # so this doesn't break VM management.
-        iifname "${MULTIPASS_DEFAULT_IFACE}" jump cb-default-blocked
-        oifname "${MULTIPASS_DEFAULT_IFACE}" jump cb-default-blocked
+        iifname "${MULTIPASS_DEFAULT_IFACE}" jump cb_default_blocked
+        oifname "${MULTIPASS_DEFAULT_IFACE}" jump cb_default_blocked
 EOF
 
 for i in "${!NAMES[@]}"; do
-    name="${NAMES[$i]}"
     bridge="${BRIDGES[$i]}"
-    echo "        iifname \"${bridge}\" jump cb-${name}"
+    chain="${CHAINS[$i]}"
+    in_chain="${chain}_in"
+    echo "        iifname \"${bridge}\" jump ${chain}"
+    echo "        oifname \"${bridge}\" jump ${in_chain}"
 done
 
 cat <<EOF
     }
 
-    chain cb-default-blocked {
+    chain cb_default_blocked {
         # Multipass's default mpqemubr0 has no useful internet path. Drop.
         drop
     }
@@ -177,10 +183,21 @@ EOF
 for i in "${!NAMES[@]}"; do
     name="${NAMES[$i]}"
     hosts="${HOSTS[$i]}"
+    chain="${CHAINS[$i]}"
+    in_chain="${chain}_in"
 
     cat <<EOF
 
-    chain cb-${name} {
+    chain ${in_chain} {
+        # Block LAN-forwarded inbound traffic to sandbox bridges. Host-originated
+        # connections (including operator-managed 127.0.0.1 tunnels for VNC)
+        # do not traverse this forward chain, and established replies remain
+        # allowed so VM-initiated connections continue to work.
+        ct state established,related accept
+        drop
+    }
+
+    chain ${chain} {
         # Standard "allow replies + DNS" preamble.
         ct state established,related accept
         ip protocol icmp accept
@@ -280,6 +297,65 @@ for bridge in "${BRIDGES[@]}"; do
     networkctl reconfigure "$bridge" 2>/dev/null || true
 done
 
+# Install a loopback-only operator helper for graphical VNC access. Graphical
+# VMs listen on their 10.99.x.x profile-bridge address and allow only the host
+# bridge gateway. This helper is the intended human-facing exposure path: it
+# binds host 127.0.0.1 on demand and connects to one selected VM through the
+# profile bridge.
+cat > "$VNC_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat >&2 <<USAGE
+Usage: codeybox-vnc-loopback <multipass-vm-name> [local-port]
+
+Starts a foreground VNC proxy on 127.0.0.1:<local-port> for the selected
+graphical Multipass VM, forwarding to the guest's 10.99.x.x bridge address.
+The remote VNC port defaults to 5900; override with
+CODEYBOX_GRAPHICAL_VNC_PORT if the sandbox convention changes.
+USAGE
+}
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    usage
+    exit 2
+fi
+
+for cmd in multipass systemd-socket-activate socat; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "missing required tool: $cmd" >&2; exit 1; }
+done
+
+vm="$1"
+listen_port="${2:-5900}"
+remote_port="${CODEYBOX_GRAPHICAL_VNC_PORT:-5900}"
+
+if [[ ! "$listen_port" =~ ^[0-9]+$ || "$listen_port" -lt 1 || "$listen_port" -gt 65535 ]]; then
+    echo "invalid local port: $listen_port" >&2
+    exit 2
+fi
+if [[ ! "$remote_port" =~ ^[0-9]+$ || "$remote_port" -lt 1 || "$remote_port" -gt 65535 ]]; then
+    echo "invalid remote VNC port: $remote_port" >&2
+    exit 2
+fi
+
+guest_addr="$(multipass exec "$vm" -- sh -lc "ip -4 -o addr show | awk '/inet 10\.99\./{split(\$4,a,\"/\"); print a[1]; exit}'" || true)"
+if [[ -z "$guest_addr" ]]; then
+    echo "guest VM has no 10.99.x.x profile-bridge address" >&2
+    exit 1
+fi
+password="$(multipass exec "$vm" -- sh -lc 'cat /home/ubuntu/.codeybox-vnc-password 2>/dev/null || true' || true)"
+
+echo "Forwarding VNC: 127.0.0.1:${listen_port} -> ${vm}:${guest_addr}:${remote_port} via host bridge" >&2
+if [[ -n "$password" ]]; then
+    echo "VNC password: ${password}" >&2
+fi
+echo "Press Ctrl-C to stop." >&2
+exec systemd-socket-activate -l "127.0.0.1:${listen_port}" --inetd -- \
+    socat - "TCP:${guest_addr}:${remote_port},connect-timeout=5"
+EOF
+chmod 0755 "$VNC_HELPER"
+
 # ---------------------------------------------------------------------------
 # Done — summary.
 # ---------------------------------------------------------------------------
@@ -295,10 +371,12 @@ done
 echo
 echo "✓ nftables rules: $NFT_FILE"
 echo "✓ Default Multipass interface (${MULTIPASS_DEFAULT_IFACE}) forwarding: blocked"
+echo "✓ Graphical VNC loopback helper: $VNC_HELPER"
 echo
 echo "To verify:"
 echo "  multipass networks                  # confirms bridges visible to multipass"
 echo "  multipass launch --network <bridge> # launches VM on that profile"
 echo "  nft list table inet codeybox        # inspects active rules"
+echo "  codeybox-vnc-loopback <vm> 5901     # exposes one graphical VM on 127.0.0.1:5901"
 echo
 echo "Re-run this script after editing $CONFIG_FILE or to refresh resolved IPs."

@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Sandbox.Multipass;
 
@@ -183,7 +184,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // the clone path skips the start (clone is born Stopped).
             if (useBaseline)
             {
-                var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, workItemId, ct);
+                var baselineName = await EnsureBaselineForProfileAsync(spec.Network.ProfileName!, spec.Flavor, workItemId, ct);
                 await using var cloneScope = await TimingScope.BeginAsync(
                     timingStore, timingItemId, timingPhase, "vm.clone", log: _log);
                 await CloneFromBaselineAsync(name, baselineName, workItemId, ct);
@@ -191,7 +192,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             }
             else
             {
-                var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit);
+                var cloudInit = BuildCloudInit(_opts.ExtraRuncmd, _opts.ExtraCloudInit, spec.Flavor);
                 var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
                 await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
                 await using (var launchScope = await TimingScope.BeginAsync(
@@ -410,19 +411,22 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     }
 
     /// <summary>
-    /// Ensures the baseline VM for <paramref name="profileName"/> exists.
+    /// Ensures the baseline VM for <paramref name="profileName"/> and
+    /// <paramref name="flavor"/> exists.
     /// Bakes it on first call (~5-10 min: launch with cloud-init, install
     /// agent CLIs and runtime, stop). Subsequent calls return the existing
     /// baseline name.
     ///
-    /// We bake one baseline per profile because <c>multipass clone</c>
+    /// We bake one baseline per profile/flavor because <c>multipass clone</c>
     /// inherits the source VM's network attachments — a baseline launched
     /// with <c>--network cb-net</c> can only produce clones attached to
-    /// <c>cb-net</c>. Per-profile baselines also cleanly isolate "what each
-    /// profile installed" if profiles ever need different toolchains.
+    /// <c>cb-net</c>. Graphical baselines also carry a desktop/VNC toolchain,
+    /// so they must not be shared with headless baselines for the same egress
+    /// profile.
     /// </summary>
     private async Task<string> EnsureBaselineForProfileAsync(
         string profileName,
+        SandboxProfileFlavor flavor,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
@@ -431,7 +435,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                 $"Network profile '{profileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
                 $"Configured profiles: [{string.Join(", ", _opts.NetworkProfiles.Keys)}]");
 
-        var baselineName = _opts.BaselineNamePrefix + profileName;
+        var baselineName = _opts.BaselineNamePrefix + BuildBaselineKey(profileName, flavor);
         // multipass instance names cap at 24 chars; trim if a long profile
         // name pushes us over. We use a STABLE hash (SHA-256, first 6 hex
         // chars) for uniqueness so two long profile names don't collide.
@@ -452,7 +456,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         {
             if (await BaselineVmExistsAsync(baselineName, workItemId, ct))
                 return baselineName;
-            await BakeBaselineAsync(baselineName, profileName, workItemId, ct);
+            await BakeBaselineAsync(baselineName, profileName, flavor, workItemId, ct);
             return baselineName;
         }
         finally
@@ -474,6 +478,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         }
     }
 
+    private static string BuildBaselineKey(string profileName, SandboxProfileFlavor flavor)
+    {
+        if (flavor != SandboxProfileFlavor.Graphical)
+            return profileName;
+
+        return profileName.Equals(SandboxConventions.GraphicalNetworkProfile, StringComparison.OrdinalIgnoreCase)
+            ? SandboxConventions.GraphicalNetworkProfile
+            : "graphical-" + profileName;
+    }
+
     private async Task<bool> BaselineVmExistsAsync(string name, WorkItemId? workItemId, CancellationToken ct)
     {
         var info = await RunAsync([_opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
@@ -483,6 +497,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private async Task BakeBaselineAsync(
         string baselineName,
         string profileName,
+        SandboxProfileFlavor flavor,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
@@ -499,7 +514,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         // and re-runs every per-instance module including runcmd. Putting
         // installs in runcmd would mean re-running them on every clone —
         // slow, and possibly disk-filling.
-        var cloudInit = BuildCloudInit(extraRuncmd: null, _opts.ExtraCloudInit);
+        var cloudInit = BuildCloudInit(
+            extraRuncmd: null,
+            extraCloudInit: _opts.ExtraCloudInit,
+            flavor: flavor,
+            startRouteService: true,
+            includeGraphicalInstall: false);
         var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
         Directory.CreateDirectory(stagingDir);
         TryChmod0700(stagingDir);
@@ -537,11 +557,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
             // Run the install commands now, via multipass exec under sudo.
             // Each entry in ExtraRuncmd is a single shell command.
-            for (var i = 0; i < _opts.ExtraRuncmd.Count; i++)
+            var installCommands = BuildFirstBootRuncmd(flavor);
+            for (var i = 0; i < installCommands.Count; i++)
             {
-                var cmd = _opts.ExtraRuncmd[i];
+                var cmd = installCommands[i];
                 if (string.IsNullOrWhiteSpace(cmd)) continue;
-                _log.LogInformation("Baseline install step {N}/{Total}", i + 1, _opts.ExtraRuncmd.Count);
+                _log.LogInformation("Baseline install step {N}/{Total}", i + 1, installCommands.Count);
                 var execRun = await RunAsync(
                     [_opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", cmd],
                     stdin: null, ct: ct, workItemId: workItemId);
@@ -672,13 +693,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         if (DateTime.UtcNow >= deadline)
             throw new InvalidOperationException($"multipass VM {name} did not reach Running state within 3 minutes");
 
-        // `cloud-init status --wait` blocks until cloud-init has finished
-        // (success or fail). Exit code is non-zero on failure; we don't
-        // distinguish here because the post-launch verification (mount,
-        // exec) will surface concrete problems.
-        await RunAsync(
+        // `cloud-init status --wait` blocks until cloud-init has finished.
+        // Exit code is non-zero on failure, which matters for graphical
+        // launch because the desktop toolchain may be installed from runcmd.
+        var cloudInit = await RunAsync(
             [_opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
             stdin: null, ct: ct, workItemId: workItemId);
+        if (cloudInit.ExitCode != 0)
+            throw new InvalidOperationException($"cloud-init failed for multipass VM {name}: {cloudInit.Stderr}");
     }
 
     /// <summary>
@@ -872,6 +894,94 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         echo "codeybox-route: default via $gw dev $iface"
         """;
 
+    private const string GraphicalXvfbService = """
+        [Unit]
+        Description=CodeyBox graphical X server
+        After=network-online.target
+
+        [Service]
+        ExecStart=/usr/bin/Xvfb :0 -screen 0 1280x800x24 -nolisten tcp
+        Restart=always
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+        """;
+
+    private const string GraphicalXfceService = """
+        [Unit]
+        Description=CodeyBox XFCE desktop session
+        After=codeybox-xvfb.service
+        Requires=codeybox-xvfb.service
+
+        [Service]
+        User=ubuntu
+        Environment=DISPLAY=:0
+        Environment=XDG_RUNTIME_DIR=/run/user/1000
+        PermissionsStartOnly=true
+        ExecStartPre=/bin/mkdir -p /run/user/1000
+        ExecStartPre=/bin/chown ubuntu:ubuntu /run/user/1000
+        ExecStartPre=/bin/chmod 0700 /run/user/1000
+        ExecStart=/usr/bin/dbus-run-session /usr/bin/startxfce4
+        Restart=on-failure
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+        """;
+
+    private const string GraphicalVncService = """
+        [Unit]
+        Description=CodeyBox x11vnc bridge
+        After=network-online.target codeybox-xvfb.service
+        Wants=network-online.target
+        Requires=codeybox-xvfb.service
+
+        [Service]
+        ExecStart=/usr/local/sbin/codeybox-vnc
+        Restart=on-failure
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+        """;
+
+    private static readonly string GraphicalVncScript = $$"""
+        #!/bin/sh
+        set -eu
+        password_dir=/etc/codeybox
+        password_file="${password_dir}/x11vnc.pass"
+        plain_password_file=/home/ubuntu/.codeybox-vnc-password
+        install -d -m 0700 "$password_dir"
+        password=$(dd if=/dev/urandom bs=18 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | head -c 12)
+        if [ -z "$password" ]; then
+            echo "codeybox-vnc: failed to generate VNC password" >&2
+            exit 1
+        fi
+        umask 077
+        printf '%s\n' "$password" > "$plain_password_file"
+        chown ubuntu:ubuntu "$plain_password_file" || true
+        /usr/bin/x11vnc -storepasswd "$password" "$password_file" >/dev/null 2>&1
+        chmod 0600 "$password_file"
+        listen_addr=$(ip -4 -o addr show | awk '/inet 10\.99\./{split($4,a,"/"); print a[1]; exit}')
+        if [ -z "$listen_addr" ]; then
+            echo "codeybox-vnc: no profile bridge address found" >&2
+            exit 1
+        fi
+        host_addr=$(printf '%s\n' "$listen_addr" | awk -F. '{print $1"."$2"."$3".1"}')
+        exec /usr/bin/x11vnc -display :0 -rfbport {{SandboxConventions.GraphicalVncPort}} -forever -shared -rfbauth "$password_file" -listen "$listen_addr" -allow "$host_addr" -noxdamage -repeat
+        """;
+
+    private const string GraphicalInstallRuncmd = """
+        set -eux
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils socat
+        systemctl daemon-reload
+        systemctl enable codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
+        systemctl restart codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
+        """;
+
     /// <summary>
     /// Builds a cloud-init document that:
     ///   - Installs the exec wrapper at /usr/local/bin/codeybox-exec (root-
@@ -898,10 +1008,19 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     /// host bridge enforcement is in the host kernel, where the agent has
     /// no view, and is the only egress boundary we treat as load-bearing.
     /// </summary>
-    internal static string BuildCloudInit(IReadOnlyList<string>? extraRuncmd, string? extraCloudInit)
+    internal static string BuildCloudInit(
+        IReadOnlyList<string>? extraRuncmd,
+        string? extraCloudInit,
+        SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless,
+        bool startRouteService = true,
+        bool includeGraphicalInstall = true)
     {
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
         var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
+        var graphicalXvfbIndented = string.Join("\n      ", GraphicalXvfbService.Split('\n'));
+        var graphicalXfceIndented = string.Join("\n      ", GraphicalXfceService.Split('\n'));
+        var graphicalVncIndented = string.Join("\n      ", GraphicalVncService.Split('\n'));
+        var graphicalVncScriptIndented = string.Join("\n      ", GraphicalVncScript.Split('\n'));
 
         var sb = new StringBuilder();
         sb.AppendLine("#cloud-config");
@@ -927,26 +1046,41 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         sb.AppendLine("      RemainAfterExit=yes");
         sb.AppendLine("      [Install]");
         sb.AppendLine("      WantedBy=multi-user.target");
+        if (flavor == SandboxProfileFlavor.Graphical)
+        {
+            sb.AppendLine("  - path: /etc/systemd/system/codeybox-xvfb.service");
+            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(graphicalXvfbIndented);
+            sb.AppendLine("  - path: /etc/systemd/system/codeybox-xfce.service");
+            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(graphicalXfceIndented);
+            sb.AppendLine("  - path: /etc/systemd/system/codeybox-vnc.service");
+            sb.AppendLine("    permissions: '0644'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(graphicalVncIndented);
+            sb.AppendLine("  - path: /usr/local/sbin/codeybox-vnc");
+            sb.AppendLine("    permissions: '0755'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(graphicalVncScriptIndented);
+        }
         sb.AppendLine("runcmd:");
         // Enable the route service. --now runs it once immediately so the
-        // first boot's traffic uses the profile bridge before any
-        // extraRuncmd installs run.
+        // first boot's traffic uses the profile bridge before any package
+        // installation or caller extraRuncmd runs.
         sb.AppendLine("  - systemctl daemon-reload");
-        sb.AppendLine("  - systemctl enable --now codeybox-route.service");
-        // Splice caller-supplied runcmd entries into the same block, AFTER
-        // the route swap so they have working egress.
+        sb.AppendLine(startRouteService
+            ? "  - systemctl enable --now codeybox-route.service"
+            : "  - systemctl enable codeybox-route.service");
+        if (flavor == SandboxProfileFlavor.Graphical && includeGraphicalInstall)
+            AppendRuncmdCommand(sb, GraphicalInstallRuncmd);
+        // Splice caller-supplied runcmd entries into the same block, after the
+        // route swap so project/tool installs obey the selected profile.
         if (extraRuncmd is not null)
         {
             foreach (var cmd in extraRuncmd)
-            {
-                if (string.IsNullOrWhiteSpace(cmd)) continue;
-                // Each entry is a single shell command. We use the YAML
-                // block-literal form (`- |`) so multi-line commands work
-                // and we don't have to worry about escaping.
-                sb.AppendLine("  - |");
-                foreach (var line in cmd.Split('\n'))
-                    sb.Append("      ").AppendLine(line);
-            }
+                AppendRuncmdCommand(sb, cmd);
         }
         if (!string.IsNullOrWhiteSpace(extraCloudInit))
         {
@@ -955,6 +1089,29 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             sb.AppendLine(extraCloudInit);
         }
         return sb.ToString();
+    }
+
+    private static void AppendRuncmdCommand(StringBuilder sb, string cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return;
+        // Each entry is a single shell command. We use the YAML block-literal
+        // form (`- |`) so multi-line commands work without escaping.
+        sb.AppendLine("  - |");
+        foreach (var line in cmd.Split('\n'))
+            sb.Append("      ").AppendLine(line);
+    }
+
+    private IReadOnlyList<string> BuildFirstBootRuncmd(SandboxProfileFlavor flavor)
+    {
+        if (flavor != SandboxProfileFlavor.Graphical)
+            return _opts.ExtraRuncmd;
+
+        var commands = new List<string>(_opts.ExtraRuncmd.Count + 1)
+        {
+            GraphicalInstallRuncmd,
+        };
+        commands.AddRange(_opts.ExtraRuncmd);
+        return commands;
     }
 
     private Task<RunResult> RunAsync(
@@ -989,7 +1146,9 @@ internal interface IProcessRunner
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null);
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null);
 }
 
 internal sealed class DefaultProcessRunner : IProcessRunner
@@ -999,7 +1158,9 @@ internal sealed class DefaultProcessRunner : IProcessRunner
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null)
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -1015,8 +1176,9 @@ internal sealed class DefaultProcessRunner : IProcessRunner
         using var p = new Process { StartInfo = psi };
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
+        var limitOutput = maxStdoutBytes.HasValue || maxStderrBytes.HasValue;
         var streamChunks = stdoutChunkCallback is not null || stderrChunkCallback is not null;
-        if (streamChunks)
+        if (streamChunks && !limitOutput)
         {
             p.OutputDataReceived += (_, e) =>
             {
@@ -1037,10 +1199,22 @@ internal sealed class DefaultProcessRunner : IProcessRunner
         p.Start();
         Task<string>? stdoutTask = null;
         Task<string>? stderrTask = null;
-        if (streamChunks)
+        Task<LimitedReadResult>? limitedStdoutTask = null;
+        Task<LimitedReadResult>? limitedStderrTask = null;
+        if (streamChunks && !limitOutput)
         {
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
+        }
+        else if (limitOutput)
+        {
+            void KillForLimit()
+            {
+                try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+            }
+
+            limitedStdoutTask = ReadLimitedAsync(p.StandardOutput, maxStdoutBytes, stdoutChunkCallback, KillForLimit, ct);
+            limitedStderrTask = ReadLimitedAsync(p.StandardError, maxStderrBytes, stderrChunkCallback, KillForLimit, ct);
         }
         else
         {
@@ -1060,11 +1234,89 @@ internal sealed class DefaultProcessRunner : IProcessRunner
         }
         if (stdoutTask is not null && stderrTask is not null)
             return new RunResult(p.ExitCode, await stdoutTask, await stderrTask);
+        if (limitedStdoutTask is not null && limitedStderrTask is not null)
+        {
+            var stdoutResult = await limitedStdoutTask;
+            var stderrResult = await limitedStderrTask;
+            return new RunResult(
+                p.ExitCode,
+                stdoutResult.Text,
+                stderrResult.Text,
+                stdoutResult.LimitExceeded,
+                stderrResult.LimitExceeded);
+        }
         return new RunResult(p.ExitCode, stdout.ToString(), stderr.ToString());
+    }
+
+    private static async Task<LimitedReadResult> ReadLimitedAsync(
+        StreamReader reader,
+        int? maxBytes,
+        Action<string>? chunkCallback,
+        Action onLimitExceeded,
+        CancellationToken ct)
+    {
+        var output = new StringBuilder();
+        var buffer = new char[4096];
+        var totalBytes = 0;
+
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
+            if (read == 0)
+                return new LimitedReadResult(output.ToString(), LimitExceeded: false);
+
+            var chunk = new string(buffer, 0, read);
+            if (maxBytes is { } limit)
+            {
+                var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+                if (totalBytes + chunkBytes > limit)
+                {
+                    var remaining = Math.Max(0, limit - totalBytes);
+                    if (remaining > 0)
+                    {
+                        var truncated = TakeUtf8Prefix(chunk, remaining);
+                        output.Append(truncated);
+                        chunkCallback?.Invoke(truncated);
+                    }
+
+                    onLimitExceeded();
+                    return new LimitedReadResult(output.ToString(), LimitExceeded: true);
+                }
+
+                totalBytes += chunkBytes;
+            }
+
+            output.Append(chunk);
+            chunkCallback?.Invoke(chunk);
+        }
+    }
+
+    private static string TakeUtf8Prefix(string value, int maxBytes)
+    {
+        var used = 0;
+        for (var i = 0; i < value.Length; i++)
+        {
+            var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(i, 1));
+            if (used + charBytes > maxBytes)
+                return value[..i];
+            used += charBytes;
+        }
+
+        return value;
     }
 }
 
-internal readonly record struct RunResult(int ExitCode, string Stdout, string Stderr);
+internal readonly record struct LimitedReadResult(string Text, bool LimitExceeded);
+
+internal readonly record struct RunResult(
+    int ExitCode,
+    string Stdout,
+    string Stderr,
+    bool StdoutLimitExceeded = false,
+    bool StderrLimitExceeded = false)
+{
+    public bool Success => ExitCode == 0;
+}
 
 internal sealed class MultipassDaemonRetryPolicy
 {
@@ -1486,6 +1738,10 @@ public sealed record MultipassSandboxOptions
 internal sealed class MultipassSandbox : IPreemptibleSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
+    internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
+    internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
+    internal const int MaxScreenshotStderrBytes = 64 * 1024;
+    private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
 
     private readonly string _name;
     private readonly string _sandboxRoot;
@@ -1499,6 +1755,9 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     private readonly WorkItemId? _workItemId;
     private readonly string _timingPhase;
     private readonly Action<string>? _onDisposed;
+    private readonly int _maxScreenshotPngBytes;
+    private readonly int _maxScreenshotBase64StdoutBytes;
+    private readonly int _maxScreenshotStderrBytes;
     private int _firstExecEmitted;
     private bool _disposed;
     private bool _preserveOnDispose;
@@ -1506,7 +1765,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
         Action<string>? onDisposed = null, IProcessRunner? runner = null,
-        MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
+        int? maxScreenshotPngBytes = null, int? maxScreenshotStderrBytes = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -1520,6 +1780,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         _workItemId = timingItemId.Value == Guid.Empty ? null : timingItemId;
         _timingPhase = timingPhase;
         _onDisposed = onDisposed;
+        _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
+        _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
+        if (_maxScreenshotPngBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxScreenshotPngBytes), "Screenshot PNG limit must be positive.");
+        if (_maxScreenshotStderrBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxScreenshotStderrBytes), "Screenshot stderr limit must be positive.");
+        _maxScreenshotBase64StdoutBytes = ((_maxScreenshotPngBytes + 2) / 3 * 4) + 4096;
         Id = name;
     }
 
@@ -1527,11 +1794,22 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
+        var result = await ExecRunAsync(exec, ct);
+        return new SandboxExecResult(result.ExitCode, result.Stdout, result.Stderr);
+    }
+
+    private async Task<RunResult> ExecRunAsync(
+        SandboxExec exec,
+        CancellationToken ct,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null)
+    {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (exec.Argv.Count == 0) throw new ArgumentException("Argv must be non-empty", nameof(exec));
 
         var transferredVmPaths = new List<string>();
-        var wrapped = BuildWrappedInvocation(exec, extraEnvFile: null);
+        var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
+        var wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, extraEnvFile: null);
         var argv = BuildMultipassExecArgv(wrapped);
         var argvBytes = EstimateArgvBytes(argv);
         if (argvBytes > ArgvBytesWarningThreshold)
@@ -1540,11 +1818,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
                 "Multipass exec argv for {Name} is {Bytes} bytes; routing through transferred files to avoid ARG_MAX",
                 _name, argvBytes);
 
-            if (exec.ExtraEnvironment is { Count: > 0 })
+            if (effectiveEnvironment is { Count: > 0 })
             {
-                var envFile = await TransferExecEnvironmentAsync(exec.ExtraEnvironment, ct);
+                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
                 transferredVmPaths.Add(envFile);
-                wrapped = BuildWrappedInvocation(exec, envFile);
+                wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile);
                 argv = BuildMultipassExecArgv(wrapped);
             }
 
@@ -1567,8 +1845,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
                 exec.Stdin,
                 ct,
                 exec.StdoutChunkCallback,
-                exec.StderrChunkCallback);
-            return new SandboxExecResult(result.ExitCode, result.Stdout, result.Stderr);
+                exec.StderrChunkCallback,
+                maxStdoutBytes,
+                maxStderrBytes);
+            return result;
         }
         finally
         {
@@ -1579,7 +1859,150 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         }
     }
 
-    private List<string> BuildWrappedInvocation(SandboxExec exec, string? extraEnvFile)
+    public async Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+    {
+        EnsureGraphical();
+        var result = await ExecRunAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-lc",
+                "tmp=$(mktemp --suffix=.png); trap 'rm -f \"$tmp\"' EXIT; DISPLAY=:0 scrot -z \"$tmp\"; base64 -w0 \"$tmp\"",
+            ],
+            WorkingDirectory = _spec.WorkingDirectory,
+        }, ct, maxStdoutBytes: _maxScreenshotBase64StdoutBytes, maxStderrBytes: _maxScreenshotStderrBytes);
+
+        if (result.StdoutLimitExceeded)
+            throw new InvalidOperationException("graphical screenshot output exceeded the maximum capture size");
+        if (result.StderrLimitExceeded)
+            throw new InvalidOperationException("graphical screenshot stderr exceeded the maximum capture size");
+        if (!result.Success)
+            throw new InvalidOperationException($"graphical screenshot failed: {result.Stderr}");
+
+        try
+        {
+            var screenshot = Convert.FromBase64String(result.Stdout.Trim());
+            if (screenshot.Length > _maxScreenshotPngBytes)
+                throw new InvalidOperationException("graphical screenshot PNG exceeded the maximum capture size");
+            if (!HasPngSignature(screenshot))
+                throw new InvalidOperationException("graphical screenshot command returned non-PNG data");
+            return screenshot;
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException("graphical screenshot command returned invalid base64", ex);
+        }
+    }
+
+    private static bool HasPngSignature(byte[] bytes)
+        => bytes.Length >= PngSignature.Length
+            && bytes.AsSpan(0, PngSignature.Length).SequenceEqual(PngSignature);
+
+    public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+    {
+        EnsureGraphical();
+        SandboxInputEventValidation.Validate(events);
+        foreach (var inputEvent in events)
+        {
+            var argv = BuildXdotoolArgv(inputEvent);
+
+            var result = await ExecAsync(new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = _spec.WorkingDirectory,
+            }, ct);
+            if (!result.Success)
+                throw new InvalidOperationException(
+                    $"graphical input event '{inputEvent.Type}' failed: {result.Stderr}");
+        }
+    }
+
+    private void EnsureGraphical()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_spec.Flavor != SandboxProfileFlavor.Graphical)
+            throw new NotSupportedException("This Multipass sandbox was not created with the graphical flavor.");
+    }
+
+    private static IReadOnlyList<string> BuildXdotoolArgv(SandboxInputEvent inputEvent)
+    {
+        var argv = new List<string>
+        {
+            "xdotool",
+        };
+
+        switch (inputEvent.Type)
+        {
+            case SandboxInputEventType.Click:
+                if (inputEvent.X is { } clickX && inputEvent.Y is { } clickY)
+                    argv.AddRange(["mousemove", "--sync", clickX.ToString(), clickY.ToString()]);
+                argv.AddRange(["click", "1"]);
+                return argv;
+
+            case SandboxInputEventType.Key:
+                argv.AddRange(["key", "--clearmodifiers", inputEvent.Key!]);
+                return argv;
+
+            case SandboxInputEventType.Move:
+                var moveX = inputEvent.X!.Value;
+                var moveY = inputEvent.Y!.Value;
+                argv.AddRange(["mousemove", "--sync", moveX.ToString(), moveY.ToString()]);
+                return argv;
+
+            case SandboxInputEventType.Scroll:
+                return BuildScrollArgv(argv, inputEvent);
+
+            case SandboxInputEventType.Type:
+                argv.AddRange(["type", "--clearmodifiers", "--delay", "0", "--", inputEvent.Text!]);
+                return argv;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(inputEvent), inputEvent.Type, "Unknown input event type.");
+        }
+    }
+
+    private static IReadOnlyList<string> BuildScrollArgv(List<string> argv, SandboxInputEvent inputEvent)
+    {
+        var vertical = inputEvent.Y ?? 0;
+        var horizontal = inputEvent.X ?? 0;
+        var amount = Math.Abs((long)(vertical != 0 ? vertical : horizontal));
+        var button = vertical switch
+        {
+            < 0 => "4",
+            > 0 => "5",
+            _ => horizontal < 0 ? "6" : "7",
+        };
+        argv.AddRange(["click", "--repeat", amount.ToString(), button]);
+        return argv;
+    }
+
+    private IReadOnlyDictionary<string, string>? BuildEffectiveExecEnvironment(SandboxExec exec)
+    {
+        if (_spec.Flavor != SandboxProfileFlavor.Graphical)
+            return exec.ExtraEnvironment;
+
+        if (exec.ExtraEnvironment is null || exec.ExtraEnvironment.Count == 0)
+        {
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
+            };
+        }
+
+        if (exec.ExtraEnvironment.ContainsKey("DISPLAY"))
+            return exec.ExtraEnvironment;
+
+        var merged = new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
+        {
+            ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
+        };
+        return merged;
+    }
+
+    private List<string> BuildWrappedInvocation(
+        SandboxExec exec,
+        IReadOnlyDictionary<string, string>? effectiveEnvironment,
+        string? extraEnvFile)
     {
         // The codeybox-exec wrapper closes stdin by default to prevent
         // tools that read stdin from hanging the sandbox. When the
@@ -1592,12 +2015,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         {
             wrapped.AddRange(["--env-file", extraEnvFile]);
         }
-        else if (exec.ExtraEnvironment is { Count: > 0 })
+        else if (effectiveEnvironment is { Count: > 0 })
         {
             // env(1) takes KEY=VALUE pairs followed by the command. This
             // keeps the common case small and preserves historical ordering.
             wrapped.Add("env");
-            foreach (var (k, v) in exec.ExtraEnvironment)
+            foreach (var (k, v) in effectiveEnvironment)
                 wrapped.Add($"{k}={v}");
         }
         wrapped.AddRange(exec.Argv);
@@ -1707,10 +2130,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null) =>
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null) =>
         MultipassDaemonRetry.RunWithRetryAsync(
             argv,
-            ctInner => _runner.RunAsync(argv, stdin, ctInner, stdoutChunkCallback, stderrChunkCallback),
+            ctInner => _runner.RunAsync(argv, stdin, ctInner, stdoutChunkCallback, stderrChunkCallback, maxStdoutBytes, maxStderrBytes),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
                 _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,

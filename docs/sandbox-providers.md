@@ -125,6 +125,66 @@ group dance (multipass handles its own KVM access). Confirm with
 * **Image bring-up.** First launch downloads the default Ubuntu image
   (~600 MB) to the multipass cache. Subsequent launches reuse it.
 
+### Graphical Multipass sandboxes
+
+Projects that need to build or test GUI applications can opt in with:
+
+```json
+{
+  "CodeyBox": {
+    "Projects": [
+      {
+        "Id": "desktop-app",
+        "RepositoryUrl": "https://example.com/desktop-app.git",
+        "GraphicalSandbox": true
+      }
+    ]
+  }
+}
+```
+
+When enabled, the work and rework phases use `SandboxProfileFlavor.Graphical`
+and the conventional `graphical` network profile (`cb-graphical` in the default
+operator examples). Audit sandboxes use
+the graphical flavor only when an auditor declares `AuditCapabilities.Graphical`;
+ordinary tool auditors keep their configured `auditTool` profile. LLM audit and
+merge phases keep their normal headless profiles. The Multipass
+graphical flavor installs a lightweight XFCE session on Xvfb, starts `x11vnc`
+on the VM's `10.99.x.x` profile-bridge address on the conventional graphical VNC
+port (`SandboxConventions.GraphicalVncPort`, currently `5900`), and preinstalls
+`xdotool`, `scrot`, and `ffmpeg`. The VNC server is password-protected and
+allows only the host bridge gateway. For operator viewing, run
+`codeybox-vnc-loopback <multipass-vm-name> 5901` and connect to
+`127.0.0.1:5901`; the helper binds host loopback and proxies to the guest bridge
+listener. The CodeyBox
+screenshot/input APIs call `scrot` and `xdotool` through `multipass exec`;
+no additional LLM network surface is required.
+
+Operator setup needs the dedicated graphical profile bridge:
+
+```text
+# /etc/codeybox/networks.conf
+graphical        cb-graphical    10.99.6.0/24   internet
+```
+
+Use `internet` or an allowlist that covers the Ubuntu package sources while
+the graphical baseline is baked. A no-egress graphical bridge is only viable
+with a custom image that already contains the desktop, VNC, screenshot, and
+input tooling.
+
+Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
+
+```json
+"SandboxNetworkProfiles": {
+  "graphical": "cb-graphical"
+}
+```
+
+With `MultipassUseBaselineImages=true`, the provider bakes
+`cb-baseline-graphical` the first time a graphical project runs. Delete that
+baseline to force a rebuild after changing graphical tooling or
+`MultipassExtraRuncmd`.
+
 **Integration-tested**: end-to-end on a real Ubuntu 25.10 host. The
 shipped test verifies VM launch, native bind-mount visibility,
 env-from-file (with explicit no-argv-leak verification via in-VM `ps`

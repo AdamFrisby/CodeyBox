@@ -96,6 +96,7 @@ claude           cb-claude       10.99.2.0/24   api.anthropic.com
 internet-only    cb-net          10.99.5.0/24   internet
 codex            cb-codex           10.99.3.0/24   api.openai.com
 multi-llm        cb-multi-llm       10.99.4.0/24   api.anthropic.com,api.openai.com,api.githubcopilot.com
+graphical        cb-graphical       10.99.6.0/24   internet
 EOF
 
 # 3. Run the setup script (creates bridges, applies nftables, persists rules).
@@ -124,7 +125,8 @@ Two layers of config:
       "isolated":  "cb-iso",
       "claude":    "cb-claude",
       "codex":     "cb-codex",
-      "multi-llm": "cb-multi-llm"
+      "multi-llm": "cb-multi-llm",
+      "graphical": "cb-graphical"
     }
   }
 }
@@ -158,6 +160,25 @@ its egress needs are project-specific.
 If a profile referenced in project config isn't in
 `SandboxNetworkProfiles`, the provider fails loudly at sandbox
 creation — never silently degrades to "no enforcement."
+
+### Graphical VNC exposure
+
+Graphical Multipass sandboxes run `x11vnc` on the conventional graphical
+VNC port (`SandboxConventions.GraphicalVncPort`, currently `5900`), bound
+to the VM's `10.99.x.x` profile-bridge address. The server uses a per-sandbox
+VNC password and only allows the host bridge gateway address.
+
+For human access, use the loopback-only helper installed by
+`setup-host-networks.sh`:
+
+```bash
+codeybox-vnc-loopback <multipass-vm-name> 5901
+```
+
+Then connect your VNC client to `127.0.0.1:5901`. Programmatic screenshots
+and input use `multipass exec` (`scrot`/`xdotool`); VNC is only an
+operator-facing inspection path. The helper binds host loopback and proxies
+to the guest bridge VNC listener.
 
 ## Sandbox staging directory hardening
 
@@ -228,7 +249,7 @@ root's permissions don't drift back to default 0755.
 - **Agent reaches an unexpected host.** Either the IP was allowlisted
   (check the resolved IPs against your config) or the rule isn't being
   hit (check `nft -a list ruleset` for counters). If forward traffic on
-  `mpqemubr0` is being accepted, the script's `cb-default-blocked`
+  `mpqemubr0` is being accepted, the script's `cb_default_blocked`
   chain isn't loaded — re-run.
 
 ## Tests

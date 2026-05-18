@@ -136,6 +136,14 @@ public sealed record Project
     public ProjectChangelog? Changelog { get; init; }
 
     /// <summary>
+    /// When true, work and rework sandboxes use the graphical sandbox flavor
+    /// and the conventional graphical network profile. Auditors use graphical
+    /// sandboxes when they declare <see cref="AuditCapabilities.Graphical"/>.
+    /// Default false because graphical VMs are larger and slower.
+    /// </summary>
+    public bool GraphicalSandbox { get; init; }
+
+    /// <summary>
     /// When true, agents in this project may emit structured <c>&lt;codeybox-question&gt;</c>
     /// blocks mid-work to escalate ambiguity to the operator. The work item parks
     /// at NeedsOperatorInput, fires a webhook, and waits for POST /workitems/{id}/answer.

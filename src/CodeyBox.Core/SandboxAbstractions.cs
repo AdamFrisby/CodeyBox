@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -83,6 +85,20 @@ public interface ISandbox : IAsyncDisposable
     /// added later.
     /// </summary>
     Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns a PNG screenshot of the current graphical desktop. Providers
+    /// that do not support graphical sandboxes throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    Task<byte[]> GetScreenshotAsync(CancellationToken ct = default) =>
+        throw new NotSupportedException("This sandbox does not expose a graphical desktop.");
+
+    /// <summary>
+    /// Synthesizes desktop input events inside a graphical sandbox. Providers
+    /// that do not support graphical sandboxes throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default) =>
+        throw new NotSupportedException("This sandbox does not expose a graphical desktop.");
 }
 
 /// <summary>
@@ -106,6 +122,7 @@ public sealed record SandboxSpec
     public IReadOnlyDictionary<string, string> Environment { get; init; } = new Dictionary<string, string>();
     public SandboxResourceLimits Limits { get; init; } = SandboxResourceLimits.Default;
     public SandboxNetworkPolicy Network { get; init; } = SandboxNetworkPolicy.Denied;
+    public SandboxProfileFlavor Flavor { get; init; } = SandboxProfileFlavor.Headless;
     public string WorkingDirectory { get; init; } = "/work";
 
     /// <summary>
@@ -114,6 +131,132 @@ public sealed record SandboxSpec
     /// </summary>
     public WorkItemId? TimingWorkItemId { get; init; }
     public string? TimingPhase { get; init; }
+}
+
+public enum SandboxProfileFlavor
+{
+    Headless = 0,
+    Graphical = 1,
+}
+
+public enum SandboxInputEventType
+{
+    Click,
+    Key,
+    Move,
+    Scroll,
+    Type,
+}
+
+public sealed record SandboxInputEvent
+{
+    public required SandboxInputEventType Type { get; init; }
+    public int? X { get; init; }
+    public int? Y { get; init; }
+    public string? Key { get; init; }
+    public string? Text { get; init; }
+}
+
+public static class SandboxInputEventValidation
+{
+    public const int DefaultMaxEvents = 32;
+    public const int DefaultMaxTextUtf8Bytes = 4096;
+    public const int DefaultMaxKeyUtf8Bytes = 128;
+    public const int DefaultMaxCoordinate = 32767;
+    public const int DefaultMaxScrollMagnitude = 1000;
+
+    public static void Validate(
+        IReadOnlyList<SandboxInputEvent> events,
+        int maxEvents = DefaultMaxEvents,
+        int maxTextUtf8Bytes = DefaultMaxTextUtf8Bytes,
+        int maxKeyUtf8Bytes = DefaultMaxKeyUtf8Bytes,
+        int maxCoordinate = DefaultMaxCoordinate,
+        int maxScrollMagnitude = DefaultMaxScrollMagnitude)
+    {
+        ArgumentNullException.ThrowIfNull(events);
+        if (events.Count == 0)
+            throw new ArgumentException("Graphical input requires at least one event.", nameof(events));
+        if (events.Count > maxEvents)
+            throw new ArgumentOutOfRangeException(nameof(events), $"Graphical input is limited to {maxEvents} events per call.");
+
+        for (var i = 0; i < events.Count; i++)
+        {
+            var inputEvent = events[i];
+            if (inputEvent is null)
+                throw new ArgumentException($"Graphical input event {i} is null.", nameof(events));
+
+            switch (inputEvent.Type)
+            {
+                case SandboxInputEventType.Click:
+                    if (inputEvent.X.HasValue != inputEvent.Y.HasValue)
+                        throw new ArgumentException("Click events must provide both X and Y, or neither.", nameof(events));
+                    ValidateCoordinate(inputEvent.X, maxCoordinate, nameof(SandboxInputEvent.X));
+                    ValidateCoordinate(inputEvent.Y, maxCoordinate, nameof(SandboxInputEvent.Y));
+                    break;
+
+                case SandboxInputEventType.Key:
+                    ValidateText(inputEvent.Key, maxKeyUtf8Bytes, "Key events require Key.", nameof(SandboxInputEvent.Key));
+                    break;
+
+                case SandboxInputEventType.Move:
+                    if (inputEvent.X is null || inputEvent.Y is null)
+                        throw new ArgumentException("Move events require X and Y.", nameof(events));
+                    ValidateCoordinate(inputEvent.X, maxCoordinate, nameof(SandboxInputEvent.X));
+                    ValidateCoordinate(inputEvent.Y, maxCoordinate, nameof(SandboxInputEvent.Y));
+                    break;
+
+                case SandboxInputEventType.Scroll:
+                    ValidateScroll(inputEvent, maxScrollMagnitude);
+                    break;
+
+                case SandboxInputEventType.Type:
+                    ValidateText(
+                        inputEvent.Text,
+                        maxTextUtf8Bytes,
+                        "Type events require Text.",
+                        nameof(SandboxInputEvent.Text),
+                        allowWhitespace: true);
+                    break;
+
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(events), inputEvent.Type, "Unknown input event type.");
+            }
+        }
+    }
+
+    private static void ValidateCoordinate(int? value, int maxCoordinate, string name)
+    {
+        if (value is null)
+            return;
+        if (value.Value < 0 || value.Value > maxCoordinate)
+            throw new ArgumentOutOfRangeException(name, $"{name} must be between 0 and {maxCoordinate}.");
+    }
+
+    private static void ValidateScroll(SandboxInputEvent inputEvent, int maxScrollMagnitude)
+    {
+        var vertical = inputEvent.Y ?? 0;
+        var horizontal = inputEvent.X ?? 0;
+        if (vertical == 0 && horizontal == 0)
+            throw new ArgumentException("Scroll events require a non-zero X or Y amount.", nameof(inputEvent));
+        if (vertical != 0 && horizontal != 0)
+            throw new ArgumentException("Scroll events support one axis at a time.", nameof(inputEvent));
+        if (Math.Abs((long)(vertical != 0 ? vertical : horizontal)) > maxScrollMagnitude)
+            throw new ArgumentOutOfRangeException(nameof(inputEvent), $"Scroll amount must be <= {maxScrollMagnitude}.");
+    }
+
+    private static void ValidateText(
+        string? value,
+        int maxUtf8Bytes,
+        string missingMessage,
+        string fieldName,
+        bool allowWhitespace = false)
+    {
+        if (value is null || (allowWhitespace ? value.Length == 0 : string.IsNullOrWhiteSpace(value)))
+            throw new ArgumentException(missingMessage, fieldName);
+        var byteCount = Encoding.UTF8.GetByteCount(value);
+        if (byteCount > maxUtf8Bytes)
+            throw new ArgumentOutOfRangeException(fieldName, $"{fieldName} must be <= {maxUtf8Bytes} UTF-8 bytes.");
+    }
 }
 
 /// <summary>

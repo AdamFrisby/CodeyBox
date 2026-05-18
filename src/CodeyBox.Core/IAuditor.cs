@@ -45,6 +45,8 @@ public enum AuditCapabilities
     AgentCredentials = 1 << 0,
     /// <summary>Auditor needs network egress (to the agent allowlist).</summary>
     Network = 1 << 1,
+    /// <summary>Auditor needs a sandbox with graphical desktop capabilities.</summary>
+    Graphical = 1 << 2,
 }
 
 /// <summary>Information the pipeline passes to each auditor.</summary>

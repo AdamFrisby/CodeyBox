@@ -11,6 +11,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
+using CodeyBox.Audit;
 using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
@@ -844,6 +845,7 @@ builder.Services.AddSingleton(_ =>
     return options;
 });
 builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(sp.GetRequiredService<PresetCatalogOptions>()));
+builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------
@@ -1555,13 +1557,17 @@ namespace CodeyBox.Api
         /// "SandboxNetworkProfiles": {
         ///   "isolated":  "cb-iso",
         ///   "claude":    "cb-claude",
-        ///   "multi-llm": "cb-multi-llm"
+        ///   "multi-llm": "cb-multi-llm",
+        ///   "graphical": "cb-graphical"
         /// }
         /// </code>
         /// Bridge names are limited to 15 characters by Linux IFNAMSIZ.
         /// Profile names (the keys) have no such limit.
         /// </summary>
-        public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = [];
+        public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase)
+        {
+            [CodeyBox.Sandbox.SandboxConventions.GraphicalNetworkProfile] = "cb-graphical",
+        };
 
         /// <summary>
         /// Shell commands run inside the sandbox VM at first boot, after

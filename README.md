@@ -63,6 +63,13 @@ Three sandbox providers — pick by `CodeyBox.SandboxProvider`:
 See `docs/sandbox-providers.md` for the full setup and trade-offs of
 each.
 
+Projects that need GUI build/test plumbing can set `GraphicalSandbox: true`.
+With Multipass this routes work and rework through the conventional `graphical`
+network profile, uses the `cb-baseline-graphical` baseline, and starts an
+XFCE/Xvfb desktop with screenshot and input synthesis exposed through the
+sandbox API. Audit sandboxes use the graphical flavor when the auditor declares
+`AuditCapabilities.Graphical`.
+
 See [`docs/`](docs/README.md) for the full write-up. **Read
 [`docs/security.md`](docs/security.md) before deploying.**
 

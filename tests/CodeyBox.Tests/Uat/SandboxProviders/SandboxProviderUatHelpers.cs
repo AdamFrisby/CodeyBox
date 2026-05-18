@@ -60,14 +60,20 @@ internal sealed class RecordingMultipassRunner : IProcessRunner
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null)
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null)
     {
-        Calls.Enqueue(new MultipassCall(argv.ToArray(), stdin));
+        Calls.Enqueue(new MultipassCall(argv.ToArray(), stdin, maxStdoutBytes, maxStderrBytes));
         return await _handler(argv, stdin, ct);
     }
 }
 
-internal sealed record MultipassCall(IReadOnlyList<string> Argv, string? Stdin);
+internal sealed record MultipassCall(
+    IReadOnlyList<string> Argv,
+    string? Stdin,
+    int? MaxStdoutBytes = null,
+    int? MaxStderrBytes = null);
 
 internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
 {

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Net.Http.Json;
@@ -132,7 +133,7 @@ public sealed class TimingAndOpenTelemetryUatTests : IDisposable
     [Fact]
     public void Metrics_InstrumentsEmitFleetObservabilityMeasurements()
     {
-        var measurements = new List<(string Instrument, long Value, string? TagValue)>();
+        var measurements = new ConcurrentBag<(string Instrument, long Value, string? TagValue)>();
         using var listener = new MeterListener();
         listener.InstrumentPublished = (instrument, meterListener) =>
         {
@@ -158,7 +159,8 @@ public sealed class TimingAndOpenTelemetryUatTests : IDisposable
         CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", "Working"));
         CodeyBoxMeters.AgentDuration.Record(250, new KeyValuePair<string, object?>("phase", "work"));
 
-        Assert.Contains(measurements, m => m.Instrument == "codeybox.work_item.transitions" && m.Value == 1 && m.TagValue == "Working");
-        Assert.Contains(measurements, m => m.Instrument == "codeybox.agent.duration_ms" && m.Value == 250 && m.TagValue == "work");
+        var snapshot = measurements.ToArray();
+        Assert.Contains(snapshot, m => m.Instrument == "codeybox.work_item.transitions" && m.Value == 1 && m.TagValue == "Working");
+        Assert.Contains(snapshot, m => m.Instrument == "codeybox.agent.duration_ms" && m.Value == 250 && m.TagValue == "work");
     }
 }

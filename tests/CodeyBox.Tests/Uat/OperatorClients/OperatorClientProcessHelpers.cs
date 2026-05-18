@@ -46,6 +46,16 @@ internal static class OperatorClientPaths
 
 internal static partial class OperatorClientProcess
 {
+    // Shared per-test-process to avoid paying dotnet's cold-start cost (NuGet
+    // restore, MSBuild SDK resolution) on every CLI invocation; only the
+    // codeybox-side cliConfig directory needs per-call isolation.
+    private static readonly Lazy<string> SharedDotnetCliHome = new(() =>
+    {
+        var path = Path.Combine(Path.GetTempPath(), "codeybox-dotnet-home-shared-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        return path;
+    });
+
     internal static Task<ProcessResult> RunCodeyBoxCliAsync(
         IReadOnlyList<string> args,
         IDictionary<string, string?>? environment = null,
@@ -64,14 +74,13 @@ internal static partial class OperatorClientProcess
         IDictionary<string, string?>? environment,
         string? stdin)
     {
-        var home = Path.Combine(Path.GetTempPath(), "codeybox-dotnet-home-" + Guid.NewGuid().ToString("N"));
+        var home = SharedDotnetCliHome.Value;
         var cliConfig = Path.Combine(Path.GetTempPath(), "codeybox-cli-config-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(home);
         Directory.CreateDirectory(cliConfig);
 
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(120));
             var startInfo = new ProcessStartInfo
             {
                 FileName = "dotnet",
@@ -133,7 +142,6 @@ internal static partial class OperatorClientProcess
         }
         finally
         {
-            TryDeleteDirectory(home);
             TryDeleteDirectory(cliConfig);
         }
     }
