@@ -61,6 +61,9 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly QuotaRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
+    // Last-resort pause for quota-shaped terminal failures when neither the
+    // agent output nor quota probes expose a reset window.
+    internal static readonly TimeSpan DefaultQuotaFailurePause = TimeSpan.FromMinutes(5);
     // Per-process exhausted-member TTL when the chosen agent hits quota mid-flight.
     // Subscription windows reset on the order of hours; one hour is a conservative
     // upper bound that keeps the in-process cache useful across consecutive pickups
@@ -4441,7 +4444,19 @@ public sealed class PipelineRunner : IPipelineRunner
     private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
-        var next = current.With(WorkItemState.Failed, error, failureKind: failureKind, quotaResetAt: quotaResetAt);
+        WorkItem next;
+        if (failureKind == "quota")
+        {
+            var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, ct);
+            next = current.With(WorkItemState.Failed, error, failureKind: failureKind, quotaResetAt: effectiveResetAt) with
+            {
+                NextQuotaRetryAt = effectiveResetAt,
+            };
+        }
+        else
+        {
+            next = current.With(WorkItemState.Failed, error, failureKind: failureKind, quotaResetAt: quotaResetAt);
+        }
 
         // Use TryUpdateIfStateAsync to avoid overwriting a state change that happened concurrently (e.g. cancellation via API).
         var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
@@ -4470,6 +4485,41 @@ public sealed class PipelineRunner : IPipelineRunner
             WorkItem = next,
             Project = effectiveProject,
         }, CancellationToken.None);
+    }
+
+    private async Task<DateTimeOffset> ResolveQuotaResetAtForFailedTransitionAsync(
+        WorkItem item,
+        Project? project,
+        DateTimeOffset? detectedResetAt,
+        CancellationToken ct)
+    {
+        var resetAt = ClampQuotaReset(detectedResetAt);
+        if (resetAt is not null)
+            return resetAt.Value;
+
+        if (_classRouter is not null)
+        {
+            try
+            {
+                var effectiveProject = project ?? await _projects.GetAsync(item.ProjectId, ct);
+                resetAt = await _classRouter.ComputeEarliestExhaustedResetAsync(item, effectiveProject, ct);
+                if (resetAt is not null)
+                    return resetAt.Value;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(
+                    ex,
+                    "Failed to compute quota reset fallback for failed work item {Id}; using default pause",
+                    item.Id);
+            }
+        }
+
+        return DateTimeOffset.UtcNow.Add(DefaultQuotaFailurePause);
     }
 
     private async Task TransitionWaitingForQuotaResetAsync(

@@ -92,7 +92,8 @@ internal static class TestSupport
         bool graphicalSandbox = false,
         ProjectNetworkProfiles? networkProfiles = null,
         ICredentialProvider? credentials = null,
-        IProjectRepository? projectRepository = null)
+        IProjectRepository? projectRepository = null,
+        AgentClassRouter? classRouter = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -152,6 +153,7 @@ internal static class TestSupport
             timingStore: timingStore,
             auditReports: auditReportStore,
             agentStreams: agentStreams,
+            classRouter: classRouter,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[]
             {
                 new ClaudeQuotaFailureDetector(),

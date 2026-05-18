@@ -64,7 +64,8 @@ public sealed record WorkItem
 
     /// <summary>
     /// When the quota window that caused a "quota" failure is expected to
-    /// reset, if parsed from agent output.
+    /// reset. Prefer parsed agent-output reset hints; quota failures may also
+    /// use probe-derived reset times or the orchestrator's default pause.
     /// </summary>
     public DateTimeOffset? QuotaResetAt { get; init; }
 
