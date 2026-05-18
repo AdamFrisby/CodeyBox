@@ -58,7 +58,31 @@ public sealed class DefaultDiskSpaceProbe : IDiskSpaceProbe
 }
 
 /// <summary>
-/// Thrown by <see cref="ISandboxProvider.CreateAsync"/> when a configured
+/// Optional provider-level capability: sandbox providers that maintain a
+/// free-disk preflight expose the per-mount snapshot through this interface
+/// so dashboards, /healthz, and the startup banner can render the same view
+/// the guard uses to decide deferrals — without the API layer taking a
+/// concrete-type dependency on any single provider implementation.
+/// </summary>
+public interface IDiskGuardedSandboxProvider
+{
+    /// <summary>
+    /// Returns the current snapshot for each monitored mount. Empty when
+    /// the implementation's disk-guard is unconfigured / disabled.
+    /// </summary>
+    IReadOnlyList<DiskGuardSample> SampleDiskGuardState();
+}
+
+/// <summary>
+/// One row of <see cref="IDiskGuardedSandboxProvider.SampleDiskGuardState"/>.
+/// <c>FreeBytes</c> is <c>null</c> when the probe could not resolve the
+/// mount (treated as inconclusive — the preflight does not block work in
+/// that case).
+/// </summary>
+public sealed record DiskGuardSample(string Path, long? FreeBytes, long ThresholdBytes);
+
+/// <summary>
+/// Thrown by a sandbox provider's <c>CreateAsync</c> when a configured
 /// disk-space preflight refuses to launch because free space on one of the
 /// monitored mounts dropped below the threshold. The orchestrator catches
 /// this, schedules a deferred re-pickup, and fires a <c>disk.deferred</c>

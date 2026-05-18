@@ -45,7 +45,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider
+public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -160,13 +160,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     public string Name => "multipass";
 
-    /// <summary>
-    /// Returns the ordered list of mounts the disk-guard checks. Exposed for
-    /// the /healthz endpoint and the startup banner so operators see the same
-    /// paths the preflight uses. Empty when <see cref="MultipassSandboxOptions.DiskGuard"/>
-    /// is unset.
-    /// </summary>
-    public IReadOnlyList<string> DiskGuardPaths
+    private IReadOnlyList<string> DiskGuardPaths
     {
         get
         {
@@ -183,18 +177,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         }
     }
 
-    /// <summary>
-    /// Returns <c>(path, freeBytes, thresholdBytes)</c> for each path the
-    /// disk-guard monitors. <c>freeBytes</c> is null when the probe couldn't
-    /// resolve the mount. Same iteration order as <see cref="DiskGuardPaths"/>.
-    /// </summary>
-    public IReadOnlyList<(string Path, long? FreeBytes, long ThresholdBytes)> SampleDiskGuardState()
+    /// <inheritdoc />
+    public IReadOnlyList<DiskGuardSample> SampleDiskGuardState()
     {
         if (ReadOptions().DiskGuard is not { } guard) return [];
         var paths = DiskGuardPaths;
-        var result = new List<(string, long?, long)>(paths.Count);
+        var result = new List<DiskGuardSample>(paths.Count);
         foreach (var p in paths)
-            result.Add((p, _diskProbe.GetFreeBytes(p), guard.MinFreeBytes));
+            result.Add(new DiskGuardSample(p, _diskProbe.GetFreeBytes(p), guard.MinFreeBytes));
         return result;
     }
 

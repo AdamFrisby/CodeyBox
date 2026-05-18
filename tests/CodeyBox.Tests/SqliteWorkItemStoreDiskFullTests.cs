@@ -68,5 +68,39 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
         var bigPrompt = item with { Prompt = new string('z', 256 * 1024) };
         var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(() => store.UpdateAsync(bigPrompt));
         Assert.Equal("UpdateAsync", ex.Operation);
+        Assert.IsType<SqliteException>(ex.InnerException);
+    }
+
+    /// <summary>
+    /// TryUpdateIfStateAsync is the orchestrator's primary persistence call for
+    /// state transitions (every WorkItemRetrier.RetryAsync goes through it),
+    /// so the SQLITE_FULL translation must hold here too. Without this test a
+    /// refactor that reorders the catches or drops the error-code comparison
+    /// would not be caught.
+    /// </summary>
+    [Fact]
+    public async Task TryUpdateIfStateAsync_TranslatesSqliteFull_ToTypedException()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "t",
+            Prompt = "p",
+            Agent = AgentKind.Claude,
+        };
+        await store.CreateAsync(item);
+
+        store.ForceMaxPageCountForTesting(1);
+
+        // Force a write large enough that SQLite has to grow the file and
+        // cannot satisfy that growth under max_page_count=1.
+        var bigPrompt = item with { Prompt = new string('z', 256 * 1024) };
+        var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(
+            () => store.TryUpdateIfStateAsync(bigPrompt, item.State));
+        Assert.Equal("TryUpdateIfStateAsync", ex.Operation);
+        Assert.IsType<SqliteException>(ex.InnerException);
     }
 }

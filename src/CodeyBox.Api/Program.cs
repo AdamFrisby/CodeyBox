@@ -457,19 +457,25 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
 
     // Startup banner: log free disk for each guarded path so the operator
     // can see at a glance whether the host is close to the threshold. Mirrors
-    // the existing baseline-image banner pattern.
+    // the existing baseline-image banner pattern. Speaks to the capability
+    // interface so this code does not depend on the concrete provider type.
     if (diskGuard is not null)
     {
-        foreach (var (path, freeBytes, threshold) in provider.SampleDiskGuardState())
-        {
-            var freeRendered = freeBytes is long b ? FormatBytes(b) : "(unknown)";
-            startupLog.LogInformation(
-                "Multipass disk-guard: {Path} free={FreeBytes} threshold={Threshold}",
-                path, freeRendered, FormatBytes(threshold));
-        }
+        LogDiskGuardBanner(provider, startupLog);
     }
 
     return provider;
+}
+
+static void LogDiskGuardBanner(IDiskGuardedSandboxProvider provider, ILogger startupLog)
+{
+    foreach (var sample in provider.SampleDiskGuardState())
+    {
+        var freeRendered = sample.FreeBytes is long b ? FormatBytes(b) : "(unknown)";
+        startupLog.LogInformation(
+            "Disk-guard: {Path} free={FreeBytes} threshold={Threshold}",
+            sample.Path, freeRendered, FormatBytes(sample.ThresholdBytes));
+    }
 }
 
 static MultipassDiskGuardOptions? BuildMultipassDiskGuard(CodeyBoxOptions opts, ILogger startupLog)
@@ -1464,6 +1470,32 @@ var app = builder.Build();
 // before the host starts observing file-change reloads.
 _ = app.Services.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
 
+// Convert WorkItemStoreDiskFullException into a clean 503 instead of letting
+// the raw exception escape the HTTP layer. Once SQLite refuses to accept
+// writes there is no recovery without operator intervention; returning a
+// service-unavailable response is the closest thing to "stop accepting new
+// work cleanly" the bug report asked for.
+app.Use(async (ctx, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (WorkItemStoreDiskFullException ex)
+    {
+        var logger = ctx.RequestServices.GetRequiredService<ILoggerFactory>()
+            .CreateLogger("CodeyBox.Api.DiskFull");
+        logger.LogCritical(ex, "Refusing request {Path}: state store reports disk full ({Operation})",
+            ctx.Request.Path, ex.Operation);
+        ctx.Response.Clear();
+        ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        ctx.Response.Headers["Retry-After"] = "300";
+        ctx.Response.ContentType = "application/json";
+        await ctx.Response.WriteAsync(
+            "{\"error\":\"state store full\",\"detail\":\"host disk is exhausted; no further state transitions can be persisted\"}");
+    }
+});
+
 app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
 
 WorkItemEndpoints.Map(app);
@@ -1561,12 +1593,12 @@ app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
 {
     // Surface free-disk metrics for each path the disk-guard monitors so
     // dashboards can alert before the orchestrator starts deferring or the
-    // state store hits SQLITE_FULL. Only emitted for the multipass provider
-    // (the only one that exposes a guard today); other providers report an
-    // empty list, preserving the previous response shape on a best-effort
-    // basis.
-    object[] disk = sandboxes is MultipassSandboxProvider mp
-        ? mp.SampleDiskGuardState().Select(s => (object)new
+    // state store hits SQLITE_FULL. Providers opt in by implementing the
+    // IDiskGuardedSandboxProvider capability interface — providers without
+    // a disk-guard report an empty list, preserving the previous response
+    // shape on a best-effort basis.
+    object[] disk = sandboxes is IDiskGuardedSandboxProvider guarded
+        ? guarded.SampleDiskGuardState().Select(s => (object)new
         {
             path = s.Path,
             freeBytes = s.FreeBytes,
@@ -1785,11 +1817,13 @@ namespace CodeyBox.Api
         public bool MultipassUseBaselineImages { get; set; } = false;
 
         /// <summary>
-        /// Disk-guard preflight configuration. When set, every
+        /// Disk-guard preflight configuration. Enabled by default
+        /// (<see cref="DiskGuardOptions.Enabled"/>=<c>true</c>,
+        /// <see cref="DiskGuardOptions.MinFreeBytes"/>=10 GiB); every
         /// <c>MultipassSandboxProvider.CreateAsync</c> call checks free space
         /// on the configured mounts and defers the work item (same machinery
-        /// as the budget cap) when any mount is below the threshold. Null
-        /// (default) disables the preflight, preserving legacy behaviour.
+        /// as the budget cap) when any mount is below the threshold. Set
+        /// <c>CodeyBox:DiskGuard:Enabled=false</c> to disable.
         /// </summary>
         public DiskGuardOptions DiskGuard { get; set; } = new();
 

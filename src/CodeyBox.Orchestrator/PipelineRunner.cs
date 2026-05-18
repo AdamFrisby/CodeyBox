@@ -661,6 +661,15 @@ public sealed class PipelineRunner : IPipelineRunner
                 await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "quota", quotaResetAt: ex.ResetAt);
             }
         }
+        catch (SandboxDiskDeferredException)
+        {
+            // Disk-guard preflight refused a sandbox launch. Re-throw so
+            // OrchestratorService can route this to the same defer-and-requeue
+            // path as the budget cap (audit + disk.deferred webhook +
+            // ScheduleDeferredRequeue). Without this re-throw the catch-all
+            // below would mark the item terminally Failed.
+            throw;
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);
