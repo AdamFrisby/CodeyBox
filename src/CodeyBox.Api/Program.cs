@@ -266,25 +266,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             new BubblewrapSandboxOptions(),
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
             sp.GetService<ITimingStore>()),
-        "multipass" => new MultipassSandboxProvider(
-            // Resolve through IOptionsMonitor so cloud-init / runcmd edits land
-            // on the next VM launch without restart. Sandboxes already running
-            // keep the snapshot they were constructed with.
-            () =>
-            {
-                var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
-                var multipassSandbox = live.MultipassSandbox ?? new MultipassSandboxConfig();
-                return new MultipassSandboxOptions
-                {
-                    ExtraCloudInit = live.MultipassExtraCloudInit,
-                    ExtraRuncmd = live.MultipassExtraRuncmd,
-                    NetworkProfiles = live.SandboxNetworkProfiles,
-                    UseBaselineImages = live.MultipassUseBaselineImages,
-                    CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
-                };
-            },
-            loggerFactory.CreateLogger<MultipassSandboxProvider>(),
-            sp.GetService<ITimingStore>()),
+        "multipass" => BuildMultipass(opts, sp, loggerFactory, startupLog, sp.GetService<ITimingStore>()),
         _ => throw new InvalidOperationException(
             $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, bubblewrap, process"),
     };
@@ -443,6 +425,99 @@ static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env,
     }
     startupLog.LogWarning("Using Process sandbox provider — NO ISOLATION. Dev only.");
     return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
+}
+
+static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServiceProvider sp, ILoggerFactory loggerFactory, ILogger startupLog, ITimingStore? timings)
+{
+    // DiskGuard is resolved once at startup: it captures the state-database
+    // directory (built from opts) which is itself immutable for the process
+    // lifetime. The cloud-init / runcmd / network-profile fields below are
+    // resolved live via IOptionsMonitor on every VM launch.
+    var diskGuard = BuildMultipassDiskGuard(opts, startupLog);
+    var provider = new MultipassSandboxProvider(
+        // Resolve through IOptionsMonitor so cloud-init / runcmd edits land
+        // on the next VM launch without restart. Sandboxes already running
+        // keep the snapshot they were constructed with.
+        () =>
+        {
+            var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+            var multipassSandbox = live.MultipassSandbox ?? new MultipassSandboxConfig();
+            return new MultipassSandboxOptions
+            {
+                ExtraCloudInit = live.MultipassExtraCloudInit,
+                ExtraRuncmd = live.MultipassExtraRuncmd,
+                NetworkProfiles = live.SandboxNetworkProfiles,
+                UseBaselineImages = live.MultipassUseBaselineImages,
+                CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
+                DiskGuard = diskGuard,
+            };
+        },
+        loggerFactory.CreateLogger<MultipassSandboxProvider>(),
+        timings);
+
+    // Startup banner: log free disk for each guarded path so the operator
+    // can see at a glance whether the host is close to the threshold. Mirrors
+    // the existing baseline-image banner pattern.
+    if (diskGuard is not null)
+    {
+        foreach (var (path, freeBytes, threshold) in provider.SampleDiskGuardState())
+        {
+            var freeRendered = freeBytes is long b ? FormatBytes(b) : "(unknown)";
+            startupLog.LogInformation(
+                "Multipass disk-guard: {Path} free={FreeBytes} threshold={Threshold}",
+                path, freeRendered, FormatBytes(threshold));
+        }
+    }
+
+    return provider;
+}
+
+static MultipassDiskGuardOptions? BuildMultipassDiskGuard(CodeyBoxOptions opts, ILogger startupLog)
+{
+    var cfg = opts.DiskGuard;
+    if (cfg is null || !cfg.Enabled) return null;
+    if (cfg.MinFreeBytes <= 0)
+    {
+        startupLog.LogWarning(
+            "CodeyBox:DiskGuard:MinFreeBytes={MinFreeBytes} is non-positive; disabling disk-guard preflight",
+            cfg.MinFreeBytes);
+        return null;
+    }
+
+    TimeSpan recheck = TimeSpan.FromMinutes(5);
+    if (!string.IsNullOrWhiteSpace(cfg.RecheckIn))
+    {
+        if (!TimeSpan.TryParse(cfg.RecheckIn, out recheck) || recheck <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:DiskGuard:RecheckIn '{cfg.RecheckIn}' must be a positive TimeSpan (e.g. '00:05:00').");
+    }
+
+    // Auto-include the state-database directory so a write-side ENOSPC is
+    // caught by the preflight before it surfaces as SQLITE_FULL.
+    var extras = new List<string>(cfg.AdditionalPaths);
+    if (!string.IsNullOrWhiteSpace(opts.StateDatabasePath))
+    {
+        var dbDir = Path.GetDirectoryName(opts.StateDatabasePath);
+        if (!string.IsNullOrEmpty(dbDir) && !extras.Contains(dbDir, StringComparer.Ordinal))
+            extras.Add(dbDir);
+    }
+
+    return new MultipassDiskGuardOptions
+    {
+        MinFreeBytes = cfg.MinFreeBytes,
+        MultipassDataPath = cfg.MultipassDataPath,
+        RecheckIn = recheck,
+        AdditionalPaths = extras,
+    };
+}
+
+static string FormatBytes(long bytes)
+{
+    const double gib = 1024d * 1024 * 1024;
+    const double mib = 1024d * 1024;
+    if (bytes >= gib) return $"{bytes / gib:F2} GiB";
+    if (bytes >= mib) return $"{bytes / mib:F2} MiB";
+    return $"{bytes:N0} B";
 }
 
 // --- Git host ----------------------------------------------------------------
@@ -1482,7 +1557,25 @@ app.MapGet("/quota", async (
 
 app.MapGet("/events/schema", () => Results.Ok(EventSchema.GetSchema()));
 
-app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
+{
+    // Surface free-disk metrics for each path the disk-guard monitors so
+    // dashboards can alert before the orchestrator starts deferring or the
+    // state store hits SQLITE_FULL. Only emitted for the multipass provider
+    // (the only one that exposes a guard today); other providers report an
+    // empty list, preserving the previous response shape on a best-effort
+    // basis.
+    object[] disk = sandboxes is MultipassSandboxProvider mp
+        ? mp.SampleDiskGuardState().Select(s => (object)new
+        {
+            path = s.Path,
+            freeBytes = s.FreeBytes,
+            thresholdBytes = s.ThresholdBytes,
+            belowThreshold = s.FreeBytes is long b && b < s.ThresholdBytes,
+        }).ToArray()
+        : [];
+    return Results.Ok(new { status = "ok", disk });
+});
 
 try
 {
@@ -1692,6 +1785,15 @@ namespace CodeyBox.Api
         public bool MultipassUseBaselineImages { get; set; } = false;
 
         /// <summary>
+        /// Disk-guard preflight configuration. When set, every
+        /// <c>MultipassSandboxProvider.CreateAsync</c> call checks free space
+        /// on the configured mounts and defers the work item (same machinery
+        /// as the budget cap) when any mount is below the threshold. Null
+        /// (default) disables the preflight, preserving legacy behaviour.
+        /// </summary>
+        public DiskGuardOptions DiskGuard { get; set; } = new();
+
+        /// <summary>
         /// Outbound webhook endpoints. Empty list disables webhooks entirely.
         /// Each entry configures one HTTPS target that receives pipeline events.
         /// </summary>
@@ -1784,6 +1886,49 @@ namespace CodeyBox.Api
         public string PeriodicCheckInterval { get; set; } = "00:05:00";
         public string ClockDriftSafetyMargin { get; set; } = "00:02:00";
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+    }
+
+    /// <summary>
+    /// Disk-guard preflight configuration. Bound from <c>CodeyBox:DiskGuard</c>.
+    /// </summary>
+    public sealed class DiskGuardOptions
+    {
+        /// <summary>
+        /// Master switch. Default true so a stock deployment refuses to launch
+        /// new sandboxes when the host is out of disk; set false to disable
+        /// the preflight entirely (e.g. on a development laptop where the
+        /// staging path lives on a small partition).
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Minimum free bytes per monitored mount. Below this the provider
+        /// throws <c>SandboxDiskDeferredException</c> and the orchestrator
+        /// reschedules the pickup. Default 10 GiB.
+        /// </summary>
+        public long MinFreeBytes { get; set; } = 10L * 1024 * 1024 * 1024;
+
+        /// <summary>
+        /// Path under which Multipass stores VM images. Default matches the
+        /// snap install. Override for non-snap installs or custom data
+        /// directories.
+        /// </summary>
+        public string MultipassDataPath { get; set; } = "/var/snap/multipass/common/data";
+
+        /// <summary>
+        /// Recheck delay before retrying a deferred work item. Defaults to
+        /// 5 minutes. Same form as other TimeSpan options
+        /// (<c>hh:mm:ss</c>).
+        /// </summary>
+        public string RecheckIn { get; set; } = "00:05:00";
+
+        /// <summary>
+        /// Extra paths to check in addition to <see cref="MultipassDataPath"/>.
+        /// The wiring code automatically adds the state-database directory so
+        /// SQLite writes won't be the first thing to ENOSPC on a host whose
+        /// /var/lib/codeybox lives on a different volume.
+        /// </summary>
+        public List<string> AdditionalPaths { get; set; } = [];
     }
 
     public sealed class ShutdownOptions
