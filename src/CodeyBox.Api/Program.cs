@@ -433,7 +433,7 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
     // directory (built from opts) which is itself immutable for the process
     // lifetime. The cloud-init / runcmd / network-profile fields below are
     // resolved live via IOptionsMonitor on every VM launch.
-    var diskGuard = BuildMultipassDiskGuard(opts, startupLog);
+    var diskGuard = MultipassDiskGuardConfig.Build(opts, startupLog);
     var provider = new MultipassSandboxProvider(
         // Resolve through IOptionsMonitor so cloud-init / runcmd edits land
         // on the next VM launch without restart. Sandboxes already running
@@ -476,45 +476,6 @@ static void LogDiskGuardBanner(IDiskGuardedSandboxProvider provider, ILogger sta
             "Disk-guard: {Path} free={FreeBytes} threshold={Threshold}",
             sample.Path, freeRendered, FormatBytes(sample.ThresholdBytes));
     }
-}
-
-static MultipassDiskGuardOptions? BuildMultipassDiskGuard(CodeyBoxOptions opts, ILogger startupLog)
-{
-    var cfg = opts.DiskGuard;
-    if (cfg is null || !cfg.Enabled) return null;
-    if (cfg.MinFreeBytes <= 0)
-    {
-        startupLog.LogWarning(
-            "CodeyBox:DiskGuard:MinFreeBytes={MinFreeBytes} is non-positive; disabling disk-guard preflight",
-            cfg.MinFreeBytes);
-        return null;
-    }
-
-    TimeSpan recheck = TimeSpan.FromMinutes(5);
-    if (!string.IsNullOrWhiteSpace(cfg.RecheckIn))
-    {
-        if (!TimeSpan.TryParse(cfg.RecheckIn, out recheck) || recheck <= TimeSpan.Zero)
-            throw new InvalidOperationException(
-                $"CodeyBox:DiskGuard:RecheckIn '{cfg.RecheckIn}' must be a positive TimeSpan (e.g. '00:05:00').");
-    }
-
-    // Auto-include the state-database directory so a write-side ENOSPC is
-    // caught by the preflight before it surfaces as SQLITE_FULL.
-    var extras = new List<string>(cfg.AdditionalPaths);
-    if (!string.IsNullOrWhiteSpace(opts.StateDatabasePath))
-    {
-        var dbDir = Path.GetDirectoryName(opts.StateDatabasePath);
-        if (!string.IsNullOrEmpty(dbDir) && !extras.Contains(dbDir, StringComparer.Ordinal))
-            extras.Add(dbDir);
-    }
-
-    return new MultipassDiskGuardOptions
-    {
-        MinFreeBytes = cfg.MinFreeBytes,
-        MultipassDataPath = cfg.MultipassDataPath,
-        RecheckIn = recheck,
-        AdditionalPaths = extras,
-    };
 }
 
 static string FormatBytes(long bytes)
