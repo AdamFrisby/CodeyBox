@@ -93,7 +93,9 @@ public sealed record IterationStartedDetails
 /// <summary>
 /// Details payload for the <c>iteration.completed</c> event. Emitted after
 /// a work or rework iteration successfully produces a commit on the work
-/// branch. Failed iterations surface via <c>work_item.failed</c> instead.
+/// branch. Failed iterations surface via <c>work_item.failed</c> instead —
+/// no <c>success: false</c> variant is fired today, so the absence of this
+/// event paired with a terminal failure event is the signal trackers use.
 /// </summary>
 public sealed record IterationCompletedDetails
 {
@@ -103,7 +105,6 @@ public sealed record IterationCompletedDetails
     /// <summary>Tip of the work branch after the iteration committed; null when not resolvable.</summary>
     public string? CommitSha { get; init; }
     public required long DurationMs { get; init; }
-    public required bool Success { get; init; }
 }
 
 /// <summary>
@@ -180,6 +181,4 @@ public sealed record MergeCompletedDetails
     public required string BaseBranch { get; init; }
     public required string WorkBranch { get; init; }
     public string? MergeSha { get; init; }
-    /// <summary>Conflicted paths that the agent resolved during merge; null when the merge had no conflicts or the host did not track them.</summary>
-    public IReadOnlyList<string>? Conflicts { get; init; }
 }

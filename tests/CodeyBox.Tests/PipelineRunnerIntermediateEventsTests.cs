@@ -92,11 +92,34 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
         Assert.Equal(item.Id.ToString(), completedDetails.WorkItemId);
         Assert.Equal(1, completedDetails.Iteration);
         Assert.Equal(IterationPhase.Work, completedDetails.Phase);
-        Assert.True(completedDetails.Success);
         Assert.True(completedDetails.DurationMs >= 0);
         // commitSha is best-effort but the work phase committed to the work
         // branch — LocalGitHost.ResolveCommitAsync should resolve it.
         Assert.False(string.IsNullOrEmpty(completedDetails.CommitSha));
+    }
+
+    [Fact]
+    public async Task IterationStarted_DispatchedAt_IsBoundedByRunWindow()
+    {
+        // DispatchedAt is the contract field receivers correlate iterations
+        // by — if a regression sets it to default(DateTimeOffset) or item.CreatedAt,
+        // the value will fall outside the [before, after] window.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = BuildPipeline(_workspace, seed, webhooks);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("iter-dispatched.txt", "x\n"));
+
+        var item = MakeItem("feature/iter-dispatched");
+        await tp.Store.CreateAsync(item);
+
+        var before = DateTimeOffset.UtcNow.AddSeconds(-1);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        var after = DateTimeOffset.UtcNow.AddSeconds(1);
+
+        var started = webhooks.Events.First(e => e.Event == "iteration.started");
+        var details = Assert.IsType<IterationStartedDetails>(started.Details);
+        Assert.InRange(details.DispatchedAt, before, after);
     }
 
     [Fact]
@@ -183,8 +206,14 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
         Assert.Single(firstFindings.Findings);
         var f = firstFindings.Findings[0];
         Assert.Equal("force-rework", f.Auditor);
-        Assert.Equal(AuditSeverity.Error.ToString(), f.Severity);
+        // Wire severity is the explicit string from PipelineRunner.ToWireSeverity,
+        // not f.Severity.ToString() — the contract is decoupled from the enum.
+        Assert.Equal("Error", f.Severity);
         Assert.Equal("force rework", f.Title);
+        // Round-trip Description and Location so a Title↔Description swap or a
+        // dropped field would be caught.
+        Assert.Equal("iteration 1 always fails", f.Description);
+        Assert.Equal("src/foo.cs:42", f.Location);
 
         // Rework is the iteration that follows the failing audit. Numbered as
         // iteration+1 (next attempt) — audit 1 fails, then rework iter 2 runs.
@@ -203,7 +232,6 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
         Assert.NotNull(reworkCompleted);
         var reworkCompletedDetails = Assert.IsType<IterationCompletedDetails>(reworkCompleted!.Details);
         Assert.Equal(2, reworkCompletedDetails.Iteration);
-        Assert.True(reworkCompletedDetails.Success);
 
         // Ordering: rework starts only after audit.completed for iter=1 fail.
         var names = webhooks.Events.Select(e => e.Event).ToList();
@@ -283,7 +311,6 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
         Assert.Equal(item.Id.ToString(), completedDetails.WorkItemId);
         Assert.Equal(IterationPhase.Rework, completedDetails.Phase);
         Assert.Equal(1, completedDetails.Iteration);
-        Assert.True(completedDetails.Success);
 
         // No work-phase iteration event must fire — the resume branch is taken
         // because work is skipped (entry == Reworking, PreemptCheckpoint set).
@@ -293,9 +320,10 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
             && d.Phase == IterationPhase.Work);
 
         // Ordering: started precedes completed; both precede merge.completed.
-        var names = webhooks.Events.Select(e => e.Event).ToList();
-        var startedIdx = webhooks.Events.IndexOf(reworkStarted);
-        var completedIdx = webhooks.Events.IndexOf(reworkCompleted);
+        var events = webhooks.Events.ToList();
+        var names = events.Select(e => e.Event).ToList();
+        var startedIdx = events.IndexOf(reworkStarted);
+        var completedIdx = events.IndexOf(reworkCompleted);
         Assert.True(startedIdx < completedIdx);
         Assert.True(completedIdx < IndexOf(names, "merge.completed"));
     }
@@ -412,9 +440,89 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
             _calls++;
             if (_calls == 1)
                 return Task.FromResult(new AuditResult(false, [
-                    new AuditFinding(Name, AuditSeverity.Error, "force rework", "iteration 1 always fails"),
+                    new AuditFinding(Name, AuditSeverity.Error, "force rework", "iteration 1 always fails", "src/foo.cs:42"),
                 ]));
             return Task.FromResult(new AuditResult(true, []));
         }
+    }
+
+    private sealed class MixedSeverityAuditor : IAuditor
+    {
+        public MixedSeverityAuditor(string name) => Name = name;
+        public string Name { get; }
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
+            => Task.FromResult(new AuditResult(true, [
+                new AuditFinding(Name, AuditSeverity.Error, "blocker", "blocking issue"),
+                new AuditFinding(Name, AuditSeverity.Info, "nit", "non-blocking nit"),
+            ]));
+    }
+
+    private sealed class ThrowingWebhookDispatcher : IWebhookDispatcher
+    {
+        public List<string> Captured { get; } = new();
+
+        public Task PublishAsync(WebhookEvent evt, CancellationToken ct)
+        {
+            Captured.Add(evt.Event);
+            // Mimic a real dispatcher that breaks during the intermediate phase.
+            if (evt.Event.StartsWith("iteration.", StringComparison.Ordinal)
+                || evt.Event.StartsWith("audit.", StringComparison.Ordinal)
+                || evt.Event.StartsWith("merge.", StringComparison.Ordinal))
+                throw new InvalidOperationException("dispatcher boom");
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task FindingsCounters_SplitBlockingAndNonBlocking_BySeverity()
+    {
+        // Catches the swap-the-counters or hard-coded-zero regression: with one
+        // Error and one Info finding the counters must come out 1/1 and the
+        // wire payload must include both severities.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = BuildPipeline(_workspace, seed, webhooks,
+            auditors: [new MixedSeverityAuditor("mixed")]);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("mixed-findings.txt", "x\n"));
+
+        var item = MakeItem("feature/mixed-findings");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var findingsEvt = webhooks.Events.First(e => e.Event == "audit.findings.emitted");
+        var details = Assert.IsType<AuditFindingsEmittedDetails>(findingsEvt.Details);
+        Assert.Equal(1, details.Blocking);
+        Assert.Equal(1, details.NonBlocking);
+        Assert.Equal(2, details.Findings.Count);
+        Assert.Contains(details.Findings, f => f.Severity == "Error");
+        Assert.Contains(details.Findings, f => f.Severity == "Info");
+    }
+
+    [Fact]
+    public async Task DispatcherThrows_PipelineStillCompletes()
+    {
+        // Pin the fire-and-forget contract: PipelineRunner.TryPublishEventAsync
+        // must swallow dispatcher exceptions for non-cancellation paths. A
+        // regression that removed the try/catch would surface as random
+        // pipeline failures whenever the dispatcher misbehaves.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new ThrowingWebhookDispatcher();
+        using var tp = BuildPipeline(_workspace, seed, webhooks);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("throwing-dispatcher.txt", "x\n"));
+
+        var item = MakeItem("feature/throwing-dispatcher");
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalState = (await tp.Store.GetAsync(item.Id, CancellationToken.None))!.State;
+        Assert.Equal(WorkItemState.Done, finalState);
+        Assert.Contains("iteration.started", webhooks.Captured);
+        Assert.Contains("merge.completed", webhooks.Captured);
     }
 }

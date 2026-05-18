@@ -523,8 +523,7 @@ within a single uninterrupted run.
     "iteration": 1,
     "phase": "work",
     "commitSha": "abc123def456...",
-    "durationMs": 18234,
-    "success": true
+    "durationMs": 18234
   }
 }
 ```
@@ -536,7 +535,12 @@ within a single uninterrupted run.
 | `phase` | string | `"work"` or `"rework"` |
 | `commitSha` | string\|null | Tip of the work branch after the iteration committed; null when the host could not resolve it |
 | `durationMs` | int | Wall-clock duration from `iteration.started` to this event |
-| `success` | bool | `true` when the iteration produced a commit. Failed iterations surface via `work_item.failed` and do not fire this event today. |
+
+The event is emitted only when the iteration produced a commit. Failed
+iterations surface via `work_item.failed`; trackers correlating
+`iteration.started` with `iteration.completed` should treat the absence of
+a `.completed` partner — paired with a terminal failure event — as the
+"iteration failed" signal.
 
 ### `audit.started` details
 
@@ -614,6 +618,11 @@ findings — receivers can use it as a "this iteration emitted no comments" sign
 | `verdict` | string | `"pass"` when no blocking findings; `"fail"` when blocking findings drove rework or the final-iteration failure |
 | `durationMs` | int | Wall-clock duration from `audit.started` to this event |
 
+As with `iteration.completed`, `audit.completed` is only emitted when the
+audit phase completes — if the audit phase throws (timeout, agent crash,
+host shutdown) the matching `audit.started` will have no partner event;
+trackers should rely on the terminal failure event to close the iteration.
+
 ### `merge.started` details
 
 ```json
@@ -634,8 +643,7 @@ findings — receivers can use it as a "this iteration emitted no comments" sign
     "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "baseBranch": "main",
     "workBranch": "codeybox/a1b2c3d4",
-    "mergeSha": "abc123def456...",
-    "conflicts": null
+    "mergeSha": "abc123def456..."
   }
 }
 ```
@@ -646,7 +654,10 @@ findings — receivers can use it as a "this iteration emitted no comments" sign
 | `baseBranch` | string | Branch the work branch was merged into |
 | `workBranch` | string | The merged feature branch |
 | `mergeSha` | string\|null | Resulting merge commit on the work branch |
-| `conflicts` | string[]\|null | Conflicted paths the agent resolved; currently always `null` (reserved for future surface) |
+
+If the merge phase throws (agent failure, host shutdown), the matching
+`merge.started` will have no partner event; trackers should rely on the
+terminal failure event in the same way as for the iteration/audit phases.
 
 ---
 
