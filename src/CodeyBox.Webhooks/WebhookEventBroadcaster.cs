@@ -26,9 +26,11 @@ public sealed class WebhookEventBroadcaster
     /// <summary>
     /// When true, every <see cref="Publish"/> runs <see cref="EventSchema.ValidateEnvelope"/>
     /// and throws on a missing required field. Off by default so production never
-    /// observes the cost; tests set it to fail fast on schema drift.
+    /// observes the cost; tests set it to fail fast on schema drift. Internal +
+    /// <c>InternalsVisibleTo("CodeyBox.Tests")</c> so a loaded plugin assembly
+    /// cannot flip it on at runtime.
     /// </summary>
-    public static bool StrictSchemaValidationForTests { get; set; }
+    internal static bool StrictSchemaValidationForTests { get; set; }
 
     /// <summary>Test-only hook: count of live subscribers.</summary>
     internal int SubscriberCount { get { lock (_lock) return _subscribers.Count; } }

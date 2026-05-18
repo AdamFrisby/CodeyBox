@@ -32,22 +32,22 @@ public static class EventSchema
 
     private static IReadOnlyDictionary<string, FieldSchema> BuildEnvelope() => new Dictionary<string, FieldSchema>
     {
-        ["eventSchemaVersion"] = new("string", "Semver schema version this payload conforms to.", "1.0"),
-        ["eventType"] = new("string", "Stable event identifier. Identical to legacy `event`.", "1.0"),
-        ["emittedAt"] = new("string", "ISO-8601 UTC timestamp at the moment the event left the pipeline.", "1.0"),
-        ["event"] = new("string", "Legacy alias of `eventType`, retained for backwards compatibility.", "1.0"),
-        ["occurredAt"] = new("string", "ISO-8601 UTC wall-clock time the event was generated.", "1.0"),
-        ["workItem"] = new("object|null", "Work-item context; null for queue/agent/sandbox-level events.", "1.0"),
-        ["project"] = new("object|null", "Project context; null for non-project-scoped events.", "1.0"),
-        ["release"] = new("object|null", "Release context; populated only for `release.*` events.", "1.0"),
-        ["details"] = new("object|null", "Event-specific payload. Shape depends on `eventType`.", "1.0"),
-        ["usage"] = new("object|null", "Token usage / cost for the most recent iteration. Omitted when unavailable.", "1.0"),
-        ["usageTotal"] = new("object|null", "Cumulative token usage / cost across every iteration. Omitted when unavailable.", "1.0"),
+        ["eventSchemaVersion"] = new("string", "Semver schema version this payload conforms to.", CurrentVersion),
+        ["eventType"] = new("string", "Stable event identifier. Identical to legacy `event`.", CurrentVersion),
+        ["emittedAt"] = new("string", "ISO-8601 UTC timestamp at the moment the event left the pipeline.", CurrentVersion),
+        ["event"] = new("string", "Legacy alias of `eventType`, retained for backwards compatibility.", CurrentVersion),
+        ["occurredAt"] = new("string", "ISO-8601 UTC wall-clock time the event was generated.", CurrentVersion),
+        ["workItem"] = new("object|null", "Work-item context; null for queue/agent/sandbox-level events.", CurrentVersion),
+        ["project"] = new("object|null", "Project context; null for non-project-scoped events.", CurrentVersion),
+        ["release"] = new("object|null", "Release context; populated only for `release.*` events.", CurrentVersion),
+        ["details"] = new("object|null", "Event-specific payload. Shape depends on `eventType`.", CurrentVersion),
+        ["usage"] = new("object|null", "Token usage / cost for the most recent iteration. Omitted when unavailable.", CurrentVersion),
+        ["usageTotal"] = new("object|null", "Cumulative token usage / cost across every iteration. Omitted when unavailable.", CurrentVersion),
     };
 
     private static IReadOnlyDictionary<string, EventTypeSchema> BuildEventTypes()
         => KnownEventTypes
-            .Select(name => new KeyValuePair<string, EventTypeSchema>(name, new EventTypeSchema("1.0")))
+            .Select(name => new KeyValuePair<string, EventTypeSchema>(name, new EventTypeSchema(CurrentVersion)))
             .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
 
     /// <summary>
@@ -115,24 +115,20 @@ public static class EventSchema
         "release.sync_conflict",
     ];
 
-    private static readonly HashSet<string> KnownEventTypeSet = new(KnownEventTypes, StringComparer.Ordinal);
-
-    /// <summary>True when <paramref name="eventType"/> is enumerated in <see cref="KnownEventTypes"/>.</summary>
-    public static bool IsKnownEventType(string eventType)
-        => eventType is not null && KnownEventTypeSet.Contains(eventType);
-
     /// <summary>
     /// Validates that an event payload carries the three required envelope
     /// fields. Used by the test-mode validator to fail fast on schema drift.
     /// Returns null on success; otherwise a human-readable error.
     /// </summary>
-    public static string? ValidateEnvelope(WebhookEvent evt)
+    public static string? ValidateEnvelope(WebhookEvent? evt)
     {
         if (evt is null) return "event is null";
-        if (string.IsNullOrEmpty(evt.EventSchemaVersion))
-            return $"event '{evt.Event}': eventSchemaVersion is required";
+        // eventType is validated first so the per-field error messages can
+        // safely interpolate evt.Event without producing "event '': ...".
         if (string.IsNullOrEmpty(evt.Event))
             return "eventType is required";
+        if (string.IsNullOrEmpty(evt.EventSchemaVersion))
+            return $"event '{evt.Event}': eventSchemaVersion is required";
         if (evt.EmittedAt == default)
             return $"event '{evt.Event}': emittedAt is required";
         return null;

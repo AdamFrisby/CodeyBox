@@ -1,21 +1,20 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
 /// <summary>
 /// Guards against drift between <c>docs/EVENT_SCHEMA.md</c> and the
-/// programmatic <see cref="EventSchema"/>. If a new event type is added to
-/// the code without a matching row in the doc (or vice versa), the
-/// integration test fails fast — that's the cheapest place to catch it.
+/// programmatic <see cref="EventSchema"/>. Drift is checked in both directions:
+/// every entry in <see cref="EventSchema.KnownEventTypes"/> must appear in the
+/// doc, and every row in the doc's event-type table must exist in code. That
+/// way a stale row left over after an event-type removal also fails CI.
 /// </summary>
 public sealed class EventSchemaDocSyncTests
 {
     private static string FindRepoRoot()
     {
-        // Walk up from the assembly directory until we hit the slnx or the
-        // repo .git folder. This is the same trick other tests use to find
-        // checked-in source files without hard-coding paths.
         var dir = AppContext.BaseDirectory;
         while (dir is not null)
         {
@@ -26,13 +25,13 @@ public sealed class EventSchemaDocSyncTests
         throw new InvalidOperationException("Could not locate repo root from " + AppContext.BaseDirectory);
     }
 
+    private static string ReadDoc() =>
+        File.ReadAllText(Path.Combine(FindRepoRoot(), "docs", "EVENT_SCHEMA.md"));
+
     [Fact]
     public void Doc_MentionsEveryKnownEventType()
     {
-        var docPath = Path.Combine(FindRepoRoot(), "docs", "EVENT_SCHEMA.md");
-        Assert.True(File.Exists(docPath), "docs/EVENT_SCHEMA.md must exist");
-
-        var doc = File.ReadAllText(docPath);
+        var doc = ReadDoc();
         foreach (var name in EventSchema.KnownEventTypes)
         {
             Assert.True(
@@ -42,10 +41,31 @@ public sealed class EventSchemaDocSyncTests
     }
 
     [Fact]
+    public void Doc_DoesNotMentionEventTypesThatNoLongerExist()
+    {
+        // Reverse direction: parse the event-types table in the doc and assert
+        // every name resolves to a KnownEventTypes entry. Catches stale rows
+        // that linger after an event is removed from code.
+        var doc = ReadDoc();
+        var known = new HashSet<string>(EventSchema.KnownEventTypes, StringComparer.Ordinal);
+
+        // The table rows are of the form `| `event.type.name` | 1.0 | … |`.
+        // Only event-type rows have a dotted identifier wrapped in backticks
+        // in the first column, so the regex is unambiguous.
+        var rowRegex = new Regex(@"^\|\s*`([a-z][a-z0-9_]*\.[a-z0-9_.]+)`\s*\|", RegexOptions.Multiline);
+        var docTypes = rowRegex.Matches(doc).Select(m => m.Groups[1].Value).ToHashSet(StringComparer.Ordinal);
+
+        Assert.NotEmpty(docTypes);
+        var stale = docTypes.Except(known).ToList();
+        Assert.True(
+            stale.Count == 0,
+            $"docs/EVENT_SCHEMA.md still lists event types that are no longer in EventSchema.KnownEventTypes: {string.Join(", ", stale)}");
+    }
+
+    [Fact]
     public void Doc_DeclaresCurrentSchemaVersion()
     {
-        var docPath = Path.Combine(FindRepoRoot(), "docs", "EVENT_SCHEMA.md");
-        var doc = File.ReadAllText(docPath);
+        var doc = ReadDoc();
         Assert.Contains(EventSchema.CurrentVersion, doc);
     }
 

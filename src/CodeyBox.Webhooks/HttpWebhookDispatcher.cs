@@ -175,12 +175,25 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
             Project: evt.Project is { } proj
                 ? new WebhookProjectPayload(proj.Id.Value, proj.DisplayName, repoUrl ?? "")
                 : null,
+            Release: evt.Release is { } rel ? MapRelease(rel) : null,
             Details: evt.Details,
             Usage: evt.Usage,
             UsageTotal: evt.UsageTotal);
 
         return JsonSerializer.Serialize(payload, JsonOptions);
     }
+
+    private static WebhookReleasePayload MapRelease(Release release) => new(
+        Id: release.Id.ToString(),
+        ProjectId: release.ProjectId.Value,
+        Name: release.Name,
+        State: release.State.ToString(),
+        BranchName: release.BranchName,
+        CreatedAt: release.CreatedAt,
+        ClosedAt: release.ClosedAt,
+        ReleasedAt: release.ReleasedAt,
+        FailedReason: release.FailedReason,
+        TargetTag: release.TargetTag);
 
     private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string? repositoryUrl, AgentKind projectDefaultAgent) => new(
         Id: item.Id.ToString(),
@@ -239,6 +252,7 @@ internal sealed record WebhookPayload(
     DateTimeOffset OccurredAt,
     WebhookWorkItemPayload? WorkItem,
     WebhookProjectPayload? Project,
+    WebhookReleasePayload? Release,
     object? Details,
     WorkItemIterationUsage? Usage,
     WorkItemUsageTotal? UsageTotal);
@@ -262,3 +276,15 @@ internal sealed record WebhookProjectPayload(
     string Id,
     string DisplayName,
     string RepositoryUrl);
+
+internal sealed record WebhookReleasePayload(
+    string Id,
+    string ProjectId,
+    string Name,
+    string State,
+    string? BranchName,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? ClosedAt,
+    DateTimeOffset? ReleasedAt,
+    string? FailedReason,
+    string? TargetTag);

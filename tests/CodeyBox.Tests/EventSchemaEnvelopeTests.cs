@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Webhooks;
@@ -37,20 +36,28 @@ public sealed class EventSchemaEnvelopeTests
         Project = MakeProject(),
     };
 
-    [Fact]
-    public void Payload_CarriesAllThreeRequiredEnvelopeFields()
+    [Theory]
+    [InlineData("queue.paused")]
+    [InlineData("agent.smoke_failed")]
+    [InlineData("sandbox.leak_detected")]
+    [InlineData("project.budget_warning")]
+    [InlineData("work_item.done")]
+    [InlineData("release.published")]
+    public void Payload_CarriesAllThreeRequiredEnvelopeFields(string eventName)
     {
-        var json = HttpWebhookDispatcher.BuildPayload(MakeEvent());
+        // One representative event from each category — a future refactor that
+        // skips BuildPayload for a particular category (e.g. queue.*) gets
+        // caught here rather than only by integration tests.
+        var json = HttpWebhookDispatcher.BuildPayload(MakeEvent(eventName));
         using var doc = JsonDocument.Parse(json);
 
         Assert.True(doc.RootElement.TryGetProperty("eventSchemaVersion", out var version));
         Assert.Equal("1.0", version.GetString());
 
         Assert.True(doc.RootElement.TryGetProperty("eventType", out var type));
-        Assert.Equal("work_item.done", type.GetString());
+        Assert.Equal(eventName, type.GetString());
 
         Assert.True(doc.RootElement.TryGetProperty("emittedAt", out var emitted));
-        // ISO-8601 round-trips through DateTimeOffset.
         Assert.True(DateTimeOffset.TryParse(emitted.GetString(), out _));
     }
 
@@ -81,11 +88,12 @@ public sealed class EventSchemaEnvelopeTests
     }
 
     [Fact]
-    public void Payload_EmittedAtEqualsLegacyOccurredAt_WhenDefaultsApply()
+    public void Payload_EmittedAtAndOccurredAt_RoundTripThroughJson()
     {
-        // Both default to UtcNow at construction — for a freshly built event
-        // they will be very close but not identical. Verify both are ISO-8601
-        // parseable and emittedAt is set.
+        // Both timestamps default to UtcNow at construction; they will be very
+        // close but not tick-identical. Assert each round-trips back to its
+        // source property — the schema-1.0 docs describe them as a stable
+        // alias, not a tick-for-tick guarantee.
         var evt = MakeEvent();
         var json = HttpWebhookDispatcher.BuildPayload(evt);
         using var doc = JsonDocument.Parse(json);
@@ -96,6 +104,32 @@ public sealed class EventSchemaEnvelopeTests
         Assert.Equal(
             evt.OccurredAt,
             DateTimeOffset.Parse(doc.RootElement.GetProperty("occurredAt").GetString()!));
+    }
+
+    [Fact]
+    public void Payload_ReleaseEnvelopeFieldIsSerialised()
+    {
+        // The schema/docs advertise `release` as a top-level envelope field.
+        // BuildPayload must serialise evt.Release so trackers validating
+        // strict-against-schema don't see a missing field on release.* events.
+        var release = new Release
+        {
+            Id = ReleaseId.New(),
+            ProjectId = new ProjectId("proj"),
+            Name = "v1.4.0",
+            State = ReleaseState.Open,
+            BranchName = "release/v1.4.0",
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+        var evt = MakeEvent("release.created") with { Release = release };
+        var json = HttpWebhookDispatcher.BuildPayload(evt);
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.True(doc.RootElement.TryGetProperty("release", out var releaseEl));
+        Assert.Equal(JsonValueKind.Object, releaseEl.ValueKind);
+        Assert.Equal(release.Name, releaseEl.GetProperty("name").GetString());
+        Assert.Equal("Open", releaseEl.GetProperty("state").GetString());
+        Assert.Equal("release/v1.4.0", releaseEl.GetProperty("branchName").GetString());
     }
 
     [Fact]
@@ -151,5 +185,79 @@ public sealed class EventSchemaEnvelopeTests
         var err = EventSchema.ValidateEnvelope(drifted);
         Assert.NotNull(err);
         Assert.Contains("eventSchemaVersion", err);
+    }
+
+    [Fact]
+    public void ValidateEnvelope_ReportsMissingEventType()
+    {
+        // Event is `required` so the only way to land here in production is a
+        // future builder forgetting to forward the event name, or an upstream
+        // string source that resolves to "". Pin both the null and empty cases.
+        var drifted = MakeEvent() with { Event = "" };
+        var err = EventSchema.ValidateEnvelope(drifted);
+        Assert.NotNull(err);
+        Assert.Contains("eventType", err);
+    }
+
+    [Fact]
+    public void ValidateEnvelope_ReportsNullEvent()
+    {
+        // ValidateEnvelope is a public static — callers can pass null. The
+        // broadcaster's ArgumentNullException.ThrowIfNull means production
+        // never hits this, but pin the contract.
+        var err = EventSchema.ValidateEnvelope(null);
+        Assert.NotNull(err);
+    }
+
+    [Fact]
+    public void Publish_StrictMode_ThrowsWhenEnvelopeIsInvalid()
+    {
+        // The strict-mode safeguard itself needs a guard — a future refactor
+        // that demotes the throw to a log call must fail CI here.
+        var broadcaster = new WebhookEventBroadcaster();
+        var bad = MakeEvent() with { EventSchemaVersion = "" };
+
+        var prev = WebhookEventBroadcaster.StrictSchemaValidationForTests;
+        WebhookEventBroadcaster.StrictSchemaValidationForTests = true;
+        try
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() => broadcaster.Publish(bad));
+            Assert.Contains("eventSchemaVersion", ex.Message);
+        }
+        finally
+        {
+            WebhookEventBroadcaster.StrictSchemaValidationForTests = prev;
+        }
+    }
+
+    [Fact]
+    public async Task SsePayload_CarriesAllThreeRequiredEnvelopeFields()
+    {
+        // SSE reuses HttpWebhookDispatcher.BuildPayload today, but a future
+        // refactor that introduces a separate builder must not silently strip
+        // the envelope. Drive the broadcaster end-to-end via Subscribe/Publish
+        // and assert the envelope on the materialised event.
+        var broadcaster = new WebhookEventBroadcaster();
+        await using var subscription = broadcaster.Subscribe(new SubscriptionFilter(), lastEventId: null);
+
+        var evt = MakeEvent("work_item.audit_iteration");
+        broadcaster.Publish(evt);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        BroadcastedEvent? received = null;
+        await foreach (var b in subscription.ReadAsync(cts.Token))
+        {
+            received = b;
+            break;
+        }
+        Assert.NotNull(received);
+
+        // Same builder the SSE WriteEventAsync calls — if it's ever replaced
+        // by an SSE-specific builder, this assertion must move with it.
+        var json = HttpWebhookDispatcher.BuildPayload(received!.Event);
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("1.0", doc.RootElement.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal("work_item.audit_iteration", doc.RootElement.GetProperty("eventType").GetString());
+        Assert.True(doc.RootElement.TryGetProperty("emittedAt", out _));
     }
 }

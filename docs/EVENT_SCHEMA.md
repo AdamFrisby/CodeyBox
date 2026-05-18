@@ -57,9 +57,12 @@ Every webhook + SSE payload is a JSON object with this shape:
 | `eventType` | string | Stable event identifier, e.g. `work_item.done`. |
 | `emittedAt` | string (ISO-8601 UTC) | Wall-clock time the event left the pipeline. |
 
-`eventType` is identical to the legacy `event` field, and `emittedAt` is
-identical to the legacy `occurredAt` field. Trackers should prefer the new
-names; the legacy names will remain for the lifetime of the `1.x` series.
+`eventType` is identical to the legacy `event` field. `emittedAt` is a stable
+alias of `occurredAt` at schema `1.0` — both are stamped at event construction
+and differ only by the handful of ticks between two `UtcNow` reads. The names
+are kept separate so future minor versions can differentiate "generated" from
+"emitted" without a breaking rename. Trackers should prefer the new names; the
+legacy names will remain for the lifetime of the `1.x` series.
 
 ### Context fields
 
@@ -189,9 +192,12 @@ def handle(headers, body_bytes):
 ## Validating during development
 
 `EventSchema.ValidateEnvelope(WebhookEvent)` (in `CodeyBox.Webhooks`) is the
-test-mode validator. It is invoked by `EnvelopeFieldsAreAlwaysPopulatedTests`
-across every code path that constructs a `WebhookEvent` to fail fast on
-schema drift in CI.
+test-mode validator. The test-assembly module initialiser in
+`tests/CodeyBox.Tests/TestAssemblyInitializer.cs` flips
+`WebhookEventBroadcaster.StrictSchemaValidationForTests = true`, which routes
+every event published through `BroadcastingWebhookDispatcher` past the
+validator. The direct unit tests in `tests/CodeyBox.Tests/EventSchemaEnvelopeTests.cs`
+pin the envelope contract and exercise each ValidateEnvelope branch.
 
 If you add a new event type, follow this checklist:
 

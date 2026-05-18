@@ -26,10 +26,13 @@ public sealed record WebhookEvent
     public DateTimeOffset OccurredAt { get; init; } = DateTimeOffset.UtcNow;
 
     /// <summary>
-    /// ISO-8601 UTC timestamp set when the event leaves the pipeline. Identical
-    /// to <see cref="OccurredAt"/> in this version — kept as a distinct envelope
+    /// ISO-8601 UTC timestamp on the envelope. At schema 1.0 the default value
+    /// is a separate <c>DateTimeOffset.UtcNow</c> read taken at construction —
+    /// it is a stable alias of <see cref="OccurredAt"/> in practice but the
+    /// two reads can differ by a handful of ticks. Kept as a distinct envelope
     /// field so future versions can differentiate generation vs. emission time
-    /// without a breaking rename.
+    /// without a breaking rename; a dispatcher that wants a true "leaves the
+    /// pipeline" stamp can override it explicitly at publish time.
     /// </summary>
     public DateTimeOffset EmittedAt { get; init; } = DateTimeOffset.UtcNow;
 
