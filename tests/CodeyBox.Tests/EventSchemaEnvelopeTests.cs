@@ -210,6 +210,21 @@ public sealed class EventSchemaEnvelopeTests
     }
 
     [Fact]
+    public void ValidateEnvelope_RejectsUnknownEventType()
+    {
+        // Strict-mode guard against the "/events/schema advertises a closed set
+        // of event types, but a new emit site forgets to update the list" hazard
+        // documented on EventSchema.ValidateEnvelope. An emitter that ships a
+        // typo (or simply forgets to register a new event) must fail CI before
+        // it ever reaches a downstream tracker that has cached the schema.
+        var drifted = MakeEvent("work_item.frobnicate");
+        var err = EventSchema.ValidateEnvelope(drifted);
+        Assert.NotNull(err);
+        Assert.Contains("work_item.frobnicate", err);
+        Assert.Contains("KnownEventTypes", err);
+    }
+
+    [Fact]
     public void Publish_StrictMode_ThrowsWhenEnvelopeIsInvalid()
     {
         // The strict-mode safeguard itself needs a guard — a future refactor

@@ -34,7 +34,7 @@ public static class EventSchema
     {
         ["eventSchemaVersion"] = new("string", "Semver schema version this payload conforms to.", CurrentVersion),
         ["eventType"] = new("string", "Stable event identifier. Identical to legacy `event`.", CurrentVersion),
-        ["emittedAt"] = new("string", "ISO-8601 UTC timestamp at the moment the event left the pipeline.", CurrentVersion),
+        ["emittedAt"] = new("string", "ISO-8601 UTC timestamp stamped at event construction. Alias of `occurredAt` at schema 1.0; reserved for differentiation from `occurredAt` in a future minor bump.", CurrentVersion),
         ["event"] = new("string", "Legacy alias of `eventType`, retained for backwards compatibility.", CurrentVersion),
         ["occurredAt"] = new("string", "ISO-8601 UTC wall-clock time the event was generated.", CurrentVersion),
         ["workItem"] = new("object|null", "Work-item context; null for queue/agent/sandbox-level events.", CurrentVersion),
@@ -117,8 +117,13 @@ public static class EventSchema
 
     /// <summary>
     /// Validates that an event payload carries the three required envelope
-    /// fields. Used by the test-mode validator to fail fast on schema drift.
-    /// Returns null on success; otherwise a human-readable error.
+    /// fields and that <c>evt.Event</c> is one of <see cref="KnownEventTypes"/>.
+    /// Used by the test-mode validator to fail fast on schema drift — a new
+    /// event name added at an emit site without a matching entry in
+    /// <see cref="KnownEventTypes"/> would otherwise ship without breaking any
+    /// test even though <c>GET /events/schema</c> tells trackers the new name
+    /// does not exist. Returns null on success; otherwise a human-readable
+    /// error.
     /// </summary>
     public static string? ValidateEnvelope(WebhookEvent? evt)
     {
@@ -131,8 +136,13 @@ public static class EventSchema
             return $"event '{evt.Event}': eventSchemaVersion is required";
         if (evt.EmittedAt == default)
             return $"event '{evt.Event}': emittedAt is required";
+        if (!KnownEventTypesSet.Contains(evt.Event))
+            return $"event '{evt.Event}': eventType is not in EventSchema.KnownEventTypes — add it to the list (and docs/EVENT_SCHEMA.md) or fix the emit-site spelling";
         return null;
     }
+
+    private static readonly HashSet<string> KnownEventTypesSet =
+        new(KnownEventTypes, StringComparer.Ordinal);
 }
 
 public sealed record EventSchemaDocument(

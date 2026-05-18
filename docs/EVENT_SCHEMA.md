@@ -55,7 +55,7 @@ Every webhook + SSE payload is a JSON object with this shape:
 |---|---|---|
 | `eventSchemaVersion` | string (semver) | Schema version this payload conforms to. |
 | `eventType` | string | Stable event identifier, e.g. `work_item.done`. |
-| `emittedAt` | string (ISO-8601 UTC) | Wall-clock time the event left the pipeline. |
+| `emittedAt` | string (ISO-8601 UTC) | Stamped at event construction. Alias of `occurredAt` at schema `1.0`; reserved for differentiation from `occurredAt` in a future minor bump. |
 
 `eventType` is identical to the legacy `event` field. `emittedAt` is a stable
 alias of `occurredAt` at schema `1.0` — both are stamped at event construction
