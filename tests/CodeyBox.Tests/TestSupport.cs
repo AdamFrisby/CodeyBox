@@ -91,7 +91,8 @@ internal static class TestSupport
         ISandboxProvider? sandboxProvider = null,
         bool graphicalSandbox = false,
         ProjectNetworkProfiles? networkProfiles = null,
-        ICredentialProvider? credentials = null)
+        ICredentialProvider? credentials = null,
+        IProjectRepository? projectRepository = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -115,7 +116,7 @@ internal static class TestSupport
             AuditTypes = auditTypes,
             MaxLlmAuditorParallelism = maxLlmAuditorParallelism,
         };
-        var projects = new InMemoryProjectRepository(new Project
+        var defaultProject = new Project
         {
             Id = new ProjectId("test-project"),
             DisplayName = "Test Project",
@@ -128,7 +129,8 @@ internal static class TestSupport
             NetworkProfiles = networkProfiles ?? new ProjectNetworkProfiles(),
             Upstream = upstream ?? ProjectUpstream.Noop,
             Audit = audit,
-        });
+        };
+        var projects = projectRepository ?? new InMemoryProjectRepository(defaultProject);
 
         var presetCatalog = presetCatalogOverride ?? new ScriptedAuditorCatalog(auditorList);
         var composer = new ProjectAuditorComposer(presetCatalog);

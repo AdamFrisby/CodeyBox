@@ -4,6 +4,47 @@ All CodeyBox configuration lives under the `CodeyBox` key in any standard
 .NET configuration provider (`appsettings.json`, environment variables,
 `CODEYBOX_EXTRA_CONFIG`, etc.).
 
+## Hot-reload
+
+CodeyBox uses the standard .NET configuration stack with `reloadOnChange: true`
+on every JSON source (including `CODEYBOX_EXTRA_CONFIG`). An edit to a
+configuration file is debounced by the framework's file watcher (~1 s) and
+then bound atomically; consumers wired through `IOptionsMonitor<T>` see the
+new value on the next read.
+
+Hot-reloadable today:
+
+- `Projects` — adding a new project takes effect on the next pickup. Removing
+  a project that still has non-terminal work items is **rejected** by an
+  `IValidateOptions<ProjectsOptions>` and the prior project list is retained;
+  the repository keeps its own last-good snapshot because rejected options do
+  not invoke its reload callback. The operator sees an `OptionsValidationException`
+  naming the project, and knows to cancel / wait for the in-flight items first.
+- `Projects[].Audit.PerIterationTimeoutMinutes` — the resolved `Project`
+  record is captured once at work-item pickup, so a change mid-iteration
+  does not move the goalposts for an item already running.
+- `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
+  re-read on every reaper sweep.
+- `MultipassExtraRuncmd` / `MultipassExtraCloudInit` / `SandboxNetworkProfiles` /
+  `MultipassUseBaselineImages` — re-read on every sandbox launch. VMs already
+  running keep the snapshot they booted with.
+
+Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
+
+- `SandboxProvider` — switching from `multipass` to `bubblewrap` mid-flight
+  would orphan running sandboxes.
+- `StateDatabasePath`, `GitRootDirectory`, `AgentStreams.Path` — captured by
+  open file/SQLite handles at startup.
+
+For `CodeyBoxOptions`, CodeyBox installs a last-known-good options cache around
+`IOptionsMonitor<CodeyBoxOptions>`. This is CodeyBox policy, not default
+Microsoft.Extensions.Options behavior: the stock monitor cache would throw on
+`CurrentValue` after a rejected reload until another change token fires.
+
+A field that is *neither* hot-reloadable nor explicitly guarded continues
+to require a restart in practice (the consumer captured the value at
+startup); we add explicit guards as we tighten the contract.
+
 ---
 
 ## Top-level keys

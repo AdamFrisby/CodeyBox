@@ -22,8 +22,15 @@ public sealed class DeadWorkerReaper : BackgroundService
     private readonly IWorkItemStore _store;
     private readonly ITaskQueue _queue;
     private readonly IWebhookDispatcher? _webhooks;
-    private readonly DeadWorkerOptions _opts;
+    private readonly Func<DeadWorkerOptions> _optsAccessor;
     private readonly ILogger<DeadWorkerReaper> _log;
+
+    // Resolves the current DeadWorkerOptions value on every read so MaxRecoveryAttempts /
+    // DeadWorkerThreshold edits applied via IOptionsMonitor take effect on the next sweep
+    // without restarting CodeyBox. PeriodicTimer's interval is fixed at construction so
+    // changes to CheckInterval are picked up by the next timer (i.e. next restart) — that
+    // limitation is documented on CheckInterval itself.
+    private DeadWorkerOptions _opts => _optsAccessor();
 
     public DeadWorkerReaper(
         IWorkerRegistry registry,
@@ -32,11 +39,20 @@ public sealed class DeadWorkerReaper : BackgroundService
         DeadWorkerOptions opts,
         ILogger<DeadWorkerReaper> log,
         IWebhookDispatcher? webhooks = null)
+        : this(registry, store, queue, () => opts, log, webhooks) { }
+
+    public DeadWorkerReaper(
+        IWorkerRegistry registry,
+        IWorkItemStore store,
+        ITaskQueue queue,
+        Func<DeadWorkerOptions> optionsAccessor,
+        ILogger<DeadWorkerReaper> log,
+        IWebhookDispatcher? webhooks = null)
     {
         _registry = registry;
         _store = store;
         _queue = queue;
-        _opts = opts;
+        _optsAccessor = optionsAccessor;
         _log = log;
         _webhooks = webhooks;
     }

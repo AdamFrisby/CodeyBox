@@ -38,10 +38,13 @@ var builder = WebApplication.CreateBuilder(args);
 // operator-side configuration (e.g. dev/test setups in a gitignored
 // local/ directory) layer on top of the committed appsettings.json
 // without copying files into the API project. Loaded LAST so it wins.
+// reloadOnChange:true so an operator can edit this file without restarting
+// CodeyBox — IOptionsMonitor<T> consumers will observe the new values within
+// the framework's debounce window (~1 s).
 {
     var extra = Environment.GetEnvironmentVariable("CODEYBOX_EXTRA_CONFIG");
     if (!string.IsNullOrEmpty(extra))
-        builder.Configuration.AddJsonFile(extra, optional: false, reloadOnChange: false);
+        builder.Configuration.AddJsonFile(extra, optional: false, reloadOnChange: true);
 }
 
 // Default to loopback-only. Operators putting a TLS-terminating reverse
@@ -166,8 +169,36 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 }
 
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
-builder.Services.AddSingleton<IOptions<ProjectsOptions>>(_ =>
-    Options.Create(ProjectsOptionsBinder.Bind(builder.Configuration.GetSection("CodeyBox"))));
+// Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
+// is wired into the framework's reload pipeline. PostConfigure layers our custom
+// map-shaped binding (audit-type / language overrides / profile inheritance) on
+// top of the framework's section.Bind() — these dictionaries don't bind from the
+// standard Bind() path because their keys are dynamic JSON property names. On
+// reload, both run again automatically.
+builder.Services.AddOptions<ProjectsOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox"))
+    .PostConfigure(opts => ProjectsOptionsBinder.ApplyCustomMaps(opts, builder.Configuration.GetSection("CodeyBox")));
+
+// Immutable-field guard for CodeyBoxOptions. The startup snapshot is bound from
+// IConfiguration when the service provider resolves it, after test/host
+// ConfigureAppConfiguration hooks have had a chance to add their final sources.
+// The retaining monitor cache is deliberate: stock IOptionsMonitor drops its
+// prior cached value before validating a reload candidate, so a rejected edit
+// would make CurrentValue throw until the next successful reload.
+builder.Services.AddSingleton(sp => new CodeyBoxOptionsStartupSnapshot(
+    sp.GetRequiredService<IConfiguration>().GetSection("CodeyBox").Get<CodeyBoxOptions>()
+    ?? new CodeyBoxOptions()));
+builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
+    sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
+        sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
+builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
+    sp => new ImmutableCodeyBoxOptionsValidator(
+        sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
+
+// Rejects ProjectsOptions reloads that remove a project still holding
+// non-terminal work items. Adding new projects passes cleanly.
+builder.Services.AddSingleton<IValidateOptions<ProjectsOptions>, ProjectsOptionsRemovalValidator>();
+
 builder.Services.Configure<HostOptions>(o =>
 {
     var cbOpts = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
@@ -235,12 +266,19 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
             sp.GetService<ITimingStore>()),
         "multipass" => new MultipassSandboxProvider(
-            new MultipassSandboxOptions
+            // Resolve through IOptionsMonitor so cloud-init / runcmd edits land
+            // on the next VM launch without restart. Sandboxes already running
+            // keep the snapshot they were constructed with.
+            () =>
             {
-                ExtraCloudInit = opts.MultipassExtraCloudInit,
-                ExtraRuncmd = opts.MultipassExtraRuncmd,
-                NetworkProfiles = opts.SandboxNetworkProfiles,
-                UseBaselineImages = opts.MultipassUseBaselineImages,
+                var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+                return new MultipassSandboxOptions
+                {
+                    ExtraCloudInit = live.MultipassExtraCloudInit,
+                    ExtraRuncmd = live.MultipassExtraRuncmd,
+                    NetworkProfiles = live.SandboxNetworkProfiles,
+                    UseBaselineImages = live.MultipassUseBaselineImages,
+                };
             },
             loggerFactory.CreateLogger<MultipassSandboxProvider>(),
             sp.GetService<ITimingStore>()),
@@ -835,7 +873,17 @@ builder.Services.AddSingleton<CredentialSmokeGate>(sp =>
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CredentialSmokeGate>()));
 
 // --- Projects + per-project upstream + audit composer ------------------------
-builder.Services.AddSingleton<IProjectRepository, ProjectRepository>();
+// ProjectRepository observes IOptionsMonitor<ProjectsOptions>, so an
+// appsettings.json edit that adds a new project — or changes an existing
+// project's audit timeout — takes effect within the framework's debounce
+// window (~1 s). The ProjectsOptionsRemovalValidator above rejects edits
+// that drop a project with in-flight work items, so reloads that would
+// strand running pipelines are surfaced as ERR and the prior project list
+// is retained.
+builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
+    sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>(),
+    sp.GetRequiredService<ILogger<ProjectRepository>>(),
+    sp.GetService<PresetCatalogOptions>()));
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(_ =>
 {
@@ -1043,13 +1091,26 @@ builder.Services.AddSingleton<DeadWorkerOptions>(sp =>
     opts.Validate();
     return opts;
 });
-builder.Services.AddSingleton<DeadWorkerReaper>(sp => new DeadWorkerReaper(
-    sp.GetRequiredService<IWorkerRegistry>(),
-    sp.GetRequiredService<IWorkItemStore>(),
-    sp.GetRequiredService<ITaskQueue>(),
-    sp.GetRequiredService<DeadWorkerOptions>(),
-    sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
-    sp.GetRequiredService<IWebhookDispatcher>()));
+builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
+{
+    // Resolve DeadWorkerOptions through the live CodeyBoxOptions monitor on
+    // every sweep. Edits to CodeyBox:DeadWorker:MaxRecoveryAttempts (and
+    // DeadWorkerThreshold) take effect on the next sweep without restart.
+    // CheckInterval is sampled at PeriodicTimer construction so changes
+    // require a restart — documented on the field itself.
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    // Run the same Validate() startup check on the resolved value once so
+    // misconfigured DeadWorkerOptions surfaces here (matches the previous
+    // factory behaviour where DeadWorkerOptions.Validate() ran at resolve time).
+    sp.GetRequiredService<DeadWorkerOptions>();
+    return new DeadWorkerReaper(
+        sp.GetRequiredService<IWorkerRegistry>(),
+        sp.GetRequiredService<IWorkItemStore>(),
+        sp.GetRequiredService<ITaskQueue>(),
+        () => monitor.CurrentValue.DeadWorker,
+        sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
+        sp.GetRequiredService<IWebhookDispatcher>());
+});
 
 // --- Agent cost extractors + calculator ------------------------------------
 builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(sp =>
@@ -1304,6 +1365,10 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>
 preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
 
 var app = builder.Build();
+
+// Force the immutable-options baseline and retaining monitor cache to exist
+// before the host starts observing file-change reloads.
+_ = app.Services.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
 
 app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
 
