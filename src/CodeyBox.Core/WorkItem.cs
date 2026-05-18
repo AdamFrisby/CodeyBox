@@ -41,10 +41,10 @@ public sealed record WorkItem
     public string? AuditorProfile { get; init; }
 
     /// <summary>Wall-clock budget for the work phase (also applied per rework iteration).</summary>
-    public TimeSpan WorkTimeout { get; init; } = TimeSpan.FromMinutes(60);
+    public TimeSpan WorkTimeout { get; init; } = TimeSpan.FromMinutes(240);
 
     /// <summary>Wall-clock budget for the merge phase.</summary>
-    public TimeSpan MergeTimeout { get; init; } = TimeSpan.FromMinutes(15);
+    public TimeSpan MergeTimeout { get; init; } = TimeSpan.FromMinutes(60);
 
     /// <summary>If true and the project has an upstream, push to it after merge.</summary>
     public bool PushUpstream { get; init; } = true;

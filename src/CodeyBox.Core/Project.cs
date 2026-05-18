@@ -334,9 +334,9 @@ public sealed record ProjectAudit
 
     public int MaxIterations { get; init; } = 10;
     public AuditSeverity FailingSeverity { get; init; } = AuditSeverity.Error;
-    // 30 min: see AuditOptions.PerIterationTimeout for the rationale on the bump
-    // from 10 → 30. Project config overrides this when set.
-    public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(30);
+    // 120 min: no audit run has ever genuinely hung; prior 30 min cap clipped large refactors.
+    // Project config overrides this when set.
+    public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(120);
     public bool StopOnFirstFailure { get; init; }
 
     /// <summary>

@@ -306,7 +306,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         // append defaults to project lists, which would be surprising.
         var mergedMaxIter = project?.MaxIterations ?? defaults?.MaxIterations ?? 3;
         var mergedSeverity = AuditSeverityParser.Parse(project?.FailingSeverity ?? defaults?.FailingSeverity);
-        var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 10;
+        var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 120;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
         var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;
         var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ProjectAuditLanguages.Default;
