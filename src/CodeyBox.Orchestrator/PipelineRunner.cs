@@ -1906,7 +1906,7 @@ public sealed class PipelineRunner : IPipelineRunner
             CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
                 new KeyValuePair<string, object?>("iteration", iteration.ToString()));
 
-            await PublishAuditFindingsEmittedAsync(item, project, iteration, findings, blocking.Count, nonBlocking);
+            await PublishAuditFindingsEmittedAsync(item, project, iteration, findings, blocking.Count, nonBlocking, ct);
 
             var iterUsage = await TryGetUsageSummaryAsync(item.Id);
             await _webhooks.PublishAsync(new WebhookEvent
@@ -1922,7 +1922,7 @@ public sealed class PipelineRunner : IPipelineRunner
             }, CancellationToken.None);
 
             var auditVerdict = blocking.Count == 0 ? AuditVerdict.Pass : AuditVerdict.Fail;
-            await PublishAuditCompletedAsync(item, project, iteration, auditVerdict, auditPhaseStart);
+            await PublishAuditCompletedAsync(item, project, iteration, auditVerdict, auditPhaseStart, ct);
 
             if (blocking.Count == 0)
             {
@@ -5058,10 +5058,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private async Task PublishAuditFindingsEmittedAsync(
         WorkItem item, Project project, int iteration,
-        IReadOnlyList<AuditFinding> findings, int blocking, int nonBlocking)
+        IReadOnlyList<AuditFinding> findings, int blocking, int nonBlocking, CancellationToken ct)
     {
         try
         {
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
             var payload = findings.Select(f => new AuditFindingPayload
             {
                 Auditor = f.AuditorName,
@@ -5073,7 +5074,7 @@ public sealed class PipelineRunner : IPipelineRunner
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "audit.findings.emitted",
-                WorkItem = item,
+                WorkItem = current,
                 Project = project,
                 Details = new AuditFindingsEmittedDetails
                 {
@@ -5092,15 +5093,16 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private async Task PublishAuditCompletedAsync(
-        WorkItem item, Project project, int iteration, string verdict, DateTimeOffset startedAt)
+        WorkItem item, Project project, int iteration, string verdict, DateTimeOffset startedAt, CancellationToken ct)
     {
         try
         {
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
             var durationMs = (long)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "audit.completed",
-                WorkItem = item,
+                WorkItem = current,
                 Project = project,
                 Details = new AuditCompletedDetails
                 {

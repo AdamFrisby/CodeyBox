@@ -239,7 +239,87 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
         Assert.False(string.IsNullOrEmpty(completedDetails.MergeSha));
     }
 
+    [Fact]
+    public async Task ResumeFromPreemptRework_EmitsReworkIterationEvents()
+    {
+        // Exercises the resume-preempt-rework branch (PipelineRunner.cs:377-412):
+        // a WorkItem pre-seeded in Reworking state with a PreemptCheckpoint must
+        // still emit iteration.started/completed (Phase=Rework) when picked up.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = BuildPipeline(_workspace, seed, webhooks);
+
+        // Non-default work-branch name keeps the pickup rebase out of the way
+        // (IsPickupRebaseOwnedWorkBranch matches only "codeybox/{id8}").
+        var workBranch = "feature/preempt-rework-events";
+        var item = MakeItem(workBranch) with { State = WorkItemState.Reworking };
+        item = item with { PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}" };
+        await tp.Store.CreateAsync(item);
+        await PushPreemptCheckpointAsync(tp.GitHost, item, seed);
+
+        // One file-write covers the resumed rework run; one for the real merge.
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("resumed-rework.txt", "resumed\n"));
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var reworkStarted = webhooks.Events.FirstOrDefault(e =>
+            e.Event == "iteration.started"
+            && e.Details is IterationStartedDetails d
+            && d.Phase == IterationPhase.Rework);
+        Assert.NotNull(reworkStarted);
+        var startedDetails = Assert.IsType<IterationStartedDetails>(reworkStarted!.Details);
+        Assert.Equal(item.Id.ToString(), startedDetails.WorkItemId);
+        Assert.Equal(IterationPhase.Rework, startedDetails.Phase);
+        // Resume re-bases the rework numbering to 1 — see docs/webhooks.md
+        // "Resumed-after-preempt caveat".
+        Assert.Equal(1, startedDetails.Iteration);
+
+        var reworkCompleted = webhooks.Events.FirstOrDefault(e =>
+            e.Event == "iteration.completed"
+            && e.Details is IterationCompletedDetails d
+            && d.Phase == IterationPhase.Rework);
+        Assert.NotNull(reworkCompleted);
+        var completedDetails = Assert.IsType<IterationCompletedDetails>(reworkCompleted!.Details);
+        Assert.Equal(item.Id.ToString(), completedDetails.WorkItemId);
+        Assert.Equal(IterationPhase.Rework, completedDetails.Phase);
+        Assert.Equal(1, completedDetails.Iteration);
+        Assert.True(completedDetails.Success);
+
+        // No work-phase iteration event must fire — the resume branch is taken
+        // because work is skipped (entry == Reworking, PreemptCheckpoint set).
+        Assert.DoesNotContain(webhooks.Events, e =>
+            e.Event == "iteration.started"
+            && e.Details is IterationStartedDetails d
+            && d.Phase == IterationPhase.Work);
+
+        // Ordering: started precedes completed; both precede merge.completed.
+        var names = webhooks.Events.Select(e => e.Event).ToList();
+        var startedIdx = webhooks.Events.IndexOf(reworkStarted);
+        var completedIdx = webhooks.Events.IndexOf(reworkCompleted);
+        Assert.True(startedIdx < completedIdx);
+        Assert.True(completedIdx < IndexOf(names, "merge.completed"));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private async Task PushPreemptCheckpointAsync(LocalGitHost gitHost, WorkItem item, string seed)
+    {
+        // Mirrors HostShutdownCancellationTests.CreatePreemptCheckpointAsync —
+        // seeds the host bare repo with a checkpoint ref at item.PreemptCheckpoint
+        // so the resume path can `git fetch origin {checkpoint}` and check out
+        // the work branch from it.
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed);
+        var clone = Path.Combine(_workspace, "checkpoint-" + Guid.NewGuid().ToString("N")[..8]);
+        var bare = gitHost.GetRepoPath(repoId);
+        await TestSupport.RunGit(_workspace, "clone", bare, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@example.invalid");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", item.WorkBranch!);
+        await File.WriteAllTextAsync(Path.Combine(clone, "partial-rework.txt"), "partial\n");
+        await TestSupport.RunGit(clone, "add", "-A");
+        await TestSupport.RunGit(clone, "commit", "-m", "checkpoint");
+        await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{item.PreemptCheckpoint}");
+    }
 
     private static int IndexOf(IReadOnlyList<string> names, string name)
     {

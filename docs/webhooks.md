@@ -484,6 +484,16 @@ When audit iteration N produces blocking findings and rework is permitted,
 `iteration = N + 1` (the rework is the "next attempt", evaluated by audit
 iteration N+1). The audit phase events use the audit iteration number directly.
 
+**Resumed-after-preempt caveat.** When a host shutdown preempts a work item
+mid-rework and the item is resumed on a later run, the resumed rework's
+`iteration.started`/`iteration.completed` are emitted with `iteration = 1`,
+regardless of which rework iteration was interrupted. The audit loop also
+restarts at `iteration = 1` on resume, so the numbering stays internally
+consistent within the resumed run — but trackers that dedupe by
+`(workItemId, iteration)` across runs may see iteration numbers go backwards
+across a preempt boundary. Receivers should treat iteration as monotonic only
+within a single uninterrupted run.
+
 ### `iteration.started` details
 
 ```json
