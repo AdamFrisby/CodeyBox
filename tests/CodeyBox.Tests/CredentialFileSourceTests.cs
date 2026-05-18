@@ -80,7 +80,13 @@ public sealed class CredentialFileSourceTests : IDisposable
 
         Assert.NotNull(fresh);
         Assert.Contains("fresh", fresh!);
-        Assert.True(observed.Task.IsCompleted, "TokenUpdated should have fired");
+        // Wait for the event itself rather than asserting IsCompleted: under
+        // load the watcher thread can update the cache (which lets the next
+        // GetRaw short-circuit on matching mtime/length) a beat before it
+        // reaches RaiseTokenUpdated, so the poll above can return "fresh"
+        // while the event is still in flight.
+        var fired = await Task.WhenAny(observed.Task, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.Same(observed.Task, fired);
     }
 
     [Fact]
