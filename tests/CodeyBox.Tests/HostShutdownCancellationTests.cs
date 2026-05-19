@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
 using CodeyBox.Agents;
@@ -53,7 +54,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
     private ShutdownTestHarness BuildPipeline(
         string seedRepoUrl,
         IAgentRunner agent,
-        PipelineOptions? options = null)
+        PipelineOptions? options = null,
+        ILogger<PipelineRunner>? logger = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -85,7 +87,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
             projects, upstreamFactory, composer, store,
             new NullWebhookDispatcher(),
             options ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance);
+            logger ?? NullLogger<PipelineRunner>.Instance);
 
         return new ShutdownTestHarness(pipeline, store, gitHost);
     }
@@ -96,7 +98,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
     public async Task HostShutdown_DoesNotCancelItem_LeavesWorkingState()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var harness = BuildBlockingPipeline(seed);
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var harness = BuildPipeline(seed, new BlockingAgentRunner(), logger: logger);
 
         var item = NewItem();
         await harness.Store.CreateAsync(item);
@@ -118,14 +121,31 @@ public sealed class HostShutdownCancellationTests : IDisposable
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
 
         var final = await harness.Store.GetAsync(item.Id);
+        // (b) item left mid-flight — not Failed, not Cancelled — so the recovery
+        // loop can pick it up on next startup.
         Assert.Equal(WorkItemState.Working, final!.State);
         Assert.Null(final.CancellationReason);
         Assert.NotNull(final.PreemptedAt);
         Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        // (c) auto-retry is NOT triggered for host-shutdown attribution; the
+        // recovery loop owns the item, and bumping TransientCancelRetries here
+        // would race the host going away.
+        Assert.Equal(0, final.TransientCancelRetries);
+        Assert.Null(final.FailureKind);
 
         var showRef = await TestSupport.RunGit(harness.GitHost.GetRepoPath(item.Id.ToString()),
             "show-ref", "--verify", final.PreemptCheckpoint!);
         Assert.Equal(0, showRef.code);
+
+        // (a) the structured boundary log fires with Boundary=RunAsync.host-shutdown
+        // so post-incident triage can correlate the catch site with the source.
+        // A regression that dropped the LogBoundary call (or wired the wrong source)
+        // would surface as a missing entry here.
+        var boundary = Assert.Single(logger.Entries, e =>
+            e.Properties.TryGetValue("Boundary", out var b) && b is string s
+                && s == "RunAsync.host-shutdown");
+        Assert.Equal(CancellationSources.HostShutdown, boundary.Properties["CancellationSource"]);
+        Assert.Equal(true, boundary.Properties["HostShutdown"]);
     }
 
     [Fact]
@@ -171,7 +191,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
     public async Task OperatorCancel_TransitionsItem_ToCancelled_WithReason()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var harness = BuildBlockingPipeline(seed);
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var harness = BuildPipeline(seed, new BlockingAgentRunner(), logger: logger);
 
         var item = NewItem();
         await harness.Store.CreateAsync(item);
@@ -192,8 +213,24 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var final = await harness.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Cancelled, final!.State);
         Assert.Equal(WorkItemCancellationReason.OperatorRequested, final.CancellationReason);
+        // The cancel must be attributed to the operator, not silently reclassified
+        // as a transient/host source — operators rely on this to distinguish their
+        // own DELETE /workitems/{id} action from other cancellation contributors.
+        Assert.Equal(CancellationSources.Operator, final.CancellationSource);
+        // The auto-retry path must not fire on operator cancel; operators don't
+        // want their explicit cancel re-queued.
+        Assert.Equal(0, final.TransientCancelRetries);
         Assert.Null(final.PreemptedAt);
         Assert.Null(final.PreemptCheckpoint);
+
+        // The structured boundary log must be emitted with source=operator so
+        // post-incident triage can correlate the catch site with the source.
+        var boundary = Assert.Single(logger.Entries, e =>
+            e.Properties.TryGetValue("Boundary", out var b) && b is string s
+                && s == "RunAsync.operator-cancel");
+        Assert.Equal(CancellationSources.Operator, boundary.Properties["CancellationSource"]);
+        Assert.Equal(true, boundary.Properties["OperatorRequested"]);
+        Assert.Equal(false, boundary.Properties["HostShutdown"]);
     }
 
     [Fact]

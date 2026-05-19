@@ -86,6 +86,8 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaFailureClassifier _quotaClassifier;
+    private readonly ITaskQueue? _taskQueue;
+    private readonly OrchestratorOptions _orchestratorOptions;
     private readonly string _disabledHostHooksPath;
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
@@ -139,7 +141,9 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentClassRouter? classRouter = null,
         IAgentFallbackHistoryStore? fallbackHistory = null,
         IQuotaFailureClassifier? quotaClassifier = null,
-        IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null)
+        IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
+        ITaskQueue? taskQueue = null,
+        OrchestratorOptions? orchestratorOptions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -191,6 +195,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 .ToDictionary(p => p.Kind);
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
         _questionStore = questionStore;
+        _taskQueue = taskQueue;
+        _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
     }
@@ -335,25 +341,32 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 await Transition(item, WorkItemState.Working, ct, project);
                 string? workAgentStdout = null;
-                using (var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                using (var workPhase = new PhaseCancellation("work", ct))
                 {
-                    workCts.CancelAfter(item.WorkTimeout);
-                    using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, workCts);
+                    workPhase.SetPhaseTimeout(item.WorkTimeout);
+                    workPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
                     // In-iteration quota fallback: if the chosen agent hits quota
                     // mid-flight, swap to the next class member and retry. Audit,
                     // rework, and merge phases are wrapped equivalently below.
                     var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
-                    workAgentStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "work", iteration: null,
-                        async (runner, trialItem) =>
-                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "work", workCts, ct, phaseCt =>
-                                RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                    BuildInitialWorkPrompt(trialItem.Prompt, project.AllowAgentQuestions, auditors), isInitial: true,
-                                    networkProfile: sandboxTarget.NetworkProfile,
-                                    sandboxFlavor: sandboxTarget.Flavor,
-                                    project: project,
-                                    phaseCt,
-                                    hostShutdownToken)),
-                        ct);
+                    try
+                    {
+                        workAgentStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "work", iteration: null,
+                            async (runner, trialItem) =>
+                                await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "work", workPhase, ct, phaseCt =>
+                                    RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
+                                        BuildInitialWorkPrompt(trialItem.Prompt, project.AllowAgentQuestions, auditors), isInitial: true,
+                                        networkProfile: sandboxTarget.NetworkProfile,
+                                        sandboxFlavor: sandboxTarget.Flavor,
+                                        project: project,
+                                        phaseCt,
+                                        hostShutdownToken)),
+                            ct);
+                    }
+                    catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+                    {
+                        throw workPhase.Wrap(oce);
+                    }
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
                 if (resumingPreempt)
@@ -374,23 +387,30 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 await Transition(item, WorkItemState.Reworking, ct, project);
                 string? reworkStdout = null;
-                using (var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                using (var reworkPhase = new PhaseCancellation("rework-resume", ct))
                 {
-                    reworkCts.CancelAfter(item.WorkTimeout);
-                    using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
+                    reworkPhase.SetPhaseTimeout(item.WorkTimeout);
+                    reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
                     var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
-                    reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
-                        async (runner, trialItem) =>
-                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "rework", reworkCts, ct,
-                                phaseCt => RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                    BuildInterruptedReworkResumePrompt(trialItem.Prompt, trialItem.PreemptCheckpoint!),
-                                    isInitial: false,
-                                    networkProfile: sandboxTarget.NetworkProfile,
-                                    sandboxFlavor: sandboxTarget.Flavor,
-                                    project: project,
-                                    phaseCt,
-                                    hostShutdownToken)),
-                        ct);
+                    try
+                    {
+                        reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
+                            async (runner, trialItem) =>
+                                await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "rework", reworkPhase, ct,
+                                    phaseCt => RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
+                                        BuildInterruptedReworkResumePrompt(trialItem.Prompt, trialItem.PreemptCheckpoint!),
+                                        isInitial: false,
+                                        networkProfile: sandboxTarget.NetworkProfile,
+                                        sandboxFlavor: sandboxTarget.Flavor,
+                                        project: project,
+                                        phaseCt,
+                                        hostShutdownToken)),
+                            ct);
+                    }
+                    catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+                    {
+                        throw reworkPhase.Wrap(oce);
+                    }
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
                 await ClearPreemptAsync(item, ct);
@@ -440,19 +460,26 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!skipMerge)
             {
                 await Transition(item, WorkItemState.Merging, ct, project);
-                using (var mergeCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                using (var mergePhase = new PhaseCancellation("merge", ct))
                 {
-                    mergeCts.CancelAfter(item.MergeTimeout);
-                    using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, mergeCts);
-                    (mergeSha, agentStdout) = await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
-                        async (runner, trialItem) =>
-                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergeCts, ct, phaseCt =>
-                                RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                    networkProfile: project.NetworkProfiles.Merge,
-                                    project: project,
-                                    phaseCt,
-                                    hostShutdownToken)),
-                        ct);
+                    mergePhase.SetPhaseTimeout(item.MergeTimeout);
+                    mergePhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+                    try
+                    {
+                        (mergeSha, agentStdout) = await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
+                            async (runner, trialItem) =>
+                                await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergePhase, ct, phaseCt =>
+                                    RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
+                                        networkProfile: project.NetworkProfiles.Merge,
+                                        project: project,
+                                        phaseCt,
+                                        hostShutdownToken)),
+                            ct);
+                    }
+                    catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+                    {
+                        throw mergePhase.Wrap(oce);
+                    }
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
                 await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
@@ -470,42 +497,91 @@ public sealed class PipelineRunner : IPipelineRunner
                 await Transition(item, WorkItemState.Done, ct, project);
             }
         }
+        catch (PhaseCancellationException pex) when (
+            hostShutdownToken.IsCancellationRequested
+            || pex.Source == CancellationSources.HostShutdown)
+        {
+            // Host is shutting down — leave the item in its current mid-flight
+            // state. The recovery loop will reset and re-enqueue it on next startup.
+            PhaseCancellation.LogBoundary(_log, "RunAsync.host-shutdown", pex.Phase, pex.Source,
+                operatorRequested: ct.IsCancellationRequested,
+                hostShutdown: true,
+                exception: pex);
+            _log.LogInformation(
+                "Work item {Id} interrupted by host shutdown in phase '{Phase}' (source={Source}); leaving in mid-flight state for recovery",
+                item.Id, pex.Phase, pex.Source);
+            throw;
+        }
+        catch (PhaseCancellationException pex) when (
+            ct.IsCancellationRequested
+            || pex.Source == CancellationSources.Operator)
+        {
+            PhaseCancellation.LogBoundary(_log, "RunAsync.operator-cancel", pex.Phase, pex.Source,
+                operatorRequested: true,
+                hostShutdown: false,
+                exception: pex);
+            await HandleOperatorCancelAsync(item, project);
+            throw;
+        }
+        catch (PhaseCancellationException pex) when (CancellationSources.IsPhaseTimeout(pex.Source))
+        {
+            // Actual configured timeout fired — the per-phase wall-clock cap
+            // we set via SetPhaseTimeout. Surface as failureKind="timeout" so
+            // the operator can tell apart "your WorkTimeout is too tight"
+            // from the (formerly-conflated) "host-side cancellation glitch".
+            PhaseCancellation.LogBoundary(_log, "RunAsync.configured-timeout", pex.Phase, pex.Source,
+                operatorRequested: false,
+                hostShutdown: false,
+                exception: pex);
+            _log.LogWarning(
+                "Work item {Id} hit configured timeout in phase '{Phase}' (source={Source})",
+                item.Id, pex.Phase, pex.Source);
+            await TransitionFailed(item,
+                $"phase '{pex.Phase}' exceeded configured timeout ({pex.Source})",
+                CancellationToken.None, project,
+                failureKind: "timeout",
+                cancellationSource: pex.Source);
+        }
+        catch (PhaseCancellationException pex)
+        {
+            // Unattributed cancellation — neither operator cancel, nor host
+            // shutdown, nor a configured timeout. Treat as transient candidate:
+            // try the auto-retry path; if exhausted, surface a clearer error
+            // instead of the old generic "A task was canceled." string.
+            PhaseCancellation.LogBoundary(_log, "RunAsync.unattributed", pex.Phase, pex.Source,
+                operatorRequested: false,
+                hostShutdown: false,
+                exception: pex);
+            await HandleTransientCancellationAsync(item, project, pex);
+        }
         catch (OperationCanceledException) when (ct.IsCancellationRequested || hostShutdownToken.IsCancellationRequested)
         {
+            // Legacy fallthrough for OCEs that bypassed PhaseCancellation —
+            // preserves the previous behaviour for code paths still using
+            // raw OCE propagation (e.g. early-cancel checks before phase setup).
             if (hostShutdownToken.IsCancellationRequested)
             {
-                // Host is shutting down — leave the item in its current mid-flight
-                // state. The recovery loop will reset and re-enqueue it on next startup.
                 _log.LogInformation(
-                    "Work item {Id} interrupted by host shutdown; leaving in mid-flight state for recovery",
+                    "Work item {Id} interrupted by host shutdown (legacy OCE path); leaving in mid-flight state for recovery",
                     item.Id);
             }
             else
             {
-                // Operator-requested cancel (DELETE /workitems/{id}).
-                var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-                if (current.State is not WorkItemState.Done and not WorkItemState.Failed
-                    and not WorkItemState.MergeConflictResolutionFailed
-                    and not WorkItemState.AbandonedAfterRecoveryAttempts)
-                {
-                    var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
-                        WorkItemCancellationReason.OperatorRequested);
-                    await _store.UpdateAsync(cancelled, CancellationToken.None);
-                    AuditLog.WorkItemCancelled(item.Id);
-                    await _webhooks.PublishAsync(new WebhookEvent
-                    {
-                        Event = "work_item.cancelled",
-                        WorkItem = cancelled,
-                        Project = project,
-                    }, CancellationToken.None);
-                }
+                await HandleOperatorCancelAsync(item, project);
             }
             throw;
         }
         catch (OperationCanceledException ex)
         {
-            _log.LogWarning("Work item {Id} timed out", item.Id);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "timeout");
+            // Last-resort catch: an OCE escaped all PhaseCancellation scopes
+            // without attribution AND neither root token is cancelled. Treat as
+            // an unknown-source transient cancellation so the auto-retry path
+            // covers it instead of dead-ending with a generic "timeout" label.
+            _log.LogWarning(ex,
+                "Work item {Id} hit an unwrapped OperationCanceledException with no clear source; routing to transient-retry path",
+                item.Id);
+            await HandleTransientCancellationAsync(item, project,
+                new PhaseCancellationException("unknown", CancellationSources.Unknown, ex));
         }
         catch (AuditFailedException ex)
         {
@@ -1596,24 +1672,6 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (OperationCanceledException) { }
     }
 
-    private IDisposable RegisterHostShutdownDeadline(CancellationToken hostShutdownToken, CancellationTokenSource phaseCts)
-    {
-        if (!hostShutdownToken.CanBeCanceled)
-            return NullDisposable.Instance;
-
-        return hostShutdownToken.Register(static state =>
-        {
-            var (cts, grace) = ((CancellationTokenSource Cts, TimeSpan Grace))state!;
-            try { cts.CancelAfter(grace); }
-            catch (ObjectDisposedException) { }
-        }, (phaseCts, _opts.ShutdownGrace));
-    }
-
-    private sealed class NullDisposable : IDisposable
-    {
-        public static readonly NullDisposable Instance = new();
-        public void Dispose() { }
-    }
 
     // Returns a 2 KB tail of agent output for inclusion in audit log events.
     private static string? Tail(string? s)
@@ -1718,28 +1776,37 @@ public sealed class PipelineRunner : IPipelineRunner
                 throw new OperationCanceledException(hostShutdownToken);
 
             await Transition(item, WorkItemState.Auditing, ct, project);
-            using var auditCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            auditCts.CancelAfter(project.Audit.PerIterationTimeout);
-            using var auditShutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, auditCts);
+            using var auditPhase = new PhaseCancellation("audit", ct);
+            auditPhase.SetPhaseTimeout(project.Audit.PerIterationTimeout);
+            auditPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
 
-            var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt,
-                ModelId: item.ModelId, ReasoningMode: item.ReasoningMode);
-            var collectTask = CollectFindingsAsync(item, project, runner, auditors, repoId, ctx, auditCts.Token);
-            var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
-            if (completedAuditTask != collectTask)
+            IReadOnlyList<AuditFinding> findings;
+            AgentKind? activeAuditAgentKind;
+            try
             {
-                var drainTask = Task.Delay(_opts.AuditShutdownDrain);
-                completedAuditTask = await Task.WhenAny(collectTask, drainTask);
+                var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt,
+                    ModelId: item.ModelId, ReasoningMode: item.ReasoningMode);
+                var collectTask = CollectFindingsAsync(item, project, runner, auditors, repoId, ctx, auditPhase.Token);
+                var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completedAuditTask != collectTask)
                 {
-                    await auditCts.CancelAsync();
-                    throw new OperationCanceledException(hostShutdownToken);
+                    var drainTask = Task.Delay(_opts.AuditShutdownDrain);
+                    completedAuditTask = await Task.WhenAny(collectTask, drainTask);
+                    if (completedAuditTask != collectTask)
+                    {
+                        await auditPhase.Cts.CancelAsync();
+                        throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
+                    }
                 }
-            }
 
-            var (findings, activeAuditAgentKind) = await collectTask;
-            if (hostShutdownToken.IsCancellationRequested)
-                throw new OperationCanceledException(hostShutdownToken);
+                (findings, activeAuditAgentKind) = await collectTask;
+                if (hostShutdownToken.IsCancellationRequested)
+                    throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
+            }
+            catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+            {
+                throw auditPhase.Wrap(oce);
+            }
 
             // Emit cross-review event once per iteration when at least one LLM
             // auditor actually ran with a different agent than the work agent.
@@ -1793,22 +1860,30 @@ public sealed class PipelineRunner : IPipelineRunner
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
                 : (IReadOnlyList<WorkItemQuestion>)[];
             var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions, project.AllowAgentQuestions);
-            using var reworkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            reworkCts.CancelAfter(item.WorkTimeout);
-            using var reworkShutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, reworkCts);
+            using var reworkPhase = new PhaseCancellation("rework", ct);
+            reworkPhase.SetPhaseTimeout(item.WorkTimeout);
+            reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
             var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
-            var reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: iteration,
-                async (workerRunner, trialItem) =>
-                    await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkCts, ct,
-                        phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
-                            reworkPrompt, isInitial: false,
-                            networkProfile: sandboxTarget.NetworkProfile,
-                            sandboxFlavor: sandboxTarget.Flavor,
-                            project: project,
-                            phaseCt,
-                            hostShutdownToken,
-                            iteration: iteration)),
-                ct);
+            string? reworkStdout;
+            try
+            {
+                reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: iteration,
+                    async (workerRunner, trialItem) =>
+                        await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
+                            phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
+                                reworkPrompt, isInitial: false,
+                                networkProfile: sandboxTarget.NetworkProfile,
+                                sandboxFlavor: sandboxTarget.Flavor,
+                                project: project,
+                                phaseCt,
+                                hostShutdownToken,
+                                iteration: iteration)),
+                    ct);
+            }
+            catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+            {
+                throw reworkPhase.Wrap(oce);
+            }
             if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
             {
                 var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
@@ -3792,133 +3867,144 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        using var upstreamCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        using var shutdownDeadline = RegisterHostShutdownDeadline(hostShutdownToken, upstreamCts);
-        ct = upstreamCts.Token;
+        using var upstreamPhase = new PhaseCancellation("upstream", ct);
+        upstreamPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+        ct = upstreamPhase.Token;
 
-        await Transition(item, WorkItemState.UpstreamPushing, ct, project);
-
-        // Best-effort: compute the diff for LLM-generated PR descriptions.
-        // Failures here are non-fatal — the fields default to empty strings
-        // and the generator falls back to the static template.
-        var (diffStat, fullDiff) = (string.Empty, string.Empty);
         try
         {
-            (diffStat, fullDiff) = await _gitHost.GetDiffAsync(repoId, baseBranch, workBranch, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-        {
-            _log.LogDebug("Could not compute diff for PR description: {Message}", ex.Message);
-        }
+            await Transition(item, WorkItemState.UpstreamPushing, ct, project);
 
-        IReadOnlyList<string> addressedFindings = [];
-        if (_auditReports is not null)
-        {
+            // Best-effort: compute the diff for LLM-generated PR descriptions.
+            // Failures here are non-fatal — the fields default to empty strings
+            // and the generator falls back to the static template.
+            var (diffStat, fullDiff) = (string.Empty, string.Empty);
             try
             {
-                var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
-                var titles = new List<string>();
-                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var report in reports)
-                    foreach (var finding in report.Findings)
-                        if (seen.Add(finding.Title))
-                            titles.Add(finding.Title);
-                addressedFindings = titles;
+                (diffStat, fullDiff) = await _gitHost.GetDiffAsync(repoId, baseBranch, workBranch, ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
-                _log.LogDebug("Could not load audit findings for PR description: {Message}", ex.Message);
+                _log.LogDebug("Could not compute diff for PR description: {Message}", ex.Message);
             }
-        }
 
-        var request = new UpstreamCompletionRequest
-        {
-            RepositoryId = repoId,
-            WorkItemId = item.Id,
-            ProjectId = project.Id,
-            WorkBranch = workBranch,
-            BaseBranch = baseBranch,
-            MergeSha = mergeSha,
-            Title = item.Title,
-            Description = BuildPrDescription(item.Id, agentStdout),
-            DiffStat = diffStat,
-            FullDiff = fullDiff,
-            WorkItemPrompt = item.Prompt,
-            AddressedFindings = addressedFindings,
-            AgentStdout = agentStdout,
-            TokenEnvVar = project.Upstream.TokenEnvVar,
-            AutoMerge = project.Upstream.AutoMerge,
-            MergeMethod = project.Upstream.MergeMethod,
-        };
-
-        // Capture the outcome from a successful CompleteAsync so the local
-        // bookkeeping (state transition + webhook events) runs once, outside
-        // the retry loop. Transition must NOT be inside the try — if it throws
-        // after a successful CompleteAsync, the loop would re-invoke the remote
-        // API call, creating duplicate PRs or merge attempts.
-        UpstreamCompletionOutcome? completed = null;
-        for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
-        {
-            var current = await _store.GetAsync(item.Id, ct) ?? item;
-            await _store.UpdateAsync(current with { UpstreamPushAttempts = attempt }, ct);
-
-            try
+            IReadOnlyList<string> addressedFindings = [];
+            if (_auditReports is not null)
             {
-                UpstreamCompletionOutcome outcome;
-                await using (var upstreamScope = await TimingScope.BeginAsync(
-                    _timings, item.Id, "upstream_push", "upstream.complete",
-                    metadata: new Dictionary<string, object> { ["attempt"] = attempt },
-                    log: _log))
+                try
                 {
-                    outcome = await upstream.CompleteAsync(request, ct);
+                    var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
+                    var titles = new List<string>();
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var report in reports)
+                        foreach (var finding in report.Findings)
+                            if (seen.Add(finding.Title))
+                                titles.Add(finding.Title);
+                    addressedFindings = titles;
                 }
-                if (outcome.PullRequestUrl is not null)
-                    _log.LogInformation("Upstream PR: {Url}", outcome.PullRequestUrl);
-                if (outcome.MergedSha is not null)
-                    _log.LogInformation("Upstream PR auto-merged: {Sha}", outcome.MergedSha);
-                if (outcome.Notes is not null)
-                    _log.LogInformation("Upstream notes: {Notes}", outcome.Notes);
-                completed = outcome;
-                break;
+                catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+                {
+                    _log.LogDebug("Could not load audit findings for PR description: {Message}", ex.Message);
+                }
             }
-            catch (Exception ex)
+
+            var request = new UpstreamCompletionRequest
             {
-                if (TryGetUpstreamReconcileConflict(ex, out var conflict))
-                {
-                    _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
-                    await TransitionFailed(item, conflict.Message, ct, project, failureKind: "infrastructure");
-                    break;
-                }
+                RepositoryId = repoId,
+                WorkItemId = item.Id,
+                ProjectId = project.Id,
+                WorkBranch = workBranch,
+                BaseBranch = baseBranch,
+                MergeSha = mergeSha,
+                Title = item.Title,
+                Description = BuildPrDescription(item.Id, agentStdout),
+                DiffStat = diffStat,
+                FullDiff = fullDiff,
+                WorkItemPrompt = item.Prompt,
+                AddressedFindings = addressedFindings,
+                AgentStdout = agentStdout,
+                TokenEnvVar = project.Upstream.TokenEnvVar,
+                AutoMerge = project.Upstream.AutoMerge,
+                MergeMethod = project.Upstream.MergeMethod,
+            };
 
-                _log.LogWarning("Upstream complete attempt {Attempt} failed: {Error}", attempt, ex.Message);
-                if (attempt < _opts.UpstreamPushMaxAttempts)
-                    await Task.Delay(_opts.UpstreamPushBackoff, ct);
-                else
-                    await TransitionFailed(item, $"upstream complete failed after {attempt} attempts: {ex.Message}", ct, project, failureKind: "infrastructure");
-            }
-        }
-
-        if (completed is not null)
-        {
-            if (completed.PullRequestUrl is not null && completed.PullRequestNumber is not null)
+            // Capture the outcome from a successful CompleteAsync so the local
+            // bookkeeping (state transition + webhook events) runs once, outside
+            // the retry loop. Transition must NOT be inside the try — if it throws
+            // after a successful CompleteAsync, the loop would re-invoke the remote
+            // API call, creating duplicate PRs or merge attempts.
+            UpstreamCompletionOutcome? completed = null;
+            for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
             {
                 var current = await _store.GetAsync(item.Id, ct) ?? item;
-                await _webhooks.PublishAsync(new WebhookEvent
+                await _store.UpdateAsync(current with { UpstreamPushAttempts = attempt }, ct);
+
+                try
                 {
-                    Event = "work_item.pull_request_opened",
-                    WorkItem = current,
-                    Project = project,
-                    Details = new PullRequestOpenedDetails
+                    UpstreamCompletionOutcome outcome;
+                    await using (var upstreamScope = await TimingScope.BeginAsync(
+                        _timings, item.Id, "upstream_push", "upstream.complete",
+                        metadata: new Dictionary<string, object> { ["attempt"] = attempt },
+                        log: _log))
                     {
-                        WorkBranch = workBranch,
-                        BaseBranch = baseBranch,
-                        PullRequestNumber = completed.PullRequestNumber.Value,
-                        PullRequestUrl = completed.PullRequestUrl,
-                        MergedSha = completed.MergedSha,
-                    },
-                }, ct);
+                        outcome = await upstream.CompleteAsync(request, ct);
+                    }
+                    if (outcome.PullRequestUrl is not null)
+                        _log.LogInformation("Upstream PR: {Url}", outcome.PullRequestUrl);
+                    if (outcome.MergedSha is not null)
+                        _log.LogInformation("Upstream PR auto-merged: {Sha}", outcome.MergedSha);
+                    if (outcome.Notes is not null)
+                        _log.LogInformation("Upstream notes: {Notes}", outcome.Notes);
+                    completed = outcome;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (TryGetUpstreamReconcileConflict(ex, out var conflict))
+                    {
+                        _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
+                        await TransitionFailed(item, conflict.Message, ct, project, failureKind: "infrastructure");
+                        break;
+                    }
+
+                    _log.LogWarning("Upstream complete attempt {Attempt} failed: {Error}", attempt, ex.Message);
+                    if (attempt < _opts.UpstreamPushMaxAttempts)
+                        await Task.Delay(_opts.UpstreamPushBackoff, ct);
+                    else
+                        await TransitionFailed(item, $"upstream complete failed after {attempt} attempts: {ex.Message}", ct, project, failureKind: "infrastructure");
+                }
             }
-            await Transition(item, WorkItemState.Done, ct, project);
+
+            if (completed is not null)
+            {
+                if (completed.PullRequestUrl is not null && completed.PullRequestNumber is not null)
+                {
+                    var current = await _store.GetAsync(item.Id, ct) ?? item;
+                    await _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.pull_request_opened",
+                        WorkItem = current,
+                        Project = project,
+                        Details = new PullRequestOpenedDetails
+                        {
+                            WorkBranch = workBranch,
+                            BaseBranch = baseBranch,
+                            PullRequestNumber = completed.PullRequestNumber.Value,
+                            PullRequestUrl = completed.PullRequestUrl,
+                            MergedSha = completed.MergedSha,
+                        },
+                    }, ct);
+                }
+                await Transition(item, WorkItemState.Done, ct, project);
+            }
+        }
+        catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+        {
+            // Attribute any OCE bubbling out of the upstream-push body. The
+            // explicit per-attempt logic above swallows non-cancellation
+            // failures itself; anything reaching here is a cancellation we want
+            // routed to the new attributed catches in RunAsync.
+            throw upstreamPhase.Wrap(oce);
         }
     }
 
@@ -4384,22 +4470,31 @@ public sealed class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Wraps a returning agent phase action with a background liveness probe.
-    /// If the probe detects a hang it cancels <paramref name="phaseCts"/> and
+    /// If the probe detects a hang it cancels the phase's underlying CTS and
     /// throws <see cref="AgentStuckException"/>, which the caller's
     /// <c>catch</c> handles. The non-generic overload delegates here.
+    ///
+    /// <para>
+    /// The <paramref name="phaseCancellation"/> parameter is also responsible
+    /// for cancellation-source attribution: when the probe cancels the CTS,
+    /// the post-fact catch filter records the source as
+    /// <see cref="CancellationSources.StuckProbe"/> so the outer pipeline
+    /// catch (if it ever sees an unwrapped OCE) can still tell apart a
+    /// stuck-kill from a transient host cancellation.
+    /// </para>
     /// </summary>
     private async Task<T> RunWithStuckProbeAsync<T>(
         WorkItem item,
         Project project,
         AgentKind agentKind,
         string phase,
-        CancellationTokenSource phaseCts,
+        PhaseCancellation phaseCancellation,
         CancellationToken ct,
         Func<CancellationToken, Task<T>> work)
     {
         var thresholdMinutes = ResolveEffectiveStuckThresholdMinutes(project);
         if (thresholdMinutes <= 0)
-            return await work(phaseCts.Token);
+            return await work(phaseCancellation.Token);
 
         ValidateStuckThreshold(thresholdMinutes, phase);
 
@@ -4408,17 +4503,22 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var ctx = new StuckContext { Phase = phase, AgentKind = agentKind };
         var source = ActivitySourceFactory();
-        var probe = new StuckProbe(source, thresholdSamples, ctx, phaseCts, _log, StuckProbePollInterval);
+        var probe = new StuckProbe(source, thresholdSamples, ctx, phaseCancellation.Cts, _log, StuckProbePollInterval);
 
         using var probeCts = new CancellationTokenSource();
         _ = probe.RunAsync(probeCts.Token); // fire-and-forget; self-terminating
 
         try
         {
-            return await work(phaseCts.Token);
+            return await work(phaseCancellation.Token);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested && ctx.Detected)
         {
+            // The probe cancelled directly via the CTS (no hook ran), so the
+            // attribution slot may still be empty. Claim it now — before the
+            // AgentStuckException propagates — so any observer that reads
+            // PhaseCancellation.Source sees "stuck-probe".
+            phaseCancellation.RecordStuckProbe();
             throw new AgentStuckException(ctx);
         }
         finally
@@ -4432,10 +4532,10 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         AgentKind agentKind,
         string phase,
-        CancellationTokenSource phaseCts,
+        PhaseCancellation phaseCancellation,
         CancellationToken ct,
         Func<CancellationToken, Task> work)
-        => RunWithStuckProbeAsync<bool>(item, project, agentKind, phase, phaseCts, ct,
+        => RunWithStuckProbeAsync<bool>(item, project, agentKind, phase, phaseCancellation, ct,
             async pct => { await work(pct); return true; });
 
     private async Task HandleAgentStuckAsync(WorkItem item, Project project, AgentStuckException stuckEx)
@@ -4544,21 +4644,27 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null)
+    private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null, string? cancellationSource = null)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
         WorkItem next;
         if (failureKind == "quota")
         {
             var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, ct);
-            next = current.With(WorkItemState.Failed, error, failureKind: failureKind, quotaResetAt: effectiveResetAt) with
+            next = current.With(WorkItemState.Failed, error,
+                failureKind: failureKind,
+                quotaResetAt: effectiveResetAt,
+                cancellationSource: cancellationSource) with
             {
                 NextQuotaRetryAt = effectiveResetAt,
             };
         }
         else
         {
-            next = current.With(WorkItemState.Failed, error, failureKind: failureKind, quotaResetAt: quotaResetAt);
+            next = current.With(WorkItemState.Failed, error,
+                failureKind: failureKind,
+                quotaResetAt: quotaResetAt,
+                cancellationSource: cancellationSource);
         }
 
         // Use TryUpdateIfStateAsync to avoid overwriting a state change that happened concurrently (e.g. cancellation via API).
@@ -4589,6 +4695,144 @@ public sealed class PipelineRunner : IPipelineRunner
             Project = effectiveProject,
         }, CancellationToken.None);
     }
+
+    /// <summary>
+    /// Operator-cancel handler. Extracted so both the new
+    /// <see cref="PhaseCancellationException"/> catch and the legacy raw-OCE
+    /// catch route through identical state-write logic. Idempotent — if the
+    /// item is already in a terminal-ish state, the cancel is skipped.
+    /// </summary>
+    private async Task HandleOperatorCancelAsync(WorkItem item, Project? project)
+    {
+        var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+        if (current.State is WorkItemState.Done or WorkItemState.Failed
+            or WorkItemState.MergeConflictResolutionFailed
+            or WorkItemState.AbandonedAfterRecoveryAttempts)
+            return;
+
+        var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
+            WorkItemCancellationReason.OperatorRequested,
+            cancellationSource: CancellationSources.Operator);
+        await _store.UpdateAsync(cancelled, CancellationToken.None);
+        AuditLog.WorkItemCancelled(item.Id);
+        var effectiveProject = project ?? new Project
+        {
+            Id = item.ProjectId,
+            DisplayName = item.ProjectId.Value,
+            RepositoryUrl = string.Empty,
+        };
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "work_item.cancelled",
+            WorkItem = cancelled,
+            Project = effectiveProject,
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Handles a <see cref="PhaseCancellationException"/> whose source could
+    /// not be attributed to operator cancel / host shutdown / configured
+    /// timeout. The auto-retry path resets the item to a recoverable pre-phase
+    /// state and re-enqueues, up to <see cref="OrchestratorOptions.MaxTransientCancelRetries"/>
+    /// attempts; further failures transition to Failed with a pointed error.
+    ///
+    /// <para>
+    /// The recovery state mirrors the dead-worker reaper / startup replay
+    /// mapping (Working → Queued, Reworking/Auditing → WorkComplete,
+    /// Merging → AuditPassed, UpstreamPushing → Merged) so the next pickup
+    /// resumes at the right phase without re-running already-committed work.
+    /// </para>
+    /// </summary>
+    private async Task HandleTransientCancellationAsync(
+        WorkItem item,
+        Project? project,
+        PhaseCancellationException pex)
+    {
+        var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+
+        var max = _orchestratorOptions.MaxTransientCancelRetries;
+        var attempts = current.TransientCancelRetries;
+
+        if (max <= 0 || attempts >= max)
+        {
+            var detail = max <= 0
+                ? $"phase '{pex.Phase}' cancelled by host (source={pex.Source}); auto-retry disabled (MaxTransientCancelRetries={max})"
+                : $"phase '{pex.Phase}' cancelled by host (source={pex.Source}); exhausted {max} transient-cancel retries — operator must investigate (likely supervisor/cancellation-token leak in the orchestrator host)";
+            _log.LogError(
+                "Work item {Id} surfacing transient-cancel as Failed: phase={Phase} source={Source} attempts={Attempts}/{Max}",
+                item.Id, pex.Phase, pex.Source, attempts, max);
+            await TransitionFailed(item, detail, CancellationToken.None, project,
+                failureKind: "cancelled",
+                cancellationSource: pex.Source);
+            return;
+        }
+
+        var resumeState = ResumeStateForTransientRetry(current, pex.Phase);
+        // Use the record initializer (rather than With) so the auto-retry path
+        // can preserve CancellationSource even for non-failure target states
+        // (Queued, WorkComplete, AuditPassed, Merged) — the operator wants to
+        // see what cancelled the prior phase even after the item resumes.
+        var resumed = current.With(resumeState,
+            error: $"transient cancellation in phase '{pex.Phase}' (source={pex.Source}); auto-retrying") with
+        {
+            CancellationSource = pex.Source,
+            TransientCancelRetries = attempts + 1,
+            // Reset RecoveryAttempts the same way WorkItemRetrier does so a
+            // run of transient retries doesn't burn the host-crash recovery
+            // budget on top of the transient-cancel budget.
+            RecoveryAttempts = 0,
+        };
+        var updated = await _store.TryUpdateIfStateAsync(resumed, current.State, CancellationToken.None);
+        if (!updated)
+        {
+            _log.LogInformation(
+                "Work item {Id} state changed concurrently; skipping transient-cancel auto-retry transition",
+                item.Id);
+            return;
+        }
+        AuditLog.WorkItemTransientCancelRetried(item.Id, pex.Phase, pex.Source, attempts + 1, max);
+        _log.LogWarning(
+            "Work item {Id} auto-retrying after transient cancellation: phase={Phase} source={Source} attempt={Attempt}/{Max}; reset to {ResumeState}",
+            item.Id, pex.Phase, pex.Source, attempts + 1, max, resumeState);
+
+        // Kick the orchestrator's dispatch loop so the now-non-terminal item is
+        // picked back up without waiting for an unrelated kick. If the queue
+        // dependency wasn't wired (test bootstrap path), fall back to the
+        // existing dispatch behaviour: the next periodic eligibility scan or
+        // other workitem completion will surface it.
+        if (_taskQueue is not null)
+        {
+            try { await _taskQueue.EnqueueAsync(item.Id, CancellationToken.None); }
+            catch (Exception enqEx)
+            {
+                _log.LogWarning(enqEx,
+                    "Failed to kick task queue for transient-cancel auto-retry of work item {Id}; will rely on the next pickup tick",
+                    item.Id);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Maps the cancelled phase name onto the work item state the next pickup
+    /// should resume from. Mirrors the dead-worker / startup-replay mapping
+    /// so the pipeline resumes mid-flight rather than restarting from scratch.
+    /// Internal (not private) so the per-phase table is unit-testable directly
+    /// — driving the full pipeline through each phase to exercise this switch
+    /// would dwarf the table it verifies.
+    /// </summary>
+    internal static WorkItemState ResumeStateForTransientRetry(WorkItem current, string phase) => phase switch
+    {
+        // Work / rework-resume / rework / audit all left the agent commits on
+        // the work branch (or about to); resume at the matching phase entry.
+        "work" => WorkItemState.Queued,
+        "rework-resume" => WorkItemState.WorkComplete,
+        "rework" => WorkItemState.WorkComplete,
+        "audit" => WorkItemState.WorkComplete,
+        "merge" => WorkItemState.AuditPassed,
+        "upstream" => WorkItemState.Merged,
+        // Unknown phase name: re-queue from the start — safer than guessing.
+        _ => WorkItemState.Queued,
+    };
 
     private async Task<DateTimeOffset> ResolveQuotaResetAtForFailedTransitionAsync(
         WorkItem item,
