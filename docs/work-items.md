@@ -126,14 +126,14 @@ When a pipeline phase is interrupted by `OperationCanceledException`, the orches
 |----------------------|---------|-------------------------|-------------|
 | `operator` | `DELETE /workitems/{id}` (or the orchestrator's per-item registration token) | (state goes to `Cancelled`, not Failed) | No |
 | `host-shutdown` | `IHostApplicationLifetime.ApplicationStopping` fired | (item left mid-flight for recovery loop) | n/a — recovery owns it |
-| `host-shutdown-deadline` | Host shutdown grace expired before the phase drained | `cancelled` | Yes (transient) |
-| `stuck-probe` | Stuck-probe detected zero-activity threshold and killed the phase | `agent` | Per `AutoRetryOnStuck` |
+| `host-shutdown-deadline` | Host shutdown grace expired before the phase drained | (item left mid-flight for recovery loop) | n/a — recovery owns it (host is going away; auto-retry would race the shutdown) |
+| `stuck-probe` | Stuck-probe detected zero-activity threshold and killed the phase | `agent` (via `AgentStuckException`, not via `cancellationSource`) | Per `AutoRetryOnStuck` |
 | `timeout:<phase>` | Configured per-phase wall-clock cap fired (`WorkTimeout`, `MergeTimeout`, `Audit.PerIterationTimeout`) | `timeout` | No |
 | `unknown` | OCE propagated past every attribution hook — typically a leaked supervisor token in the orchestrator host | `cancelled` | Yes (transient) |
 
 #### Transient-cancel auto-retry
 
-When `cancellationSource` resolves to a transient label (`unknown` or `host-shutdown-deadline`) — i.e. neither operator intent nor a configured timeout — the orchestrator auto-retries the item from a recoverable pre-phase state instead of failing it outright. This matches the "pause not fail" guarantee for transient issues and avoids losing hours of rework when an unattributed host hiccup interrupts an expensive run.
+When `cancellationSource` resolves to `unknown` — an `OperationCanceledException` that propagated past every attribution hook, neither operator intent, host shutdown, nor a configured timeout — the orchestrator auto-retries the item from a recoverable pre-phase state instead of failing it outright. This matches the "pause not fail" guarantee for transient issues and avoids losing hours of rework when an unattributed host hiccup interrupts an expensive run.
 
 The retry counter is `transientCancelRetries`, capped by `CodeyBox:WorkerPool:MaxTransientCancelRetries` (default 3). Past the cap, the item transitions to `Failed` with `failureKind=cancelled` and a pointed error message identifying the suspected cause (typically: "supervisor/cancellation-token leak in the orchestrator host"). Set `MaxTransientCancelRetries=0` to disable the auto-retry path entirely and surface every transient cancellation immediately.
 
@@ -141,8 +141,8 @@ The resume-state mapping mirrors the dead-worker reaper / startup replay:
 
 | Cancelled phase | Resume state |
 |-----------------|--------------|
-| `work` / `rework-resume` | `Queued` (work phase rerun) |
-| `rework` / `audit` | `WorkComplete` (audit phase rerun) |
+| `work` | `Queued` (work phase rerun) |
+| `rework-resume` / `rework` / `audit` | `WorkComplete` (audit phase rerun; committed work on the work branch is preserved) |
 | `merge` | `AuditPassed` (merge phase rerun) |
 | `upstream` | `Merged` (upstream push rerun) |
 

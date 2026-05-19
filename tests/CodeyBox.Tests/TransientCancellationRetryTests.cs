@@ -138,6 +138,27 @@ public sealed class TransientCancellationRetryTests : IDisposable
         Assert.Equal(0, after.TransientCancelRetries);
     }
 
+    /// <summary>
+    /// Pins the full per-phase resume-state table so a swap (e.g. merge -> Queued
+    /// instead of AuditPassed) would re-run already-committed phases. Driving the
+    /// full pipeline through each phase to exercise this switch would dwarf the
+    /// table it verifies, so we hit the internal helper directly.
+    /// </summary>
+    [Theory]
+    [InlineData("work", WorkItemState.Queued)]
+    [InlineData("rework-resume", WorkItemState.WorkComplete)]
+    [InlineData("rework", WorkItemState.WorkComplete)]
+    [InlineData("audit", WorkItemState.WorkComplete)]
+    [InlineData("merge", WorkItemState.AuditPassed)]
+    [InlineData("upstream", WorkItemState.Merged)]
+    [InlineData("unrecognised-phase", WorkItemState.Queued)] // default arm — safer than guessing
+    public void ResumeStateForTransientRetry_MapsPhaseToExpectedState(string phase, WorkItemState expected)
+    {
+        var item = NewItem();
+        var actual = PipelineRunner.ResumeStateForTransientRetry(item, phase);
+        Assert.Equal(expected, actual);
+    }
+
     private static WorkItem NewItem() => new()
     {
         Id = WorkItemId.New(),

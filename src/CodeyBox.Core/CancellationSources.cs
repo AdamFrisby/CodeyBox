@@ -57,6 +57,14 @@ public static class CancellationSources
     /// loop should treat as transient (re-run the phase rather than fail the item).
     /// Configured timeouts and operator cancellations are excluded — those reflect
     /// the operator's intent and should not be silently retried.
+    /// <para>
+    /// <see cref="HostShutdownDeadline"/> is intentionally NOT transient: by
+    /// construction it can only fire after <see cref="HostShutdown"/> has
+    /// already been recorded, and the host-shutdown catch in
+    /// <c>PipelineRunner.RunAsync</c> wins ordering — the item is left
+    /// mid-flight for the recovery loop to pick up on next startup, which is
+    /// the correct behaviour while the host is going away.
+    /// </para>
     /// </summary>
-    public static bool IsTransient(string? source) => source is HostShutdownDeadline or Unknown;
+    public static bool IsTransient(string? source) => source is Unknown;
 }

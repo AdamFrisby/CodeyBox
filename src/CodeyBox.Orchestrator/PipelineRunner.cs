@@ -3873,130 +3873,130 @@ public sealed class PipelineRunner : IPipelineRunner
 
         try
         {
-        await Transition(item, WorkItemState.UpstreamPushing, ct, project);
+            await Transition(item, WorkItemState.UpstreamPushing, ct, project);
 
-        // Best-effort: compute the diff for LLM-generated PR descriptions.
-        // Failures here are non-fatal — the fields default to empty strings
-        // and the generator falls back to the static template.
-        var (diffStat, fullDiff) = (string.Empty, string.Empty);
-        try
-        {
-            (diffStat, fullDiff) = await _gitHost.GetDiffAsync(repoId, baseBranch, workBranch, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-        {
-            _log.LogDebug("Could not compute diff for PR description: {Message}", ex.Message);
-        }
-
-        IReadOnlyList<string> addressedFindings = [];
-        if (_auditReports is not null)
-        {
+            // Best-effort: compute the diff for LLM-generated PR descriptions.
+            // Failures here are non-fatal — the fields default to empty strings
+            // and the generator falls back to the static template.
+            var (diffStat, fullDiff) = (string.Empty, string.Empty);
             try
             {
-                var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
-                var titles = new List<string>();
-                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var report in reports)
-                    foreach (var finding in report.Findings)
-                        if (seen.Add(finding.Title))
-                            titles.Add(finding.Title);
-                addressedFindings = titles;
+                (diffStat, fullDiff) = await _gitHost.GetDiffAsync(repoId, baseBranch, workBranch, ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
-                _log.LogDebug("Could not load audit findings for PR description: {Message}", ex.Message);
+                _log.LogDebug("Could not compute diff for PR description: {Message}", ex.Message);
             }
-        }
 
-        var request = new UpstreamCompletionRequest
-        {
-            RepositoryId = repoId,
-            WorkItemId = item.Id,
-            ProjectId = project.Id,
-            WorkBranch = workBranch,
-            BaseBranch = baseBranch,
-            MergeSha = mergeSha,
-            Title = item.Title,
-            Description = BuildPrDescription(item.Id, agentStdout),
-            DiffStat = diffStat,
-            FullDiff = fullDiff,
-            WorkItemPrompt = item.Prompt,
-            AddressedFindings = addressedFindings,
-            AgentStdout = agentStdout,
-            TokenEnvVar = project.Upstream.TokenEnvVar,
-            AutoMerge = project.Upstream.AutoMerge,
-            MergeMethod = project.Upstream.MergeMethod,
-        };
-
-        // Capture the outcome from a successful CompleteAsync so the local
-        // bookkeeping (state transition + webhook events) runs once, outside
-        // the retry loop. Transition must NOT be inside the try — if it throws
-        // after a successful CompleteAsync, the loop would re-invoke the remote
-        // API call, creating duplicate PRs or merge attempts.
-        UpstreamCompletionOutcome? completed = null;
-        for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
-        {
-            var current = await _store.GetAsync(item.Id, ct) ?? item;
-            await _store.UpdateAsync(current with { UpstreamPushAttempts = attempt }, ct);
-
-            try
+            IReadOnlyList<string> addressedFindings = [];
+            if (_auditReports is not null)
             {
-                UpstreamCompletionOutcome outcome;
-                await using (var upstreamScope = await TimingScope.BeginAsync(
-                    _timings, item.Id, "upstream_push", "upstream.complete",
-                    metadata: new Dictionary<string, object> { ["attempt"] = attempt },
-                    log: _log))
+                try
                 {
-                    outcome = await upstream.CompleteAsync(request, ct);
+                    var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
+                    var titles = new List<string>();
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var report in reports)
+                        foreach (var finding in report.Findings)
+                            if (seen.Add(finding.Title))
+                                titles.Add(finding.Title);
+                    addressedFindings = titles;
                 }
-                if (outcome.PullRequestUrl is not null)
-                    _log.LogInformation("Upstream PR: {Url}", outcome.PullRequestUrl);
-                if (outcome.MergedSha is not null)
-                    _log.LogInformation("Upstream PR auto-merged: {Sha}", outcome.MergedSha);
-                if (outcome.Notes is not null)
-                    _log.LogInformation("Upstream notes: {Notes}", outcome.Notes);
-                completed = outcome;
-                break;
+                catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+                {
+                    _log.LogDebug("Could not load audit findings for PR description: {Message}", ex.Message);
+                }
             }
-            catch (Exception ex)
+
+            var request = new UpstreamCompletionRequest
             {
-                if (TryGetUpstreamReconcileConflict(ex, out var conflict))
-                {
-                    _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
-                    await TransitionFailed(item, conflict.Message, ct, project, failureKind: "infrastructure");
-                    break;
-                }
+                RepositoryId = repoId,
+                WorkItemId = item.Id,
+                ProjectId = project.Id,
+                WorkBranch = workBranch,
+                BaseBranch = baseBranch,
+                MergeSha = mergeSha,
+                Title = item.Title,
+                Description = BuildPrDescription(item.Id, agentStdout),
+                DiffStat = diffStat,
+                FullDiff = fullDiff,
+                WorkItemPrompt = item.Prompt,
+                AddressedFindings = addressedFindings,
+                AgentStdout = agentStdout,
+                TokenEnvVar = project.Upstream.TokenEnvVar,
+                AutoMerge = project.Upstream.AutoMerge,
+                MergeMethod = project.Upstream.MergeMethod,
+            };
 
-                _log.LogWarning("Upstream complete attempt {Attempt} failed: {Error}", attempt, ex.Message);
-                if (attempt < _opts.UpstreamPushMaxAttempts)
-                    await Task.Delay(_opts.UpstreamPushBackoff, ct);
-                else
-                    await TransitionFailed(item, $"upstream complete failed after {attempt} attempts: {ex.Message}", ct, project, failureKind: "infrastructure");
-            }
-        }
-
-        if (completed is not null)
-        {
-            if (completed.PullRequestUrl is not null && completed.PullRequestNumber is not null)
+            // Capture the outcome from a successful CompleteAsync so the local
+            // bookkeeping (state transition + webhook events) runs once, outside
+            // the retry loop. Transition must NOT be inside the try — if it throws
+            // after a successful CompleteAsync, the loop would re-invoke the remote
+            // API call, creating duplicate PRs or merge attempts.
+            UpstreamCompletionOutcome? completed = null;
+            for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
             {
                 var current = await _store.GetAsync(item.Id, ct) ?? item;
-                await _webhooks.PublishAsync(new WebhookEvent
+                await _store.UpdateAsync(current with { UpstreamPushAttempts = attempt }, ct);
+
+                try
                 {
-                    Event = "work_item.pull_request_opened",
-                    WorkItem = current,
-                    Project = project,
-                    Details = new PullRequestOpenedDetails
+                    UpstreamCompletionOutcome outcome;
+                    await using (var upstreamScope = await TimingScope.BeginAsync(
+                        _timings, item.Id, "upstream_push", "upstream.complete",
+                        metadata: new Dictionary<string, object> { ["attempt"] = attempt },
+                        log: _log))
                     {
-                        WorkBranch = workBranch,
-                        BaseBranch = baseBranch,
-                        PullRequestNumber = completed.PullRequestNumber.Value,
-                        PullRequestUrl = completed.PullRequestUrl,
-                        MergedSha = completed.MergedSha,
-                    },
-                }, ct);
+                        outcome = await upstream.CompleteAsync(request, ct);
+                    }
+                    if (outcome.PullRequestUrl is not null)
+                        _log.LogInformation("Upstream PR: {Url}", outcome.PullRequestUrl);
+                    if (outcome.MergedSha is not null)
+                        _log.LogInformation("Upstream PR auto-merged: {Sha}", outcome.MergedSha);
+                    if (outcome.Notes is not null)
+                        _log.LogInformation("Upstream notes: {Notes}", outcome.Notes);
+                    completed = outcome;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (TryGetUpstreamReconcileConflict(ex, out var conflict))
+                    {
+                        _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
+                        await TransitionFailed(item, conflict.Message, ct, project, failureKind: "infrastructure");
+                        break;
+                    }
+
+                    _log.LogWarning("Upstream complete attempt {Attempt} failed: {Error}", attempt, ex.Message);
+                    if (attempt < _opts.UpstreamPushMaxAttempts)
+                        await Task.Delay(_opts.UpstreamPushBackoff, ct);
+                    else
+                        await TransitionFailed(item, $"upstream complete failed after {attempt} attempts: {ex.Message}", ct, project, failureKind: "infrastructure");
+                }
             }
-            await Transition(item, WorkItemState.Done, ct, project);
-        }
+
+            if (completed is not null)
+            {
+                if (completed.PullRequestUrl is not null && completed.PullRequestNumber is not null)
+                {
+                    var current = await _store.GetAsync(item.Id, ct) ?? item;
+                    await _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.pull_request_opened",
+                        WorkItem = current,
+                        Project = project,
+                        Details = new PullRequestOpenedDetails
+                        {
+                            WorkBranch = workBranch,
+                            BaseBranch = baseBranch,
+                            PullRequestNumber = completed.PullRequestNumber.Value,
+                            PullRequestUrl = completed.PullRequestUrl,
+                            MergedSha = completed.MergedSha,
+                        },
+                    }, ct);
+                }
+                await Transition(item, WorkItemState.Done, ct, project);
+            }
         }
         catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
         {
@@ -4816,8 +4816,11 @@ public sealed class PipelineRunner : IPipelineRunner
     /// Maps the cancelled phase name onto the work item state the next pickup
     /// should resume from. Mirrors the dead-worker / startup-replay mapping
     /// so the pipeline resumes mid-flight rather than restarting from scratch.
+    /// Internal (not private) so the per-phase table is unit-testable directly
+    /// — driving the full pipeline through each phase to exercise this switch
+    /// would dwarf the table it verifies.
     /// </summary>
-    private static WorkItemState ResumeStateForTransientRetry(WorkItem current, string phase) => phase switch
+    internal static WorkItemState ResumeStateForTransientRetry(WorkItem current, string phase) => phase switch
     {
         // Work / rework-resume / rework / audit all left the agent commits on
         // the work branch (or about to); resume at the matching phase entry.
