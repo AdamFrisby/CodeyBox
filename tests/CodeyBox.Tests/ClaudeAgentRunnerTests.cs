@@ -153,11 +153,14 @@ public sealed class ClaudeAgentRunnerTests
     [Fact]
     public async Task RunAsync_WithOAuthJsonBundle_WritesCredentialsFileToSandbox()
     {
-        // ClaudeAgentRunner.PrepareSandboxAsync must materialise the host's
-        // ~/.claude/.credentials.json inside the VM when the provider has
-        // shipped CODEYBOX_CLAUDE_OAUTH_JSON. This is what lets the in-VM
-        // claude CLI auto-rotate when the host's access_token expires
-        // mid-run; without it, long runs 401 on rework after ~30 minutes.
+        // ClaudeAgentRunner.PrepareSandboxAsync must materialise the sanitised
+        // OAuth bundle (access_token + expires_at, no refresh_token) into the
+        // VM's ~/.claude/.credentials.json when the provider has shipped
+        // CODEYBOX_CLAUDE_OAUTH_JSON. The in-VM CLI cannot self-refresh
+        // (by design — see ClaudeOAuthFileCredentialProvider for the shared-
+        // OAuth race rationale); this hook just gets the current access_token
+        // onto disk in the canonical location so the CLI's auth probe
+        // succeeds.
         var sandbox = new MultiExecCapturingSandbox();
         var runner = new ClaudeAgentRunner();
         var credential = new AgentCredential(
@@ -166,7 +169,7 @@ public sealed class ClaudeAgentRunnerTests
             {
                 ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-ant-oat01-abc",
                 [ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar] =
-                    """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz"}}""",
+                    """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","expiresAt":9999999999}}""",
             },
             new Dictionary<string, string>());
 

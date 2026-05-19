@@ -330,6 +330,30 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void ClaudeUnauthorizedObserved_emits_agent_claude_unauthorized_event()
+    {
+        AuditLog.ClaudeUnauthorizedObserved("work", "vm-99");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("agent.claude_unauthorized", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(LogEventLevel.Warning, evt.Level);
+        Assert.Equal("work", GetScalar<string>(evt, "Phase"));
+        Assert.Equal("vm-99", GetScalar<string>(evt, "SandboxName"));
+    }
+
+    [Fact]
+    public void ClaudeUnauthorizedObserved_NullSandbox_FallsBackToUnknownPlaceholder()
+    {
+        AuditLog.ClaudeUnauthorizedObserved("audit", sandboxName: null);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("agent.claude_unauthorized", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("audit", GetScalar<string>(evt, "Phase"));
+        Assert.Equal("(unknown)", GetScalar<string>(evt, "SandboxName"));
+    }
+
+    [Fact]
     public void CrossReviewActive_emits_audit_cross_review_active_event()
     {
         AuditLog.CrossReviewActive(AgentKind.Claude, AgentKind.Gemini);

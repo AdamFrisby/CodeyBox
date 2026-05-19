@@ -82,22 +82,22 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task SanitisedBundle_OnlyHostCanRefresh_PreventsParallelRefreshRace()
+    public async Task SanitisedBundle_NeverEmitsRefreshTokenAcrossRepeatedCalls()
     {
-        // AC2 of the shared-OAuth race fix: two parallel "refresh the same
-        // token" actions (host-side and in-VM) must not both reach Anthropic.
-        // We enforce this structurally by stripping the refresh_token from
-        // the VM bundle: the in-VM CLI has no refresh_token, so it is
-        // *incapable* of calling the refresh endpoint. Only the host CLI ever
-        // refreshes, so only one refresh request can ever fire against
-        // Anthropic for a given token rotation.
+        // The shared-OAuth race fix is enforced structurally: the in-VM CLI
+        // never receives a refresh_token, so it is incapable of calling
+        // Anthropic's refresh endpoint at all. This test pins that structural
+        // guarantee — across repeated provider calls (including concurrent
+        // ones from different consumers), every emitted bundle must omit the
+        // refresh_token even when the host file still contains one. It is NOT
+        // a simulation of two concurrent refreshes reaching Anthropic; the
+        // provider itself never refreshes, so there is no race to simulate at
+        // this layer.
         const string raw =
             """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz","expiresAt":9999999999}}""";
         var path = WriteCredFile(raw);
         var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
 
-        // Two concurrent credential acquisitions (simulating the host probe
-        // and a fresh VM injection happening at the same instant).
         var taskA = Task.Run(() => p.GetAsync(AgentKind.Claude));
         var taskB = Task.Run(() => p.GetAsync(AgentKind.Claude));
         var creds = await Task.WhenAll(taskA, taskB);
@@ -107,15 +107,13 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         var bundleA = a!.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar];
         var bundleB = b!.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar];
 
-        // Both consumers got the same access_token (no race-induced fork).
         Assert.Equal(a.EnvironmentVariables["CLAUDE_CODE_OAUTH_TOKEN"],
                      b.EnvironmentVariables["CLAUDE_CODE_OAUTH_TOKEN"]);
         Assert.Equal(bundleA, bundleB);
-
-        // And neither one carries a refresh_token, so neither one can
-        // initiate a refresh against Anthropic.
         Assert.DoesNotContain("refreshToken", bundleA, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("refreshToken", bundleB, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("rt-xyz", bundleA);
+        Assert.DoesNotContain("rt-xyz", bundleB);
     }
 
     [Fact]

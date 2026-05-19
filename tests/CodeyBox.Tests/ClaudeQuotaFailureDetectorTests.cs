@@ -1,5 +1,7 @@
 using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -102,5 +104,83 @@ public sealed class ClaudeQuotaFailureDetectorTests
     public void IsUnauthorizedSignal_ReturnsFalseWhenNo401(string? stderr, string? stdout)
     {
         Assert.False(ClaudeQuotaFailureDetector.IsUnauthorizedSignal(stderr, stdout));
+    }
+}
+
+/// <summary>
+/// Tests for <see cref="ClaudeQuotaFailureDetector.EmitAdvisoryAuditEvents"/>.
+/// Mutates the static <see cref="Log.Logger"/>, so shares the
+/// <c>GlobalSerilog</c> xUnit collection with other tests that depend on it.
+/// </summary>
+[Collection("GlobalSerilog")]
+public sealed class ClaudeQuotaFailureDetectorAdvisoryAuditTests : IDisposable
+{
+    private readonly TestSink _sink = new();
+    private readonly ClaudeQuotaFailureDetector _detector = new();
+
+    public ClaudeQuotaFailureDetectorAdvisoryAuditTests()
+    {
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(_sink)
+            .CreateLogger();
+    }
+
+    public void Dispose() => Log.CloseAndFlush();
+
+    [Fact]
+    public void EmitAdvisoryAuditEvents_StderrHas401_EmitsClaudeUnauthorizedAuditEvent()
+    {
+        _detector.EmitAdvisoryAuditEvents(
+            stderr: "API Error: 401 unauthorized", stdout: null,
+            phase: "work", sandboxName: "vm-42");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("agent.claude_unauthorized", ScalarString(evt, "EventName"));
+        Assert.Equal(LogEventLevel.Warning, evt.Level);
+        Assert.Equal("work", ScalarString(evt, "Phase"));
+        Assert.Equal("vm-42", ScalarString(evt, "SandboxName"));
+    }
+
+    [Fact]
+    public void EmitAdvisoryAuditEvents_Stream401_EmitsClaudeUnauthorizedAuditEvent()
+    {
+        _detector.EmitAdvisoryAuditEvents(
+            stderr: null,
+            stdout: """{"type":"result","subtype":"error","is_error":true,"result":"API Error: 401 token expired"}""",
+            phase: "audit", sandboxName: null);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("agent.claude_unauthorized", ScalarString(evt, "EventName"));
+        Assert.Equal("audit", ScalarString(evt, "Phase"));
+        Assert.Equal("(unknown)", ScalarString(evt, "SandboxName"));
+    }
+
+    [Fact]
+    public void EmitAdvisoryAuditEvents_No401Present_DoesNotEmitAnyEvent()
+    {
+        _detector.EmitAdvisoryAuditEvents(
+            stderr: "rate_limit_exceeded reset after 1h", stdout: null,
+            phase: "work", sandboxName: "vm-1");
+
+        Assert.Empty(_sink.Events);
+    }
+
+    [Fact]
+    public void EmitAdvisoryAuditEvents_EmptyInput_DoesNotEmitAnyEvent()
+    {
+        _detector.EmitAdvisoryAuditEvents(
+            stderr: null, stdout: null, phase: "work", sandboxName: null);
+        _detector.EmitAdvisoryAuditEvents(
+            stderr: "", stdout: "", phase: "work", sandboxName: null);
+
+        Assert.Empty(_sink.Events);
+    }
+
+    private static string? ScalarString(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return null;
+        return sv.Value as string;
     }
 }

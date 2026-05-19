@@ -55,4 +55,58 @@ public sealed class CompositeQuotaFailureClassifierTests
         Assert.Null(_classifier.Detect(AgentKind.Claude, stderr: null, stdout: null));
         Assert.Null(_classifier.Detect(AgentKind.Claude, stderr: "", stdout: ""));
     }
+
+    [Fact]
+    public void EmitAdvisoryAuditEvents_DispatchesToMatchingDetector()
+    {
+        var claude = new RecordingDetector(AgentKind.Claude);
+        var codex = new RecordingDetector(AgentKind.Codex);
+        var classifier = new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { claude, codex });
+
+        classifier.EmitAdvisoryAuditEvents(AgentKind.Claude, "stderr-text", "stdout-text", "work", "vm-1");
+
+        var call = Assert.Single(claude.Calls);
+        Assert.Equal("stderr-text", call.Stderr);
+        Assert.Equal("stdout-text", call.Stdout);
+        Assert.Equal("work", call.Phase);
+        Assert.Equal("vm-1", call.SandboxName);
+        Assert.Empty(codex.Calls);
+    }
+
+    [Fact]
+    public void EmitAdvisoryAuditEvents_EmptyInput_DoesNotDispatch()
+    {
+        var claude = new RecordingDetector(AgentKind.Claude);
+        var classifier = new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { claude });
+
+        classifier.EmitAdvisoryAuditEvents(AgentKind.Claude, stderr: null, stdout: null, "work", "vm-1");
+        classifier.EmitAdvisoryAuditEvents(AgentKind.Claude, stderr: "", stdout: "", "work", "vm-1");
+
+        Assert.Empty(claude.Calls);
+    }
+
+    [Fact]
+    public void EmitAdvisoryAuditEvents_UnknownAgentKind_SilentlyNoOps()
+    {
+        var claude = new RecordingDetector(AgentKind.Claude);
+        var classifier = new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { claude });
+        var unknown = new AgentKind("mistral");
+
+        // Must not throw and must not dispatch to any registered detector.
+        classifier.EmitAdvisoryAuditEvents(unknown, "stderr", "stdout", "work", "vm-1");
+
+        Assert.Empty(claude.Calls);
+    }
+
+    private sealed record AdvisoryCall(string? Stderr, string? Stdout, string Phase, string? SandboxName);
+
+    private sealed class RecordingDetector : IAgentQuotaFailureDetector
+    {
+        public RecordingDetector(AgentKind kind) { Kind = kind; }
+        public AgentKind Kind { get; }
+        public List<AdvisoryCall> Calls { get; } = new();
+        public QuotaDetection? Detect(string? stderr, string? stdout) => null;
+        public void EmitAdvisoryAuditEvents(string? stderr, string? stdout, string phase, string? sandboxName) =>
+            Calls.Add(new AdvisoryCall(stderr, stdout, phase, sandboxName));
+    }
 }
