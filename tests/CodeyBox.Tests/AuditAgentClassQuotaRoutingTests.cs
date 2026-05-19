@@ -82,11 +82,149 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         Assert.Equal([AgentKind.Codex], auditor.Invocations);
     }
 
-    // Acceptance criterion #3 (all members exhausted → auditor skipped) is
-    // covered by AuditQuotaPauseTests.AuditLlmQuotaFailure_AllClassMembersExhausted_SkipsLlmAuditorAndContinues
-    // — it exercises the mid-iteration path via TerminalQuotaError + the
-    // wrapper's AgentClassExhaustedException; the LLM task body catches the
-    // exception and treats it as a skip rather than parking.
+    // ── Acceptance #3 (resolve-time path): every probe below floor → skip ─
+
+    [Fact]
+    public async Task AllClassMembersExhausted_AtResolveTime_AuditorSkippedAndItemCompletes()
+    {
+        // Bug 779e7dc9 acceptance #3 — resolve-time path. Every probed
+        // candidate (preferred audit agent + every class member) reports
+        // available below MinQuotaPct, so ResolveAuditAgentRunnerAsync returns
+        // null and the audit-loop body skips the LLM auditor for this
+        // iteration rather than parking the item. Mid-iteration coverage of
+        // the same acceptance is in AuditQuotaPauseTests.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Claude, AgentKind.Codex],
+            quotas: new()
+            {
+                [AgentKind.Gemini] = 1.0,
+                [AgentKind.Claude] = 2.0,
+                [AgentKind.Codex] = 3.0,
+            });
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Auditor never ran — resolver returned null before the auditor was
+        // dispatched into a sandbox. This is the resolve-time skip path.
+        Assert.Empty(auditor.Invocations);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+        // The fix guarantees the LastError never carries the old
+        // "agent exited 1" string when the auditor is skipped for quota.
+        Assert.DoesNotContain("agent exited 1", final.LastError ?? string.Empty);
+    }
+
+    // ── Probe-throws + UnknownPolicy branches in EvaluateAuditCandidateQuotaAsync ─
+
+    [Fact]
+    public async Task PreferredProbeThrows_FailOpen_AuditorRunsOnPreferredAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            throwingProbes: [AgentKind.Gemini],
+            unknownPolicy: QuotaUnknownPolicy.FailOpen);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // FailOpen treats a throwing probe as "available", so the preferred
+        // audit agent (gemini) is used — the chain walk is never entered.
+        Assert.Equal([AgentKind.Gemini], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredProbeThrows_FailCautious_AuditorFallsThroughToClassMember()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            throwingProbes: [AgentKind.Gemini],
+            unknownPolicy: QuotaUnknownPolicy.FailCautious);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // FailCautious treats the throwing preferred probe as "rejected",
+        // forcing fallback to the class chain — codex (the next available)
+        // runs the auditor.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredProbeUnknown_FailOpen_AuditorRunsOnPreferredAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new()
+            {
+                // Negative pct means "unknown" to ResolveMemberQuota.
+                [AgentKind.Gemini] = -1.0,
+                [AgentKind.Codex] = 80.0,
+            },
+            unknownPolicy: QuotaUnknownPolicy.FailOpen);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // FailOpen on an unknown probe value means the preferred agent is
+        // accepted as available.
+        Assert.Equal([AgentKind.Gemini], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredProbeUnknown_FailCautious_AuditorFallsThroughToClassMember()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new()
+            {
+                [AgentKind.Gemini] = -1.0,
+                [AgentKind.Codex] = 80.0,
+            },
+            unknownPolicy: QuotaUnknownPolicy.FailCautious);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // FailCautious rejects the unknown preferred probe; chain falls
+        // through to codex.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+    }
 
     // ── Harness ─────────────────────────────────────────────────────────────
 
@@ -94,7 +232,9 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         string seedRepoUrl,
         RecordingLlmAuditor auditor,
         IReadOnlyList<AgentKind> classMembers,
-        Dictionary<AgentKind, double>? quotas = null)
+        Dictionary<AgentKind, double>? quotas = null,
+        IReadOnlyList<AgentKind>? throwingProbes = null,
+        QuotaUnknownPolicy unknownPolicy = QuotaUnknownPolicy.UseObservedFailures)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -108,9 +248,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         var webhooks = new CapturingWebhookDispatcher();
 
         var agents = classMembers.Select(k => new ScriptableAgent(k)).ToList();
-        var gemini = agents.FirstOrDefault(a => a.Kind == AgentKind.Gemini);
         var codex = agents.FirstOrDefault(a => a.Kind == AgentKind.Codex);
-        var claude = agents.FirstOrDefault(a => a.Kind == AgentKind.Claude);
         var registry = new AgentRegistry([.. agents]);
 
         var frontier = new AgentClass
@@ -129,10 +267,14 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
                 .ToList(),
         };
 
+        var throwSet = throwingProbes is null
+            ? new HashSet<AgentKind>()
+            : new HashSet<AgentKind>(throwingProbes);
         var probes = classMembers
             .Select(kind => (IAgentQuotaProbe)new ConfigurableProbe(
                 kind,
-                quotas?.GetValueOrDefault(kind, 80.0) ?? 80.0))
+                quotas?.GetValueOrDefault(kind, 80.0) ?? 80.0,
+                shouldThrow: throwSet.Contains(kind)))
             .ToList();
 
         var router = new AgentClassRouter(
@@ -168,7 +310,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             sandboxes,
             gitHost,
             registry,
-            new StaticCredentialProvider(),
+            new PermissiveCredentialProvider(),
             prs,
             projects,
             new TestUpstreamFactory(),
@@ -178,7 +320,11 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: probes,
-            auditQuotaOptions: new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            auditQuotaOptions: new QuotaRouterOptions
+            {
+                MinQuotaPct = 10.0,
+                UnknownPolicy = unknownPolicy,
+            },
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(
@@ -188,7 +334,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             ]));
 
-        return new RoutingFixture(pipeline, store, webhooks, gemini, codex, claude);
+        return new RoutingFixture(pipeline, store, webhooks, codex);
     }
 
     private static WorkItem NewItem(AgentKind agent) => new()
@@ -221,11 +367,21 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
 
     private sealed class ConfigurableProbe : IAgentQuotaProbe
     {
+        private readonly bool _shouldThrow;
         private double _pct;
-        public ConfigurableProbe(AgentKind kind, double initialPct) { Kind = kind; _pct = initialPct; }
+        public ConfigurableProbe(AgentKind kind, double initialPct, bool shouldThrow = false)
+        {
+            Kind = kind;
+            _pct = initialPct;
+            _shouldThrow = shouldThrow;
+        }
         public AgentKind Kind { get; }
         public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-            => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _pct });
+        {
+            if (_shouldThrow)
+                throw new InvalidOperationException("probe failure (test)");
+            return Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _pct });
+        }
         public Task MarkExhaustedAsync(AgentMembership member, TimeSpan ttl, DateTimeOffset? resetAt = null, CancellationToken ct = default)
         {
             _pct = 0.0;
@@ -233,13 +389,23 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         }
     }
 
+    // Returns a non-null AgentCredential for every kind so the resolver's
+    // credential gate does not short-circuit to workRunner — quota routing
+    // is what these tests are actually exercising.
+    private sealed class PermissiveCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+            => Task.FromResult<AgentCredential?>(new AgentCredential(
+                agent,
+                EnvironmentVariables: new Dictionary<string, string>(),
+                Files: new Dictionary<string, string>()));
+    }
+
     private sealed record RoutingFixture(
         PipelineRunner Pipeline,
         SqliteWorkItemStore Store,
         CapturingWebhookDispatcher Webhooks,
-        ScriptableAgent? Gemini,
-        ScriptableAgent? Codex,
-        ScriptableAgent? Claude) : IDisposable
+        ScriptableAgent? Codex) : IDisposable
     {
         public void Dispose() => Store.Dispose();
     }

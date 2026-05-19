@@ -2355,20 +2355,6 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Resolves the <see cref="IAgentRunner"/> to use for a given LLM auditor,
-    /// applying the three-level hierarchy:
-    /// <list type="number">
-    ///   <item><see cref="ProjectAudit.PerAuditorAgent"/>[<paramref name="auditorName"/>] if present.</item>
-    ///   <item>Else <see cref="ProjectAudit.AuditAgent"/> if set.</item>
-    ///   <item>Else <paramref name="workRunner"/> (current behaviour, backwards compat).</item>
-    /// </list>
-    /// Falls back to <paramref name="workRunner"/> with a warning if the
-    /// configured audit agent is unregistered, has no credentials, or is below
-    /// its quota threshold (using the injected <see cref="IAgentQuotaProbe"/>s).
-    /// Resolved once per auditor per iteration; the result is reused for that
-    /// auditor's sandbox and prompt invocation.
-    /// </summary>
-    /// <summary>
     /// Picks the agent runner for an LLM-driven auditor invocation. Returns
     /// <c>null</c> only when the work item has a configured agent class AND
     /// every member of that class is quota-exhausted — the caller then skips
@@ -2433,7 +2419,6 @@ public sealed class PipelineRunner : IPipelineRunner
         if (preferredOk)
             return preferredRunner;
 
-        AuditLog.QuotaAuditFallthrough(preferredKind.Value, workRunner.Kind, auditorName);
         _log.LogInformation(
             "Audit agent '{AuditKind}' rejected ({Reason}) for auditor '{Auditor}'",
             preferredKind.Value.Value, preferredReason, auditorName);
@@ -2442,15 +2427,21 @@ public sealed class PipelineRunner : IPipelineRunner
         // agent. With no class configured, the operator hasn't opted into
         // class-aware audit routing, so the workRunner is the best we can do.
         if (_classRouter is null || classId is null)
+        {
+            AuditLog.QuotaAuditFallthrough(preferredKind.Value, workRunner.Kind, auditorName);
             return workRunner;
+        }
 
         // Walk the work item's class chain for an unexhausted candidate.
-        var classMembersTried = 0;
+        // quotaRejectedCount counts candidates rejected specifically for quota
+        // (including the preferred agent above) — this is what the
+        // LlmAuditorSkippedQuota event reports. Candidates skipped for other
+        // reasons (missing runner / credentials) are intentionally excluded.
+        var quotaRejectedCount = 1;   // the preferred agent we just rejected
         foreach (var member in _classRouter.OrderedFallbackCandidates(item, project))
         {
-            classMembersTried++;
             if (member.Agent == preferredKind.Value)
-                continue;   // already tried above
+                continue;   // already counted above
             if (!_agents.TryGet(member.Agent, out var memberRunner))
             {
                 _log.LogWarning(
@@ -2472,11 +2463,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogInformation(
                     "Class '{ClassId}' member '{Member}' rejected ({Reason}) for auditor '{Auditor}'",
                     classId, member.Agent.Value, memberReason, auditorName);
+                quotaRejectedCount++;
                 continue;
             }
             _log.LogInformation(
                 "Audit agent '{AuditKind}' exhausted; routing auditor '{Auditor}' to class member '{Member}'",
                 preferredKind.Value.Value, auditorName, member.Agent.Value);
+            // Emit the fallthrough audit-log only once the real fallback agent
+            // is picked. Earlier this fired unconditionally before the chain
+            // walk, naming workRunner — incorrect when the chain picks a
+            // different member.
+            AuditLog.QuotaAuditFallthrough(preferredKind.Value, member.Agent, auditorName);
             return memberRunner;
         }
 
@@ -2485,19 +2482,21 @@ public sealed class PipelineRunner : IPipelineRunner
         // exhausted, falling back to workRunner doesn't help. Skip the
         // auditor for this iteration — the rest of the audit set still runs
         // and the work item keeps progressing.
-        AuditLog.LlmAuditorSkippedQuota(item.Id, auditorName, classMembersTried);
+        AuditLog.LlmAuditorSkippedQuota(item.Id, auditorName, quotaRejectedCount);
         _log.LogWarning(
-            "LLM auditor '{Auditor}' skipped: all {Members} member(s) of class '{ClassId}' quota-exhausted",
-            auditorName, classMembersTried, classId);
+            "LLM auditor '{Auditor}' skipped: all {Members} candidate agent(s) of class '{ClassId}' quota-exhausted",
+            auditorName, quotaRejectedCount, classId);
         return null;
     }
 
     /// <summary>
-    /// Returns <c>(true, "ok")</c> when the candidate passes both the
-    /// observed-failure breaker and the live quota probe; otherwise returns
-    /// <c>(false, reason)</c> describing which gate rejected the candidate.
-    /// Mirrors the gating logic in <see cref="AgentClassRouter"/> so the work
-    /// and audit phases agree on what counts as "available".
+    /// Returns <c>(true, reason)</c> when the candidate passes both the
+    /// observed-failure breaker and the live quota probe (reason is a short
+    /// human-readable description like "available (80.0%)" or
+    /// "quota unknown; fail-open"); otherwise returns <c>(false, reason)</c>
+    /// describing which gate rejected the candidate. Mirrors the gating logic
+    /// in <see cref="AgentClassRouter"/> so the work and audit phases agree
+    /// on what counts as "available".
     /// </summary>
     private async Task<(bool Allowed, string Reason)> EvaluateAuditCandidateQuotaAsync(
         AgentKind kind, AgentMembership member, CancellationToken ct)
@@ -2561,8 +2560,12 @@ public sealed class PipelineRunner : IPipelineRunner
     /// When no class router is wired or the item has no agent class, the wrapper
     /// is a single-attempt pass-through — the original behaviour. When every
     /// class member is exhausted in this pickup, throws
-    /// <see cref="AgentClassExhaustedException"/> so the top-level
-    /// <see cref="RunAsync"/> can park the item in WaitingForQuotaReset.
+    /// <see cref="AgentClassExhaustedException"/>; what happens next depends on
+    /// the caller. The work-phase consumer (top-level <see cref="RunAsync"/>)
+    /// parks the item in WaitingForQuotaReset. The audit-phase consumer (the
+    /// per-auditor task body) catches the exception locally and skips that
+    /// LLM auditor for the iteration so the rest of the audit set can still
+    /// run and the work item keeps progressing.
     /// </para>
     /// <para>
     /// <paramref name="invoker"/> receives a trial <see cref="WorkItem"/> whose

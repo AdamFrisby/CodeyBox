@@ -76,6 +76,46 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditLlmQuotaFailure_FallbackSkipsCandidateWithRecentObservedFailure()
+    {
+        // Bug 779e7dc9 also added an observed-failure short-circuit to the
+        // in-iteration fallback loop in InvokeAgentWithQuotaFallbackAsync:
+        // candidates with a recent entry in IQuotaFailureStore.HasRecentAsync
+        // are skipped before the next attempt runs. This test pre-seeds an
+        // observation for claude, then makes the auditor fail on gemini so
+        // the fallback loop iterates [gemini→already-tried, claude→observed-
+        // failure skip, codex→picked]. Without the new branch, claude would
+        // be invoked first and the auditor would burn an extra round-trip on
+        // a known-bad agent.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var dbPath = Path.Combine(_workspace, $"quota-failures-{Guid.NewGuid():N}.db");
+        using var quotaFailures = new SqliteQuotaFailureStore(dbPath);
+        await quotaFailures.RecordAsync(
+            AgentKind.Claude, modelId: null,
+            QuotaFailureKind.LimitReached, DateTimeOffset.UtcNow);
+
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", invocation =>
+            invocation.Agent == AgentKind.Gemini ? QuotaResult() : new AuditResult(true, []));
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Claude, AgentKind.Codex],
+            quotaFailures: quotaFailures);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Auditor must NOT have been invoked on claude — the observed-failure
+        // skip branch in InvokeAgentWithQuotaFallbackAsync filters it out
+        // before the next attempt. Order must be exactly gemini→codex.
+        Assert.Equal([AgentKind.Gemini, AgentKind.Codex], auditor.Invocations);
+    }
+
+    [Fact]
     public async Task AuditLlmQuotaFailure_NoLongerParksWhenChainExhausted()
     {
         // Bug 779e7dc9: previously, when the audit-side quota fallback
@@ -105,7 +145,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
     private AuditQuotaFixture BuildFixture(
         string seedRepoUrl,
         RoutingLlmAuditor auditor,
-        IReadOnlyList<AgentKind> classMembers)
+        IReadOnlyList<AgentKind> classMembers,
+        IQuotaFailureStore? quotaFailures = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -120,9 +161,16 @@ public sealed class AuditQuotaPauseTests : IDisposable
         var queue = new InMemoryTaskQueue();
         var time = new ManualClock(DateTimeOffset.UtcNow);
 
-        var gemini = new ScriptableAgent(AgentKind.Gemini);
-        var codex = new ScriptableAgent(AgentKind.Codex);
-        var registry = new AgentRegistry([gemini, codex]);
+        // Register a ScriptableAgent for every class member so the routing test
+        // can exercise classes containing arbitrary agent kinds (the fallback
+        // loop test seeds gemini + claude + codex).
+        var agentSet = new HashSet<AgentKind>(classMembers);
+        agentSet.Add(AgentKind.Gemini);
+        agentSet.Add(AgentKind.Codex);
+        var scriptedAgents = agentSet.ToDictionary(k => k, k => new ScriptableAgent(k));
+        var gemini = scriptedAgents[AgentKind.Gemini];
+        var codex = scriptedAgents[AgentKind.Codex];
+        var registry = new AgentRegistry(scriptedAgents.Values.Cast<IAgentRunner>().ToArray());
 
         var frontier = new AgentClass
         {
@@ -200,6 +248,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             retryScheduler: scheduler,
             classRouter: router,
             fallbackHistory: fallbackHistory,
+            quotaFailures: quotaFailures,
             quotaClassifier: new CompositeQuotaFailureClassifier(
             [
                 new ClaudeQuotaFailureDetector(),
@@ -207,7 +256,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             ]));
 
-        return new AuditQuotaFixture(pipeline, scheduler, store, queue, webhooks, fallbackHistory, time, gemini);
+        return new AuditQuotaFixture(pipeline, scheduler, store, queue, webhooks, fallbackHistory, time, gemini, codex);
     }
 
     private static WorkItem NewItem(AgentKind agent) => new()
@@ -275,7 +324,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
         CapturingWebhookDispatcher Webhooks,
         InMemoryAgentFallbackHistoryStore FallbackHistory,
         ManualClock Time,
-        ScriptableAgent Gemini) : IDisposable
+        ScriptableAgent Gemini,
+        ScriptableAgent Codex) : IDisposable
     {
         public void Dispose()
         {
