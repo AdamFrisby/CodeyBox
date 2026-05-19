@@ -74,6 +74,7 @@ Audit-tier events additionally carry:
 | `work_item.transitioned` | Info | `PipelineRunner.Transition` | `WorkItemId`, `State` (target state) |
 | `work_item.cancelled` | Info | `PipelineRunner.RunAsync` (cancellation handler) | `WorkItemId` |
 | `work_item.failed` | Warning | `PipelineRunner.TransitionFailed` | `WorkItemId`, `Error` |
+| `work_item.transient_cancel_retried` | Warning | `PipelineRunner.HandleTransientCancellationAsync` | `WorkItemId`, `Phase`, `CancellationSource`, `Attempt`, `MaxAttempts` |
 
 ### Agent execution
 

@@ -118,6 +118,36 @@ Returns 409 when `cancellationReason=OperatorRequested` — use `POST /workitems
 
 When the recovery loop has retried an item more than `CodeyBox:WorkerPool:MaxRecoveryAttempts` times (default 3) without it ever reaching a terminal state, the item is transitioned to `AbandonedAfterRecoveryAttempts` with a descriptive `lastError`. Use `POST /workitems/{id}/retry` to resume manually after investigating the root cause.
 
+### Cancellation source attribution
+
+When a pipeline phase is interrupted by `OperationCanceledException`, the orchestrator now attributes the cancellation to a stable source label, persisted as `cancellationSource` on the work item and surfaced in `lastError` / webhook events. This replaces the previously-conflated `failureKind=timeout` / `lastError='A task was canceled.'` shape that made it impossible to tell apart a real configured timeout from a transient host-side cancellation.
+
+| `cancellationSource` | Meaning | `failureKind` on Failed | Auto-retry? |
+|----------------------|---------|-------------------------|-------------|
+| `operator` | `DELETE /workitems/{id}` (or the orchestrator's per-item registration token) | (state goes to `Cancelled`, not Failed) | No |
+| `host-shutdown` | `IHostApplicationLifetime.ApplicationStopping` fired | (item left mid-flight for recovery loop) | n/a — recovery owns it |
+| `host-shutdown-deadline` | Host shutdown grace expired before the phase drained | `cancelled` | Yes (transient) |
+| `stuck-probe` | Stuck-probe detected zero-activity threshold and killed the phase | `agent` | Per `AutoRetryOnStuck` |
+| `timeout:<phase>` | Configured per-phase wall-clock cap fired (`WorkTimeout`, `MergeTimeout`, `Audit.PerIterationTimeout`) | `timeout` | No |
+| `unknown` | OCE propagated past every attribution hook — typically a leaked supervisor token in the orchestrator host | `cancelled` | Yes (transient) |
+
+#### Transient-cancel auto-retry
+
+When `cancellationSource` resolves to a transient label (`unknown` or `host-shutdown-deadline`) — i.e. neither operator intent nor a configured timeout — the orchestrator auto-retries the item from a recoverable pre-phase state instead of failing it outright. This matches the "pause not fail" guarantee for transient issues and avoids losing hours of rework when an unattributed host hiccup interrupts an expensive run.
+
+The retry counter is `transientCancelRetries`, capped by `CodeyBox:WorkerPool:MaxTransientCancelRetries` (default 3). Past the cap, the item transitions to `Failed` with `failureKind=cancelled` and a pointed error message identifying the suspected cause (typically: "supervisor/cancellation-token leak in the orchestrator host"). Set `MaxTransientCancelRetries=0` to disable the auto-retry path entirely and surface every transient cancellation immediately.
+
+The resume-state mapping mirrors the dead-worker reaper / startup replay:
+
+| Cancelled phase | Resume state |
+|-----------------|--------------|
+| `work` / `rework-resume` | `Queued` (work phase rerun) |
+| `rework` / `audit` | `WorkComplete` (audit phase rerun) |
+| `merge` | `AuditPassed` (merge phase rerun) |
+| `upstream` | `Merged` (upstream push rerun) |
+
+Auto-retry events emit `work_item.transient_cancel_retried` (audit-log level Warning) with phase, source, attempt, and max so dashboards can isolate host-hiccup churn from quota or operator-driven retries.
+
 ---
 
 ## Inspecting blast radius

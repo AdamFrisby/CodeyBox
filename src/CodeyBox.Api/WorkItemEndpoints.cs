@@ -1360,7 +1360,9 @@ internal static class WorkItemEndpoints
             QuotaRetryFrom: item.QuotaRetryFrom,
             Usage: usage?.Iteration,
             UsageTotal: usage?.Total,
-            Priority: item.Priority);
+            Priority: item.Priority,
+            CancellationSource: item.CancellationSource,
+            TransientCancelRetries: item.TransientCancelRetries);
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -1566,7 +1568,9 @@ public sealed record WorkItemDto(
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     WorkItemUsageTotal? UsageTotal = null,
     IReadOnlyList<AgentFallbackDto>? FallbackHistory = null,
-    int Priority = 0);
+    int Priority = 0,
+    string? CancellationSource = null,
+    int TransientCancelRetries = 0);
 
 public sealed record AgentFallbackDto(
     string Id,

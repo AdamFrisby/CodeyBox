@@ -96,6 +96,27 @@ public sealed record WorkItem
     public WorkItemCancellationReason? CancellationReason { get; init; }
 
     /// <summary>
+    /// Stable label for which contributor first cancelled the most recent
+    /// pipeline phase — see <see cref="CancellationSources"/>. Populated when
+    /// <see cref="State"/> is <see cref="WorkItemState.Failed"/> with
+    /// <see cref="FailureKind"/> = "timeout" or "cancelled", and preserved
+    /// across an auto-retry so operators can still see the trigger after a
+    /// successful re-run. Null for items that never hit cancellation.
+    /// </summary>
+    public string? CancellationSource { get; init; }
+
+    /// <summary>
+    /// Number of times this work item has been automatically re-queued from a
+    /// transient host-side cancellation (i.e. an OCE whose contributor we
+    /// couldn't attribute to an operator cancel, configured timeout, host
+    /// shutdown, or stuck probe). Capped by
+    /// <see cref="OrchestratorOptions.MaxTransientCancelRetries"/>; further
+    /// transient cancellations after the cap are surfaced as Failed with a
+    /// pointed error message instead of being retried silently.
+    /// </summary>
+    public int TransientCancelRetries { get; init; }
+
+    /// <summary>
     /// How many times the recovery loop has reset this item from a mid-flight
     /// state back to a recoverable state after successive host shutdowns. When
     /// this reaches <c>OrchestratorOptions.MaxRecoveryAttempts</c> the item is
@@ -222,7 +243,8 @@ public sealed record WorkItem
         string? error = null,
         WorkItemCancellationReason? cancellationReason = null,
         string? failureKind = null,
-        DateTimeOffset? quotaResetAt = null) => this with
+        DateTimeOffset? quotaResetAt = null,
+        string? cancellationSource = null) => this with
         {
             State = state,
             LastError = error,
@@ -236,6 +258,12 @@ public sealed record WorkItem
             QuotaRetryFrom = IsQuotaShapedState(state) ? QuotaRetryFrom : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
             CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
+            // CancellationSource is preserved on Failed (so triage shows what cancelled the
+            // phase) and on Cancelled (so we record whether the cancel came from operator
+            // vs host shutdown deadline). Cleared on Queued/successful states.
+            CancellationSource = IsCancellationSourceCarryingState(state)
+                ? (cancellationSource ?? CancellationSource)
+                : null,
             UpdatedAt = DateTimeOffset.UtcNow,
             // Clear StartedAt when re-queuing: retried items must not appear in-flight
             // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
@@ -249,4 +277,7 @@ public sealed record WorkItem
 
     private static bool IsQuotaShapedState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
+
+    private static bool IsCancellationSourceCarryingState(WorkItemState state) =>
+        state is WorkItemState.Failed or WorkItemState.Cancelled;
 }

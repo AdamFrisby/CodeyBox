@@ -768,6 +768,22 @@ public sealed class OrchestratorService : BackgroundService
             {
                 await _pipeline.RunAsync(item, registration.Token, ct);
             }
+            catch (PhaseCancellationException pex) when (ct.IsCancellationRequested)
+            {
+                // Host shutdown that bubbled all the way back up — log structured
+                // attribution so post-incident triage can correlate the worker
+                // exit with the phase + source the pipeline saw.
+                _log.LogInformation(
+                    "Worker {WorkerId} item {Id} aborted by host shutdown: phase={Phase} source={CancellationSource}",
+                    workerIndex, id, pex.Phase, pex.Source);
+                return;
+            }
+            catch (PhaseCancellationException pex)
+            {
+                _log.LogInformation(
+                    "Worker {WorkerId} item {Id} cancelled in phase {Phase}: source={CancellationSource}",
+                    workerIndex, id, pex.Phase, pex.Source);
+            }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 return;
@@ -964,6 +980,26 @@ public sealed record OrchestratorOptions
     /// item will be re-enqueued on every orchestrator restart without bound).
     /// </summary>
     public int MaxRecoveryAttempts { get; init; } = 10;
+
+    /// <summary>
+    /// Maximum number of times a work item will be silently re-queued after a
+    /// transient host-side cancellation — i.e. an <see cref="OperationCanceledException"/>
+    /// whose contributor the pipeline couldn't attribute to an operator cancel,
+    /// configured per-phase timeout, host shutdown, or stuck-probe. Past this
+    /// cap, the item transitions to <see cref="WorkItemState.Failed"/> with
+    /// <c>failureKind=cancelled</c> and a pointed error message instead of
+    /// being retried again.
+    ///
+    /// <para>
+    /// Default 3: expensive items can survive a small number of transient
+    /// host hiccups (TaskCanceledException from a leaked supervisor token,
+    /// a brief network glitch surfaced as cancellation, etc.) without
+    /// burning a $1K rework iteration. Set to 0 to disable the auto-retry
+    /// path entirely — every unattributed cancellation will surface as Failed
+    /// immediately, preserving the operator's full attention.
+    /// </para>
+    /// </summary>
+    public int MaxTransientCancelRetries { get; init; } = 3;
 
     public AutoRetryOnQuotaFailureOptions AutoRetryOnQuotaFailure { get; init; } = new();
 

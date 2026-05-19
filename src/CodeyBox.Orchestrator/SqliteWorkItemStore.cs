@@ -136,6 +136,17 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Index for the priority-aware pickup query: state filter first, then priority,
         // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
+
+        // Additive migration: capture the first contributor that cancelled a
+        // pipeline phase so the operator can distinguish a configured timeout
+        // ("timeout:work") from a transient host-side cancellation ("unknown").
+        // NULL means legacy row or never-cancelled item.
+        RunMigration("ALTER TABLE work_items ADD COLUMN cancellation_source TEXT;");
+
+        // Additive migration: counts auto-retries triggered by transient
+        // (unattributed) host-side cancellations. Default 0 keeps existing rows
+        // eligible for the auto-retry path on their next transient failure.
+        RunMigration("ALTER TABLE work_items ADD COLUMN transient_cancel_retries INTEGER NOT NULL DEFAULT 0;");
     }
 
     private void RunMigration(string sql)
@@ -165,11 +176,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                     stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                     min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
-                    failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority)
+                    failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
+                    cancellation_source, transient_cancel_retries)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                     $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                     $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
-                    $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority);
+                    $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
+                    $cancellation_source, $transient_cancel_retries);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -213,7 +226,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
-                    auditor_profile = $auditor_profile
+                    auditor_profile = $auditor_profile,
+                    cancellation_source = $cancellation_source,
+                    transient_cancel_retries = $transient_cancel_retries
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -252,7 +267,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
-                    auditor_profile = $auditor_profile
+                    auditor_profile = $auditor_profile,
+                    cancellation_source = $cancellation_source,
+                    transient_cancel_retries = $transient_cancel_retries
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -625,6 +642,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$quota_retry_from", (object?)item.QuotaRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$priority", item.Priority);
+        cmd.Parameters.AddWithValue("$cancellation_source", (object?)item.CancellationSource ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$transient_cancel_retries", item.TransientCancelRetries);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -665,6 +684,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         QuotaRetryFrom = ReadNullableString(r, "quota_retry_from"),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),
         Priority = ReadInt32OrDefault(r, "priority", defaultValue: 0),
+        CancellationSource = ReadNullableString(r, "cancellation_source"),
+        TransientCancelRetries = ReadInt32OrDefault(r, "transient_cancel_retries", defaultValue: 0),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)

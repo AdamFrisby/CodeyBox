@@ -47,6 +47,20 @@ public static class AuditLog
         Audit("work_item.retried")
             .Information("Work item {WorkItemId} retried from phase {From}", id.ToString(), from);
 
+    /// <summary>
+    /// Emitted when the pipeline auto-retries a work item after a transient
+    /// (unattributed) host-side cancellation. Distinct from
+    /// <see cref="WorkItemRetried"/> (operator-driven retry) and the
+    /// quota-router retry path so dashboards can isolate cancellation noise
+    /// from quota churn or operator activity.
+    /// </summary>
+    public static void WorkItemTransientCancelRetried(
+        WorkItemId id, string phase, string cancellationSource, int attempt, int maxAttempts) =>
+        Audit("work_item.transient_cancel_retried")
+            .Warning(
+                "Work item {WorkItemId} auto-retried after transient cancellation: phase={Phase} source={CancellationSource} attempt={Attempt}/{MaxAttempts}",
+                id.ToString(), phase, cancellationSource, attempt, maxAttempts);
+
     public static void WorkItemRecovered(WorkItemId id, string fromState, string toState, int attempt) =>
         Audit("work_item.recovered")
             .Information(
