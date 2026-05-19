@@ -66,4 +66,41 @@ public sealed class ClaudeQuotaFailureDetectorTests
         // would defeat the per-provider boundary the composite enforces.
         Assert.Null(_detector.Detect(stderr: null, stdout: stdout));
     }
+
+    [Fact]
+    public void Detect_Claude401Stderr_NoLongerClassifiedAsQuotaEvent()
+    {
+        // Claude 401 is intentionally not classified as a quota failure — it
+        // is dominated by the shared-OAuth refresh race and recording it as
+        // Unauthorized would pin Claude as unavailable for the breaker window.
+        // See ClaudeQuotaFailureDetector class summary.
+        Assert.Null(_detector.Detect(stderr: "API Error: 401 unauthorized", stdout: null));
+    }
+
+    [Fact]
+    public void Detect_Claude401StreamJson_NoLongerClassifiedAsQuotaEvent()
+    {
+        var stdout = """{"type":"result","subtype":"error","is_error":true,"result":"API Error: 401 — your token expired"}""";
+        Assert.Null(_detector.Detect(stderr: null, stdout: stdout));
+    }
+
+    [Theory]
+    [InlineData("API Error: 401 unauthorized", null)]
+    [InlineData(null, "API Error: 401 — token expired")]
+    [InlineData(null, """{"type":"result","subtype":"error","is_error":true,"result":"API Error: 401"}""")]
+    [InlineData("rate_limit_exceeded but mentions API Error: 401", null)]
+    public void IsUnauthorizedSignal_DetectsAcrossStreams(string? stderr, string? stdout)
+    {
+        Assert.True(ClaudeQuotaFailureDetector.IsUnauthorizedSignal(stderr, stdout));
+    }
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("rate_limit_exceeded", null)]
+    [InlineData("", "")]
+    [InlineData("API Error: 500", null)]
+    public void IsUnauthorizedSignal_ReturnsFalseWhenNo401(string? stderr, string? stdout)
+    {
+        Assert.False(ClaudeQuotaFailureDetector.IsUnauthorizedSignal(stderr, stdout));
+    }
 }

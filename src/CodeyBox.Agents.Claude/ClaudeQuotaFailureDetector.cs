@@ -5,24 +5,69 @@ using CodeyBox.Core;
 namespace CodeyBox.Agents.Claude;
 
 /// <summary>
-/// Recognises quota / rate-limit / auth failures emitted by the Claude Code CLI.
+/// Recognises quota / rate-limit failures emitted by the Claude Code CLI.
 ///
 /// Sources scanned:
 /// <list type="bullet">
-///   <item>stderr / stdout text (e.g. <c>rate_limit_exceeded</c>, <c>API Error: 401</c>).</item>
+///   <item>stderr / stdout text (e.g. <c>rate_limit_exceeded</c>).</item>
 ///   <item>Stream-json error events: <c>{"type":"result","is_error":true,"result":"..."}</c>
 ///         (with optional <c>subtype:"error"</c>).</item>
 /// </list>
+///
+/// <para><b>401 / Unauthorized is deliberately NOT classified as a quota
+/// failure here.</b> Anthropic's single-use refresh tokens, combined with the
+/// host <c>claude</c> CLI rotating concurrently with in-VM CLI invocations,
+/// produce intermittent 401s even though the user's subscription is fully
+/// available. Treating those as <c>QuotaFailureKind.Unauthorized</c> would
+/// trip the observed-failure breaker and pin Claude as unusable for the full
+/// breaker window, defeating the fallback chain. 401s are surfaced separately
+/// via <see cref="IsUnauthorizedSignal"/> so callers can audit-log them as
+/// auth/transient events without recording them as quota events. The
+/// shared-OAuth race itself is largely closed by stripping the refresh_token
+/// from the bundle materialised into the VM (see
+/// <c>ClaudeOAuthFileCredentialProvider</c>); this stopgap covers the residual
+/// expired-access-token case.</para>
 /// </summary>
 public sealed class ClaudeQuotaFailureDetector : IAgentQuotaFailureDetector
 {
     public AgentKind Kind => AgentKind.Claude;
 
+    /// <summary>
+    /// stderr/stdout substring marking a Claude CLI 401 / Unauthorized response.
+    /// Centralised so the detector and any audit-log emitter agree on the
+    /// pattern.
+    /// </summary>
+    internal const string UnauthorizedSignal = "API Error: 401";
+
     private static readonly (string Pattern, QuotaFailureKind Kind)[] Patterns =
     [
         ("rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded),
-        ("API Error: 401", QuotaFailureKind.Unauthorized),
     ];
+
+    /// <summary>
+    /// Returns true when the captured streams carry the Claude 401 marker.
+    /// Used to emit a distinguishing audit-log line without classifying the
+    /// failure as a quota event — see the class summary for the rationale.
+    /// </summary>
+    public static bool IsUnauthorizedSignal(string? stderr, string? stdout)
+    {
+        if (!string.IsNullOrEmpty(stderr) && stderr.Contains(UnauthorizedSignal, StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (!string.IsNullOrEmpty(stdout) && stdout.Contains(UnauthorizedSignal, StringComparison.OrdinalIgnoreCase))
+            return true;
+        foreach (var msg in ExtractStreamJsonErrorMessages(stdout))
+        {
+            if (msg.Contains(UnauthorizedSignal, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    public void EmitAdvisoryAuditEvents(string? stderr, string? stdout, string phase, string? sandboxName)
+    {
+        if (IsUnauthorizedSignal(stderr, stdout))
+            AuditLog.ClaudeUnauthorizedObserved(phase, sandboxName);
+    }
 
     public QuotaDetection? Detect(string? stderr, string? stdout)
     {

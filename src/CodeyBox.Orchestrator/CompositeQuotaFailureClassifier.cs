@@ -23,6 +23,15 @@ public interface IQuotaFailureClassifier
         CancellationToken ct,
         ProjectId? projectId = null,
         string? stdout = null);
+
+    /// <summary>
+    /// Dispatches to the per-agent detector's
+    /// <see cref="IAgentQuotaFailureDetector.EmitAdvisoryAuditEvents"/> hook so
+    /// per-provider non-quota failure signals (e.g. Claude 401) can produce
+    /// agent-specific audit-log lines without leaking provider knowledge into
+    /// the orchestrator. Safe to call regardless of whether the agent failed.
+    /// </summary>
+    void EmitAdvisoryAuditEvents(AgentKind agent, string? stderr, string? stdout, string phase, string? sandboxName);
 }
 
 public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier
@@ -43,6 +52,14 @@ public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier
         return _detectors.TryGetValue(agent, out var detector)
             ? detector.Detect(stderr, stdout)
             : null;
+    }
+
+    public void EmitAdvisoryAuditEvents(AgentKind agent, string? stderr, string? stdout, string phase, string? sandboxName)
+    {
+        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
+            return;
+        if (_detectors.TryGetValue(agent, out var detector))
+            detector.EmitAdvisoryAuditEvents(stderr, stdout, phase, sandboxName);
     }
 
     public async Task RecordIfQuotaFailureAsync(
