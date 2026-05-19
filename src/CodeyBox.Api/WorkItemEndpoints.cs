@@ -813,8 +813,18 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
-    /// Partially update a Queued work item's title, prompt, and/or agent.
-    /// Returns 409 Conflict when the item is no longer in Queued state.
+    /// Partially update a Queued work item's editable fields (title, prompt,
+    /// agent, work/merge timeouts, min model score). Returns 409 Conflict when
+    /// the item is no longer in Queued state.
+    ///
+    /// Timeout / score fields are clamped using the same bounds as creation —
+    /// out-of-range values do not error, they pin to the boundary so an
+    /// operator-led bulk-PATCH of a queue after a defaults bump never 400s.
+    ///
+    /// Priority is NOT modifiable via this endpoint: the store's TryUpdateIfStateAsync
+    /// deliberately omits the priority column (see commit 31789f7 — UpdatePriorityAsync
+    /// is the TOCTOU-safe partial-UPDATE path). Use PATCH /workitems/{id}/priority
+    /// for priority changes.
     /// </summary>
     private static async Task<IResult> PatchWorkItemAsync(
         string id,
@@ -832,19 +842,20 @@ internal static class WorkItemEndpoints
             return Results.Conflict(new { error = $"cannot edit item in state {item.State}; only Queued items are editable" });
 
         var updated = item;
+        var now = DateTimeOffset.UtcNow;
 
         if (body.Title is not null)
         {
             try { Validation.ValidateNoOptionLikeOrControl(body.Title, nameof(body.Title)); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
             if (body.Title.Length > 200) return Results.BadRequest(new { error = "title must be <= 200 chars" });
-            updated = updated with { Title = body.Title, UpdatedAt = DateTimeOffset.UtcNow };
+            updated = updated with { Title = body.Title, UpdatedAt = now };
         }
 
         if (body.Prompt is not null)
         {
             if (body.Prompt.Length > 64 * 1024) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
-            updated = updated with { Prompt = body.Prompt, UpdatedAt = DateTimeOffset.UtcNow };
+            updated = updated with { Prompt = body.Prompt, UpdatedAt = now };
         }
 
         if (body.Agent is not null)
@@ -852,8 +863,17 @@ internal static class WorkItemEndpoints
             var kind = new AgentKind(body.Agent);
             if (!agents.TryGet(kind, out _))
                 return Results.BadRequest(new { error = $"unknown agent '{body.Agent}'", available = agents.Available.Select(a => a.Value) });
-            updated = updated with { Agent = kind, UpdatedAt = DateTimeOffset.UtcNow };
+            updated = updated with { Agent = kind, UpdatedAt = now };
         }
+
+        if (body.WorkTimeoutMinutes is { } w)
+            updated = updated with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)), UpdatedAt = now };
+
+        if (body.MergeTimeoutMinutes is { } m)
+            updated = updated with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)), UpdatedAt = now };
+
+        if (body.MinModelScore is { } minScore)
+            updated = updated with { MinModelScore = Math.Clamp(minScore, 0, 200), UpdatedAt = now };
 
         // TryUpdateIfStateAsync guards against a race where the orchestrator picks
         // up the item between the GetAsync above and this write.
@@ -865,7 +885,10 @@ internal static class WorkItemEndpoints
             updated.Id,
             titleChanged: body.Title is not null,
             promptChanged: body.Prompt is not null,
-            agentChanged: body.Agent is not null);
+            agentChanged: body.Agent is not null,
+            workTimeoutChanged: body.WorkTimeoutMinutes is not null,
+            mergeTimeoutChanged: body.MergeTimeoutMinutes is not null,
+            minModelScoreChanged: body.MinModelScore is not null);
 
         var statesById = new Dictionary<WorkItemId, WorkItemState>();
         var depExternalIds = new Dictionary<WorkItemId, string?>();
@@ -1521,7 +1544,10 @@ public sealed record RetryWorkItemRequest(string? From);
 public sealed record PatchWorkItemRequest(
     string? Title = null,
     string? Prompt = null,
-    string? Agent = null);
+    string? Agent = null,
+    int? WorkTimeoutMinutes = null,
+    int? MergeTimeoutMinutes = null,
+    int? MinModelScore = null);
 
 public sealed record PatchPriorityRequest(int Priority);
 

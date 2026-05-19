@@ -743,20 +743,25 @@ Returns `202 Accepted`.
 
 ### `PATCH /workitems/{id}`
 
-Partially update a **Queued** work item's `title`, `prompt`, and/or `agent`.
-Only fields provided (non-null) in the body are updated.
+Partially update a **Queued** work item's editable fields. Only fields
+provided (non-null) in the body are updated.
 
 ```json
 {
   "title": "optional new title",
   "prompt": "optional new prompt text",
-  "agent": "optional agent override"
+  "agent": "optional agent override",
+  "workTimeoutMinutes": 240,
+  "mergeTimeoutMinutes": 60,
+  "minModelScore": 70
 }
 ```
 
 * Returns `200 OK` with the updated work item record.
 * Returns `409 Conflict` when the item is not in `Queued` state (in-flight items are read-only).
 * Validation rules for `title`, `prompt`, and `agent` are identical to `POST /workitems`.
+* `workTimeoutMinutes` is clamped to `[1, 480]`, `mergeTimeoutMinutes` to `[1, 240]`, `minModelScore` to `[0, 200]` — out-of-range values pin to the boundary rather than 400, matching the creation surface. This lets an operator bulk-PATCH the queue after a defaults bump without special-casing stray inputs.
+* Priority is not editable here — use `PATCH /workitems/{id}/priority` (works on any non-terminal state, uses a TOCTOU-safe partial UPDATE).
 
 ### `PATCH /workitems/{id}/priority`
 

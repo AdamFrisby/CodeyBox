@@ -110,6 +110,9 @@ public sealed class PatchWorkItemRequest
     public string? Title { get; set; }
     public string? Prompt { get; set; }
     public string? Agent { get; set; }
+    public int? WorkTimeoutMinutes { get; set; }
+    public int? MergeTimeoutMinutes { get; set; }
+    public int? MinModelScore { get; set; }
 }
 
 /// <summary>Request body for POST /workitems/reorder.</summary>

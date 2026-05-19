@@ -282,4 +282,246 @@ public sealed class PatchWorkItemHttpTests : IDisposable
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
+
+    // ── Timeout / score / priority patches ──────────────────────────────────
+    //
+    // These guard the operator-led defaults-migration path: when WorkItem
+    // defaults change (commit c980620 bumped WorkTimeout 60→240m), pre-existing
+    // Queued items keep their old persisted value and die at the old wall. PATCH
+    // lets the operator bulk-bump those items in place without losing queue
+    // position or breaking dependsOn references.
+
+    [Fact]
+    public async Task PatchWorkTimeout_WhenQueued_PersistsAndReturnsNewValue()
+    {
+        var item = QueuedItem() with { WorkTimeout = TimeSpan.FromMinutes(60) };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { workTimeoutMinutes = 240 });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(TimeSpan.FromMinutes(240), fetched!.WorkTimeout);
+    }
+
+    [Fact]
+    public async Task PatchMergeTimeout_WhenQueued_Persists()
+    {
+        var item = QueuedItem() with { MergeTimeout = TimeSpan.FromMinutes(15) };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { mergeTimeoutMinutes = 60 });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(TimeSpan.FromMinutes(60), fetched!.MergeTimeout);
+    }
+
+    [Fact]
+    public async Task PatchWorkTimeout_AboveMax_ClampsToBoundary()
+    {
+        // Mirrors POST /workitems behaviour: out-of-range values clamp silently
+        // rather than 400. This is intentional so an operator bulk-bumping a
+        // queue after a defaults change never has to special-case stray inputs.
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { workTimeoutMinutes = 9999 });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(TimeSpan.FromMinutes(480), fetched!.WorkTimeout);
+    }
+
+    [Fact]
+    public async Task PatchWorkTimeout_BelowMin_ClampsToOne()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { workTimeoutMinutes = 0 });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(TimeSpan.FromMinutes(1), fetched!.WorkTimeout);
+    }
+
+    [Fact]
+    public async Task PatchMergeTimeout_AboveMax_ClampsTo240()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { mergeTimeoutMinutes = 9999 });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(TimeSpan.FromMinutes(240), fetched!.MergeTimeout);
+    }
+
+    [Fact]
+    public async Task PatchMinModelScore_WhenQueued_PersistsClamped()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { minModelScore = 80 });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(80, fetched!.MinModelScore);
+    }
+
+    [Fact]
+    public async Task PatchMinModelScore_AboveMax_ClampsTo200()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { minModelScore = 9999 });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(200, fetched!.MinModelScore);
+    }
+
+    [Fact]
+    public async Task PatchPriority_FieldIsIgnoredSilently()
+    {
+        // Sanity check: the JSON binder accepts unknown fields, so a request body
+        // with `priority` (which is NOT in PatchWorkItemRequest) just no-ops on
+        // priority. Operators wanting to change priority must use
+        // PATCH /workitems/{id}/priority. See the endpoint summary for why
+        // priority isn't on this request: it has its own TOCTOU-safe partial
+        // UPDATE column path that TryUpdateIfStateAsync deliberately bypasses.
+        var item = QueuedItem() with { ProjectId = new ProjectId("test-project"), Priority = 0 };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { priority = 250, title = "still-patches-other-fields" });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(0, fetched!.Priority);
+        Assert.Equal("still-patches-other-fields", fetched.Title);
+    }
+
+    [Fact]
+    public async Task PatchWorkTimeout_WhenNotQueued_Returns409()
+    {
+        var item = QueuedItem() with
+        {
+            State = WorkItemState.Working,
+            WorkTimeout = TimeSpan.FromMinutes(60),
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { workTimeoutMinutes = 240 });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(TimeSpan.FromMinutes(60), fetched!.WorkTimeout);
+    }
+
+    [Fact]
+    public async Task PatchMergeTimeout_WhenAuditing_Returns409()
+    {
+        var item = QueuedItem() with
+        {
+            State = WorkItemState.Auditing,
+            MergeTimeout = TimeSpan.FromMinutes(15),
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { mergeTimeoutMinutes = 60 });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(TimeSpan.FromMinutes(15), fetched!.MergeTimeout);
+    }
+
+    [Fact]
+    public async Task PatchCombinedFields_AppliesAllInOneCall()
+    {
+        // Operator-led bulk migration: one PATCH that updates both timeouts
+        // and the model-score floor. Validates that the handler accumulates
+        // the with-clones rather than silently dropping fields.
+        var item = QueuedItem() with
+        {
+            WorkTimeout = TimeSpan.FromMinutes(60),
+            MergeTimeout = TimeSpan.FromMinutes(15),
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new
+            {
+                workTimeoutMinutes = 240,
+                mergeTimeoutMinutes = 60,
+                minModelScore = 70,
+            });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(TimeSpan.FromMinutes(240), fetched!.WorkTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(60), fetched.MergeTimeout);
+        Assert.Equal(70, fetched.MinModelScore);
+    }
+
+    [Fact]
+    public async Task PatchWorkTimeout_PreBumpSimulation_ItemPicksUpNewCap()
+    {
+        // End-to-end simulation of the bug-report scenario:
+        //   1. Item created under the OLD 60-minute default.
+        //   2. Defaults bump ships; the item is still Queued.
+        //   3. Operator PATCHes the new cap onto the item.
+        //   4. Dispatch reads the patched timeout, not the old default.
+        var item = QueuedItem() with { WorkTimeout = TimeSpan.FromMinutes(60) };
+        await _factory.Store.CreateAsync(item);
+
+        var patch = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { workTimeoutMinutes = 240 });
+        Assert.Equal(HttpStatusCode.OK, patch.StatusCode);
+
+        // Re-read as the dispatcher would: the next pickup sees the patched value.
+        var ready = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, ready!.State);
+        Assert.Equal(TimeSpan.FromMinutes(240), ready.WorkTimeout);
+
+        // Verify queue position survived the patch — operator must not lose
+        // ordering when bulk-bumping the queue.
+        Assert.Equal(item.QueuePosition, ready.QueuePosition);
+    }
 }
