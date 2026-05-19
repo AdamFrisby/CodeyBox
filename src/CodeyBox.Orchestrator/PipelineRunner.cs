@@ -1354,6 +1354,8 @@ public sealed class PipelineRunner : IPipelineRunner
             // Per-provider detector (registered as IQuotaFailureClassifier) inspects
             // stderr/stdout and structured stream events. Per-CLI classification +
             // reset-window parsing now live in the per-provider library.
+            _quotaClassifier.EmitAdvisoryAuditEvents(
+                runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
             var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
             if (detection is not null)
             {
@@ -2246,6 +2248,8 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!needsCreds || (run.Result.AgentStderr is null && run.Result.AgentStdout is null))
             return;
 
+        _quotaClassifier.EmitAdvisoryAuditEvents(
+            run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout, "audit", sandboxName: null);
         var quotaDetection = _quotaClassifier.Detect(
             run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
         await _quotaClassifier.RecordIfQuotaFailureAsync(
@@ -3044,6 +3048,8 @@ public sealed class PipelineRunner : IPipelineRunner
         LogAgentOutput(_log, runner.Kind, agentResult);
         if (!agentResult.Success)
         {
+            _quotaClassifier.EmitAdvisoryAuditEvents(
+                runner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
             var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
             if (detection is not null)
             {

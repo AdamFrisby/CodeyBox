@@ -82,6 +82,7 @@ Audit-tier events additionally carry:
 |-------------|-------|-----------|------------|
 | `agent.started` | Info | `PipelineRunner.RunAgentPhaseAsync`, `RunAgentMergePhaseAsync` | `Agent`, `Sandbox`, `Phase` (`work`, `rework`, or `merge`) |
 | `agent.finished` | Info | Same as above | `Agent`, `Sandbox`, `Success`, `ExitCode`, `DurationMs` |
+| `agent.claude_unauthorized` | Warning | `ClaudeQuotaFailureDetector.EmitAdvisoryAuditEvents` (via `PipelineRunner`) | `Phase`, `SandboxName`. Logged when the Claude CLI returns HTTP 401. Treated as transient (no quota-breaker recording) — most commonly an expired access token. |
 
 ### Sandbox lifecycle
 

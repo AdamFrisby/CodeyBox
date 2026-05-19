@@ -40,12 +40,15 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     public async Task ProjectTaggedQuotaFailure_BlocksDifferentProject()
     {
         var now = DateTimeOffset.UtcNow;
+        // rate_limit_exceeded is still recognised as a quota event (Claude 401
+        // is intentionally not — see ClaudeQuotaFailureDetector for why), so
+        // use the rate-limit signal for the breaker-recording assertion.
         await _classifier.RecordIfQuotaFailureAsync(
             _failures,
             AgentKind.Claude,
             "claude-opus-4-7",
             summary: "agent exited 1",
-            stderr: "API Error: 401",
+            stderr: "error: rate_limit_exceeded",
             now,
             TimeSpan.FromMinutes(30),
             CancellationToken.None,
@@ -153,7 +156,6 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     [Theory]
     [InlineData(nameof(AgentKind.Codex), "You have hit your usage limit", QuotaFailureKind.LimitReached)]
     [InlineData(nameof(AgentKind.Claude), "error: rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded)]
-    [InlineData(nameof(AgentKind.Claude), "API Error: 401 unauthorized", QuotaFailureKind.Unauthorized)]
     public void Detector_MatchesDocumentedQuotaPatternsOnly(string agentName, string stderr, QuotaFailureKind expected)
     {
         var agent = agentName switch
@@ -170,6 +172,19 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     }
 
     [Fact]
+    public void Detector_Claude401_IsNotClassifiedAsQuotaFailure()
+    {
+        // Claude 401 is treated as a transient auth signal (shared-OAuth race
+        // or expired access token), NOT as a quota event — recording it would
+        // trip the observed-failure breaker and pin Claude as unusable for the
+        // full breaker window, defeating the fallback chain. See
+        // ClaudeQuotaFailureDetector for the rationale.
+        Assert.Null(_classifier.Detect(AgentKind.Claude, "API Error: 401 unauthorized", stdout: null));
+        Assert.Null(_classifier.Detect(AgentKind.Claude, stderr: null,
+            stdout: """{"type":"result","subtype":"error","is_error":true,"result":"API Error: 401"}"""));
+    }
+
+    [Fact]
     public async Task RecordIfQuotaFailure_RequiresAgentExitedOne()
     {
         var now = DateTimeOffset.UtcNow;
@@ -178,7 +193,7 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
             AgentKind.Claude,
             "claude-opus-4-7",
             summary: "agent exited 2",
-            stderr: "API Error: 401",
+            stderr: "error: rate_limit_exceeded",
             now,
             TimeSpan.FromMinutes(30),
             CancellationToken.None);
@@ -194,7 +209,7 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
             AgentKind.Claude,
             "claude-opus-4-7",
             summary: "agent exited 1",
-            stderr: "API Error: 401",
+            stderr: "error: rate_limit_exceeded",
             now,
             TimeSpan.FromMinutes(30),
             CancellationToken.None);

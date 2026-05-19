@@ -18,6 +18,16 @@ public interface IAgentQuotaFailureDetector
     /// Returns null when nothing matches. Must never throw.
     /// </summary>
     QuotaDetection? Detect(string? stderr, string? stdout);
+
+    /// <summary>
+    /// Optional hook: emit agent-specific advisory audit-log events for
+    /// non-quota failure signals — e.g. Claude's 401 (shared-OAuth refresh
+    /// race / expired access token), which is intentionally <em>not</em>
+    /// classified as a quota event but is still operationally interesting.
+    /// Called by the orchestrator at most once per agent failure. The default
+    /// implementation does nothing. Must never throw.
+    /// </summary>
+    void EmitAdvisoryAuditEvents(string? stderr, string? stdout, string phase, string? sandboxName) { }
 }
 
 /// <summary>

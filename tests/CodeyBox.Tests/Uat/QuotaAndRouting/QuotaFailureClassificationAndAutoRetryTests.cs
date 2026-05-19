@@ -33,13 +33,21 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     [InlineData(nameof(AgentKind.Codex), "You hit your usage limit. Try again after 5m.", QuotaFailureKind.LimitReached)]
     [InlineData(nameof(AgentKind.Claude), "rate_limit_exceeded reset after 1h", QuotaFailureKind.RateLimitExceeded)]
     [InlineData(nameof(AgentKind.Gemini), "RESOURCE_EXHAUSTED reset after 20m", QuotaFailureKind.RateLimitExceeded)]
-    [InlineData(nameof(AgentKind.Claude), "API Error: 401 unauthorized", QuotaFailureKind.Unauthorized)]
     public void DetectorClassifiesQuotaTextFromAgentOutput(string agentName, string stderr, QuotaFailureKind expected)
     {
         var detection = BuildClassifier().Detect(ResolveAgent(agentName), stderr, stdout: null);
 
         Assert.NotNull(detection);
         Assert.Equal(expected, detection!.Kind);
+    }
+
+    [Fact]
+    public void Claude401_IsNotClassifiedAsQuotaEvent_EvenViaUatClassifier()
+    {
+        // Shared-OAuth refresh race (see commit message): 401 from Claude must
+        // not trip the observed-failure breaker, otherwise a single race burns
+        // 10 minutes of Claude availability per occurrence.
+        Assert.Null(BuildClassifier().Detect(AgentKind.Claude, "API Error: 401 unauthorized", stdout: null));
     }
 
     [Theory]

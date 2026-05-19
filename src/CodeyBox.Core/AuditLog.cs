@@ -350,6 +350,22 @@ public static class AuditLog
             .Warning("Agent {Agent} credential smoke test failed in {DurationMs}ms: {Reason}",
                 agent.Value, (long)duration.TotalMilliseconds, reason);
 
+    /// <summary>
+    /// Emitted when a Claude CLI invocation surfaced a 401 Unauthorized from
+    /// Anthropic. Logged separately from quota/rate-limit events so operators
+    /// can tell shared-OAuth-refresh races (the dominant cause) and access-token
+    /// expiry apart from genuine token revocation — see
+    /// <c>ClaudeQuotaFailureDetector</c> for why these are not classified as
+    /// <c>QuotaFailureKind.Unauthorized</c>.
+    /// </summary>
+    public static void ClaudeUnauthorizedObserved(string phase, string? sandboxName) =>
+        Audit("agent.claude_unauthorized")
+            .Warning(
+                "Claude returned 401 Unauthorized during phase {Phase} in sandbox {SandboxName}; " +
+                "treating as transient (not a quota event). Most commonly caused by an expired access " +
+                "token; persistent 401s indicate a revoked or misconfigured credential.",
+                phase, sandboxName ?? "(unknown)");
+
     // ── Queue control ────────────────────────────────────────────────────────
 
     public static void QueuePaused(string reason) =>

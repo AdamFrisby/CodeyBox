@@ -58,7 +58,15 @@ Recognized patterns are intentionally conservative:
 - `exceeded the rate limit`
 - `quota exceeded`
 - `exhausted your capacity` (Gemini per-model wall)
-- `API Error: 401`
+
+`API Error: 401` from the Claude CLI is **not** included. Anthropic's
+single-use OAuth refresh tokens combined with concurrent host + in-VM CLI
+invocations produced intermittent 401s that tripped the breaker even when the
+subscription was fully available. The 401 is now recorded via the
+`agent.claude_unauthorized` audit-log event rather than the breaker; the
+shared-refresh race is structurally closed by stripping the refresh_token from
+the bundle materialised into the sandbox (see
+`ClaudeOAuthFileCredentialProvider` for the rationale).
 
 Detection scans stderr, plain-text stdout, and (when present) the structured
 NDJSON stream-json events emitted by claude/codex/gemini CLIs. Stream-json

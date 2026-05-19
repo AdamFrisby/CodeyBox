@@ -38,12 +38,13 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ShipsFullOAuthJsonBundleForInVmRefresh()
+    public async Task ShipsSanitisedOAuthJsonBundleWithoutRefreshToken()
     {
-        // The in-VM claude CLI needs the full credentials file (refresh_token
-        // included) to auto-rotate when the host's access_token expires
-        // mid-run. ClaudeAgentRunner materialises this env var back to
-        // ~/.claude/.credentials.json inside the sandbox.
+        // The bundle materialised into the VM must omit the refresh_token so
+        // the in-VM CLI cannot redeem it concurrently with the host CLI —
+        // shared single-use refresh tokens cause intermittent 401s that pin
+        // Claude as unavailable for the breaker window. See
+        // ClaudeOAuthFileCredentialProvider's class summary.
         const string raw =
             """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz","expiresAt":1234567890}}""";
         var path = WriteCredFile(raw);
@@ -52,8 +53,67 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         var cred = await p.GetAsync(AgentKind.Claude);
 
         Assert.NotNull(cred);
-        Assert.Equal(raw, cred!.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar]);
+        var bundle = cred!.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar];
         Assert.Equal("sk-ant-oat01-abc", cred.EnvironmentVariables["CLAUDE_CODE_OAUTH_TOKEN"]);
+        Assert.Contains("\"accessToken\":\"sk-ant-oat01-abc\"", bundle);
+        Assert.Contains("\"expiresAt\":1234567890", bundle);
+        Assert.DoesNotContain("refreshToken", bundle, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("rt-xyz", bundle);
+
+        // Sanity: still valid JSON shaped like the original.
+        using var doc = System.Text.Json.JsonDocument.Parse(bundle);
+        var oauth = doc.RootElement.GetProperty("claudeAiOauth");
+        Assert.Equal("sk-ant-oat01-abc", oauth.GetProperty("accessToken").GetString());
+    }
+
+    [Fact]
+    public async Task SanitisedBundle_OmitsExpiresAtWhenAbsentInSource()
+    {
+        // No expiresAt field in the source file: don't fabricate one.
+        const string raw = """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz"}}""";
+        var path = WriteCredFile(raw);
+        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+
+        var cred = await p.GetAsync(AgentKind.Claude);
+
+        var bundle = cred!.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar];
+        Assert.DoesNotContain("expiresAt", bundle, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("refreshToken", bundle, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SanitisedBundle_NeverEmitsRefreshTokenAcrossRepeatedCalls()
+    {
+        // The shared-OAuth race fix is enforced structurally: the in-VM CLI
+        // never receives a refresh_token, so it is incapable of calling
+        // Anthropic's refresh endpoint at all. This test pins that structural
+        // guarantee — across repeated provider calls (including concurrent
+        // ones from different consumers), every emitted bundle must omit the
+        // refresh_token even when the host file still contains one. It is NOT
+        // a simulation of two concurrent refreshes reaching Anthropic; the
+        // provider itself never refreshes, so there is no race to simulate at
+        // this layer.
+        const string raw =
+            """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz","expiresAt":9999999999}}""";
+        var path = WriteCredFile(raw);
+        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+
+        var taskA = Task.Run(() => p.GetAsync(AgentKind.Claude));
+        var taskB = Task.Run(() => p.GetAsync(AgentKind.Claude));
+        var creds = await Task.WhenAll(taskA, taskB);
+        var a = creds[0];
+        var b = creds[1];
+
+        var bundleA = a!.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar];
+        var bundleB = b!.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar];
+
+        Assert.Equal(a.EnvironmentVariables["CLAUDE_CODE_OAUTH_TOKEN"],
+                     b.EnvironmentVariables["CLAUDE_CODE_OAUTH_TOKEN"]);
+        Assert.Equal(bundleA, bundleB);
+        Assert.DoesNotContain("refreshToken", bundleA, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("refreshToken", bundleB, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("rt-xyz", bundleA);
+        Assert.DoesNotContain("rt-xyz", bundleB);
     }
 
     [Fact]

@@ -16,7 +16,7 @@ namespace CodeyBox.Orchestrator;
 ///
 /// <para>File format expected:</para>
 /// <code>
-/// { "claudeAiOauth": { "accessToken": "sk-ant-oat01-...", "refreshToken": "..." } }
+/// { "claudeAiOauth": { "accessToken": "sk-ant-oat01-...", "refreshToken": "...", "expiresAt": 1234567890 } }
 /// </code>
 ///
 /// <para>The provider surfaces two env vars when the file parses:</para>
@@ -24,13 +24,25 @@ namespace CodeyBox.Orchestrator;
 ///   <item><description>The legacy sandbox env var (default
 ///   <c>CLAUDE_CODE_OAUTH_TOKEN</c>) carrying just the access_token, for
 ///   flows that authenticate via Bearer token (API-key style).</description></item>
-///   <item><description><c>CODEYBOX_CLAUDE_OAUTH_JSON</c> carrying the full
-///   file contents (including refresh_token) so that
+///   <item><description><c>CODEYBOX_CLAUDE_OAUTH_JSON</c> carrying a
+///   <em>sanitised</em> bundle (access_token + expires_at only — the
+///   refresh_token is stripped) so that
 ///   <see cref="CodeyBox.Agents.Claude.ClaudeAgentRunner"/> can materialise
-///   <c>~/.claude/.credentials.json</c> inside the sandbox. The in-VM CLI
-///   then auto-rotates as needed instead of 401-ing when the host rotates
-///   the access_token mid-run.</description></item>
+///   <c>~/.claude/.credentials.json</c> inside the sandbox.</description></item>
 /// </list>
+///
+/// <para><b>Why the refresh_token is stripped:</b> Anthropic's OAuth refresh
+/// tokens are single-use. Shipping the refresh_token into every VM races the
+/// host-side <c>claude</c> CLI: whichever party redeems it first invalidates
+/// the other party's copy, producing intermittent 401s that the router treats
+/// as agent-unavailable for the full observed-failure window. By keeping the
+/// refresh_token host-side only, the host CLI is the sole party that can
+/// refresh, so two parallel refresh attempts cannot collide. A VM iteration
+/// that outlives the access_token's expiry will fail with a 401 (handled as a
+/// transient/auth failure rather than as a quota-exhaustion signal — see
+/// <see cref="CodeyBox.Agents.Claude.ClaudeQuotaFailureDetector"/>); a fresh
+/// iteration then picks up the host's currently-fresh token via the normal
+/// credential pipeline.</para>
 ///
 /// Only handles <see cref="AgentKind.Claude"/>; returns null for other agents
 /// so a chained env-var provider can supply them.
@@ -74,6 +86,7 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
         }
 
         string token;
+        string sanitisedBundle;
         try
         {
             using var doc = JsonDocument.Parse(rawContents);
@@ -85,6 +98,7 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
                 return Task.FromResult<AgentCredential?>(null);
             }
             token = tokenEl.GetString() ?? "";
+            sanitisedBundle = BuildSandboxBundle(oauth, token);
         }
         catch (Exception ex)
         {
@@ -98,8 +112,37 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
         var env = new Dictionary<string, string>
         {
             [_sandboxEnvVar] = token,
-            [OAuthJsonEnvVar] = rawContents,
+            [OAuthJsonEnvVar] = sanitisedBundle,
         };
         return Task.FromResult<AgentCredential?>(new AgentCredential(AgentKind.Claude, env, new Dictionary<string, string>()));
+    }
+
+    /// <summary>
+    /// Builds the env-var bundle the runner materialises into
+    /// <c>~/.claude/.credentials.json</c> inside the sandbox. Carries the
+    /// access_token (and the expires_at hint when the host file had one) but
+    /// deliberately omits the refresh_token — see the class summary for the
+    /// rationale on host-side-only refresh.
+    /// </summary>
+    private static string BuildSandboxBundle(JsonElement oauth, string token)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            writer.WritePropertyName("claudeAiOauth");
+            writer.WriteStartObject();
+            writer.WriteString("accessToken", token);
+            // Forward expiresAt verbatim (number or string) when present so the
+            // in-VM CLI can short-circuit a doomed reuse of a stale token.
+            if (oauth.TryGetProperty("expiresAt", out var expiresAt))
+            {
+                writer.WritePropertyName("expiresAt");
+                expiresAt.WriteTo(writer);
+            }
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
     }
 }
