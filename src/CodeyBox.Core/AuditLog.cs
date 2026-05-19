@@ -106,10 +106,19 @@ public static class AuditLog
             .Information("Work item {WorkItemId} cascade-cancelled because parent {ParentWorkItemId} was cancelled",
                 id.ToString(), parentId.ToString());
 
-    public static void WorkItemPatched(WorkItemId id, bool titleChanged, bool promptChanged, bool agentChanged) =>
+    public static void WorkItemPatched(
+        WorkItemId id,
+        bool titleChanged,
+        bool promptChanged,
+        bool agentChanged,
+        bool workTimeoutChanged = false,
+        bool mergeTimeoutChanged = false,
+        bool minModelScoreChanged = false) =>
         Audit("work_item.patched")
-            .Information("Work item {WorkItemId} patched: title={TitleChanged} prompt={PromptChanged} agent={AgentChanged}",
-                id.ToString(), titleChanged, promptChanged, agentChanged);
+            .Information(
+                "Work item {WorkItemId} patched: title={TitleChanged} prompt={PromptChanged} agent={AgentChanged} workTimeout={WorkTimeoutChanged} mergeTimeout={MergeTimeoutChanged} minModelScore={MinModelScoreChanged}",
+                id.ToString(), titleChanged, promptChanged, agentChanged,
+                workTimeoutChanged, mergeTimeoutChanged, minModelScoreChanged);
 
     /// <summary>
     /// Distinct audit event for priority changes. Records the previous and new
