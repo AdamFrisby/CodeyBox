@@ -311,13 +311,24 @@ The pipeline falls back to the work agent (with a warning log) when:
 - The credential provider returns `null` for the audit agent (e.g. the
   `CODEYBOX_GEMINI_API_KEY` env var is unset).
 - The audit agent's quota probe reports available% below the configured
-  minimum threshold — see `docs/agent-classes.md`.
+  minimum threshold AND there is no work-item agent class to walk.
 
-Fallback never crashes the pipeline: work items complete normally using the
-work agent for both phases. The `audit.cross_review_active` audit-tier event
-is NOT emitted when fallback occurs; `quota_router.audit_fallthrough` IS
-emitted so operators can observe when the correlation-breaking benefit was
-lost for an iteration.
+When the work item DOES have an agent class configured (see
+`docs/agent-classes.md`) and the configured audit agent's quota is below
+threshold, the audit router walks the work-item's class chain — preferring
+class members that pass the same observed-failure + probe checks the
+work-phase router uses — and routes the LLM auditor to the first viable
+member. If every member of the class is also quota-exhausted, the LLM
+auditor is **skipped with a warning for that iteration** rather than
+parking the work item. Other (non-LLM) auditors still run and the item
+keeps progressing; audit signal is degraded but not lost.
+
+Fallback never crashes the pipeline. The `audit.cross_review_active`
+audit-tier event is NOT emitted when fallback occurs;
+`quota_router.audit_fallthrough` IS emitted so operators can observe when
+the correlation-breaking benefit was lost for an iteration.
+`audit.llm_auditor_skipped_quota` is emitted when an LLM auditor was
+skipped because every candidate agent was quota-exhausted.
 
 ### Observability
 
@@ -326,6 +337,7 @@ lost for an iteration.
 | `auditor.run` | After each auditor. Now includes `agentKind` property. |
 | `audit.cross_review_active` | Once per iteration when at least one LLM auditor actually ran with a different agent (post-fallback). |
 | `quota_router.audit_fallthrough` | Once per auditor when quota triggered fallthrough. |
+| `audit.llm_auditor_skipped_quota` | Once per auditor when every candidate agent was quota-exhausted and the auditor was skipped for the iteration. |
 
 The `work_item.audit_iteration` webhook event (see `docs/webhooks.md`)
 gains an optional `auditAgentKind` field in its `details` object:
