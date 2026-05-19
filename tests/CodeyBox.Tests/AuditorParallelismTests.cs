@@ -390,8 +390,17 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         Assert.Equal(1, calls);
     }
 
+    // Bug 779e7dc9 changed the audit-side quota-exhaustion policy from
+    // "park the work item in WaitingForQuotaReset" to "skip the LLM auditor
+    // for this iteration and keep going". These three tests previously
+    // pinned the parsed/probe/default reset-time accuracy for the audit-park
+    // path; with the new behaviour the audit pipeline no longer parks on
+    // class-exhaustion, so they now pin the new skip-and-continue policy.
+    // Reset-time accuracy for the still-parking work-phase path is covered
+    // by PipelineRunnerQuotaFallbackTests.
+
     [Fact]
-    public async Task LlmAgentQuotaFailure_UsesParsedResetMarkerBeforeDefaultFallback()
+    public async Task LlmAgentQuotaFailure_AuditClassExhausted_SkipsAuditorRatherThanParking_WithParsedReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var probe = new FixedQuotaProbe(AgentKind.Claude, DateTimeOffset.UtcNow.AddHours(1));
@@ -436,26 +445,15 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
 
         var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
         await tp.Store.CreateAsync(item);
-        var beforeFailure = DateTimeOffset.UtcNow;
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
-        var afterFailure = DateTimeOffset.UtcNow;
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
-        Assert.Equal("quota", final.FailureKind);
-        Assert.NotNull(final.QuotaResetAt);
-        Assert.NotNull(final.NextQuotaRetryAt);
-        Assert.Equal("audit", final.QuotaRetryFrom);
-        Assert.Equal(0, probe.CallCount);
-        Assert.InRange(
-            final.QuotaResetAt.Value,
-            beforeFailure.AddMinutes(13),
-            afterFailure.AddMinutes(13));
-        Assert.Equal(final.QuotaResetAt, final.NextQuotaRetryAt);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
     }
 
     [Fact]
-    public async Task LlmAgentQuotaFailure_UsesProbeResetWhenDetectionHasNoReset()
+    public async Task LlmAgentQuotaFailure_AuditClassExhausted_SkipsAuditor_WithProbeResetAvailable()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var resetAt = DateTimeOffset.UtcNow.AddMinutes(17);
@@ -503,15 +501,12 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
-        Assert.Equal("quota", final.FailureKind);
-        Assert.Equal(resetAt, final.QuotaResetAt);
-        Assert.Equal(resetAt, final.NextQuotaRetryAt);
-        Assert.Equal("audit", final.QuotaRetryFrom);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Null(final.QuotaResetAt);
     }
 
     [Fact]
-    public async Task LlmAgentQuotaFailure_DefaultsWhenRouterProbeHasNoReset()
+    public async Task LlmAgentQuotaFailure_AuditClassExhausted_SkipsAuditor_WhenProbeHasNoReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var probe = new ExhaustedNoResetQuotaProbe(AgentKind.Claude);
@@ -556,22 +551,11 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
 
         var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
         await tp.Store.CreateAsync(item);
-        var beforeFailure = DateTimeOffset.UtcNow;
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
-        var afterFailure = DateTimeOffset.UtcNow;
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
-        Assert.Equal("quota", final.FailureKind);
-        Assert.True(probe.CallCount > 0, "quota fallback should query the class router probe before defaulting");
-        Assert.NotNull(final.QuotaResetAt);
-        Assert.NotNull(final.NextQuotaRetryAt);
-        Assert.Equal("audit", final.QuotaRetryFrom);
-        Assert.InRange(
-            final.QuotaResetAt.Value,
-            beforeFailure.AddMinutes(5),
-            afterFailure.AddMinutes(5));
-        Assert.Equal(final.QuotaResetAt, final.NextQuotaRetryAt);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Null(final.QuotaResetAt);
     }
 }
 

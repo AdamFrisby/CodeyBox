@@ -23,8 +23,13 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditLlmQuotaFailure_ParksWaitingForQuotaReset_AndPublishesWebhook()
+    public async Task AuditLlmQuotaFailure_AllClassMembersExhausted_SkipsLlmAuditorAndContinues()
     {
+        // Bug 779e7dc9 (warning-and-skip variant): when every member of the
+        // work item's agent class is quota-exhausted for an LLM auditor, the
+        // pipeline now skips that auditor for the iteration rather than
+        // parking the whole work item. The remaining auditors still run and
+        // the item ships with degraded (but non-fatal) audit signal.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => QuotaResult());
         using var fix = BuildFixture(seed, auditor, [AgentKind.Gemini]);
@@ -37,13 +42,9 @@ public sealed class AuditQuotaPauseTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
-        Assert.NotEqual(WorkItemState.Failed, final.State);
-        Assert.Equal("quota", final.FailureKind);
-        Assert.NotNull(final.QuotaResetAt);
-        Assert.NotNull(final.NextQuotaRetryAt);
-        Assert.Equal("audit", final.QuotaRetryFrom);
-        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
     }
 
     [Fact]
@@ -75,8 +76,14 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task QuotaRetryScheduler_RetriesAuditParkFromAuditAndRerunsAuditor()
+    public async Task AuditLlmQuotaFailure_NoLongerParksWhenChainExhausted()
     {
+        // Bug 779e7dc9: previously, when the audit-side quota fallback
+        // exhausted every class member, the pipeline parked the work item in
+        // WaitingForQuotaReset. The preferred behaviour now is warning-and-skip
+        // so non-LLM audit signal still completes. This test pins that —
+        // even with a class of one (gemini-only) and a quota-failing auditor,
+        // the item completes Done and the QuotaRetryScheduler is NOT armed.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RoutingLlmAuditor("cheating:llm-review", _ =>
             _.CallNumber == 1 ? QuotaResult() : new AuditResult(true, []));
@@ -87,31 +94,12 @@ public sealed class AuditQuotaPauseTests : IDisposable
         await fix.Store.CreateAsync(item);
 
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
-        var parked = await fix.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
-        Assert.Equal("audit", parked.QuotaRetryFrom);
-        Assert.NotNull(parked.NextQuotaRetryAt);
-
-        fix.Time.UtcNow = parked.NextQuotaRetryAt.Value.AddSeconds(1);
-        var fired = typeof(QuotaRetryScheduler).GetMethod(
-            "OnTargetedTimerFired",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        fired.Invoke(fix.Scheduler, [item.Id]);
-
-        await WaitForAsync(async () =>
-            (await fix.Store.GetAsync(item.Id))?.State == WorkItemState.WorkComplete);
-
-        Assert.Equal(item.Id, await fix.Queue.DequeueAsync(CancellationToken.None));
-        var retryItem = await fix.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.WorkComplete, retryItem!.State);
-        Assert.Equal(1, retryItem.QuotaRetryAttempts);
-
-        await fix.Pipeline.RunAsync(retryItem, CancellationToken.None);
 
         var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Equal(2, auditor.CallCount);
-        Assert.True(fix.Webhooks.Events.Count(e => e.Event == "work_item.auditing") >= 2);
+        Assert.Null(final.NextQuotaRetryAt);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
     }
 
     private AuditQuotaFixture BuildFixture(
