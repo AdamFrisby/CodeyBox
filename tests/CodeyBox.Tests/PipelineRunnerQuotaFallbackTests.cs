@@ -281,6 +281,46 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkFallbackAttempt_HostShutdownSourceBeatsAttemptTimeoutFallback()
+    {
+        var time = new ManualTimeProvider();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            timeProvider: time,
+            phaseAbsoluteTimeoutMultiplier: 10.0);
+
+        fix.Codex.WorkDelays.Enqueue(TimeSpan.FromSeconds(11));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fallback should not run"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            WorkTimeout = TimeSpan.FromSeconds(10),
+        };
+        await fix.Store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        var workStarted = WaitForAgentPhaseStart(AgentKind.Codex, "work", fix.Codex, fix.Claude);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None, hostShutdownCts.Token);
+        await WaitForPhaseStartAsync("work", workStarted, pipelineTask);
+
+        await hostShutdownCts.CancelAsync();
+        time.Advance(TimeSpan.FromSeconds(10));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            pipelineTask.WaitAsync(TimeSpan.FromSeconds(10)));
+
+        Assert.Equal(1, fix.Codex.CallCount);
+        Assert.Equal(0, fix.Claude.CallCount);
+        Assert.Empty(await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None));
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Working, finalItem!.State);
+        Assert.Null(finalItem.FailureKind);
+    }
+
+    [Fact]
     public async Task ReworkFallbackAttempt_GetsFreshWorkTimeoutBudget()
     {
         var time = new ManualTimeProvider();

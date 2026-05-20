@@ -2640,7 +2640,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 && phaseCancellation is not null
                 && oce is not PhaseCancellationException)
             {
-                if (phaseCancellation.Token.IsCancellationRequested)
+                if (phaseCancellation.Token.IsCancellationRequested
+                    || phaseCancellation.Source is not null)
                     throw phaseCancellation.Wrap(oce);
 
                 throw new AgentAttemptTimeoutException(

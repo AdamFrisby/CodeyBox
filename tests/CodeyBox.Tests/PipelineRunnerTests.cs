@@ -219,6 +219,13 @@ public sealed class PipelineRunnerTests
         Assert.Equal(TimeSpan.FromMinutes(720), absolute);
     }
 
+    [Fact]
+    public void ResolvePhaseAbsoluteTimeout_AllowsMinimumMultiplier()
+    {
+        var absolute = PipelineRunner.ResolvePhaseAbsoluteTimeout(TimeSpan.FromMinutes(240), multiplier: 1.0);
+        Assert.Equal(TimeSpan.FromMinutes(240), absolute);
+    }
+
     [Theory]
     [InlineData(-2)]
     [InlineData(-1)]

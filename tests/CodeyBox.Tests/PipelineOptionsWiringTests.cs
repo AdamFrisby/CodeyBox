@@ -27,6 +27,19 @@ public sealed class PipelineOptionsWiringTests
         Assert.Equal(2.5, options.PhaseAbsoluteTimeoutMultiplier);
     }
 
+    [Fact]
+    public void ProgramAcceptsMinimumPhaseAbsoluteTimeoutMultiplier()
+    {
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:PhaseAbsoluteTimeoutMultiplier"] = "1.0",
+        });
+
+        var options = factory.Services.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+
+        Assert.Equal(1.0, options.PhaseAbsoluteTimeoutMultiplier);
+    }
+
     [Theory]
     [InlineData("0.5")]
     [InlineData("NaN")]
