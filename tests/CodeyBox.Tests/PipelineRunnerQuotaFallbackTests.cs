@@ -396,7 +396,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             maxSteps: 5000);
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
-        Assert.InRange(elapsed, TimeSpan.FromMinutes(720), TimeSpan.FromMinutes(730));
+        Assert.InRange(elapsed, TimeSpan.FromMinutes(720), TimeSpan.FromMinutes(720) + TimeSpan.FromSeconds(20));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
@@ -408,6 +408,53 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(2, history.Count);
         Assert.Equal(AgentKind.Codex, history[0].ToAgent);
         Assert.Equal(AgentKind.Claude, history[1].ToAgent);
+    }
+
+    [Fact]
+    public async Task ReworkFallbackAttempt_FinalTimeoutAfterAllMembers_FailsAsTimeout()
+    {
+        var time = new ManualTimeProvider();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipelineThreeMembers(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            timeProvider: time,
+            phaseAbsoluteTimeoutMultiplier: 10.0);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkDelays.Enqueue(TimeSpan.FromSeconds(11));
+        fix.Claude.ReworkDelays.Enqueue(TimeSpan.FromSeconds(11));
+        fix.Gemini.ReworkDelays.Enqueue(TimeSpan.FromSeconds(11));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            WorkTimeout = TimeSpan.FromSeconds(10),
+        };
+        await fix.Store.CreateAsync(item);
+
+        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude, fix.Gemini);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
+        await WaitForReworkStartAsync(reworkStarted, pipelineTask);
+        await RunWithAdvancingTimeAsync(
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 500);
+
+        var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(32));
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Failed, finalItem!.State);
+        Assert.Equal("timeout", finalItem.FailureKind);
+        Assert.Equal(CancellationSources.PhaseTimeout("rework"), finalItem.CancellationSource);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Equal(2, history.Count);
+        Assert.Equal(AgentKind.Claude, history[0].ToAgent);
+        Assert.Equal(AgentKind.Gemini, history[1].ToAgent);
     }
 
     [Fact]
@@ -476,13 +523,16 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         await fix.Store.CreateAsync(item);
 
         var mergeStarted = WaitForPhaseStart("merge", fix.Codex, fix.Claude);
+        var fallbackMergeStarted = WaitForAgentPhaseStart(AgentKind.Claude, "merge", fix.Codex, fix.Claude);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForPhaseStartAsync("merge", mergeStarted, pipelineTask);
-        await RunWithAdvancingTimeAsync(
+        await RunWithAdvancingTimeUntilAsync(
+            fallbackMergeStarted,
             pipelineTask,
             time,
             step: TimeSpan.FromMilliseconds(100),
-            maxSteps: 1000);
+            maxSteps: 200);
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
@@ -816,6 +866,21 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         return started.Task;
     }
 
+    private static Task WaitForAgentPhaseStart(AgentKind agentKind, string phase, params ScriptableAgent[] agents)
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        foreach (var agent in agents)
+        {
+            agent.PhaseInvocationStarted += (startedAgent, startedPhase) =>
+            {
+                if (startedAgent == agentKind && startedPhase == phase)
+                    started.TrySetResult();
+            };
+        }
+
+        return started.Task;
+    }
+
     private static Task WaitForReworkStartAsync(Task reworkStarted, Task pipelineTask) =>
         WaitForPhaseStartAsync("rework", reworkStarted, pipelineTask);
 
@@ -843,6 +908,32 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         }
 
         await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    private static async Task RunWithAdvancingTimeUntilAsync(
+        Task targetTask,
+        Task pipelineTask,
+        ManualTimeProvider time,
+        TimeSpan? step = null,
+        int maxSteps = 200)
+    {
+        var delta = step ?? TimeSpan.FromMilliseconds(20);
+        for (var i = 0; i < maxSteps && !targetTask.IsCompleted && !pipelineTask.IsCompleted; i++)
+        {
+            time.Advance(delta);
+            await Task.Delay(1);
+        }
+
+        if (targetTask.IsCompleted)
+            return;
+
+        if (pipelineTask.IsCompleted)
+        {
+            await pipelineTask;
+            throw new InvalidOperationException("Pipeline completed before the expected fallback attempt started.");
+        }
+
+        throw new TimeoutException("Pipeline did not reach the expected fallback attempt before the manual-time limit.");
     }
 
     private static WorkItem NewItem(AgentKind initialAgent) => new()
@@ -950,7 +1041,6 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
     public Queue<TimeSpan> MergeDelays { get; } = new();
     public Queue<FileWrite> WorkPlan { get; } = new();
     public int CallCount { get; private set; }
-    public event Action<AgentKind, bool>? InvocationStarted;
     public event Action<AgentKind, string>? PhaseInvocationStarted;
 
     public AgentKind Kind { get; }
@@ -977,7 +1067,6 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
             || prompt.StartsWith("# Interrupted Rework Resume", StringComparison.Ordinal);
         var isMerge = prompt.StartsWith("# Merge task", StringComparison.Ordinal);
         var phase = isMerge ? "merge" : isRework ? "rework" : "work";
-        InvocationStarted?.Invoke(Kind, isRework);
         PhaseInvocationStarted?.Invoke(Kind, phase);
 
         if (isMerge)

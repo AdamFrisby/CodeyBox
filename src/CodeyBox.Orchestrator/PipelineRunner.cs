@@ -2588,10 +2588,11 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <summary>
     /// Runs <paramref name="invoker"/> with the work item's chosen agent runner;
     /// if the invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>
-    /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase),
-    /// marks the member exhausted in the router's in-process cache, picks the
-    /// next-best class member, swaps the runner + ModelId + ReasoningMode on a
-    /// trial copy of the work item, and retries the same iteration.
+    /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase)
+    /// or exceeds the configured per-attempt timeout, picks the next-best class
+    /// member, swaps the runner + ModelId + ReasoningMode on a trial copy of
+    /// the work item, and retries the same iteration. Quota failures also mark
+    /// the member exhausted in the router's in-process cache.
     ///
     /// <para>
     /// When no class router is wired or the item has no agent class, the wrapper
@@ -2826,11 +2827,22 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!_agents.TryGet(nextMember.Agent, out var nextRunner))
                 throw new InvalidOperationException($"No runner registered for fallback agent '{nextMember.Agent}'");
 
-            AuditLog.AgentQuotaFallback(
-                item.Id, phase, iteration,
-                fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
-                toAgent: nextMember.Agent, toModel: nextMember.ModelId,
-                reason: safeReason);
+            if (quotaExhausted)
+            {
+                AuditLog.AgentQuotaFallback(
+                    item.Id, phase, iteration,
+                    fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
+                    toAgent: nextMember.Agent, toModel: nextMember.ModelId,
+                    reason: safeReason);
+            }
+            else
+            {
+                AuditLog.AgentAttemptTimeoutFallback(
+                    item.Id, phase, iteration,
+                    fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
+                    toAgent: nextMember.Agent, toModel: nextMember.ModelId,
+                    reason: safeReason);
+            }
 
             // Trial item carries the new Agent / ModelId / ReasoningMode so webhook
             // consumers that read WorkItem.Agent see the agent actually being run.
@@ -5502,10 +5514,10 @@ public sealed record QuestionDismissedDetails(
     string Reason);
 
 /// <summary>
-/// Webhook payload for <c>agent.fallback</c>: a mid-iteration QuotaExhausted
-/// classification triggered the pipeline to retry the same iteration against
-/// the next class member. <see cref="ToAgent"/> is null when no fallback was
-/// available and the item parked in WaitingForQuotaReset.
+/// Webhook payload for <c>agent.fallback</c>: quota exhaustion or a per-attempt
+/// timeout triggered the pipeline to retry the same iteration against the next
+/// class member. <see cref="ToAgent"/> is null when no fallback was available
+/// and the item parked in WaitingForQuotaReset.
 /// </summary>
 public sealed record AgentFallbackDetails(
     string WorkItemId,

@@ -275,6 +275,30 @@ public static class AuditLog
                 reason);
 
     /// <summary>
+    /// Emitted when a single agent attempt exceeds its per-attempt timeout and
+    /// the pipeline retries the same iteration against the next class member.
+    /// Distinct from <see cref="AgentQuotaFallback"/> so operational logs do
+    /// not report timeout-driven fallback as quota exhaustion.
+    /// </summary>
+    public static void AgentAttemptTimeoutFallback(
+        WorkItemId workItemId,
+        string phase,
+        int? iteration,
+        AgentKind fromAgent,
+        string? fromModel,
+        AgentKind toAgent,
+        string? toModel,
+        string reason) =>
+        Audit("agent.attempt_timeout_fallback")
+            .Warning(
+                "Mid-iteration attempt timeout fallback: workItem={WorkItemId} phase={Phase} iteration={Iteration} " +
+                "from={FromAgent}/{FromModel} to={ToAgent}/{ToModel} reason={Reason}",
+                workItemId.ToString(), phase, iteration,
+                fromAgent.Value, fromModel ?? "(default)",
+                toAgent.Value, toModel ?? "(default)",
+                reason);
+
+    /// <summary>
     /// Emitted when every eligible class member returned QuotaExhausted within
     /// a single pickup, and the pipeline parked the item in WaitingForQuotaReset
     /// rather than transitioning it to Failed.
