@@ -10,25 +10,35 @@ internal static class SandboxEndpoints
         var group = app.MapGroup("/sandboxes");
         group.MapGet("/leaked", GetLeaked);
         group.MapPost("/leaked/{name}/dispose", DisposeLeakedAsync);
+        app.MapGet("/admin/sandbox-leaks", GetSandboxLeakSummary);
     }
 
     /// <summary>
     /// Returns the list of sandboxes most recently detected as leaked by the
-    /// <see cref="SandboxLeakReaper"/>. The list is updated after each periodic
-    /// sweep (default every 15 minutes). An empty array means no leaks were
-    /// detected on the last sweep, not that no leaks exist.
+    /// <see cref="SandboxLeakReaper"/> and not yet successfully disposed. The
+    /// list is updated after each periodic sweep (default every 15 minutes). An
+    /// empty array means no pending leaked sandboxes remain from the last sweep.
     /// </summary>
     private static IResult GetLeaked(SandboxLeakReaper reaper)
     {
         var leaks = reaper.GetLatestLeaks();
-        var dto = leaks.Select(l => new
-        {
-            name = l.Name,
-            createdAt = l.CreatedAt,
-            ageMinutes = Math.Round(l.Age.TotalMinutes, 1),
-            diskMb = l.DiskBytes.HasValue ? l.DiskBytes.Value / (1024 * 1024) : (long?)null,
-        });
+        var dto = leaks.Select(ToLeakDto);
         return Results.Ok(dto);
+    }
+
+    /// <summary>
+    /// Operator-visible summary of leaked sandboxes that are known from the latest
+    /// sweep and have not yet been successfully disposed.
+    /// </summary>
+    private static IResult GetSandboxLeakSummary(SandboxLeakReaper reaper)
+    {
+        var leaks = reaper.GetLatestLeaks();
+        return Results.Ok(new
+        {
+            count = leaks.Count,
+            agesMinutes = leaks.Select(l => Math.Round(l.Age.TotalMinutes, 1)).ToArray(),
+            leaks = leaks.Select(ToLeakDto).ToArray(),
+        });
     }
 
     /// <summary>
@@ -72,7 +82,8 @@ internal static class SandboxEndpoints
             AuditLog.SandboxLeakDisposed(name,
                 ageMinutes: leak.Age.TotalMinutes,
                 diskMb: diskMb,
-                disposedAt: disposedAt);
+                disposedAt: disposedAt,
+                reason: leak.Reason);
             _ = webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "sandbox.leak_disposed",
@@ -82,6 +93,7 @@ internal static class SandboxEndpoints
                     AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
                     DiskMb = diskMb,
                     DisposedAt = disposedAt,
+                    Reason = leak.Reason,
                 },
             }, ct);
             log.LogInformation("SandboxEndpoints: operator-triggered dispose of leaked sandbox {Name}", name);
@@ -96,7 +108,7 @@ internal static class SandboxEndpoints
         catch (OperationCanceledException)
         {
             // The 5-minute per-disposal timeout fired.
-            AuditLog.SandboxLeakDisposeFailed(name, leak.Age.TotalMinutes, diskMb, "timeout");
+            AuditLog.SandboxLeakDisposeFailed(name, leak.Age.TotalMinutes, diskMb, "timeout", leak.Reason);
             _ = webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "sandbox.leak_dispose_failed",
@@ -106,13 +118,14 @@ internal static class SandboxEndpoints
                     AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
                     DiskMb = diskMb,
                     Error = "timeout",
+                    Reason = leak.Reason,
                 },
             }, ct);
             return Results.Problem("Dispose timed out after 5 minutes", statusCode: 504);
         }
         catch (Exception ex)
         {
-            AuditLog.SandboxLeakDisposeFailed(name, leak.Age.TotalMinutes, diskMb, ex.Message);
+            AuditLog.SandboxLeakDisposeFailed(name, leak.Age.TotalMinutes, diskMb, ex.Message, leak.Reason);
             _ = webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "sandbox.leak_dispose_failed",
@@ -122,6 +135,7 @@ internal static class SandboxEndpoints
                     AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
                     DiskMb = diskMb,
                     Error = ex.Message,
+                    Reason = leak.Reason,
                 },
             }, ct);
             log.LogWarning(ex, "SandboxEndpoints: failed to dispose leaked sandbox {Name}", name);
@@ -129,4 +143,13 @@ internal static class SandboxEndpoints
             return Results.Problem("Dispose failed; see server logs for details", statusCode: 500);
         }
     }
+
+    private static object ToLeakDto(LeakedSandboxInfo l) => new
+    {
+        name = l.Name,
+        createdAt = l.CreatedAt,
+        ageMinutes = Math.Round(l.Age.TotalMinutes, 1),
+        diskMb = l.DiskBytes.HasValue ? l.DiskBytes.Value / (1024 * 1024) : (long?)null,
+        reason = l.Reason,
+    };
 }

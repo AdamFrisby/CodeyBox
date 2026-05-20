@@ -17,6 +17,8 @@ public sealed record SandboxLeakDetails
     public required string Name { get; init; }
     public double AgeMinutes { get; init; }
     public long? DiskMb { get; init; }
+    /// <summary>Stable reason code explaining why the sandbox was classified as leaked.</summary>
+    public string? Reason { get; init; }
     /// <summary>Set only for <c>sandbox.leak_disposed</c>.</summary>
     public DateTimeOffset? DisposedAt { get; init; }
     /// <summary>Set only for <c>sandbox.leak_dispose_failed</c>.</summary>

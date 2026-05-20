@@ -68,6 +68,24 @@ public sealed class SandboxLeakReaperTests
     }
 
     [Fact]
+    public async Task AutoDispose_DoesNotDisposeTrackedActiveSandbox()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo(
+            "codeybox-active-auto",
+            OldEnough(threshold),
+            DiskBytes: null,
+            IsTrackedActive: true));
+
+        var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Empty(provider.DisposedNames);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
     public async Task InactiveSandbox_OlderThanThreshold_ReportedAsLeak()
     {
         var threshold = TimeSpan.FromMinutes(30);
@@ -84,6 +102,25 @@ public sealed class SandboxLeakReaperTests
         var leaks = reaper.GetLatestLeaks();
         Assert.Single(leaks);
         Assert.Equal("codeybox-stale000000000", leaks[0].Name);
+        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, leaks[0].Reason);
+    }
+
+    [Fact]
+    public async Task WaitingForQuotaResetItemDoesNotPreserveInactiveSandbox()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo(
+            "codeybox-parkedquota",
+            OldEnough(threshold),
+            DiskBytes: null,
+            IsTrackedActive: false));
+
+        var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Contains("codeybox-parkedquota", provider.DisposedNames);
+        Assert.Empty(reaper.GetLatestLeaks());
     }
 
     [Fact]
@@ -142,6 +179,7 @@ public sealed class SandboxLeakReaperTests
 
         var leak = Assert.Single(reaper.GetLatestLeaks());
         Assert.Equal("codeybox-expired-preempt", leak.Name);
+        Assert.Equal(SandboxLeakReasons.ExpiredPreemptRetention, leak.Reason);
     }
 
     [Fact]
@@ -225,6 +263,27 @@ public sealed class SandboxLeakReaperTests
 
         Assert.Contains("codeybox-leak1111111111", provider.DisposedNames);
         Assert.Contains("codeybox-leak2222222222", provider.DisposedNames);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
+    public async Task AutoDispose_DefaultEnabled_DisposesEligibleLeak()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo("codeybox-defaultauto", OldEnough(threshold), null, false));
+        var opts = new SandboxLeakOptions
+        {
+            Enabled = true,
+            CheckInterval = TimeSpan.FromHours(1),
+            LeakAgeThreshold = threshold,
+        };
+        var reaper = new SandboxLeakReaper(provider, new NullWebhookDispatcher(), opts, NullLogger<SandboxLeakReaper>.Instance);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Contains("codeybox-defaultauto", provider.DisposedNames);
+        Assert.Empty(reaper.GetLatestLeaks());
     }
 
     [Fact]
@@ -243,6 +302,8 @@ public sealed class SandboxLeakReaperTests
 
         // The sandbox that didn't throw should still be disposed.
         Assert.Contains("codeybox-willsucceed00", provider.DisposedNames);
+        var leak = Assert.Single(reaper.GetLatestLeaks());
+        Assert.Equal("codeybox-willthrow0000", leak.Name);
     }
 
     // ── Sweep resilience ─────────────────────────────────────────────────────

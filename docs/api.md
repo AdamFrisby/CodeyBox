@@ -899,8 +899,10 @@ An empty array means no workers are currently registered. A row with a stale `la
 ### `GET /sandboxes/leaked`
 
 Returns the list of `codeybox-*` Multipass VMs that were detected as leaked on
-the most recent reaper sweep (default every 15 minutes). An empty array means
-no leaks were found on the last sweep.
+the most recent reaper sweep (default every 15 minutes) and not yet
+successfully disposed. An empty array means no pending leaked sandboxes remain
+from the last sweep; with `AutoDispose=true`, stale VMs may have been detected
+and already purged.
 
 ```json
 [
@@ -908,12 +910,36 @@ no leaks were found on the last sweep.
     "name": "codeybox-a1b2c3d4e5f6",
     "createdAt": "2026-05-04T02:00:00+00:00",
     "ageMinutes": 127.3,
-    "diskMb": null
+    "diskMb": null,
+    "reason": "untracked_active_sandbox_age_threshold_exceeded"
   }
 ]
 ```
 
 See [`sandbox-leaks.md`](sandbox-leaks.md) for full leak detection semantics.
+
+### `GET /admin/sandbox-leaks`
+
+Returns an operator-visible summary of leaked sandboxes detected on the latest
+sweep and not yet successfully disposed.
+
+Response: `200 OK`
+
+```json
+{
+  "count": 1,
+  "agesMinutes": [127.3],
+  "leaks": [
+    {
+      "name": "codeybox-a1b2c3d4e5f6",
+      "createdAt": "2026-05-04T02:00:00+00:00",
+      "ageMinutes": 127.3,
+      "diskMb": null,
+      "reason": "untracked_active_sandbox_age_threshold_exceeded"
+    }
+  ]
+}
+```
 
 ### `POST /sandboxes/leaked/{name}/dispose`
 

@@ -47,7 +47,7 @@ All options are under `CodeyBox:SandboxLeak` in `appsettings.json`.
       "Enabled": true,
       "CheckInterval": "00:15:00",
       "LeakAgeThreshold": "00:30:00",
-      "AutoDispose": false
+      "AutoDispose": true
     }
   }
 }
@@ -58,14 +58,13 @@ All options are under `CodeyBox:SandboxLeak` in `appsettings.json`.
 | `Enabled` | `true` | Enable or disable the sweep entirely |
 | `CheckInterval` | `00:15:00` (15 min) | How often to run the leak scan |
 | `LeakAgeThreshold` | `00:30:00` (30 min) | Minimum age before a non-active sandbox is declared leaked |
-| `AutoDispose` | `false` | When true, automatically purge each detected leak |
+| `AutoDispose` | `true` | When true, automatically purge each detected leak |
 
 ### AutoDispose
 
-`AutoDispose` defaults to **false**. The first time you see leaked sandboxes, you
-may want to investigate the cause before enabling automatic cleanup. Once you
-understand the failure mode, set `AutoDispose: true` to have the reaper call
-`multipass delete --purge <name>` on each detected leak.
+`AutoDispose` defaults to **true** because stale Multipass VMs keep consuming
+host memory after their phase has ended. Set `AutoDispose: false` for
+detection-only operation on a diagnostic host.
 
 Each auto-dispose runs with a 5-minute per-sandbox timeout and is best-effort:
 one failed disposal never blocks the rest of the sweep.
@@ -83,7 +82,9 @@ and any configured webhook endpoints):
 | `sandbox.leak_disposed` | A leaked sandbox was successfully disposed |
 | `sandbox.leak_dispose_failed` | Disposal of a leaked sandbox failed |
 
-Each event carries `{ name, ageMinutes, diskMb }` in the structured log fields.
+Each event carries `{ name, ageMinutes, diskMb, reason }` in the structured log
+fields. The `reason` is a stable classification code such as
+`untracked_active_sandbox_age_threshold_exceeded`.
 
 ---
 
@@ -91,9 +92,10 @@ Each event carries `{ name, ageMinutes, diskMb }` in the structured log fields.
 
 ### `GET /sandboxes/leaked`
 
-Returns the list of sandboxes detected as leaked on the **most recent sweep**.
-An empty array means no leaks were detected on the last sweep, not that no leaks
-could exist (e.g., the reaper may not have run yet).
+Returns the list of sandboxes detected as leaked on the **most recent sweep**
+and not yet successfully disposed. An empty array means no pending leaked
+sandboxes remain from the last sweep; with `AutoDispose=true`, stale VMs may
+have been detected and already purged.
 
 ```json
 [
@@ -101,9 +103,31 @@ could exist (e.g., the reaper may not have run yet).
     "name": "codeybox-a1b2c3d4e5f6",
     "createdAt": "2026-05-04T02:00:00+00:00",
     "ageMinutes": 127.3,
-    "diskMb": null
+    "diskMb": null,
+    "reason": "untracked_active_sandbox_age_threshold_exceeded"
   }
 ]
+```
+
+### `GET /admin/sandbox-leaks`
+
+Returns an operator summary for sandboxes detected as leaked and not yet
+successfully disposed by the latest sweep.
+
+```json
+{
+  "count": 1,
+  "agesMinutes": [127.3],
+  "leaks": [
+    {
+      "name": "codeybox-a1b2c3d4e5f6",
+      "createdAt": "2026-05-04T02:00:00+00:00",
+      "ageMinutes": 127.3,
+      "diskMb": null,
+      "reason": "untracked_active_sandbox_age_threshold_exceeded"
+    }
+  ]
+}
 ```
 
 ### `POST /sandboxes/leaked/{name}/dispose`

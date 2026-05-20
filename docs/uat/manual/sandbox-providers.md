@@ -53,8 +53,8 @@ project; several steps intentionally create and destroy sandboxes.
 
 ## Stale Sandbox Cleanup Drill
 
-1. Create or preserve a disposable `codeybox-*` Multipass VM older than the
-   configured leak threshold.
+1. Set `CodeyBox:SandboxLeak:AutoDispose=false`, then create or preserve a
+   disposable `codeybox-*` Multipass VM older than the configured leak threshold.
    - Expected: `GET /sandboxes/leaked` lists the VM after the reaper sweep.
 2. Create or preserve another VM with a `.codeybox-preempt` marker younger than
    `PreemptRetention`.
@@ -62,6 +62,7 @@ project; several steps intentionally create and destroy sandboxes.
 3. Call `POST /sandboxes/leaked/{name}/dispose` for the listed stale VM.
    - Expected: the VM is deleted and purged, the endpoint returns success, and a
      repeated dispose returns not found.
-4. Enable `CodeyBox:SandboxLeak:AutoDispose=true` on a disposable host.
+4. Re-enable default `CodeyBox:SandboxLeak:AutoDispose=true` on a disposable
+   host.
    - Expected: eligible leaks are disposed during the sweep, and failures for one
      VM do not prevent disposal attempts for others.
