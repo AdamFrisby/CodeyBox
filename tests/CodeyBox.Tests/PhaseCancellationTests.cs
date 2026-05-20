@@ -117,6 +117,35 @@ public sealed class PhaseCancellationTests
         Assert.Null(phase.Source);
     }
 
+    [Theory]
+    [InlineData(-2)]
+    [InlineData(-1)]
+    [InlineData(0)]
+    public void AttemptTimeout_DisabledTimeoutsDoNotCancelAttempt(int milliseconds)
+    {
+        var timeout = milliseconds == -1
+            ? Timeout.InfiniteTimeSpan
+            : TimeSpan.FromMilliseconds(milliseconds);
+        var time = new ManualTimeProvider();
+        using var phase = new PhaseCancellation("rework", CancellationToken.None, time);
+
+        using var attempt = phase.BeginAttemptTimeout(timeout);
+
+        Assert.False(attempt.Token.IsCancellationRequested);
+        Assert.False(attempt.TimeoutElapsed);
+
+        time.Advance(TimeSpan.FromDays(30));
+
+        Assert.False(attempt.Token.IsCancellationRequested);
+        Assert.False(attempt.TimeoutElapsed);
+        Assert.False(phase.Token.IsCancellationRequested);
+
+        phase.Cts.Cancel();
+
+        Assert.True(attempt.Token.IsCancellationRequested);
+        Assert.False(attempt.TimeoutElapsed);
+    }
+
     [Fact]
     public void PhaseAbsoluteTimeout_BoundsCumulativeFallbackAttempts()
     {
