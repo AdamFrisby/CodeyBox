@@ -34,6 +34,7 @@ internal sealed class PhaseCancellation : IDisposable
 {
     private readonly CancellationTokenSource _cts;
     private readonly List<IDisposable> _disposables = new();
+    private readonly TimeProvider _timeProvider;
     private string? _source;
     private bool _disposed;
 
@@ -44,8 +45,15 @@ internal sealed class PhaseCancellation : IDisposable
     public string? Source => Volatile.Read(ref _source);
 
     public PhaseCancellation(string phase, CancellationToken parentCt)
+        : this(phase, parentCt, TimeProvider.System)
+    {
+    }
+
+    internal PhaseCancellation(string phase, CancellationToken parentCt, TimeProvider timeProvider)
     {
         Phase = phase;
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        _timeProvider = timeProvider;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt);
         if (parentCt.CanBeCanceled)
         {
@@ -65,16 +73,15 @@ internal sealed class PhaseCancellation : IDisposable
     {
         if (timeout == Timeout.InfiniteTimeSpan || timeout <= TimeSpan.Zero)
             return;
-        var timeoutCts = new CancellationTokenSource(timeout);
-        _disposables.Add(timeoutCts);
-        _disposables.Add(timeoutCts.Token.Register(static state =>
-        {
-            var self = (PhaseCancellation)state!;
-            self.TryRecordSource(CancellationSources.PhaseTimeout(self.Phase));
-            try { self._cts.Cancel(); }
-            catch (ObjectDisposedException) { /* phase already disposed; nothing to do */ }
-        }, this));
+        _disposables.Add(CreateTimeout(timeout));
     }
+
+    /// <summary>
+    /// Arms a disposable timeout for a single fallback attempt. Disposing the
+    /// returned registration clears the timer without cancelling the phase,
+    /// allowing the next agent in a fallback chain to receive a fresh deadline.
+    /// </summary>
+    public IDisposable BeginAttemptTimeout(TimeSpan timeout) => CreateTimeout(timeout);
 
     /// <summary>
     /// Registers a host-shutdown hook. When the host begins stopping, the
@@ -207,6 +214,23 @@ internal sealed class PhaseCancellation : IDisposable
     private void TryRecordSource(string source) =>
         Interlocked.CompareExchange(ref _source, source, null);
 
+    private IDisposable CreateTimeout(TimeSpan timeout)
+    {
+        if (timeout == Timeout.InfiniteTimeSpan || timeout <= TimeSpan.Zero)
+            return EmptyDisposable.Instance;
+
+        var timeoutCts = new CancellationTokenSource(timeout, _timeProvider);
+        var registration = timeoutCts.Token.Register(static state =>
+        {
+            var self = (PhaseCancellation)state!;
+            self.TryRecordSource(CancellationSources.PhaseTimeout(self.Phase));
+            try { self._cts.Cancel(); }
+            catch (ObjectDisposedException) { /* phase already disposed; nothing to do */ }
+        }, this);
+
+        return new CompositeDisposable(registration, timeoutCts);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -221,6 +245,34 @@ internal sealed class PhaseCancellation : IDisposable
         }
         _disposables.Clear();
         _cts.Dispose();
+    }
+
+    private sealed class EmptyDisposable : IDisposable
+    {
+        public static readonly EmptyDisposable Instance = new();
+        public void Dispose() { }
+    }
+
+    private sealed class CompositeDisposable : IDisposable
+    {
+        private readonly IDisposable _first;
+        private readonly IDisposable _second;
+        private int _disposed;
+
+        public CompositeDisposable(IDisposable first, IDisposable second)
+        {
+            _first = first;
+            _second = second;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            try { _first.Dispose(); }
+            finally { _second.Dispose(); }
+        }
     }
 }
 

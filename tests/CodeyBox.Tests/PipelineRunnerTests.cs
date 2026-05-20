@@ -212,6 +212,21 @@ public sealed class PipelineRunnerTests
         Assert.DoesNotContain("security:llm-review", preflightSection);
     }
 
+    [Fact]
+    public void ResolvePhaseAbsoluteTimeout_DefaultMultiplierGivesThreeAttemptBudget()
+    {
+        var absolute = PipelineRunner.ResolvePhaseAbsoluteTimeout(TimeSpan.FromMinutes(240), multiplier: 3.0);
+        Assert.Equal(TimeSpan.FromMinutes(720), absolute);
+    }
+
+    [Fact]
+    public void ResolvePhaseAbsoluteTimeout_RejectsMultiplierBelowOne()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            PipelineRunner.ResolvePhaseAbsoluteTimeout(TimeSpan.FromMinutes(240), multiplier: 0.5));
+        Assert.Contains("PhaseAbsoluteTimeoutMultiplier", ex.Message);
+    }
+
     private sealed class FakeShellAuditor : IAuditor, IShellAuditorArgvProvider
     {
         public FakeShellAuditor(string name, IReadOnlyList<string> argv) { Name = name; Argv = argv; }

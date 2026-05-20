@@ -231,9 +231,48 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(WorkItemState.Failed, finalItem!.State);
     }
 
+    [Fact]
+    public async Task ReworkFallbackAttempt_GetsFreshWorkTimeoutBudget()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkDelays.Enqueue(TimeSpan.FromSeconds(2));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded"));
+
+        fix.Claude.ReworkDelays.Enqueue(TimeSpan.FromSeconds(2));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            WorkTimeout = TimeSpan.FromSeconds(3),
+        };
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(history, h =>
+            h.Phase == "rework"
+            && h.FromAgent == AgentKind.Codex
+            && h.ToAgent == AgentKind.Claude);
+    }
+
     // ── Harness ──────────────────────────────────────────────────────────────
 
-    private TestFixture BuildPipeline(string seedRepoUrl)
+    private TestFixture BuildPipeline(
+        string seedRepoUrl,
+        IReadOnlyList<IAuditor>? auditors = null,
+        int maxAuditIterations = 1)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -260,6 +299,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             ],
         };
 
+        var auditorList = auditors ?? [];
         var project = new Project
         {
             Id = new ProjectId("test-project"),
@@ -268,11 +308,15 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Codex,
             DefaultAgentClass = "frontier",
-            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+            Audit = new ProjectAudit
+            {
+                MaxIterations = maxAuditIterations,
+                AuditTypes = auditorList.Count > 0 ? ["scripted"] : [],
+            },
         };
 
         var projects = new InMemoryProjectRepository(project);
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
 
         var codexProbe = new RecordingProbe(AgentKind.Codex);
         var claudeProbe = new RecordingProbe(AgentKind.Claude);
@@ -532,6 +576,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
 {
     public Queue<AgentResult> ScriptedFailures { get; } = new();
+    public Queue<AgentResult> ReworkScriptedFailures { get; } = new();
+    public Queue<TimeSpan> WorkDelays { get; } = new();
+    public Queue<TimeSpan> ReworkDelays { get; } = new();
     public Queue<FileWrite> WorkPlan { get; } = new();
     public int CallCount { get; private set; }
 
@@ -568,7 +615,15 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
                 : new AgentResult(false, "merge failed", rc.Stdout, rc.Stderr);
         }
 
-        if (ScriptedFailures.Count > 0)
+        var isRework = prompt.StartsWith("## Rework requested", StringComparison.Ordinal)
+            || prompt.StartsWith("# Interrupted Rework Resume", StringComparison.Ordinal);
+        var delays = isRework ? ReworkDelays : WorkDelays;
+        if (delays.Count > 0)
+            await Task.Delay(delays.Dequeue(), ct);
+
+        if (isRework && ReworkScriptedFailures.Count > 0)
+            return ReworkScriptedFailures.Dequeue();
+        if (!isRework && ScriptedFailures.Count > 0)
             return ScriptedFailures.Dequeue();
 
         if (WorkPlan.Count == 0)
@@ -591,6 +646,31 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         string? modelId = null, string? reasoningMode = null,
         CancellationToken ct = default)
         => Task.FromResult(new TextOnlyAgentResult(false, "not used", null, null));
+}
+
+internal sealed class OnceFailingAuditor : IAuditor
+{
+    private int _calls;
+    public string Name => "once-failing-fallback";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+
+    public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        _ = context;
+        _ = ct;
+        _calls++;
+        if (_calls == 1)
+        {
+            return Task.FromResult(new AuditResult(false, [
+                new AuditFinding(Name, AuditSeverity.Error, "force rework", "iteration 1 always fails"),
+            ]));
+        }
+
+        return Task.FromResult(new AuditResult(true, []));
+    }
 }
 
 /// <summary>

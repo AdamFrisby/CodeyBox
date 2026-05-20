@@ -128,7 +128,7 @@ When a pipeline phase is interrupted by `OperationCanceledException`, the orches
 | `host-shutdown` | `IHostApplicationLifetime.ApplicationStopping` fired | (item left mid-flight for recovery loop) | n/a — recovery owns it |
 | `host-shutdown-deadline` | Host shutdown grace expired before the phase drained | (item left mid-flight for recovery loop) | n/a — recovery owns it (host is going away; auto-retry would race the shutdown) |
 | `stuck-probe` | Stuck-probe detected zero-activity threshold and killed the phase | `agent` (via `AgentStuckException`, not via `cancellationSource`) | Per `AutoRetryOnStuck` |
-| `timeout:<phase>` | Configured per-phase wall-clock cap fired (`WorkTimeout`, `MergeTimeout`, `Audit.PerIterationTimeout`) | `timeout` | No |
+| `timeout:<phase>` | Configured wall-clock cap fired. Work/rework and merge use fresh per-agent-attempt budgets (`WorkTimeout` / `MergeTimeout`) inside an absolute fallback-chain cap (`PhaseAbsoluteTimeoutMultiplier`, default `3.0`); audit uses `Audit.PerIterationTimeout`. | `timeout` | No |
 | `unknown` | OCE propagated past every attribution hook — typically a leaked supervisor token in the orchestrator host | `cancelled` | Yes (transient) |
 
 #### Transient-cancel auto-retry

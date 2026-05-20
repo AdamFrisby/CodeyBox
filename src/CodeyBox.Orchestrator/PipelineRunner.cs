@@ -92,6 +92,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
     private const int MaxConflictResolverFileBytes = 128 * 1024;
+    private static readonly TimeSpan MaxCancellationTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
 
     /// <summary>
     /// Overridable in tests to inject a programmable activity source without
@@ -341,9 +342,9 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 await Transition(item, WorkItemState.Working, ct, project);
                 string? workAgentStdout = null;
-                using (var workPhase = new PhaseCancellation("work", ct))
+                using (var workPhase = new PhaseCancellation("work", ct, _opts.TimeProvider))
                 {
-                    workPhase.SetPhaseTimeout(item.WorkTimeout);
+                    workPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
                     workPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
                     // In-iteration quota fallback: if the chosen agent hits quota
                     // mid-flight, swap to the next class member and retry. Audit,
@@ -361,7 +362,9 @@ public sealed class PipelineRunner : IPipelineRunner
                                         project: project,
                                         phaseCt,
                                         hostShutdownToken)),
-                            ct);
+                            ct,
+                            phaseCancellation: workPhase,
+                            attemptTimeout: item.WorkTimeout);
                     }
                     catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
                     {
@@ -387,9 +390,9 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 await Transition(item, WorkItemState.Reworking, ct, project);
                 string? reworkStdout = null;
-                using (var reworkPhase = new PhaseCancellation("rework-resume", ct))
+                using (var reworkPhase = new PhaseCancellation("rework-resume", ct, _opts.TimeProvider))
                 {
-                    reworkPhase.SetPhaseTimeout(item.WorkTimeout);
+                    reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
                     reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
                     var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
                     try
@@ -405,7 +408,9 @@ public sealed class PipelineRunner : IPipelineRunner
                                         project: project,
                                         phaseCt,
                                         hostShutdownToken)),
-                            ct);
+                            ct,
+                            phaseCancellation: reworkPhase,
+                            attemptTimeout: item.WorkTimeout);
                     }
                     catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
                     {
@@ -460,9 +465,9 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!skipMerge)
             {
                 await Transition(item, WorkItemState.Merging, ct, project);
-                using (var mergePhase = new PhaseCancellation("merge", ct))
+                using (var mergePhase = new PhaseCancellation("merge", ct, _opts.TimeProvider))
                 {
-                    mergePhase.SetPhaseTimeout(item.MergeTimeout);
+                    mergePhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.MergeTimeout));
                     mergePhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
                     try
                     {
@@ -474,7 +479,9 @@ public sealed class PipelineRunner : IPipelineRunner
                                         project: project,
                                         phaseCt,
                                         hostShutdownToken)),
-                            ct);
+                            ct,
+                            phaseCancellation: mergePhase,
+                            attemptTimeout: item.MergeTimeout);
                     }
                     catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
                     {
@@ -655,6 +662,22 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
+
+    private TimeSpan ResolvePhaseAbsoluteTimeout(TimeSpan perAttemptTimeout) =>
+        ResolvePhaseAbsoluteTimeout(perAttemptTimeout, _opts.PhaseAbsoluteTimeoutMultiplier);
+
+    internal static TimeSpan ResolvePhaseAbsoluteTimeout(TimeSpan perAttemptTimeout, double multiplier)
+    {
+        if (perAttemptTimeout == Timeout.InfiniteTimeSpan || perAttemptTimeout <= TimeSpan.Zero)
+            return perAttemptTimeout;
+        if (double.IsNaN(multiplier) || double.IsInfinity(multiplier) || multiplier < 1.0)
+            throw new InvalidOperationException("CodeyBox:PhaseAbsoluteTimeoutMultiplier must be >= 1");
+
+        var ticks = Math.Ceiling(perAttemptTimeout.Ticks * multiplier);
+        if (ticks >= MaxCancellationTimer.Ticks)
+            return MaxCancellationTimer;
+        return TimeSpan.FromTicks((long)ticks);
+    }
 
     private async Task RebaseExistingWorkBranchOntoFreshBaseAsync(
         WorkItem item,
@@ -1778,7 +1801,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 throw new OperationCanceledException(hostShutdownToken);
 
             await Transition(item, WorkItemState.Auditing, ct, project);
-            using var auditPhase = new PhaseCancellation("audit", ct);
+            using var auditPhase = new PhaseCancellation("audit", ct, _opts.TimeProvider);
             auditPhase.SetPhaseTimeout(project.Audit.PerIterationTimeout);
             auditPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
 
@@ -1862,8 +1885,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
                 : (IReadOnlyList<WorkItemQuestion>)[];
             var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions, project.AllowAgentQuestions);
-            using var reworkPhase = new PhaseCancellation("rework", ct);
-            reworkPhase.SetPhaseTimeout(item.WorkTimeout);
+            using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
+            reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
             reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
             var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
             string? reworkStdout;
@@ -1880,7 +1903,9 @@ public sealed class PipelineRunner : IPipelineRunner
                                 phaseCt,
                                 hostShutdownToken,
                                 iteration: iteration)),
-                    ct);
+                    ct,
+                    phaseCancellation: reworkPhase,
+                    attemptTimeout: item.WorkTimeout);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
@@ -2586,9 +2611,19 @@ public sealed class PipelineRunner : IPipelineRunner
         int? iteration,
         Func<IAgentRunner, WorkItem, Task<TResult>> invoker,
         CancellationToken ct,
+        PhaseCancellation? phaseCancellation = null,
+        TimeSpan? attemptTimeout = null,
         IAgentRunner? initialRunnerOverride = null,
         AgentMembership? initialMemberOverride = null)
     {
+        async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, WorkItem trialItem)
+        {
+            using var timeout = phaseCancellation is not null && attemptTimeout is { } perAttempt
+                ? phaseCancellation.BeginAttemptTimeout(perAttempt)
+                : null;
+            return await invoker(runner, trialItem);
+        }
+
         // Resolve the initial member from the work item's currently-selected agent.
         // OrchestratorService writes Agent / ModelId / ReasoningMode onto item before
         // calling Pipeline.RunAsync; we trust those as the first-attempt picks.
@@ -2616,7 +2651,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_classRouter is null
             || (item.AgentClassId is null && project.DefaultAgentClass is null))
         {
-            return await invoker(initialRunner, initialItem);
+            return await InvokeAttemptAsync(initialRunner, initialItem);
         }
 
         var classId = item.AgentClassId ?? project.DefaultAgentClass!;
@@ -2647,7 +2682,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             try
             {
-                return await invoker(currentRunner, currentItem);
+                return await InvokeAttemptAsync(currentRunner, currentItem);
             }
             catch (TerminalQuotaError quotaEx)
             {
@@ -4025,7 +4060,7 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        using var upstreamPhase = new PhaseCancellation("upstream", ct);
+        using var upstreamPhase = new PhaseCancellation("upstream", ct, _opts.TimeProvider);
         upstreamPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
         ct = upstreamPhase.Token;
 
@@ -5426,6 +5461,7 @@ public sealed record PipelineOptions
     public TimeSpan UpstreamPushBackoff { get; init; } = TimeSpan.FromSeconds(15);
     public HostGitIdentity? HostGitIdentity { get; init; }
     public TimeSpan ShutdownGrace { get; init; } = TimeSpan.FromSeconds(60);
+    public double PhaseAbsoluteTimeoutMultiplier { get; init; } = 3.0;
     public TimeSpan AuditShutdownDrain => Min(TimeSpan.FromSeconds(60), ShutdownGrace);
     public TimeSpan AgentPreemptSignalTimeout => Min(TimeSpan.FromSeconds(2), ShutdownGrace);
     public TimeSpan AgentPreemptDrain => Min(TimeSpan.FromSeconds(2), ShutdownGrace);
@@ -5439,6 +5475,8 @@ public sealed record PipelineOptions
     /// Must be ≥ 1 (or 0 to disable) when non-negative.
     /// </summary>
     public int StuckThresholdMinutes { get; init; } = 10;
+
+    internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 
     private static TimeSpan Min(TimeSpan a, TimeSpan b) => a <= b ? a : b;
 }

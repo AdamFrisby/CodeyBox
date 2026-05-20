@@ -104,8 +104,9 @@ secret never lands on a persistent disk inside the VM.
 
 `SandboxResourceLimits` caps CPU, memory, disk, and wall-clock.
 Multipass enforces memory and CPU limits at VM-launch time. The
-orchestrator additionally enforces per-phase `WorkTimeout` and
-`MergeTimeout` via `CancellationTokenSource.CancelAfter`.
+orchestrator additionally enforces per-attempt `WorkTimeout` and
+`MergeTimeout` budgets, plus an absolute fallback-chain cap, via
+`CancellationTokenSource` timers.
 
 ### 6. State persistence is host-side only
 
