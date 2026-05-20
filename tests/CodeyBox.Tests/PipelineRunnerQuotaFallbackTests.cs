@@ -232,6 +232,45 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkFallbackAttempt_TimeoutFallsBackWithFreshWorkBudget()
+    {
+        var time = new ManualTimeProvider();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            timeProvider: time,
+            phaseAbsoluteTimeoutMultiplier: 10.0);
+
+        fix.Codex.WorkDelays.Enqueue(TimeSpan.FromSeconds(11));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed by fallback"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            WorkTimeout = TimeSpan.FromSeconds(10),
+        };
+        await fix.Store.CreateAsync(item);
+
+        var workStarted = WaitForPhaseStart("work", fix.Codex, fix.Claude);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
+        await WaitForPhaseStartAsync("work", workStarted, pipelineTask);
+        await RunWithAdvancingTimeAsync(
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 500);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var fallback = Assert.Single(history, h => h.Phase == "work");
+        Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+        Assert.Equal(AgentKind.Claude, fallback.ToAgent);
+        Assert.Contains("per-attempt timeout", fallback.Reason);
+    }
+
+    [Fact]
     public async Task ReworkFallbackAttempt_GetsFreshWorkTimeoutBudget()
     {
         var time = new ManualTimeProvider();
@@ -310,7 +349,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         await RunWithAdvancingTimeAsync(pipelineTask, time, step: TimeSpan.FromMilliseconds(100), maxSteps: 250);
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
-        Assert.InRange(elapsed, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(15900));
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(17));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
@@ -325,36 +364,39 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
-    public async Task ReworkFallbackAttempt_TimesOutBeforeAbsolutePhaseCap()
+    public async Task ReworkFallbackAttemptTimeouts_AreBoundedByAbsolutePhaseCap()
     {
         var time = new ManualTimeProvider();
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(
+        using var fix = BuildPipelineThreeMembers(
             seed,
             [new OnceFailingAuditor()],
             maxAuditIterations: 2,
             timeProvider: time,
-            phaseAbsoluteTimeoutMultiplier: 5.0);
+            phaseAbsoluteTimeoutMultiplier: 3.0);
 
-        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
-        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
-            Success: false,
-            Summary: "agent exited 1",
-            Stdout: null,
-            Stderr: "API Error: rate_limit_exceeded"));
-        fix.Claude.ReworkDelays.Enqueue(TimeSpan.FromMilliseconds(300));
-        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed"));
+        fix.Gemini.ReworkDelays.Enqueue(TimeSpan.FromMinutes(250));
+        fix.Codex.ReworkDelays.Enqueue(TimeSpan.FromMinutes(250));
+        fix.Claude.ReworkDelays.Enqueue(TimeSpan.FromMinutes(250));
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
 
-        var item = NewItem(initialAgent: AgentKind.Codex) with
+        var item = NewItem(initialAgent: AgentKind.Gemini) with
         {
-            WorkTimeout = TimeSpan.FromMilliseconds(100),
+            WorkTimeout = TimeSpan.FromMinutes(240),
         };
         await fix.Store.CreateAsync(item);
 
-        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude);
+        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude, fix.Gemini);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForReworkStartAsync(reworkStarted, pipelineTask);
-        await RunWithAdvancingTimeAsync(pipelineTask, time);
+        await RunWithAdvancingTimeAsync(
+            pipelineTask,
+            time,
+            step: TimeSpan.FromSeconds(10),
+            maxSteps: 5000);
+
+        var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
+        Assert.InRange(elapsed, TimeSpan.FromMinutes(720), TimeSpan.FromMinutes(730));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
@@ -363,8 +405,134 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(CancellationSources.PhaseTimeout("rework"), finalItem.CancellationSource);
 
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
-        Assert.Single(history);
-        Assert.Equal(AgentKind.Claude, history[0].ToAgent);
+        Assert.Equal(2, history.Count);
+        Assert.Equal(AgentKind.Codex, history[0].ToAgent);
+        Assert.Equal(AgentKind.Claude, history[1].ToAgent);
+    }
+
+    [Fact]
+    public async Task InterruptedReworkResumeFallbackAttempt_TimeoutFallsBackWithFreshWorkBudget()
+    {
+        var time = new ManualTimeProvider();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            timeProvider: time,
+            phaseAbsoluteTimeoutMultiplier: 30.0);
+
+        fix.Codex.ReworkDelays.Enqueue(TimeSpan.FromSeconds(11));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("resume.txt", "resumed by fallback"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            State = WorkItemState.Reworking,
+            WorkBranch = "codeybox/rework-resume",
+            WorkTimeout = TimeSpan.FromSeconds(10),
+            PreemptedAt = DateTimeOffset.UtcNow,
+        };
+        item = item with { PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}" };
+        await CreatePreemptCheckpointAsync(fix.GitHost, item, seed);
+        await fix.Store.CreateAsync(item);
+
+        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
+        await WaitForReworkStartAsync(reworkStarted, pipelineTask);
+        await RunWithAdvancingTimeAsync(
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 500);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.True(finalItem!.State == WorkItemState.Done, finalItem.LastError);
+        Assert.Null(finalItem.PreemptedAt);
+        Assert.Null(finalItem.PreemptCheckpoint);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var fallback = Assert.Single(history, h => h.Phase == "rework");
+        Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+        Assert.Equal(AgentKind.Claude, fallback.ToAgent);
+        Assert.Contains("per-attempt timeout", fallback.Reason);
+    }
+
+    [Fact]
+    public async Task MergeFallbackAttempt_TimeoutFallsBackWithFreshMergeBudget()
+    {
+        var time = new ManualTimeProvider();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            timeProvider: time,
+            phaseAbsoluteTimeoutMultiplier: 10.0);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.MergeDelays.Enqueue(TimeSpan.FromSeconds(11));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            MergeTimeout = TimeSpan.FromSeconds(10),
+        };
+        await fix.Store.CreateAsync(item);
+
+        var mergeStarted = WaitForPhaseStart("merge", fix.Codex, fix.Claude);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
+        await WaitForPhaseStartAsync("merge", mergeStarted, pipelineTask);
+        await RunWithAdvancingTimeAsync(
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 1000);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.True(finalItem!.State == WorkItemState.Done, finalItem.LastError);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var fallback = Assert.Single(history, h => h.Phase == "merge");
+        Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+        Assert.Equal(AgentKind.Claude, fallback.ToAgent);
+        Assert.Contains("per-attempt timeout", fallback.Reason);
+    }
+
+    [Fact]
+    public async Task NoRouterSingleAgentAttempt_UsesWorkTimeoutBeforeAbsoluteCap()
+    {
+        var time = new ManualTimeProvider();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            timeProvider: time,
+            useClassRouter: false,
+            stuckThresholdMinutes: 0);
+
+        fix.Codex.WorkDelays.Enqueue(TimeSpan.FromSeconds(25));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            AgentClassId = null,
+            WorkTimeout = TimeSpan.FromSeconds(10),
+        };
+        await fix.Store.CreateAsync(item);
+
+        var workStarted = WaitForPhaseStart("work", fix.Codex);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
+        await WaitForPhaseStartAsync("work", workStarted, pipelineTask);
+        await RunWithAdvancingTimeAsync(
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 400);
+
+        var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(12));
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Failed, finalItem!.State);
+        Assert.Equal("timeout", finalItem.FailureKind);
+        Assert.Equal(CancellationSources.PhaseTimeout("work"), finalItem.CancellationSource);
+        Assert.Empty(await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None));
     }
 
     // ── Harness ──────────────────────────────────────────────────────────────
@@ -374,7 +542,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         IReadOnlyList<IAuditor>? auditors = null,
         int maxAuditIterations = 1,
         TimeProvider? timeProvider = null,
-        double phaseAbsoluteTimeoutMultiplier = 3.0)
+        double phaseAbsoluteTimeoutMultiplier = 3.0,
+        bool useClassRouter = true,
+        int stuckThresholdMinutes = -1)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -409,11 +579,12 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             RepositoryUrl = seedRepoUrl,
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Codex,
-            DefaultAgentClass = "frontier",
+            DefaultAgentClass = useClassRouter ? "frontier" : null,
             Audit = new ProjectAudit
             {
                 MaxIterations = maxAuditIterations,
                 AuditTypes = auditorList.Count > 0 ? ["scripted"] : [],
+                StuckThresholdMinutes = stuckThresholdMinutes,
             },
         };
 
@@ -444,11 +615,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: [codexProbe, claudeProbe],
-            classRouter: router,
+            classRouter: useClassRouter ? router : null,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }));
 
-        return new TestFixture(pipeline, store, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory);
+        return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory);
     }
 
     private TestFixture BuildPipelineWithCost(string seedRepoUrl, IWorkItemCostStore costStore)
@@ -524,7 +695,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }));
 
-        return new TestFixture(pipeline, store, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory);
+        return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory);
     }
 
     private sealed class FakeFallbackExtractor : IAgentCostExtractor
@@ -627,14 +798,17 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         return new ThreeMemberFixture(pipeline, store, codex, claude, gemini, webhooks, fallbackHistory);
     }
 
-    private static Task WaitForReworkStart(params ScriptableAgent[] agents)
+    private static Task WaitForReworkStart(params ScriptableAgent[] agents) =>
+        WaitForPhaseStart("rework", agents);
+
+    private static Task WaitForPhaseStart(string phase, params ScriptableAgent[] agents)
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         foreach (var agent in agents)
         {
-            agent.InvocationStarted += (_, isRework) =>
+            agent.PhaseInvocationStarted += (_, startedPhase) =>
             {
-                if (isRework)
+                if (startedPhase == phase)
                     started.TrySetResult();
             };
         }
@@ -642,14 +816,17 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         return started.Task;
     }
 
-    private static async Task WaitForReworkStartAsync(Task reworkStarted, Task pipelineTask)
+    private static Task WaitForReworkStartAsync(Task reworkStarted, Task pipelineTask) =>
+        WaitForPhaseStartAsync("rework", reworkStarted, pipelineTask);
+
+    private static async Task WaitForPhaseStartAsync(string phase, Task phaseStarted, Task pipelineTask)
     {
-        var completed = await Task.WhenAny(reworkStarted, pipelineTask, Task.Delay(TimeSpan.FromSeconds(10)));
-        if (completed == reworkStarted)
+        var completed = await Task.WhenAny(phaseStarted, pipelineTask, Task.Delay(TimeSpan.FromSeconds(10)));
+        if (completed == phaseStarted)
             return;
         if (completed == pipelineTask)
             await pipelineTask;
-        throw new TimeoutException("Pipeline did not reach rework before the test timeout.");
+        throw new TimeoutException($"Pipeline did not reach {phase} before the test timeout.");
     }
 
     private static async Task RunWithAdvancingTimeAsync(
@@ -680,10 +857,26 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         PushUpstream = false,
     };
 
+    private async Task CreatePreemptCheckpointAsync(LocalGitHost gitHost, WorkItem item, string seed)
+    {
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed);
+        var clone = Path.Combine(_workspace, "checkpoint-" + Guid.NewGuid().ToString("N")[..8]);
+        var bare = gitHost.GetRepoPath(repoId);
+        Assert.Equal(0, (await TestSupport.RunGit(_workspace, "clone", bare, clone)).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "config", "user.email", "test@example.invalid")).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "config", "user.name", "Test")).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "checkout", "-B", item.WorkBranch!)).code);
+        await File.WriteAllTextAsync(Path.Combine(clone, "partial-rework.txt"), "partial");
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "add", "-A")).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "commit", "-m", "checkpoint")).code);
+        Assert.Equal(0, (await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{item.PreemptCheckpoint}")).code);
+    }
+
     private sealed class TestFixture : IDisposable
     {
         public PipelineRunner Pipeline { get; }
         public SqliteWorkItemStore Store { get; }
+        public LocalGitHost GitHost { get; }
         public ScriptableAgent Codex { get; }
         public ScriptableAgent Claude { get; }
         public RecordingProbe CodexProbe { get; }
@@ -692,6 +885,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         public InMemoryAgentFallbackHistoryStore FallbackHistory { get; }
 
         public TestFixture(PipelineRunner pipeline, SqliteWorkItemStore store,
+            LocalGitHost gitHost,
             ScriptableAgent codex, ScriptableAgent claude,
             RecordingProbe codexProbe, RecordingProbe claudeProbe,
             CapturingWebhookDispatcher webhooks,
@@ -699,6 +893,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         {
             Pipeline = pipeline;
             Store = store;
+            GitHost = gitHost;
             Codex = codex;
             Claude = claude;
             CodexProbe = codexProbe;
@@ -749,11 +944,14 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
 
     public Queue<AgentResult> ScriptedFailures { get; } = new();
     public Queue<AgentResult> ReworkScriptedFailures { get; } = new();
+    public Queue<AgentResult> MergeScriptedFailures { get; } = new();
     public Queue<TimeSpan> WorkDelays { get; } = new();
     public Queue<TimeSpan> ReworkDelays { get; } = new();
+    public Queue<TimeSpan> MergeDelays { get; } = new();
     public Queue<FileWrite> WorkPlan { get; } = new();
     public int CallCount { get; private set; }
     public event Action<AgentKind, bool>? InvocationStarted;
+    public event Action<AgentKind, string>? PhaseInvocationStarted;
 
     public AgentKind Kind { get; }
 
@@ -775,9 +973,20 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         bool captureStructuredStream = false)
     {
         CallCount++;
+        var isRework = prompt.StartsWith("## Rework requested", StringComparison.Ordinal)
+            || prompt.StartsWith("# Interrupted Rework Resume", StringComparison.Ordinal);
+        var isMerge = prompt.StartsWith("# Merge task", StringComparison.Ordinal);
+        var phase = isMerge ? "merge" : isRework ? "rework" : "work";
+        InvocationStarted?.Invoke(Kind, isRework);
+        PhaseInvocationStarted?.Invoke(Kind, phase);
 
-        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
+        if (isMerge)
         {
+            if (MergeDelays.Count > 0)
+                await Task.Delay(MergeDelays.Dequeue(), _timeProvider, ct);
+            if (MergeScriptedFailures.Count > 0)
+                return MergeScriptedFailures.Dequeue();
+
             // Run a real git merge inside the sandbox so the merge phase passes.
             var workBranchEnd = prompt.IndexOf("` into branch", StringComparison.Ordinal);
             var workBranchStart = prompt.IndexOf('`') + 1;
@@ -792,9 +1001,6 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
                 : new AgentResult(false, "merge failed", rc.Stdout, rc.Stderr);
         }
 
-        var isRework = prompt.StartsWith("## Rework requested", StringComparison.Ordinal)
-            || prompt.StartsWith("# Interrupted Rework Resume", StringComparison.Ordinal);
-        InvocationStarted?.Invoke(Kind, isRework);
         var delays = isRework ? ReworkDelays : WorkDelays;
         if (delays.Count > 0)
             await Task.Delay(delays.Dequeue(), _timeProvider, ct);
@@ -824,122 +1030,6 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         string? modelId = null, string? reasoningMode = null,
         CancellationToken ct = default)
         => Task.FromResult(new TextOnlyAgentResult(false, "not used", null, null));
-}
-
-internal sealed class ManualTimeProvider : TimeProvider
-{
-    private readonly object _gate = new();
-    private readonly List<ManualTimer> _timers = [];
-    private DateTimeOffset _utcNow = DateTimeOffset.UnixEpoch;
-
-    public override DateTimeOffset GetUtcNow()
-    {
-        lock (_gate)
-            return _utcNow;
-    }
-
-    public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
-    {
-        var timer = new ManualTimer(this, callback, state);
-        lock (_gate)
-            _timers.Add(timer);
-        timer.Change(dueTime, period);
-        return timer;
-    }
-
-    public void Advance(TimeSpan delta)
-    {
-        if (delta < TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(delta));
-
-        List<(TimerCallback Callback, object? State)> callbacks = [];
-        lock (_gate)
-        {
-            _utcNow += delta;
-            foreach (var timer in _timers.ToArray())
-            {
-                if (timer.TryConsumeDue(_utcNow, out var callback))
-                    callbacks.Add(callback);
-            }
-
-            _timers.RemoveAll(static t => t.IsDisposed);
-        }
-
-        foreach (var (callback, state) in callbacks)
-            callback(state);
-    }
-
-    private sealed class ManualTimer : ITimer
-    {
-        private readonly ManualTimeProvider _provider;
-        private readonly TimerCallback _callback;
-        private readonly object? _state;
-        private DateTimeOffset? _dueAt;
-        private TimeSpan _period;
-        private bool _disposed;
-
-        public ManualTimer(ManualTimeProvider provider, TimerCallback callback, object? state)
-        {
-            _provider = provider;
-            _callback = callback;
-            _state = state;
-        }
-
-        public bool IsDisposed => _disposed;
-
-        public bool Change(TimeSpan dueTime, TimeSpan period)
-        {
-            lock (_provider._gate)
-            {
-                if (_disposed)
-                    return false;
-
-                _period = period;
-                _dueAt = dueTime == Timeout.InfiniteTimeSpan
-                    ? null
-                    : _provider._utcNow + dueTime;
-                return true;
-            }
-        }
-
-        public bool TryConsumeDue(DateTimeOffset now, out (TimerCallback Callback, object? State) callback)
-        {
-            lock (_provider._gate)
-            {
-                callback = default;
-                if (_disposed || _dueAt is not { } dueAt || dueAt > now)
-                    return false;
-
-                callback = (_callback, _state);
-                if (_period > TimeSpan.Zero && _period != Timeout.InfiniteTimeSpan)
-                {
-                    do
-                    {
-                        dueAt += _period;
-                    } while (dueAt <= now);
-                    _dueAt = dueAt;
-                }
-                else
-                {
-                    _dueAt = null;
-                }
-
-                return true;
-            }
-        }
-
-        public ValueTask DisposeAsync()
-        {
-            Dispose();
-            return ValueTask.CompletedTask;
-        }
-
-        public void Dispose()
-        {
-            lock (_provider._gate)
-                _disposed = true;
-        }
-    }
 }
 
 internal sealed class OnceFailingAuditor : IAuditor

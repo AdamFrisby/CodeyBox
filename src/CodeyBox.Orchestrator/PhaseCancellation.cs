@@ -219,9 +219,6 @@ internal sealed class PhaseCancellation : IDisposable
 
     private IDisposable CreateTimeout(TimeSpan timeout)
     {
-        if (timeout == Timeout.InfiniteTimeSpan || timeout <= TimeSpan.Zero)
-            return EmptyDisposable.Instance;
-
         var timeoutCts = new CancellationTokenSource(timeout, _timeProvider);
         var registration = timeoutCts.Token.Register(static state =>
         {
@@ -248,12 +245,6 @@ internal sealed class PhaseCancellation : IDisposable
         }
         _disposables.Clear();
         _cts.Dispose();
-    }
-
-    private sealed class EmptyDisposable : IDisposable
-    {
-        public static readonly EmptyDisposable Instance = new();
-        public void Dispose() { }
     }
 
     private sealed class CompositeDisposable : IDisposable

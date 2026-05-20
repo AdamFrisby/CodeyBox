@@ -92,6 +92,8 @@ public sealed class PipelineRunner : IPipelineRunner
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
     private const int MaxConflictResolverFileBytes = 128 * 1024;
+    // CancellationTokenSource timers use a uint millisecond due-time internally;
+    // keep computed phase caps inside that runtime ceiling.
     private static readonly TimeSpan MaxCancellationTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
 
     /// <summary>
@@ -2637,9 +2639,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 && phaseCancellation is not null
                 && oce is not PhaseCancellationException)
             {
-                throw new PhaseCancellationException(
+                if (phaseCancellation.Token.IsCancellationRequested)
+                    throw phaseCancellation.Wrap(oce);
+
+                throw new AgentAttemptTimeoutException(
                     phaseCancellation.Phase,
-                    CancellationSources.PhaseTimeout(phaseCancellation.Phase),
+                    runner.Kind,
+                    attemptTimeout!.Value,
                     oce);
             }
         }
@@ -2671,7 +2677,17 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_classRouter is null
             || (item.AgentClassId is null && project.DefaultAgentClass is null))
         {
-            return await InvokeAttemptAsync(initialRunner, initialItem);
+            try
+            {
+                return await InvokeAttemptAsync(initialRunner, initialItem);
+            }
+            catch (AgentAttemptTimeoutException timeoutEx) when (phaseCancellation is not null)
+            {
+                throw new PhaseCancellationException(
+                    phaseCancellation.Phase,
+                    CancellationSources.PhaseTimeout(phaseCancellation.Phase),
+                    timeoutEx);
+            }
         }
 
         var classId = item.AgentClassId ?? project.DefaultAgentClass!;
@@ -2695,26 +2711,19 @@ public sealed class PipelineRunner : IPipelineRunner
                 QualityScore = 100,
             };
 
-        while (true)
+        async Task MoveToNextMemberOrThrowAsync(
+            string safeReason,
+            bool quotaExhausted,
+            DateTimeOffset? quotaResetAt,
+            Exception terminalException)
         {
-            triedKeys.Add((currentMember.Agent, currentMember.ModelId ?? string.Empty));
-            triedCount++;
-
-            try
-            {
-                return await InvokeAttemptAsync(currentRunner, currentItem);
-            }
-            catch (TerminalQuotaError quotaEx)
+            if (quotaExhausted)
             {
                 // Cap the reset hint against a sane operator-visible ceiling. Reset
                 // windows are extracted from attacker-influenceable agent output;
                 // a maliciously-crafted Retry-After could otherwise park an item
                 // arbitrarily far in the future.
-                var clampedReset = ClampQuotaReset(quotaEx.ResetAt);
-                // Normalize stderr-derived reason for log/webhook serialization:
-                // strip CR/LF so plain-text log sinks can't be spoofed by embedded
-                // newlines (CWE-117), and trim to a single-line summary.
-                var safeReason = SingleLineSummary(quotaEx.Message);
+                var clampedReset = ClampQuotaReset(quotaResetAt);
 
                 // Mark the member exhausted in the router and the probe so the
                 // next pickup (or the rest of this pipeline) skips it.
@@ -2737,45 +2746,48 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     earliestReset = reset;
                 }
+            }
 
-                // Find the next candidate that we haven't already tried this run.
-                var candidates = _classRouter.OrderedFallbackCandidates(item, project);
-                AgentMembership? nextMember = null;
-                foreach (var candidate in candidates)
+            // Find the next candidate that we haven't already tried this run.
+            var candidates = _classRouter.OrderedFallbackCandidates(item, project);
+            AgentMembership? nextMember = null;
+            foreach (var candidate in candidates)
+            {
+                var key = (candidate.Agent, candidate.ModelId ?? string.Empty);
+                if (triedKeys.Contains(key)) continue;
+                if (!_agents.TryGet(candidate.Agent, out _))
                 {
-                    var key = (candidate.Agent, candidate.ModelId ?? string.Empty);
-                    if (triedKeys.Contains(key)) continue;
-                    if (!_agents.TryGet(candidate.Agent, out _))
-                    {
-                        // Audible misconfiguration: class declares this agent kind but
-                        // no runner is wired in DI; skipping silently would hide the gap.
-                        _log.LogWarning(
-                            "Class '{ClassId}' member {Agent} has no registered runner; skipping for fallback (work item {WorkItemId})",
-                            classId, candidate.Agent.Value, item.Id);
-                        continue;
-                    }
-                    // The router's in-process exhausted-cache filters most stale
-                    // picks, but a member can be quota-failed in the persistent
-                    // observed-failure store (e.g. an earlier process recorded
-                    // the failure and just-started workers haven't seen the
-                    // event yet). Skip those too so the audit pipeline doesn't
-                    // burn a roundtrip rediscovering an exhaustion we already know.
-                    if (_quotaFailures is not null
-                        && await _quotaFailures.HasRecentAsync(
-                            candidate.Agent, candidate.ModelId,
-                            _auditQuotaOptions.ObservedFailureWindow,
-                            DateTimeOffset.UtcNow, ct))
-                    {
-                        _log.LogInformation(
-                            "Class '{ClassId}' member {Agent}/{Model} has a recent observed quota failure; skipping for fallback (work item {WorkItemId})",
-                            classId, candidate.Agent.Value, candidate.ModelId ?? "(default)", item.Id);
-                        continue;
-                    }
-                    nextMember = candidate;
-                    break;
+                    // Audible misconfiguration: class declares this agent kind but
+                    // no runner is wired in DI; skipping silently would hide the gap.
+                    _log.LogWarning(
+                        "Class '{ClassId}' member {Agent} has no registered runner; skipping for fallback (work item {WorkItemId})",
+                        classId, candidate.Agent.Value, item.Id);
+                    continue;
                 }
+                // The router's in-process exhausted-cache filters most stale
+                // picks, but a member can be quota-failed in the persistent
+                // observed-failure store (e.g. an earlier process recorded
+                // the failure and just-started workers haven't seen the
+                // event yet). Skip those too so the audit pipeline doesn't
+                // burn a roundtrip rediscovering an exhaustion we already know.
+                if (_quotaFailures is not null
+                    && await _quotaFailures.HasRecentAsync(
+                        candidate.Agent, candidate.ModelId,
+                        _auditQuotaOptions.ObservedFailureWindow,
+                        DateTimeOffset.UtcNow, ct))
+                {
+                    _log.LogInformation(
+                        "Class '{ClassId}' member {Agent}/{Model} has a recent observed quota failure; skipping for fallback (work item {WorkItemId})",
+                        classId, candidate.Agent.Value, candidate.ModelId ?? "(default)", item.Id);
+                    continue;
+                }
+                nextMember = candidate;
+                break;
+            }
 
-                if (nextMember is null)
+            if (nextMember is null)
+            {
+                if (quotaExhausted)
                 {
                     AuditLog.AgentQuotaAllExhausted(item.Id, classId, phase, triedCount);
                     if (_fallbackHistory is not null)
@@ -2804,76 +2816,126 @@ public sealed class PipelineRunner : IPipelineRunner
                     throw new AgentClassExhaustedException(classId, phase, triedCount, earliestReset, msg);
                 }
 
-                if (!_agents.TryGet(nextMember.Agent, out var nextRunner))
-                    throw new InvalidOperationException($"No runner registered for fallback agent '{nextMember.Agent}'");
+                var timeoutPhase = phaseCancellation?.Phase ?? phase;
+                throw new PhaseCancellationException(
+                    timeoutPhase,
+                    CancellationSources.PhaseTimeout(timeoutPhase),
+                    terminalException);
+            }
 
-                AuditLog.AgentQuotaFallback(
-                    item.Id, phase, iteration,
-                    fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
-                    toAgent: nextMember.Agent, toModel: nextMember.ModelId,
-                    reason: safeReason);
+            if (!_agents.TryGet(nextMember.Agent, out var nextRunner))
+                throw new InvalidOperationException($"No runner registered for fallback agent '{nextMember.Agent}'");
 
-                // Trial item carries the new Agent / ModelId / ReasoningMode so webhook
-                // consumers that read WorkItem.Agent see the agent actually being run.
-                var trialItem = item with
+            AuditLog.AgentQuotaFallback(
+                item.Id, phase, iteration,
+                fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
+                toAgent: nextMember.Agent, toModel: nextMember.ModelId,
+                reason: safeReason);
+
+            // Trial item carries the new Agent / ModelId / ReasoningMode so webhook
+            // consumers that read WorkItem.Agent see the agent actually being run.
+            var trialItem = item with
+            {
+                Agent = nextMember.Agent,
+                ModelId = nextMember.ModelId,
+                ReasoningMode = nextMember.ReasoningMode,
+            };
+
+            if (_fallbackHistory is not null)
+            {
+                try
                 {
-                    Agent = nextMember.Agent,
-                    ModelId = nextMember.ModelId,
-                    ReasoningMode = nextMember.ReasoningMode,
-                };
-
-                if (_fallbackHistory is not null)
+                    await _fallbackHistory.RecordAsync(new AgentFallbackRecord(
+                        Id: Guid.NewGuid(),
+                        WorkItemId: item.Id,
+                        Phase: phase,
+                        Iteration: iteration,
+                        FromAgent: currentMember.Agent,
+                        FromModel: currentMember.ModelId,
+                        ToAgent: nextMember.Agent,
+                        ToModel: nextMember.ModelId,
+                        Reason: safeReason,
+                        OccurredAt: DateTimeOffset.UtcNow), CancellationToken.None);
+                }
+                catch (Exception histEx)
                 {
-                    try
+                    _log.LogDebug(histEx, "fallback history record failed for agent.fallback event");
+                }
+            }
+
+            if (_webhooks is not null)
+            {
+                try
+                {
+                    await _webhooks.PublishAsync(new WebhookEvent
                     {
-                        await _fallbackHistory.RecordAsync(new AgentFallbackRecord(
-                            Id: Guid.NewGuid(),
-                            WorkItemId: item.Id,
+                        Event = "agent.fallback",
+                        WorkItem = trialItem,
+                        Project = project,
+                        Details = new AgentFallbackDetails(
+                            WorkItemId: item.Id.ToString(),
                             Phase: phase,
                             Iteration: iteration,
-                            FromAgent: currentMember.Agent,
+                            FromAgent: currentMember.Agent.Value,
                             FromModel: currentMember.ModelId,
-                            ToAgent: nextMember.Agent,
+                            ToAgent: nextMember.Agent.Value,
                             ToModel: nextMember.ModelId,
-                            Reason: safeReason,
-                            OccurredAt: DateTimeOffset.UtcNow), CancellationToken.None);
-                    }
-                    catch (Exception histEx)
-                    {
-                        _log.LogDebug(histEx, "fallback history record failed for agent.fallback event");
-                    }
+                            Reason: safeReason),
+                    }, CancellationToken.None);
                 }
-
-                if (_webhooks is not null)
+                catch (Exception webhookEx)
                 {
-                    try
-                    {
-                        await _webhooks.PublishAsync(new WebhookEvent
-                        {
-                            Event = "agent.fallback",
-                            WorkItem = trialItem,
-                            Project = project,
-                            Details = new AgentFallbackDetails(
-                                WorkItemId: item.Id.ToString(),
-                                Phase: phase,
-                                Iteration: iteration,
-                                FromAgent: currentMember.Agent.Value,
-                                FromModel: currentMember.ModelId,
-                                ToAgent: nextMember.Agent.Value,
-                                ToModel: nextMember.ModelId,
-                                Reason: safeReason),
-                        }, CancellationToken.None);
-                    }
-                    catch (Exception webhookEx)
-                    {
-                        _log.LogDebug(webhookEx, "agent.fallback webhook publish failed");
-                    }
+                    _log.LogDebug(webhookEx, "agent.fallback webhook publish failed");
                 }
-
-                currentMember = nextMember;
-                currentRunner = nextRunner;
-                currentItem = trialItem;
             }
+
+            currentMember = nextMember;
+            currentRunner = nextRunner;
+            currentItem = trialItem;
+        }
+
+        while (true)
+        {
+            triedKeys.Add((currentMember.Agent, currentMember.ModelId ?? string.Empty));
+            triedCount++;
+
+            try
+            {
+                return await InvokeAttemptAsync(currentRunner, currentItem);
+            }
+            catch (TerminalQuotaError quotaEx)
+            {
+                // Normalize stderr-derived reason for log/webhook serialization:
+                // strip CR/LF so plain-text log sinks can't be spoofed by embedded
+                // newlines (CWE-117), and trim to a single-line summary.
+                var safeReason = SingleLineSummary(quotaEx.Message);
+                await MoveToNextMemberOrThrowAsync(
+                    safeReason,
+                    quotaExhausted: true,
+                    quotaResetAt: quotaEx.ResetAt,
+                    terminalException: quotaEx);
+            }
+            catch (AgentAttemptTimeoutException timeoutEx)
+            {
+                var safeReason = SingleLineSummary(timeoutEx.Message);
+                await MoveToNextMemberOrThrowAsync(
+                    safeReason,
+                    quotaExhausted: false,
+                    quotaResetAt: null,
+                    terminalException: timeoutEx);
+            }
+        }
+    }
+
+    private sealed class AgentAttemptTimeoutException : OperationCanceledException
+    {
+        public AgentAttemptTimeoutException(
+            string phase,
+            AgentKind agent,
+            TimeSpan timeout,
+            Exception inner)
+            : base($"Agent {agent.Value} attempt in phase '{phase}' exceeded per-attempt timeout {timeout}.", inner)
+        {
         }
     }
 
