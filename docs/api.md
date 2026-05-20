@@ -1099,6 +1099,7 @@ state (or when there are no dependencies). See [`work-items.md`](work-items.md).
     "Concurrency": 2,
     "UpstreamPushMaxAttempts": 5,
     "UpstreamPushBackoffSeconds": 15,
+    "PhaseAbsoluteTimeoutMultiplier": 3.0,
     "SandboxNetworkProfiles": {
       "isolated": "cb-iso",
       "claude":   "cb-claude",

@@ -212,6 +212,51 @@ public sealed class PipelineRunnerTests
         Assert.DoesNotContain("security:llm-review", preflightSection);
     }
 
+    [Fact]
+    public void ResolvePhaseAbsoluteTimeout_DefaultMultiplierGivesThreeAttemptBudget()
+    {
+        var absolute = PipelineRunner.ResolvePhaseAbsoluteTimeout(TimeSpan.FromMinutes(240), multiplier: 3.0);
+        Assert.Equal(TimeSpan.FromMinutes(720), absolute);
+    }
+
+    [Fact]
+    public void ResolvePhaseAbsoluteTimeout_AllowsMinimumMultiplier()
+    {
+        var absolute = PipelineRunner.ResolvePhaseAbsoluteTimeout(TimeSpan.FromMinutes(240), multiplier: 1.0);
+        Assert.Equal(TimeSpan.FromMinutes(240), absolute);
+    }
+
+    [Theory]
+    [InlineData(-2)]
+    [InlineData(-1)]
+    [InlineData(0)]
+    public void ResolvePhaseAbsoluteTimeout_PassesThroughDisabledTimeouts(int milliseconds)
+    {
+        var perAttempt = milliseconds == -1
+            ? Timeout.InfiniteTimeSpan
+            : TimeSpan.FromMilliseconds(milliseconds);
+
+        var absolute = PipelineRunner.ResolvePhaseAbsoluteTimeout(perAttempt, multiplier: 3.0);
+
+        Assert.Equal(perAttempt, absolute);
+    }
+
+    [Fact]
+    public void ResolvePhaseAbsoluteTimeout_ClampsToRuntimeTimerCeiling()
+    {
+        var absolute = PipelineRunner.ResolvePhaseAbsoluteTimeout(TimeSpan.FromDays(100), multiplier: 1000.0);
+
+        Assert.Equal(TimeSpan.FromMilliseconds(uint.MaxValue - 1d), absolute);
+    }
+
+    [Fact]
+    public void ResolvePhaseAbsoluteTimeout_RejectsMultiplierBelowOne()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            PipelineRunner.ResolvePhaseAbsoluteTimeout(TimeSpan.FromMinutes(240), multiplier: 0.5));
+        Assert.Contains("PhaseAbsoluteTimeoutMultiplier", ex.Message);
+    }
+
     private sealed class FakeShellAuditor : IAuditor, IShellAuditorArgvProvider
     {
         public FakeShellAuditor(string name, IReadOnlyList<string> argv) { Name = name; Argv = argv; }

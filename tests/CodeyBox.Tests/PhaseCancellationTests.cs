@@ -88,6 +88,87 @@ public sealed class PhaseCancellationTests
     }
 
     [Fact]
+    public void AttemptTimeout_DisposeAndRestartGivesFallbackAgentFreshDeadline()
+    {
+        var time = new ManualTimeProvider();
+        using var phase = new PhaseCancellation("rework", CancellationToken.None, time);
+        phase.SetPhaseTimeout(TimeSpan.FromMinutes(720));
+
+        using (var first = phase.BeginAttemptTimeout(TimeSpan.FromMinutes(240)))
+        {
+            time.Advance(TimeSpan.FromMinutes(240));
+            Assert.True(first.Token.IsCancellationRequested);
+            Assert.True(first.TimeoutElapsed);
+            Assert.False(phase.Token.IsCancellationRequested);
+        }
+
+        using (var attempt = phase.BeginAttemptTimeout(TimeSpan.FromMinutes(240)))
+        {
+            time.Advance(TimeSpan.FromMinutes(239));
+            Assert.False(attempt.Token.IsCancellationRequested);
+            Assert.False(phase.Token.IsCancellationRequested);
+
+            time.Advance(TimeSpan.FromMinutes(1));
+            Assert.True(attempt.Token.IsCancellationRequested);
+            Assert.True(attempt.TimeoutElapsed);
+            Assert.False(phase.Token.IsCancellationRequested);
+        }
+
+        Assert.Null(phase.Source);
+    }
+
+    [Theory]
+    [InlineData(-2)]
+    [InlineData(-1)]
+    [InlineData(0)]
+    public void AttemptTimeout_DisabledTimeoutsDoNotCancelAttempt(int milliseconds)
+    {
+        var timeout = milliseconds == -1
+            ? Timeout.InfiniteTimeSpan
+            : TimeSpan.FromMilliseconds(milliseconds);
+        var time = new ManualTimeProvider();
+        using var phase = new PhaseCancellation("rework", CancellationToken.None, time);
+
+        using var attempt = phase.BeginAttemptTimeout(timeout);
+
+        Assert.False(attempt.Token.IsCancellationRequested);
+        Assert.False(attempt.TimeoutElapsed);
+
+        time.Advance(TimeSpan.FromDays(30));
+
+        Assert.False(attempt.Token.IsCancellationRequested);
+        Assert.False(attempt.TimeoutElapsed);
+        Assert.False(phase.Token.IsCancellationRequested);
+
+        phase.Cts.Cancel();
+
+        Assert.True(attempt.Token.IsCancellationRequested);
+        Assert.False(attempt.TimeoutElapsed);
+    }
+
+    [Fact]
+    public void PhaseAbsoluteTimeout_BoundsCumulativeFallbackAttempts()
+    {
+        var time = new ManualTimeProvider();
+        using var phase = new PhaseCancellation("rework", CancellationToken.None, time);
+        phase.SetPhaseTimeout(TimeSpan.FromMinutes(720));
+
+        for (var i = 0; i < 3; i++)
+        {
+            using var attempt = phase.BeginAttemptTimeout(TimeSpan.FromMinutes(240));
+            time.Advance(TimeSpan.FromMinutes(239));
+            Assert.False(phase.Token.IsCancellationRequested);
+        }
+
+        time.Advance(TimeSpan.FromMinutes(2));
+        Assert.False(phase.Token.IsCancellationRequested);
+
+        time.Advance(TimeSpan.FromMinutes(1));
+        Assert.True(phase.Token.IsCancellationRequested);
+        Assert.Equal(CancellationSources.PhaseTimeout("rework"), phase.Source);
+    }
+
+    [Fact]
     public async Task StuckProbe_AttributesAsStuckProbe()
     {
         using var phase = new PhaseCancellation("merge", CancellationToken.None);
@@ -179,4 +260,5 @@ public sealed class PhaseCancellationTests
         Assert.False(CancellationSources.IsTransient(CancellationSources.PhaseTimeout("work")));
         Assert.False(CancellationSources.IsTransient(null));
     }
+
 }

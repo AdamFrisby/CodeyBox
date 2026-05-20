@@ -194,6 +194,7 @@ builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
     sp => new ImmutableCodeyBoxOptionsValidator(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
+builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, CodeyBoxOptionsValidator>();
 
 // Rejects ProjectsOptions reloads that remove a project still holding
 // non-terminal work items. Adding new projects passes cleanly.
@@ -1209,6 +1210,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         UpstreamPushMaxAttempts = opts.UpstreamPushMaxAttempts,
         UpstreamPushBackoff = TimeSpan.FromSeconds(opts.UpstreamPushBackoffSeconds),
         ShutdownGrace = TimeSpan.FromSeconds(Math.Max(1, opts.Shutdown.GraceSeconds)),
+        PhaseAbsoluteTimeoutMultiplier = opts.PhaseAbsoluteTimeoutMultiplier,
         HostGitIdentity = hostIdentity,
     };
 });
@@ -1599,6 +1601,7 @@ namespace CodeyBox.Api
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
+        public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;
 
         /// <summary>
         /// Which sandbox provider to use. One of: <c>multipass</c>,

@@ -379,6 +379,35 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal("security:llm-review", GetScalar<string>(evt, "AuditorName"));
     }
 
+    [Fact]
+    public void AgentAttemptTimeoutFallback_emits_distinct_timeout_fallback_event_at_Warning()
+    {
+        var workItemId = WorkItemId.New();
+
+        AuditLog.AgentAttemptTimeoutFallback(
+            workItemId,
+            phase: "rework",
+            iteration: 5,
+            fromAgent: AgentKind.Gemini,
+            fromModel: "gemini-2.5-pro",
+            toAgent: AgentKind.Codex,
+            toModel: "gpt-5.2",
+            reason: "attempt timed out after 240m");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("agent.attempt_timeout_fallback", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(LogEventLevel.Warning, evt.Level);
+        Assert.Equal(workItemId.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal("rework", GetScalar<string>(evt, "Phase"));
+        Assert.Equal(5, GetScalar<int>(evt, "Iteration"));
+        Assert.Equal("gemini", GetScalar<string>(evt, "FromAgent"));
+        Assert.Equal("gemini-2.5-pro", GetScalar<string>(evt, "FromModel"));
+        Assert.Equal("codex", GetScalar<string>(evt, "ToAgent"));
+        Assert.Equal("gpt-5.2", GetScalar<string>(evt, "ToModel"));
+        Assert.Equal("attempt timed out after 240m", GetScalar<string>(evt, "Reason"));
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static T? GetScalar<T>(LogEvent evt, string key)
