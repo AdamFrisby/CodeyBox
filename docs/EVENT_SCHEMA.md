@@ -15,7 +15,7 @@ without the other, CI fails.
 ## Current version
 
 ```
-eventSchemaVersion = "1.0"
+eventSchemaVersion = "1.1"
 ```
 
 The `eventSchemaVersion` string is semver (`major.minor`). Trackers should
@@ -31,7 +31,7 @@ Every webhook + SSE payload is a JSON object with this shape:
 ```jsonc
 {
   // ── Required (since 1.0) ─────────────────────────────────────
-  "eventSchemaVersion": "1.0",                  // semver string
+  "eventSchemaVersion": "1.1",                  // semver string
   "eventType":          "work_item.done",       // stable identifier
   "emittedAt":          "2026-05-18T12:34:56.789+00:00",
 
@@ -132,8 +132,8 @@ subscribe to.
 | `release.failed` | 1.0 | Deep audit exceeded max iterations. |
 | `release.sync_conflict` | 1.0 | Conflict merging `main` into a release branch. |
 
-See [`webhooks.md`](webhooks.md) for the per-event `details` payload shapes
-(unchanged at 1.0 from the existing webhook documentation).
+See [`webhooks.md`](webhooks.md) for the per-event `details` payload shapes.
+Schema 1.1 adds the sandbox leak `reason` details field.
 
 ---
 
@@ -204,9 +204,9 @@ If you add a new event type, follow this checklist:
 
 1. Append the event-type string to `EventSchema.KnownEventTypes`.
 2. Add a row in the "Event types" table above.
-3. If the change is additive at the same major version, leave the version
-   constant `WebhookEvent.CurrentSchemaVersion` alone. The minor bump can
-   be a single release-note line.
+3. If the change is additive at the same major version, update
+   `WebhookEvent.CurrentSchemaVersion` for the minor bump and document the
+   newly introduced field or event type.
 4. If the change is a rename/removal/type-change, that is a major bump:
    coordinate with operators first, then update `CurrentSchemaVersion` and
    set `introducedIn` on the affected entries.

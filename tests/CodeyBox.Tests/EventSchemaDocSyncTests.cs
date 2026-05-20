@@ -82,7 +82,7 @@ public sealed class EventSchemaDocSyncTests
         using var parsed = JsonDocument.Parse(json);
         var root = parsed.RootElement;
 
-        Assert.Equal("1.0", root.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal(EventSchema.CurrentVersion, root.GetProperty("eventSchemaVersion").GetString());
         Assert.True(root.TryGetProperty("evolutionRules", out _));
         Assert.True(root.TryGetProperty("envelope", out var envelope));
         Assert.True(envelope.TryGetProperty("eventSchemaVersion", out _));

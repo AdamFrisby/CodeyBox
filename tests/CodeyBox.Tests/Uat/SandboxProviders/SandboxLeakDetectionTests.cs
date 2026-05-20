@@ -60,8 +60,14 @@ public sealed class SandboxLeakDetectionTests
         Assert.DoesNotContain("codeybox-dispose-fails", provider.DisposedNames);
         var remaining = Assert.Single(reaper.GetLatestLeaks());
         Assert.Equal("codeybox-dispose-fails", remaining.Name);
-        Assert.Contains(webhooks.Events, e => e.Event == "sandbox.leak_disposed");
-        Assert.Contains(webhooks.Events, e => e.Event == "sandbox.leak_dispose_failed");
+        var disposed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_disposed");
+        var disposedDetails = Assert.IsType<SandboxLeakDetails>(disposed.Details);
+        Assert.Equal("codeybox-dispose-ok", disposedDetails.Name);
+        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, disposedDetails.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_dispose_failed");
+        var failedDetails = Assert.IsType<SandboxLeakDetails>(failed.Details);
+        Assert.Equal("codeybox-dispose-fails", failedDetails.Name);
+        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, failedDetails.Reason);
     }
 
     [Fact]
@@ -112,7 +118,11 @@ public sealed class SandboxLeakDetectionTests
     {
         var threshold = TimeSpan.FromMinutes(30);
         var provider = new UatSandboxProvider();
-        provider.Add(new ManagedSandboxInfo("codeybox-admin", OldEnough(threshold), null, false));
+        provider.Add(new ManagedSandboxInfo(
+            "codeybox-admin",
+            DateTimeOffset.UtcNow - TimeSpan.FromMinutes(67.24),
+            null,
+            false));
         var reaper = BuildReaper(provider, new CapturingWebhookDispatcher(), leakAgeThreshold: threshold);
         await reaper.RunSweepAsync(CancellationToken.None);
         using var factory = new SandboxProviderApiFactory(
@@ -126,9 +136,12 @@ public sealed class SandboxLeakDetectionTests
         response.EnsureSuccessStatusCode();
         var body = await response.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal(1, body.GetProperty("count").GetInt32());
-        Assert.Single(body.GetProperty("agesMinutes").EnumerateArray());
+        var summaryAge = Assert.Single(body.GetProperty("agesMinutes").EnumerateArray()).GetDouble();
+        Assert.InRange(summaryAge, 67.2, 67.4);
+        Assert.Equal(Math.Round(summaryAge, 1), summaryAge);
         var leak = Assert.Single(body.GetProperty("leaks").EnumerateArray());
         Assert.Equal("codeybox-admin", leak.GetProperty("name").GetString());
+        Assert.Equal(summaryAge, leak.GetProperty("ageMinutes").GetDouble());
         Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, leak.GetProperty("reason").GetString());
     }
 

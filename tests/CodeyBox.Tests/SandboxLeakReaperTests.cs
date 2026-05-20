@@ -18,7 +18,8 @@ public sealed class SandboxLeakReaperTests
         FakeSandboxProvider provider,
         bool autoDispose = false,
         TimeSpan? leakAgeThreshold = null,
-        TimeSpan? preemptRetention = null)
+        TimeSpan? preemptRetention = null,
+        int? maxConcurrentAutoDispose = null)
     {
         var opts = new SandboxLeakOptions
         {
@@ -27,6 +28,7 @@ public sealed class SandboxLeakReaperTests
             LeakAgeThreshold = leakAgeThreshold ?? TimeSpan.FromMinutes(30),
             PreemptRetention = preemptRetention ?? TimeSpan.FromHours(24),
             AutoDispose = autoDispose,
+            MaxConcurrentAutoDispose = maxConcurrentAutoDispose ?? 4,
         };
         return new SandboxLeakReaper(provider, new NullWebhookDispatcher(), opts, NullLogger<SandboxLeakReaper>.Instance);
     }
@@ -36,6 +38,15 @@ public sealed class SandboxLeakReaperTests
 
     private static DateTimeOffset TooNew(TimeSpan threshold) =>
         DateTimeOffset.UtcNow - threshold + TimeSpan.FromMinutes(1);
+
+    private static WorkItem MakeWorkItem(WorkItemState state) => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("proj"),
+        Title = $"{state} item",
+        Prompt = "exercise sandbox ownership mapping",
+        State = state,
+    };
 
     // ── Leak detection ───────────────────────────────────────────────────────
 
@@ -55,11 +66,16 @@ public sealed class SandboxLeakReaperTests
     {
         var threshold = TimeSpan.FromMinutes(30);
         var provider = new FakeSandboxProvider();
-        provider.AddSandbox(new ManagedSandboxInfo(
+        var owner = MakeWorkItem(WorkItemState.Working) with
+        {
+            StartedAt = DateTimeOffset.UtcNow - TimeSpan.FromHours(1),
+        };
+        provider.AddSandboxForWorkItem(
+            owner,
             "codeybox-aabbcc00112233",
             OldEnough(threshold),
-            DiskBytes: null,
-            IsTrackedActive: true));   // active in current process
+            diskBytes: null,
+            currentPhaseActive: true);   // active in current process
 
         var reaper = BuildReaper(provider, leakAgeThreshold: threshold);
         await reaper.RunSweepAsync(CancellationToken.None);
@@ -110,15 +126,27 @@ public sealed class SandboxLeakReaperTests
     {
         var threshold = TimeSpan.FromMinutes(30);
         var provider = new FakeSandboxProvider();
-        provider.AddSandbox(new ManagedSandboxInfo(
+        var parkedItem = MakeWorkItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            FailureKind = "quota",
+            QuotaResetAt = DateTimeOffset.UtcNow.AddHours(2),
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(2),
+            QuotaRetryFrom = "audit",
+            StartedAt = DateTimeOffset.UtcNow - TimeSpan.FromHours(3),
+        };
+        // The work item still exists in a parked state, but the provider's
+        // current-phase ownership snapshot says no active phase owns this VM.
+        provider.AddSandboxForWorkItem(
+            parkedItem,
             "codeybox-parkedquota",
             OldEnough(threshold),
-            DiskBytes: null,
-            IsTrackedActive: false));
+            diskBytes: null,
+            currentPhaseActive: false);
 
         var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold);
         await reaper.RunSweepAsync(CancellationToken.None);
 
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, provider.OwnerOf("codeybox-parkedquota")?.State);
         Assert.Contains("codeybox-parkedquota", provider.DisposedNames);
         Assert.Empty(reaper.GetLatestLeaks());
     }
@@ -287,6 +315,28 @@ public sealed class SandboxLeakReaperTests
     }
 
     [Fact]
+    public async Task AutoDispose_RespectsConfiguredConcurrencyLimit()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.SetDisposeDelay(TimeSpan.FromMilliseconds(25));
+        for (var i = 0; i < 6; i++)
+            provider.AddSandbox(new ManagedSandboxInfo($"codeybox-bounded{i}", OldEnough(threshold), null, false));
+
+        var reaper = BuildReaper(
+            provider,
+            autoDispose: true,
+            leakAgeThreshold: threshold,
+            maxConcurrentAutoDispose: 2);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(6, provider.DisposedNames.Count);
+        Assert.InRange(provider.MaxConcurrentDisposesObserved, 1, 2);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
     public async Task AutoDispose_OneFailure_ContinuesWithRemainingLeaks()
     {
         var threshold = TimeSpan.FromMinutes(30);
@@ -354,14 +404,52 @@ public sealed class SandboxLeakReaperTests
 
 internal sealed class FakeSandboxProvider : ISandboxProvider
 {
-    private readonly List<ManagedSandboxInfo> _sandboxes = [];
+    private readonly object _gate = new();
+    private readonly List<FakeSandboxRecord> _sandboxes = [];
+    private readonly List<string> _disposedNames = [];
     private readonly HashSet<string> _throwOnDispose = new(StringComparer.Ordinal);
+    private TimeSpan _disposeDelay = TimeSpan.Zero;
+    private int _activeDisposes;
+    private int _maxConcurrentDisposesObserved;
     private bool _throwOnList;
 
-    public List<string> DisposedNames { get; } = [];
+    public IReadOnlyList<string> DisposedNames
+    {
+        get
+        {
+            lock (_gate)
+                return _disposedNames.ToList();
+        }
+    }
 
-    public void AddSandbox(ManagedSandboxInfo info) => _sandboxes.Add(info);
+    public int MaxConcurrentDisposesObserved => _maxConcurrentDisposesObserved;
+
+    public void AddSandbox(ManagedSandboxInfo info)
+    {
+        lock (_gate)
+            _sandboxes.Add(new FakeSandboxRecord(info, Owner: null, CurrentPhaseActive: info.IsTrackedActive));
+    }
+
+    public void AddSandboxForWorkItem(
+        WorkItem owner,
+        string name,
+        DateTimeOffset createdAt,
+        long? diskBytes,
+        bool currentPhaseActive)
+    {
+        var info = new ManagedSandboxInfo(name, createdAt, diskBytes, IsTrackedActive: currentPhaseActive);
+        lock (_gate)
+            _sandboxes.Add(new FakeSandboxRecord(info, owner, currentPhaseActive));
+    }
+
+    public WorkItem? OwnerOf(string name)
+    {
+        lock (_gate)
+            return _sandboxes.FirstOrDefault(s => s.Info.Name == name)?.Owner;
+    }
+
     public void SetDisposeThrows(string name) => _throwOnDispose.Add(name);
+    public void SetDisposeDelay(TimeSpan delay) => _disposeDelay = delay;
     public void SetListThrows() => _throwOnList = true;
 
     public string Name => "fake";
@@ -373,14 +461,49 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     {
         if (_throwOnList)
             throw new InvalidOperationException("Simulated ListAllManagedAsync failure");
-        return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(_sandboxes.ToList());
+        lock (_gate)
+        {
+            return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(
+                _sandboxes
+                    .Select(s => s.Info with { IsTrackedActive = s.CurrentPhaseActive })
+                    .ToList());
+        }
     }
 
-    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+    public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
         if (_throwOnDispose.Contains(name))
             throw new InvalidOperationException($"Simulated dispose failure for {name}");
-        DisposedNames.Add(name);
-        return Task.CompletedTask;
+
+        var active = Interlocked.Increment(ref _activeDisposes);
+        RecordMaxConcurrentDisposes(active);
+        try
+        {
+            if (_disposeDelay > TimeSpan.Zero)
+                await Task.Delay(_disposeDelay, ct);
+            lock (_gate)
+                _disposedNames.Add(name);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeDisposes);
+        }
     }
+
+    private void RecordMaxConcurrentDisposes(int active)
+    {
+        while (true)
+        {
+            var observed = _maxConcurrentDisposesObserved;
+            if (active <= observed)
+                return;
+            if (Interlocked.CompareExchange(ref _maxConcurrentDisposesObserved, active, observed) == observed)
+                return;
+        }
+    }
+
+    private sealed record FakeSandboxRecord(
+        ManagedSandboxInfo Info,
+        WorkItem? Owner,
+        bool CurrentPhaseActive);
 }

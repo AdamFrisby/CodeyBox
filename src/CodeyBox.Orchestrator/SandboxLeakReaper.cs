@@ -1,6 +1,7 @@
+using CodeyBox.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using CodeyBox.Core;
+using System.Collections.Concurrent;
 
 namespace CodeyBox.Orchestrator;
 
@@ -50,7 +51,10 @@ public sealed class SandboxLeakReaper : BackgroundService
         _log = log;
     }
 
-    /// <summary>Returns the most recently detected leaked sandboxes.</summary>
+    /// <summary>
+    /// Returns leaked sandboxes from the latest sweep that have not yet been
+    /// successfully auto-disposed or operator-disposed.
+    /// </summary>
     public IReadOnlyList<LeakedSandboxInfo> GetLatestLeaks() => _latestLeaks;
 
     /// <summary>
@@ -152,13 +156,27 @@ public sealed class SandboxLeakReaper : BackgroundService
                 return;
             }
 
-            // Dispose all leaks concurrently, each with an independent timeout.
-            // A single failed disposal must never block the rest of the batch.
-            var failedNames = (await Task.WhenAll(leaks.Select(leak => DisposeSingleAsync(leak, ct))))
-                .Where(name => name is not null)
-                .Select(name => name!)
-                .ToHashSet(StringComparer.Ordinal);
-            _latestLeaks = leaks.Where(leak => failedNames.Contains(leak.Name)).ToList();
+            var maxConcurrentDisposes = Math.Max(1, _opts.MaxConcurrentAutoDispose);
+            if (_opts.MaxConcurrentAutoDispose < 1)
+                _log.LogWarning(
+                    "SandboxLeakReaper: MaxConcurrentAutoDispose {Configured} is below the 1-dispose minimum; clamped to 1",
+                    _opts.MaxConcurrentAutoDispose);
+
+            // Dispose leaks with bounded host-side pressure; each sandbox still
+            // gets its independent timeout and one failure never blocks the batch.
+            var failedNames = new ConcurrentBag<string>();
+            await Parallel.ForEachAsync(leaks, new ParallelOptions
+            {
+                CancellationToken = ct,
+                MaxDegreeOfParallelism = maxConcurrentDisposes,
+            }, async (leak, token) =>
+            {
+                var failedName = await DisposeSingleAsync(leak, token);
+                if (failedName is not null)
+                    failedNames.Add(failedName);
+            });
+            var failedNameSet = failedNames.ToHashSet(StringComparer.Ordinal);
+            _latestLeaks = leaks.Where(leak => failedNameSet.Contains(leak.Name)).ToList();
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -244,20 +262,6 @@ public sealed class SandboxLeakReaper : BackgroundService
     }
 }
 
-public static class SandboxLeakReasons
-{
-    public const string UntrackedActiveSandbox = "untracked_active_sandbox_age_threshold_exceeded";
-    public const string ExpiredPreemptRetention = "expired_preempt_retention_age_threshold_exceeded";
-}
-
-/// <summary>A leaked sandbox detected by <see cref="SandboxLeakReaper"/>.</summary>
-public sealed record LeakedSandboxInfo(
-    string Name,
-    DateTimeOffset CreatedAt,
-    TimeSpan Age,
-    long? DiskBytes,
-    string Reason = SandboxLeakReasons.UntrackedActiveSandbox);
-
 /// <summary>
 /// Configuration for <see cref="SandboxLeakReaper"/>. Bound from
 /// <c>CodeyBox:SandboxLeak</c>.
@@ -290,4 +294,10 @@ public sealed class SandboxLeakOptions
     /// instances consume host memory until purged.
     /// </summary>
     public bool AutoDispose { get; set; } = true;
+
+    /// <summary>
+    /// Maximum number of leaked sandboxes to dispose concurrently in one sweep.
+    /// Default 4 to limit pressure on multipassd during restart cleanup.
+    /// </summary>
+    public int MaxConcurrentAutoDispose { get; set; } = 4;
 }

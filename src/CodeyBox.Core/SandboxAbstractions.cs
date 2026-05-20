@@ -64,7 +64,8 @@ public interface ISandboxProvider
 /// </param>
 /// <param name="HasPreemptMarker">
 /// True when the sandbox root carries the graceful-shutdown preempt marker.
-/// Such sandboxes are intentionally preserved and must not be treated as leaks.
+/// Such sandboxes are intentionally preserved during the configured preempt
+/// retention window and must not be treated as leaks until that window expires.
 /// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
