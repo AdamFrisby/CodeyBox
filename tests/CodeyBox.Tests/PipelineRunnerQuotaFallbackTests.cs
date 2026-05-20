@@ -234,27 +234,35 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     [Fact]
     public async Task ReworkFallbackAttempt_GetsFreshWorkTimeoutBudget()
     {
+        var time = new ManualTimeProvider();
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            timeProvider: time);
 
         fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
-        fix.Codex.ReworkDelays.Enqueue(TimeSpan.FromSeconds(2));
+        fix.Codex.ReworkDelays.Enqueue(TimeSpan.FromSeconds(35));
         fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
             Success: false,
             Summary: "agent exited 1",
             Stdout: null,
             Stderr: "API Error: rate_limit_exceeded"));
 
-        fix.Claude.ReworkDelays.Enqueue(TimeSpan.FromSeconds(2));
+        fix.Claude.ReworkDelays.Enqueue(TimeSpan.FromSeconds(35));
         fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed"));
 
         var item = NewItem(initialAgent: AgentKind.Codex) with
         {
-            WorkTimeout = TimeSpan.FromSeconds(3),
+            WorkTimeout = TimeSpan.FromSeconds(60),
         };
         await fix.Store.CreateAsync(item);
 
-        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
+        await WaitForReworkStartAsync(reworkStarted, pipelineTask);
+        await RunWithAdvancingTimeAsync(pipelineTask, time, step: TimeSpan.FromMilliseconds(100), maxSteps: 1000);
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
@@ -267,12 +275,106 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             && h.ToAgent == AgentKind.Claude);
     }
 
+    [Fact]
+    public async Task ReworkFallbackPhase_UsesConfiguredAbsoluteTimeoutThroughPipeline()
+    {
+        var time = new ManualTimeProvider();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipelineThreeMembers(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            timeProvider: time,
+            phaseAbsoluteTimeoutMultiplier: 1.5);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkDelays.Enqueue(TimeSpan.FromSeconds(3));
+        fix.Claude.ReworkDelays.Enqueue(TimeSpan.FromSeconds(3));
+        fix.Gemini.ReworkDelays.Enqueue(TimeSpan.FromMilliseconds(9500));
+        foreach (var agent in new[] { fix.Codex, fix.Claude, fix.Gemini })
+            agent.ReworkScriptedFailures.Enqueue(new AgentResult(
+                Success: false,
+                Summary: "agent exited 1",
+                Stdout: null,
+                Stderr: "API Error: rate_limit_exceeded"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            WorkTimeout = TimeSpan.FromSeconds(10),
+        };
+        await fix.Store.CreateAsync(item);
+
+        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude, fix.Gemini);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
+        await WaitForReworkStartAsync(reworkStarted, pipelineTask);
+        await RunWithAdvancingTimeAsync(pipelineTask, time, step: TimeSpan.FromMilliseconds(100), maxSteps: 250);
+
+        var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(15900));
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Failed, finalItem!.State);
+        Assert.Equal("timeout", finalItem.FailureKind);
+        Assert.Equal(CancellationSources.PhaseTimeout("rework"), finalItem.CancellationSource);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Equal(2, history.Count);
+        Assert.Equal(AgentKind.Claude, history[0].ToAgent);
+        Assert.Equal(AgentKind.Gemini, history[1].ToAgent);
+    }
+
+    [Fact]
+    public async Task ReworkFallbackAttempt_TimesOutBeforeAbsolutePhaseCap()
+    {
+        var time = new ManualTimeProvider();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            timeProvider: time,
+            phaseAbsoluteTimeoutMultiplier: 5.0);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded"));
+        fix.Claude.ReworkDelays.Enqueue(TimeSpan.FromMilliseconds(300));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            WorkTimeout = TimeSpan.FromMilliseconds(100),
+        };
+        await fix.Store.CreateAsync(item);
+
+        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude);
+        var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
+        await WaitForReworkStartAsync(reworkStarted, pipelineTask);
+        await RunWithAdvancingTimeAsync(pipelineTask, time);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Failed, finalItem!.State);
+        Assert.Equal("timeout", finalItem.FailureKind);
+        Assert.Equal(CancellationSources.PhaseTimeout("rework"), finalItem.CancellationSource);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Single(history);
+        Assert.Equal(AgentKind.Claude, history[0].ToAgent);
+    }
+
     // ── Harness ──────────────────────────────────────────────────────────────
 
     private TestFixture BuildPipeline(
         string seedRepoUrl,
         IReadOnlyList<IAuditor>? auditors = null,
-        int maxAuditIterations = 1)
+        int maxAuditIterations = 1,
+        TimeProvider? timeProvider = null,
+        double phaseAbsoluteTimeoutMultiplier = 3.0)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -283,8 +385,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var prs = new InMemoryPullRequestService();
         var webhooks = new CapturingWebhookDispatcher();
 
-        var codex = new ScriptableAgent(AgentKind.Codex);
-        var claude = new ScriptableAgent(AgentKind.Claude);
+        var codex = new ScriptableAgent(AgentKind.Codex, timeProvider);
+        var claude = new ScriptableAgent(AgentKind.Claude, timeProvider);
         var registry = new AgentRegistry([codex, claude]);
 
         var frontier = new AgentClass
@@ -333,7 +435,13 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
-            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                PhaseAbsoluteTimeoutMultiplier = phaseAbsoluteTimeoutMultiplier,
+                TimeProvider = timeProvider ?? TimeProvider.System,
+            },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: [codexProbe, claudeProbe],
             classRouter: router,
@@ -428,7 +536,12 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         public ModelRateConfig? DefaultPricing => null;
     }
 
-    private ThreeMemberFixture BuildPipelineThreeMembers(string seedRepoUrl)
+    private ThreeMemberFixture BuildPipelineThreeMembers(
+        string seedRepoUrl,
+        IReadOnlyList<IAuditor>? auditors = null,
+        int maxAuditIterations = 1,
+        TimeProvider? timeProvider = null,
+        double phaseAbsoluteTimeoutMultiplier = 3.0)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -439,9 +552,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var prs = new InMemoryPullRequestService();
         var webhooks = new CapturingWebhookDispatcher();
 
-        var codex = new ScriptableAgent(AgentKind.Codex);
-        var claude = new ScriptableAgent(AgentKind.Claude);
-        var gemini = new ScriptableAgent(AgentKind.Gemini);
+        var codex = new ScriptableAgent(AgentKind.Codex, timeProvider);
+        var claude = new ScriptableAgent(AgentKind.Claude, timeProvider);
+        var gemini = new ScriptableAgent(AgentKind.Gemini, timeProvider);
         var registry = new AgentRegistry([codex, claude, gemini]);
 
         // Members sort by config order (same QualityScore): codex first, then
@@ -469,8 +582,18 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
         };
 
+        var auditorList = auditors ?? [];
+        project = project with
+        {
+            Audit = new ProjectAudit
+            {
+                MaxIterations = maxAuditIterations,
+                AuditTypes = auditorList.Count > 0 ? ["scripted"] : [],
+            },
+        };
+
         var projects = new InMemoryProjectRepository(project);
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
 
         var codexProbe = new RecordingProbe(AgentKind.Codex);
         var claudeProbe = new RecordingProbe(AgentKind.Claude);
@@ -488,7 +611,13 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
-            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                PhaseAbsoluteTimeoutMultiplier = phaseAbsoluteTimeoutMultiplier,
+                TimeProvider = timeProvider ?? TimeProvider.System,
+            },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: [codexProbe, claudeProbe, geminiProbe],
             classRouter: router,
@@ -496,6 +625,47 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector(), new GeminiQuotaFailureDetector() }));
 
         return new ThreeMemberFixture(pipeline, store, codex, claude, gemini, webhooks, fallbackHistory);
+    }
+
+    private static Task WaitForReworkStart(params ScriptableAgent[] agents)
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        foreach (var agent in agents)
+        {
+            agent.InvocationStarted += (_, isRework) =>
+            {
+                if (isRework)
+                    started.TrySetResult();
+            };
+        }
+
+        return started.Task;
+    }
+
+    private static async Task WaitForReworkStartAsync(Task reworkStarted, Task pipelineTask)
+    {
+        var completed = await Task.WhenAny(reworkStarted, pipelineTask, Task.Delay(TimeSpan.FromSeconds(10)));
+        if (completed == reworkStarted)
+            return;
+        if (completed == pipelineTask)
+            await pipelineTask;
+        throw new TimeoutException("Pipeline did not reach rework before the test timeout.");
+    }
+
+    private static async Task RunWithAdvancingTimeAsync(
+        Task pipelineTask,
+        ManualTimeProvider time,
+        TimeSpan? step = null,
+        int maxSteps = 200)
+    {
+        var delta = step ?? TimeSpan.FromMilliseconds(20);
+        for (var i = 0; i < maxSteps && !pipelineTask.IsCompleted; i++)
+        {
+            time.Advance(delta);
+            await Task.Delay(1);
+        }
+
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     private static WorkItem NewItem(AgentKind initialAgent) => new()
@@ -575,16 +745,23 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 /// </summary>
 internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
 {
+    private readonly TimeProvider _timeProvider;
+
     public Queue<AgentResult> ScriptedFailures { get; } = new();
     public Queue<AgentResult> ReworkScriptedFailures { get; } = new();
     public Queue<TimeSpan> WorkDelays { get; } = new();
     public Queue<TimeSpan> ReworkDelays { get; } = new();
     public Queue<FileWrite> WorkPlan { get; } = new();
     public int CallCount { get; private set; }
+    public event Action<AgentKind, bool>? InvocationStarted;
 
     public AgentKind Kind { get; }
 
-    public ScriptableAgent(AgentKind kind) { Kind = kind; }
+    public ScriptableAgent(AgentKind kind, TimeProvider? timeProvider = null)
+    {
+        Kind = kind;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+    }
 
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -617,9 +794,10 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
 
         var isRework = prompt.StartsWith("## Rework requested", StringComparison.Ordinal)
             || prompt.StartsWith("# Interrupted Rework Resume", StringComparison.Ordinal);
+        InvocationStarted?.Invoke(Kind, isRework);
         var delays = isRework ? ReworkDelays : WorkDelays;
         if (delays.Count > 0)
-            await Task.Delay(delays.Dequeue(), ct);
+            await Task.Delay(delays.Dequeue(), _timeProvider, ct);
 
         if (isRework && ReworkScriptedFailures.Count > 0)
             return ReworkScriptedFailures.Dequeue();
@@ -646,6 +824,122 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         string? modelId = null, string? reasoningMode = null,
         CancellationToken ct = default)
         => Task.FromResult(new TextOnlyAgentResult(false, "not used", null, null));
+}
+
+internal sealed class ManualTimeProvider : TimeProvider
+{
+    private readonly object _gate = new();
+    private readonly List<ManualTimer> _timers = [];
+    private DateTimeOffset _utcNow = DateTimeOffset.UnixEpoch;
+
+    public override DateTimeOffset GetUtcNow()
+    {
+        lock (_gate)
+            return _utcNow;
+    }
+
+    public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+    {
+        var timer = new ManualTimer(this, callback, state);
+        lock (_gate)
+            _timers.Add(timer);
+        timer.Change(dueTime, period);
+        return timer;
+    }
+
+    public void Advance(TimeSpan delta)
+    {
+        if (delta < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(delta));
+
+        List<(TimerCallback Callback, object? State)> callbacks = [];
+        lock (_gate)
+        {
+            _utcNow += delta;
+            foreach (var timer in _timers.ToArray())
+            {
+                if (timer.TryConsumeDue(_utcNow, out var callback))
+                    callbacks.Add(callback);
+            }
+
+            _timers.RemoveAll(static t => t.IsDisposed);
+        }
+
+        foreach (var (callback, state) in callbacks)
+            callback(state);
+    }
+
+    private sealed class ManualTimer : ITimer
+    {
+        private readonly ManualTimeProvider _provider;
+        private readonly TimerCallback _callback;
+        private readonly object? _state;
+        private DateTimeOffset? _dueAt;
+        private TimeSpan _period;
+        private bool _disposed;
+
+        public ManualTimer(ManualTimeProvider provider, TimerCallback callback, object? state)
+        {
+            _provider = provider;
+            _callback = callback;
+            _state = state;
+        }
+
+        public bool IsDisposed => _disposed;
+
+        public bool Change(TimeSpan dueTime, TimeSpan period)
+        {
+            lock (_provider._gate)
+            {
+                if (_disposed)
+                    return false;
+
+                _period = period;
+                _dueAt = dueTime == Timeout.InfiniteTimeSpan
+                    ? null
+                    : _provider._utcNow + dueTime;
+                return true;
+            }
+        }
+
+        public bool TryConsumeDue(DateTimeOffset now, out (TimerCallback Callback, object? State) callback)
+        {
+            lock (_provider._gate)
+            {
+                callback = default;
+                if (_disposed || _dueAt is not { } dueAt || dueAt > now)
+                    return false;
+
+                callback = (_callback, _state);
+                if (_period > TimeSpan.Zero && _period != Timeout.InfiniteTimeSpan)
+                {
+                    do
+                    {
+                        dueAt += _period;
+                    } while (dueAt <= now);
+                    _dueAt = dueAt;
+                }
+                else
+                {
+                    _dueAt = null;
+                }
+
+                return true;
+            }
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Dispose();
+            return ValueTask.CompletedTask;
+        }
+
+        public void Dispose()
+        {
+            lock (_provider._gate)
+                _disposed = true;
+        }
+    }
 }
 
 internal sealed class OnceFailingAuditor : IAuditor

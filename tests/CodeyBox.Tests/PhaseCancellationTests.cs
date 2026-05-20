@@ -94,22 +94,27 @@ public sealed class PhaseCancellationTests
         using var phase = new PhaseCancellation("rework", CancellationToken.None, time);
         phase.SetPhaseTimeout(TimeSpan.FromMinutes(720));
 
-        using (phase.BeginAttemptTimeout(TimeSpan.FromMinutes(240)))
+        using (var first = phase.BeginAttemptTimeout(TimeSpan.FromMinutes(240)))
         {
-            time.Advance(TimeSpan.FromMinutes(200));
+            time.Advance(TimeSpan.FromMinutes(240));
+            Assert.True(first.Token.IsCancellationRequested);
+            Assert.True(first.TimeoutElapsed);
             Assert.False(phase.Token.IsCancellationRequested);
         }
 
-        using (phase.BeginAttemptTimeout(TimeSpan.FromMinutes(240)))
+        using (var attempt = phase.BeginAttemptTimeout(TimeSpan.FromMinutes(240)))
         {
             time.Advance(TimeSpan.FromMinutes(239));
+            Assert.False(attempt.Token.IsCancellationRequested);
             Assert.False(phase.Token.IsCancellationRequested);
 
             time.Advance(TimeSpan.FromMinutes(1));
-            Assert.True(phase.Token.IsCancellationRequested);
+            Assert.True(attempt.Token.IsCancellationRequested);
+            Assert.True(attempt.TimeoutElapsed);
+            Assert.False(phase.Token.IsCancellationRequested);
         }
 
-        Assert.Equal(CancellationSources.PhaseTimeout("rework"), phase.Source);
+        Assert.Null(phase.Source);
     }
 
     [Fact]

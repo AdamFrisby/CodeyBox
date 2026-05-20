@@ -194,6 +194,7 @@ builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
     sp => new ImmutableCodeyBoxOptionsValidator(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
+builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, CodeyBoxOptionsValidator>();
 
 // Rejects ProjectsOptions reloads that remove a project still holding
 // non-terminal work items. Adding new projects passes cleanly.

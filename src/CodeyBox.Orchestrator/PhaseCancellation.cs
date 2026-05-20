@@ -77,11 +77,14 @@ internal sealed class PhaseCancellation : IDisposable
     }
 
     /// <summary>
-    /// Arms a disposable timeout for a single fallback attempt. Disposing the
-    /// returned registration clears the timer without cancelling the phase,
-    /// allowing the next agent in a fallback chain to receive a fresh deadline.
+    /// Arms a disposable cancellation scope for a single fallback attempt.
+    /// The returned token is linked to the phase token and is also cancelled
+    /// when this attempt's timeout elapses. The timeout deliberately does not
+    /// cancel the phase CTS; the phase CTS is reserved for the absolute cap,
+    /// operator cancellation, host shutdown, and stuck-probe cancellation.
     /// </summary>
-    public IDisposable BeginAttemptTimeout(TimeSpan timeout) => CreateTimeout(timeout);
+    public PhaseAttemptCancellation BeginAttemptTimeout(TimeSpan timeout) =>
+        new(this, timeout, _timeProvider);
 
     /// <summary>
     /// Registers a host-shutdown hook. When the host begins stopping, the
@@ -272,6 +275,48 @@ internal sealed class PhaseCancellation : IDisposable
 
             try { _first.Dispose(); }
             finally { _second.Dispose(); }
+        }
+    }
+
+    internal sealed class PhaseAttemptCancellation : IDisposable
+    {
+        private readonly CancellationTokenSource _cts;
+        private readonly CancellationTokenSource? _timeoutCts;
+        private readonly CancellationTokenRegistration _timeoutRegistration;
+        private int _timeoutElapsed;
+        private bool _disposed;
+
+        public PhaseAttemptCancellation(
+            PhaseCancellation phaseCancellation,
+            TimeSpan timeout,
+            TimeProvider timeProvider)
+        {
+            _cts = CancellationTokenSource.CreateLinkedTokenSource(phaseCancellation.Token);
+
+            if (timeout == Timeout.InfiniteTimeSpan || timeout <= TimeSpan.Zero)
+                return;
+
+            _timeoutCts = new CancellationTokenSource(timeout, timeProvider);
+            _timeoutRegistration = _timeoutCts.Token.Register(static state =>
+            {
+                var self = (PhaseAttemptCancellation)state!;
+                Interlocked.Exchange(ref self._timeoutElapsed, 1);
+                try { self._cts.Cancel(); }
+                catch (ObjectDisposedException) { /* attempt already completed */ }
+            }, this);
+        }
+
+        public CancellationToken Token => _cts.Token;
+
+        public bool TimeoutElapsed => Volatile.Read(ref _timeoutElapsed) != 0;
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _timeoutRegistration.Dispose();
+            _timeoutCts?.Dispose();
+            _cts.Dispose();
         }
     }
 }
