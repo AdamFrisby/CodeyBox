@@ -179,6 +179,69 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpTestPass_NonTestFailureWithoutFailedHeadersReportsCommandError()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+        });
+        var output = """
+            /work/src/Invoice.cs(12,20): error CS1002: ; expected [/work/src/App.csproj]
+
+            Build FAILED.
+
+            /work/src/Invoice.cs(12,20): error CS1002: ; expected [/work/src/App.csproj]
+                0 Warning(s)
+                1 Error(s)
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("command exited 1", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("CS1002", finding.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CSharpTestPass_UnrunnableFailuresPlusBuildErrorReportsCommandError()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+        });
+        var output = """
+              Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [1 ms]
+              Error Message:
+               Microsoft.Playwright.PlaywrightException : Browser executable was not found
+              Stack Trace:
+
+            Failed!  - Failed: 1, Passed: 100, Skipped: 0, Total: 101, Duration: 4 s
+            /work/src/Program.cs(7,13): error CS0103: The name 'missing' does not exist in the current context [/work/src/App.csproj]
+            Build FAILED.
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("command exited 1", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("CS0103", finding.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_ReportsSlowAssertionFailureEvenWithoutStackTrace()
     {
         var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions

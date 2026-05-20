@@ -130,7 +130,7 @@ per running sandbox plus the agent's memory needs.
   required local infrastructure is absent are not part of the scoring or
   auditing criteria. `csharp:test-pass` filters near-zero-duration failures
   with no stack trace while still reporting real assertion/runtime failures;
-  see [issue 990de0d22e96443fb9eb9176e0b5af3d](work-items.md#work-items)
+  see [work item 990de0d22e96443fb9eb9176e0b5af3d](/work-items/990de0d22e96443fb9eb9176e0b5af3d)
   for the motivating case.
 * **Merge phase verification failed.** The agent ran but the orchestrator's
   post-merge check (expected SHA / clean working tree) failed. The work

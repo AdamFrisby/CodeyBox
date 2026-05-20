@@ -4,11 +4,13 @@ namespace CodeyBox.Audit.Shell;
 
 /// <summary>
 /// Audits the working tree by running an arbitrary command inside the
-/// sandbox. Exit code 0 → pass; non-zero → fail with stdout/stderr captured
-/// as a single Error finding. If the top-level tool is confirmed missing
-/// before the command runs, the auditor emits a non-blocking Info finding
-/// instead. Use for linters, formatters, type-checkers, SAST tools — anything
-/// with a shell-style "exit 0 = good" contract.
+/// sandbox. Most commands follow the shell-style "exit 0 = good" contract:
+/// exit code 0 passes, and non-zero fails with stdout/stderr captured as a
+/// single Error finding. If the top-level tool is confirmed missing before the
+/// command runs, the auditor emits a non-blocking Info finding instead. The
+/// built-in csharp:test-pass command additionally classifies dotnet test
+/// failures so tests that did not run in the sandbox can be excluded while
+/// real test and command-level failures remain blocking.
 ///
 /// Does NOT need agent credentials, so it runs in the credential-free audit
 /// sandbox. Operators concerned about a malicious build script reaching
@@ -58,12 +60,30 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         {
             var parsed = DotnetTestOutputParser.Parse(Name, combinedOutput);
             if (parsed.ParsedFailureCount > 0)
-                return new AuditResult(
-                    parsed.Findings.Count == 0,
-                    parsed.Findings,
-                    RawOutput: combinedOutput);
+            {
+                if (!parsed.HasCommandFailureSignals)
+                    return new AuditResult(
+                        parsed.Findings.Count == 0,
+                        parsed.Findings,
+                        RawOutput: combinedOutput);
+
+                if (parsed.Findings.Count > 0)
+                {
+                    var commandFinding = BuildCommandFinding(result, toolName);
+                    return new AuditResult(
+                        false,
+                        [.. parsed.Findings, commandFinding],
+                        RawOutput: combinedOutput);
+                }
+            }
         }
 
+        var finding = BuildCommandFinding(result, toolName);
+        return new AuditResult(false, [finding], RawOutput: combinedOutput);
+    }
+
+    private AuditFinding BuildCommandFinding(SandboxExecResult result, string toolName)
+    {
         var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
 
         // Exit 127 is only non-blocking when it is confirmed to be the
@@ -78,12 +98,11 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             ? $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)"
             : $"command exited {result.ExitCode}: {string.Join(' ', _opts.Argv)}";
 
-        var finding = new AuditFinding(
+        return new AuditFinding(
             AuditorName: Name,
             Severity: severity,
             Title: title,
             Description: description.TrimEnd());
-        return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
 
     private async Task<bool> IsDirectToolMissingAsync(

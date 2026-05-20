@@ -4,24 +4,33 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Shell;
 
-public static class DotnetTestOutputParser
+internal static class DotnetTestOutputParser
 {
     private const double UnrunnableFailureThresholdMs = 50;
     private static readonly Regex FailedTestHeaderRegex = new(
         @"^\s*Failed\s+(?<name>.+?)\s+\[(?<duration>[^\]\r\n]+)\]\s*$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline,
         TimeSpan.FromSeconds(1));
+    private static readonly Regex PostFailureBodyRegex = new(
+        @"^\s*(?:Failed!|Passed!|Skipped!|Test Run |Total tests:|Results File:)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline,
+        TimeSpan.FromSeconds(1));
+    private static readonly Regex CommandFailureSignalRegex = new(
+        @"^\s*(?:.+(?:\)|:)\s*)?error\s+(?:CS|MSB|NETSDK|NU)\d+\b|^\s*Build FAILED\.|^\s*The argument .+ is invalid\.|^\s*The active test run was aborted\b|^\s*Testhost process\b.*\b(?:crashed|failed|error)\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Multiline,
+        TimeSpan.FromSeconds(1));
 
     public static DotnetTestOutputParseResult Parse(string auditorName, string output)
     {
         if (string.IsNullOrWhiteSpace(output))
-            return new DotnetTestOutputParseResult([], 0, 0);
+            return new DotnetTestOutputParseResult([], 0, 0, false);
 
         var matches = FailedTestHeaderRegex.Matches(output);
         if (matches.Count == 0)
-            return new DotnetTestOutputParseResult([], 0, 0);
+            return new DotnetTestOutputParseResult([], 0, 0, false);
 
         var findings = new List<AuditFinding>();
+        var failureBodyRanges = new List<(int Start, int End)>();
         var excluded = 0;
 
         for (var i = 0; i < matches.Count; i++)
@@ -33,6 +42,8 @@ public static class DotnetTestOutputParser
             var bodyEnd = i + 1 < matches.Count
                 ? matches[i + 1].Index
                 : output.Length;
+            bodyEnd = FindFailureBodyEnd(output, bodyStart, bodyEnd);
+            failureBodyRanges.Add((bodyStart, bodyEnd));
             var body = output[bodyStart..bodyEnd].Trim();
             var durationMs = TryParseDurationMilliseconds(durationText);
             var stackTrace = ExtractStackTrace(body);
@@ -50,7 +61,45 @@ public static class DotnetTestOutputParser
                 Description: BuildDescription(durationText, body)));
         }
 
-        return new DotnetTestOutputParseResult(findings, matches.Count, excluded);
+        return new DotnetTestOutputParseResult(
+            findings,
+            matches.Count,
+            excluded,
+            HasCommandFailureSignalOutsideRanges(output, failureBodyRanges));
+    }
+
+    private static int FindFailureBodyEnd(string output, int bodyStart, int defaultEnd)
+    {
+        var postBody = PostFailureBodyRegex.Match(output, bodyStart);
+        return postBody.Success && postBody.Index < defaultEnd
+            ? postBody.Index
+            : defaultEnd;
+    }
+
+    private static bool HasCommandFailureSignalOutsideRanges(
+        string output,
+        IReadOnlyList<(int Start, int End)> excludedRanges)
+    {
+        foreach (Match signal in CommandFailureSignalRegex.Matches(output))
+        {
+            if (!IsInsideAnyRange(signal.Index, excludedRanges))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsInsideAnyRange(
+        int index,
+        IReadOnlyList<(int Start, int End)> ranges)
+    {
+        foreach (var (start, end) in ranges)
+        {
+            if (index >= start && index < end)
+                return true;
+        }
+
+        return false;
     }
 
     private static bool IsUnrunnableFailure(double? durationMs, string stackTrace)
@@ -141,7 +190,8 @@ public static class DotnetTestOutputParser
         => value.Length <= max ? value : value[..max] + "...";
 }
 
-public sealed record DotnetTestOutputParseResult(
+internal sealed record DotnetTestOutputParseResult(
     IReadOnlyList<AuditFinding> Findings,
     int ParsedFailureCount,
-    int ExcludedUnrunnableFailureCount);
+    int ExcludedUnrunnableFailureCount,
+    bool HasCommandFailureSignals);
