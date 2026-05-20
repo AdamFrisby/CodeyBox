@@ -103,6 +103,7 @@ public sealed class PresetCatalogTests
             - Half-finished implementations (functions that return early, swallowed branches)
             - Public functions whose docstrings/comments describe behaviour the code doesn't implement
             - Test files that were renamed or deleted instead of fixed
+            Tests which cannot be run in this environment are not part of the scoring or auditing criteria.
             """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("completeness"));
         Assert.Equal("""
             Compare the diff against the original task. Look for shortcuts the agent took rather than fully solving the problem:
@@ -115,6 +116,17 @@ public sealed class PresetCatalogTests
             - Functions that return success without actually doing the work
             Any of these should be flagged as Error.
             """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("cheating"));
+    }
+
+    [Fact]
+    public void AuditTypeYamlLoading_AddsUnrunnableTestsRuleToCoverageLlmAuditors()
+    {
+        var catalog = new PresetCatalog();
+        const string rule = "Tests which cannot be run in this environment are not part of the scoring or auditing criteria.";
+
+        Assert.Contains(rule, catalog.GetAuditTypeReviewFocus("tests"), StringComparison.Ordinal);
+        Assert.Contains(rule, catalog.GetAuditTypeReviewFocus("completeness"), StringComparison.Ordinal);
+        Assert.Contains(rule, catalog.GetAuditTypeReviewFocus("quality"), StringComparison.Ordinal);
     }
 
     [Fact]

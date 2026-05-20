@@ -96,6 +96,120 @@ public sealed class AuditTests
         Assert.Contains("command exited 127", finding.Title);
     }
 
+    [Fact]
+    public async Task CSharpTestPass_IgnoresFastFailuresWithoutStackTraceAndReportsRealFailures()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+        });
+        var output = """
+              Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [1 ms]
+              Error Message:
+               Microsoft.Playwright.PlaywrightException : Browser executable was not found
+              Stack Trace:
+
+              Failed JobTrack.Tests.E2E.ReportsTests.CanOpenReports [2 ms]
+              Error Message:
+               System.Net.Http.HttpRequestException : Connection refused (localhost API not running)
+              Stack Trace:
+
+              Failed JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals [12 ms]
+              Error Message:
+               Assert.Equal() Failure: Values differ
+               Expected: 1
+               Actual:   2
+              Stack Trace:
+                 at JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals() in /work/tests/InvoiceTests.cs:line 42
+
+              Failed JobTrack.Tests.Unit.UserTests.RequiresEmail [80 ms]
+              Error Message:
+               System.NullReferenceException : Object reference not set to an instance of an object.
+              Stack Trace:
+                 at JobTrack.Tests.Unit.UserTests.RequiresEmail() in /work/tests/UserTests.cs:line 12
+
+            Failed!  - Failed: 4, Passed: 98, Skipped: 0, Total: 102, Duration: 4 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.Equal(2, result.Findings.Count);
+        Assert.All(result.Findings, f => Assert.Equal(AuditSeverity.Error, f.Severity));
+        Assert.Contains(result.Findings, f => f.Title.Contains("JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals", StringComparison.Ordinal));
+        Assert.Contains(result.Findings, f => f.Title.Contains("JobTrack.Tests.Unit.UserTests.RequiresEmail", StringComparison.Ordinal));
+        Assert.DoesNotContain(result.Findings, f => f.Title.Contains("JobTrack.Tests.E2E", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CSharpTestPass_AllUnrunnableFastFailuresProducesNoErrorFindings()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+        });
+        var output = """
+              Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [1 ms]
+              Error Message:
+               Microsoft.Playwright.PlaywrightException : Browser executable was not found
+              Stack Trace:
+
+              Failed JobTrack.Tests.E2E.ApiTests.CanLoadDashboard [1 ms]
+              Error Message:
+               System.Net.Http.HttpRequestException : Connection refused (localhost API not running)
+              Stack Trace:
+
+            Failed!  - Failed: 2, Passed: 100, Skipped: 0, Total: 102, Duration: 4 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+    }
+
+    [Fact]
+    public async Task CSharpTestPass_ReportsSlowAssertionFailureEvenWithoutStackTrace()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+        });
+        var output = """
+              Failed JobTrack.Tests.Unit.MathTests.SlowAssertion [80 ms]
+              Error Message:
+               Assert.Equal() Failure: Values differ
+               Expected: 1
+               Actual:   2
+              Stack Trace:
+
+            Failed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6, Duration: 1 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("JobTrack.Tests.Unit.MathTests.SlowAssertion", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("Assert.Equal() Failure", finding.Description, StringComparison.Ordinal);
+    }
+
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
 

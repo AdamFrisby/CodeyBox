@@ -54,6 +54,16 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         if (result.Success)
             return new AuditResult(true, [], RawOutput: combinedOutput);
 
+        if (IsCSharpTestPassAuditor())
+        {
+            var parsed = DotnetTestOutputParser.Parse(Name, combinedOutput);
+            if (parsed.ParsedFailureCount > 0)
+                return new AuditResult(
+                    parsed.Findings.Count == 0,
+                    parsed.Findings,
+                    RawOutput: combinedOutput);
+        }
+
         var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
 
         // Exit 127 is only non-blocking when it is confirmed to be the
@@ -98,6 +108,12 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     {
         return result.ExitCode == 127 && _opts.TreatExit127AsMissingTool == true;
     }
+
+    private bool IsCSharpTestPassAuditor()
+        => string.Equals(Name, "csharp:test-pass", StringComparison.Ordinal)
+           && _opts.Argv.Count >= 2
+           && string.Equals(_opts.Argv[0], "dotnet", StringComparison.Ordinal)
+           && string.Equals(_opts.Argv[1], "test", StringComparison.Ordinal);
 
     private AuditResult MissingToolResult(string toolName, string rawOutput)
     {

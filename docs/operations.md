@@ -125,6 +125,13 @@ per running sandbox plus the agent's memory needs.
   phase still has Error-severity findings; the work item flips to
   `AuditFailed`. Inspect the auditor findings on the record and decide
   whether to relax the audit policy, fix the prompt, or merge by hand.
+* **Tests cannot run in the sandbox.** Audit scoring only counts tests that
+  can run in the current audit environment; tests that cannot launch because
+  required local infrastructure is absent are not part of the scoring or
+  auditing criteria. `csharp:test-pass` filters near-zero-duration failures
+  with no stack trace while still reporting real assertion/runtime failures;
+  see [issue 990de0d22e96443fb9eb9176e0b5af3d](work-items.md#work-items)
+  for the motivating case.
 * **Merge phase verification failed.** The agent ran but the orchestrator's
   post-merge check (expected SHA / clean working tree) failed. The work
   item flips to `Failed`; nothing was pushed to the host bare repo's

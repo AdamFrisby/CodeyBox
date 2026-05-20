@@ -126,3 +126,4 @@ reviewFocus: |-
   Cite the test file:line you're flagging in 'location'. Where the
   problem is "no test exists for this prod change," cite the
   production file:line where the missing coverage is.
+  Tests which cannot be run in this environment are not part of the scoring or auditing criteria.

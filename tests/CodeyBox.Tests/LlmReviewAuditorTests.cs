@@ -1,4 +1,5 @@
 using CodeyBox.Audit.Llm;
+using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 
@@ -103,6 +104,44 @@ public sealed class LlmReviewAuditorTests
         Assert.Null(runner.ObservedReasoningMode);
     }
 
+    [Fact]
+    public async Task RunAsync_TestCoveragePromptDoesNotScoreUnrunnableE2EProjects()
+    {
+        var runner = new UnrunnableE2ERuleAwareRunner();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "tests:meaningfulness-review",
+            Agent = runner,
+            ReviewFocus = new PresetCatalog().GetAuditTypeReviewFocus("tests"),
+            FrameTemplate = "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
+        });
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: """
+                Test directory listing:
+                - tests/JobTrack.Tests.Unit/JobTrack.Tests.Unit.csproj
+                - tests/JobTrack.Tests.E2E/JobTrack.Tests.E2E.csproj
+
+                Sandbox inventory:
+                - no ms-playwright browser cache
+                - no running JobTrack API
+                """);
+        var sandbox = new WritableResultFileSandbox();
+
+        var result = await auditor.RunAsync(sandbox, "/work", ctx);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+        Assert.Contains(
+            "Tests which cannot be run in this environment are not part of the scoring or auditing criteria.",
+            runner.ObservedPrompt,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(result.Findings, f => f.Title.Contains("add more E2E coverage", StringComparison.OrdinalIgnoreCase));
+    }
+
     private sealed class CredentialCapturingRunner : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Codex;
@@ -128,6 +167,54 @@ public sealed class LlmReviewAuditorTests
             RunCalled = true;
             return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
         }
+    }
+
+    private sealed class UnrunnableE2ERuleAwareRunner : IAgentRunner
+    {
+        public AgentKind Kind => AgentKind.Codex;
+        public string ObservedPrompt { get; private set; } = string.Empty;
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            ObservedPrompt = prompt;
+            if (sandbox is WritableResultFileSandbox writableSandbox)
+            {
+                writableSandbox.ResultJson = prompt.Contains(
+                    "Tests which cannot be run in this environment are not part of the scoring or auditing criteria.",
+                    StringComparison.Ordinal)
+                    ? "{\"passed\":true,\"findings\":[]}"
+                    : """
+                      {"passed":false,"findings":[{"severity":"error","title":"add more E2E coverage","description":"E2E project exists but cannot run here"}]}
+                      """;
+            }
+
+            return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
+        }
+    }
+
+    private sealed class WritableResultFileSandbox : ISandbox
+    {
+        public string Id => "writable-result-file-sandbox";
+        public string ResultJson { get; set; } = "{\"passed\":true,\"findings\":[]}";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "cat")
+                return Task.FromResult(new SandboxExecResult(0, ResultJson, ""));
+
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class ResultFileSandbox : ISandbox
