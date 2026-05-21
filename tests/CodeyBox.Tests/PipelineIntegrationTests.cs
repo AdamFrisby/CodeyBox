@@ -46,6 +46,32 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkPhaseCommit_CarriesCodeyBoxAttributionTrailers()
+    {
+        // Persistent attribution: the orchestrator-emitted commit must carry
+        // CodeyBox-WorkItem + CodeyBox-Agent trailers so `git log --grep` can
+        // identify which agent produced the change without consulting the DB.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("attribution.txt", "marker\n"));
+
+        var item = NewItem("feature/attribution");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.Equal(WorkItemState.Done, (await tp.Store.GetAsync(item.Id))!.State);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, message, _) = await TestSupport.RunGit(barePath, "log", "-1", "--format=%B", $"{item.WorkBranch}");
+
+        Assert.Contains($"CodeyBox-WorkItem: {item.Id}", message);
+        Assert.Contains("CodeyBox-Agent: ", message);
+        Assert.Contains(CodeyBoxTrailers.CoAuthoredBy, message);
+        // No fallbacks occurred — that trailer must be absent.
+        Assert.DoesNotContain("CodeyBox-Fallbacks:", message);
+    }
+
+    [Fact]
     public async Task WorkPhasePickup_WithExistingBareRepoWorkBranch_PreservesPriorAttempt()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

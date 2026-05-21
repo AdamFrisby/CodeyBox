@@ -668,6 +668,36 @@ public sealed class PipelineRunner : IPipelineRunner
 
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
 
+    /// <summary>
+    /// Builds the trailer block to append to an orchestrator-emitted commit
+    /// message. Always includes <c>CodeyBox-WorkItem</c>, <c>CodeyBox-Agent</c>,
+    /// and the terminal <c>Co-Authored-By</c> trailer; conditionally includes
+    /// <c>CodeyBox-Fallbacks</c> when fallback events occurred for this work
+    /// item. Failures to load fallback history degrade silently — the trailer
+    /// block is still emitted, just without the optional fallbacks line, so a
+    /// SQLite hiccup never blocks a commit.
+    /// </summary>
+    internal async Task<string> ComposeCommitTrailerBlockAsync(
+        WorkItemId workItemId,
+        AgentKind finalAgent,
+        string? finalModel,
+        CancellationToken ct)
+    {
+        IReadOnlyList<AgentFallbackRecord>? history = null;
+        if (_fallbackHistory is not null)
+        {
+            try
+            {
+                history = await _fallbackHistory.ListByWorkItemAsync(workItemId, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogDebug(ex, "fallback history fetch failed for commit-trailer composition (work item {WorkItemId})", workItemId);
+            }
+        }
+        return CodeyBoxTrailers.Compose(workItemId, finalAgent, finalModel, history);
+    }
+
     private TimeSpan ResolvePhaseAbsoluteTimeout(TimeSpan perAttemptTimeout) =>
         ResolvePhaseAbsoluteTimeout(perAttemptTimeout, _opts.PhaseAbsoluteTimeoutMultiplier);
 
@@ -1325,7 +1355,13 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 using var checkpointCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 checkpointCts.CancelAfter(_opts.PreemptCheckpointDrain);
-                await CheckpointPreemptAsync(item, sandbox, branch, checkpointCts.Token);
+                await CheckpointPreemptAsync(
+                    item,
+                    sandbox,
+                    branch,
+                    runner.Kind,
+                    ResolveObservedModelId(runner, item.ModelId),
+                    checkpointCts.Token);
             }
             catch (Exception ex)
             {
@@ -1476,9 +1512,10 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (hasStagedDiff)
         {
+            var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct);
             var commitMessage = isInitial
-                ? $"codeybox: {item.Title}{CoAuthoredByTrailer}"
-                : $"codeybox rework: address audit findings{CoAuthoredByTrailer}";
+                ? $"codeybox: {item.Title}\n\n{trailerBlock}"
+                : $"codeybox rework: address audit findings\n\n{trailerBlock}";
             await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
@@ -1582,7 +1619,13 @@ public sealed class PipelineRunner : IPipelineRunner
         }, ct);
     }
 
-    private async Task CheckpointPreemptAsync(WorkItem item, ISandbox sandbox, string branch, CancellationToken ct)
+    private async Task CheckpointPreemptAsync(
+        WorkItem item,
+        ISandbox sandbox,
+        string branch,
+        AgentKind agentKind,
+        string? observedModelId,
+        CancellationToken ct)
     {
         var checkpointRef = PreemptRefFor(item.Id);
         try
@@ -1593,8 +1636,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 WorkingDirectory = SandboxConventions.WorkDir,
             }, ct);
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, agentKind, observedModelId, ct);
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m",
-                $"codeybox: preempt checkpoint {item.Title}{CoAuthoredByTrailer}");
+                $"codeybox: preempt checkpoint {item.Title}\n\n{trailerBlock}");
             await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{checkpointRef}");
 
             var current = await _store.GetAsync(item.Id, ct) ?? item;
@@ -3235,7 +3279,8 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             try
             {
-                await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, ct);
+                var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct);
+                await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct);
                 mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
                 await ImportIsolatedMergeCommitAsync(repoId, isolatedMergeRepoPath!, verificationRef, ct);
@@ -3670,6 +3715,7 @@ public sealed class PipelineRunner : IPipelineRunner
         ISandbox sandbox,
         IReadOnlyList<ConflictHunk> conflictHunks,
         string workBranch,
+        string trailerBlock,
         CancellationToken ct)
     {
         var files = conflictHunks.Select(h => h.Path).Distinct(StringComparer.Ordinal).ToArray();
@@ -3709,7 +3755,7 @@ public sealed class PipelineRunner : IPipelineRunner
         }, ct);
         if (mergeHead.Success)
         {
-            var msg = $"codeybox: merge {workBranch}\n\n{CodeyBoxTrailers.CoAuthoredBy}\n";
+            var msg = $"codeybox: merge {workBranch}\n\n{trailerBlock}\n";
             var commit = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "commit", "-F", "-"],
