@@ -17,6 +17,14 @@ namespace CodeyBox.Audit.Presets;
 internal sealed class PresetConfigLoader
 {
     private const string ResourcePrefix = "CodeyBox.Audit.Presets.Defaults.";
+    private const string UnrunnableTestsRule = "Tests which cannot be run in this environment are not part of the scoring or auditing criteria.";
+    private static readonly IReadOnlySet<string> AuditTypesWithUnrunnableTestsRule =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "tests",
+            "completeness",
+            "quality",
+        };
     private static readonly IDeserializer Deserializer = new DeserializerBuilder()
         .WithNamingConvention(CamelCaseNamingConvention.Instance)
         .WithDuplicateKeyChecking()
@@ -55,6 +63,7 @@ internal sealed class PresetConfigLoader
         }
 
         ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
+        ApplyMandatoryReviewFocusRules(auditTypes);
         ValidateFrame("llm-prompt-frame.yaml", frame.Frame);
 
         return new PresetConfigSnapshot(languages, auditTypes, frame.Frame);
@@ -200,6 +209,26 @@ internal sealed class PresetConfigLoader
         existing.Auditors.AddRange(incoming.Auditors);
         existing.Patterns.AddRange(incoming.Patterns);
     }
+
+    private static void ApplyMandatoryReviewFocusRules(Dictionary<string, AuditTypePresetDefinition> auditTypes)
+    {
+        foreach (var id in AuditTypesWithUnrunnableTestsRule)
+        {
+            if (!auditTypes.TryGetValue(id, out var definition) ||
+                string.IsNullOrWhiteSpace(definition.ReviewFocus) ||
+                ContainsLine(definition.ReviewFocus, UnrunnableTestsRule))
+            {
+                continue;
+            }
+
+            definition.ReviewFocus = definition.ReviewFocus.TrimEnd() + "\n" + UnrunnableTestsRule;
+        }
+    }
+
+    private static bool ContainsLine(string text, string line)
+        => text.Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n')
+            .Any(existingLine => existingLine.Trim().Equals(line, StringComparison.Ordinal));
 
     private static void ComposeLanguage(
         Dictionary<string, LanguagePresetDefinition> languages,

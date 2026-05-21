@@ -330,7 +330,7 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
-    public void UserOverride_ProjectConfigWinsForAuditTypeFocus()
+    public void UserOverride_ProjectConfigFocusKeepsMandatoryUnrunnableTestsRule()
     {
         using var temp = TempProject();
         Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
@@ -348,7 +348,10 @@ public sealed class PresetCatalogTests
             },
         });
 
-        Assert.Equal("from appsettings", catalog.GetAuditTypeReviewFocus("completeness"));
+        Assert.Equal("""
+            from appsettings
+            Tests which cannot be run in this environment are not part of the scoring or auditing criteria.
+            """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("completeness"));
     }
 
     [Fact]

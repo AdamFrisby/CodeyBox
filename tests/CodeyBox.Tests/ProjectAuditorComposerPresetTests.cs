@@ -93,6 +93,7 @@ public sealed class ProjectAuditorComposerPresetTests
 
         Assert.Contains("frame-start", runner.Prompt, StringComparison.Ordinal);
         Assert.Contains("project-specific completeness focus", runner.Prompt, StringComparison.Ordinal);
+        Assert.Contains("Tests which cannot be run in this environment are not part of the scoring or auditing criteria.", runner.Prompt, StringComparison.Ordinal);
         Assert.DoesNotContain("TODO / FIXME / XXX", runner.Prompt, StringComparison.Ordinal);
     }
 
