@@ -7,3 +7,4 @@ reviewFocus: |-
   - Half-finished implementations (functions that return early, swallowed branches)
   - Public functions whose docstrings/comments describe behaviour the code doesn't implement
   - Test files that were renamed or deleted instead of fixed
+  Tests which cannot be run in this environment are not part of the scoring or auditing criteria.

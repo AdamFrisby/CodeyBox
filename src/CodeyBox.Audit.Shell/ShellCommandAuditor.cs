@@ -4,11 +4,13 @@ namespace CodeyBox.Audit.Shell;
 
 /// <summary>
 /// Audits the working tree by running an arbitrary command inside the
-/// sandbox. Exit code 0 → pass; non-zero → fail with stdout/stderr captured
-/// as a single Error finding. If the top-level tool is confirmed missing
-/// before the command runs, the auditor emits a non-blocking Info finding
-/// instead. Use for linters, formatters, type-checkers, SAST tools — anything
-/// with a shell-style "exit 0 = good" contract.
+/// sandbox. Most commands follow the shell-style "exit 0 = good" contract:
+/// exit code 0 passes, and non-zero fails with stdout/stderr captured as a
+/// single Error finding. If the top-level tool is confirmed missing before
+/// the command runs, the auditor emits a non-blocking Info finding instead.
+/// A command-specific result classifier can refine non-zero exits without
+/// making this generic shell runner aware of language- or tool-specific
+/// output formats.
 ///
 /// Does NOT need agent credentials, so it runs in the credential-free audit
 /// sandbox. Operators concerned about a malicious build script reaching
@@ -54,6 +56,24 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         if (result.Success)
             return new AuditResult(true, [], RawOutput: combinedOutput);
 
+        var finding = BuildCommandFinding(result, toolName);
+        if (_opts.ResultClassifier is not null)
+        {
+            var classified = _opts.ResultClassifier.ClassifyFailedCommand(new ShellCommandResultContext(
+                Name,
+                _opts.Argv,
+                result,
+                combinedOutput,
+                finding));
+            if (classified is not null)
+                return classified;
+        }
+
+        return new AuditResult(false, [finding], RawOutput: combinedOutput);
+    }
+
+    private AuditFinding BuildCommandFinding(SandboxExecResult result, string toolName)
+    {
         var description = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
 
         // Exit 127 is only non-blocking when it is confirmed to be the
@@ -68,12 +88,11 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             ? $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)"
             : $"command exited {result.ExitCode}: {string.Join(' ', _opts.Argv)}";
 
-        var finding = new AuditFinding(
+        return new AuditFinding(
             AuditorName: Name,
             Severity: severity,
             Title: title,
             Description: description.TrimEnd());
-        return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
 
     private async Task<bool> IsDirectToolMissingAsync(
@@ -116,4 +135,5 @@ public sealed record ShellCommandAuditorOptions
     public required IReadOnlyList<string> Argv { get; init; }
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
+    public IShellCommandResultClassifier? ResultClassifier { get; init; }
 }

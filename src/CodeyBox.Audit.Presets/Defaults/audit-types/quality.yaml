@@ -8,3 +8,4 @@ reviewFocus: |-
   - Error handling at boundaries that swallows or rethrows incorrectly
   - Duplicated logic that should be a single helper
   - Comments that describe WHAT instead of WHY
+  Tests which cannot be run in this environment are not part of the scoring or auditing criteria.

@@ -92,6 +92,45 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public async Task CSharpPreset_TestPassUsesDotnetOutputClassifier()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:test-pass");
+        var output = """
+              Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [< 1 ms]
+              Error Message:
+               Microsoft.Playwright.PlaywrightException : Browser executable was not found
+              Stack Trace:
+
+            Failed!  - Failed: 1, Passed: 100, Skipped: 0, Total: 101, Duration: 4 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (exec.Argv.Count >= 3
+                && exec.Argv[0] == "sh"
+                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            {
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+            }
+
+            if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "test")
+                return new SandboxExecResult(1, output, "");
+
+            return new SandboxExecResult(0, ".\n", "");
+        });
+
+        var result = await auditor.RunAsync(
+            sandbox,
+            "/work",
+            new AuditContext(WorkItemId.New(), "feature", "main", 1, "do x"),
+            CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
+    }
+
+    [Fact]
     public void AuditTypeYamlLoading_LoadsBuiltInReviewFocus()
     {
         var catalog = new PresetCatalog();
@@ -103,6 +142,7 @@ public sealed class PresetCatalogTests
             - Half-finished implementations (functions that return early, swallowed branches)
             - Public functions whose docstrings/comments describe behaviour the code doesn't implement
             - Test files that were renamed or deleted instead of fixed
+            Tests which cannot be run in this environment are not part of the scoring or auditing criteria.
             """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("completeness"));
         Assert.Equal("""
             Compare the diff against the original task. Look for shortcuts the agent took rather than fully solving the problem:
@@ -115,6 +155,17 @@ public sealed class PresetCatalogTests
             - Functions that return success without actually doing the work
             Any of these should be flagged as Error.
             """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("cheating"));
+    }
+
+    [Fact]
+    public void AuditTypeYamlLoading_AddsUnrunnableTestsRuleToCoverageLlmAuditors()
+    {
+        var catalog = new PresetCatalog();
+        const string rule = "Tests which cannot be run in this environment are not part of the scoring or auditing criteria.";
+
+        Assert.Contains(rule, catalog.GetAuditTypeReviewFocus("tests"), StringComparison.Ordinal);
+        Assert.Contains(rule, catalog.GetAuditTypeReviewFocus("completeness"), StringComparison.Ordinal);
+        Assert.Contains(rule, catalog.GetAuditTypeReviewFocus("quality"), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -279,7 +330,7 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
-    public void UserOverride_ProjectConfigWinsForAuditTypeFocus()
+    public void UserOverride_ProjectConfigFocusKeepsMandatoryUnrunnableTestsRule()
     {
         using var temp = TempProject();
         Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
@@ -297,7 +348,10 @@ public sealed class PresetCatalogTests
             },
         });
 
-        Assert.Equal("from appsettings", catalog.GetAuditTypeReviewFocus("completeness"));
+        Assert.Equal("""
+            from appsettings
+            Tests which cannot be run in this environment are not part of the scoring or auditing criteria.
+            """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("completeness"));
     }
 
     [Fact]
@@ -426,5 +480,14 @@ public sealed class PresetCatalogTests
             if (Directory.Exists(Path))
                 Directory.Delete(Path, recursive: true);
         }
+    }
+
+    private sealed class FakeSandbox : ISandbox
+    {
+        private readonly Func<SandboxExec, SandboxExecResult> _onExec;
+        public FakeSandbox(Func<SandboxExec, SandboxExecResult> onExec) { _onExec = onExec; }
+        public string Id => "fake";
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) => Task.FromResult(_onExec(exec));
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
