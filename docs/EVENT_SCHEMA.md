@@ -108,6 +108,7 @@ subscribe to.
 | `work_item.done` | 1.0 | Work item completed successfully. |
 | `work_item.failed` | 1.0 | Work item failed (unrecoverable). |
 | `work_item.cancelled` | 1.0 | Work item cancelled via API. |
+| `work_item.resumed` | 1.0 | Operator-cancelled work item resumed via `POST /workitems/{id}/resume`. |
 | `work_item.needs_operator_input` | 1.0 | Work item parked awaiting operator answers. |
 | `work_item.waiting_for_quota_reset` | 1.0 | Work item parked until quota reset window. |
 | `work_item.agent_stuck` | 1.0 | Stuck-agent probe killed a hung agent. |

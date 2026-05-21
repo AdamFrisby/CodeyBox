@@ -27,6 +27,7 @@ internal static class WorkItemEndpoints
         group.MapPost("/{id}/dismiss-question", DismissQuestionAsync);
         group.MapGet("/{id}/stdout-tail", GetStdoutTailAsync);
         group.MapPost("/{id}/uncancel", UncancelAsync);
+        group.MapPost("/{id}/resume", ResumeAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -813,6 +814,92 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
+    /// Resume an operator-cancelled work item against its existing bare repo
+    /// and work-branch — preserving every agent commit already made — instead
+    /// of re-doing the work via /replay. The operator's <c>DELETE</c> is
+    /// undone, the audit-iteration counter continues from where it stopped,
+    /// and the pipeline re-enters at the requested phase.
+    ///
+    /// Distinct from <c>/uncancel</c> (which refuses operator cancels) and
+    /// <c>/retry</c> (which is scoped to terminal-failed states). Returns:
+    ///   - 400 if 'from' is not one of work/audit/merge or the reason violates
+    ///     the length/control-character guard shared with /queue/pause.
+    ///   - 409 if the item is not in Cancelled state, or if from=audit/merge
+    ///     was requested but no prior audit reports exist (work-branch never
+    ///     reached an auditable state).
+    ///   - 412 if the bare repo or the work-branch ref is no longer present
+    ///     (resume cannot reconstruct the prior agent work; the operator must
+    ///     fall back to /replay).
+    ///
+    /// Orchestration (validation, precondition checks, atomic update, audit
+    /// log emit, queue kick) lives in <see cref="WorkItemRetrier.ResumeAsync"/>
+    /// so the API does not depend on <see cref="IGitHost"/> or duplicate the
+    /// retry-path logic.
+    /// </summary>
+    private static async Task<IResult> ResumeAsync(
+        string id,
+        ResumeWorkItemRequest? body,
+        IWorkItemStore store,
+        WorkItemRetrier retrier,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var reason = body?.Reason;
+        if (reason is not null)
+        {
+            if (reason.Any(char.IsControl))
+                return Results.BadRequest(new { error = "reason must not contain control characters" });
+            if (reason.Length > 500)
+                return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+        }
+
+        var outcome = await retrier.ResumeAsync(item!, body?.From ?? "work", reason, ct);
+
+        switch (outcome.Status)
+        {
+            case WorkItemRetrier.ResumeStatus.BadRequest:
+                return Results.BadRequest(new { error = outcome.Error });
+            case WorkItemRetrier.ResumeStatus.Conflict:
+                return Results.Conflict(new { error = outcome.Error });
+            case WorkItemRetrier.ResumeStatus.PreconditionFailed:
+                return Results.Json(new { error = outcome.Error },
+                    statusCode: StatusCodes.Status412PreconditionFailed);
+        }
+
+        var resumed = outcome.Resumed!;
+        var requestedFrom = (body?.From ?? "work").Trim().ToLowerInvariant();
+
+        var project = await projects.GetAsync(resumed.ProjectId, ct);
+        if (project is not null)
+        {
+            await webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.resumed",
+                WorkItem = resumed,
+                Project = project,
+                Details = new
+                {
+                    id = resumed.Id.ToString(),
+                    externalId = resumed.ExternalId,
+                    from = requestedFrom,
+                    reason = reason,
+                },
+            }, ct);
+        }
+
+        return Results.Ok(new
+        {
+            id = resumed.Id.ToString(),
+            from = requestedFrom,
+            state = resumed.State.ToString(),
+        });
+    }
+
+    /// <summary>
     /// Partially update a Queued work item's editable fields (title, prompt,
     /// agent, work/merge timeouts, min model score). Returns 409 Conflict when
     /// the item is no longer in Queued state.
@@ -1540,6 +1627,8 @@ public sealed record CreateWorkItemRequest(
     int? Priority = null);
 
 public sealed record RetryWorkItemRequest(string? From);
+
+public sealed record ResumeWorkItemRequest(string? From = null, string? Reason = null);
 
 public sealed record PatchWorkItemRequest(
     string? Title = null,

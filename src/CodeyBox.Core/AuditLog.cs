@@ -48,6 +48,28 @@ public static class AuditLog
             .Information("Work item {WorkItemId} retried from phase {From}", id.ToString(), from);
 
     /// <summary>
+    /// Emitted by <c>POST /workitems/{id}/resume</c> when an operator resumes a
+    /// previously operator-cancelled item, preserving the bare repo and the
+    /// work-branch + agent commits already on it. Distinct from
+    /// <see cref="WorkItemRetried"/> (which handles the terminal-failed retry
+    /// paths and the parent-cascade uncancel path) so operators can isolate
+    /// intentional resume actions from the broader retry-after-failure churn.
+    ///
+    /// Reason is forced through an empty-string sentinel because Serilog drops
+    /// null properties, and the timeline reader at
+    /// <c>src/CodeyBox.Api/AuditLogTimelineReader.cs</c> relies on the property
+    /// being present so it can distinguish "reason omitted" from "log line
+    /// schema changed". Both ends must stay in sync.
+    /// </summary>
+    public static void WorkItemResumed(WorkItemId id, string from, string? reason) =>
+        Audit("work_item.resumed")
+            .ForContext("Reason", reason ?? "")
+            .Information(
+                "Work item {WorkItemId} resumed from phase {From} (priorState=Cancelled)",
+                id.ToString(),
+                from);
+
+    /// <summary>
     /// Emitted when the pipeline auto-retries a work item after a transient
     /// (unattributed) host-side cancellation. Distinct from
     /// <see cref="WorkItemRetried"/> (operator-driven retry) and the

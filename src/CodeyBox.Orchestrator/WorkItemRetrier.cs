@@ -13,6 +13,7 @@ public sealed class WorkItemRetrier
     private readonly ITaskQueue _queue;
     private readonly IGitHost _gitHost;
     private readonly IAgentStreamSummaryStore? _streamSummaries;
+    private readonly IAuditReportStore? _auditReports;
     private readonly ILogger<WorkItemRetrier> _log;
 
     public WorkItemRetrier(
@@ -20,12 +21,14 @@ public sealed class WorkItemRetrier
         ITaskQueue queue,
         IGitHost gitHost,
         ILogger<WorkItemRetrier> log,
-        IAgentStreamSummaryStore? streamSummaries = null)
+        IAgentStreamSummaryStore? streamSummaries = null,
+        IAuditReportStore? auditReports = null)
     {
         _store = store;
         _queue = queue;
         _gitHost = gitHost;
         _streamSummaries = streamSummaries;
+        _auditReports = auditReports;
         _log = log;
     }
 
@@ -106,5 +109,156 @@ public sealed class WorkItemRetrier
         await _queue.EnqueueAsync(resumed.Id, ct);
 
         return (true, null, resumeState, actualFrom);
+    }
+
+    /// <summary>
+    /// Outcome of a resume attempt. <see cref="ResumeStatus"/> maps 1:1 to HTTP
+    /// status codes so the API endpoint can be a thin adapter.
+    /// </summary>
+    public enum ResumeStatus
+    {
+        Ok = 200,
+        BadRequest = 400,
+        Conflict = 409,
+        PreconditionFailed = 412,
+    }
+
+    public readonly record struct ResumeOutcome(
+        ResumeStatus Status,
+        string? Error,
+        WorkItem? Resumed,
+        WorkItemState? ResumeState);
+
+    /// <summary>
+    /// Operator-cancel resume: restores a Cancelled work item to the pipeline
+    /// while preserving its bare repo + work-branch + agent commits.
+    ///
+    /// Distinct from <see cref="RetryAsync"/>: retry uses
+    /// <c>WorkItem.With(Queued)</c> which intentionally CLEARS WorkBranch (the
+    /// failed-retry path generates a fresh branch), while resume must keep the
+    /// existing branch so the rework picks up on top of the prior commits.
+    /// Also emits a distinct <c>work_item.resumed</c> audit event so operators
+    /// can isolate intentional resume actions from retry-after-failure churn.
+    ///
+    /// Always enqueues — the dispatcher uses <see cref="ITaskQueue"/> as a
+    /// generic "something changed, re-check the DB" kick channel, not a
+    /// Queued-only worker queue (matches DeadWorkerReaper / RetryAsync / the
+    /// transient-cancel auto-retry — all enqueue regardless of target state).
+    /// </summary>
+    public async Task<ResumeOutcome> ResumeAsync(
+        WorkItem item,
+        string from,
+        string? reason,
+        CancellationToken ct = default)
+    {
+        if (item.State != WorkItemState.Cancelled)
+            return new ResumeOutcome(
+                ResumeStatus.Conflict,
+                $"cannot resume item in state {item.State}; only Cancelled items can be resumed",
+                null,
+                null);
+
+        var requestedFrom = (from ?? "work").Trim().ToLowerInvariant();
+        var resumeState = requestedFrom switch
+        {
+            "work" => WorkItemState.Queued,
+            "audit" => WorkItemState.WorkComplete,
+            "merge" => WorkItemState.AuditPassed,
+            _ => (WorkItemState?)null,
+        };
+        if (resumeState is null)
+            return new ResumeOutcome(
+                ResumeStatus.BadRequest,
+                $"invalid 'from' value '{from}'; expected one of: work, audit, merge",
+                null,
+                null);
+
+        // Resume preserves the prior bare repo + work-branch (that is the
+        // entire point — recovering the agent commits the operator's cancel
+        // left intact). If either is gone, the operator must fall back to
+        // /replay for a fresh start.
+        const string preconditionMessage =
+            "bare repo or work-branch no longer present; cannot resume — use POST /workitems/{id}/replay for a fresh start";
+        var repoPresent = await _gitHost.RepositoryExistsAsync(item.Id, ct);
+        if (!repoPresent)
+            return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
+
+        var workBranch = item.WorkBranch;
+        bool branchPresent;
+        try
+        {
+            branchPresent = !string.IsNullOrEmpty(workBranch)
+                && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
+        }
+        catch (ArgumentException)
+        {
+            // A legacy/corrupt WorkBranch value can fail name validation in the
+            // git host. Treat that the same as "branch not present" — the
+            // operator's recovery path is the same (412 → /replay).
+            branchPresent = false;
+        }
+        if (!branchPresent)
+            return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
+
+        // from=audit / from=merge bypass the work phase, so the existing
+        // commits on the work-branch must already be auditable. The cheapest
+        // signal is the audit-reports table: a non-empty set proves the audit
+        // phase ran at least once on these commits. If it hasn't, force the
+        // operator through from=work (which produces a rework iteration on top
+        // of the prior commits) rather than running auditors on a clean diff.
+        if (resumeState.Value != WorkItemState.Queued && _auditReports is not null)
+        {
+            var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
+            if (reports.Count == 0)
+                return new ResumeOutcome(
+                    ResumeStatus.Conflict,
+                    $"cannot resume from '{requestedFrom}': work-branch has never reached an audit-passing state (no prior audit reports). Use from=work to produce an auditable rework iteration first.",
+                    null,
+                    null);
+        }
+
+        // Build the resumed item by hand rather than via WorkItem.With() —
+        // With(Queued) intentionally clears WorkBranch for the failed-retry
+        // path. Resume's whole purpose is to preserve it. AuditIterations,
+        // FallbackHistory, UsageTotal, QuotaResetAt, Priority, ExternalId and
+        // ReleaseId are preserved by virtue of not appearing in this
+        // initializer.
+        var resumed = item with
+        {
+            State = resumeState.Value,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            LastError = null,
+            CancellationReason = null,
+            CancellationSource = null,
+            FailureKind = null,
+            RecoveryAttempts = 0,
+            StartedAt = null,
+        };
+
+        // Conditional update guards against a racing cascade-cancel or
+        // concurrent resume request — we only mutate from Cancelled.
+        var updated = await _store.TryUpdateIfStateAsync(resumed, WorkItemState.Cancelled, ct);
+        if (!updated)
+            return new ResumeOutcome(
+                ResumeStatus.Conflict,
+                "concurrent resume request already processed this item",
+                null,
+                null);
+
+        if (_streamSummaries is not null)
+        {
+            try { await _streamSummaries.DeleteByWorkItemAsync(resumed.Id, ct); }
+            catch (Exception ex) { _log.LogWarning(ex, "Failed to delete stream summaries for resumed work item {Id}", resumed.Id); }
+        }
+
+        // Always kick the dispatcher. The orchestrator's PickNextEligibleAsync
+        // routes by state on every kick (see OrchestratorService:286-311), so
+        // a kick for a WorkComplete or AuditPassed item is what gets the
+        // pipeline to re-enter the matching phase.
+        await _queue.EnqueueAsync(resumed.Id, ct);
+
+        AuditLog.WorkItemResumed(resumed.Id, requestedFrom, reason);
+
+        return new ResumeOutcome(ResumeStatus.Ok, null, resumed, resumeState);
     }
 }

@@ -89,6 +89,7 @@ public static class EventSchema
         "work_item.done",
         "work_item.failed",
         "work_item.cancelled",
+        "work_item.resumed",
         "work_item.needs_operator_input",
         "work_item.waiting_for_quota_reset",
         // Work-item lifecycle / operator interaction

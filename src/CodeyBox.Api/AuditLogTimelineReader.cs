@@ -216,6 +216,26 @@ internal sealed class AuditLogTimelineReader
                     var details = new { phase = from };
                     return new TimelineEntry(time, "state_transition", $"Retried from {from}", details);
                 }
+            case "work_item.resumed":
+                {
+                    var from = GetStr(root, "From") ?? "work";
+                    var reason = GetStr(root, "Reason");
+                    // Reason is round-tripped through the empty-string sentinel
+                    // because Serilog drops null properties; see
+                    // AuditLog.WorkItemResumed at src/CodeyBox.Core/AuditLog.cs.
+                    if (string.IsNullOrEmpty(reason)) reason = null;
+                    var details = new { phase = from, reason };
+                    var summary = reason is null ? $"Resumed from {from}" : $"Resumed from {from}: {Truncate(reason, 80)}";
+                    // Advance prevState so the next state_transition shows
+                    // "Queued → Working" (etc.) instead of stale "Cancelled → ...".
+                    prevState = from switch
+                    {
+                        "audit" => "WorkComplete",
+                        "merge" => "AuditPassed",
+                        _ => "Queued",
+                    };
+                    return new TimelineEntry(time, "state_transition", summary, details);
+                }
             case "work_item.dependent_cancelled":
                 {
                     var parentId = GetStr(root, "ParentWorkItemId") ?? "?";

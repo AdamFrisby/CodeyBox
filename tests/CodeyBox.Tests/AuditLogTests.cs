@@ -380,6 +380,38 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void WorkItemResumed_emits_work_item_resumed_event_with_From_and_Reason()
+    {
+        var id = WorkItemId.New();
+
+        AuditLog.WorkItemResumed(id, from: "audit", reason: "operator fixed auditor #100");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("work_item.resumed", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(id.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal("audit", GetScalar<string>(evt, "From"));
+        Assert.Equal("operator fixed auditor #100", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
+    public void WorkItemResumed_NullReason_RoundTripsThroughEmptyStringSentinel()
+    {
+        // Serilog drops null properties, so the audit emitter forces null
+        // through "" so the timeline reader can rely on the Reason property
+        // being present. Both ends must stay in sync — see
+        // AuditLogTimelineReader case "work_item.resumed".
+        var id = WorkItemId.New();
+
+        AuditLog.WorkItemResumed(id, from: "work", reason: null);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("work_item.resumed", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("work", GetScalar<string>(evt, "From"));
+        Assert.Equal("", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public void AgentAttemptTimeoutFallback_emits_distinct_timeout_fallback_event_at_Warning()
     {
         var workItemId = WorkItemId.New();

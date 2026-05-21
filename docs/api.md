@@ -103,6 +103,7 @@ Fetch a single work item. The `{id}` path segment accepts either:
 
 The composite form is unambiguous and works with all endpoints that accept `{id}`
 (`GET`, `DELETE`, `PATCH /workitems/{id}`, `POST /workitems/{id}/retry`,
+`POST /workitems/{id}/resume`,
 `GET /workitems/{id}/dependents`, `GET /workitems/{id}/timeline`, etc.).
 
 Returns `400 Bad Request` when the colon form has an empty project or externalId part.
