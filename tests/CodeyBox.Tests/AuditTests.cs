@@ -280,6 +280,35 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpTestPass_ReportsFastAssertionFailureEvenWithUnrunnableSignalText()
+    {
+        var auditor = CSharpTestPassAuditor();
+        var output = """
+              Failed JobTrack.Tests.Unit.ApiClientTests.ReportsConnectionStatus [1 ms]
+              Error Message:
+               Assert.Equal() Failure: Strings differ
+               Expected: "connection refused"
+               Actual:   "healthy"
+              Stack Trace:
+
+            Failed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6, Duration: 1 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("JobTrack.Tests.Unit.ApiClientTests.ReportsConnectionStatus", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("Assert.Equal() Failure", finding.Description, StringComparison.Ordinal);
+        Assert.Contains("connection refused", finding.Description, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_ReportsFastUnrunnableSignalWhenFullBodyHasStackTraceAfterTruncationPoint()
     {
         var auditor = CSharpTestPassAuditor();

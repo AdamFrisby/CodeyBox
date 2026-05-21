@@ -26,6 +26,10 @@ internal static class DotnetTestOutputParser
         @"\b(?:Microsoft\.Playwright\.PlaywrightException|Browser executable (?:was )?not found|Playwright\b.*\b(?:install|driver|browser)|unable to launch|failed to launch|connection refused|no connection could be made|ECONNREFUSED|missing (?:host|dependency|dependencies)|required (?:host|dependency|dependencies)\b.*\bnot (?:found|available))\b",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Singleline,
         TimeSpan.FromSeconds(1));
+    private static readonly Regex AssertionFailureSignalRegex = new(
+        @"\b(?:Assert\.[A-Za-z0-9_]+\(\) Failure|Assert\.[A-Za-z0-9_]+ failed|Xunit\.Sdk\.[A-Za-z0-9_]+Exception|NUnit\.Framework\.AssertionException|Microsoft\.VisualStudio\.TestTools\.UnitTesting\.AssertFailedException|FluentAssertions\.Execution\.AssertionFailedException|Shouldly\.ShouldAssertException)\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Singleline,
+        TimeSpan.FromSeconds(1));
 
     public static DotnetTestOutputParseResult Parse(string auditorName, string output)
     {
@@ -129,6 +133,7 @@ internal static class DotnetTestOutputParser
         => durationMs is not null
            && durationMs.Value < UnrunnableFailureThresholdMs
            && string.IsNullOrWhiteSpace(stackTrace)
+           && !AssertionFailureSignalRegex.IsMatch(body)
            && UnrunnableFailureSignalRegex.IsMatch(body);
 
     private static string ExtractBody(string output, int bodyStart, int bodyEnd)
