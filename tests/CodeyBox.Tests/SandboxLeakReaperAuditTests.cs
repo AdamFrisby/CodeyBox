@@ -49,7 +49,7 @@ public sealed class SandboxLeakReaperAuditTests : IDisposable
         var evt = Assert.Single(_sink.Events, e =>
             GetScalar<string>(e, "EventName") == "sandbox.leak_disposed"
             && GetScalar<string>(e, "SandboxName") == "codeybox-audit-dispose");
-        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, GetScalar<string>(evt, "Reason"));
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, GetScalar<string>(evt, "Reason"));
         Assert.InRange(GetScalar<double>(evt, "AgeMinutes"), 90.9, 91.2);
     }
 

@@ -14,10 +14,11 @@ namespace CodeyBox.Orchestrator;
 /// <para><b>What counts as a leak:</b> a sandbox whose name starts with
 /// <c>codeybox-*</c>, that is not in the current process's in-memory active set
 /// (meaning the current orchestrator did not create it, or the creating instance
-/// crashed before calling DisposeAsync), and whose creation timestamp is older
-/// than <see cref="SandboxLeakOptions.LeakAgeThreshold"/>. The age threshold
-/// guards against mistaking a sandbox that is mid-way through work-phase clone
-/// — typically less than 30 minutes — for a genuine leak.</para>
+/// crashed before calling DisposeAsync), and whose creation timestamp is either
+/// older than <see cref="SandboxLeakOptions.LeakAgeThreshold"/> or missing
+/// because staging metadata was deleted. The age threshold guards against
+/// mistaking a sandbox that is mid-way through work-phase clone — typically less
+/// than 30 minutes — for a genuine leak.</para>
 ///
 /// <para><b>Auto-dispose:</b> on by default. Operators can set
 /// <see cref="SandboxLeakOptions.AutoDispose"/> to false for detection-only
@@ -113,11 +114,9 @@ public sealed class SandboxLeakReaper : BackgroundService
                 if (info.IsTrackedActive)
                     continue;
 
-                // No creation timestamp → can't determine age → skip (conservative).
-                if (!info.CreatedAt.HasValue)
-                    continue;
-
-                var age = now - info.CreatedAt.Value;
+                var missingCreationMetadata = !info.CreatedAt.HasValue;
+                var createdAt = info.CreatedAt ?? now - _opts.LeakAgeThreshold;
+                var age = now - createdAt;
                 if (info.HasPreemptMarker && age < _opts.PreemptRetention)
                     continue;
 
@@ -125,10 +124,12 @@ public sealed class SandboxLeakReaper : BackgroundService
                     continue;
 
                 var diskMb = info.DiskBytes.HasValue ? info.DiskBytes.Value / (1024 * 1024) : (long?)null;
-                var reason = info.HasPreemptMarker
-                    ? SandboxLeakReasons.ExpiredPreemptRetention
-                    : SandboxLeakReasons.UntrackedActiveSandbox;
-                leaks.Add(new LeakedSandboxInfo(info.Name, info.CreatedAt.Value, age, info.DiskBytes, reason));
+                var reason = missingCreationMetadata
+                    ? SandboxLeakReasons.UntrackedSandboxMissingCreationMetadata
+                    : (info.HasPreemptMarker
+                        ? SandboxLeakReasons.ExpiredPreemptRetention
+                        : SandboxLeakReasons.UntrackedSandbox);
+                leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason));
                 AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb, reason);
                 _ = _webhooks.PublishAsync(new WebhookEvent
                 {

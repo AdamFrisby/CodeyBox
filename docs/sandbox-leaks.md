@@ -9,22 +9,27 @@ and are the primary cause of the host running out of memory and disk over time.
 
 ## What counts as a leak
 
-A Multipass VM is classified as leaked when **all three** conditions hold:
+A Multipass VM is classified as leaked when these conditions hold:
 
 1. Its name starts with `codeybox-` (the orchestrator's sandbox prefix).
 2. The current orchestrator process has **no in-memory record** of having created it.
    After a normal restart, this is initially empty, so the age threshold (below)
    guards against false positives.
-3. Its creation timestamp — derived from the staging directory mtime — is **older
-   than `LeakAgeThreshold`** (default 30 minutes).
+3. Its creation timestamp — derived first from the staging directory mtime and
+   then from `multipass info` metadata when available — is **older than
+   `LeakAgeThreshold`** (default 30 minutes), or its creation timestamp cannot be
+   determined.
 
 A sandbox that is mid-way through the VM-launch → clone → mount → start sequence
 is typically less than 10 minutes old. The 30-minute threshold is a conservative
 safety margin: it is unlikely that a legitimately active sandbox would be both
 untracked *and* over 30 minutes old.
 
-Sandboxes for which the creation time cannot be determined (staging directory
-missing) are **not** declared leaked — the reaper is conservative by design.
+Sandboxes for which the creation time still cannot be determined are declared
+leaked once they are untracked by the current provider snapshot. Their age is
+reported from the threshold boundary and their reason is
+`untracked_sandbox_missing_creation_metadata`, so operators can distinguish
+missing metadata from an ordinary age-threshold leak.
 
 ### Providers
 
@@ -84,7 +89,8 @@ and any configured webhook endpoints):
 
 Each event carries `{ name, ageMinutes, diskMb, reason }` in the structured log
 fields. The `reason` is a stable classification code such as
-`untracked_active_sandbox_age_threshold_exceeded`.
+`untracked_sandbox_age_threshold_exceeded` or
+`untracked_sandbox_missing_creation_metadata`.
 
 ---
 
@@ -104,7 +110,7 @@ have been detected and already purged.
     "createdAt": "2026-05-04T02:00:00+00:00",
     "ageMinutes": 127.3,
     "diskMb": null,
-    "reason": "untracked_active_sandbox_age_threshold_exceeded"
+    "reason": "untracked_sandbox_age_threshold_exceeded"
   }
 ]
 ```
@@ -124,7 +130,7 @@ successfully disposed by the latest sweep.
       "createdAt": "2026-05-04T02:00:00+00:00",
       "ageMinutes": 127.3,
       "diskMb": null,
-      "reason": "untracked_active_sandbox_age_threshold_exceeded"
+      "reason": "untracked_sandbox_age_threshold_exceeded"
     }
   ]
 }

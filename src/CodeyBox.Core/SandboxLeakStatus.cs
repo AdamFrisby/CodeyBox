@@ -8,7 +8,8 @@ namespace CodeyBox.Core;
 /// </summary>
 public static class SandboxLeakReasons
 {
-    public const string UntrackedActiveSandbox = "untracked_active_sandbox_age_threshold_exceeded";
+    public const string UntrackedSandbox = "untracked_sandbox_age_threshold_exceeded";
+    public const string UntrackedSandboxMissingCreationMetadata = "untracked_sandbox_missing_creation_metadata";
     public const string ExpiredPreemptRetention = "expired_preempt_retention_age_threshold_exceeded";
 }
 
@@ -21,4 +22,4 @@ public sealed record LeakedSandboxInfo(
     DateTimeOffset CreatedAt,
     TimeSpan Age,
     long? DiskBytes,
-    string Reason = SandboxLeakReasons.UntrackedActiveSandbox);
+    string Reason = SandboxLeakReasons.UntrackedSandbox);

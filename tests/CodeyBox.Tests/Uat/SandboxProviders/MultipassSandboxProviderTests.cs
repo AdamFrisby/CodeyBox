@@ -471,6 +471,33 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task DisposeAsync_DeleteFailureThrowsAndDoesNotMarkSandboxDisposed()
+    {
+        var disposedNames = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "delete", "--purge", "codeybox-deletefail"])
+                return Task.FromResult(new RunResult(17, "", "still running"));
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = new MultipassSandbox(
+            "codeybox-deletefail",
+            Path.Combine(_workspace, "delete-fail-root"),
+            new SandboxSpec { ImageReference = "ignored" },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/false" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            onDisposed: disposedNames.Add,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await sandbox.DisposeAsync());
+
+        Assert.Contains("multipass delete --purge codeybox-deletefail failed", ex.Message);
+        Assert.Empty(disposedNames);
+    }
+
+    [Fact]
     public async Task ListAllManagedAsync_FiltersCodeyboxVmsAddsDiskInfoAndUsesTtlCache()
     {
         var staging = Path.Combine(_workspace, "staging");
@@ -491,6 +518,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                       {"name":"cb-baseline-claude"},
                       {"name":"codeybox-alpha"},
                       {"name":"codeybox-beta"},
+                      {"name":"codeybox-orphan"},
                       {"name":"codeybox-invalid.name"}
                     ]}
                     """, ""));
@@ -502,7 +530,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 return Task.FromResult(new RunResult(0, """
                     {"info":{
                       "codeybox-alpha":{"disks":{"sda1":{"used":"1048576"}}},
-                      "codeybox-beta":{"disks":{"sda1":{"used":"2097152"}}}
+                      "codeybox-beta":{"disks":{"sda1":{"used":"2097152"}}},
+                      "codeybox-orphan":{"created":"2026-05-18T00:00:00Z","disks":{"sda1":{"used":"3145728"}}}
                     }}
                     """, ""));
             }
@@ -517,10 +546,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Same(first, second);
         Assert.Equal(1, listCalls);
         Assert.Equal(1, infoCalls);
-        Assert.Equal(["codeybox-alpha", "codeybox-beta"], first.Select(s => s.Name).ToArray());
+        Assert.Equal(["codeybox-alpha", "codeybox-beta", "codeybox-orphan"], first.Select(s => s.Name).ToArray());
         Assert.All(first, s => Assert.NotNull(s.CreatedAt));
         Assert.Equal(1024 * 1024, first.Single(s => s.Name == "codeybox-alpha").DiskBytes);
         Assert.True(first.Single(s => s.Name == "codeybox-beta").HasPreemptMarker);
+        Assert.Equal(
+            DateTimeOffset.Parse("2026-05-18T00:00:00Z"),
+            first.Single(s => s.Name == "codeybox-orphan").CreatedAt);
     }
 
     [Fact]
@@ -593,6 +625,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
                 return new RunResult(0, "", "");
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out var removedState);
+                return new RunResult(0, "", "");
+            }
 
             return new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
         });
@@ -690,6 +728,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
                 return Task.FromResult(new RunResult(0, "", ""));
 
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out var removedState);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
             return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var provider = NewProvider(
@@ -784,6 +828,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
                 return Task.FromResult(new RunResult(0, "", ""));
 
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out var removedState);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
             return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var provider = NewProvider(
@@ -866,6 +916,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
                 return Task.FromResult(new RunResult(0, "", ""));
 
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out var removedState);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
             return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
 
@@ -946,6 +1002,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
                 return Task.FromResult(new RunResult(0, "", ""));
 
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out var removedState);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
             return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
 
@@ -1017,7 +1079,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 deletedName = deleteName;
-                states.TryRemove(deleteName, out _);
+                states.TryRemove(deleteName, out var removedState);
                 return Task.FromResult(new RunResult(0, "", ""));
             }
 
@@ -1089,7 +1151,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 deletedName = deleteName;
-                states.TryRemove(deleteName, out _);
+                states.TryRemove(deleteName, out var removedState);
                 return Task.FromResult(new RunResult(0, "", ""));
             }
 
@@ -1299,6 +1361,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
                 return Task.FromResult(new RunResult(0, "", ""));
 
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out var removedState);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
             return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var logger = new RecordingLogger<MultipassSandboxProvider>();
@@ -1425,6 +1493,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
                 return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out var removedState);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
 
             // Exec of the user payload — first attempt returns a transient
             // socket failure; the second must succeed and produce "hello".

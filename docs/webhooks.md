@@ -425,7 +425,7 @@ sandboxes are not associated with a specific work item.
     "name": "codeybox-a1b2c3d4e5f6",
     "ageMinutes": 127.3,
     "diskMb": null,
-    "reason": "untracked_active_sandbox_age_threshold_exceeded"
+    "reason": "untracked_sandbox_age_threshold_exceeded"
   }
 }
 ```
@@ -435,7 +435,7 @@ sandboxes are not associated with a specific work item.
 | `name` | string | all | VM name matching the `codeybox-*` prefix |
 | `ageMinutes` | number | all | Age of the sandbox in minutes at detection time |
 | `diskMb` | number\|null | all | Disk usage in MiB, if available; null otherwise |
-| `reason` | string | all | Stable classification reason code (added in event schema `1.1`) |
+| `reason` | string | all | Stable classification reason code (added in event schema `1.1`), e.g. `untracked_sandbox_age_threshold_exceeded` or `untracked_sandbox_missing_creation_metadata` |
 | `disposedAt` | ISO-8601 | `sandbox.leak_disposed` | Timestamp when the sandbox was successfully disposed |
 | `error` | string | `sandbox.leak_dispose_failed` | Human-readable failure reason (e.g. `"timeout"` or multipass error) |
 

@@ -274,13 +274,13 @@ public sealed class AuditLogTests : IDisposable
             ageMinutes: 90.5,
             diskMb: 512,
             disposedAt: DateTimeOffset.UtcNow,
-            reason: "untracked_active_sandbox_age_threshold_exceeded");
+            reason: "untracked_sandbox_age_threshold_exceeded");
 
         var evt = Assert.Single(_sink.Events);
         Assert.True(GetScalar<bool>(evt, "Audit"));
         Assert.Equal("sandbox.leak_disposed", GetScalar<string>(evt, "EventName"));
         Assert.Equal("codeybox-stale", GetScalar<string>(evt, "SandboxName"));
-        Assert.Equal("untracked_active_sandbox_age_threshold_exceeded", GetScalar<string>(evt, "Reason"));
+        Assert.Equal("untracked_sandbox_age_threshold_exceeded", GetScalar<string>(evt, "Reason"));
     }
 
     [Fact]

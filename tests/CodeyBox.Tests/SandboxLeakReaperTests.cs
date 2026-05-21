@@ -19,7 +19,8 @@ public sealed class SandboxLeakReaperTests
         bool autoDispose = false,
         TimeSpan? leakAgeThreshold = null,
         TimeSpan? preemptRetention = null,
-        int? maxConcurrentAutoDispose = null)
+        int? maxConcurrentAutoDispose = null,
+        IWebhookDispatcher? webhooks = null)
     {
         var opts = new SandboxLeakOptions
         {
@@ -30,7 +31,7 @@ public sealed class SandboxLeakReaperTests
             AutoDispose = autoDispose,
             MaxConcurrentAutoDispose = maxConcurrentAutoDispose ?? 4,
         };
-        return new SandboxLeakReaper(provider, new NullWebhookDispatcher(), opts, NullLogger<SandboxLeakReaper>.Instance);
+        return new SandboxLeakReaper(provider, webhooks ?? new NullWebhookDispatcher(), opts, NullLogger<SandboxLeakReaper>.Instance);
     }
 
     private static DateTimeOffset OldEnough(TimeSpan threshold) =>
@@ -74,8 +75,8 @@ public sealed class SandboxLeakReaperTests
             owner,
             "codeybox-aabbcc00112233",
             OldEnough(threshold),
-            diskBytes: null,
-            currentPhaseActive: true);   // active in current process
+            diskBytes: null);
+        provider.MarkCurrentPhaseActive("codeybox-aabbcc00112233");
 
         var reaper = BuildReaper(provider, leakAgeThreshold: threshold);
         await reaper.RunSweepAsync(CancellationToken.None);
@@ -118,7 +119,7 @@ public sealed class SandboxLeakReaperTests
         var leaks = reaper.GetLatestLeaks();
         Assert.Single(leaks);
         Assert.Equal("codeybox-stale000000000", leaks[0].Name);
-        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, leaks[0].Reason);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leaks[0].Reason);
     }
 
     [Fact]
@@ -140,8 +141,9 @@ public sealed class SandboxLeakReaperTests
             parkedItem,
             "codeybox-parkedquota",
             OldEnough(threshold),
-            diskBytes: null,
-            currentPhaseActive: false);
+            diskBytes: null);
+        var ownershipSnapshot = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.False(ownershipSnapshot.IsTrackedActive);
 
         var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold);
         await reaper.RunSweepAsync(CancellationToken.None);
@@ -228,9 +230,11 @@ public sealed class SandboxLeakReaperTests
     }
 
     [Fact]
-    public async Task SandboxWithNullCreatedAt_NotReportedAsLeak()
+    public async Task SandboxWithNullCreatedAt_IsReportedAsMissingMetadataLeak()
     {
-        // If we can't determine the creation time, be conservative — skip it.
+        // Missing staging metadata used to skip stale VMs forever. Once a VM is
+        // untracked by the provider ownership snapshot, missing CreatedAt is
+        // itself actionable and carries a distinct reason.
         var provider = new FakeSandboxProvider();
         provider.AddSandbox(new ManagedSandboxInfo(
             "codeybox-unknown0000000",
@@ -241,7 +245,10 @@ public sealed class SandboxLeakReaperTests
         var reaper = BuildReaper(provider);
         await reaper.RunSweepAsync(CancellationToken.None);
 
-        Assert.Empty(reaper.GetLatestLeaks());
+        var leak = Assert.Single(reaper.GetLatestLeaks());
+        Assert.Equal("codeybox-unknown0000000", leak.Name);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandboxMissingCreationMetadata, leak.Reason);
+        Assert.True(leak.Age >= TimeSpan.FromMinutes(30));
     }
 
     [Fact]
@@ -258,8 +265,9 @@ public sealed class SandboxLeakReaperTests
         await reaper.RunSweepAsync(CancellationToken.None);
 
         var leaks = reaper.GetLatestLeaks();
-        Assert.Single(leaks);
-        Assert.Equal("codeybox-leaked0000000", leaks[0].Name);
+        Assert.Equal(
+            ["codeybox-leaked0000000", "codeybox-notime000000"],
+            leaks.Select(l => l.Name).OrderBy(name => name, StringComparer.Ordinal).ToArray());
     }
 
     // ── Auto-dispose ─────────────────────────────────────────────────────────
@@ -336,6 +344,30 @@ public sealed class SandboxLeakReaperTests
         Assert.Empty(reaper.GetLatestLeaks());
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-2)]
+    public async Task AutoDispose_ClampsNonPositiveConcurrencyLimitToOne(int configuredLimit)
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.SetDisposeDelay(TimeSpan.FromMilliseconds(25));
+        for (var i = 0; i < 3; i++)
+            provider.AddSandbox(new ManagedSandboxInfo($"codeybox-clamped{i}", OldEnough(threshold), null, false));
+
+        var reaper = BuildReaper(
+            provider,
+            autoDispose: true,
+            leakAgeThreshold: threshold,
+            maxConcurrentAutoDispose: configuredLimit);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(3, provider.DisposedNames.Count);
+        Assert.Equal(1, provider.MaxConcurrentDisposesObserved);
+        Assert.Empty(reaper.GetLatestLeaks());
+    }
+
     [Fact]
     public async Task AutoDispose_OneFailure_ContinuesWithRemainingLeaks()
     {
@@ -354,6 +386,29 @@ public sealed class SandboxLeakReaperTests
         Assert.Contains("codeybox-willsucceed00", provider.DisposedNames);
         var leak = Assert.Single(reaper.GetLatestLeaks());
         Assert.Equal("codeybox-willthrow0000", leak.Name);
+    }
+
+    [Fact]
+    public async Task AutoDispose_DisposeTimeout_KeepsFailedLeakInLatestLeaks()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo("codeybox-timeout0000", OldEnough(threshold), null, false));
+        provider.SetDisposeThrowsOperationCanceled("codeybox-timeout0000");
+        var webhooks = new CapturingWebhookDispatcher();
+
+        var reaper = BuildReaper(provider, autoDispose: true, leakAgeThreshold: threshold, webhooks: webhooks);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Empty(provider.DisposedNames);
+        var leak = Assert.Single(reaper.GetLatestLeaks());
+        Assert.Equal("codeybox-timeout0000", leak.Name);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leak.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_dispose_failed");
+        var details = Assert.IsType<SandboxLeakDetails>(failed.Details);
+        Assert.Equal("timeout", details.Error);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, details.Reason);
     }
 
     // ── Sweep resilience ─────────────────────────────────────────────────────
@@ -408,6 +463,8 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     private readonly List<FakeSandboxRecord> _sandboxes = [];
     private readonly List<string> _disposedNames = [];
     private readonly HashSet<string> _throwOnDispose = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _cancelOnDispose = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _currentPhaseSandboxNames = new(StringComparer.Ordinal);
     private TimeSpan _disposeDelay = TimeSpan.Zero;
     private int _activeDisposes;
     private int _maxConcurrentDisposesObserved;
@@ -427,19 +484,24 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     public void AddSandbox(ManagedSandboxInfo info)
     {
         lock (_gate)
-            _sandboxes.Add(new FakeSandboxRecord(info, Owner: null, CurrentPhaseActive: info.IsTrackedActive));
+            _sandboxes.Add(new FakeSandboxRecord(info, Owner: null));
     }
 
     public void AddSandboxForWorkItem(
         WorkItem owner,
         string name,
         DateTimeOffset createdAt,
-        long? diskBytes,
-        bool currentPhaseActive)
+        long? diskBytes)
     {
-        var info = new ManagedSandboxInfo(name, createdAt, diskBytes, IsTrackedActive: currentPhaseActive);
+        var info = new ManagedSandboxInfo(name, createdAt, diskBytes, IsTrackedActive: false);
         lock (_gate)
-            _sandboxes.Add(new FakeSandboxRecord(info, owner, currentPhaseActive));
+            _sandboxes.Add(new FakeSandboxRecord(info, owner));
+    }
+
+    public void MarkCurrentPhaseActive(string name)
+    {
+        lock (_gate)
+            _currentPhaseSandboxNames.Add(name);
     }
 
     public WorkItem? OwnerOf(string name)
@@ -449,6 +511,7 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     }
 
     public void SetDisposeThrows(string name) => _throwOnDispose.Add(name);
+    public void SetDisposeThrowsOperationCanceled(string name) => _cancelOnDispose.Add(name);
     public void SetDisposeDelay(TimeSpan delay) => _disposeDelay = delay;
     public void SetListThrows() => _throwOnList = true;
 
@@ -465,7 +528,11 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
         {
             return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(
                 _sandboxes
-                    .Select(s => s.Info with { IsTrackedActive = s.CurrentPhaseActive })
+                    .Select(s => s.Info with
+                    {
+                        IsTrackedActive = s.Info.IsTrackedActive ||
+                            _currentPhaseSandboxNames.Contains(s.Info.Name),
+                    })
                     .ToList());
         }
     }
@@ -474,6 +541,8 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     {
         if (_throwOnDispose.Contains(name))
             throw new InvalidOperationException($"Simulated dispose failure for {name}");
+        if (_cancelOnDispose.Contains(name))
+            throw new OperationCanceledException($"Simulated dispose timeout for {name}");
 
         var active = Interlocked.Increment(ref _activeDisposes);
         RecordMaxConcurrentDisposes(active);
@@ -504,6 +573,5 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
 
     private sealed record FakeSandboxRecord(
         ManagedSandboxInfo Info,
-        WorkItem? Owner,
-        bool CurrentPhaseActive);
+        WorkItem? Owner);
 }

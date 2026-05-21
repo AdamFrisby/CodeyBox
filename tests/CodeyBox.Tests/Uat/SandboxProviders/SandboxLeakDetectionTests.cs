@@ -15,13 +15,12 @@ namespace CodeyBox.Tests.Uat.SandboxProviders;
 public sealed class SandboxLeakDetectionTests
 {
     [Fact]
-    public async Task Sweep_IgnoresActiveFreshUnknownAndPreservedPreemptSandboxes()
+    public async Task Sweep_IgnoresActiveFreshAndPreservedPreemptSandboxes()
     {
         var threshold = TimeSpan.FromMinutes(30);
         var provider = new UatSandboxProvider();
         provider.Add(new ManagedSandboxInfo("codeybox-active", OldEnough(threshold), null, IsTrackedActive: true));
         provider.Add(new ManagedSandboxInfo("codeybox-fresh", DateTimeOffset.UtcNow.AddMinutes(-5), null, IsTrackedActive: false));
-        provider.Add(new ManagedSandboxInfo("codeybox-unknown", null, null, IsTrackedActive: false));
         provider.Add(new ManagedSandboxInfo(
             "codeybox-preempt",
             DateTimeOffset.UtcNow.AddHours(-2),
@@ -37,10 +36,10 @@ public sealed class SandboxLeakDetectionTests
         var leak = Assert.Single(reaper.GetLatestLeaks());
         Assert.Equal("codeybox-leaked", leak.Name);
         Assert.Equal(5 * 1024 * 1024, leak.DiskBytes);
-        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, leak.Reason);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leak.Reason);
         var evt = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_detected");
         var details = Assert.IsType<SandboxLeakDetails>(evt.Details);
-        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, details.Reason);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, details.Reason);
     }
 
     [Fact]
@@ -63,11 +62,11 @@ public sealed class SandboxLeakDetectionTests
         var disposed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_disposed");
         var disposedDetails = Assert.IsType<SandboxLeakDetails>(disposed.Details);
         Assert.Equal("codeybox-dispose-ok", disposedDetails.Name);
-        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, disposedDetails.Reason);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, disposedDetails.Reason);
         var failed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_dispose_failed");
         var failedDetails = Assert.IsType<SandboxLeakDetails>(failed.Details);
         Assert.Equal("codeybox-dispose-fails", failedDetails.Name);
-        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, failedDetails.Reason);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, failedDetails.Reason);
     }
 
     [Fact]
@@ -142,7 +141,7 @@ public sealed class SandboxLeakDetectionTests
         var leak = Assert.Single(body.GetProperty("leaks").EnumerateArray());
         Assert.Equal("codeybox-admin", leak.GetProperty("name").GetString());
         Assert.Equal(summaryAge, leak.GetProperty("ageMinutes").GetDouble());
-        Assert.Equal(SandboxLeakReasons.UntrackedActiveSandbox, leak.GetProperty("reason").GetString());
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leak.GetProperty("reason").GetString());
     }
 
     [Fact]

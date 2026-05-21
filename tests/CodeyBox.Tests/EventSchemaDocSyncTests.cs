@@ -66,7 +66,11 @@ public sealed class EventSchemaDocSyncTests
     public void Doc_DeclaresCurrentSchemaVersion()
     {
         var doc = ReadDoc();
-        Assert.Contains(EventSchema.CurrentVersion, doc);
+        Assert.Equal("1.1", EventSchema.CurrentVersion);
+
+        var declaration = Regex.Match(doc, @"^eventSchemaVersion\s*=\s*""(?<version>\d+\.\d+)""\s*$", RegexOptions.Multiline);
+        Assert.True(declaration.Success, "docs/EVENT_SCHEMA.md must declare the current eventSchemaVersion");
+        Assert.Equal("1.1", declaration.Groups["version"].Value);
     }
 
     [Fact]
@@ -82,7 +86,7 @@ public sealed class EventSchemaDocSyncTests
         using var parsed = JsonDocument.Parse(json);
         var root = parsed.RootElement;
 
-        Assert.Equal(EventSchema.CurrentVersion, root.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal("1.1", root.GetProperty("eventSchemaVersion").GetString());
         Assert.True(root.TryGetProperty("evolutionRules", out _));
         Assert.True(root.TryGetProperty("envelope", out var envelope));
         Assert.True(envelope.TryGetProperty("eventSchemaVersion", out _));

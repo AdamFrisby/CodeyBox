@@ -911,7 +911,7 @@ and already purged.
     "createdAt": "2026-05-04T02:00:00+00:00",
     "ageMinutes": 127.3,
     "diskMb": null,
-    "reason": "untracked_active_sandbox_age_threshold_exceeded"
+    "reason": "untracked_sandbox_age_threshold_exceeded"
   }
 ]
 ```
@@ -935,7 +935,7 @@ Response: `200 OK`
       "createdAt": "2026-05-04T02:00:00+00:00",
       "ageMinutes": 127.3,
       "diskMb": null,
-      "reason": "untracked_active_sandbox_age_threshold_exceeded"
+      "reason": "untracked_sandbox_age_threshold_exceeded"
     }
   ]
 }
