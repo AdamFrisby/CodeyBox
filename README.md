@@ -40,6 +40,27 @@ network profile and spawns a fresh sandbox:
 Phases 1–3 together are the atomic unit: failure of any of them marks the
 item failed. Phase 4 is retried independently.
 
+## Commit-message trailers
+
+Every commit the orchestrator produces stamps a trailer block so attribution
+survives a DB wipe — `git log --grep 'CodeyBox-Agent: gemini'` is the
+source of truth.
+
+```
+codeybox: <subject>
+
+CodeyBox-WorkItem: <work-item id>
+CodeyBox-Agent: <agent>[/<model>]
+CodeyBox-Fallbacks: <from>→<to> (×N <reason>); …      # only if fallbacks happened
+Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+```
+
+`CodeyBox-Fallbacks` summarises the work item's `AgentFallbackRecord`
+events grouped by `from→to` agent, count, and most-common reason; it is
+omitted when no fallback occurred. All trailers are valid RFC-5322 single
+lines. See `CodeyBox.Core.CodeyBoxTrailers.Compose` for the canonical
+producer.
+
 ## Status
 
 Built and building clean:
