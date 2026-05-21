@@ -280,6 +280,36 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpTestPass_ReportsFastUnrunnableSignalWhenFullBodyHasStackTraceAfterTruncationPoint()
+    {
+        var auditor = CSharpTestPassAuditor();
+        var longErrorContext = new string('x', 4_200);
+        var output = $"""
+              Failed JobTrack.Tests.Unit.ApiClientTests.ReportsConnectionErrors [1 ms]
+              Error Message:
+               System.InvalidOperationException : connection refused while calling the fake API
+               {longErrorContext}
+              Stack Trace:
+                 at JobTrack.Tests.Unit.ApiClientTests.ReportsConnectionErrors() in /work/tests/ApiClientTests.cs:line 42
+
+            Failed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6, Duration: 1 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("JobTrack.Tests.Unit.ApiClientTests.ReportsConnectionErrors", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("connection refused", finding.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ApiClientTests.cs", finding.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_NonTestFailureWithoutFailedHeadersReportsCommandError()
     {
         var auditor = CSharpTestPassAuditor();

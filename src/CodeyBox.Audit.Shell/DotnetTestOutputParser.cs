@@ -53,11 +53,11 @@ internal static class DotnetTestOutputParser
                 : output.Length;
             bodyEnd = FindFailureBodyEnd(output, bodyStart, bodyEnd);
             failureBodyRanges.Add((bodyStart, bodyEnd));
-            var body = ExtractBodySnippet(output, bodyStart, bodyEnd);
+            var fullBody = ExtractBody(output, bodyStart, bodyEnd);
             var durationMs = TryParseDurationMilliseconds(durationText);
-            var stackTrace = ExtractStackTrace(body);
+            var stackTrace = ExtractStackTrace(fullBody);
 
-            if (IsUnrunnableFailure(durationMs, stackTrace, body))
+            if (IsUnrunnableFailure(durationMs, stackTrace, fullBody))
             {
                 match = nextMatch;
                 continue;
@@ -69,7 +69,7 @@ internal static class DotnetTestOutputParser
                     AuditorName: auditorName,
                     Severity: AuditSeverity.Error,
                     Title: $"test failed: {testName}",
-                    Description: BuildDescription(durationText, body)));
+                    Description: BuildDescription(durationText, fullBody)));
             }
             else
             {
@@ -131,11 +131,10 @@ internal static class DotnetTestOutputParser
            && string.IsNullOrWhiteSpace(stackTrace)
            && UnrunnableFailureSignalRegex.IsMatch(body);
 
-    private static string ExtractBodySnippet(string output, int bodyStart, int bodyEnd)
+    private static string ExtractBody(string output, int bodyStart, int bodyEnd)
     {
         var bodyLength = Math.Max(0, bodyEnd - bodyStart);
-        var snippetLength = Math.Min(bodyLength, MaxFailureBodyChars);
-        return output.Substring(bodyStart, snippetLength).Trim();
+        return output.Substring(bodyStart, bodyLength).Trim();
     }
 
     private static string BuildDescription(string durationText, string body)
