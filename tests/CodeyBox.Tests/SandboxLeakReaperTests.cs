@@ -151,6 +151,7 @@ public sealed class SandboxLeakReaperTests
             "codeybox-runningphase",
             OldEnough(threshold),
             diskBytes: null);
+        provider.MarkCurrentPhaseActive("codeybox-runningphase");
         var ownershipSnapshot = await provider.ListAllManagedAsync(CancellationToken.None);
         Assert.False(ownershipSnapshot.Single(s => s.Name == "codeybox-parkedquota").IsTrackedActive);
         Assert.True(ownershipSnapshot.Single(s => s.Name == "codeybox-runningphase").IsTrackedActive);
@@ -504,13 +505,11 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
         DateTimeOffset createdAt,
         long? diskBytes)
     {
-        // Feed the owner state into the provider snapshot so parked quota items
-        // are exercised as a distinct non-active state, not just as stored test data.
         var info = new ManagedSandboxInfo(
             name,
             createdAt,
             diskBytes,
-            OwnerStateCountsAsActivePhase(owner.State));
+            IsTrackedActive: false);
         lock (_gate)
             _sandboxes.Add(new FakeSandboxRecord(info, owner));
     }
@@ -587,13 +586,6 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
                 return;
         }
     }
-
-    private static bool OwnerStateCountsAsActivePhase(WorkItemState state) =>
-        state is WorkItemState.Working
-            or WorkItemState.Reworking
-            or WorkItemState.Auditing
-            or WorkItemState.Merging
-            or WorkItemState.UpstreamPushing;
 
     private sealed record FakeSandboxRecord(
         ManagedSandboxInfo Info,

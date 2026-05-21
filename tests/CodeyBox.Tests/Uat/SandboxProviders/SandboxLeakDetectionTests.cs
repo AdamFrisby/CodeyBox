@@ -141,7 +141,7 @@ public sealed class SandboxLeakDetectionTests
         var leak = Assert.Single(body.GetProperty("leaks").EnumerateArray());
         Assert.Equal("codeybox-admin", leak.GetProperty("name").GetString());
         Assert.Equal(summaryAge, leak.GetProperty("ageMinutes").GetDouble());
-        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leak.GetProperty("reason").GetString());
+        Assert.Equal("untracked_sandbox_age_threshold_exceeded", leak.GetProperty("reason").GetString());
     }
 
     [Fact]

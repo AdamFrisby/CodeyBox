@@ -2,8 +2,10 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -471,7 +473,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task DisposeAsync_DeleteFailureUntracksActiveSandboxAndAllowsRetry()
+    public async Task DisposeAsync_DeleteFailureUntracksActiveSandboxWithoutMaskingCompletedPhase()
     {
         var disposedNames = new List<string>();
         var noLongerActiveNames = new List<string>();
@@ -499,17 +501,135 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             runner: runner,
             daemonRetryPolicy: InstantDaemonRetryPolicy());
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await sandbox.DisposeAsync());
+        await sandbox.DisposeAsync();
 
-        Assert.Contains("multipass delete --purge codeybox-deletefail failed", ex.Message);
         Assert.Equal(1, deleteCalls);
         Assert.Empty(disposedNames);
         Assert.Equal(["codeybox-deletefail"], noLongerActiveNames);
 
         await sandbox.DisposeAsync();
 
+        Assert.Equal(1, deleteCalls);
+        Assert.Empty(disposedNames);
+    }
+
+    [Fact]
+    public async Task ProviderCreatedSandbox_DeleteFailureUntracksActiveCacheAndReaperDisposes()
+    {
+        var staging = Path.Combine(_workspace, "provider-delete-fail-staging");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var deleteCalls = 0;
+        var listCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                states[argv[3]] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "info", var name, "--format=csv"])
+                return Task.FromResult(states.TryGetValue(name, out var state)
+                    ? new RunResult(0, state, "")
+                    : new RunResult(1, "", "not found"));
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new RunResult(0, "", ""));
+
+            if (argv is [_, "list", "--format", "json"])
+            {
+                listCalls++;
+                var list = states.Keys
+                    .OrderBy(vmName => vmName, StringComparer.Ordinal)
+                    .Select(vmName => new { name = vmName })
+                    .ToArray();
+                return Task.FromResult(new RunResult(0, JsonSerializer.Serialize(new { list }), ""));
+            }
+
+            if (argv is [_, "info", "--format", "json", ..])
+            {
+                var info = states.Keys.ToDictionary(
+                    vmName => vmName,
+                    vmName => new
+                    {
+                        created = "2026-05-18T00:00:00Z",
+                        disks = new Dictionary<string, object>
+                        {
+                            ["sda1"] = new { used = "1048576" },
+                        },
+                    },
+                    StringComparer.Ordinal);
+                return Task.FromResult(new RunResult(0, JsonSerializer.Serialize(new { info }), ""));
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deleteCalls++;
+                if (deleteCalls == 1)
+                    return Task.FromResult(new RunResult(17, "", "transient delete failure"));
+
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new RunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var name = sandbox.Id;
+        var active = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.True(active.IsTrackedActive);
+
+        await sandbox.DisposeAsync();
+
+        Assert.Equal(1, deleteCalls);
+        var untracked = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.Equal(name, untracked.Name);
+        Assert.False(untracked.IsTrackedActive);
+        Assert.Equal(2, listCalls);
+
+        var reaper = new SandboxLeakReaper(
+            provider,
+            new NullWebhookDispatcher(),
+            new SandboxLeakOptions
+            {
+                Enabled = true,
+                AutoDispose = true,
+                CheckInterval = TimeSpan.FromHours(1),
+                LeakAgeThreshold = TimeSpan.Zero,
+                MaxConcurrentAutoDispose = 1,
+            },
+            NullLogger<SandboxLeakReaper>.Instance);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
         Assert.Equal(2, deleteCalls);
-        Assert.Equal(["codeybox-deletefail"], disposedNames);
+        Assert.Empty(states);
+        Assert.Empty(reaper.GetLatestLeaks());
     }
 
     [Fact]

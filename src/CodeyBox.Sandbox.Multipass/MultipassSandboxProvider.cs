@@ -2413,8 +2413,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to delete multipass VM {Name}", _name);
-            _onNoLongerTrackedActive?.Invoke(_name);
-            throw;
+            _disposed = true;
+            try
+            {
+                _onNoLongerTrackedActive?.Invoke(_name);
+            }
+            catch (Exception callbackEx)
+            {
+                _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
+            }
+            return;
         }
         _disposed = true;
         _onDisposed?.Invoke(_name);
