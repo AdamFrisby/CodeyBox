@@ -7,6 +7,7 @@ namespace CodeyBox.Audit.Shell;
 internal static class DotnetTestOutputParser
 {
     private const double UnrunnableFailureThresholdMs = 50;
+    private const int MaxFailureBodyChars = 4_000;
     private static readonly Regex FailedTestHeaderRegex = new(
         @"^\s*Failed\s+(?<name>.+?)\s+\[(?<duration>[^\]\r\n]+)\]\s*$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline,
@@ -23,15 +24,14 @@ internal static class DotnetTestOutputParser
     public static DotnetTestOutputParseResult Parse(string auditorName, string output)
     {
         if (string.IsNullOrWhiteSpace(output))
-            return new DotnetTestOutputParseResult([], 0, 0, false);
+            return new DotnetTestOutputParseResult([], 0, false);
 
         var matches = FailedTestHeaderRegex.Matches(output);
         if (matches.Count == 0)
-            return new DotnetTestOutputParseResult([], 0, 0, false);
+            return new DotnetTestOutputParseResult([], 0, false);
 
         var findings = new List<AuditFinding>();
         var failureBodyRanges = new List<(int Start, int End)>();
-        var excluded = 0;
 
         for (var i = 0; i < matches.Count; i++)
         {
@@ -49,10 +49,7 @@ internal static class DotnetTestOutputParser
             var stackTrace = ExtractStackTrace(body);
 
             if (IsUnrunnableFailure(durationMs, stackTrace))
-            {
-                excluded++;
                 continue;
-            }
 
             findings.Add(new AuditFinding(
                 AuditorName: auditorName,
@@ -64,7 +61,6 @@ internal static class DotnetTestOutputParser
         return new DotnetTestOutputParseResult(
             findings,
             matches.Count,
-            excluded,
             HasCommandFailureSignalOutsideRanges(output, failureBodyRanges));
     }
 
@@ -111,7 +107,7 @@ internal static class DotnetTestOutputParser
     {
         var details = string.IsNullOrWhiteSpace(body)
             ? "(no failure details were emitted)"
-            : Truncate(body, 4_000);
+            : Truncate(body, MaxFailureBodyChars);
 
         return $"The test failed after {durationText}.\n\n{details}";
     }
@@ -193,5 +189,4 @@ internal static class DotnetTestOutputParser
 internal sealed record DotnetTestOutputParseResult(
     IReadOnlyList<AuditFinding> Findings,
     int ParsedFailureCount,
-    int ExcludedUnrunnableFailureCount,
     bool HasCommandFailureSignals);

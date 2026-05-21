@@ -15,7 +15,12 @@ internal static class LanguagePresetHelpers
             language,
             markerDescription,
             markerScript,
-            new ShellCommandAuditor(new ShellCommandAuditorOptions { Name = name, Argv = argv }));
+            new ShellCommandAuditor(new ShellCommandAuditorOptions
+            {
+                Name = name,
+                Argv = argv,
+                ResultClassifier = ResultClassifierFor(language, name, argv),
+            }));
 
     public static IAuditor ShellScript(
         string language,
@@ -36,4 +41,21 @@ internal static class LanguagePresetHelpers
                 ToolName = toolName,
                 TreatExit127AsMissingTool = treatExit127AsMissingTool,
             }));
+
+    private static IShellCommandResultClassifier? ResultClassifierFor(
+        string language,
+        string name,
+        IReadOnlyList<string> argv)
+    {
+        if (string.Equals(language, "csharp", StringComparison.Ordinal)
+            && string.Equals(name, "csharp:test-pass", StringComparison.Ordinal)
+            && argv.Count >= 2
+            && string.Equals(argv[0], "dotnet", StringComparison.Ordinal)
+            && string.Equals(argv[1], "test", StringComparison.Ordinal))
+        {
+            return new DotnetTestCommandResultClassifier();
+        }
+
+        return null;
+    }
 }

@@ -6,11 +6,11 @@ namespace CodeyBox.Audit.Shell;
 /// Audits the working tree by running an arbitrary command inside the
 /// sandbox. Most commands follow the shell-style "exit 0 = good" contract:
 /// exit code 0 passes, and non-zero fails with stdout/stderr captured as a
-/// single Error finding. If the top-level tool is confirmed missing before the
-/// command runs, the auditor emits a non-blocking Info finding instead. The
-/// built-in csharp:test-pass command additionally classifies dotnet test
-/// failures so tests that did not run in the sandbox can be excluded while
-/// real test and command-level failures remain blocking.
+/// single Error finding. If the top-level tool is confirmed missing before
+/// the command runs, the auditor emits a non-blocking Info finding instead.
+/// A command-specific result classifier can refine non-zero exits without
+/// making this generic shell runner aware of language- or tool-specific
+/// output formats.
 ///
 /// Does NOT need agent credentials, so it runs in the credential-free audit
 /// sandbox. Operators concerned about a malicious build script reaching
@@ -56,29 +56,19 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         if (result.Success)
             return new AuditResult(true, [], RawOutput: combinedOutput);
 
-        if (IsCSharpTestPassAuditor())
+        var finding = BuildCommandFinding(result, toolName);
+        if (_opts.ResultClassifier is not null)
         {
-            var parsed = DotnetTestOutputParser.Parse(Name, combinedOutput);
-            if (parsed.ParsedFailureCount > 0)
-            {
-                if (!parsed.HasCommandFailureSignals)
-                    return new AuditResult(
-                        parsed.Findings.Count == 0,
-                        parsed.Findings,
-                        RawOutput: combinedOutput);
-
-                if (parsed.Findings.Count > 0)
-                {
-                    var commandFinding = BuildCommandFinding(result, toolName);
-                    return new AuditResult(
-                        false,
-                        [.. parsed.Findings, commandFinding],
-                        RawOutput: combinedOutput);
-                }
-            }
+            var classified = _opts.ResultClassifier.ClassifyFailedCommand(new ShellCommandResultContext(
+                Name,
+                _opts.Argv,
+                result,
+                combinedOutput,
+                finding));
+            if (classified is not null)
+                return classified;
         }
 
-        var finding = BuildCommandFinding(result, toolName);
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
 
@@ -128,12 +118,6 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         return result.ExitCode == 127 && _opts.TreatExit127AsMissingTool == true;
     }
 
-    private bool IsCSharpTestPassAuditor()
-        => string.Equals(Name, "csharp:test-pass", StringComparison.Ordinal)
-           && _opts.Argv.Count >= 2
-           && string.Equals(_opts.Argv[0], "dotnet", StringComparison.Ordinal)
-           && string.Equals(_opts.Argv[1], "test", StringComparison.Ordinal);
-
     private AuditResult MissingToolResult(string toolName, string rawOutput)
     {
         var finding = new AuditFinding(
@@ -151,4 +135,5 @@ public sealed record ShellCommandAuditorOptions
     public required IReadOnlyList<string> Argv { get; init; }
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
+    public IShellCommandResultClassifier? ResultClassifier { get; init; }
 }

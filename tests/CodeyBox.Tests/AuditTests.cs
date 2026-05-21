@@ -99,11 +99,7 @@ public sealed class AuditTests
     [Fact]
     public async Task CSharpTestPass_IgnoresFastFailuresWithoutStackTraceAndReportsRealFailures()
     {
-        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
-        {
-            Name = "csharp:test-pass",
-            Argv = ["dotnet", "test", "--no-build"],
-        });
+        var auditor = CSharpTestPassAuditor();
         var output = """
               Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [1 ms]
               Error Message:
@@ -147,13 +143,39 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpTestPass_RealFailuresPlusBuildErrorReportsTestAndCommandErrors()
+    {
+        var auditor = CSharpTestPassAuditor();
+        var output = """
+              Failed JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals [12 ms]
+              Error Message:
+               Assert.Equal() Failure: Values differ
+               Expected: 1
+               Actual:   2
+              Stack Trace:
+                 at JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals() in /work/tests/InvoiceTests.cs:line 42
+
+            Failed!  - Failed: 1, Passed: 98, Skipped: 0, Total: 99, Duration: 4 s
+            /work/src/Program.cs(7,13): error CS0103: The name 'missing' does not exist in the current context [/work/src/App.csproj]
+            Build FAILED.
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.Equal(2, result.Findings.Count);
+        Assert.Contains(result.Findings, f => f.Title.Contains("JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals", StringComparison.Ordinal));
+        Assert.Contains(result.Findings, f => f.Title.Contains("command exited 1: dotnet test --no-build", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task CSharpTestPass_AllUnrunnableFastFailuresProducesNoErrorFindings()
     {
-        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
-        {
-            Name = "csharp:test-pass",
-            Argv = ["dotnet", "test", "--no-build"],
-        });
+        var auditor = CSharpTestPassAuditor();
         var output = """
               Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [1 ms]
               Error Message:
@@ -179,13 +201,32 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpTestPass_IgnoresSubMillisecondUnrunnableFailure()
+    {
+        var auditor = CSharpTestPassAuditor();
+        var output = """
+              Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [< 1 ms]
+              Error Message:
+               Microsoft.Playwright.PlaywrightException : Browser executable was not found
+              Stack Trace:
+
+            Failed!  - Failed: 1, Passed: 100, Skipped: 0, Total: 101, Duration: 4 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_NonTestFailureWithoutFailedHeadersReportsCommandError()
     {
-        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
-        {
-            Name = "csharp:test-pass",
-            Argv = ["dotnet", "test", "--no-build"],
-        });
+        var auditor = CSharpTestPassAuditor();
         var output = """
             /work/src/Invoice.cs(12,20): error CS1002: ; expected [/work/src/App.csproj]
 
@@ -212,11 +253,7 @@ public sealed class AuditTests
     [Fact]
     public async Task CSharpTestPass_UnrunnableFailuresPlusBuildErrorReportsCommandError()
     {
-        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
-        {
-            Name = "csharp:test-pass",
-            Argv = ["dotnet", "test", "--no-build"],
-        });
+        var auditor = CSharpTestPassAuditor();
         var output = """
               Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [1 ms]
               Error Message:
@@ -244,11 +281,7 @@ public sealed class AuditTests
     [Fact]
     public async Task CSharpTestPass_ReportsSlowAssertionFailureEvenWithoutStackTrace()
     {
-        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
-        {
-            Name = "csharp:test-pass",
-            Argv = ["dotnet", "test", "--no-build"],
-        });
+        var auditor = CSharpTestPassAuditor();
         var output = """
               Failed JobTrack.Tests.Unit.MathTests.SlowAssertion [80 ms]
               Error Message:
@@ -272,6 +305,14 @@ public sealed class AuditTests
         Assert.Contains("JobTrack.Tests.Unit.MathTests.SlowAssertion", finding.Title, StringComparison.Ordinal);
         Assert.Contains("Assert.Equal() Failure", finding.Description, StringComparison.Ordinal);
     }
+
+    private static ShellCommandAuditor CSharpTestPassAuditor() =>
+        new(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+            ResultClassifier = new DotnetTestCommandResultClassifier(),
+        });
 
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");

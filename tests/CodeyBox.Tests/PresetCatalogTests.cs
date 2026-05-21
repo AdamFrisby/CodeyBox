@@ -92,6 +92,45 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public async Task CSharpPreset_TestPassUsesDotnetOutputClassifier()
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:test-pass");
+        var output = """
+              Failed JobTrack.Tests.E2E.LoginTests.CanOpenLoginPage [< 1 ms]
+              Error Message:
+               Microsoft.Playwright.PlaywrightException : Browser executable was not found
+              Stack Trace:
+
+            Failed!  - Failed: 1, Passed: 100, Skipped: 0, Total: 101, Duration: 4 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (exec.Argv.Count >= 3
+                && exec.Argv[0] == "sh"
+                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            {
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+            }
+
+            if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "test")
+                return new SandboxExecResult(1, output, "");
+
+            return new SandboxExecResult(0, ".\n", "");
+        });
+
+        var result = await auditor.RunAsync(
+            sandbox,
+            "/work",
+            new AuditContext(WorkItemId.New(), "feature", "main", 1, "do x"),
+            CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.DoesNotContain(result.Findings, f => f.Severity == AuditSeverity.Error);
+    }
+
+    [Fact]
     public void AuditTypeYamlLoading_LoadsBuiltInReviewFocus()
     {
         var catalog = new PresetCatalog();
@@ -438,5 +477,14 @@ public sealed class PresetCatalogTests
             if (Directory.Exists(Path))
                 Directory.Delete(Path, recursive: true);
         }
+    }
+
+    private sealed class FakeSandbox : ISandbox
+    {
+        private readonly Func<SandboxExec, SandboxExecResult> _onExec;
+        public FakeSandbox(Func<SandboxExec, SandboxExecResult> onExec) { _onExec = onExec; }
+        public string Id => "fake";
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) => Task.FromResult(_onExec(exec));
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
