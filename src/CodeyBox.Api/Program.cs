@@ -566,6 +566,18 @@ builder.Services.AddSingleton(sp => new GeminiOAuthCredentialFileSource(
 builder.Services.AddSingleton(sp => new GeminiSettingsCredentialFileSource(
     geminiSettingsFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
 
+// Bridges the host-side ClaudeCredentialFileSource watcher to in-flight VMs:
+// when ~/.claude/.credentials.json rotates while a Claude agent is running in
+// a sandbox, the pusher writes the fresh sanitised bundle into the VM's
+// ~/.claude/.credentials.json before its next Anthropic call goes 401. The
+// runner picks the pusher up via its optional constructor parameter and
+// registers each active sandbox for the duration of RunAsync/RunResumedAsync.
+builder.Services.AddSingleton<ClaudeTokenRotationPusher>(sp => new ClaudeTokenRotationPusher(
+    sp.GetRequiredService<ClaudeCredentialFileSource>(),
+    sp.GetService<ILogger<ClaudeTokenRotationPusher>>()));
+builder.Services.AddSingleton<IClaudeTokenRotationPusher>(sp =>
+    sp.GetRequiredService<ClaudeTokenRotationPusher>());
+
 builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
 {
     var builtInFirst = new List<ICredentialProvider>();

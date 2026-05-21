@@ -85,29 +85,13 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
             return Task.FromResult<AgentCredential?>(null);
         }
 
-        string token;
-        string sanitisedBundle;
-        try
+        if (!TryBuildSanitisedBundle(rawContents, out var token, out var sanitisedBundle))
         {
-            using var doc = JsonDocument.Parse(rawContents);
-            if (!doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth) ||
-                !oauth.TryGetProperty("accessToken", out var tokenEl) ||
-                tokenEl.ValueKind != JsonValueKind.String)
-            {
-                _log?.LogWarning("Claude OAuth file {Path} missing .claudeAiOauth.accessToken; falling through", _source.FilePath);
-                return Task.FromResult<AgentCredential?>(null);
-            }
-            token = tokenEl.GetString() ?? "";
-            sanitisedBundle = BuildSandboxBundle(oauth, token);
-        }
-        catch (Exception ex)
-        {
-            _log?.LogWarning(ex, "Failed to parse Claude OAuth file {Path}; falling through", _source.FilePath);
+            _log?.LogWarning(
+                "Claude OAuth file {Path} could not be parsed into a sanitised sandbox bundle; falling through",
+                _source.FilePath);
             return Task.FromResult<AgentCredential?>(null);
         }
-
-        if (string.IsNullOrEmpty(token))
-            return Task.FromResult<AgentCredential?>(null);
 
         var env = new Dictionary<string, string>
         {
@@ -118,12 +102,46 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
     }
 
     /// <summary>
-    /// Builds the env-var bundle the runner materialises into
-    /// <c>~/.claude/.credentials.json</c> inside the sandbox. Carries the
-    /// access_token (and the expires_at hint when the host file had one) but
-    /// deliberately omits the refresh_token — see the class summary for the
-    /// rationale on host-side-only refresh.
+    /// Parses a host-side Claude credentials JSON document and produces the
+    /// sanitised bundle ClaudeAgentRunner materialises into
+    /// <c>~/.claude/.credentials.json</c> inside the sandbox. The bundle
+    /// carries the access_token (and the <c>expiresAt</c> hint when present)
+    /// but deliberately omits the refresh_token — see the class summary for
+    /// the rationale on host-side-only refresh. Returns <c>false</c> for
+    /// missing/malformed input so callers can fall through cleanly.
     /// </summary>
+    public static bool TryBuildSanitisedBundle(
+        string? rawContents,
+        out string accessToken,
+        out string sanitisedBundle)
+    {
+        accessToken = "";
+        sanitisedBundle = "";
+        if (string.IsNullOrEmpty(rawContents))
+            return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(rawContents);
+            if (!doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth) ||
+                !oauth.TryGetProperty("accessToken", out var tokenEl) ||
+                tokenEl.ValueKind != JsonValueKind.String)
+            {
+                return false;
+            }
+            var token = tokenEl.GetString() ?? "";
+            if (token.Length == 0)
+                return false;
+            accessToken = token;
+            sanitisedBundle = BuildSandboxBundle(oauth, token);
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
     private static string BuildSandboxBundle(JsonElement oauth, string token)
     {
         using var stream = new MemoryStream();

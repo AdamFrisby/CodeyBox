@@ -412,6 +412,35 @@ public static class AuditLog
                 "token; persistent 401s indicate a revoked or misconfigured credential.",
                 phase, sandboxName ?? "(unknown)");
 
+    /// <summary>
+    /// Emitted once per active Claude-running sandbox after the host's
+    /// <c>~/.claude/.credentials.json</c> rotates and
+    /// <c>ClaudeTokenRotationPusher</c> writes the new sanitised bundle into
+    /// the VM. Together with the prior <c>credential file mtime rotated</c>
+    /// host-side log entry, this lets operators correlate a host rotation with
+    /// the per-VM in-flight refresh, and explain the absence of subsequent
+    /// <c>agent.claude_unauthorized</c> events on long-running iterations.
+    /// </summary>
+    public static void ClaudeTokenPushedToVm(string sandboxName) =>
+        Audit("agent.claude_token_pushed_to_vm")
+            .Information(
+                "Rotated Claude access token pushed into sandbox {SandboxName}",
+                sandboxName);
+
+    /// <summary>
+    /// Emitted when <c>ClaudeTokenRotationPusher</c> tried to write the
+    /// rotated bundle into a VM and the exec failed (non-zero exit or the
+    /// exec threw). The active iteration in that VM is therefore likely to
+    /// surface as <c>agent.claude_unauthorized</c> on its next Anthropic
+    /// call; pairing the two events isolates "push failed → 401" from
+    /// "genuinely revoked credential → 401".
+    /// </summary>
+    public static void ClaudeTokenPushFailed(string sandboxName, string reason) =>
+        Audit("agent.claude_token_push_failed")
+            .Warning(
+                "Failed to push rotated Claude access token into sandbox {SandboxName}: {Reason}",
+                sandboxName, reason);
+
     // ── Queue control ────────────────────────────────────────────────────────
 
     public static void QueuePaused(string reason) =>

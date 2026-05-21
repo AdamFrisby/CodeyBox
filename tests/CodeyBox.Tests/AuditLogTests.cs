@@ -354,6 +354,31 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void ClaudeTokenPushedToVm_emits_claude_token_pushed_to_vm_event_at_Information()
+    {
+        AuditLog.ClaudeTokenPushedToVm("codeybox-vm-77");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("agent.claude_token_pushed_to_vm", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(LogEventLevel.Information, evt.Level);
+        Assert.Equal("codeybox-vm-77", GetScalar<string>(evt, "SandboxName"));
+    }
+
+    [Fact]
+    public void ClaudeTokenPushFailed_emits_claude_token_push_failed_event_at_Warning()
+    {
+        AuditLog.ClaudeTokenPushFailed("codeybox-vm-77", "exit 1: permission denied");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("agent.claude_token_push_failed", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(LogEventLevel.Warning, evt.Level);
+        Assert.Equal("codeybox-vm-77", GetScalar<string>(evt, "SandboxName"));
+        Assert.Equal("exit 1: permission denied", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public void CrossReviewActive_emits_audit_cross_review_active_event()
     {
         AuditLog.CrossReviewActive(AgentKind.Claude, AgentKind.Gemini);

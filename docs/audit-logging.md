@@ -83,6 +83,8 @@ Audit-tier events additionally carry:
 | `agent.started` | Info | `PipelineRunner.RunAgentPhaseAsync`, `RunAgentMergePhaseAsync` | `Agent`, `Sandbox`, `Phase` (`work`, `rework`, or `merge`) |
 | `agent.finished` | Info | Same as above | `Agent`, `Sandbox`, `Success`, `ExitCode`, `DurationMs` |
 | `agent.claude_unauthorized` | Warning | `ClaudeQuotaFailureDetector.EmitAdvisoryAuditEvents` (via `PipelineRunner`) | `Phase`, `SandboxName`. Logged when the Claude CLI returns HTTP 401. Treated as transient (no quota-breaker recording) — most commonly an expired access token. |
+| `agent.claude_token_pushed_to_vm` | Info | `ClaudeTokenRotationPusher.PushToAllAsync` | `SandboxName`. Emitted once per active Claude-running sandbox after `~/.claude/.credentials.json` rotates on the host and the fresh sanitised bundle was written into the VM. Pair with the absence of subsequent `agent.claude_unauthorized` to confirm the in-VM refresh closed the gap. |
+| `agent.claude_token_push_failed` | Warning | `ClaudeTokenRotationPusher.PushToSandboxAsync` | `SandboxName`, `Reason`. The exec into the VM failed; the running iteration is likely to 401 on its next Anthropic call. |
 
 ### Sandbox lifecycle
 
