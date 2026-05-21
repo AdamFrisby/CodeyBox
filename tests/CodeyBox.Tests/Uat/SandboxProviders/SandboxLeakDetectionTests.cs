@@ -107,9 +107,13 @@ public sealed class SandboxLeakDetectionTests
         var leak = Assert.Single(body.EnumerateArray());
         Assert.Equal("codeybox-endpoint", leak.GetProperty("name").GetString());
         Assert.Equal(2, leak.GetProperty("diskMb").GetInt64());
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leak.GetProperty("reason").GetString());
         dispose.EnsureSuccessStatusCode();
         Assert.Equal(HttpStatusCode.NotFound, repeat.StatusCode);
         Assert.Contains("codeybox-endpoint", provider.DisposedNames);
+        var disposed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_disposed");
+        var details = Assert.IsType<SandboxLeakDetails>(disposed.Details);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, details.Reason);
     }
 
     [Fact]

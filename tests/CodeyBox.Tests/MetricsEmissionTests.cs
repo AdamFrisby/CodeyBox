@@ -1,4 +1,5 @@
 using System.Diagnostics.Metrics;
+using System.Collections.Concurrent;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -11,10 +12,10 @@ public sealed class MetricsEmissionTests
 {
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private static (MeterListener Listener, List<(string Instrument, long Value, string? Tag, string? TagValue)> Measurements)
+    private static (MeterListener Listener, ConcurrentQueue<(string Instrument, long Value, string? Tag, string? TagValue)> Measurements)
         CreateLongListener(string meterName, string instrumentName, string? tagKey = null)
     {
-        var measurements = new List<(string, long, string?, string?)>();
+        var measurements = new ConcurrentQueue<(string, long, string?, string?)>();
         var listener = new MeterListener();
 
         listener.InstrumentPublished = (instrument, l) =>
@@ -31,11 +32,21 @@ public sealed class MetricsEmissionTests
                 for (var i = 0; i < tags.Length; i++)
                     if (tags[i].Key == tagKey) tagValue = tags[i].Value?.ToString();
             }
-            measurements.Add((instrument.Name, value, tagKey, tagValue));
+            measurements.Enqueue((instrument.Name, value, tagKey, tagValue));
         });
 
         listener.Start();
         return (listener, measurements);
+    }
+
+    private static void AssertEventuallyContains(
+        ConcurrentQueue<(string Instrument, long Value, string? Tag, string? TagValue)> measurements,
+        Func<(string Instrument, long Value, string? Tag, string? TagValue), bool> predicate)
+    {
+        var found = SpinWait.SpinUntil(
+            () => measurements.ToArray().Any(predicate),
+            TimeSpan.FromSeconds(2));
+        Assert.True(found, "Expected metric measurement was not observed.");
     }
 
     // ── PipelineTransitions ───────────────────────────────────────────────────
@@ -47,7 +58,7 @@ public sealed class MetricsEmissionTests
         using (listener)
         {
             CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", "Working"));
-            Assert.Contains(measurements, measurement =>
+            AssertEventuallyContains(measurements, measurement =>
                 measurement.Value == 1L && measurement.TagValue == "Working");
         }
     }
@@ -60,8 +71,8 @@ public sealed class MetricsEmissionTests
         {
             CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", "Merging"));
             CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", "Done"));
-            Assert.Contains(measurements, measurement => measurement.TagValue == "Merging");
-            Assert.Contains(measurements, measurement => measurement.TagValue == "Done");
+            AssertEventuallyContains(measurements, measurement => measurement.TagValue == "Merging");
+            AssertEventuallyContains(measurements, measurement => measurement.TagValue == "Done");
         }
     }
 
@@ -74,8 +85,8 @@ public sealed class MetricsEmissionTests
         using (listener)
         {
             CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "passed"));
-            Assert.Single(measurements);
-            Assert.Equal("passed", measurements[0].TagValue);
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 1L && measurement.TagValue == "passed");
         }
     }
 
@@ -86,8 +97,8 @@ public sealed class MetricsEmissionTests
         using (listener)
         {
             CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "reworking"));
-            Assert.Single(measurements);
-            Assert.Equal("reworking", measurements[0].TagValue);
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 1L && measurement.TagValue == "reworking");
         }
     }
 
@@ -98,8 +109,8 @@ public sealed class MetricsEmissionTests
         using (listener)
         {
             CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
-            Assert.Single(measurements);
-            Assert.Equal("failed", measurements[0].TagValue);
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 1L && measurement.TagValue == "failed");
         }
     }
 
@@ -112,8 +123,7 @@ public sealed class MetricsEmissionTests
         using (listener)
         {
             CodeyBoxMeters.AuditBlockingFindings.Record(3, new KeyValuePair<string, object?>("iteration", "1"));
-            Assert.Single(measurements);
-            Assert.Equal(3L, measurements[0].Value);
+            AssertEventuallyContains(measurements, measurement => measurement.Value == 3L);
         }
     }
 
@@ -130,9 +140,8 @@ public sealed class MetricsEmissionTests
                 new KeyValuePair<string, object?>("auditor.kind", "shell"),
                 new KeyValuePair<string, object?>("iteration", "1"));
 
-            Assert.Single(measurements);
-            Assert.Equal(150L, measurements[0].Value);
-            Assert.Equal("shell-lint", measurements[0].TagValue);
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 150L && measurement.TagValue == "shell-lint");
         }
     }
 
@@ -148,9 +157,8 @@ public sealed class MetricsEmissionTests
                 new KeyValuePair<string, object?>("agent.kind", "claude"),
                 new KeyValuePair<string, object?>("phase", "work"));
 
-            Assert.Single(measurements);
-            Assert.Equal(5000L, measurements[0].Value);
-            Assert.Equal("claude", measurements[0].TagValue);
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 5000L && measurement.TagValue == "claude");
         }
     }
 
@@ -164,8 +172,8 @@ public sealed class MetricsEmissionTests
                 new KeyValuePair<string, object?>("agent.kind", "claude"),
                 new KeyValuePair<string, object?>("phase", "rework"));
 
-            Assert.Single(measurements);
-            Assert.Equal("rework", measurements[0].TagValue);
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 1200L && measurement.TagValue == "rework");
         }
     }
 
@@ -180,9 +188,10 @@ public sealed class MetricsEmissionTests
             CodeyBoxMeters.SandboxLifecycle.Record(800, new KeyValuePair<string, object?>("step", "start"));
             CodeyBoxMeters.SandboxLifecycle.Record(200, new KeyValuePair<string, object?>("step", "clone"));
 
-            Assert.Equal(2, measurements.Count);
-            Assert.Equal("start", measurements[0].TagValue);
-            Assert.Equal("clone", measurements[1].TagValue);
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 800L && measurement.TagValue == "start");
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 200L && measurement.TagValue == "clone");
         }
     }
 }

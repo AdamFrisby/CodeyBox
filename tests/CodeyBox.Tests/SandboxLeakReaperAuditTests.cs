@@ -53,6 +53,37 @@ public sealed class SandboxLeakReaperAuditTests : IDisposable
         Assert.InRange(GetScalar<double>(evt, "AgeMinutes"), 90.9, 91.2);
     }
 
+    [Fact]
+    public async Task RunSweepAsync_AutoDisposeFailure_EmitsFailedAuditWithReason()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo(
+            "codeybox-audit-failed",
+            DateTimeOffset.UtcNow - TimeSpan.FromMinutes(65),
+            DiskBytes: null,
+            IsTrackedActive: false));
+        provider.SetDisposeThrows("codeybox-audit-failed");
+        var reaper = new SandboxLeakReaper(
+            provider,
+            new NullWebhookDispatcher(),
+            new SandboxLeakOptions
+            {
+                Enabled = true,
+                CheckInterval = TimeSpan.FromHours(1),
+                LeakAgeThreshold = threshold,
+                AutoDispose = true,
+            },
+            NullLogger<SandboxLeakReaper>.Instance);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        var evt = Assert.Single(_sink.Events, e =>
+            GetScalar<string>(e, "EventName") == "sandbox.leak_dispose_failed"
+            && GetScalar<string>(e, "SandboxName") == "codeybox-audit-failed");
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, GetScalar<string>(evt, "Reason"));
+    }
+
     private static T? GetScalar<T>(LogEvent evt, string key)
     {
         if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)

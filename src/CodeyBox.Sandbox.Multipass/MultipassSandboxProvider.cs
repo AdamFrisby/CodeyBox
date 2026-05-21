@@ -192,8 +192,26 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         var workItemId = spec.TimingWorkItemId;
         var timingPhase = spec.TimingPhase ?? "work";
 
+        void MarkTrackedActive(string n)
+        {
+            _activeSandboxNames[n] = true;
+            _listCacheExpiry = DateTimeOffset.MinValue;
+        }
+
+        void MarkNoLongerActive(string n)
+        {
+            _activeSandboxNames.TryRemove(n, out _);
+            _listCacheExpiry = DateTimeOffset.MinValue;
+        }
+
         try
         {
+            // Track ownership before the VM becomes host-visible. A slow launch,
+            // clone, cloud-init wait, mount, or environment transfer can overlap a
+            // leak-reaper sweep; once multipass lists this name, it must already be
+            // protected as an in-flight phase sandbox.
+            MarkTrackedActive(name);
+
             // Choose between two boot paths:
             //   - Baseline-clone path (UseBaselineImages=true + profile is set):
             //     bake one VM per profile lazily on first use, then `multipass
@@ -253,16 +271,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // already baked into the source VM's filesystem, so the clone
             // inherits it. The codeybox-route systemd service runs on every
             // boot in both paths.
-            _activeSandboxNames[name] = true;
-            // Invalidate the list cache so the next ListAllManagedAsync call reflects
-            // the newly created sandbox immediately rather than serving stale data.
-            _listCacheExpiry = DateTimeOffset.MinValue;
-            void MarkNoLongerActive(string n)
-            {
-                _activeSandboxNames.TryRemove(n, out _);
-                _listCacheExpiry = DateTimeOffset.MinValue;
-            }
-
             return new MultipassSandbox(name, sandboxRoot, spec, opts, _log, timingStore, timingItemId, timingPhase,
                 onDisposed: MarkNoLongerActive,
                 onNoLongerTrackedActive: MarkNoLongerActive,
@@ -272,7 +280,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         catch
         {
             // Best-effort cleanup if launch / mount / transfer half-succeeded.
-            await TryDeleteVmAsync(opts, name);
+            try { await TryDeleteVmAsync(opts, name); }
+            finally { MarkNoLongerActive(name); }
             try { Directory.Delete(sandboxRoot, recursive: true); } catch { }
             throw;
         }

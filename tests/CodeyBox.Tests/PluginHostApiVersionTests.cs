@@ -19,7 +19,7 @@ public sealed class PluginHostApiVersionTests
     [Fact]
     public void Satisfies_MinorLowerThanCurrent_ReturnsTrue()
     {
-        // Host 1.0 satisfies plugin requiring 1.0 (same or lower minor)
+        // Host 1.1 satisfies plugin requiring 1.0 (same or lower minor)
         Assert.True(CodeyBoxApiVersion.Satisfies("1.0"));
     }
 
@@ -34,7 +34,7 @@ public sealed class PluginHostApiVersionTests
     [Fact]
     public void Satisfies_HigherMinor_ReturnsFalse()
     {
-        // Plugin wants 1.99 but host is 1.0
+        // Plugin wants 1.99 but host is 1.1
         Assert.False(CodeyBoxApiVersion.Satisfies("1.99"));
     }
 

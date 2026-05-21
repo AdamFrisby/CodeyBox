@@ -203,7 +203,7 @@ the operator explicitly opts in. This is intentional.
 
 Every plugin declares the minimum host API version it requires via
 `minHostApiVersion` on `[CodeyBoxPlugin]`. The host rejects plugins that
-require a version newer than `CodeyBoxApiVersion.Current` (currently `"1.0"`).
+require a version newer than `CodeyBoxApiVersion.Current` (currently `"1.1"`).
 
 ### Version bump rules
 
