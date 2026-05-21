@@ -112,7 +112,31 @@ Use `POST /workitems/{id}/uncancel` to reset a `Cancelled` item back to `Queued`
 - `cancellationReason=ParentCascaded` — the parent has since been retried.
 - `cancellationReason=null` — legacy item whose reason is ambiguous (likely a pre-fix host-shutdown victim; see Operations Guide).
 
-Returns 409 when `cancellationReason=OperatorRequested` — use `POST /workitems` to re-create the item instead.
+Returns 409 when `cancellationReason=OperatorRequested` — use `POST /workitems/{id}/resume` instead (see below).
+
+### Resuming an operator-cancelled item
+
+When the operator hits `DELETE /workitems/{id}` mid-iteration — for example to pause the pipeline while triaging a flaky auditor — the bare repo at `~/.codeybox/repos/{id}.git` and the work-branch with every commit the agent has already produced stay on disk. `POST /workitems/{id}/resume` re-enters the pipeline on top of that preserved state instead of throwing the work away.
+
+```
+POST /workitems/{id}/resume
+{
+  "from": "work" | "audit" | "merge",   // optional, default "work"
+  "reason": "<operator-supplied reason>"   // optional, free-form, appears in audit log + webhook
+}
+```
+
+| `from` | Resume state | When to use |
+|--------|--------------|-------------|
+| `work` (default) | `Queued` | Continue rework on top of the existing work-branch — the next pickup sees N commits ahead of base and produces the next rework iteration. |
+| `audit` | `WorkComplete` | Re-run the audit phase against the existing tip — useful when the cancel was triggered to wait for an auditor fix. `auditIterations` continues from its prior value (not reset to 0). |
+| `merge` | `AuditPassed` | Attempt the merge against the latest base. Rare; offered for completeness. |
+
+**Preserves** the `Id`, `ExternalId`, `WorkBranch`, every commit in the bare repo, `FallbackHistory`, `UsageTotal`, `AuditIterations`, `QuotaResetAt`, and `Priority`. **Resets** `LastError`, `CancellationReason`, `CancellationSource`, `FailureKind`, and `RecoveryAttempts`.
+
+Returns `412 Precondition Failed` when the bare repo or the work-branch ref is no longer present on disk — fall back to `POST /workitems/{id}/replay` for a fresh start. Returns `409` when the item is not in `Cancelled` state.
+
+Distinct from `/uncancel` (operator cancels are refused there by design — the operator chose to stop, so undoing that needs its own verb) and from `/retry` (which is scoped to terminal-failed states, not Cancelled).
 
 ### AbandonedAfterRecoveryAttempts
 

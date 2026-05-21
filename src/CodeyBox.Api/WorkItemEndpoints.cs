@@ -27,6 +27,7 @@ internal static class WorkItemEndpoints
         group.MapPost("/{id}/dismiss-question", DismissQuestionAsync);
         group.MapGet("/{id}/stdout-tail", GetStdoutTailAsync);
         group.MapPost("/{id}/uncancel", UncancelAsync);
+        group.MapPost("/{id}/resume", ResumeAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -813,6 +814,132 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
+    /// Resume an operator-cancelled work item against its existing bare repo
+    /// and work-branch — preserving every agent commit already made — instead
+    /// of re-doing the work via /replay. The operator's <c>DELETE</c> is
+    /// undone, the audit-iteration counter continues from where it stopped,
+    /// and the pipeline re-enters at the requested phase.
+    ///
+    /// Distinct from <c>/uncancel</c> (which refuses operator cancels) and
+    /// <c>/retry</c> (which is scoped to terminal-failed states). Returns:
+    ///   - 409 if the item is not in Cancelled state.
+    ///   - 412 if the bare repo or the work-branch ref is no longer present
+    ///     (resume cannot reconstruct the prior agent work; the operator must
+    ///     fall back to /replay).
+    /// </summary>
+    private static async Task<IResult> ResumeAsync(
+        string id,
+        ResumeWorkItemRequest? body,
+        IWorkItemStore store,
+        ITaskQueue queue,
+        IGitHost gitHost,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State != WorkItemState.Cancelled)
+            return Results.Conflict(new
+            {
+                error = $"cannot resume item in state {item.State}; only Cancelled items can be resumed",
+            });
+
+        var requestedFrom = (body?.From ?? "work").Trim().ToLowerInvariant();
+        var resumeState = requestedFrom switch
+        {
+            "work" => WorkItemState.Queued,
+            "audit" => WorkItemState.WorkComplete,
+            "merge" => WorkItemState.AuditPassed,
+            _ => (WorkItemState?)null,
+        };
+        if (resumeState is null)
+            return Results.BadRequest(new
+            {
+                error = $"invalid 'from' value '{body?.From}'; expected one of: work, audit, merge",
+            });
+
+        // Resume preserves the prior bare repo + work-branch (that is the
+        // entire point — recovering the agent commits the operator's cancel
+        // left intact). If either is gone, the operator must fall back to
+        // /replay for a fresh start.
+        var repoPresent = await gitHost.RepositoryExistsAsync(item.Id, ct);
+        if (!repoPresent)
+            return Results.Json(new
+            {
+                error = "bare repo or work-branch no longer present; cannot resume — use POST /workitems/{id}/replay for a fresh start",
+            }, statusCode: StatusCodes.Status412PreconditionFailed);
+
+        var workBranch = item.WorkBranch;
+        var branchPresent = !string.IsNullOrEmpty(workBranch)
+            && await gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
+        if (!branchPresent)
+            return Results.Json(new
+            {
+                error = "bare repo or work-branch no longer present; cannot resume — use POST /workitems/{id}/replay for a fresh start",
+            }, statusCode: StatusCodes.Status412PreconditionFailed);
+
+        // Build the resumed item by hand rather than via WorkItem.With() —
+        // With(Queued) intentionally clears WorkBranch for the failed-retry
+        // path. Resume's whole purpose is to preserve it.
+        var resumed = item with
+        {
+            State = resumeState.Value,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            LastError = null,
+            CancellationReason = null,
+            CancellationSource = null,
+            FailureKind = null,
+            RecoveryAttempts = 0,
+            // StartedAt cleared so the new run shows up as fresh in the
+            // in-flight set; bare-repo + work-branch + audit-iteration counter
+            // are preserved by virtue of being untouched here.
+            StartedAt = null,
+        };
+
+        // Conditional update guards against a racing cascade-cancel or
+        // concurrent resume request — we only mutate from Cancelled.
+        var updated = await store.TryUpdateIfStateAsync(resumed, WorkItemState.Cancelled, ct);
+        if (!updated)
+            return Results.Conflict(new { error = "concurrent resume request already processed this item" });
+
+        // from=work goes back through the worker dispatcher; from=audit and
+        // from=merge enter mid-pipeline (the pipeline runner gates each phase
+        // by entry state and skips earlier phases when their output is
+        // already in the bare repo).
+        if (resumeState.Value == WorkItemState.Queued)
+            await queue.EnqueueAsync(resumed.Id, ct);
+
+        AuditLog.WorkItemResumed(resumed.Id, requestedFrom, body?.Reason);
+
+        var project = await projects.GetAsync(resumed.ProjectId, ct);
+        if (project is not null)
+        {
+            await webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.resumed",
+                WorkItem = resumed,
+                Project = project,
+                Details = new
+                {
+                    id = resumed.Id.ToString(),
+                    externalId = resumed.ExternalId,
+                    from = requestedFrom,
+                    reason = body?.Reason,
+                },
+            }, ct);
+        }
+
+        return Results.Ok(new
+        {
+            id = resumed.Id.ToString(),
+            from = requestedFrom,
+            state = resumed.State.ToString(),
+        });
+    }
+
+    /// <summary>
     /// Partially update a Queued work item's editable fields (title, prompt,
     /// agent, work/merge timeouts, min model score). Returns 409 Conflict when
     /// the item is no longer in Queued state.
@@ -1540,6 +1667,8 @@ public sealed record CreateWorkItemRequest(
     int? Priority = null);
 
 public sealed record RetryWorkItemRequest(string? From);
+
+public sealed record ResumeWorkItemRequest(string? From = null, string? Reason = null);
 
 public sealed record PatchWorkItemRequest(
     string? Title = null,

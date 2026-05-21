@@ -216,6 +216,15 @@ internal sealed class AuditLogTimelineReader
                     var details = new { phase = from };
                     return new TimelineEntry(time, "state_transition", $"Retried from {from}", details);
                 }
+            case "work_item.resumed":
+                {
+                    var from = GetStr(root, "From") ?? "work";
+                    var reason = GetStr(root, "Reason");
+                    if (string.IsNullOrEmpty(reason)) reason = null;
+                    var details = new { phase = from, reason };
+                    var summary = reason is null ? $"Resumed from {from}" : $"Resumed from {from}: {Truncate(reason, 80)}";
+                    return new TimelineEntry(time, "state_transition", summary, details);
+                }
             case "work_item.dependent_cancelled":
                 {
                     var parentId = GetStr(root, "ParentWorkItemId") ?? "?";
