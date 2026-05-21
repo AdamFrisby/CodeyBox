@@ -54,6 +54,12 @@ public static class AuditLog
     /// <see cref="WorkItemRetried"/> (which handles the terminal-failed retry
     /// paths and the parent-cascade uncancel path) so operators can isolate
     /// intentional resume actions from the broader retry-after-failure churn.
+    ///
+    /// Reason is forced through an empty-string sentinel because Serilog drops
+    /// null properties, and the timeline reader at
+    /// <c>src/CodeyBox.Api/AuditLogTimelineReader.cs</c> relies on the property
+    /// being present so it can distinguish "reason omitted" from "log line
+    /// schema changed". Both ends must stay in sync.
     /// </summary>
     public static void WorkItemResumed(WorkItemId id, string from, string? reason) =>
         Audit("work_item.resumed")

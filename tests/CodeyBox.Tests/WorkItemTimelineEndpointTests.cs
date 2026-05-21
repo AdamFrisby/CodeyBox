@@ -174,6 +174,72 @@ public sealed class WorkItemTimelineEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Timeline_Resume_WithReason_FormatsSummaryAndAdvancesPrevState()
+    {
+        var id = WorkItemId.New();
+        var t0 = DateTimeOffset.UtcNow.AddMinutes(-20);
+        await _factory.Store.CreateAsync(MakeItem(id, t0), CancellationToken.None);
+
+        await File.AppendAllLinesAsync(_factory.TodayAuditFile, [
+            MakeClef(id, "work_item.cancelled", t0,                  new { }),
+            MakeClef(id, "work_item.resumed",   t0.AddMinutes(1),    new { From = "audit", Reason = "auditor #100 fixed" }),
+            MakeClef(id, "work_item.transitioned", t0.AddMinutes(2), new { State = "Auditing" }),
+        ]);
+
+        var body = await GetTimelineAsync(id);
+
+        Assert.Equal(3, body.Entries.Count);
+        var resumeEntry = body.Entries[1];
+        Assert.Equal("state_transition", resumeEntry.Kind);
+        Assert.Contains("Resumed from audit", resumeEntry.Summary);
+        Assert.Contains("auditor #100 fixed", resumeEntry.Summary);
+        // prevState must advance: the next state_transition should not be
+        // labelled "Cancelled → Auditing".
+        var afterResume = body.Entries[2];
+        Assert.Contains("WorkComplete → Auditing", afterResume.Summary);
+    }
+
+    [Fact]
+    public async Task Timeline_Resume_WithoutReason_OmitsReasonFromSummary()
+    {
+        var id = WorkItemId.New();
+        var t0 = DateTimeOffset.UtcNow.AddMinutes(-20);
+        await _factory.Store.CreateAsync(MakeItem(id, t0), CancellationToken.None);
+
+        // Reason is emitted as "" by AuditLog.WorkItemResumed when null was passed.
+        // The reader must treat the empty-string sentinel as null.
+        await File.AppendAllLinesAsync(_factory.TodayAuditFile, [
+            MakeClef(id, "work_item.resumed", t0, new { From = "work", Reason = "" }),
+        ]);
+
+        var body = await GetTimelineAsync(id);
+
+        var entry = Assert.Single(body.Entries);
+        Assert.Equal("Resumed from work", entry.Summary);
+    }
+
+    [Fact]
+    public async Task Timeline_Resume_TruncatesLongReasonAt80Chars()
+    {
+        var id = WorkItemId.New();
+        var t0 = DateTimeOffset.UtcNow.AddMinutes(-20);
+        await _factory.Store.CreateAsync(MakeItem(id, t0), CancellationToken.None);
+
+        var longReason = new string('x', 200);
+        await File.AppendAllLinesAsync(_factory.TodayAuditFile, [
+            MakeClef(id, "work_item.resumed", t0, new { From = "work", Reason = longReason }),
+        ]);
+
+        var body = await GetTimelineAsync(id);
+
+        var entry = Assert.Single(body.Entries);
+        // Truncate(80) caps at 80 chars + an ellipsis marker; the full 200-char
+        // reason must not appear in the summary.
+        Assert.DoesNotContain(longReason, entry.Summary);
+        Assert.Contains("Resumed from work", entry.Summary);
+    }
+
+    [Fact]
     public async Task Timeline_AuditorRunSummary_IncludesIterationNumber()
     {
         var id = WorkItemId.New();

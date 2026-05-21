@@ -63,6 +63,20 @@ public sealed class ResumeEndpointTests : IDisposable
             RecoveryAttempts = 2,
         };
 
+    private static AuditReport MakeAuditedOnceReport(WorkItemId id) => new()
+    {
+        Id = Guid.NewGuid().ToString("N"),
+        WorkItemId = id.ToString(),
+        Iteration = 1,
+        AuditorName = "test:fake",
+        AuditorKind = "test",
+        WorstSeverity = "Info",
+        StartedAt = DateTimeOffset.UtcNow,
+        EndedAt = DateTimeOffset.UtcNow,
+        DurationMs = 0,
+        Findings = Array.Empty<AuditReportFinding>(),
+    };
+
     // ── Happy path: from=work (default) ───────────────────────────────────────
 
     [Fact]
@@ -113,14 +127,19 @@ public sealed class ResumeEndpointTests : IDisposable
     // ── from=audit goes to WorkComplete, audit iteration counter preserved ───
 
     [Fact]
-    public async Task Resume_FromAudit_TransitionsToWorkCompleteWithoutEnqueueing()
+    public async Task Resume_FromAudit_TransitionsToWorkCompleteAndKicksDispatcher()
     {
-        // The audit phase is re-entered via the pipeline runner's state-gated
-        // dispatch, NOT via the Queued worker queue. So from=audit must NOT
-        // call ITaskQueue.EnqueueAsync — doing so would race the pipeline's
-        // pickup logic.
+        // The dispatcher uses ITaskQueue as a generic "something changed,
+        // re-check the DB" kick channel (OrchestratorService.cs:159-166) and
+        // routes by State on every kick via PickNextEligibleAsync. Every
+        // comparable Cancelled→non-terminal transition in the codebase
+        // (WorkItemRetrier, DeadWorkerReaper, the transient-cancel auto-retry,
+        // ReplayPendingAsync) always enqueues regardless of target state, so
+        // resume must too — otherwise from=audit waits indefinitely for some
+        // unrelated event to wake the dispatcher.
         var item = CancelledItem();
         await _factory.Store.CreateAsync(item);
+        await _factory.AuditReports.CreateAsync(MakeAuditedOnceReport(item.Id));
         _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
 
         var resp = await _client.PostAsJsonAsync(
@@ -134,7 +153,7 @@ public sealed class ResumeEndpointTests : IDisposable
         Assert.Equal(item.WorkBranch, readBack.WorkBranch);
 
         var queue = _factory.Services.GetRequiredService<ITaskQueue>();
-        Assert.Equal(0, queue.Count);
+        Assert.Equal(1, queue.Count);
     }
 
     // ── from=merge → AuditPassed ──────────────────────────────────────────────
@@ -144,6 +163,7 @@ public sealed class ResumeEndpointTests : IDisposable
     {
         var item = CancelledItem();
         await _factory.Store.CreateAsync(item);
+        await _factory.AuditReports.CreateAsync(MakeAuditedOnceReport(item.Id));
         _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
 
         var resp = await _client.PostAsJsonAsync(
@@ -153,6 +173,113 @@ public sealed class ResumeEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var readBack = await _factory.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditPassed, readBack!.State);
+
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        Assert.Equal(1, queue.Count);
+    }
+
+    // ── 409 when from=audit but the work-branch was never audited ─────────────
+
+    [Fact]
+    public async Task Resume_FromAudit_NoPriorAuditReports_Returns409()
+    {
+        // Spec: from=audit is meaningful only if we trust the existing commits
+        // to be auditable. Cheapest signal that the work-branch reached an
+        // auditable state is the presence of at least one audit report.
+        var item = CancelledItem();
+        await _factory.Store.CreateAsync(item);
+        _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
+        // Deliberately do NOT seed any audit reports.
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/resume",
+            new ResumeRequestBody(From: "audit", Reason: null));
+
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Cancelled, readBack!.State);
+    }
+
+    [Fact]
+    public async Task Resume_FromMerge_NoPriorAuditReports_Returns409()
+    {
+        var item = CancelledItem();
+        await _factory.Store.CreateAsync(item);
+        _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/resume",
+            new ResumeRequestBody(From: "merge", Reason: null));
+
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+    }
+
+    // ── Preserved-field guarantees: WorkBranch + spec fields survive resume ──
+
+    [Fact]
+    public async Task Resume_PreservesSpecMandatedFields()
+    {
+        // Spec: 'Preserve: Id, ExternalId, WorkBranch, all commits in the bare
+        // repo, FallbackHistory, UsageTotal, AuditIterations, QuotaResetAt,
+        // Priority.' AuditIterations + UsageTotal + FallbackHistory live in
+        // separate stores (not on WorkItem), so the WorkItem-level guarantee
+        // is: nothing in the spec list is mutated by resume.
+        var qr = DateTimeOffset.UtcNow.AddHours(2);
+        var item = CancelledItem(externalId: "JOBTRACK-preserve") with
+        {
+            Priority = 47,
+            QuotaResetAt = qr,
+        };
+        await _factory.Store.CreateAsync(item);
+        _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/resume",
+            new ResumeRequestBody(From: "work", Reason: null));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.NotNull(readBack);
+        Assert.Equal(item.Id, readBack!.Id);
+        Assert.Equal("JOBTRACK-preserve", readBack.ExternalId);
+        Assert.Equal(item.WorkBranch, readBack.WorkBranch);
+        Assert.Equal(47, readBack.Priority);
+        // QuotaResetAt is only carried into quota-shaped states by WorkItem.With,
+        // so resume's manual `with { … }` preserves it.
+        Assert.Equal(qr, readBack.QuotaResetAt);
+    }
+
+    // ── Reason validation matches the codebase convention ─────────────────────
+
+    [Fact]
+    public async Task Resume_RejectsControlCharactersInReason()
+    {
+        var item = CancelledItem();
+        await _factory.Store.CreateAsync(item);
+        _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/resume",
+            new ResumeRequestBody(From: "work", Reason: "line1\nline2"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Cancelled, readBack!.State);
+    }
+
+    [Fact]
+    public async Task Resume_RejectsReasonOverLengthCap()
+    {
+        var item = CancelledItem();
+        await _factory.Store.CreateAsync(item);
+        _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/resume",
+            new ResumeRequestBody(From: "work", Reason: new string('x', 501)));
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
     }
 
     // ── 412 when bare repo is missing ─────────────────────────────────────────
@@ -297,12 +424,16 @@ internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
         Path.GetTempPath(), $"cb-resume-http-{Guid.NewGuid():N}.db");
 
     public SqliteWorkItemStore Store { get; }
+    public SqliteAuditReportStore AuditReports { get; }
     public StubResumeGitHost GitHost { get; } = new();
     public CapturingWebhookDispatcher Webhooks { get; } = new();
 
     public ResumeApiFactory()
     {
         Store = new SqliteWorkItemStore(_dbPath);
+        // Construct AFTER SqliteWorkItemStore so the work_items table that the
+        // audit_reports foreign key references is already created.
+        AuditReports = new SqliteAuditReportStore(_dbPath);
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -327,6 +458,9 @@ internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
             services.RemoveAll<IWorkItemStore>();
             services.AddSingleton<IWorkItemStore>(Store);
 
+            services.RemoveAll<IAuditReportStore>();
+            services.AddSingleton<IAuditReportStore>(AuditReports);
+
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
                 new Project
@@ -348,6 +482,7 @@ internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
     {
         if (disposing)
         {
+            AuditReports.Dispose();
             Store.Dispose();
             try { File.Delete(_dbPath); } catch { }
         }
