@@ -237,6 +237,95 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Contains("claude auth", result.Summary);
         Assert.Single(sandbox.AllExecs);
     }
+
+    // ── Rotation pusher registration ──────────────────────────────────────────
+
+    [Fact]
+    public async Task RunAsync_RegistersSandboxWithRotationPusherForDurationOfRun()
+    {
+        // The runner must register the active sandbox with the pusher before
+        // delegating to the CLI and unregister it on return so a host-side
+        // rotation that lands mid-iteration pushes into THIS sandbox (and a
+        // rotation that lands later does not).
+        var sandbox = new CapturingSandbox();
+        var pusher = new RecordingRotationPusher();
+        var runner = new ClaudeAgentRunner(pusher);
+
+        Assert.Empty(pusher.ActiveDuringRun);
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        Assert.Single(pusher.RegisterCalls);
+        Assert.Same(sandbox, pusher.RegisterCalls[0]);
+        // After the run completes the registration must be disposed.
+        Assert.Equal(1, pusher.DisposedCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_NullPusher_DoesNotThrow()
+    {
+        // Default construction (no pusher injected) must work for tests and
+        // for hosts that don't run the rotation watcher.
+        var sandbox = new CapturingSandbox();
+        var runner = new ClaudeAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        Assert.True(result.Success);
+    }
+
+    [Fact]
+    public async Task RunResumedAsync_RegistersSandboxWithRotationPusher()
+    {
+        // The preempt-resume code path also runs the CLI in the same sandbox
+        // and is equally vulnerable to mid-run rotation; the override must
+        // register too.
+        var sandbox = new CapturingSandbox();
+        var pusher = new RecordingRotationPusher();
+        var runner = new ClaudeAgentRunner(pusher);
+
+        await runner.RunResumedAsync(sandbox, "/work", "prompt", credential: null,
+            resume: new AgentResumeContext(""));
+
+        Assert.Single(pusher.RegisterCalls);
+        Assert.Same(sandbox, pusher.RegisterCalls[0]);
+        Assert.Equal(1, pusher.DisposedCount);
+    }
+}
+
+internal sealed class RecordingRotationPusher : IClaudeTokenRotationPusher
+{
+    public List<ISandbox> RegisterCalls { get; } = new();
+    public List<ISandbox> ActiveDuringRun { get; } = new();
+    public int DisposedCount { get; private set; }
+
+    public IDisposable RegisterActiveSandbox(ISandbox sandbox)
+    {
+        RegisterCalls.Add(sandbox);
+        ActiveDuringRun.Add(sandbox);
+        return new Releaser(this, sandbox);
+    }
+
+    private sealed class Releaser : IDisposable
+    {
+        private readonly RecordingRotationPusher _owner;
+        private readonly ISandbox _sandbox;
+        private bool _disposed;
+
+        public Releaser(RecordingRotationPusher owner, ISandbox sandbox)
+        {
+            _owner = owner;
+            _sandbox = sandbox;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _owner.ActiveDuringRun.Remove(_sandbox);
+            _owner.DisposedCount++;
+        }
+    }
 }
 
 /// <summary>

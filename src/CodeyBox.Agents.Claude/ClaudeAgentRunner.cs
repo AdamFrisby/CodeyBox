@@ -16,6 +16,24 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 {
     private static readonly HttpClient TextOnlyHttp = new();
 
+    private readonly IClaudeTokenRotationPusher? _rotationPusher;
+
+    public ClaudeAgentRunner() : this(rotationPusher: null) { }
+
+    /// <summary>
+    /// Optional <paramref name="rotationPusher"/> hooks the runner into the
+    /// host-side credential watcher: while a Claude invocation is running in a
+    /// sandbox, host-side rotations of <c>~/.claude/.credentials.json</c> are
+    /// pushed into the VM's <c>~/.claude/.credentials.json</c> so the in-VM
+    /// CLI does not 401 on its next Anthropic call. Disposing the registration
+    /// (handled automatically by the <c>using</c> wrapper) removes the sandbox
+    /// from the active set on completion of the run.
+    /// </summary>
+    public ClaudeAgentRunner(IClaudeTokenRotationPusher? rotationPusher)
+    {
+        _rotationPusher = rotationPusher;
+    }
+
     public override AgentKind Kind => AgentKind.Claude;
 
     /// <summary>
@@ -118,6 +136,12 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
+        // Register the sandbox so a host-side credential rotation while this
+        // iteration is running pushes the fresh access_token into the VM
+        // before its next Anthropic call goes 401. Unregistration is deferred
+        // until the run completes (success or failure path).
+        using var _ = _rotationPusher?.RegisterActiveSandbox(sandbox);
+
         var structuredStreamSupported = !captureStructuredStream
             || await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
         var effectiveCaptureStructuredStream = captureStructuredStream && structuredStreamSupported;
@@ -139,6 +163,33 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         var warning = $"Warning: Claude CLI at '{Binary}' does not support --output-format stream-json --verbose; structured stream capture was disabled.";
         var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
         return result with { Stderr = stderr };
+    }
+
+    public override async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        // Same rationale as RunAsync — the resumed iteration runs the CLI in
+        // the same sandbox and is equally vulnerable to a mid-run host
+        // rotation invalidating its access_token.
+        using var _ = _rotationPusher?.RegisterActiveSandbox(sandbox);
+        return await base.RunResumedAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            resume,
+            modelId,
+            reasoningMode,
+            ct,
+            stdoutChunkCallback).ConfigureAwait(false);
     }
 
     protected override AgentInvocation BuildInvocation(
