@@ -1,3 +1,4 @@
+using System.Text;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
@@ -173,6 +174,33 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpTestPass_CommandSignalsInsideFailedTestBodyDoNotAddCommandError()
+    {
+        var auditor = CSharpTestPassAuditor();
+        var output = """
+              Failed JobTrack.Tests.Unit.CompilerMessageTests.ReportsDiagnosticText [80 ms]
+              Error Message:
+               Assert.Contains() Failure: expected generated text to include:
+               /work/src/Program.cs(7,13): error CS0103: The name 'missing' does not exist in the current context [/work/src/App.csproj]
+              Stack Trace:
+                 at JobTrack.Tests.Unit.CompilerMessageTests.ReportsDiagnosticText() in /work/tests/CompilerMessageTests.cs:line 42
+
+            Failed!  - Failed: 1, Passed: 98, Skipped: 0, Total: 99, Duration: 4 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Contains("JobTrack.Tests.Unit.CompilerMessageTests.ReportsDiagnosticText", finding.Title, StringComparison.Ordinal);
+        Assert.DoesNotContain("command exited 1", finding.Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_AllUnrunnableFastFailuresProducesNoErrorFindings()
     {
         var auditor = CSharpTestPassAuditor();
@@ -221,6 +249,34 @@ public sealed class AuditTests
 
         Assert.True(result.Passed);
         Assert.Empty(result.Findings);
+    }
+
+    [Fact]
+    public async Task CSharpTestPass_ReportsFastFailureWithoutUnrunnableSignal()
+    {
+        var auditor = CSharpTestPassAuditor();
+        var output = """
+              Failed JobTrack.Tests.Unit.MathTests.FastAssertion [12 ms]
+              Error Message:
+               Assert.Equal() Failure: Values differ
+               Expected: 1
+               Actual:   2
+              Stack Trace:
+
+            Failed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6, Duration: 1 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("JobTrack.Tests.Unit.MathTests.FastAssertion", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("Assert.Equal() Failure", finding.Description, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -306,6 +362,42 @@ public sealed class AuditTests
         Assert.Contains("Assert.Equal() Failure", finding.Description, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task CSharpTestPass_CapsReportedFailuresAndAggregatesOverflow()
+    {
+        var auditor = CSharpTestPassAuditor();
+        var output = BuildRepeatedDotnetFailureOutput(60);
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.Equal(50, result.Findings.Count(f => f.Title.StartsWith("test failed:", StringComparison.Ordinal)));
+        Assert.Contains(result.Findings, f => f.Title.Contains("additional dotnet test failures omitted: 10", StringComparison.Ordinal));
+        Assert.DoesNotContain(result.Findings, f => f.Title.Contains("JobTrack.Tests.Unit.GeneratedTests.Case059", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CSharpTestPass_CapsParsedFailureBlocksAndReportsSingleOverflowFinding()
+    {
+        var auditor = CSharpTestPassAuditor();
+        var output = BuildRepeatedDotnetFailureOutput(1_100);
+        var sandbox = new FakeSandbox(exec =>
+            IsToolProbe(exec)
+                ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
+                : new SandboxExecResult(1, output, ""));
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.Equal(50, result.Findings.Count(f => f.Title.StartsWith("test failed:", StringComparison.Ordinal)));
+        Assert.Contains(result.Findings, f => f.Title.Contains("additional dotnet test failures omitted", StringComparison.Ordinal));
+        Assert.Contains(result.Findings, f => f.Title.Contains("too many failed-test blocks", StringComparison.Ordinal));
+    }
+
     private static ShellCommandAuditor CSharpTestPassAuditor() =>
         new(new ShellCommandAuditorOptions
         {
@@ -322,6 +414,25 @@ public sealed class AuditTests
         exec.Argv[0] == "sh" &&
         exec.Argv[1] == "-c" &&
         exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
+
+    private static string BuildRepeatedDotnetFailureOutput(int count)
+    {
+        var output = new StringBuilder();
+        for (var i = 0; i < count; i++)
+        {
+            output.AppendLine($"      Failed JobTrack.Tests.Unit.GeneratedTests.Case{i:000} [80 ms]");
+            output.AppendLine("      Error Message:");
+            output.AppendLine("       Assert.Equal() Failure: Values differ");
+            output.AppendLine("       Expected: 1");
+            output.AppendLine("       Actual:   2");
+            output.AppendLine("      Stack Trace:");
+            output.AppendLine($"         at JobTrack.Tests.Unit.GeneratedTests.Case{i:000}() in /work/tests/GeneratedTests.cs:line {i + 1}");
+            output.AppendLine();
+        }
+
+        output.AppendLine($"Failed!  - Failed: {count}, Passed: 0, Skipped: 0, Total: {count}, Duration: 4 s");
+        return output.ToString();
+    }
 
     private sealed class FakeAuditor : IAuditor
     {

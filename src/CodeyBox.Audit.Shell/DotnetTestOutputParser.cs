@@ -7,6 +7,8 @@ namespace CodeyBox.Audit.Shell;
 internal static class DotnetTestOutputParser
 {
     private const double UnrunnableFailureThresholdMs = 50;
+    private const int MaxParsedFailureHeaders = 1_024;
+    private const int MaxReportedFailureFindings = 50;
     private const int MaxFailureBodyChars = 4_000;
     private static readonly Regex FailedTestHeaderRegex = new(
         @"^\s*Failed\s+(?<name>.+?)\s+\[(?<duration>[^\]\r\n]+)\]\s*$",
@@ -20,53 +22,78 @@ internal static class DotnetTestOutputParser
         @"^\s*(?:.+(?:\)|:)\s*)?error\s+(?:CS|MSB|NETSDK|NU)\d+\b|^\s*Build FAILED\.|^\s*The argument .+ is invalid\.|^\s*The active test run was aborted\b|^\s*Testhost process\b.*\b(?:crashed|failed|error)\b",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Multiline,
         TimeSpan.FromSeconds(1));
+    private static readonly Regex UnrunnableFailureSignalRegex = new(
+        @"\b(?:Microsoft\.Playwright\.PlaywrightException|Browser executable (?:was )?not found|Playwright\b.*\b(?:install|driver|browser)|unable to launch|failed to launch|connection refused|no connection could be made|ECONNREFUSED|missing (?:host|dependency|dependencies)|required (?:host|dependency|dependencies)\b.*\bnot (?:found|available))\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Singleline,
+        TimeSpan.FromSeconds(1));
 
     public static DotnetTestOutputParseResult Parse(string auditorName, string output)
     {
         if (string.IsNullOrWhiteSpace(output))
             return new DotnetTestOutputParseResult([], 0, false);
 
-        var matches = FailedTestHeaderRegex.Matches(output);
-        if (matches.Count == 0)
+        var match = FailedTestHeaderRegex.Match(output);
+        if (!match.Success)
             return new DotnetTestOutputParseResult([], 0, false);
 
         var findings = new List<AuditFinding>();
         var failureBodyRanges = new List<(int Start, int End)>();
+        var parsedFailureCount = 0;
+        var omittedReportedFailureCount = 0;
 
-        for (var i = 0; i < matches.Count; i++)
+        while (match.Success && parsedFailureCount < MaxParsedFailureHeaders)
         {
-            var match = matches[i];
+            var nextMatch = match.NextMatch();
+            parsedFailureCount++;
             var testName = match.Groups["name"].Value.Trim();
             var durationText = match.Groups["duration"].Value.Trim();
             var bodyStart = match.Index + match.Length;
-            var bodyEnd = i + 1 < matches.Count
-                ? matches[i + 1].Index
+            var bodyEnd = nextMatch.Success
+                ? nextMatch.Index
                 : output.Length;
             bodyEnd = FindFailureBodyEnd(output, bodyStart, bodyEnd);
             failureBodyRanges.Add((bodyStart, bodyEnd));
-            var body = output[bodyStart..bodyEnd].Trim();
+            var body = ExtractBodySnippet(output, bodyStart, bodyEnd);
             var durationMs = TryParseDurationMilliseconds(durationText);
             var stackTrace = ExtractStackTrace(body);
 
-            if (IsUnrunnableFailure(durationMs, stackTrace))
+            if (IsUnrunnableFailure(durationMs, stackTrace, body))
+            {
+                match = nextMatch;
                 continue;
+            }
 
-            findings.Add(new AuditFinding(
-                AuditorName: auditorName,
-                Severity: AuditSeverity.Error,
-                Title: $"test failed: {testName}",
-                Description: BuildDescription(durationText, body)));
+            if (findings.Count < MaxReportedFailureFindings)
+            {
+                findings.Add(new AuditFinding(
+                    AuditorName: auditorName,
+                    Severity: AuditSeverity.Error,
+                    Title: $"test failed: {testName}",
+                    Description: BuildDescription(durationText, body)));
+            }
+            else
+            {
+                omittedReportedFailureCount++;
+            }
+
+            match = nextMatch;
         }
+
+        if (omittedReportedFailureCount > 0)
+            findings.Add(BuildOmittedFailureFinding(auditorName, omittedReportedFailureCount));
+
+        if (match.Success)
+            findings.Add(BuildUnparsedFailureOverflowFinding(auditorName));
 
         return new DotnetTestOutputParseResult(
             findings,
-            matches.Count,
+            parsedFailureCount,
             HasCommandFailureSignalOutsideRanges(output, failureBodyRanges));
     }
 
     private static int FindFailureBodyEnd(string output, int bodyStart, int defaultEnd)
     {
-        var postBody = PostFailureBodyRegex.Match(output, bodyStart);
+        var postBody = PostFailureBodyRegex.Match(output, bodyStart, Math.Max(0, defaultEnd - bodyStart));
         return postBody.Success && postBody.Index < defaultEnd
             ? postBody.Index
             : defaultEnd;
@@ -98,10 +125,18 @@ internal static class DotnetTestOutputParser
         return false;
     }
 
-    private static bool IsUnrunnableFailure(double? durationMs, string stackTrace)
+    private static bool IsUnrunnableFailure(double? durationMs, string stackTrace, string body)
         => durationMs is not null
            && durationMs.Value < UnrunnableFailureThresholdMs
-           && string.IsNullOrWhiteSpace(stackTrace);
+           && string.IsNullOrWhiteSpace(stackTrace)
+           && UnrunnableFailureSignalRegex.IsMatch(body);
+
+    private static string ExtractBodySnippet(string output, int bodyStart, int bodyEnd)
+    {
+        var bodyLength = Math.Max(0, bodyEnd - bodyStart);
+        var snippetLength = Math.Min(bodyLength, MaxFailureBodyChars);
+        return output.Substring(bodyStart, snippetLength).Trim();
+    }
 
     private static string BuildDescription(string durationText, string body)
     {
@@ -111,6 +146,20 @@ internal static class DotnetTestOutputParser
 
         return $"The test failed after {durationText}.\n\n{details}";
     }
+
+    private static AuditFinding BuildOmittedFailureFinding(string auditorName, int omittedCount)
+        => new(
+            AuditorName: auditorName,
+            Severity: AuditSeverity.Error,
+            Title: $"additional dotnet test failures omitted: {omittedCount}",
+            Description: $"Only the first {MaxReportedFailureFindings} real test failures are reported individually to keep audit output bounded. Fix the reported failures, then rerun the auditor to surface any remaining failures.");
+
+    private static AuditFinding BuildUnparsedFailureOverflowFinding(string auditorName)
+        => new(
+            AuditorName: auditorName,
+            Severity: AuditSeverity.Error,
+            Title: "dotnet test output had too many failed-test blocks to classify safely",
+            Description: $"The parser inspected the first {MaxParsedFailureHeaders} failed-test blocks and stopped before enumerating the rest. Reduce the failing test volume or fix the reported failures, then rerun the auditor.");
 
     private static string ExtractStackTrace(string body)
     {
