@@ -471,13 +471,20 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task DisposeAsync_DeleteFailureThrowsAndDoesNotMarkSandboxDisposed()
+    public async Task DisposeAsync_DeleteFailureUntracksActiveSandboxAndAllowsRetry()
     {
         var disposedNames = new List<string>();
+        var noLongerActiveNames = new List<string>();
+        var deleteCalls = 0;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             if (argv is [_, "delete", "--purge", "codeybox-deletefail"])
-                return Task.FromResult(new RunResult(17, "", "still running"));
+            {
+                deleteCalls++;
+                return Task.FromResult(deleteCalls == 1
+                    ? new RunResult(17, "", "still running")
+                    : new RunResult(0, "", ""));
+            }
 
             return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
@@ -488,13 +495,21 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             new MultipassSandboxOptions { MultipassBinary = "/bin/false" },
             NullLogger<MultipassSandboxProvider>.Instance,
             onDisposed: disposedNames.Add,
+            onNoLongerTrackedActive: noLongerActiveNames.Add,
             runner: runner,
             daemonRetryPolicy: InstantDaemonRetryPolicy());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await sandbox.DisposeAsync());
 
         Assert.Contains("multipass delete --purge codeybox-deletefail failed", ex.Message);
+        Assert.Equal(1, deleteCalls);
         Assert.Empty(disposedNames);
+        Assert.Equal(["codeybox-deletefail"], noLongerActiveNames);
+
+        await sandbox.DisposeAsync();
+
+        Assert.Equal(2, deleteCalls);
+        Assert.Equal(["codeybox-deletefail"], disposedNames);
     }
 
     [Fact]

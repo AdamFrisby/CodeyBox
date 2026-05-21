@@ -57,10 +57,11 @@ public interface ISandboxProvider
 /// <param name="CreatedAt">Best-effort creation timestamp; null if not derivable.</param>
 /// <param name="DiskBytes">Reported disk usage; null if not available.</param>
 /// <param name="IsTrackedActive">
-/// True when this sandbox was created by the current orchestrator process
-/// and has not yet been disposed. False means the sandbox exists on the
-/// host but the current process has no record of creating it — the primary
-/// indicator of a leak.
+/// True when this sandbox is still owned by a currently-running phase in the
+/// current orchestrator process. False means the sandbox exists on the host
+/// but no live phase owns it; that includes sandboxes from prior processes and
+/// sandboxes whose normal phase disposal failed and should be retried by the
+/// leak reaper.
 /// </param>
 /// <param name="HasPreemptMarker">
 /// True when the sandbox root carries the graceful-shutdown preempt marker.

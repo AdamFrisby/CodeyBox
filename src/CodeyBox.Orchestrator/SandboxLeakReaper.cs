@@ -14,11 +14,12 @@ namespace CodeyBox.Orchestrator;
 /// <para><b>What counts as a leak:</b> a sandbox whose name starts with
 /// <c>codeybox-*</c>, that is not in the current process's in-memory active set
 /// (meaning the current orchestrator did not create it, or the creating instance
-/// crashed before calling DisposeAsync), and whose creation timestamp is either
-/// older than <see cref="SandboxLeakOptions.LeakAgeThreshold"/> or missing
-/// because staging metadata was deleted. The age threshold guards against
-/// mistaking a sandbox that is mid-way through work-phase clone — typically less
-/// than 30 minutes — for a genuine leak.</para>
+/// crashed before calling DisposeAsync, or normal phase disposal failed and
+/// released active ownership), and whose creation timestamp is either older than
+/// <see cref="SandboxLeakOptions.LeakAgeThreshold"/> or missing because staging
+/// metadata was deleted. The age threshold guards against mistaking a sandbox
+/// that is mid-way through work-phase clone — typically less than 30 minutes —
+/// for a genuine leak.</para>
 ///
 /// <para><b>Auto-dispose:</b> on by default. Operators can set
 /// <see cref="SandboxLeakOptions.AutoDispose"/> to false for detection-only

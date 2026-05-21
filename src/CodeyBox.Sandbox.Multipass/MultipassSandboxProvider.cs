@@ -66,7 +66,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private readonly Dictionary<string, SemaphoreSlim> _baselineLocks = new();
     private readonly object _baselineLocksGuard = new();
 
-    // Tracks sandboxes created by the current process that haven't been disposed.
+    // Tracks sandboxes still owned by a currently-running phase in this process.
     // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
     private readonly ConcurrentDictionary<string, bool> _activeSandboxNames = new(StringComparer.Ordinal);
 
@@ -257,8 +257,15 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // Invalidate the list cache so the next ListAllManagedAsync call reflects
             // the newly created sandbox immediately rather than serving stale data.
             _listCacheExpiry = DateTimeOffset.MinValue;
+            void MarkNoLongerActive(string n)
+            {
+                _activeSandboxNames.TryRemove(n, out _);
+                _listCacheExpiry = DateTimeOffset.MinValue;
+            }
+
             return new MultipassSandbox(name, sandboxRoot, spec, opts, _log, timingStore, timingItemId, timingPhase,
-                onDisposed: n => { _activeSandboxNames.TryRemove(n, out _); _listCacheExpiry = DateTimeOffset.MinValue; },
+                onDisposed: MarkNoLongerActive,
+                onNoLongerTrackedActive: MarkNoLongerActive,
                 runner: _runner,
                 daemonRetryPolicy: _daemonRetryPolicy);
         }
@@ -1993,6 +2000,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     private readonly WorkItemId? _workItemId;
     private readonly string _timingPhase;
     private readonly Action<string>? _onDisposed;
+    private readonly Action<string>? _onNoLongerTrackedActive;
     private readonly int _maxScreenshotPngBytes;
     private readonly int _maxScreenshotBase64StdoutBytes;
     private readonly int _maxScreenshotStderrBytes;
@@ -2002,7 +2010,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
-        Action<string>? onDisposed = null, IProcessRunner? runner = null,
+        Action<string>? onDisposed = null, Action<string>? onNoLongerTrackedActive = null, IProcessRunner? runner = null,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         int? maxScreenshotPngBytes = null, int? maxScreenshotStderrBytes = null)
     {
@@ -2018,6 +2026,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         _workItemId = timingItemId.Value == Guid.Empty ? null : timingItemId;
         _timingPhase = timingPhase;
         _onDisposed = onDisposed;
+        _onNoLongerTrackedActive = onNoLongerTrackedActive;
         _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
         _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
         if (_maxScreenshotPngBytes <= 0)
@@ -2404,6 +2413,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to delete multipass VM {Name}", _name);
+            _onNoLongerTrackedActive?.Invoke(_name);
             throw;
         }
         _disposed = true;
