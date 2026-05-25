@@ -691,6 +691,86 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_ReconcilesParsedSummaryThroughCostStoreInterface()
+    {
+        var item = CreateItem(WorkItemState.Done);
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl", """
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"a"}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:01Z","tool_use_id":"t1","content":"ok"}
+            {"type":"result","timestamp":"2026-01-01T00:00:02Z","result":"done","total_cost_usd":0.75,"usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":3}}
+            """);
+        var costs = new CapturingWorkItemCostStore();
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var reconciliation = Assert.Single(costs.Reconciliations);
+        Assert.Equal(item.Id, reconciliation.WorkItemId);
+        Assert.Equal("work-1-abcdef.jsonl", reconciliation.FileName);
+        Assert.Equal("work", reconciliation.Phase);
+        Assert.Equal(1, reconciliation.Iteration);
+        Assert.Equal(AgentKind.Claude, reconciliation.AgentKind);
+        Assert.Equal(10, reconciliation.InputTokens);
+        Assert.Equal(3, reconciliation.CachedInputTokens);
+        Assert.Equal(2, reconciliation.OutputTokens);
+        Assert.Equal(0.75m, reconciliation.EstimatedUsd);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_ReconcilesCachedSummaryThroughCostStoreInterface()
+    {
+        var item = CreateItem(WorkItemState.Done);
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl", """
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"cached"}}
+            """);
+        var summarisedAt = DateTimeOffset.Parse("2026-01-01T00:00:03Z");
+        await _summaries.UpsertAsync(new AgentStreamSummaryRow(
+            item.Id,
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Claude,
+            new AgentStreamSummary(
+                TotalDuration: TimeSpan.FromSeconds(2),
+                TimeToFirstToken: TimeSpan.FromMilliseconds(500),
+                InputTokens: 10,
+                OutputTokens: 2,
+                CachedInputTokens: 3,
+                EstimatedUsd: 0.75m,
+                ToolCalls: [],
+                Stalls: [],
+                FinalAssistantMessage: "done"),
+            summarisedAt));
+        var costs = new CapturingWorkItemCostStore();
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ThrowingAgentStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(0, count);
+        var reconciliation = Assert.Single(costs.Reconciliations);
+        Assert.Equal(item.Id, reconciliation.WorkItemId);
+        Assert.Equal("work-1-abcdef.jsonl", reconciliation.FileName);
+        Assert.Equal("work", reconciliation.Phase);
+        Assert.Equal(1, reconciliation.Iteration);
+        Assert.Equal(AgentKind.Claude, reconciliation.AgentKind);
+        Assert.Equal(10, reconciliation.InputTokens);
+        Assert.Equal(3, reconciliation.CachedInputTokens);
+        Assert.Equal(2, reconciliation.OutputTokens);
+        Assert.Equal(0.75m, reconciliation.EstimatedUsd);
+        Assert.Equal(TimeSpan.FromSeconds(2), reconciliation.TotalDuration);
+        Assert.Equal(summarisedAt, reconciliation.SummarisedAt);
+    }
+
+    [Fact]
     public async Task AnalyzeRecentTerminalWorkItemsAsync_ProjectsTiminglessCodexSummaryFromCostWindow()
     {
         var item = CreateItem(WorkItemState.Done);
@@ -961,6 +1041,56 @@ public sealed class ThrowingAgentStreamParser : IAgentStreamParser
 
     public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
         throw new InvalidOperationException("stream parser failed");
+}
+
+internal sealed class CapturingWorkItemCostStore : IWorkItemCostStore
+{
+    public List<WorkItemCostReconciliation> Reconciliations { get; } = [];
+
+    public Task RecordAsync(WorkItemCost cost, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<IReadOnlyList<WorkItemCost>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
+
+    public Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
+        string projectId,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
+
+    public Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+        string projectId,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        string? agentKind,
+        string? modelId,
+        int maxItems,
+        CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
+
+    public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string ProjectId, double TotalUsd)>>([]);
+
+    public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ReconcileFromAgentStreamSummaryAsync(
+        WorkItemCostReconciliation reconciliation,
+        CancellationToken ct = default)
+    {
+        Reconciliations.Add(reconciliation);
+        return Task.CompletedTask;
+    }
+
+    public Task<decimal> SumEstimatedUsdAsync(
+        string projectId,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken ct = default) =>
+        Task.FromResult(0m);
 }
 
 public sealed class AggregateEndpointTests : IClassFixture<AgentStreamAnalysisApiFactory>

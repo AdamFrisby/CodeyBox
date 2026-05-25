@@ -353,6 +353,16 @@ public sealed class ProjectRepositoryTests
         Assert.False(fullPage.HasMore);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task ListPageAsync_RejectsNonPositiveLimit(int limit)
+    {
+        var repo = new ProjectRepository(Options.Create(new ProjectsOptions()));
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => repo.ListPageAsync(limit));
+    }
+
     [Fact]
     public void InvalidMergeMethod_ThrowsAtStartup()
     {
