@@ -110,7 +110,7 @@ public sealed class AgentClassRouterTests : IDisposable
 
         Assert.Equal(AgentKind.Codex, decision.Chosen!.Agent);
         Assert.Equal(AgentBilling.PayPerApi, decision.Chosen.Billing);
-        Assert.Contains("100.0% available", decision.Reason);
+        Assert.Contains("pay-per-api member is never quota-gated", decision.Reason);
     }
 
     [Fact]

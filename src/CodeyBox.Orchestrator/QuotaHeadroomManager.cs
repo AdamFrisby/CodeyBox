@@ -69,7 +69,7 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
     {
         _headroomEstimator = headroomEstimator;
         _probesByKind = probes
-            .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
+            .Where(p => p.SupportsHeadroom)
             .ToDictionary(p => p.Kind);
         _opts = opts;
         _log = log ?? NullLogger<InProcessQuotaHeadroomManager>.Instance;
@@ -121,14 +121,15 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
         {
             _log.LogWarning(
                 ex,
-                "Quota headroom estimation failed for project {ProjectId} agent {Agent} model {Model}; dispatch will use the base quota gate only",
+                "Quota headroom estimation failed for project {ProjectId} agent {Agent} model {Model}; refusing dispatch as a fail-closed safety measure",
                 request.ProjectId.Value,
                 member.Agent.Value,
                 member.ModelId ?? "(default)");
             return new QuotaHeadroomGateResult(
-                true,
+                false,
                 "headroom estimation unavailable",
                 request.ResetAt,
+                InsufficientHeadroom: true,
                 ReservedPct: reservedPct,
                 ProjectedAvailablePct: request.AvailablePct - reservedPct);
         }
@@ -143,6 +144,17 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
                 Estimate: estimate,
                 ReservedPct: reservedPct,
                 ProjectedAvailablePct: request.AvailablePct - reservedPct);
+        }
+
+        if (!estimate!.TrustedForEnforcement)
+        {
+            return new QuotaHeadroomGateResult(
+                true,
+                $"quota available (untrusted headroom estimate {cost:F1}% skipped for enforcement)",
+                request.ResetAt,
+                Estimate: estimate,
+                ReservedPct: reservedPct,
+                ProjectedAvailablePct: request.AvailablePct - reservedPct - cost);
         }
 
         var minRemainingPct = Math.Max(0, request.MinRemainingPct ?? 0);

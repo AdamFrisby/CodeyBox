@@ -226,9 +226,6 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
         return totalTokens > 0 && totalTokens <= maxTokensPerRow;
     }
 
-    internal static bool IsTrustedHeadroomRow(WorkItemCost row) =>
-        ClassifyHeadroomRow(row) == HeadroomRowTrust.Trusted;
-
     private static HeadroomRowTrust ClassifyHeadroomRow(WorkItemCost row)
     {
         if (string.IsNullOrWhiteSpace(row.RawMetadataJson))

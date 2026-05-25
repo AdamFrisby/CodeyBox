@@ -81,7 +81,15 @@ public sealed class AgentClassRouter : IQuotaResetResolver
     /// quota probe, preserving legacy behaviour exactly.
     /// </summary>
     public async Task<AgentRoutingDecision> ResolveAsync(
-        WorkItem item, Project? project, CancellationToken ct)
+        WorkItem item, Project? project, CancellationToken ct) =>
+        await ResolveAsync(item, project, reserve: false, ct);
+
+    /// <summary>
+    /// Resolves the agent to use for <paramref name="item"/>, optionally
+    /// reserving quota headroom via <see cref="IQuotaHeadroomManager.TryReserveAsync"/>.
+    /// </summary>
+    public async Task<AgentRoutingDecision> ResolveAsync(
+        WorkItem item, Project? project, bool reserve, CancellationToken ct)
     {
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null)
@@ -192,7 +200,7 @@ public sealed class AgentClassRouter : IQuotaResetResolver
 
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
-            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, quota.ResetAt, ct);
+            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, quota.ResetAt, reserve, ct);
             if (gate.Allow)
             {
                 // Mark all remaining sorted entries as "ranked lower" for the audit event.
@@ -216,10 +224,8 @@ public sealed class AgentClassRouter : IQuotaResetResolver
                 return new AgentRoutingDecision
                 {
                     Chosen = member,
-                    Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {quota.AvailablePct:F1}% available",
-                    ChosenAvailablePct = quota.AvailablePct,
-                    ChosenQuotaResetAt = quota.ResetAt,
-                    ChosenMinQuotaPct = _opts.MinQuotaPct,
+                    Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {gate.Reason}",
+                    Reservation = gate.Reservation,
                 };
             }
 
@@ -444,6 +450,7 @@ public sealed class AgentClassRouter : IQuotaResetResolver
         ProjectId projectId,
         double availablePct,
         DateTimeOffset? resetAt,
+        bool reserve,
         CancellationToken ct)
     {
         if (member.Billing == AgentBilling.PayPerApi)
@@ -456,21 +463,25 @@ public sealed class AgentClassRouter : IQuotaResetResolver
                 return new QuotaGateDecision(false, "quota exhausted", resetAt);
 
             if (_headroomManager is null)
-                return new QuotaGateDecision(true, "quota available", resetAt);
+                return new QuotaGateDecision(true, $"{availablePct:F1}% available", resetAt);
 
-            var result = await _headroomManager.EvaluateAsync(
-                new QuotaHeadroomGateRequest(
-                    projectId,
-                    member,
-                    availablePct,
-                    resetAt,
-                    MinRemainingPct: _opts.MinQuotaPct),
-                ct);
+            var request = new QuotaHeadroomGateRequest(
+                projectId,
+                member,
+                availablePct,
+                resetAt,
+                MinRemainingPct: _opts.MinQuotaPct);
+
+            var result = await (reserve
+                ? _headroomManager.TryReserveAsync(request, ct)
+                : _headroomManager.EvaluateAsync(request, ct));
+
             return new QuotaGateDecision(
                 result.Allow,
                 result.Reason,
                 result.RetryAt,
-                result.InsufficientHeadroom);
+                result.InsufficientHeadroom,
+                result.Reservation);
         }
 
         if (reservedPct > 0)
@@ -573,7 +584,8 @@ public sealed class AgentClassRouter : IQuotaResetResolver
         bool Allow,
         string Reason,
         DateTimeOffset? RetryAt,
-        bool InsufficientHeadroom = false);
+        bool InsufficientHeadroom = false,
+        IQuotaReservationLease? Reservation = null);
 }
 
 public sealed record EffectiveQuota(double AvailablePct, DateTimeOffset? ResetAt, string? Window);
@@ -614,14 +626,11 @@ public sealed record AgentRoutingDecision
     /// </summary>
     public bool ShouldWait { get; init; }
 
-    /// <summary>Quota availability observed for <see cref="Chosen"/> at route time.</summary>
-    public double? ChosenAvailablePct { get; init; }
-
-    /// <summary>Quota reset observed for <see cref="Chosen"/> at route time.</summary>
-    public DateTimeOffset? ChosenQuotaResetAt { get; init; }
-
-    /// <summary>Minimum remaining quota percentage used for route-time gating.</summary>
-    public double? ChosenMinQuotaPct { get; init; }
+    /// <summary>
+    /// Optional quota reservation lease acquired during routing. The caller
+    /// must release this lease when the work item finishes or is cancelled.
+    /// </summary>
+    public IQuotaReservationLease? Reservation { get; init; }
 
     /// <summary>Suggested delay before re-attempting pickup.</summary>
     public TimeSpan SuggestedRecheckIn { get; init; }
@@ -720,6 +729,8 @@ public sealed class PayPerApiQuotaProbe : IAgentQuotaProbe
 {
     public AgentKind Kind => new("pay-per-api");
 
+    public bool SupportsHeadroom => false;
+
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
         => Task.FromResult(new AgentQuotaSnapshot
         {
@@ -736,6 +747,8 @@ public sealed class PayPerApiQuotaProbe : IAgentQuotaProbe
 public sealed class NullQuotaProbe : IAgentQuotaProbe
 {
     public AgentKind Kind => new("null");
+
+    public bool SupportsHeadroom => false;
 
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
         => Task.FromResult(new AgentQuotaSnapshot

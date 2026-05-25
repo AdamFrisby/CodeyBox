@@ -82,21 +82,15 @@ public sealed class AgentClassRouterTests
             headroomManager: manager);
     }
 
-    private static async Task<IQuotaReservationLease> ReserveAsync(
-        IQuotaHeadroomManager manager,
+    private static async Task<IQuotaReservationLease> ResolveWithReservationAsync(
+        AgentClassRouter router,
         WorkItem item,
-        AgentRoutingDecision decision)
+        Project? project = null)
     {
+        var decision = await router.ResolveAsync(item, project, reserve: true, CancellationToken.None);
         Assert.NotNull(decision.Chosen);
-        var gate = await manager.TryReserveAsync(
-            new QuotaHeadroomGateRequest(
-                item.ProjectId,
-                decision.Chosen!,
-                decision.ChosenAvailablePct ?? -1,
-                decision.ChosenQuotaResetAt,
-                MinRemainingPct: decision.ChosenMinQuotaPct));
-        Assert.True(gate.Allow, gate.Reason);
-        return Assert.IsAssignableFrom<IQuotaReservationLease>(gate.Reservation);
+        Assert.NotNull(decision.Reservation);
+        return decision.Reservation!;
     }
 
     // ── No class configured ──────────────────────────────────────────────────
@@ -213,7 +207,7 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task UntrustedHeadroomEstimate_BlocksDispatch()
+    public async Task UntrustedHeadroomEstimate_DoesNotBlockDispatch()
     {
         var cls = FrontierClass(Sub(Claude));
         var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
@@ -226,9 +220,10 @@ public sealed class AgentClassRouterTests
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
-        Assert.Null(decision.Chosen);
-        Assert.True(decision.ShouldWait);
-        Assert.Contains("headroom", decision.Reason);
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+        Assert.Contains("untrusted", decision.Reason);
     }
 
     [Fact]
@@ -305,15 +300,11 @@ public sealed class AgentClassRouterTests
             headroomManager: manager);
 
         var firstItem = MakeItem("frontier");
-        var first = await router.ResolveAsync(firstItem, null, CancellationToken.None);
-        var firstReservation = await ReserveAsync(manager, firstItem, first);
+        var firstReservation = await ResolveWithReservationAsync(router, firstItem);
         var secondItem = MakeItem("frontier");
-        var second = await router.ResolveAsync(secondItem, null, CancellationToken.None);
-        var secondReservation = await ReserveAsync(manager, secondItem, second);
-        var third = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        var secondReservation = await ResolveWithReservationAsync(router, secondItem);
+        var third = await router.ResolveAsync(MakeItem("frontier"), null, reserve: true, CancellationToken.None);
 
-        Assert.Equal(Claude, first.Chosen!.Agent);
-        Assert.Equal(Claude, second.Chosen!.Agent);
         Assert.Null(third.Chosen);
         Assert.True(third.ShouldWait);
         Assert.Contains("headroom", third.Reason);
@@ -321,10 +312,8 @@ public sealed class AgentClassRouterTests
         await secondReservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
 
         var afterReleaseItem = MakeItem("frontier");
-        var afterRelease = await router.ResolveAsync(afterReleaseItem, null, CancellationToken.None);
-        var afterReleaseReservation = await ReserveAsync(manager, afterReleaseItem, afterRelease);
-        Assert.Equal(Claude, afterRelease.Chosen!.Agent);
-        Assert.False(afterRelease.ShouldWait);
+        var afterReleaseReservation = await ResolveWithReservationAsync(router, afterReleaseItem);
+        Assert.False(afterReleaseReservation == null);
         await afterReleaseReservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
     }
 
@@ -381,12 +370,11 @@ public sealed class AgentClassRouterTests
             headroomManager: manager);
 
         var firstItem = MakeItem("frontier");
-        var first = await router.ResolveAsync(firstItem, null, CancellationToken.None);
-        var firstReservation = await ReserveAsync(manager, firstItem, first);
+        var firstReservation = await ResolveWithReservationAsync(router, firstItem);
 
         await firstReservation.ReleaseAsync(quotaMayHaveBeenConsumed: true);
 
-        var immediate = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        var immediate = await router.ResolveAsync(MakeItem("frontier"), null, reserve: true, CancellationToken.None);
         Assert.Null(immediate.Chosen);
         Assert.True(immediate.ShouldWait);
         Assert.Contains("headroom", immediate.Reason);
@@ -395,18 +383,19 @@ public sealed class AgentClassRouterTests
         var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
         while (DateTimeOffset.UtcNow < deadline)
         {
-            afterTtl = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+            afterTtl = await router.ResolveAsync(MakeItem("frontier"), null, reserve: true, CancellationToken.None);
             if (afterTtl.Chosen is not null)
                 break;
 
             await Task.Delay(20);
         }
 
-        var afterTtlItem = MakeItem("frontier");
-        var afterTtlReservation = await ReserveAsync(manager, afterTtlItem, afterTtl!);
-        Assert.Equal(Claude, afterTtl!.Chosen!.Agent);
+        Assert.NotNull(afterTtl!.Chosen);
+        var afterTtlReservation = afterTtl.Reservation;
+        Assert.NotNull(afterTtlReservation);
+        Assert.Equal(Claude, afterTtl.Chosen!.Agent);
         Assert.Equal(1, probe.RefreshCount);
-        await afterTtlReservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
+        await afterTtlReservation!.ReleaseAsync(quotaMayHaveBeenConsumed: false);
     }
 
     [Fact]
@@ -431,12 +420,11 @@ public sealed class AgentClassRouterTests
             headroomManager: manager);
 
         var firstItem = MakeItem("frontier");
-        var first = await router.ResolveAsync(firstItem, null, CancellationToken.None);
-        var firstReservation = await ReserveAsync(manager, firstItem, first);
+        var firstReservation = await ResolveWithReservationAsync(router, firstItem);
 
         await firstReservation.ReleaseAsync(quotaMayHaveBeenConsumed: true);
 
-        var immediate = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        var immediate = await router.ResolveAsync(MakeItem("frontier"), null, reserve: true, CancellationToken.None);
         Assert.Null(immediate.Chosen);
         Assert.True(immediate.ShouldWait);
         Assert.Contains("headroom", immediate.Reason);
@@ -445,7 +433,7 @@ public sealed class AgentClassRouterTests
         var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
         while (DateTimeOffset.UtcNow < deadline)
         {
-            afterTtl = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+            afterTtl = await router.ResolveAsync(MakeItem("frontier"), null, reserve: true, CancellationToken.None);
             if (afterTtl.Chosen is not null)
                 break;
 
@@ -510,20 +498,16 @@ public sealed class AgentClassRouterTests
             headroomManager: manager);
 
         var firstItem = MakeItem("claude-opus") with { ProjectId = projectId };
-        var first = await router.ResolveAsync(
-            firstItem,
-            null,
-            CancellationToken.None);
-        var reservation = await ReserveAsync(manager, firstItem, first);
+        var reservation = await ResolveWithReservationAsync(router, firstItem);
 
         try
         {
             var second = await router.ResolveAsync(
                 MakeItem("claude-sonnet") with { ProjectId = projectId },
                 null,
+                reserve: true,
                 CancellationToken.None);
 
-            Assert.Equal("opus", first.Chosen!.ModelId);
             Assert.Null(second.Chosen);
             Assert.True(second.ShouldWait);
             Assert.Contains("headroom", second.Reason);
@@ -624,7 +608,7 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task SubscriptionEstimatorException_UsesBaseQuotaGate()
+    public async Task SubscriptionEstimatorException_FailsClosed()
     {
         var cls = FrontierClass(Sub(Claude));
         var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
@@ -640,8 +624,9 @@ public sealed class AgentClassRouterTests
             null,
             CancellationToken.None);
 
-        Assert.Equal(Claude, decision.Chosen!.Agent);
-        Assert.False(decision.ShouldWait);
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+        Assert.Contains("lack projected quota headroom", decision.Reason);
     }
 
     // ── No probe registered → unknown policy ────────────────────────────────

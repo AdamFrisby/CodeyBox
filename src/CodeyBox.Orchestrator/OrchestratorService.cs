@@ -717,7 +717,7 @@ public sealed class OrchestratorService : BackgroundService
             // Skipped entirely (no probe, no wait) when no agent class is configured.
             if (_router is not null)
             {
-                var decision = await _router.ResolveAsync(item, project, ct);
+                var decision = await _router.ResolveAsync(item, project, reserve: true, ct);
                 if (decision.ShouldWait)
                 {
                     CompleteQuotaRouting();
@@ -734,38 +734,7 @@ public sealed class OrchestratorService : BackgroundService
                 }
                 if (decision.Chosen is { } chosen)
                 {
-                    if (_quotaHeadroomManager is not null && chosen.Billing == AgentBilling.Subscription)
-                    {
-                        var reservationGate = await _quotaHeadroomManager.TryReserveAsync(
-                            new QuotaHeadroomGateRequest(
-                                item.ProjectId,
-                                chosen,
-                                decision.ChosenAvailablePct ?? -1,
-                                decision.ChosenQuotaResetAt,
-                                MinRemainingPct: decision.ChosenMinQuotaPct),
-                            ct);
-                        if (!reservationGate.Allow)
-                        {
-                            var retryAt = reservationGate.RetryAt
-                                ?? DateTimeOffset.UtcNow.Add(QuotaWaitParker.DefaultQuotaFailurePause);
-                            var recheckIn = retryAt > DateTimeOffset.UtcNow
-                                ? retryAt - DateTimeOffset.UtcNow
-                                : TimeSpan.Zero;
-                            CompleteQuotaRouting();
-                            AuditLog.QuotaRouterDeferred(item.Id, recheckIn);
-                            await _quotaWaitParker.ParkAsync(
-                                new QuotaWaitParkRequest(
-                                    item,
-                                    reservationGate.Reason,
-                                    QuotaRetryPhaseForDispatchState(item.State),
-                                    retryAt,
-                                    project),
-                                ct);
-                            return;
-                        }
-
-                        quotaReservation = reservationGate.Reservation;
-                    }
+                    quotaReservation = decision.Reservation;
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId, ReasoningMode = chosen.ReasoningMode };
                 }
                 else if (decision.NoEligibleMembers)

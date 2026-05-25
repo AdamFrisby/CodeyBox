@@ -166,7 +166,7 @@ public sealed class QuotaEndpointTests
         Assert.Equal(10, untrustedProjection.GetProperty("estimatedIterPctCost").GetDouble(), precision: 2);
         Assert.False(untrustedProjection.GetProperty("trustedForEnforcement").GetBoolean());
         Assert.Equal(5, untrustedProjection.GetProperty("projectedAvailablePct").GetDouble(), precision: 2);
-        Assert.False(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
+        Assert.True(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
     }
 
     [Fact]
@@ -308,5 +308,29 @@ public sealed class QuotaEndpointTests
             .EnumerateArray());
         Assert.Equal("second-project", projection.GetProperty("projectId").GetString());
         Assert.False(doc.RootElement.GetProperty("headroomProjectionTruncated").GetBoolean());
+    }
+
+    [Fact]
+    public async Task GetQuota_Returns400ForInvalidLimit()
+    {
+        using var factory = new WorkItemApiFactory();
+        var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/quota?limit=0");
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Contains("limit must be positive", doc.RootElement.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task GetQuota_Returns404ForUnknownProject()
+    {
+        using var factory = new WorkItemApiFactory();
+        var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/quota?projectId=non-existent");
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Contains("unknown project 'non-existent'", doc.RootElement.GetProperty("error").GetString());
     }
 }

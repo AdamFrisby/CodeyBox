@@ -15,6 +15,12 @@ public interface IAgentQuotaProbe
     /// <summary>The agent kind this probe covers.</summary>
     AgentKind Kind { get; }
 
+    /// <summary>
+    /// True if this probe represents a real provider quota that should be
+    /// used for headroom projection and reservation.
+    /// </summary>
+    bool SupportsHeadroom => true;
+
     /// <summary>Returns a quota snapshot, possibly from an in-process cache.</summary>
     Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct);
 
