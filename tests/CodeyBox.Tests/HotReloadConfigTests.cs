@@ -504,16 +504,19 @@ public sealed class HotReloadConfigTests
             await File.WriteAllTextAsync(path,
                 "{ \"CodeyBox\": { \"Projects\": [ { \"Id\": \"alpha\", \"RepositoryUrl\": \"https://example.com/alpha.git\" } ] } }");
 
-            var config = new ConfigurationBuilder()
-                .AddJsonFile(path, optional: false, reloadOnChange: true)
-                .Build();
+            using var trackedConfig = TestFileSystemWatcherLeakTracker.TrackReloadingConfiguration(
+                new ConfigurationBuilder()
+                    .AddJsonFile(path, optional: false, reloadOnChange: true)
+                    .Build(),
+                path);
+            var config = trackedConfig.Configuration;
 
             var services = new ServiceCollection();
             services.AddOptions<ProjectsOptions>()
                 .Bind(config.GetSection("CodeyBox"))
                 .PostConfigure(opts => ProjectsOptionsBinder.ApplyCustomMaps(opts, config.GetSection("CodeyBox")));
             services.AddSingleton<IConfiguration>(config);
-            var provider = services.BuildServiceProvider();
+            using var provider = services.BuildServiceProvider();
             var monitor = provider.GetRequiredService<IOptionsMonitor<ProjectsOptions>>();
 
             Assert.Single(monitor.CurrentValue.Projects);

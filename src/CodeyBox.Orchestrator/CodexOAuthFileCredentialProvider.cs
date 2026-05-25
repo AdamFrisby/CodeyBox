@@ -21,26 +21,37 @@ namespace CodeyBox.Orchestrator;
 /// Only handles <see cref="AgentKind.Codex"/>; returns null for others so a
 /// chained env-var provider can supply API-key based auth.
 /// </summary>
-public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
+public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider, IDisposable
 {
     private readonly CredentialFileSource _source;
     private readonly ILogger<CodexOAuthFileCredentialProvider>? _log;
+    private readonly bool _ownsSource;
+    private bool _disposed;
 
     public CodexOAuthFileCredentialProvider(
         string filePath,
         ILogger<CodexOAuthFileCredentialProvider>? log = null,
         bool watch = true)
         : this(new CredentialFileSource(
-            filePath ?? throw new ArgumentNullException(nameof(filePath)), log, watch), log)
+            filePath ?? throw new ArgumentNullException(nameof(filePath)), log, watch), log, ownsSource: true)
     {
     }
 
     public CodexOAuthFileCredentialProvider(
         CredentialFileSource source,
         ILogger<CodexOAuthFileCredentialProvider>? log = null)
+        : this(source, log, ownsSource: false)
+    {
+    }
+
+    private CodexOAuthFileCredentialProvider(
+        CredentialFileSource source,
+        ILogger<CodexOAuthFileCredentialProvider>? log,
+        bool ownsSource)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _log = log;
+        _ownsSource = ownsSource;
     }
 
     public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
@@ -86,6 +97,14 @@ public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
             };
         }
         return Task.FromResult<AgentCredential?>(credential);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (_ownsSource)
+            _source.Dispose();
     }
 
     /// <summary>

@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Sandbox.Bubblewrap;
+using CodeyBox.Tests;
 
 namespace CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -157,11 +158,8 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var watcher = new FileSystemWatcher(_workspace)
-        {
-            Filter = Path.GetFileName(readyPath),
-            EnableRaisingEvents = true,
-        };
+        using var watcher = TestFileSystemWatcherLeakTracker.CreateWatcher(_workspace, Path.GetFileName(readyPath));
+        watcher.EnableRaisingEvents = true;
         watcher.Created += (_, _) => ready.TrySetResult();
         var provider = new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions

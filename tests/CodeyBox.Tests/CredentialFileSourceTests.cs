@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Configuration;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -112,6 +113,7 @@ public sealed class CredentialFileSourceTests : IDisposable
         var source = new CredentialFileSource(path);
         try
         {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
             using var writer = new StringWriter();
             Assert.True(TestFileSystemWatcherLeakTracker.ReportLeaks(writer));
             var output = writer.ToString();
@@ -122,6 +124,53 @@ public sealed class CredentialFileSourceTests : IDisposable
         {
             source.Dispose();
         }
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void LeakTracker_PrintsWarning_WhenTrackedFileSystemWatcherIsNotDisposed()
+    {
+        var path = Path.Combine(_tempDir, "direct.txt");
+        var watcher = TestFileSystemWatcherLeakTracker.CreateWatcher(_tempDir, "direct.txt");
+        try
+        {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+            using var writer = new StringWriter();
+            Assert.True(TestFileSystemWatcherLeakTracker.ReportLeaks(writer));
+            var output = writer.ToString();
+            Assert.Contains("FileSystemWatcher", output);
+            Assert.Contains(path, output);
+        }
+        finally
+        {
+            watcher.Dispose();
+        }
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void LeakTracker_PrintsWarning_WhenReloadingConfigurationIsNotDisposed()
+    {
+        var path = WriteFile("reload-config.json", """{"CodeyBox":{"CredentialFileWatchers":false}}""");
+        var tracked = TestFileSystemWatcherLeakTracker.TrackReloadingConfiguration(
+            new ConfigurationBuilder()
+                .AddJsonFile(path, optional: false, reloadOnChange: true)
+                .Build(),
+            path);
+        try
+        {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+            using var writer = new StringWriter();
+            Assert.True(TestFileSystemWatcherLeakTracker.ReportLeaks(writer));
+            var output = writer.ToString();
+            Assert.Contains("reloadOnChange configuration", output);
+            Assert.Contains(path, output);
+        }
+        finally
+        {
+            tracked.Dispose();
+        }
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
     }
 
     [Fact]

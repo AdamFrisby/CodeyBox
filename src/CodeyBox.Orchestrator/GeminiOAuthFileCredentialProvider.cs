@@ -22,7 +22,7 @@ namespace CodeyBox.Orchestrator;
 /// Only handles <see cref="AgentKind.Gemini"/>; returns null for others so a
 /// chained env-var provider can supply API-key based auth.
 /// </summary>
-public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider
+public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider, IDisposable
 {
     public const string OAuthCredsEnvVar = "CODEYBOX_GEMINI_OAUTH_CREDS_JSON";
     public const string SettingsEnvVar = "CODEYBOX_GEMINI_SETTINGS_JSON";
@@ -30,6 +30,8 @@ public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider
     private readonly CredentialFileSource _oauthSource;
     private readonly CredentialFileSource _settingsSource;
     private readonly ILogger<GeminiOAuthFileCredentialProvider>? _log;
+    private readonly bool _ownsSources;
+    private bool _disposed;
 
     public GeminiOAuthFileCredentialProvider(
         string oauthCredsPath,
@@ -41,7 +43,8 @@ public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider
                 oauthCredsPath ?? throw new ArgumentNullException(nameof(oauthCredsPath)), log, watch),
             new CredentialFileSource(
                 settingsPath ?? throw new ArgumentNullException(nameof(settingsPath)), log, watch),
-            log)
+            log,
+            ownsSources: true)
     {
     }
 
@@ -49,10 +52,20 @@ public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider
         CredentialFileSource oauthSource,
         CredentialFileSource settingsSource,
         ILogger<GeminiOAuthFileCredentialProvider>? log = null)
+        : this(oauthSource, settingsSource, log, ownsSources: false)
+    {
+    }
+
+    private GeminiOAuthFileCredentialProvider(
+        CredentialFileSource oauthSource,
+        CredentialFileSource settingsSource,
+        ILogger<GeminiOAuthFileCredentialProvider>? log,
+        bool ownsSources)
     {
         _oauthSource = oauthSource ?? throw new ArgumentNullException(nameof(oauthSource));
         _settingsSource = settingsSource ?? throw new ArgumentNullException(nameof(settingsSource));
         _log = log;
+        _ownsSources = ownsSources;
     }
 
     public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
@@ -78,6 +91,17 @@ public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider
 
         return Task.FromResult<AgentCredential?>(
             new AgentCredential(AgentKind.Gemini, env, new Dictionary<string, string>()));
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (_ownsSources)
+        {
+            _oauthSource.Dispose();
+            _settingsSource.Dispose();
+        }
     }
 
     private const string DefaultSettingsJson = """

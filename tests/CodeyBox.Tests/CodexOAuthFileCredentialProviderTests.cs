@@ -17,13 +17,16 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
         Directory.Delete(_workspace, recursive: true);
     }
 
+    private static CodexOAuthFileCredentialProvider NewFileProvider(string path)
+        => new(path, watch: false);
+
     [Fact]
     public async Task GetAsync_ReadsCodexAuthJsonForCodex()
     {
         var authPath = Path.Combine(_workspace, "auth.json");
         var authJson = "{\"tokens\":{\"access_token\":\"test-token\"}}";
         await File.WriteAllTextAsync(authPath, authJson);
-        var provider = new CodexOAuthFileCredentialProvider(authPath);
+        var provider = NewFileProvider(authPath);
 
         var credential = await provider.GetAsync(AgentKind.Codex);
 
@@ -44,7 +47,7 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
         // file; the orchestrator threads this mount through SandboxSpec.Mounts.
         var authPath = Path.Combine(_workspace, "auth.json");
         await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"t\"}}");
-        var provider = new CodexOAuthFileCredentialProvider(authPath);
+        var provider = NewFileProvider(authPath);
 
         var credential = await provider.GetAsync(AgentKind.Codex);
 
@@ -64,7 +67,7 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
         // env-var-only mode. The CredentialMaterialiser path still works.
         var authPath = Path.Combine(_workspace, "auth.json");
         await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"t\"}}");
-        var provider = new CodexOAuthFileCredentialProvider(authPath);
+        var provider = NewFileProvider(authPath);
         var credential = await provider.GetAsync(AgentKind.Codex);
         Assert.NotNull(credential);
         // sanity: the env var path is unaffected by the new field
@@ -145,7 +148,7 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
     [Fact]
     public async Task GetAsync_WhenFileMissing_FallsThroughToNextProvider()
     {
-        var fileProvider = new CodexOAuthFileCredentialProvider(Path.Combine(_workspace, "missing.json"));
+        var fileProvider = NewFileProvider(Path.Combine(_workspace, "missing.json"));
         var envCredential = new AgentCredential(
             AgentKind.Codex,
             new Dictionary<string, string> { ["OPENAI_API_KEY"] = "env-key" },
@@ -163,7 +166,7 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
     {
         var authPath = Path.Combine(_workspace, "auth.json");
         await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"test-token\"}}");
-        var provider = new CodexOAuthFileCredentialProvider(authPath);
+        var provider = NewFileProvider(authPath);
 
         var credential = await provider.GetAsync(AgentKind.Claude);
 
@@ -184,7 +187,7 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
             await File.WriteAllTextAsync(authPath, fileAuthJson);
             var chain = new ChainedCredentialProvider([
                 new CodexAuthJsonEnvironmentCredentialProvider(envVar),
-                new CodexOAuthFileCredentialProvider(authPath),
+                NewFileProvider(authPath),
             ]);
 
             var credential = await chain.GetAsync(AgentKind.Codex);

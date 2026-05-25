@@ -47,20 +47,22 @@ namespace CodeyBox.Orchestrator;
 /// Only handles <see cref="AgentKind.Claude"/>; returns null for other agents
 /// so a chained env-var provider can supply them.
 /// </summary>
-public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
+public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider, IDisposable
 {
     public const string OAuthJsonEnvVar = "CODEYBOX_CLAUDE_OAUTH_JSON";
 
     private readonly CredentialFileSource _source;
     private readonly string _sandboxEnvVar;
     private readonly ILogger<ClaudeOAuthFileCredentialProvider>? _log;
+    private readonly bool _ownsSource;
+    private bool _disposed;
 
     public ClaudeOAuthFileCredentialProvider(
         string filePath,
         string sandboxEnvVar,
         ILogger<ClaudeOAuthFileCredentialProvider>? log = null,
         bool watch = true)
-        : this(new CredentialFileSource(filePath, log, watch), sandboxEnvVar, log)
+        : this(new CredentialFileSource(filePath, log, watch), sandboxEnvVar, log, ownsSource: true)
     {
     }
 
@@ -68,10 +70,20 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
         CredentialFileSource source,
         string sandboxEnvVar,
         ILogger<ClaudeOAuthFileCredentialProvider>? log = null)
+        : this(source, sandboxEnvVar, log, ownsSource: false)
+    {
+    }
+
+    private ClaudeOAuthFileCredentialProvider(
+        CredentialFileSource source,
+        string sandboxEnvVar,
+        ILogger<ClaudeOAuthFileCredentialProvider>? log,
+        bool ownsSource)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _sandboxEnvVar = sandboxEnvVar ?? throw new ArgumentNullException(nameof(sandboxEnvVar));
         _log = log;
+        _ownsSource = ownsSource;
     }
 
     public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
@@ -100,6 +112,14 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
             [OAuthJsonEnvVar] = sanitisedBundle,
         };
         return Task.FromResult<AgentCredential?>(new AgentCredential(AgentKind.Claude, env, new Dictionary<string, string>()));
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (_ownsSource)
+            _source.Dispose();
     }
 
     /// <summary>

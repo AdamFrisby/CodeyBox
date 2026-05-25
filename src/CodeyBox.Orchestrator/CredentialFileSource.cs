@@ -7,10 +7,11 @@ namespace CodeyBox.Orchestrator;
 /// Singleton owner of a single host-side OAuth credential file (Claude's
 /// <c>.credentials.json</c>, Codex's <c>auth.json</c>, Gemini's
 /// <c>oauth_creds.json</c>/<c>settings.json</c>). Reads the file once at
-/// startup, watches the file for changes via <see cref="FileSystemWatcher"/>,
-/// re-parses on change, and raises <see cref="TokenUpdated"/> so quota probes
-/// can invalidate their per-token caches and credential providers can hand
-/// the fresh JSON to every new sandbox.
+/// startup and, when constructed with watching enabled, watches the file for
+/// changes via <see cref="FileSystemWatcher"/>, re-parses on change, and raises
+/// <see cref="TokenUpdated"/> so quota probes can invalidate their per-token
+/// caches and credential providers can hand the fresh JSON to every new
+/// sandbox.
 ///
 /// <para>Closes the loop on out-of-band refreshes: a child sandbox or an
 /// operator running the agent CLI on the host can rewrite the file at any
@@ -25,7 +26,9 @@ namespace CodeyBox.Orchestrator;
 /// <para>GetRaw() also stat-checks the file on each call as a backstop for
 /// platforms where the watcher is slow to fire — the first caller after a
 /// write observes the change synchronously and the event fires before the
-/// raw bytes are returned.</para>
+/// raw bytes are returned. When watching is disabled, this stat check is the
+/// reload mechanism and <see cref="TokenUpdated"/> fires from the caller's
+/// thread.</para>
 /// </summary>
 public class CredentialFileSource : IDisposable
 {
@@ -42,6 +45,8 @@ public class CredentialFileSource : IDisposable
 
     /// <summary>Path to the credential file on the host filesystem.</summary>
     public string FilePath { get; }
+
+    internal bool IsWatching => _watcher is not null;
 
     /// <summary>
     /// Raised after the file is observed to change and the new contents are
@@ -248,9 +253,18 @@ public class CredentialFileSource : IDisposable
         {
             if (w is not null)
             {
-                try { w.Dispose(); }
-                catch { }
-                CredentialFileSourceWatcherDiagnostics.WatcherDisposed(w);
+                try
+                {
+                    w.Dispose();
+                    CredentialFileSourceWatcherDiagnostics.WatcherDisposed(w);
+                }
+                catch (Exception disposeEx)
+                {
+                    _log?.LogWarning(
+                        disposeEx,
+                        "Failed to dispose FileSystemWatcher for {Path} after registration failure; it may remain active",
+                        FilePath);
+                }
             }
             _log?.LogWarning(ex, "Failed to register FileSystemWatcher for {Path}; relying on stat-based reload", FilePath);
         }
@@ -281,18 +295,18 @@ public class CredentialFileSource : IDisposable
         _watcher = null;
         if (w is not null)
         {
+            try { w.EnableRaisingEvents = false; } catch { }
+            w.Changed -= OnFsEvent;
+            w.Created -= OnFsEvent;
+            w.Renamed -= OnFsRenamed;
             try
             {
-                w.EnableRaisingEvents = false;
-                w.Changed -= OnFsEvent;
-                w.Created -= OnFsEvent;
-                w.Renamed -= OnFsRenamed;
                 w.Dispose();
-            }
-            catch { }
-            finally
-            {
                 CredentialFileSourceWatcherDiagnostics.WatcherDisposed(w);
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning(ex, "Failed to dispose FileSystemWatcher for {Path}; it may remain active", FilePath);
             }
         }
     }
@@ -310,12 +324,26 @@ internal static class CredentialFileSourceWatcherDiagnostics
     public static void WatcherDisposed(FileSystemWatcher watcher)
         => _watcherDisposed(watcher);
 
-    internal static void ConfigureForTests(
+    internal static IDisposable ConfigureForTests(
         Func<string, string, FileSystemWatcher> createWatcher,
         Action<FileSystemWatcher> watcherDisposed)
     {
+        var previousCreateWatcher = _createWatcher;
+        var previousWatcherDisposed = _watcherDisposed;
         _createWatcher = createWatcher ?? throw new ArgumentNullException(nameof(createWatcher));
         _watcherDisposed = watcherDisposed ?? throw new ArgumentNullException(nameof(watcherDisposed));
+        return new RestoreDiagnostics(previousCreateWatcher, previousWatcherDisposed);
+    }
+
+    private sealed class RestoreDiagnostics(
+        Func<string, string, FileSystemWatcher> createWatcher,
+        Action<FileSystemWatcher> watcherDisposed) : IDisposable
+    {
+        public void Dispose()
+        {
+            _createWatcher = createWatcher;
+            _watcherDisposed = watcherDisposed;
+        }
     }
 }
 

@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using CodeyBox.Orchestrator;
 using CodeyBox.Webhooks;
+using Microsoft.Extensions.Configuration;
 
 namespace CodeyBox.Tests;
 
@@ -26,7 +27,7 @@ internal static class TestAssemblyInitializer
 
         SetIfMissing("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing("ASPNETCORE_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
-        SetIfMissing("CODEYBOX_CREDENTIAL_FILE_WATCHERS", "false");
+        SetIfMissing("CodeyBox__CredentialFileWatchers", "false");
         TestFileSystemWatcherLeakTracker.Install();
 
         // Fail fast in CI on schema drift: every WebhookEvent that goes
@@ -44,7 +45,9 @@ internal static class TestAssemblyInitializer
 
 internal static class TestFileSystemWatcherLeakTracker
 {
-    private static readonly ConcurrentDictionary<FileSystemWatcher, WatcherRecord> Active = new();
+    private const int MaxReportedWatcherLeaks = 5;
+
+    private static readonly ConcurrentDictionary<object, WatcherRecord> Active = new();
     private static int _installed;
 
     public static void Install()
@@ -64,29 +67,78 @@ internal static class TestFileSystemWatcherLeakTracker
         if (leaks.Length == 0) return false;
 
         writer.WriteLine(
-            $"warning: {leaks.Length} FileSystemWatcher instance(s) created by tests were not disposed. " +
-            "Dispose CredentialFileSource in the owning test Dispose()/DisposeAsync or a using block.");
-        foreach (var leak in leaks.Take(5))
-            writer.WriteLine($"warning: undisposed FileSystemWatcher for {leak.Path}");
-        if (leaks.Length > 5)
-            writer.WriteLine($"warning: {leaks.Length - 5} additional undisposed FileSystemWatcher instance(s) omitted.");
+            $"warning: {leaks.Length} FileSystemWatcher-backed resource(s) created by tests were not disposed. " +
+            "Dispose CredentialFileSource, tracked FileSystemWatcher, or tracked reload configuration in the owning test Dispose()/DisposeAsync or a using block.");
+        foreach (var leak in leaks.Take(MaxReportedWatcherLeaks))
+            writer.WriteLine($"warning: undisposed {leak.Kind} for {leak.Path}");
+        if (leaks.Length > MaxReportedWatcherLeaks)
+            writer.WriteLine($"warning: {leaks.Length - MaxReportedWatcherLeaks} additional undisposed FileSystemWatcher-backed resource(s) omitted.");
         return true;
     }
 
     public static bool IsTrackingPath(string path)
         => Active.Values.Any(l => string.Equals(l.Path, path, StringComparison.Ordinal));
 
-    private static FileSystemWatcher CreateWatcher(string dir, string fileName)
+    public static FileSystemWatcher CreateWatcher(string dir, string fileName)
     {
-        var watcher = new FileSystemWatcher(dir, fileName);
-        Active[watcher] = new WatcherRecord(Path.Combine(dir, fileName));
+        var watcher = new TrackedFileSystemWatcher(dir, fileName);
+        Track(watcher, Path.Combine(dir, fileName), "FileSystemWatcher");
         return watcher;
     }
 
-    private static void MarkDisposed(FileSystemWatcher watcher)
+    public static TrackedConfigurationRoot TrackReloadingConfiguration(IConfigurationRoot configuration, string path)
     {
-        Active.TryRemove(watcher, out _);
+        var tracked = new TrackedConfigurationRoot(configuration, path);
+        Track(tracked, path, "reloadOnChange configuration");
+        return tracked;
     }
 
-    private sealed record WatcherRecord(string Path);
+    public static void MarkDisposed(FileSystemWatcher watcher)
+    {
+        MarkDisposed((object)watcher);
+    }
+
+    private static void Track(object owner, string path, string kind)
+    {
+        Active[owner] = new WatcherRecord(path, kind);
+    }
+
+    private static void MarkDisposed(object owner)
+    {
+        Active.TryRemove(owner, out _);
+    }
+
+    private sealed record WatcherRecord(string Path, string Kind);
+
+    public sealed class TrackedConfigurationRoot(IConfigurationRoot configuration, string path) : IDisposable
+    {
+        private bool _disposed;
+
+        public IConfigurationRoot Configuration => configuration;
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            (configuration as IDisposable)?.Dispose();
+            MarkDisposed(this);
+        }
+
+        public override string ToString() => path;
+    }
+
+    private sealed class TrackedFileSystemWatcher : FileSystemWatcher
+    {
+        public TrackedFileSystemWatcher(string path, string filter)
+            : base(path, filter)
+        {
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            if (disposing)
+                MarkDisposed(this);
+        }
+    }
 }
