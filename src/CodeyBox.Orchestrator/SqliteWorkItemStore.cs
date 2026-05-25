@@ -164,6 +164,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    // SQLite primary error code for SQLITE_FULL. Matched on the primary
+    // code (SqliteErrorCode) rather than the extended variant so any
+    // SQLITE_FULL_*  refinement still routes through the disk-full path.
+    internal const int SQLITE_FULL = 13;
+
     public async Task CreateAsync(WorkItem item, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
@@ -192,6 +197,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             // A concurrent request snuck past the application-level pre-check and
             // hit the UNIQUE index on (project_id, external_id).
             throw new WorkItemExternalIdConflictException();
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("CreateAsync", sqlex);
         }
         finally
         {
@@ -233,6 +242,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("UpdateAsync", sqlex);
         }
         finally
         {
@@ -276,10 +289,41 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
             return await cmd.ExecuteNonQueryAsync(ct) > 0;
         }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryUpdateIfStateAsync", sqlex);
+        }
         finally
         {
             _writeLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Translates a <c>SQLITE_FULL</c> error into a typed exception the
+    /// orchestrator can recognise. Emits an audit event at Fatal level so
+    /// the operator dashboards / alerts fire before the host degrades
+    /// further. Returned (not thrown) so the call site retains the
+    /// <c>throw</c> for analysis flow.
+    /// </summary>
+    private static WorkItemStoreDiskFullException HandleDiskFull(string operation, SqliteException sqlex)
+    {
+        AuditLog.StoreDiskFull(operation);
+        return new WorkItemStoreDiskFullException(operation, sqlex);
+    }
+
+    /// <summary>
+    /// Test hook: clamps the underlying database's <c>max_page_count</c> on
+    /// the same connection the store uses, so subsequent writes through
+    /// <see cref="CreateAsync"/> / <see cref="UpdateAsync"/> deterministically
+    /// fail with <c>SQLITE_FULL</c>. Production code never calls this.
+    /// </summary>
+    internal void ForceMaxPageCountForTesting(long pages)
+    {
+        using var cmd = _conn.CreateCommand();
+        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- 'pages' is an int64 from a test caller; PRAGMA does not accept parameters so inlining is required and safe
+        cmd.CommandText = $"PRAGMA max_page_count = {pages};";
+        cmd.ExecuteNonQuery();
     }
 
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)

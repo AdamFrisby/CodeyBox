@@ -538,6 +538,18 @@ public static class AuditLog
             .Information("Work item {WorkItemId} for project {ProjectId} deferred by budget cap: {Reason}",
                 id.ToString(), projectId.Value, reason);
 
+    public static void DiskDeferred(WorkItemId id, string mountPath, long freeBytes, long thresholdBytes) =>
+        Audit("disk.deferred")
+            .Warning(
+                "Work item {WorkItemId} deferred: only {FreeBytes:N0} bytes free on {MountPath} (threshold {ThresholdBytes:N0})",
+                id.ToString(), freeBytes, mountPath, thresholdBytes);
+
+    public static void StoreDiskFull(string operation) =>
+        Audit("store.disk_full")
+            .Fatal(
+                "SQLite reported SQLITE_FULL during '{Operation}'; host disk is exhausted and no further state transitions can be persisted",
+                operation);
+
     public static void ProjectQueuePaused(ProjectId projectId, string reason) =>
         Audit("project_queue.paused")
             .Information("Project {ProjectId} queue paused: {Reason}", projectId.Value, reason);

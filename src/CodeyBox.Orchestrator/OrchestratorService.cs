@@ -792,6 +792,33 @@ public sealed class OrchestratorService : BackgroundService
             {
                 _log.LogInformation("Worker {WorkerId} item {Id} cancelled", workerIndex, id);
             }
+            catch (SandboxDiskDeferredException dskEx)
+            {
+                // Disk-guard preflight refused to launch a sandbox. Same
+                // semantics as the budget-cap deferral: emit the audit + the
+                // disk.deferred webhook so existing alerting fires, then
+                // schedule a re-pickup. In-flight items already running on
+                // other workers are not touched.
+                AuditLog.DiskDeferred(item.Id, dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes);
+                if (_webhooks is not null)
+                {
+                    _ = _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "disk.deferred",
+                        WorkItem = item,
+                        Project = project,
+                        Details = new
+                        {
+                            mountPath = dskEx.MountPath,
+                            freeBytes = dskEx.FreeBytes,
+                            thresholdBytes = dskEx.ThresholdBytes,
+                            suggestedRetryAt = DateTimeOffset.UtcNow + dskEx.RecheckIn,
+                        },
+                    }, CancellationToken.None);
+                }
+                ScheduleDeferredRequeue(item.Id, dskEx.RecheckIn, ct);
+                return;
+            }
             catch (Exception ex)
             {
                 _log.LogError(ex, "Worker {WorkerId} unexpected failure on {Id}", workerIndex, id);

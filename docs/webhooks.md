@@ -29,6 +29,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
+| `disk.deferred` | A sandbox launch was refused because host free disk on a monitored mount fell below `CodeyBox:DiskGuard:MinFreeBytes`. Details: `mountPath`, `freeBytes`, `thresholdBytes`, `suggestedRetryAt`. |
 | `project.budget_warning` | Project's 30-day spend crossed the warning threshold (see [Details](#projectbudget_warning-details)) |
 | `project.budget_exceeded` | Project's 30-day spend crossed the hard cap; project queue auto-paused (see [Details](#projectbudget_warning-details)) |
 | `project.budget_recovered` | Project's 30-day spend dropped back below the warning threshold (see [Details](#projectbudget_warning-details)) |

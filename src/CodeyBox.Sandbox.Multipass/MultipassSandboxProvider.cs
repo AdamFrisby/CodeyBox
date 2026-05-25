@@ -45,7 +45,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider
+public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -60,6 +60,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private readonly MultipassDaemonRetryPolicy _daemonRetryPolicy;
     private readonly string _stagingRoot;
     private readonly ITimingStore? _timings;
+    private readonly IDiskSpaceProbe _diskProbe;
     // Per-baseline-name semaphore: serialises bake operations so two
     // concurrent CreateAsync calls for the same profile don't both try to
     // launch the same baseline VM. Lazily populated.
@@ -89,20 +90,23 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     }
 
     internal MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
-        ITimingStore? timings, IProcessRunner runner, MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
-        : this(() => opts, log, timings, runner, daemonRetryPolicy)
+        ITimingStore? timings, IProcessRunner runner, MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
+        IDiskSpaceProbe? diskProbe = null)
+        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe)
     {
     }
 
     internal MultipassSandboxProvider(Func<MultipassSandboxOptions> optionsAccessor,
         ILogger<MultipassSandboxProvider> log, ITimingStore? timings, IProcessRunner runner,
-        MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
+        IDiskSpaceProbe? diskProbe = null)
     {
         _optsAccessor = optionsAccessor;
         _log = log;
         _runner = runner;
         _daemonRetryPolicy = daemonRetryPolicy ?? MultipassDaemonRetryPolicy.Default;
         _timings = timings;
+        _diskProbe = diskProbe ?? new DefaultDiskSpaceProbe();
         // StagingDirectory is captured once: the provider keeps the directory open
         // for the lifetime of the process. Re-binding it at runtime would orphan
         // already-staged sandboxes.
@@ -156,8 +160,62 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     public string Name => "multipass";
 
+    private IReadOnlyList<string> DiskGuardPaths
+    {
+        get
+        {
+            // Resolve through ReadOptions so live-edits to DiskGuard config land
+            // on the next call without restart, matching the rest of the provider.
+            if (ReadOptions().DiskGuard is not { } guard) return [];
+            var result = new List<string> { guard.MultipassDataPath };
+            foreach (var extra in guard.AdditionalPaths)
+            {
+                if (!string.IsNullOrWhiteSpace(extra) && !result.Contains(extra, StringComparer.Ordinal))
+                    result.Add(extra);
+            }
+            return result;
+        }
+    }
+
+    /// <inheritdoc />
+    public IReadOnlyList<DiskGuardSample> SampleDiskGuardState()
+    {
+        if (ReadOptions().DiskGuard is not { } guard) return [];
+        var paths = DiskGuardPaths;
+        var result = new List<DiskGuardSample>(paths.Count);
+        foreach (var p in paths)
+            result.Add(new DiskGuardSample(p, _diskProbe.GetFreeBytes(p), guard.MinFreeBytes));
+        return result;
+    }
+
+    private void PreflightDiskOrThrow()
+    {
+        if (ReadOptions().DiskGuard is not { } guard) return;
+        foreach (var path in DiskGuardPaths)
+        {
+            var free = _diskProbe.GetFreeBytes(path);
+            if (free is null) continue; // inconclusive — don't block on a missing mount
+            if (free.Value < guard.MinFreeBytes)
+            {
+                _log.LogWarning(
+                    "Disk preflight: {Path} has {FreeBytes:N0} free, below threshold {Threshold:N0}; deferring sandbox launch",
+                    path, free.Value, guard.MinFreeBytes);
+                throw new SandboxDiskDeferredException(path, free.Value, guard.MinFreeBytes, guard.RecheckIn);
+            }
+        }
+    }
+
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
+        // Preflight: refuse to launch when the host is out of disk. Without
+        // this check, multipass / qemu happily start the VM, the install
+        // runcmd or the orchestrator's first big artifact write hits
+        // ENOSPC, and the work item burns tokens before failing in a way
+        // the orchestrator can't gracefully recover from. The deferred
+        // exception bubbles to the worker loop, which schedules a re-pickup
+        // — same machinery as the budget cap path.
+        PreflightDiskOrThrow();
+
         var opts = ReadOptions();
         var name = $"codeybox-{Guid.NewGuid():N}"[..23]; // multipass max name length is 24
         var sandboxRoot = Path.Combine(_stagingRoot, name);
@@ -1987,6 +2045,60 @@ public sealed record MultipassSandboxOptions
     /// <c>... × BaselineMemoryGB</c> GiB at saturation.
     /// </summary>
     public int BaselineCpus { get; init; } = 6;
+
+    /// <summary>
+    /// Disk-guard configuration. When set, <see cref="MultipassSandboxProvider"/>
+    /// checks free space on the configured mounts before every VM launch and
+    /// throws <see cref="CodeyBox.Core.SandboxDiskDeferredException"/> when any
+    /// mount is below <see cref="MultipassDiskGuardOptions.MinFreeBytes"/>.
+    /// Null (default) disables the preflight entirely.
+    /// </summary>
+    public MultipassDiskGuardOptions? DiskGuard { get; init; }
+}
+
+/// <summary>
+/// Disk-guard preflight tunables. The provider checks free bytes on
+/// <see cref="MultipassDataPath"/> (Multipass's storage backing) and on
+/// any additional paths registered via <see cref="AdditionalPaths"/>;
+/// any single mount below <see cref="MinFreeBytes"/> causes the launch
+/// to defer rather than proceed.
+/// </summary>
+public sealed record MultipassDiskGuardOptions
+{
+    /// <summary>
+    /// Minimum free bytes on each monitored mount. Defaults to 10 GiB —
+    /// roughly enough headroom that a single sandbox launch followed by a
+    /// modest agent run won't push the host into a "no space left on device"
+    /// state, but small enough that operators don't get surprise deferrals
+    /// on healthy hosts. Tune up if your work items routinely write large
+    /// artifacts.
+    /// </summary>
+    public long MinFreeBytes { get; init; } = 10L * 1024 * 1024 * 1024;
+
+    /// <summary>
+    /// Path under which Multipass stores its VM images. On the snap install
+    /// this is <c>/var/snap/multipass/common/data</c>; non-snap installs
+    /// use a different layout and operators should override here.
+    /// </summary>
+    public string MultipassDataPath { get; init; } = "/var/snap/multipass/common/data";
+
+    /// <summary>
+    /// Extra paths to check before each launch — typically the state
+    /// database directory so we refuse to launch new work when the SQLite
+    /// volume is about to fill. Each entry is checked independently against
+    /// <see cref="MinFreeBytes"/>; the first one to fail is the one
+    /// reported in the deferral reason.
+    /// </summary>
+    public IReadOnlyList<string> AdditionalPaths { get; init; } = [];
+
+    /// <summary>
+    /// How long to wait before re-attempting pickup of a deferred item.
+    /// Defaults to 5 minutes — short enough that a transient cleanup
+    /// elsewhere on the host (a deploy log rotation, an audit-report
+    /// retention sweep) lets work resume promptly, long enough that we
+    /// don't stampede the dispatch loop while the host is still full.
+    /// </summary>
+    public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
 internal sealed class MultipassSandbox : IPreemptibleSandbox
