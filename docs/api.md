@@ -941,6 +941,34 @@ Response: `200 OK`
 }
 ```
 
+### `GET /admin/quota-retry-status`
+
+Returns an operator-visible summary of quota-shaped items currently parked for
+automatic retry. Buckets are grouped by state and whole hours since
+`nextQuotaRetryAt` passed; negative values mean the retry deadline is still in
+the future, and `null` means the item has no deadline recorded.
+
+Response: `200 OK`
+
+```json
+{
+  "generatedAt": "2026-05-25T00:00:00+00:00",
+  "totalParked": 3,
+  "buckets": [
+    {
+      "state": "WaitingForQuotaReset",
+      "hoursSinceNextQuotaRetryAtDeadline": 130,
+      "count": 2
+    },
+    {
+      "state": "Failed",
+      "hoursSinceNextQuotaRetryAtDeadline": 1,
+      "count": 1
+    }
+  ]
+}
+```
+
 ### `POST /sandboxes/leaked/{name}/dispose`
 
 Operator-triggered dispose of a leaked sandbox by name. The name must start with

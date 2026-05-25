@@ -1473,6 +1473,7 @@ FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);
 SandboxEndpoints.Map(app);
+QuotaRetryStatusEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 
 app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");

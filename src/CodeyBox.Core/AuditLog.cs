@@ -595,6 +595,24 @@ public static class AuditLog
                 id.ToString(), (long)recheckIn.TotalMilliseconds);
 
     /// <summary>
+    /// Emitted by the quota retry scheduler for every quota-shaped item it
+    /// evaluates, including no-op outcomes. <paramref name="reason"/> is forced
+    /// through an empty-string sentinel so operators can distinguish "no extra
+    /// reason" from a schema change in audit-log consumers.
+    /// </summary>
+    public static void QuotaRetryAttempted(
+        WorkItemId id,
+        string source,
+        string outcome,
+        string state,
+        string? reason = null) =>
+        Audit("quota_retry_attempted")
+            .ForContext("Reason", reason ?? "")
+            .Information(
+                "Quota retry attempted for work item {WorkItemId}: source={Source} outcome={Outcome} state={State} reason={Reason}",
+                id.ToString(), source, outcome, state, reason ?? "");
+
+    /// <summary>
     /// Emitted when all class members fail the MinModelScore floor check. Records
     /// the rejected members and their below-floor reasons so the audit log captures
     /// the failure detail even though no member was chosen.
