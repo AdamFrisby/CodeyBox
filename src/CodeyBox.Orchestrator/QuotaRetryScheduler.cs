@@ -329,8 +329,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         {
             try
             {
-                var project = await _projects!.GetAsync(item.ProjectId, ct);
-                var updated = await _store.GetAsync(item.Id, ct);
+                var project = await _projects!.GetAsync(item.ProjectId, CancellationToken.None);
+                var updated = await _store.GetAsync(item.Id, CancellationToken.None);
                 await _webhooks.PublishAsync(new WebhookEvent
                 {
                     Event = "work_item.auto_retry",
@@ -346,10 +346,6 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
                         actualFrom
                     }
                 }, CancellationToken.None);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
             }
             catch (Exception ex)
             {

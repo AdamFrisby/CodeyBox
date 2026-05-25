@@ -12,6 +12,7 @@ namespace CodeyBox.Tests;
 public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 {
     private static readonly ProjectId TestProjectId = new("test-project");
+    private static readonly ProjectId BrokenProjectId = new("broken-project");
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-quota-audit-").FullName;
     private readonly TestSink _sink = new();
 
@@ -61,6 +62,14 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
         var evt = AssertQuotaAttempt(item, "periodic", expectedOutcome, expectedState);
         Assert.Equal(expectedReason(item), GetScalar<string>(evt, "Reason"));
+
+        if (expectedOutcome.StartsWith("skipped:", StringComparison.Ordinal))
+        {
+            var stored = await fixture.Store.GetAsync(item.Id);
+            Assert.NotNull(stored);
+            Assert.Equal(item.State, stored.State);
+            Assert.Equal(item.QuotaRetryAttempts, stored.QuotaRetryAttempts);
+        }
     }
 
     public static TheoryData<string, Func<QuotaRetrySchedulerAuditTests, SchedulerFixture>, Func<WorkItem>, string, Func<WorkItem, string>> AuditOutcomeCases()
@@ -207,6 +216,26 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
+    public async Task TryRetry_AuditsSuccessfulRetryWhenWebhookEnrichmentCancelsSchedulerToken()
+    {
+        using var cts = new CancellationTokenSource();
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            new CancelOnSecondProjectLookupRepository(cts, CreateProject(TestProjectId)),
+            webhooks: new NoopWebhookDispatcher());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        await fixture.Store.CreateAsync(item);
+
+        await InvokeTryRetryAsync(fixture.Scheduler, item, "periodic", cts.Token);
+
+        Assert.True(cts.IsCancellationRequested);
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(item, "periodic", "retried", "WaitingForQuotaReset"), "Reason"));
+    }
+
+    [Fact]
     public async Task RearmTimers_WebhookFailureDoesNotOverrideRetryAudit()
     {
         using var fixture = BuildScheduler(
@@ -230,6 +259,82 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(second.Id))!.State);
         Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(first, "rearm-overdue", "retried", "WaitingForQuotaReset"), "Reason"));
         Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(second, "rearm-overdue", "retried", "WaitingForQuotaReset"), "Reason"));
+    }
+
+    [Fact]
+    public async Task TryRetry_AuditsErrorOutcomeBeforeRethrowingNonCancellationException()
+    {
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            new ThrowingForProjectRepository(BrokenProjectId, CreateProject(TestProjectId)));
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            ProjectId = BrokenProjectId,
+        };
+        await fixture.Store.CreateAsync(item);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => InvokeTryRetryAsync(fixture.Scheduler, item, "periodic", CancellationToken.None));
+
+        Assert.Equal("project lookup failed", ex.Message);
+        var evt = AssertQuotaAttempt(item, "periodic", "error", "WaitingForQuotaReset");
+        Assert.Equal("project lookup failed", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_ContinuesAfterItemRetryThrows()
+    {
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            new ThrowingForProjectRepository(BrokenProjectId, CreateProject(TestProjectId)));
+        var broken = CreateQuotaItem(WorkItemState.Failed) with
+        {
+            ProjectId = BrokenProjectId,
+        };
+        var later = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        await fixture.Store.CreateAsync(broken);
+        await fixture.Store.CreateAsync(later);
+
+        await RunPeriodicSweepAsync(fixture.Scheduler);
+
+        var brokenStored = await fixture.Store.GetAsync(broken.Id);
+        Assert.Equal(WorkItemState.Failed, brokenStored!.State);
+        Assert.Equal(0, brokenStored.QuotaRetryAttempts);
+        var laterStored = await fixture.Store.GetAsync(later.Id);
+        Assert.Equal(WorkItemState.Queued, laterStored!.State);
+        Assert.Equal(1, laterStored.QuotaRetryAttempts);
+        Assert.Equal("project lookup failed", GetScalar<string>(AssertQuotaAttempt(broken, "periodic", "error", "Failed"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(later, "periodic", "retried", "WaitingForQuotaReset"), "Reason"));
+    }
+
+    [Fact]
+    public async Task RearmTimers_ContinuesAfterItemRetryThrows()
+    {
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            new ThrowingForProjectRepository(BrokenProjectId, CreateProject(TestProjectId)));
+        var broken = CreateQuotaItem(WorkItemState.Failed) with
+        {
+            ProjectId = BrokenProjectId,
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+        };
+        var later = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+        };
+        await fixture.Store.CreateAsync(broken);
+        await fixture.Store.CreateAsync(later);
+
+        await RearmTimersAsync(fixture.Scheduler);
+
+        var brokenStored = await fixture.Store.GetAsync(broken.Id);
+        Assert.Equal(WorkItemState.Failed, brokenStored!.State);
+        Assert.Equal(0, brokenStored.QuotaRetryAttempts);
+        var laterStored = await fixture.Store.GetAsync(later.Id);
+        Assert.Equal(WorkItemState.Queued, laterStored!.State);
+        Assert.Equal(1, laterStored.QuotaRetryAttempts);
+        Assert.Equal("project lookup failed", GetScalar<string>(AssertQuotaAttempt(broken, "rearm-overdue", "error", "Failed"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(later, "rearm-overdue", "retried", "WaitingForQuotaReset"), "Reason"));
     }
 
     [Fact]
@@ -336,13 +441,16 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     private static IProjectRepository BuildProjects()
-        => new InMemoryProjectRepository(new Project
+        => new InMemoryProjectRepository(CreateProject(TestProjectId));
+
+    private static Project CreateProject(ProjectId id)
+        => new()
         {
-            Id = TestProjectId,
-            DisplayName = "Test",
+            Id = id,
+            DisplayName = "Test " + id.Value,
             RepositoryUrl = "https://example.invalid/repo.git",
             DefaultAgentClass = "frontier",
-        });
+        };
 
     private static WorkItem CreateQuotaItem(WorkItemState state)
         => new()
@@ -371,6 +479,14 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             "TryPeriodicRetryAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         await (Task)retry.Invoke(scheduler, [item, ct])!;
+    }
+
+    private static async Task InvokeTryRetryAsync(QuotaRetryScheduler scheduler, WorkItem item, string source, CancellationToken ct)
+    {
+        var retry = typeof(QuotaRetryScheduler).GetMethod(
+            "TryRetryAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)retry.Invoke(scheduler, [item, source, ct])!;
     }
 
     private static async Task RearmTimersAsync(QuotaRetryScheduler scheduler)
@@ -483,6 +599,62 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     {
         public Task PublishAsync(WebhookEvent evt, CancellationToken ct)
             => throw new InvalidOperationException("webhook failed");
+    }
+
+    private sealed class NoopWebhookDispatcher : IWebhookDispatcher
+    {
+        public Task PublishAsync(WebhookEvent evt, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class ThrowingForProjectRepository : IProjectRepository
+    {
+        private readonly ProjectId _throwFor;
+        private readonly Dictionary<string, Project> _projects;
+
+        public ThrowingForProjectRepository(ProjectId throwFor, params Project[] projects)
+        {
+            _throwFor = throwFor;
+            _projects = projects.ToDictionary(p => p.Id.Value);
+        }
+
+        public Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+        {
+            if (id == _throwFor)
+                throw new InvalidOperationException("project lookup failed");
+
+            return Task.FromResult(_projects.TryGetValue(id.Value, out var project) ? project : null);
+        }
+
+        public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Project>>([.. _projects.Values]);
+    }
+
+    private sealed class CancelOnSecondProjectLookupRepository : IProjectRepository
+    {
+        private readonly CancellationTokenSource _cts;
+        private readonly Project _project;
+        private int _calls;
+
+        public CancelOnSecondProjectLookupRepository(CancellationTokenSource cts, Project project)
+        {
+            _cts = cts;
+            _project = project;
+        }
+
+        public Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+        {
+            _calls++;
+            if (_calls == 2)
+            {
+                _cts.Cancel();
+                ct.ThrowIfCancellationRequested();
+            }
+
+            return Task.FromResult<Project?>(_project);
+        }
+
+        public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Project>>([_project]);
     }
 
     private sealed class InertTimeProvider : TimeProvider
