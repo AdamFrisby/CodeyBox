@@ -126,6 +126,43 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaWaitParker_DoesNotOverwriteConcurrentCancel()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var queuedSnapshot = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p1"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await store.CreateAsync(queuedSnapshot);
+
+        await store.UpdateAsync(
+            queuedSnapshot.With(
+                WorkItemState.Cancelled,
+                "cancelled via API",
+                cancellationReason: WorkItemCancellationReason.OperatorRequested));
+
+        var parker = new QuotaWaitParker(store, timeProvider: new FixedClock(DateTimeOffset.UtcNow));
+        await parker.ParkAsync(new QuotaWaitParkRequest(
+            queuedSnapshot,
+            "insufficient headroom",
+            "work",
+            DateTimeOffset.UtcNow.AddHours(1)));
+
+        var refetched = await store.GetAsync(queuedSnapshot.Id);
+        Assert.NotNull(refetched);
+        Assert.Equal(WorkItemState.Cancelled, refetched!.State);
+        Assert.Equal(WorkItemCancellationReason.OperatorRequested, refetched.CancellationReason);
+        Assert.Null(refetched.QuotaResetAt);
+        Assert.Null(refetched.NextQuotaRetryAt);
+    }
+
+    [Fact]
     public async Task QuotaRetryScheduler_PeriodicSweep_ReEnqueuesWaitingForQuotaResetItem()
     {
         // The other half of the spec test case "all members exhausted → item

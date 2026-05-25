@@ -638,7 +638,8 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Work item {Id} parking in WaitingForQuotaReset: {Reason}",
                 item.Id, ex.Message);
-            await TransitionWaitingForQuotaResetAsync(item, ex, project);
+            var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+            await TransitionWaitingForQuotaResetAsync(current, ex, project);
         }
         catch (TerminalQuotaError ex)
         {
@@ -647,7 +648,7 @@ public sealed class PipelineRunner : IPipelineRunner
             if (current.State == WorkItemState.Auditing)
             {
                 await TransitionWaitingForQuotaResetAsync(
-                    item,
+                    current,
                     ex.Message,
                     phase: "audit",
                     quotaResetAt: ex.ResetAt,

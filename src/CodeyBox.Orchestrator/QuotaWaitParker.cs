@@ -99,7 +99,35 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
 
     public async Task ParkAsync(QuotaWaitParkRequest request, CancellationToken ct = default)
     {
-        var current = await _store.GetAsync(request.Item.Id, ct) ?? request.Item;
+        var expectedState = request.Item.State;
+        if (WorkItemDependencies.TerminalStates.Contains(expectedState))
+        {
+            _log.LogInformation(
+                "Work item {Id} is already terminal ({State}); skipping WaitingForQuotaReset transition",
+                request.Item.Id,
+                expectedState);
+            return;
+        }
+
+        var current = await _store.GetAsync(request.Item.Id, ct);
+        if (current is null)
+        {
+            _log.LogInformation(
+                "Work item {Id} no longer exists; skipping WaitingForQuotaReset transition",
+                request.Item.Id);
+            return;
+        }
+
+        if (current.State != expectedState)
+        {
+            _log.LogInformation(
+                "Work item {Id} state changed from {ExpectedState} to {CurrentState}; skipping WaitingForQuotaReset transition",
+                request.Item.Id,
+                expectedState,
+                current.State);
+            return;
+        }
+
         var effectiveResetAt = await ResolveResetAtAsync(
             current,
             request.Project,
@@ -116,7 +144,7 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
             QuotaRetryFrom = RetryFromForQuotaPhase(request.Phase),
         };
 
-        var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
+        var updated = await _store.TryUpdateIfStateAsync(next, expectedState, ct);
         if (!updated)
         {
             _log.LogInformation(

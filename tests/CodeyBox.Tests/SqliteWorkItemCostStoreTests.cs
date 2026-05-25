@@ -241,8 +241,10 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     {
         var itemA = Guid.NewGuid().ToString();
         var itemB = Guid.NewGuid().ToString();
+        var itemC = Guid.NewGuid().ToString();
         SeedWorkItem(itemA, "proj-headroom");
         SeedWorkItem(itemB, "proj-headroom");
+        SeedWorkItem(itemC, "proj-headroom");
 
         await _store.RecordAsync(MakeCost(itemA) with
         {
@@ -253,6 +255,20 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         await _store.RecordAsync(MakeCost(itemB) with
         {
             InputTokens = 40_000,
+            OutputTokens = 10_000,
+            EstimatedUsd = 1.0,
+        });
+        await _store.RecordAsync(MakeCost(itemC, phase: "rework") with
+        {
+            Iteration = 1,
+            InputTokens = 50_000,
+            OutputTokens = 10_000,
+            EstimatedUsd = 1.0,
+        });
+        await _store.RecordAsync(MakeCost(itemC, phase: "rework") with
+        {
+            Iteration = 2,
+            InputTokens = 50_000,
             OutputTokens = 10_000,
             EstimatedUsd = 1.0,
         });
@@ -274,8 +290,9 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                 "claude-opus-4-7"));
 
         Assert.NotNull(estimate);
-        Assert.Equal(7.5, estimate!.EstimatedIterPctCost, precision: 2);
-        Assert.Equal(75_000, estimate.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(7.0, estimate!.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(70_000, estimate.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(3, estimate.SampledItemCount);
     }
 
     [Fact]
