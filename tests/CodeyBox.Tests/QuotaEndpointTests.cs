@@ -166,8 +166,81 @@ public sealed class QuotaEndpointTests
         Assert.Equal(10, untrustedProjection.GetProperty("estimatedIterPctCost").GetDouble(), precision: 2);
         Assert.False(untrustedProjection.GetProperty("trustedForEnforcement").GetBoolean());
         Assert.Equal(5, untrustedProjection.GetProperty("projectedAvailablePct").GetDouble(), precision: 2);
-        Assert.False(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
-        Assert.True(untrustedProjection.GetProperty("insufficientHeadroom").GetBoolean());
+        Assert.True(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
+        Assert.False(untrustedProjection.GetProperty("insufficientHeadroom").GetBoolean());
+        Assert.Contains("advisory", untrustedProjection.GetProperty("reason").GetString());
+    }
+
+    [Fact]
+    public async Task GetQuota_HeadroomProjectionUsesConfiguredModelQuota()
+    {
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = "https://github.com/test/repo",
+            DefaultAgentClass = "frontier-coding",
+        };
+        using var factory = new WorkItemApiFactory(projects: [project]);
+        var configuredFactory = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 80,
+                    PerModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["claude-opus-4-7"] = new() { AvailablePct = 15, Window = "weekly" },
+                    },
+                }));
+            });
+        });
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = project.Id,
+            Title = "model-specific historical item",
+            Prompt = "p",
+        };
+        await factory.Store.CreateAsync(item);
+        var costs = configuredFactory.Services.GetRequiredService<IWorkItemCostStore>();
+        await costs.RecordAsync(new WorkItemCost
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = item.Id.ToString(),
+            Phase = "work",
+            AgentKind = "claude",
+            ModelId = "claude-opus-4-7",
+            InputTokens = 80_000,
+            OutputTokens = 20_000,
+            EstimatedUsd = 1.0,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            EndedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            RawMetadataJson = """{"usageSource":"provider_metadata"}""",
+        });
+
+        var client = configuredFactory.CreateClient();
+        var response = await client.GetAsync("/quota?projectId=test-project");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        var projection = Assert.Single(doc.RootElement
+            .GetProperty("probes")[0]
+            .GetProperty("headroomProjections")
+            .EnumerateArray());
+
+        Assert.Equal("frontier-coding", projection.GetProperty("agentClassId").GetString());
+        Assert.Equal("claude", projection.GetProperty("agent").GetString());
+        Assert.Equal("claude-opus-4-7", projection.GetProperty("modelId").GetString());
+        Assert.Equal(15, projection.GetProperty("availablePct").GetDouble(), precision: 2);
+        Assert.Equal(10, projection.GetProperty("estimatedIterPctCost").GetDouble(), precision: 2);
+        Assert.Equal(5, projection.GetProperty("projectedAvailablePct").GetDouble(), precision: 2);
+        Assert.False(projection.GetProperty("wouldAllow").GetBoolean());
+        Assert.True(projection.GetProperty("insufficientHeadroom").GetBoolean());
+        Assert.Contains("insufficient headroom", projection.GetProperty("reason").GetString());
     }
 
     [Fact]

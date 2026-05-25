@@ -207,7 +207,7 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task UntrustedHeadroomEstimate_BlocksWhenProjectionFallsBelowThreshold()
+    public async Task UntrustedHeadroomEstimate_AllowsDispatchAsAdvisoryOnly()
     {
         var cls = FrontierClass(Sub(Claude));
         var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
@@ -220,9 +220,9 @@ public sealed class AgentClassRouterTests
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
-        Assert.Null(decision.Chosen);
-        Assert.True(decision.ShouldWait);
-        Assert.Contains("headroom", decision.Reason);
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+        Assert.Contains("advisory", decision.Reason);
     }
 
     [Fact]

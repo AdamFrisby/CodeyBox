@@ -377,7 +377,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task CostHistoryQuotaHeadroomEstimator_UsesProductionDefaultsAsUntrustedAndIgnoresRejectedRows()
+    public async Task CostHistoryQuotaHeadroomEstimator_UsesProductionDefaultsAsUntrustedAndDoesNotEnforce()
     {
         var productionDefaultItem = Guid.NewGuid().ToString();
         var explicitUntrustedItem = Guid.NewGuid().ToString();
@@ -457,8 +457,9 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
             AuditOnRefusal: false,
             MinRemainingPct: opts.MinQuotaPct));
 
-        Assert.False(gate.Allow);
-        Assert.True(gate.InsufficientHeadroom);
+        Assert.True(gate.Allow);
+        Assert.False(gate.InsufficientHeadroom);
+        Assert.Contains("advisory", gate.Reason);
         Assert.Equal(9.5, gate.ProjectedAvailablePct!.Value, precision: 2);
     }
 

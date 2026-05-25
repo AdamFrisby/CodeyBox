@@ -360,6 +360,51 @@ static IReadOnlyList<AgentClass> BuildAndValidateAgentClasses(
     return result;
 }
 
+static IReadOnlyList<QuotaProjectionMember> ResolveQuotaProjectionMembers(
+    Project project,
+    AgentKind agent,
+    AgentClassCatalog catalog)
+{
+    var scopedClasses = string.IsNullOrWhiteSpace(project.DefaultAgentClass)
+        ? catalog.Classes
+        : catalog.Classes
+            .Where(c => string.Equals(c.Id, project.DefaultAgentClass, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+    var projections = new List<QuotaProjectionMember>();
+    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var agentClass in scopedClasses)
+    {
+        foreach (var member in agentClass.Members)
+        {
+            if (member.Billing != AgentBilling.Subscription)
+                continue;
+            if (!string.Equals(member.Agent.Value, agent.Value, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var key = $"{agentClass.Id}\n{member.Agent.Value}\n{member.ModelId ?? string.Empty}";
+            if (seen.Add(key))
+                projections.Add(new QuotaProjectionMember(agentClass.Id, member));
+        }
+    }
+
+    return projections.Count > 0
+        ? projections
+        :
+        [
+            new QuotaProjectionMember(null, new AgentMembership
+            {
+                Agent = agent,
+                Billing = AgentBilling.Subscription,
+                QualityScore = 100,
+            }),
+        ];
+}
+
+static bool HasRecentFailureForMember(QuotaFailureObservation failure, AgentMembership member) =>
+    string.Equals(failure.Agent.Value, member.Agent.Value, StringComparison.OrdinalIgnoreCase)
+    && string.Equals(failure.ModelId ?? string.Empty, member.ModelId ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+
 static IReadOnlyList<ParsedTodModifier> BuildAndValidateTodModifiers(
     AgentScoreModifiersOptions opts, ILogger log)
 {
@@ -782,15 +827,22 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 });
 
 // --- Agent class router ------------------------------------------------------
-builder.Services.AddSingleton<AgentClassRouter>(sp =>
+builder.Services.AddSingleton<AgentClassCatalog>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentClasses");
 
-    // Build and validate the catalog.
     var catalog = BuildAndValidateAgentClasses(cbOpts.AgentClasses, startupLog);
     var subscriptionMembers = catalog.Sum(c => c.Members.Count(m => m.Billing == AgentBilling.Subscription));
     startupLog.LogInformation("Quota gate enabled for {Count} subscription members", subscriptionMembers);
+    return new AgentClassCatalog(catalog);
+});
+
+builder.Services.AddSingleton<AgentClassRouter>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentClasses");
+    var catalog = sp.GetRequiredService<AgentClassCatalog>().Classes;
 
     // Build and validate time-of-day score modifiers.
     var todModifiers = BuildAndValidateTodModifiers(cbOpts.AgentScoreModifiers, startupLog);
@@ -1450,6 +1502,7 @@ app.MapGet("/quota", async (
     IQuotaFailureStore? failureStore,
     IQuotaHeadroomManager headroomManager,
     IProjectRepository projects,
+    AgentClassCatalog agentClassCatalog,
     QuotaRouterOptions options,
     string? projectId,
     int? limit,
@@ -1486,51 +1539,73 @@ app.MapGet("/quota", async (
     var snapshots = new List<object>();
     foreach (var probe in probes.Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe))
     {
-        var member = new AgentMembership
-        {
-            Agent = probe.Kind,
-            Billing = AgentBilling.Subscription,
-            QualityScore = 100,
-        };
-        var snapshot = await probe.GetAvailabilityAsync(member, ct);
-        var headroomProjections = new List<object>();
-        foreach (var project in projectList)
-        {
-            var gate = await headroomManager.EvaluateAsync(
-                new QuotaHeadroomGateRequest(
-                    project.Id,
-                    member,
-                    snapshot.AvailablePct,
-                    snapshot.ResetAt,
-                    AuditOnRefusal: false,
-                    MinRemainingPct: options.MinQuotaPct),
-                ct);
-            var estimate = gate.Estimate;
-            var baseWouldAllow = QuotaRouter.WouldAllow(
-                snapshot.AvailablePct,
-                false,
-                options,
-                reservedQuotaPct: gate.ReservedPct);
-            headroomProjections.Add(new
+        var projectionMembersByProject = projectList.ToDictionary(
+            p => p.Id.Value,
+            p => ResolveQuotaProjectionMembers(p, probe.Kind, agentClassCatalog),
+            StringComparer.Ordinal);
+        var projectionMembers = projectionMembersByProject.Values
+            .SelectMany(members => members)
+            .ToList();
+        var firstProjectionMember = projectionMembers.FirstOrDefault(member => member.AgentClassId is not null)
+            ?? projectionMembers.FirstOrDefault();
+        var probeMember = firstProjectionMember?.Member
+            ?? new AgentMembership
             {
-                projectId = project.Id.Value,
-                estimatedIterPctCost = estimate?.EstimatedIterPctCost,
-                averageTokensPerIteration = estimate?.AverageTokensPerIteration,
-                sampledItemCount = estimate?.SampledItemCount,
-                source = estimate?.Source,
-                trustedForEnforcement = estimate?.TrustedForEnforcement,
-                reservedQuotaPct = gate.ReservedPct,
-                projectedAvailablePct = gate.ProjectedAvailablePct,
-                wouldAllow = baseWouldAllow && gate.Allow,
-                insufficientHeadroom = gate.InsufficientHeadroom,
-                reason = baseWouldAllow ? gate.Reason : "quota exhausted",
-            });
-        }
+                Agent = probe.Kind,
+                Billing = AgentBilling.Subscription,
+                QualityScore = 100,
+            };
+        var snapshot = await probe.GetAvailabilityAsync(probeMember, ct);
         var recentFailuresForProbe = failures
             .Where(f => f.Agent == probe.Kind && f.ObservedAt >= now - options.ObservedFailureWindow)
             .ToList();
         var recentDefaultFailure = recentFailuresForProbe.Any(f => f.ModelId is null);
         var recentFailure = recentFailuresForProbe.Count > 0;
+        var headroomProjections = new List<object>();
+        foreach (var project in projectList)
+        {
+            foreach (var projectionMember in projectionMembersByProject[project.Id.Value])
+            {
+                var member = projectionMember.Member;
+                var quota = AgentQuotaResolver.ResolveMemberQuota(snapshot, member);
+                var gate = await headroomManager.EvaluateAsync(
+                    new QuotaHeadroomGateRequest(
+                        project.Id,
+                        member,
+                        quota.AvailablePct,
+                        quota.ResetAt,
+                        AuditOnRefusal: false,
+                        MinRemainingPct: options.MinQuotaPct),
+                    ct);
+                var estimate = gate.Estimate;
+                var recentMemberFailure = recentFailuresForProbe.Any(f => HasRecentFailureForMember(f, member));
+                var baseWouldAllow = QuotaRouter.WouldAllow(
+                    quota.AvailablePct,
+                    recentMemberFailure,
+                    options,
+                    reservedQuotaPct: gate.ReservedPct);
+                headroomProjections.Add(new
+                {
+                    projectId = project.Id.Value,
+                    agentClassId = projectionMember.AgentClassId,
+                    agent = member.Agent.Value,
+                    modelId = member.ModelId,
+                    availablePct = quota.AvailablePct,
+                    resetAt = quota.ResetAt,
+                    quotaWindow = quota.Window,
+                    estimatedIterPctCost = estimate?.EstimatedIterPctCost,
+                    averageTokensPerIteration = estimate?.AverageTokensPerIteration,
+                    sampledItemCount = estimate?.SampledItemCount,
+                    source = estimate?.Source,
+                    trustedForEnforcement = estimate?.TrustedForEnforcement,
+                    reservedQuotaPct = gate.ReservedPct,
+                    projectedAvailablePct = gate.ProjectedAvailablePct,
+                    wouldAllow = baseWouldAllow && gate.Allow,
+                    insufficientHeadroom = gate.InsufficientHeadroom,
+                    reason = baseWouldAllow ? gate.Reason : "quota exhausted",
+                });
+            }
+        }
         var modelKeys = snapshot.PerModel.Keys
             .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -2172,3 +2247,7 @@ namespace CodeyBox.Api
 
 // Exposed for WebApplicationFactory<Program> in integration tests.
 public partial class Program { }
+
+internal sealed record AgentClassCatalog(IReadOnlyList<AgentClass> Classes);
+
+internal sealed record QuotaProjectionMember(string? AgentClassId, AgentMembership Member);

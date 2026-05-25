@@ -2,12 +2,12 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-internal static class AgentQuotaResolver
+public static class AgentQuotaResolver
 {
     /// <summary>Sentinel ModelId meaning "any model in the bucket list is acceptable".</summary>
     internal const string AutoModelSentinel = "auto";
 
-    internal static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member)
+    public static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member)
     {
         if (string.IsNullOrWhiteSpace(member.ModelId))
             return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null);

@@ -328,6 +328,32 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public async Task ListPageAsync_ReturnsSortedLimitedPageAndHasMore()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig { Id = "gamma", RepositoryUrl = "https://github.com/me/gamma.git" },
+                new ProjectConfig { Id = "alpha", RepositoryUrl = "https://github.com/me/alpha.git" },
+                new ProjectConfig { Id = "beta", RepositoryUrl = "https://github.com/me/beta.git" },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+
+        var firstPage = await repo.ListPageAsync(2);
+
+        Assert.Equal(["alpha", "beta"], firstPage.Projects.Select(p => p.Id.Value).ToArray());
+        Assert.Equal(3, firstPage.TotalCount);
+        Assert.True(firstPage.HasMore);
+
+        var fullPage = await repo.ListPageAsync(10);
+        Assert.Equal(["alpha", "beta", "gamma"], fullPage.Projects.Select(p => p.Id.Value).ToArray());
+        Assert.Equal(3, fullPage.TotalCount);
+        Assert.False(fullPage.HasMore);
+    }
+
+    [Fact]
     public void InvalidMergeMethod_ThrowsAtStartup()
     {
         var opts = new ProjectsOptions
