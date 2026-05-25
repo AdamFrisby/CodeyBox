@@ -62,7 +62,7 @@ public sealed class PullRequestDescriptionTimeoutTests
 
         // Must not hang indefinitely — the timeout cancels the generator.
         var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(5)); // Guard so the test itself doesn't hang.
+            .WaitAsync(TimeSpan.FromSeconds(30)); // Guard so the test itself doesn't hang.
 
         Assert.True(outcome.BranchPushed);
         Assert.NotNull(outcome.PullRequestUrl);

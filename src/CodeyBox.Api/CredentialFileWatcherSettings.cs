@@ -7,11 +7,20 @@ internal static class CredentialFileWatcherSettings
     public const string EnvironmentVariable = "CODEYBOX_CREDENTIAL_FILE_WATCHERS";
     public const string ConfigurationKey = "CodeyBox:CredentialFileWatchers";
 
+    /// <summary>
+    /// When true, <see cref="IsEnabled(IConfiguration)"/> always returns false.
+    /// Used by <c>TestAssemblyInitializer</c> to prevent watcher exhaustion
+    /// during parallel test runs, even if <c>WebApplicationFactory</c>
+    /// clears configuration sources.
+    /// </summary>
+    public static bool ForceDisabledForTests { get; set; }
+
     public static bool IsEnabled(IConfiguration configuration)
         => IsEnabled(configuration, Environment.GetEnvironmentVariable(EnvironmentVariable));
 
     internal static bool IsEnabled(IConfiguration configuration, string? environmentValue)
     {
+        if (ForceDisabledForTests) return false;
         ArgumentNullException.ThrowIfNull(configuration);
 
         var raw = environmentValue ?? configuration[ConfigurationKey];

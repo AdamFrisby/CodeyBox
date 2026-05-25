@@ -272,13 +272,26 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var timerFiredMethod = typeof(QuotaRetryScheduler).GetMethod("OnTargetedTimerFired", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         timerFiredMethod!.Invoke(scheduler, [item.Id]);
 
-        // Targeted timer runs in background Task.Run, so wait a bit
-        await Task.Delay(100);
-
-        var retried = await store.GetAsync(item.Id);
+        // Targeted timer runs in background Task.Run, so wait for state change
+        var retried = await WaitForStateAsync(store, item.Id, WorkItemState.Queued, TimeSpan.FromSeconds(5));
+        
+        Assert.NotNull(retried);
         Assert.Equal(WorkItemState.Queued, retried!.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
         Assert.Contains(webhooks.Events, e => e.Event == "work_item.auto_retry");
+    }
+
+    private static async Task<WorkItem?> WaitForStateAsync(
+        IWorkItemStore store, WorkItemId id, WorkItemState target, TimeSpan timeout)
+    {
+        var start = DateTimeOffset.UtcNow;
+        while (DateTimeOffset.UtcNow - start < timeout)
+        {
+            var item = await store.GetAsync(id);
+            if (item?.State == target) return item;
+            await Task.Delay(50);
+        }
+        return await store.GetAsync(id);
     }
 
     [Fact]

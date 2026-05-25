@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using CodeyBox.Api;
 using CodeyBox.Orchestrator;
 using CodeyBox.Webhooks;
 using Microsoft.Extensions.Configuration;
@@ -27,7 +28,10 @@ internal static class TestAssemblyInitializer
 
         SetIfMissing("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing("ASPNETCORE_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
-        SetIfMissing("CodeyBox__CredentialFileWatchers", "false");
+        
+        // Robustly disable credential watchers via process-wide flag.
+        CredentialFileWatcherSettings.ForceDisabledForTests = true;
+
         TestFileSystemWatcherLeakTracker.Install();
 
         // Fail fast in CI on schema drift: every WebhookEvent that goes

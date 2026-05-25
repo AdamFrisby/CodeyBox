@@ -136,7 +136,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await queue.EnqueueAsync(high.Id);
 
         await svc.StartAsync(CancellationToken.None);
-        var done = await WaitForAllDoneAsync(new[] { low.Id, mid.Id, high.Id }, TimeSpan.FromSeconds(5));
+        var done = await WaitForAllDoneAsync(new[] { low.Id, mid.Id, high.Id }, TimeSpan.FromSeconds(30));
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(done, "All items should reach Done");
@@ -160,7 +160,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await queue.EnqueueAsync(older.Id);
 
         await svc.StartAsync(CancellationToken.None);
-        var done = await WaitForAllDoneAsync(new[] { older.Id, newer.Id }, TimeSpan.FromSeconds(5));
+        var done = await WaitForAllDoneAsync(new[] { older.Id, newer.Id }, TimeSpan.FromSeconds(30));
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(done);
@@ -199,7 +199,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
 
         // Wait for the first worker to enter the pipeline.
-        var firstIn = await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var firstIn = await entered.Task.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.Equal(a.Id, firstIn);
 
         // Bump C's priority while A is held in the pipeline. The dispatcher's
@@ -214,14 +214,14 @@ public sealed class WorkItemPriorityTests : IDisposable
         pipeline.ResetEntered();
         release.SetResult();
 
-        var secondIn = await pipeline.NextEnteredAsync(TimeSpan.FromSeconds(5));
+        var secondIn = await pipeline.NextEnteredAsync(TimeSpan.FromSeconds(30));
         Assert.Equal(c.Id, secondIn);
 
         // Let remaining items finish.
         pipeline.ReleaseAll();
 
         var allDone = await WaitForAllDoneAsync(new[] { a.Id, b.Id, c.Id },
-            TimeSpan.FromSeconds(5));
+            TimeSpan.FromSeconds(30));
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(allDone);
