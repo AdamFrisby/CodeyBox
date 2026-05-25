@@ -166,9 +166,9 @@ public sealed class QuotaEndpointTests
         Assert.Equal(10, untrustedProjection.GetProperty("estimatedIterPctCost").GetDouble(), precision: 2);
         Assert.False(untrustedProjection.GetProperty("trustedForEnforcement").GetBoolean());
         Assert.Equal(5, untrustedProjection.GetProperty("projectedAvailablePct").GetDouble(), precision: 2);
-        Assert.True(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
-        Assert.False(untrustedProjection.GetProperty("insufficientHeadroom").GetBoolean());
-        Assert.Contains("advisory", untrustedProjection.GetProperty("reason").GetString());
+        Assert.False(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
+        Assert.True(untrustedProjection.GetProperty("insufficientHeadroom").GetBoolean());
+        Assert.Contains("insufficient headroom", untrustedProjection.GetProperty("reason").GetString());
     }
 
     [Fact]

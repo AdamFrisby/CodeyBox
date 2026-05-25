@@ -32,7 +32,12 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     {
         _store.Dispose();
         _rawConn.Dispose();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TryDelete(_dbPath);
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); } catch { /* best-effort */ }
     }
 
     private void SeedWorkItem(string id, string projectId = "test-project")
@@ -82,6 +87,85 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(500, row.CachedInputTokens);
         Assert.Equal(678, row.OutputTokens);
         Assert.Equal(0.168525, row.EstimatedUsd, precision: 5);
+    }
+
+    [Fact]
+    public async Task Constructor_MigratesExistingCostTableWithoutRawMetadataJson()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-cost-upgrade-test-{Guid.NewGuid():N}.db");
+        try
+        {
+            var itemId = Guid.NewGuid().ToString();
+            var started = DateTimeOffset.UtcNow.AddMinutes(-10).ToString("O");
+            var ended = DateTimeOffset.UtcNow.AddMinutes(-9).ToString("O");
+            using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                conn.Open();
+                using var setup = conn.CreateCommand();
+                setup.CommandText = """
+                    CREATE TABLE work_items (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL DEFAULT '',
+                        state INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE work_item_costs (
+                        id                  TEXT PRIMARY KEY,
+                        work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        phase               TEXT NOT NULL,
+                        iteration           INTEGER,
+                        agent_kind          TEXT NOT NULL,
+                        model_id            TEXT,
+                        input_tokens        INTEGER NOT NULL,
+                        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens       INTEGER NOT NULL,
+                        estimated_usd       REAL NOT NULL DEFAULT 0,
+                        started_at          TEXT NOT NULL,
+                        ended_at            TEXT NOT NULL
+                    );
+                    INSERT INTO work_items (id, project_id, state, updated_at)
+                    VALUES ($wi, 'proj-upgrade', 0, $ended);
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens,
+                         estimated_usd, started_at, ended_at)
+                    VALUES
+                        ('old-cost', $wi, 'work', 1, 'claude', 'claude-opus-4-7',
+                         1000, 50, 200, 0.42, $started, $ended);
+                    """;
+                setup.Parameters.AddWithValue("$wi", itemId);
+                setup.Parameters.AddWithValue("$started", started);
+                setup.Parameters.AddWithValue("$ended", ended);
+                setup.ExecuteNonQuery();
+            }
+
+            using var store = new SqliteWorkItemCostStore(dbPath);
+            await store.RecordAsync(MakeCost(itemId) with
+            {
+                Id = "new-cost",
+                RawMetadataJson = """{"usageSource":"provider_metadata"}""",
+            });
+
+            var rows = await store.GetByWorkItemAsync(itemId);
+            Assert.Equal(2, rows.Count);
+            Assert.Equal("{}", rows.Single(r => r.Id == "old-cost").RawMetadataJson);
+            Assert.Equal("""{"usageSource":"provider_metadata"}""", rows.Single(r => r.Id == "new-cost").RawMetadataJson);
+
+            var recent = await store.GetRecentByProjectAsync(
+                "proj-upgrade",
+                DateTimeOffset.UtcNow.AddHours(-1),
+                DateTimeOffset.UtcNow.AddHours(1),
+                "claude",
+                "claude-opus-4-7",
+                maxItems: 1);
+            Assert.Equal(2, recent.Count);
+        }
+        finally
+        {
+            TryDelete(dbPath);
+            TryDelete(dbPath + "-wal");
+            TryDelete(dbPath + "-shm");
+        }
     }
 
     [Fact]
@@ -377,7 +461,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task CostHistoryQuotaHeadroomEstimator_UsesProductionDefaultsAsUntrustedAndDoesNotEnforce()
+    public async Task CostHistoryQuotaHeadroomEstimator_UsesProductionDefaultsAsUntrustedButStillEnforcesProjection()
     {
         var productionDefaultItem = Guid.NewGuid().ToString();
         var explicitUntrustedItem = Guid.NewGuid().ToString();
@@ -457,10 +541,13 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
             AuditOnRefusal: false,
             MinRemainingPct: opts.MinQuotaPct));
 
-        Assert.True(gate.Allow);
-        Assert.False(gate.InsufficientHeadroom);
-        Assert.Contains("advisory", gate.Reason);
+        Assert.False(gate.Allow);
+        Assert.True(gate.InsufficientHeadroom);
+        Assert.NotNull(gate.Estimate);
+        Assert.False(gate.Estimate!.TrustedForEnforcement);
+        Assert.Equal(4.5, gate.Estimate.EstimatedIterPctCost, precision: 2);
         Assert.Equal(9.5, gate.ProjectedAvailablePct!.Value, precision: 2);
+        Assert.Contains("insufficient headroom", gate.Reason);
     }
 
     [Fact]

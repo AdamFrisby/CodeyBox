@@ -459,11 +459,16 @@ public sealed class AgentClassRouter : IQuotaResetResolver
         var reservedPct = _headroomManager?.GetReservedHeadroomPct(projectId, member.Agent) ?? 0;
         if (availablePct >= 0)
         {
-            if (!QuotaRouter.WouldAllow(availablePct, false, _opts, reservedQuotaPct: reservedPct))
-                return new QuotaGateDecision(false, "quota exhausted", resetAt);
-
             if (_headroomManager is null)
+            {
+                if (!QuotaRouter.WouldAllow(availablePct, false, _opts, reservedQuotaPct: reservedPct))
+                    return new QuotaGateDecision(false, "quota exhausted", resetAt);
+
                 return new QuotaGateDecision(true, $"{availablePct:F1}% available", resetAt);
+            }
+
+            if (!QuotaRouter.WouldAllow(availablePct, false, _opts))
+                return new QuotaGateDecision(false, "quota exhausted", resetAt);
 
             var request = new QuotaHeadroomGateRequest(
                 projectId,

@@ -72,6 +72,66 @@ public sealed class AgentClassRouterAuditTests : IDisposable
         Assert.Equal("insufficient headroom", GetScalar<string>(evt, "Reason"));
     }
 
+    [Fact]
+    public async Task ReservedHeadroomRefusal_EmitsQuotaDispatchRefusedAuditEvent()
+    {
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Claude,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = [member],
+        };
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(AgentKind.Claude, 15.0) };
+        var manager = new InProcessQuotaHeadroomManager(
+            new FixedHeadroomEstimator(10.0),
+            probes,
+            opts,
+            NullLogger<InProcessQuotaHeadroomManager>.Instance);
+        var projectId = new ProjectId("proj-reserved-audit");
+        var lease = await manager.TryReserveAsync(new QuotaHeadroomGateRequest(
+            projectId,
+            member,
+            AvailablePct: 50.0,
+            ResetAt: null,
+            AuditOnRefusal: false,
+            MinRemainingPct: opts.MinQuotaPct));
+        Assert.NotNull(lease.Reservation);
+
+        var router = new AgentClassRouter(
+            [cls],
+            probes,
+            opts,
+            NullLogger<AgentClassRouter>.Instance,
+            headroomManager: manager);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "t",
+            Prompt = "p",
+            AgentClassId = "frontier",
+        };
+
+        var decision = await router.ResolveAsync(item, null, CancellationToken.None);
+        await lease.Reservation!.ReleaseAsync(quotaMayHaveBeenConsumed: false);
+
+        Assert.True(decision.ShouldWait);
+        var evt = _sink.Events.Single(e => GetScalar<string>(e, "EventName") == "quota_dispatch_refused");
+        Assert.Equal(LogEventLevel.Warning, evt.Level);
+        Assert.Equal("claude", GetScalar<string>(evt, "Agent"));
+        Assert.Equal("proj-reserved-audit", GetScalar<string>(evt, "ProjectId"));
+        Assert.Equal(15.0, GetScalar<double>(evt, "AvailablePct"));
+        Assert.Equal(10.0, GetScalar<double>(evt, "EstimatedCost"));
+        Assert.Equal("insufficient headroom", GetScalar<string>(evt, "Reason"));
+    }
+
     private static T? GetScalar<T>(LogEvent evt, string key)
     {
         Assert.True(evt.Properties.TryGetValue(key, out var value), $"missing property {key}");

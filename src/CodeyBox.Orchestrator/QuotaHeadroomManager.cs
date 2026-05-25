@@ -125,18 +125,6 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
                 ProjectedAvailablePct: projectedWithoutEstimate);
         }
 
-        if (!estimate!.TrustedForEnforcement)
-        {
-            var projectedWithAdvisoryEstimate = request.AvailablePct - reservedPct - cost;
-            return new QuotaHeadroomGateResult(
-                true,
-                "quota available; headroom estimate is advisory only because history is untrusted",
-                request.ResetAt,
-                Estimate: estimate,
-                ReservedPct: reservedPct,
-                ProjectedAvailablePct: projectedWithAdvisoryEstimate);
-        }
-
         IQuotaReservationLease? reservation = null;
 
         if (reserve)

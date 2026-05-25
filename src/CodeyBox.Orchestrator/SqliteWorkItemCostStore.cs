@@ -60,6 +60,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
                 ON work_item_costs(agent_kind, model_id, started_at, ended_at, work_item_id);
             """;
         createCmd.ExecuteNonQuery();
+        EnsureRawMetadataColumn();
 
         _insertCmd = _conn.CreateCommand();
         _insertCmd.CommandText = """
@@ -454,6 +455,24 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         EndedAt = DateTimeOffset.Parse(r.GetString(11)),
         RawMetadataJson = r.GetString(12),
     };
+
+    private void EnsureRawMetadataColumn()
+    {
+        using (var info = _conn.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(work_item_costs)";
+            using var reader = info.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), "raw_metadata_json", StringComparison.OrdinalIgnoreCase))
+                    return;
+            }
+        }
+
+        using var alter = _conn.CreateCommand();
+        alter.CommandText = "ALTER TABLE work_item_costs ADD COLUMN raw_metadata_json TEXT NOT NULL DEFAULT '{}'";
+        alter.ExecuteNonQuery();
+    }
 
     private static WorkItemCostReconciliation ToCostReconciliation(AgentStreamSummaryRow row) =>
         new(
