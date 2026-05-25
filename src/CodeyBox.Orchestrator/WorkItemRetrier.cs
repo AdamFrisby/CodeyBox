@@ -40,12 +40,16 @@ public sealed class WorkItemRetrier
         CancellationToken ct = default)
     {
         var requestedFrom = from.Trim().ToLowerInvariant();
-        var resumeState = requestedFrom switch
+        var resumingPreemptFromQuotaWait = item.State == WorkItemState.WaitingForQuotaReset
+            && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        var resumeState = (requestedFrom, resumingPreemptFromQuotaWait) switch
         {
-            "work" => WorkItemState.Queued,
-            "audit" => WorkItemState.WorkComplete,
-            "merge" => WorkItemState.AuditPassed,
-            "upstream" => WorkItemState.Merged,
+            ("work", true) => WorkItemState.Working,
+            ("audit", true) => WorkItemState.Reworking,
+            ("work", _) => WorkItemState.Queued,
+            ("audit", _) => WorkItemState.WorkComplete,
+            ("merge", _) => WorkItemState.AuditPassed,
+            ("upstream", _) => WorkItemState.Merged,
             _ => (WorkItemState?)null,
         };
 
@@ -54,13 +58,18 @@ public sealed class WorkItemRetrier
 
         var actualFrom = requestedFrom;
 
-        // For from != "work", the pipeline expects the bare repo to still be present.
+        // For post-work resumes, the pipeline expects the bare repo and work
+        // branch to still be present. Preempt resumes restore from the checkpoint
+        // ref instead, so they only need the bare repo.
         if (resumeState != WorkItemState.Queued)
         {
             var present = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!present)
                 return (false, $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists", null, null);
+        }
 
+        if (resumeState is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged)
+        {
             // The work branch must also exist — earlier work-phase failures can
             // leave the item in Failed without ever producing a commit, in which
             // case the requested post-work resume would crash the pipeline with

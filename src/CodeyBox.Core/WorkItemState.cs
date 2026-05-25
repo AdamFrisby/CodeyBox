@@ -19,9 +19,11 @@ public enum WorkItemState
     Done = 6,
     NeedsOperatorInput = 10,
     /// <summary>
-    /// All eligible members of the agent class hit quota during this
-    /// iteration. The work item is parked (not Failed) and re-enqueued by the
-    /// quota retry scheduler when a probe shows any member is available again.
+    /// All eligible members of the agent class hit quota during this iteration,
+    /// or proactive headroom projection found that dispatch would likely cross
+    /// the configured quota floor. The work item is parked (not Failed) and
+    /// re-enqueued by the quota retry scheduler when a probe shows any member is
+    /// available again.
     /// Distinct from <see cref="Failed"/> + FailureKind="quota" because that
     /// path captures an item that *already failed* a single-agent attempt;
     /// this state captures items that exhausted every fallback in one pickup.

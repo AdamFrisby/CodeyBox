@@ -59,6 +59,86 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaWaitParker_PreservesPreemptCheckpointForParkedWorkingItem()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var resetAt = DateTimeOffset.UtcNow.AddMinutes(30);
+        var preemptedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var id = WorkItemId.New();
+        var checkpoint = $"refs/heads/codeybox/preempt/{id}";
+        var item = new WorkItem
+        {
+            Id = id,
+            ProjectId = new ProjectId("p1"),
+            Title = "preempted",
+            Prompt = "p",
+            State = WorkItemState.Working,
+            PreemptedAt = preemptedAt,
+            PreemptCheckpoint = checkpoint,
+        };
+        await store.CreateAsync(item);
+
+        var parker = new QuotaWaitParker(store, timeProvider: new FixedClock(DateTimeOffset.UtcNow));
+        await parker.ParkAsync(new QuotaWaitParkRequest(
+            item,
+            "insufficient headroom",
+            "work",
+            resetAt));
+
+        var parked = await store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal(preemptedAt, parked.PreemptedAt);
+        Assert.Equal(checkpoint, parked.PreemptCheckpoint);
+        Assert.Equal("work", parked.QuotaRetryFrom);
+    }
+
+    [Theory]
+    [InlineData("work", WorkItemState.Working)]
+    [InlineData("audit", WorkItemState.Reworking)]
+    public async Task WorkItemRetrier_WaitingForQuotaResetWithPreemptCheckpoint_ResumesCheckpointState(
+        string retryFrom,
+        WorkItemState expectedState)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var queue = new InMemoryTaskQueue();
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var id = WorkItemId.New();
+        var checkpoint = $"refs/heads/codeybox/preempt/{id}";
+        var item = new WorkItem
+        {
+            Id = id,
+            ProjectId = new ProjectId("p1"),
+            Title = "preempted",
+            Prompt = "p",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            WorkBranch = "codeybox/test",
+            PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PreemptCheckpoint = checkpoint,
+            QuotaRetryFrom = retryFrom,
+        };
+        await store.CreateAsync(item);
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await TestSupport.RunGit(gitHost.GetRepoPath(repoId), "update-ref", checkpoint, "refs/heads/main");
+        var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+
+        var result = await retrier.RetryAsync(item, retryFrom, trigger: "periodic");
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(expectedState, result.ResumeState);
+        Assert.Equal(retryFrom, result.ActualFrom);
+        var stored = await store.GetAsync(item.Id);
+        Assert.Equal(expectedState, stored!.State);
+        Assert.Equal(checkpoint, stored.PreemptCheckpoint);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public void WorkItemWith_TransitionToNonQuotaState_ClearsQuotaFields()
     {
         // Symmetric guard: transitioning back to Queued for a retry must clear
@@ -428,6 +508,8 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Theory]
+    [InlineData(WorkItemState.Queued, "work")]
+    [InlineData(WorkItemState.Working, "work")]
     [InlineData(WorkItemState.WorkComplete, "audit")]
     [InlineData(WorkItemState.Auditing, "audit")]
     [InlineData(WorkItemState.Reworking, "audit")]
@@ -486,14 +568,19 @@ public sealed class WaitingForQuotaResetTests : IDisposable
             router,
             projects);
 
+        var itemId = WorkItemId.New();
         var item = new WorkItem
         {
-            Id = WorkItemId.New(),
+            Id = itemId,
             ProjectId = pid,
             Title = "phase resume",
             Prompt = "p",
             State = state,
             WorkBranch = "codeybox/test",
+            PreemptedAt = state == WorkItemState.Working ? now.AddMinutes(-5) : null,
+            PreemptCheckpoint = state == WorkItemState.Working
+                ? $"refs/heads/codeybox/preempt/{itemId}"
+                : null,
         };
         await store.CreateAsync(item);
         await queue.EnqueueAsync(item.Id);
@@ -521,6 +608,154 @@ public sealed class WaitingForQuotaResetTests : IDisposable
         {
             await svc.StopAsync(CancellationToken.None);
         }
+    }
+
+    [Fact]
+    public async Task DispatchParkedQueuedWork_SchedulerRetriesFromWorkAndPipelineRuns()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var now = DateTimeOffset.UtcNow;
+        var time = new FixedClock(now);
+        var pid = new ProjectId("p1");
+        var resetAt = now.AddMinutes(30);
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = pid,
+            DisplayName = "p1",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Claude,
+            DefaultAgentClass = "test-class",
+        });
+        var classes = new List<AgentClass>
+        {
+            new AgentClass
+            {
+                Id = "test-class",
+                DisplayName = "Test",
+                Members =
+                [
+                    new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                ],
+            },
+        };
+
+        var exhaustedRouter = new AgentClassRouter(
+            classes,
+            [new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 5, ResetAt = resetAt })],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, QuotaRecheckInterval = TimeSpan.FromMinutes(5) },
+            NullLogger<AgentClassRouter>.Instance,
+            time);
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var pipeline = new FakePipelineRunner(store);
+        var service = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            exhaustedRouter,
+            projects);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = pid,
+            Title = "dispatch retry",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        await service.StartAsync(CancellationToken.None);
+        WorkItem? parked;
+        try
+        {
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            parked = null;
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                parked = await store.GetAsync(item.Id);
+                if (parked?.State == WorkItemState.WaitingForQuotaReset)
+                    break;
+                await Task.Delay(20);
+            }
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal("work", parked.QuotaRetryFrom);
+        Assert.DoesNotContain(item.Id, pipeline.Executed);
+
+        var restoredRouter = new AgentClassRouter(
+            classes,
+            [new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 100, ResetAt = resetAt })],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            time);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(1),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            restoredRouter,
+            projects,
+            timeProvider: time);
+
+        var sweep = typeof(QuotaRetryScheduler).GetMethod(
+            "RunPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)sweep.Invoke(scheduler, [CancellationToken.None])!;
+
+        var retried = await store.GetAsync(item.Id);
+        Assert.NotNull(retried);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+
+        var resumeService = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            restoredRouter,
+            projects);
+
+        await resumeService.StartAsync(CancellationToken.None);
+        try
+        {
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            while (DateTimeOffset.UtcNow < deadline && !pipeline.Executed.Contains(item.Id))
+                await Task.Delay(20);
+        }
+        finally
+        {
+            await resumeService.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Contains(item.Id, pipeline.Executed);
+        var final = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
     }
 
     [Fact]

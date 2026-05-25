@@ -271,12 +271,15 @@ public sealed record WorkItem
             // Clear WorkBranch when re-queuing from Working: the in-flight branch is
             // gone; the next pickup generates a fresh one.
             WorkBranch = state == WorkItemState.Queued ? null : WorkBranch,
-            PreemptedAt = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptedAt : null,
-            PreemptCheckpoint = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptCheckpoint : null,
+            PreemptedAt = IsPreemptCheckpointCarryingState(state) ? PreemptedAt : null,
+            PreemptCheckpoint = IsPreemptCheckpointCarryingState(state) ? PreemptCheckpoint : null,
         };
 
     private static bool IsQuotaShapedState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
+
+    private static bool IsPreemptCheckpointCarryingState(WorkItemState state) =>
+        state is WorkItemState.Working or WorkItemState.Reworking or WorkItemState.WaitingForQuotaReset;
 
     private static bool IsCancellationSourceCarryingState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.Cancelled;
