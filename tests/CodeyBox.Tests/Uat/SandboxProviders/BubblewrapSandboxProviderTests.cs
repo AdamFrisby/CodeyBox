@@ -124,7 +124,7 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         });
         var chunks = new List<string>();
 
-        var result = await sandbox.ExecAsync(new SandboxExec
+        var result = await ExecWithEtxtbsyRetryAsync(sandbox, new SandboxExec
         {
             Argv = ["ignored"],
             Stdin = "abcdef",
@@ -171,7 +171,7 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         });
         using var cts = new CancellationTokenSource();
 
-        var execTask = sandbox.ExecAsync(new SandboxExec { Argv = ["ignored"] }, cts.Token);
+        var execTask = ExecWithEtxtbsyRetryAsync(sandbox, new SandboxExec { Argv = ["ignored"] }, cts.Token);
         if (File.Exists(readyPath))
             ready.TrySetResult();
         await ready.Task;
@@ -201,6 +201,29 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         File.SetUnixFileMode(tempPath,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         File.Move(tempPath, path);
+    }
+
+    // ETXTBSY ("Text file busy") races with parallel test forks: another test's
+    // Process.Start() can fork while this test's WriteExecutableScript still has a
+    // write FD open on the script's inode. The forked child inherits that FD,
+    // causing the subsequent execve of the same inode to fail. Retry briefly.
+    private static async Task<SandboxExecResult> ExecWithEtxtbsyRetryAsync(
+        ISandbox sandbox, SandboxExec exec, CancellationToken ct = default)
+    {
+        const int maxAttempts = 8;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await sandbox.ExecAsync(exec, ct);
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+                when (attempt < maxAttempts
+                    && ex.Message.Contains("Text file busy", StringComparison.Ordinal))
+            {
+                await Task.Delay(25 * attempt, ct);
+            }
+        }
     }
 
     private static void AssertOption(string[] argv, string option, params string[] values)
