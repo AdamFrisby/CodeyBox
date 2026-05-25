@@ -327,23 +327,37 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
 
         if (_webhooks is not null)
         {
-            var project = await _projects!.GetAsync(item.ProjectId, ct);
-            var updated = await _store.GetAsync(item.Id, ct);
-            await _webhooks.PublishAsync(new WebhookEvent
+            try
             {
-                Event = "work_item.auto_retry",
-                WorkItem = updated ?? item,
-                Project = project,
-                Details = new
+                var project = await _projects!.GetAsync(item.ProjectId, ct);
+                var updated = await _store.GetAsync(item.Id, ct);
+                await _webhooks.PublishAsync(new WebhookEvent
                 {
-                    workItemId = item.Id.ToString(),
-                    reason = "quota",
-                    attemptNumber = (updated?.QuotaRetryAttempts ?? item.QuotaRetryAttempts + 1),
-                    triggeredBy = trigger,
-                    from = retryFrom,
-                    actualFrom
-                }
-            }, CancellationToken.None);
+                    Event = "work_item.auto_retry",
+                    WorkItem = updated ?? item,
+                    Project = project,
+                    Details = new
+                    {
+                        workItemId = item.Id.ToString(),
+                        reason = "quota",
+                        attemptNumber = (updated?.QuotaRetryAttempts ?? item.QuotaRetryAttempts + 1),
+                        triggeredBy = trigger,
+                        from = retryFrom,
+                        actualFrom
+                    }
+                }, CancellationToken.None);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Quota auto-retry for work item {Id} succeeded, but auto-retry webhook delivery failed",
+                    item.Id);
+            }
         }
 
         return new QuotaRetryAttemptResult("retried", actualFrom == retryFrom ? $"from={retryFrom}" : $"from={retryFrom}; actualFrom={actualFrom}");

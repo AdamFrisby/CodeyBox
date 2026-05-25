@@ -146,6 +146,27 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
+    public async Task PeriodicSweep_AuditLogsActualFromWhenRetryFallsBackToWork()
+    {
+        using var fixture = BuildScheduler(BuildRouter(availablePct: 100), BuildProjects());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            QuotaRetryFrom = "audit",
+            WorkBranch = "codeybox/missing-work",
+        };
+        await fixture.Store.CreateAsync(item);
+        await fixture.GitHost.EnsureRepositoryAsync(item.Id, seedFromUrl: null);
+
+        await RunPeriodicSweepAsync(fixture.Scheduler);
+
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        var evt = AssertQuotaAttempt(item, "periodic", "retried", "WaitingForQuotaReset");
+        Assert.Equal("from=audit; actualFrom=work", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public async Task TargetedTimer_AuditLogsTargetedSource()
     {
         var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
@@ -166,7 +187,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
-    public async Task PeriodicSweep_ContinuesAfterRetryExceptionAndAuditsError()
+    public async Task PeriodicSweep_WebhookFailureDoesNotOverrideRetryAudit()
     {
         using var fixture = BuildScheduler(
             BuildRouter(availablePct: 100),
@@ -181,12 +202,12 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
         Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(first.Id))!.State);
         Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(second.Id))!.State);
-        Assert.Equal("webhook failed", GetScalar<string>(AssertQuotaAttempt(first, "periodic", "error", "WaitingForQuotaReset"), "Reason"));
-        Assert.Equal("webhook failed", GetScalar<string>(AssertQuotaAttempt(second, "periodic", "error", "WaitingForQuotaReset"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(first, "periodic", "retried", "WaitingForQuotaReset"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(second, "periodic", "retried", "WaitingForQuotaReset"), "Reason"));
     }
 
     [Fact]
-    public async Task RearmTimers_ContinuesAfterOverdueRetryExceptionAndAuditsError()
+    public async Task RearmTimers_WebhookFailureDoesNotOverrideRetryAudit()
     {
         using var fixture = BuildScheduler(
             BuildRouter(availablePct: 100),
@@ -207,8 +228,45 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
         Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(first.Id))!.State);
         Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(second.Id))!.State);
-        Assert.Equal("webhook failed", GetScalar<string>(AssertQuotaAttempt(first, "rearm-overdue", "error", "WaitingForQuotaReset"), "Reason"));
-        Assert.Equal("webhook failed", GetScalar<string>(AssertQuotaAttempt(second, "rearm-overdue", "error", "WaitingForQuotaReset"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(first, "rearm-overdue", "retried", "WaitingForQuotaReset"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(second, "rearm-overdue", "retried", "WaitingForQuotaReset"), "Reason"));
+    }
+
+    [Fact]
+    public async Task PeriodicRetry_RethrowsSchedulerCancellation()
+    {
+        using var cts = new CancellationTokenSource();
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            new CancellingProjectRepository(cts));
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => TryPeriodicRetryAsync(fixture.Scheduler, item, cts.Token));
+
+        Assert.True(cts.IsCancellationRequested);
+        Assert.DoesNotContain(_sink.Events, e =>
+            string.Equals(GetScalar<string>(e, "EventName"), "quota_retry_attempted", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task RearmTimer_RethrowsSchedulerCancellation()
+    {
+        using var cts = new CancellationTokenSource();
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            new CancellingProjectRepository(cts));
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        };
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => TryRearmTimerAsync(fixture.Scheduler, item, cts.Token));
+
+        Assert.True(cts.IsCancellationRequested);
+        Assert.DoesNotContain(_sink.Events, e =>
+            string.Equals(GetScalar<string>(e, "EventName"), "quota_retry_attempted", StringComparison.Ordinal));
     }
 
     private sealed class StaticQuotaProbe : IAgentQuotaProbe
@@ -274,7 +332,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             queueController,
             webhooks,
             time);
-        return new SchedulerFixture(store, scheduler);
+        return new SchedulerFixture(store, gitHost, scheduler);
     }
 
     private static IProjectRepository BuildProjects()
@@ -307,12 +365,28 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         await (Task)sweep.Invoke(scheduler, [CancellationToken.None])!;
     }
 
+    private static async Task TryPeriodicRetryAsync(QuotaRetryScheduler scheduler, WorkItem item, CancellationToken ct)
+    {
+        var retry = typeof(QuotaRetryScheduler).GetMethod(
+            "TryPeriodicRetryAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)retry.Invoke(scheduler, [item, ct])!;
+    }
+
     private static async Task RearmTimersAsync(QuotaRetryScheduler scheduler)
     {
         var rearm = typeof(QuotaRetryScheduler).GetMethod(
             "RearmTimersAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         await (Task)rearm.Invoke(scheduler, [CancellationToken.None])!;
+    }
+
+    private static async Task TryRearmTimerAsync(QuotaRetryScheduler scheduler, WorkItem item, CancellationToken ct)
+    {
+        var rearm = typeof(QuotaRetryScheduler).GetMethod(
+            "TryRearmTimerAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task<bool>)rearm.Invoke(scheduler, [item, ct])!;
     }
 
     private LogEvent AssertQuotaAttempt(WorkItem item, string source, string outcome, string state)
@@ -347,13 +421,15 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
     public sealed class SchedulerFixture : IDisposable
     {
-        public SchedulerFixture(SqliteWorkItemStore store, QuotaRetryScheduler scheduler)
+        public SchedulerFixture(SqliteWorkItemStore store, LocalGitHost gitHost, QuotaRetryScheduler scheduler)
         {
             Store = store;
+            GitHost = gitHost;
             Scheduler = scheduler;
         }
 
         public SqliteWorkItemStore Store { get; }
+        public LocalGitHost GitHost { get; }
         public QuotaRetryScheduler Scheduler { get; }
 
         public void Dispose()
@@ -361,6 +437,23 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             Scheduler.Dispose();
             Store.Dispose();
         }
+    }
+
+    private sealed class CancellingProjectRepository : IProjectRepository
+    {
+        private readonly CancellationTokenSource _cts;
+
+        public CancellingProjectRepository(CancellationTokenSource cts) => _cts = cts;
+
+        public Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+        {
+            _cts.Cancel();
+            ct.ThrowIfCancellationRequested();
+            throw new OperationCanceledException(ct);
+        }
+
+        public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Project>>([]);
     }
 
     private sealed class FakeQueueController : IQueueController
