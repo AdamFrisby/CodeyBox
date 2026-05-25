@@ -113,7 +113,7 @@ public sealed class QuotaEndpointTests
             EstimatedUsd = 1.0,
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
             EndedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
-            RawMetadataJson = """{"usageSource":"provider_metadata"}""",
+            RawMetadataJson = """{"quotaHeadroomTrusted":true,"usageSource":"provider_api"}""",
         });
 
         var client = configuredFactory.CreateClient();

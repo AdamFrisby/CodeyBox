@@ -77,7 +77,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             new QuotaHeadroomRequest(item.ProjectId, AgentKind.Claude, "fake-model"));
 
         Assert.NotNull(estimate);
-        Assert.True(estimate!.TrustedForEnforcement);
+        Assert.False(estimate!.TrustedForEnforcement);
         Assert.Equal(20.0, estimate.EstimatedIterPctCost, precision: 2);
         Assert.Equal(2_400, estimate.AverageTokensPerIteration, precision: 2);
     }

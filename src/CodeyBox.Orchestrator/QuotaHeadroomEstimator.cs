@@ -90,22 +90,21 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
         }
 
         var hasModel = !string.IsNullOrWhiteSpace(request.ModelId);
-        IReadOnlyList<WorkItemCost> scoped = hasModel
-            ? await _costs.GetRecentByProjectAsync(
+        var scoped = hasModel
+            ? FilterHeadroomRows(await _costs.GetRecentByProjectAsync(
                 request.ProjectId.Value,
                 from,
                 now,
                 request.Agent.Value,
                 request.ModelId,
                 maxItems,
-                ct)
-            : [];
-        scoped = FilterTrustedRows(scoped);
+                ct))
+            : FilteredHeadroomRows.Empty;
         var source = "agent+model";
 
-        if (scoped.Count == 0)
+        if (scoped.Rows.Count == 0)
         {
-            scoped = FilterTrustedRows(await _costs.GetRecentByProjectAsync(
+            scoped = FilterHeadroomRows(await _costs.GetRecentByProjectAsync(
                 request.ProjectId.Value,
                 from,
                 now,
@@ -116,9 +115,9 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
             source = "agent";
         }
 
-        if (scoped.Count == 0)
+        if (scoped.Rows.Count == 0)
         {
-            scoped = FilterTrustedRows(await _costs.GetRecentByProjectAsync(
+            scoped = FilterHeadroomRows(await _costs.GetRecentByProjectAsync(
                 request.ProjectId.Value,
                 from,
                 now,
@@ -130,7 +129,7 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
         }
 
         var samples = BuildPerItemIterationSamples(
-            scoped,
+            scoped.Rows,
             maxItems,
             _options.HeadroomMaxTokensPerIteration);
         if (samples.Count == 0)
@@ -170,7 +169,7 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
             AverageTokensPerIteration: Math.Round(averageTokens, 2, MidpointRounding.AwayFromZero),
             SampledItemCount: samples.Count,
             Source: source,
-            TrustedForEnforcement: true);
+            TrustedForEnforcement: scoped.TrustedForEnforcement);
     }
 
     private double ResolveTokensPerPct(AgentKind agent)
@@ -184,23 +183,38 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
         return _options.HeadroomTokensPerQuotaPct;
     }
 
-    private IReadOnlyList<WorkItemCost> FilterTrustedRows(IReadOnlyList<WorkItemCost> rows)
+    private FilteredHeadroomRows FilterHeadroomRows(IReadOnlyList<WorkItemCost> rows)
     {
         if (rows.Count == 0)
-            return rows;
+            return FilteredHeadroomRows.Empty;
 
         var maxTokensPerRow = _options.HeadroomMaxTokensPerCostRow;
         if (maxTokensPerRow <= 0)
         {
             _log.LogWarning(
                 "Quota headroom projection disabled: HeadroomMaxTokensPerCostRow must be positive");
-            return [];
+            return FilteredHeadroomRows.Empty;
         }
 
-        return rows
-            .Where(row => IsTrustedHeadroomRow(row)
-                && IsValidTokenRow(row, maxTokensPerRow))
-            .ToList();
+        var accepted = new List<WorkItemCost>();
+        var allAcceptedRowsTrusted = true;
+        foreach (var row in rows)
+        {
+            if (!IsValidTokenRow(row, maxTokensPerRow))
+                continue;
+
+            var trust = ClassifyHeadroomRow(row);
+            if (trust == HeadroomRowTrust.Rejected)
+                continue;
+
+            accepted.Add(row);
+            if (trust != HeadroomRowTrust.Trusted)
+                allAcceptedRowsTrusted = false;
+        }
+
+        return accepted.Count == 0
+            ? FilteredHeadroomRows.Empty
+            : new FilteredHeadroomRows(accepted, allAcceptedRowsTrusted);
     }
 
     private static bool IsValidTokenRow(WorkItemCost row, int maxTokensPerRow)
@@ -212,46 +226,65 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
         return totalTokens > 0 && totalTokens <= maxTokensPerRow;
     }
 
-    internal static bool IsTrustedHeadroomRow(WorkItemCost row)
+    internal static bool IsTrustedHeadroomRow(WorkItemCost row) =>
+        ClassifyHeadroomRow(row) == HeadroomRowTrust.Trusted;
+
+    private static HeadroomRowTrust ClassifyHeadroomRow(WorkItemCost row)
     {
         if (string.IsNullOrWhiteSpace(row.RawMetadataJson))
-            return false;
+            return HeadroomRowTrust.Rejected;
 
         try
         {
             using var doc = JsonDocument.Parse(row.RawMetadataJson);
             var root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
-                return false;
+                return HeadroomRowTrust.Rejected;
 
             if (root.TryGetProperty("quotaHeadroomTrusted", out var trusted)
                 && trusted.ValueKind == JsonValueKind.True)
             {
-                return true;
+                return HeadroomRowTrust.Trusted;
             }
 
-            if (HasTrustedUsageSource(root, "usageSource")
-                || HasTrustedUsageSource(root, "source"))
+            if (HasStdoutDerivedUsageSource(root, "usageSource")
+                || HasStdoutDerivedUsageSource(root, "source"))
             {
-                return true;
+                return HeadroomRowTrust.Untrusted;
             }
 
             // Older production PipelineRunner rows used the database default "{}".
-            // Keep those rows eligible so recent real usage remains available for
-            // proactive headroom estimates after upgrade.
-            return !root.EnumerateObject().Any();
+            // Keep those rows visible for operator projections after upgrade, but
+            // do not enforce quota decisions from unauthenticated history.
+            return !root.EnumerateObject().Any()
+                ? HeadroomRowTrust.Untrusted
+                : HeadroomRowTrust.Rejected;
         }
         catch (JsonException)
         {
-            return false;
+            return HeadroomRowTrust.Rejected;
         }
     }
 
-    private static bool HasTrustedUsageSource(JsonElement root, string propertyName) =>
+    private static bool HasStdoutDerivedUsageSource(JsonElement root, string propertyName) =>
         root.TryGetProperty(propertyName, out var source)
         && source.ValueKind == JsonValueKind.String
         && (string.Equals(source.GetString(), "provider_metadata", StringComparison.OrdinalIgnoreCase)
             || string.Equals(source.GetString(), "agent_stream_analyser", StringComparison.OrdinalIgnoreCase));
+
+    private enum HeadroomRowTrust
+    {
+        Rejected,
+        Untrusted,
+        Trusted,
+    }
+
+    private sealed record FilteredHeadroomRows(
+        IReadOnlyList<WorkItemCost> Rows,
+        bool TrustedForEnforcement)
+    {
+        public static FilteredHeadroomRows Empty { get; } = new([], false);
+    }
 
     private static IReadOnlyList<double> BuildPerItemIterationSamples(
         IReadOnlyList<WorkItemCost> rows,

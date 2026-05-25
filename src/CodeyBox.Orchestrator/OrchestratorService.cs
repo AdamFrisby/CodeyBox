@@ -776,8 +776,6 @@ public sealed class OrchestratorService : BackgroundService
                     return;
                 }
             }
-            CompleteQuotaRouting();
-
             // Per-project pause gate: check before the budget lock so paused projects
             // don't consume a budget lock slot. Block is pickup-only; in-flight items
             // already running are not cancelled (same semantics as the global pause).
@@ -893,11 +891,11 @@ public sealed class OrchestratorService : BackgroundService
         }
         finally
         {
-            CompleteQuotaRouting();
             if (quotaReservation is not null)
             {
                 await quotaReservation.ReleaseAsync(pipelineInvoked, CancellationToken.None);
             }
+            CompleteQuotaRouting();
             _activeItems.TryRemove(id, out _);
 
             // Stop the heartbeat and remove the registry row on any exit path

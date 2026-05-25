@@ -294,10 +294,11 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(7.0, estimate!.EstimatedIterPctCost, precision: 2);
         Assert.Equal(70_000, estimate.AverageTokensPerIteration, precision: 2);
         Assert.Equal(3, estimate.SampledItemCount);
+        Assert.False(estimate.TrustedForEnforcement);
     }
 
     [Fact]
-    public async Task CostHistoryQuotaHeadroomEstimator_UsesProductionDefaultsAndIgnoresExplicitUntrustedAndOverCapRows()
+    public async Task CostHistoryQuotaHeadroomEstimator_UsesProductionDefaultsAsUntrustedAndIgnoresRejectedRows()
     {
         var productionDefaultItem = Guid.NewGuid().ToString();
         var explicitUntrustedItem = Guid.NewGuid().ToString();
@@ -329,6 +330,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         {
             InputTokens = 40_000,
             OutputTokens = 10_000,
+            RawMetadataJson = """{"quotaHeadroomTrusted":true}""",
         });
 
         var estimator = new CostHistoryQuotaHeadroomEstimator(
@@ -350,14 +352,14 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                 "claude-opus-4-7"));
 
         Assert.NotNull(estimate);
-        Assert.True(estimate!.TrustedForEnforcement);
+        Assert.False(estimate!.TrustedForEnforcement);
         Assert.Equal(4.5, estimate.EstimatedIterPctCost, precision: 2);
         Assert.Equal(45_000, estimate.AverageTokensPerIteration, precision: 2);
         Assert.Equal(2, estimate.SampledItemCount);
     }
 
     [Fact]
-    public async Task CostHistoryQuotaHeadroomEstimator_UsesAgentStreamAnalyserRows()
+    public async Task CostHistoryQuotaHeadroomEstimator_UsesAgentStreamAnalyserRowsAsUntrusted()
     {
         var itemId = Guid.NewGuid().ToString();
         SeedWorkItem(itemId, "proj-headroom-stream");
@@ -387,6 +389,67 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.NotNull(estimate);
         Assert.Equal(10.0, estimate!.EstimatedIterPctCost, precision: 2);
         Assert.Equal(100_000, estimate.AverageTokensPerIteration, precision: 2);
+        Assert.False(estimate.TrustedForEnforcement);
+    }
+
+    [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_ExplicitTrustedRowsEnableEnforcementAndRejectBadMetadata()
+    {
+        var trustedItem = Guid.NewGuid().ToString();
+        var malformedItem = Guid.NewGuid().ToString();
+        var nonObjectItem = Guid.NewGuid().ToString();
+        var negativeItem = Guid.NewGuid().ToString();
+        SeedWorkItem(trustedItem, "proj-headroom-explicit-trust");
+        SeedWorkItem(malformedItem, "proj-headroom-explicit-trust");
+        SeedWorkItem(nonObjectItem, "proj-headroom-explicit-trust");
+        SeedWorkItem(negativeItem, "proj-headroom-explicit-trust");
+
+        await _store.RecordAsync(MakeCost(trustedItem) with
+        {
+            InputTokens = 50_000,
+            OutputTokens = 10_000,
+            RawMetadataJson = """{"quotaHeadroomTrusted":true,"source":"provider_api"}""",
+        });
+        await _store.RecordAsync(MakeCost(malformedItem) with
+        {
+            InputTokens = 90_000,
+            OutputTokens = 0,
+            RawMetadataJson = "{",
+        });
+        await _store.RecordAsync(MakeCost(nonObjectItem) with
+        {
+            InputTokens = 90_000,
+            OutputTokens = 0,
+            RawMetadataJson = "[]",
+        });
+        await _store.RecordAsync(MakeCost(negativeItem) with
+        {
+            InputTokens = -1,
+            OutputTokens = 900_000,
+            RawMetadataJson = """{"quotaHeadroomTrusted":true}""",
+        });
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(
+                new ProjectId("proj-headroom-explicit-trust"),
+                AgentKind.Claude,
+                "claude-opus-4-7"));
+
+        Assert.NotNull(estimate);
+        Assert.True(estimate!.TrustedForEnforcement);
+        Assert.Equal(6.0, estimate.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(60_000, estimate.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(1, estimate.SampledItemCount);
     }
 
     [Theory]

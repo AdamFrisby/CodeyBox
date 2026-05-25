@@ -212,6 +212,24 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
+    public async Task UntrustedHeadroomEstimate_DoesNotBlockDispatch()
+    {
+        var cls = FrontierClass(Sub(Claude));
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(Claude, 15.0) };
+        var router = BuildRouterWithHeadroom(
+            [cls],
+            probes,
+            opts,
+            new FixedHeadroomEstimator(10.0, trustedForEnforcement: false));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
     public async Task InsufficientHeadroom_FallsBackToMemberWithMoreQuota()
     {
         var cls = FrontierClass(Sub(Claude), Sub(Codex));
@@ -774,8 +792,13 @@ internal sealed class FakeProbe : IAgentQuotaProbe
 internal sealed class FixedHeadroomEstimator : IQuotaHeadroomEstimator
 {
     private readonly double _estimatedPctCost;
+    private readonly bool _trustedForEnforcement;
 
-    public FixedHeadroomEstimator(double estimatedPctCost) => _estimatedPctCost = estimatedPctCost;
+    public FixedHeadroomEstimator(double estimatedPctCost, bool trustedForEnforcement = true)
+    {
+        _estimatedPctCost = estimatedPctCost;
+        _trustedForEnforcement = trustedForEnforcement;
+    }
 
     public Task<QuotaHeadroomEstimate?> EstimateAsync(
         QuotaHeadroomRequest request,
@@ -785,7 +808,7 @@ internal sealed class FixedHeadroomEstimator : IQuotaHeadroomEstimator
             AverageTokensPerIteration: 100_000,
             SampledItemCount: 1,
             Source: "test",
-            TrustedForEnforcement: true));
+            TrustedForEnforcement: _trustedForEnforcement));
 }
 
 internal sealed class CapturingHeadroomEstimator : IQuotaHeadroomEstimator

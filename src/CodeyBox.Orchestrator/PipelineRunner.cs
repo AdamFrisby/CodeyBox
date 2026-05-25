@@ -2616,7 +2616,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 : (true, "probe failed (fail-open policy)");
         }
 
-        var quota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
+        var quota = AgentQuotaResolver.ResolveMemberQuota(snapshot, member);
         if (quota.AvailablePct >= _auditQuotaOptions.MinQuotaPct)
             return (true, $"available ({quota.AvailablePct:F1}%)");
 

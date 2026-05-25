@@ -6,7 +6,7 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Tests for the per-model availability resolution logic in
-/// <see cref="AgentClassRouter.ResolveMemberQuota"/>:
+/// <see cref="AgentQuotaResolver.ResolveMemberQuota"/>:
 ///
 /// <list type="bullet">
 ///   <item>ModelId not in PerModel → unknown (-1), gated by QuotaUnknownPolicy.</item>
@@ -39,7 +39,7 @@ public sealed class AgentClassRouterAutoSentinelTests
             ReasoningMode = "high",
         };
 
-        var quota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
+        var quota = AgentQuotaResolver.ResolveMemberQuota(snapshot, member);
 
         // Unknown — must not silently fall back to the overall 80% bucket.
         Assert.Equal(-1, quota.AvailablePct);
@@ -67,7 +67,7 @@ public sealed class AgentClassRouterAutoSentinelTests
             ReasoningMode = "high",
         };
 
-        var quota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
+        var quota = AgentQuotaResolver.ResolveMemberQuota(snapshot, member);
 
         // Best-of-fleet is 100 (flash), not mostConstrained 5.
         Assert.Equal(100, quota.AvailablePct);
@@ -93,7 +93,7 @@ public sealed class AgentClassRouterAutoSentinelTests
             ReasoningMode = "high",
         };
 
-        var quota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
+        var quota = AgentQuotaResolver.ResolveMemberQuota(snapshot, member);
 
         Assert.Equal(50, quota.AvailablePct);
     }
@@ -121,7 +121,7 @@ public sealed class AgentClassRouterAutoSentinelTests
             ReasoningMode = "high",
         };
 
-        var quota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
+        var quota = AgentQuotaResolver.ResolveMemberQuota(snapshot, member);
 
         Assert.Equal(0, quota.AvailablePct);
         Assert.Equal(earlier, quota.ResetAt);
@@ -142,7 +142,7 @@ public sealed class AgentClassRouterAutoSentinelTests
             ReasoningMode = "high",
         };
 
-        var quota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
+        var quota = AgentQuotaResolver.ResolveMemberQuota(snapshot, member);
 
         Assert.Equal(73, quota.AvailablePct);
     }

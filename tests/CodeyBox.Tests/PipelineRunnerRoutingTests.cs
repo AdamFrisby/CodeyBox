@@ -542,6 +542,78 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
         Assert.Equal(WorkItemState.Done, (await _store.GetAsync(item.Id))!.State);
     }
 
+    [Fact]
+    public async Task QuotaReservationReleasedAfterBudgetDeferral_DoesNotParkNextItemForQuota()
+    {
+        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0, out var headroomManager);
+        var pickupCount = 0;
+        var spawnedCount = 0;
+        var pipeline = new CountingPipelineRunner(
+            _store,
+            onRun: () => Interlocked.Increment(ref pickupCount));
+
+        var now = DateTimeOffset.UtcNow;
+        var alreadyStarted = MakeRoutedItem() with
+        {
+            State = WorkItemState.Done,
+            StartedAt = now.AddMinutes(-1),
+            CreatedAt = now.AddMinutes(-2),
+        };
+        var first = MakeRoutedItem() with { Title = "first", CreatedAt = now.AddSeconds(-1) };
+        var second = MakeRoutedItem() with { Title = "second", CreatedAt = now };
+        await _store.CreateAsync(alreadyStarted);
+        await _store.CreateAsync(first);
+        await _store.CreateAsync(second);
+
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = first.ProjectId,
+            DisplayName = first.ProjectId.Value,
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "quota-reservation",
+            Budget = new ProjectBudget { MaxItemsPerHour = 1 },
+        });
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            registry,
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 2,
+                OnWorkerSpawned = () => Interlocked.Increment(ref spawnedCount),
+            },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: projects,
+            quotaHeadroomManager: headroomManager);
+
+        await queue.EnqueueAsync(first.Id);
+        await queue.EnqueueAsync(second.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var status = await svc.GetStatusAsync();
+            if (Volatile.Read(ref spawnedCount) >= 2 && status.CurrentlyRunning == 0)
+                break;
+
+            await Task.Delay(20);
+        }
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Equal(0, Volatile.Read(ref pickupCount));
+        Assert.Equal(0, headroomManager.GetReservedHeadroomPct(first.ProjectId, AgentKind.Claude));
+        Assert.Equal(WorkItemState.Queued, (await _store.GetAsync(first.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await _store.GetAsync(second.Id))!.State);
+    }
+
     private static WorkItem MakeRoutedItem() => new()
     {
         Id = WorkItemId.New(),

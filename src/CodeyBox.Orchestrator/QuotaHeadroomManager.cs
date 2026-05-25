@@ -266,7 +266,7 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
                 QualityScore = 0,
             };
             var snapshot = await probe.RefreshAvailabilityAsync(member, ct);
-            var quota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
+            var quota = AgentQuotaResolver.ResolveMemberQuota(snapshot, member);
             if (quota.AvailablePct < 0)
             {
                 _log.LogWarning(
