@@ -3,7 +3,6 @@ using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
-using System.Text.Json;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
@@ -68,37 +67,12 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
     var auditOpts = cbConf.AuditLog;
     var agentStreamOpts = cbConf.AgentStreams;
 
-    if (auditOpts.RetainedDays < 1)
-        throw new InvalidOperationException("CodeyBox:AuditLog:RetainedDays must be >= 1");
-    if (string.IsNullOrWhiteSpace(auditOpts.Path))
-        throw new InvalidOperationException("CodeyBox:AuditLog:Path must be non-empty");
-    if (string.IsNullOrWhiteSpace(auditOpts.AuditPath))
-        throw new InvalidOperationException("CodeyBox:AuditLog:AuditPath must be non-empty");
+    AuditLogStartup.ValidateAndPrepare(auditOpts);
 
-    // Ensure log directories exist and are writable before handing control
-    // to Serilog, so misconfigured paths surface at startup rather than
-    // silently dropping events.
-    foreach (var logPath in new[] { auditOpts.Path, auditOpts.AuditPath })
-    {
-        var dir = Path.GetDirectoryName(Path.GetFullPath(logPath));
-        if (string.IsNullOrEmpty(dir)) continue;
-        try
-        {
-            Directory.CreateDirectory(dir);
-            var probe = Path.Combine(dir, $".write-probe-{Guid.NewGuid():N}");
-            File.WriteAllText(probe, "");
-            File.Delete(probe);
-        }
-        catch (Exception ex)
-        {
-            throw new InvalidOperationException(
-                $"Audit log directory '{dir}' (from path '{logPath}') is not writable: {ex.Message}", ex);
-        }
-    }
-
+    using var bootstrapLoggerFactory = LoggerFactory.Create(static b => b.AddSerilog(dispose: false));
     AgentStreamsOptions.ValidateAtStartup(
         agentStreamOpts,
-        LoggerFactory.Create(static b => b.AddSerilog(dispose: false)).CreateLogger("CodeyBox.AgentStreams"));
+        bootstrapLoggerFactory.CreateLogger("CodeyBox.AgentStreams"));
 
     Log.Logger = new LoggerConfiguration()
         .MinimumLevel.Information()
@@ -524,10 +498,10 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 //    from a JSON file (default ~/.claude/.credentials.json, the path the
 //    local `claude` CLI refreshes in-place) on every pickup, so a host-side
 //    token rotation is picked up without an orchestrator restart. The
-//    provider ships the full creds JSON (including refresh_token) to the
-//    sandbox via CODEYBOX_CLAUDE_OAUTH_JSON so ClaudeAgentRunner can
-//    materialise it inside the VM — the in-VM CLI then auto-rotates instead
-//    of 401-ing when the host rotates the access_token mid-run.
+//    provider ships a sanitised creds JSON bundle (access token and expiry
+//    only; no refresh_token) to the sandbox via CODEYBOX_CLAUDE_OAUTH_JSON
+//    so ClaudeAgentRunner can materialise it inside the VM without racing the
+//    host-side CLI's single-use refresh token.
 // 2. Plugin ICredentialProvider implementations — inserted in discovery order
 //    (between OAuth-file and env-var). Vault-issued short-lived credentials
 //    are preferred over env-var fallbacks. Per-project ordering is expressed
@@ -600,13 +574,21 @@ if (geminiSettingsFilePath.StartsWith("~/", StringComparison.Ordinal))
         geminiSettingsFilePath[2..]);
 
 builder.Services.AddSingleton(sp => new ClaudeCredentialFileSource(
-    claudeOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+    claudeOAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new CodexCredentialFileSource(
-    codexOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+    codexOAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new GeminiOAuthCredentialFileSource(
-    geminiOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+    geminiOAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new GeminiSettingsCredentialFileSource(
-    geminiSettingsFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+    geminiSettingsFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 
 // Bridges the host-side ClaudeCredentialFileSource watcher to in-flight VMs:
 // when ~/.claude/.credentials.json rotates while a Claude agent is running in
@@ -763,12 +745,11 @@ builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
     var source = sp.GetRequiredService<ClaudeCredentialFileSource>();
     var probe = new ClaudeQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => new AgentQuotaCredentials(
-            ParseClaudeAccessToken(source.GetRaw(), source.FilePath, credentialLog)
+            CredentialFileTokenExtractor.ExtractClaudeAccessToken(source.GetRaw())
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<ClaudeQuotaProbe>());
@@ -778,13 +759,12 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
     var source = sp.GetRequiredService<CodexCredentialFileSource>();
     var probe = new CodexQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () =>
         {
-            var codexAuth = ParseCodexAccessTokens(source.GetRaw(), source.FilePath, credentialLog);
+            var codexAuth = CredentialFileTokenExtractor.ExtractCodexAccessTokens(source.GetRaw());
             return new AgentQuotaCredentials(
                 codexAuth.AccessToken ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
@@ -801,12 +781,11 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var credentialLog = loggerFactory.CreateLogger("CodeyBox.QuotaCredentials");
     var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
     var probe = new GeminiQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => new AgentQuotaCredentials(
-            ParseGeminiAccessToken(source.GetRaw(), source.FilePath, credentialLog)
+            CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
@@ -861,12 +840,11 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
     var source = sp.GetRequiredService<ClaudeCredentialFileSource>();
     return new ClaudeModelListProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => (
-            ParseClaudeAccessToken(source.GetRaw(), source.FilePath, credentialLog),
+            CredentialFileTokenExtractor.ExtractClaudeAccessToken(source.GetRaw()),
             Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         loggerFactory.CreateLogger<ClaudeModelListProbe>());
@@ -874,13 +852,12 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
     var source = sp.GetRequiredService<CodexCredentialFileSource>();
     return new CodexModelListProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () =>
         {
-            var codexAuth = ParseCodexAccessTokens(source.GetRaw(), source.FilePath, credentialLog);
+            var codexAuth = CredentialFileTokenExtractor.ExtractCodexAccessTokens(source.GetRaw());
             return (
                 codexAuth.AccessToken,
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"),
@@ -892,12 +869,11 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var credentialLog = loggerFactory.CreateLogger("CodeyBox.ConfigValidation");
     var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
     return new GeminiModelListProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => (
-            ParseGeminiAccessToken(source.GetRaw(), source.FilePath, credentialLog)
+            CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN"),
             Environment.GetEnvironmentVariable("GEMINI_API_KEY")
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY")),
@@ -1583,71 +1559,6 @@ catch (Exception ex)
 finally
 {
     Log.CloseAndFlush();
-}
-
-
-// File reads happen through CredentialFileSource singletons (file-watched,
-// retry-on-IOException, JSON-validated). These helpers only parse the cached
-// raw bytes — the source has already absorbed the cost of opening the file.
-static string? ParseClaudeAccessToken(string? raw, string path, ILogger log)
-{
-    if (string.IsNullOrWhiteSpace(raw)) return null;
-    try
-    {
-        using var doc = JsonDocument.Parse(raw);
-        if (doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth) &&
-            oauth.TryGetProperty("accessToken", out var token) &&
-            token.ValueKind == JsonValueKind.String)
-            return token.GetString();
-    }
-    catch (JsonException ex)
-    {
-        log.LogWarning(ex, "Claude quota OAuth file '{Path}' is malformed; falling back to environment token if configured", path);
-    }
-    return null;
-}
-
-static string? ParseGeminiAccessToken(string? raw, string path, ILogger log)
-{
-    if (string.IsNullOrWhiteSpace(raw)) return null;
-    try
-    {
-        using var doc = JsonDocument.Parse(raw);
-        if (doc.RootElement.TryGetProperty("access_token", out var token) &&
-            token.ValueKind == JsonValueKind.String)
-            return token.GetString();
-    }
-    catch (JsonException ex)
-    {
-        log.LogWarning(ex, "Gemini quota auth file '{Path}' is malformed; falling back to environment token if configured", path);
-    }
-    return null;
-}
-
-static (string? AccessToken, string? AccountId) ParseCodexAccessTokens(string? raw, string path, ILogger log)
-{
-    if (string.IsNullOrWhiteSpace(raw)) return (null, null);
-    try
-    {
-        using var doc = JsonDocument.Parse(raw);
-        if (!doc.RootElement.TryGetProperty("tokens", out var tokens))
-            return (null, null);
-
-        var accessToken = tokens.TryGetProperty("access_token", out var token) &&
-            token.ValueKind == JsonValueKind.String
-                ? token.GetString()
-                : null;
-        var accountId = tokens.TryGetProperty("account_id", out var account) &&
-            account.ValueKind == JsonValueKind.String
-                ? account.GetString()
-                : null;
-        return (accessToken, accountId);
-    }
-    catch (JsonException ex)
-    {
-        log.LogWarning(ex, "Codex quota auth file '{Path}' is malformed; falling back to environment token if configured", path);
-        return (null, null);
-    }
 }
 
 namespace CodeyBox.Api

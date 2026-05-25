@@ -121,13 +121,31 @@ public sealed class AuditorParallelismTests : IDisposable
     {
         const int DelayMs = 1_500;
         const int AuditorCount = 3;
+        var running = 0;
+        var maxRunning = 0;
 
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditors = Enumerable.Range(0, AuditorCount)
             .Select(i => new FakeLlmAuditor($"slow-{i}", async (_, _, ct) =>
             {
-                await Task.Delay(DelayMs, ct);
-                return new AuditResult(true, []);
+                var current = Interlocked.Increment(ref running);
+                int observed;
+                do
+                {
+                    observed = Volatile.Read(ref maxRunning);
+                    if (current <= observed)
+                        break;
+                } while (Interlocked.CompareExchange(ref maxRunning, current, observed) != observed);
+
+                try
+                {
+                    await Task.Delay(DelayMs, ct);
+                    return new AuditResult(true, []);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref running);
+                }
             }))
             .ToArray();
 
@@ -144,9 +162,12 @@ public sealed class AuditorParallelismTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
 
-        // Sequential would take ≥ 4 500 ms.  Parallel should land well below that.
-        Assert.True(sw.ElapsedMilliseconds < AuditorCount * DelayMs,
-            $"Expected wall-clock < {AuditorCount * DelayMs} ms but got {sw.ElapsedMilliseconds} ms — auditors may not be running concurrently");
+        Assert.Equal(AuditorCount, Volatile.Read(ref maxRunning));
+        // Keep a coarse guard against accidentally adding large serial work
+        // around the parallel section, but do not use the exact sequential
+        // delay as the threshold; solution-level test runs add scheduler noise.
+        Assert.True(sw.ElapsedMilliseconds < AuditorCount * DelayMs + 1_500,
+            $"Expected wall-clock near parallel execution but got {sw.ElapsedMilliseconds} ms");
     }
 }
 

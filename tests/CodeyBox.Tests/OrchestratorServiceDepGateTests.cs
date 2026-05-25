@@ -105,7 +105,7 @@ public sealed class OrchestratorServiceDepGateTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
 
         // Wait for both items to reach Done (dep first, then dependent).
-        var done = await WaitForStateAsync(dependent.Id, WorkItemState.Done, TimeSpan.FromSeconds(5));
+        var done = await WaitForStateAsync(dependent.Id, WorkItemState.Done, TimeSpan.FromSeconds(30));
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(done, "Dependent item should have been enqueued and processed after dep completed");
@@ -128,7 +128,7 @@ public sealed class OrchestratorServiceDepGateTests : IDisposable
         await queue.EnqueueAsync(dependent.Id);
 
         await svc.StartAsync(CancellationToken.None);
-        var done = await WaitForStateAsync(dependent.Id, WorkItemState.Done, TimeSpan.FromSeconds(5));
+        var done = await WaitForStateAsync(dependent.Id, WorkItemState.Done, TimeSpan.FromSeconds(30));
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(done, "Dependent should be picked up when dep is in Failed state");

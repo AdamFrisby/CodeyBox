@@ -12,8 +12,9 @@ namespace CodeyBox.Orchestrator;
 /// <para>Unlike Claude (which accepts an OAuth token directly via
 /// <c>CLAUDE_CODE_OAUTH_TOKEN</c>), the codex CLI hard-reads
 /// <c>~/.codex/auth.json</c> in its target user's home and offers no env-var
-/// alternative. The Codex agent runner picks up the env var, materialises the
-/// file inside the sandbox at <c>~/.codex/auth.json</c>, then invokes codex.</para>
+/// alternative. The Codex agent runner picks up the env var and materialises a
+/// private copy inside the sandbox at <c>~/.codex/auth.json</c> before
+/// invoking codex.</para>
 ///
 /// <para>Re-reading on each pickup picks up token rotations from the host's
 /// codex CLI without an orchestrator restart.</para>
@@ -21,25 +22,37 @@ namespace CodeyBox.Orchestrator;
 /// Only handles <see cref="AgentKind.Codex"/>; returns null for others so a
 /// chained env-var provider can supply API-key based auth.
 /// </summary>
-public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
+public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider, IDisposable
 {
     private readonly CredentialFileSource _source;
     private readonly ILogger<CodexOAuthFileCredentialProvider>? _log;
+    private readonly bool _ownsSource;
+    private bool _disposed;
 
     public CodexOAuthFileCredentialProvider(
         string filePath,
-        ILogger<CodexOAuthFileCredentialProvider>? log = null)
+        ILogger<CodexOAuthFileCredentialProvider>? log = null,
+        bool watch = true)
         : this(new CredentialFileSource(
-            filePath ?? throw new ArgumentNullException(nameof(filePath)), log), log)
+            filePath ?? throw new ArgumentNullException(nameof(filePath)), log, watch), log, ownsSource: true)
     {
     }
 
     public CodexOAuthFileCredentialProvider(
         CredentialFileSource source,
         ILogger<CodexOAuthFileCredentialProvider>? log = null)
+        : this(source, log, ownsSource: false)
+    {
+    }
+
+    private CodexOAuthFileCredentialProvider(
+        CredentialFileSource source,
+        ILogger<CodexOAuthFileCredentialProvider>? log,
+        bool ownsSource)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _log = log;
+        _ownsSource = ownsSource;
     }
 
     public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
@@ -60,39 +73,17 @@ public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
             return Task.FromResult<AgentCredential?>(null);
         }
 
-        // Mount the host directory containing auth.json into the sandbox at the
-        // canonical codex-CLI path. This makes the in-VM and host views of
-        // auth.json the same file, so when the in-VM codex CLI refreshes the
-        // OAuth pair, the rotated tokens land on the host immediately and
-        // every subsequent sandbox starts with the fresh refresh_token instead
-        // of a stale snapshot. Without this, the second sandbox in a series
-        // hits "refresh_token already used" and the family is invalidated
-        // server-side — breaking every codex caller until `codex login` runs.
-        // Sandbox providers that don't support host-path bind-mounts ignore
-        // this entry; the CODEX_AUTH_JSON env var still materialises the file
-        // as a fallback (see CodexAgentRunner.PrepareSandboxAsync).
-        var hostDir = Path.GetDirectoryName(_source.FilePath);
-        if (!string.IsNullOrEmpty(hostDir) && Directory.Exists(hostDir))
-        {
-            credential = credential with
-            {
-                Mounts = [new SandboxMount
-                {
-                    SandboxPath = CodexHomeSandboxPath,
-                    HostPath = hostDir,
-                    ReadOnly = false,
-                }],
-            };
-        }
         return Task.FromResult<AgentCredential?>(credential);
     }
 
-    /// <summary>
-    /// In-VM path where the codex CLI reads <c>auth.json</c>. The mount target
-    /// matches <c>$HOME/.codex</c> for the default multipass instance user
-    /// (ubuntu, uid 1000) and the bubblewrap sandbox HOME convention.
-    /// </summary>
-    internal const string CodexHomeSandboxPath = "/home/ubuntu/.codex";
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (_ownsSource)
+            _source.Dispose();
+    }
+
 }
 
 /// <summary>
@@ -149,12 +140,8 @@ internal static class CodexAuthJsonCredential
         try
         {
             using var doc = JsonDocument.Parse(raw);
-            var hasTokens = doc.RootElement.ValueKind == JsonValueKind.Object
-                && doc.RootElement.TryGetProperty("tokens", out var t)
-                && t.ValueKind == JsonValueKind.Object
-                && t.TryGetProperty("access_token", out var at)
-                && at.ValueKind == JsonValueKind.String
-                && !string.IsNullOrEmpty(at.GetString());
+            var tokens = CredentialFileTokenExtractor.ExtractCodexAccessTokens(doc.RootElement);
+            var hasTokens = !string.IsNullOrEmpty(tokens.AccessToken);
             var hasApiKey = doc.RootElement.ValueKind == JsonValueKind.Object
                 && doc.RootElement.TryGetProperty("OPENAI_API_KEY", out var k)
                 && k.ValueKind == JsonValueKind.String

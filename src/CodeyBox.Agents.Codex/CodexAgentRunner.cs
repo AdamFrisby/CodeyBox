@@ -42,21 +42,11 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     /// inside the sandbox. The codex CLI reads ONLY that file path; there's no
     /// env-var equivalent.
     ///
-    /// <para>Two paths, decided by what's already in the sandbox:</para>
-    /// <list type="bullet">
-    ///   <item><b>Mount path</b> (preferred, multipass): the credential
-    ///   provider declared a bind-mount that already exposes the host's
-    ///   <c>~/.codex/</c> at <c>$HOME/.codex/</c>. We detect this by stat-ing
-    ///   the file, and skip the write entirely. Critical for correctness:
-    ///   overwriting would clobber any refresh-token rotation the host has
-    ///   done since the credential was read, and would re-introduce the
-    ///   refresh-token-reuse cascade the mount is designed to prevent.</item>
-    ///   <item><b>Env-var snapshot path</b> (fallback, bwrap/process): no
-    ///   mount in scope, so materialise the file from <c>CODEX_AUTH_JSON</c>.
-    ///   Snapshot is fine here because these providers either share the host
-    ///   FS (process) or tear down per-run state anyway (bwrap tmpfs HOME).
-    ///   </item>
-    /// </list>
+    /// The runner preserves any non-empty auth file already present in the
+    /// sandbox, then falls back to writing a private snapshot from
+    /// <c>CODEX_AUTH_JSON</c>. Credential providers intentionally do not
+    /// bind-mount the host <c>~/.codex</c> directory into untrusted agent
+    /// sandboxes.
     ///
     /// We always read from the in-sandbox env var (rather than the credential
     /// parameter) because LlmReviewAuditor and similar call-sites pass
@@ -72,8 +62,8 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         AgentResumeContext? resume,
         CancellationToken ct = default)
     {
-        // If a bind-mount already supplied auth.json, leave it alone — writing
-        // would clobber the host's latest refresh-token rotation.
+        // If sandbox setup or restored home state already supplied auth.json,
+        // leave it alone; otherwise materialise the private snapshot.
         var write = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["bash", "-c", "set -eu; if [ -s \"$HOME/.codex/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEX_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.codex\"; umask 077; printf '%s' \"$CODEX_AUTH_JSON\" > \"$HOME/.codex/auth.json\"; fi"],

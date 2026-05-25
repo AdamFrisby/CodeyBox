@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Sandbox.Bubblewrap;
+using CodeyBox.Tests;
 
 namespace CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -101,7 +102,7 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         if (OperatingSystem.IsWindows()) return;
         var ackPath = Path.Combine(_workspace, "stdout-ack.fifo");
         var fakeBwrap = Path.Combine(_workspace, "fake-stdin-bwrap.sh");
-        await File.WriteAllTextAsync(fakeBwrap, """
+        WriteExecutableScript(fakeBwrap, """
             #!/bin/sh
             mkfifo "$ACK_FIFO"
             bytes=$(wc -c | tr -d ' ')
@@ -109,8 +110,6 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
             IFS= read -r _ < "$ACK_FIFO"
             rm -f "$ACK_FIFO"
             """);
-        File.SetUnixFileMode(fakeBwrap,
-            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var provider = new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions
             {
@@ -125,7 +124,7 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         });
         var chunks = new List<string>();
 
-        var result = await sandbox.ExecAsync(new SandboxExec
+        var result = await ExecWithEtxtbsyRetryAsync(sandbox, new SandboxExec
         {
             Argv = ["ignored"],
             Stdin = "abcdef",
@@ -148,20 +147,15 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         if (OperatingSystem.IsWindows()) return;
         var readyPath = Path.Combine(_workspace, "fake-bwrap.ready");
         var fakeBwrap = Path.Combine(_workspace, "fake-bwrap.sh");
-        await File.WriteAllTextAsync(fakeBwrap, """
+        WriteExecutableScript(fakeBwrap, """
             #!/bin/sh
             printf ready > "$READY_FILE"
             exec tail -f /dev/null
             """);
-        File.SetUnixFileMode(fakeBwrap,
-            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var watcher = new FileSystemWatcher(_workspace)
-        {
-            Filter = Path.GetFileName(readyPath),
-            EnableRaisingEvents = true,
-        };
+        using var watcher = TestFileSystemWatcherLeakTracker.CreateWatcher(_workspace, Path.GetFileName(readyPath));
+        watcher.EnableRaisingEvents = true;
         watcher.Created += (_, _) => ready.TrySetResult();
         var provider = new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions
@@ -177,7 +171,7 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         });
         using var cts = new CancellationTokenSource();
 
-        var execTask = sandbox.ExecAsync(new SandboxExec { Argv = ["ignored"] }, cts.Token);
+        var execTask = ExecWithEtxtbsyRetryAsync(sandbox, new SandboxExec { Argv = ["ignored"] }, cts.Token);
         if (File.Exists(readyPath))
             ready.TrySetResult();
         await ready.Task;
@@ -198,6 +192,39 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
 
     private static string[] SplitEcho(string stdout) =>
         stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries);
+
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    private static void WriteExecutableScript(string path, string contents)
+    {
+        var tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        File.WriteAllText(tempPath, contents);
+        File.SetUnixFileMode(tempPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.Move(tempPath, path);
+    }
+
+    // ETXTBSY ("Text file busy") races with parallel test forks: another test's
+    // Process.Start() can fork while this test's WriteExecutableScript still has a
+    // write FD open on the script's inode. The forked child inherits that FD,
+    // causing the subsequent execve of the same inode to fail. Retry briefly.
+    private static async Task<SandboxExecResult> ExecWithEtxtbsyRetryAsync(
+        ISandbox sandbox, SandboxExec exec, CancellationToken ct = default)
+    {
+        const int maxAttempts = 8;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await sandbox.ExecAsync(exec, ct);
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+                when (attempt < maxAttempts
+                    && ex.Message.Contains("Text file busy", StringComparison.Ordinal))
+            {
+                await Task.Delay(25 * attempt, ct);
+            }
+        }
+    }
 
     private static void AssertOption(string[] argv, string option, params string[] values)
     {

@@ -52,6 +52,7 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider,
     // stampede when a cached time-bound credential expires simultaneously.
     private readonly Dictionary<AgentKind, SemaphoreSlim> _fetchLocks = new();
     private readonly Dictionary<(AgentKind, string), SemaphoreSlim> _priorityFetchLocks = new();
+    private bool _disposed;
 
     /// <summary>
     /// Simple ordered-list constructor. Used by unit tests and for chains that
@@ -301,6 +302,9 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider,
     {
         lock (_cacheLock)
         {
+            if (_disposed) return;
+            _disposed = true;
+
             foreach (var s in _fetchLocks.Values) s.Dispose();
             foreach (var s in _priorityFetchLocks.Values) s.Dispose();
             _fetchLocks.Clear();

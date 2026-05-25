@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Configuration;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -55,6 +56,88 @@ public sealed class CredentialFileSourceTests : IDisposable
     }
 
     [Fact]
+    public void WatchFalse_DisablesWatcherButKeepsStatBasedReload()
+    {
+        var path = WriteFile("polling-creds.json", """{"access_token":"old"}""");
+        using var source = new CredentialFileSource(path, watch: false);
+
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+        Assert.Equal("""{"access_token":"old"}""", source.GetRaw());
+
+        var notifications = 0;
+        source.TokenUpdated += () => Interlocked.Increment(ref notifications);
+
+        File.WriteAllText(path, """{"access_token":"new-longer"}""");
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMilliseconds(100));
+
+        Assert.Equal("""{"access_token":"new-longer"}""", source.GetRaw());
+        Assert.Equal(1, Volatile.Read(ref notifications));
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void WatcherRegistrationFailure_DisposesCreatedWatcherAndKeepsStatBasedReload()
+    {
+        var path = WriteFile("registration-fails.json", """{"access_token":"old"}""");
+        DisposeObservingFileSystemWatcher? created = null;
+        FileSystemWatcher? disposed = null;
+
+        using var source = new CredentialFileSource(
+            path,
+            NullLogger.Instance,
+            watch: true,
+            createWatcher: (dir, fileName) =>
+            {
+                created = new DisposeObservingFileSystemWatcher(dir, fileName);
+                created.Dispose();
+                created.ResetDisposeCalls();
+                return created;
+            },
+            watcherDisposed: watcher => disposed = watcher);
+
+        Assert.NotNull(created);
+        Assert.Equal(1, created.DisposeCalls);
+        Assert.Same(created, disposed);
+        Assert.False(source.IsWatching);
+
+        File.WriteAllText(path, """{"access_token":"new-longer"}""");
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMilliseconds(100));
+
+        Assert.Equal("""{"access_token":"new-longer"}""", source.GetRaw());
+    }
+
+    [Fact]
+    public void Dispose_DisposesActiveWatcher()
+    {
+        var path = WriteFile("normal-dispose.json", """{"access_token":"old"}""");
+        DisposeObservingFileSystemWatcher? created = null;
+        FileSystemWatcher? disposed = null;
+        var source = new CredentialFileSource(
+            path,
+            NullLogger.Instance,
+            watch: true,
+            createWatcher: (dir, fileName) =>
+            {
+                created = new DisposeObservingFileSystemWatcher(dir, fileName);
+                return created;
+            },
+            watcherDisposed: watcher => disposed = watcher);
+
+        Assert.NotNull(created);
+        Assert.True(source.IsWatching);
+        Assert.Equal(0, created.DisposeCalls);
+
+        source.Dispose();
+
+        Assert.Equal(1, created.DisposeCalls);
+        Assert.Same(created, disposed);
+        Assert.False(source.IsWatching);
+
+        source.Dispose();
+        Assert.Equal(1, created.DisposeCalls);
+    }
+
+    [Fact]
     public async Task FileWatch_PicksUpFreshTokenWithinOneSecond()
     {
         // The "host-side autonomous OAuth refresh" code path rewrites the file
@@ -87,6 +170,114 @@ public sealed class CredentialFileSourceTests : IDisposable
         // while the event is still in flight.
         var fired = await Task.WhenAny(observed.Task, Task.Delay(TimeSpan.FromSeconds(2)));
         Assert.Same(observed.Task, fired);
+    }
+
+    [Fact]
+    public void LeakTracker_PrintsWarning_WhenCredentialWatcherIsNotDisposed()
+    {
+        var path = WriteFile("leaky-creds.json", """{"access_token":"leaky"}""");
+        using var scope = TestFileSystemWatcherLeakTracker.BeginTestCase(nameof(LeakTracker_PrintsWarning_WhenCredentialWatcherIsNotDisposed));
+        var source = new CredentialFileSource(path);
+        try
+        {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+            using var writer = new StringWriter();
+            Assert.True(scope.ReportLeaks(writer));
+            var output = writer.ToString();
+            Assert.Contains("FileSystemWatcher", output);
+            Assert.Contains(path, output);
+        }
+        finally
+        {
+            source.Dispose();
+        }
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void LeakTracker_PrintsWarning_WhenTrackedFileSystemWatcherIsNotDisposed()
+    {
+        var path = Path.Combine(_tempDir, "direct.txt");
+        using var scope = TestFileSystemWatcherLeakTracker.BeginTestCase(nameof(LeakTracker_PrintsWarning_WhenTrackedFileSystemWatcherIsNotDisposed));
+        var watcher = TestFileSystemWatcherLeakTracker.CreateWatcher(_tempDir, "direct.txt");
+        try
+        {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+            using var writer = new StringWriter();
+            Assert.True(scope.ReportLeaks(writer));
+            var output = writer.ToString();
+            Assert.Contains("FileSystemWatcher", output);
+            Assert.Contains(path, output);
+        }
+        finally
+        {
+            watcher.Dispose();
+        }
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void LeakTracker_PrintsWarning_WhenReloadingConfigurationIsNotDisposed()
+    {
+        var path = WriteFile("reload-config.json", """{"CodeyBox":{"CredentialFileWatchers":false}}""");
+        using var scope = TestFileSystemWatcherLeakTracker.BeginTestCase(nameof(LeakTracker_PrintsWarning_WhenReloadingConfigurationIsNotDisposed));
+        var tracked = TestFileSystemWatcherLeakTracker.TrackReloadingConfiguration(
+            new ConfigurationBuilder()
+                .AddJsonFile(path, optional: false, reloadOnChange: true)
+                .Build(),
+            path);
+        try
+        {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+            using var writer = new StringWriter();
+            Assert.True(scope.ReportLeaks(writer));
+            var output = writer.ToString();
+            Assert.Contains("reloadOnChange configuration", output);
+            Assert.Contains(path, output);
+        }
+        finally
+        {
+            tracked.Dispose();
+        }
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void LeakTracker_ReportsOnlyLeaksCreatedByTheCurrentTestScope()
+    {
+        var ownerPath = WriteFile("owner-scope.json", """{"access_token":"owner"}""");
+        var otherPath = WriteFile("other-scope.json", """{"access_token":"other"}""");
+        using var ownerScope = TestFileSystemWatcherLeakTracker.BeginTestCase("owner test");
+        var ownerSource = new CredentialFileSource(ownerPath);
+        try
+        {
+            using (var otherScope = TestFileSystemWatcherLeakTracker.BeginTestCase("other test"))
+            {
+                var otherSource = new CredentialFileSource(otherPath);
+                try
+                {
+                    using var otherWriter = new StringWriter();
+                    Assert.True(otherScope.ReportLeaks(otherWriter));
+                    var otherOutput = otherWriter.ToString();
+                    Assert.Contains(otherPath, otherOutput);
+                    Assert.DoesNotContain(ownerPath, otherOutput);
+                }
+                finally
+                {
+                    otherSource.Dispose();
+                }
+            }
+
+            using var ownerWriter = new StringWriter();
+            Assert.True(ownerScope.ReportLeaks(ownerWriter));
+            var ownerOutput = ownerWriter.ToString();
+            Assert.Contains(ownerPath, ownerOutput);
+            Assert.DoesNotContain(otherPath, ownerOutput);
+        }
+        finally
+        {
+            ownerSource.Dispose();
+        }
     }
 
     [Fact]
@@ -314,5 +505,24 @@ public sealed class CredentialFileSourceTests : IDisposable
             await Task.Delay(25);
         }
         return null;
+    }
+
+    private sealed class DisposeObservingFileSystemWatcher : FileSystemWatcher
+    {
+        public DisposeObservingFileSystemWatcher(string path, string filter)
+            : base(path, filter)
+        {
+        }
+
+        public int DisposeCalls { get; private set; }
+
+        public void ResetDisposeCalls() => DisposeCalls = 0;
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                DisposeCalls++;
+            base.Dispose(disposing);
+        }
     }
 }

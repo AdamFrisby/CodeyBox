@@ -1,4 +1,3 @@
-using System.Text.Json;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
 
@@ -47,19 +46,22 @@ namespace CodeyBox.Orchestrator;
 /// Only handles <see cref="AgentKind.Claude"/>; returns null for other agents
 /// so a chained env-var provider can supply them.
 /// </summary>
-public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
+public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider, IDisposable
 {
     public const string OAuthJsonEnvVar = "CODEYBOX_CLAUDE_OAUTH_JSON";
 
     private readonly CredentialFileSource _source;
     private readonly string _sandboxEnvVar;
     private readonly ILogger<ClaudeOAuthFileCredentialProvider>? _log;
+    private readonly bool _ownsSource;
+    private bool _disposed;
 
     public ClaudeOAuthFileCredentialProvider(
         string filePath,
         string sandboxEnvVar,
-        ILogger<ClaudeOAuthFileCredentialProvider>? log = null)
-        : this(new CredentialFileSource(filePath, log), sandboxEnvVar, log)
+        ILogger<ClaudeOAuthFileCredentialProvider>? log = null,
+        bool watch = true)
+        : this(new CredentialFileSource(filePath, log, watch), sandboxEnvVar, log, ownsSource: true)
     {
     }
 
@@ -67,10 +69,20 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
         CredentialFileSource source,
         string sandboxEnvVar,
         ILogger<ClaudeOAuthFileCredentialProvider>? log = null)
+        : this(source, sandboxEnvVar, log, ownsSource: false)
+    {
+    }
+
+    private ClaudeOAuthFileCredentialProvider(
+        CredentialFileSource source,
+        string sandboxEnvVar,
+        ILogger<ClaudeOAuthFileCredentialProvider>? log,
+        bool ownsSource)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _sandboxEnvVar = sandboxEnvVar ?? throw new ArgumentNullException(nameof(sandboxEnvVar));
         _log = log;
+        _ownsSource = ownsSource;
     }
 
     public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
@@ -85,7 +97,10 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
             return Task.FromResult<AgentCredential?>(null);
         }
 
-        if (!TryBuildSanitisedBundle(rawContents, out var token, out var sanitisedBundle))
+        if (!CredentialFileTokenExtractor.TryBuildClaudeSanitisedBundle(
+            rawContents,
+            out var token,
+            out var sanitisedBundle))
         {
             _log?.LogWarning(
                 "Claude OAuth file {Path} could not be parsed into a sanitised sandbox bundle; falling through",
@@ -101,66 +116,11 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
         return Task.FromResult<AgentCredential?>(new AgentCredential(AgentKind.Claude, env, new Dictionary<string, string>()));
     }
 
-    /// <summary>
-    /// Parses a host-side Claude credentials JSON document and produces the
-    /// sanitised bundle ClaudeAgentRunner materialises into
-    /// <c>~/.claude/.credentials.json</c> inside the sandbox. The bundle
-    /// carries the access_token (and the <c>expiresAt</c> hint when present)
-    /// but deliberately omits the refresh_token — see the class summary for
-    /// the rationale on host-side-only refresh. Returns <c>false</c> for
-    /// missing/malformed input so callers can fall through cleanly.
-    /// </summary>
-    public static bool TryBuildSanitisedBundle(
-        string? rawContents,
-        out string accessToken,
-        out string sanitisedBundle)
+    public void Dispose()
     {
-        accessToken = "";
-        sanitisedBundle = "";
-        if (string.IsNullOrEmpty(rawContents))
-            return false;
-
-        try
-        {
-            using var doc = JsonDocument.Parse(rawContents);
-            if (!doc.RootElement.TryGetProperty("claudeAiOauth", out var oauth) ||
-                !oauth.TryGetProperty("accessToken", out var tokenEl) ||
-                tokenEl.ValueKind != JsonValueKind.String)
-            {
-                return false;
-            }
-            var token = tokenEl.GetString() ?? "";
-            if (token.Length == 0)
-                return false;
-            accessToken = token;
-            sanitisedBundle = BuildSandboxBundle(oauth, token);
-            return true;
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-    }
-
-    private static string BuildSandboxBundle(JsonElement oauth, string token)
-    {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
-        {
-            writer.WriteStartObject();
-            writer.WritePropertyName("claudeAiOauth");
-            writer.WriteStartObject();
-            writer.WriteString("accessToken", token);
-            // Forward expiresAt verbatim (number or string) when present so the
-            // in-VM CLI can short-circuit a doomed reuse of a stale token.
-            if (oauth.TryGetProperty("expiresAt", out var expiresAt))
-            {
-                writer.WritePropertyName("expiresAt");
-                expiresAt.WriteTo(writer);
-            }
-            writer.WriteEndObject();
-            writer.WriteEndObject();
-        }
-        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        if (_disposed) return;
+        _disposed = true;
+        if (_ownsSource)
+            _source.Dispose();
     }
 }

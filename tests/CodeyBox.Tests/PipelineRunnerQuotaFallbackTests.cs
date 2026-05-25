@@ -1021,7 +1021,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         for (var i = 0; i < maxSteps && !pipelineTask.IsCompleted; i++)
         {
             time.Advance(delta);
-            await Task.Delay(1);
+            var completed = await Task.WhenAny(
+                pipelineTask,
+                Task.Delay(TimeSpan.FromMilliseconds(25)));
+            if (completed == pipelineTask)
+                break;
         }
 
         await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
@@ -1061,13 +1065,32 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         for (var i = 0; i < maxSteps && !targetTask.IsCompleted && !pipelineTask.IsCompleted; i++)
         {
             time.Advance(delta);
-            await Task.Delay(1);
+            var completed = await Task.WhenAny(
+                targetTask,
+                pipelineTask,
+                Task.Delay(TimeSpan.FromMilliseconds(10)));
+            if (completed == targetTask)
+                return;
+            if (completed == pipelineTask)
+                break;
         }
 
         if (targetTask.IsCompleted)
             return;
 
         if (pipelineTask.IsCompleted)
+        {
+            await pipelineTask;
+            throw new InvalidOperationException("Pipeline completed before the expected fallback attempt started.");
+        }
+
+        var settled = await Task.WhenAny(
+            targetTask,
+            pipelineTask,
+            Task.Delay(TimeSpan.FromSeconds(10)));
+        if (settled == targetTask)
+            return;
+        if (settled == pipelineTask)
         {
             await pipelineTask;
             throw new InvalidOperationException("Pipeline completed before the expected fallback attempt started.");

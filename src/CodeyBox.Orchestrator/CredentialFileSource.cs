@@ -7,10 +7,11 @@ namespace CodeyBox.Orchestrator;
 /// Singleton owner of a single host-side OAuth credential file (Claude's
 /// <c>.credentials.json</c>, Codex's <c>auth.json</c>, Gemini's
 /// <c>oauth_creds.json</c>/<c>settings.json</c>). Reads the file once at
-/// startup, watches the file for changes via <see cref="FileSystemWatcher"/>,
-/// re-parses on change, and raises <see cref="TokenUpdated"/> so quota probes
-/// can invalidate their per-token caches and credential providers can hand
-/// the fresh JSON to every new sandbox.
+/// startup and, when constructed with watching enabled, watches the file for
+/// changes via <see cref="FileSystemWatcher"/>, re-parses on change, and raises
+/// <see cref="TokenUpdated"/> so quota probes can invalidate their per-token
+/// caches and credential providers can hand the fresh JSON to every new
+/// sandbox.
 ///
 /// <para>Closes the loop on out-of-band refreshes: a child sandbox or an
 /// operator running the agent CLI on the host can rewrite the file at any
@@ -25,7 +26,9 @@ namespace CodeyBox.Orchestrator;
 /// <para>GetRaw() also stat-checks the file on each call as a backstop for
 /// platforms where the watcher is slow to fire — the first caller after a
 /// write observes the change synchronously and the event fires before the
-/// raw bytes are returned.</para>
+/// raw bytes are returned. When watching is disabled, this stat check is the
+/// reload mechanism and <see cref="TokenUpdated"/> fires from the caller's
+/// thread.</para>
 /// </summary>
 public class CredentialFileSource : IDisposable
 {
@@ -33,6 +36,8 @@ public class CredentialFileSource : IDisposable
     private const int RetryDelayMs = 100;
 
     private readonly ILogger? _log;
+    private readonly Func<string, string, FileSystemWatcher> _createWatcher;
+    private readonly Action<FileSystemWatcher> _watcherDisposed;
     private readonly object _gate = new();
     private string? _cached;
     private DateTime _cachedMtimeUtc = DateTime.MinValue;
@@ -43,6 +48,8 @@ public class CredentialFileSource : IDisposable
     /// <summary>Path to the credential file on the host filesystem.</summary>
     public string FilePath { get; }
 
+    internal bool IsWatching => _watcher is not null;
+
     /// <summary>
     /// Raised after the file is observed to change and the new contents are
     /// cached. Subscribers should be cheap and non-throwing — this fires on
@@ -51,12 +58,29 @@ public class CredentialFileSource : IDisposable
     /// </summary>
     public event Action? TokenUpdated;
 
-    public CredentialFileSource(string filePath, ILogger? log = null)
+    public CredentialFileSource(string filePath, ILogger? log = null, bool watch = true)
+        : this(
+            filePath,
+            log,
+            watch,
+            CredentialFileSourceWatcherDiagnostics.CreateWatcher,
+            CredentialFileSourceWatcherDiagnostics.WatcherDisposed)
+    {
+    }
+
+    internal CredentialFileSource(
+        string filePath,
+        ILogger? log,
+        bool watch,
+        Func<string, string, FileSystemWatcher> createWatcher,
+        Action<FileSystemWatcher> watcherDisposed)
     {
         FilePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
         _log = log;
+        _createWatcher = createWatcher ?? throw new ArgumentNullException(nameof(createWatcher));
+        _watcherDisposed = watcherDisposed ?? throw new ArgumentNullException(nameof(watcherDisposed));
         TryReload(force: false, out _);
-        StartWatcher();
+        if (watch) StartWatcher();
     }
 
     /// <summary>
@@ -224,28 +248,43 @@ public class CredentialFileSource : IDisposable
         if (!Directory.Exists(dir))
         {
             _log?.LogDebug(
-                "Credential file directory {Dir} does not exist; deferring file watching until GetRaw is called",
+                "Credential file directory {Dir} does not exist; relying on stat-based reload until process restart",
                 dir);
             return;
         }
 
+        FileSystemWatcher? w = null;
         try
         {
-            var w = new FileSystemWatcher(dir, fileName)
-            {
-                NotifyFilter = NotifyFilters.LastWrite
-                    | NotifyFilters.FileName
-                    | NotifyFilters.CreationTime
-                    | NotifyFilters.Size,
-                EnableRaisingEvents = true,
-            };
+            w = _createWatcher(dir, fileName);
+            w.NotifyFilter = NotifyFilters.LastWrite
+                | NotifyFilters.FileName
+                | NotifyFilters.CreationTime
+                | NotifyFilters.Size;
+            w.EnableRaisingEvents = true;
             w.Changed += OnFsEvent;
             w.Created += OnFsEvent;
             w.Renamed += OnFsRenamed;
             _watcher = w;
+            w = null;
         }
         catch (Exception ex)
         {
+            if (w is not null)
+            {
+                try
+                {
+                    w.Dispose();
+                    _watcherDisposed(w);
+                }
+                catch (Exception disposeEx)
+                {
+                    _log?.LogWarning(
+                        disposeEx,
+                        "Failed to dispose FileSystemWatcher for {Path} after registration failure; it may remain active",
+                        FilePath);
+                }
+            }
             _log?.LogWarning(ex, "Failed to register FileSystemWatcher for {Path}; relying on stat-based reload", FilePath);
         }
     }
@@ -278,12 +317,66 @@ public class CredentialFileSource : IDisposable
             try
             {
                 w.EnableRaisingEvents = false;
-                w.Changed -= OnFsEvent;
-                w.Created -= OnFsEvent;
-                w.Renamed -= OnFsRenamed;
-                w.Dispose();
             }
-            catch { }
+            catch (ObjectDisposedException ex)
+            {
+                _log?.LogDebug(ex, "FileSystemWatcher for {Path} was already disposed before event shutdown", FilePath);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _log?.LogWarning(ex, "Failed to disable FileSystemWatcher events for {Path}; continuing disposal", FilePath);
+            }
+            catch (IOException ex)
+            {
+                _log?.LogWarning(ex, "Failed to disable FileSystemWatcher events for {Path}; continuing disposal", FilePath);
+            }
+            w.Changed -= OnFsEvent;
+            w.Created -= OnFsEvent;
+            w.Renamed -= OnFsRenamed;
+            try
+            {
+                w.Dispose();
+                _watcherDisposed(w);
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning(ex, "Failed to dispose FileSystemWatcher for {Path}; it may remain active", FilePath);
+            }
+        }
+    }
+}
+
+internal static class CredentialFileSourceWatcherDiagnostics
+{
+    private static Func<string, string, FileSystemWatcher> _createWatcher =
+        static (dir, fileName) => new FileSystemWatcher(dir, fileName);
+    private static Action<FileSystemWatcher> _watcherDisposed = static _ => { };
+
+    public static FileSystemWatcher CreateWatcher(string dir, string fileName)
+        => _createWatcher(dir, fileName);
+
+    public static void WatcherDisposed(FileSystemWatcher watcher)
+        => _watcherDisposed(watcher);
+
+    internal static IDisposable ConfigureForTests(
+        Func<string, string, FileSystemWatcher> createWatcher,
+        Action<FileSystemWatcher> watcherDisposed)
+    {
+        var previousCreateWatcher = _createWatcher;
+        var previousWatcherDisposed = _watcherDisposed;
+        _createWatcher = createWatcher ?? throw new ArgumentNullException(nameof(createWatcher));
+        _watcherDisposed = watcherDisposed ?? throw new ArgumentNullException(nameof(watcherDisposed));
+        return new RestoreDiagnostics(previousCreateWatcher, previousWatcherDisposed);
+    }
+
+    private sealed class RestoreDiagnostics(
+        Func<string, string, FileSystemWatcher> createWatcher,
+        Action<FileSystemWatcher> watcherDisposed) : IDisposable
+    {
+        public void Dispose()
+        {
+            _createWatcher = createWatcher;
+            _watcherDisposed = watcherDisposed;
         }
     }
 }
@@ -291,28 +384,28 @@ public class CredentialFileSource : IDisposable
 /// <summary>Marker for the Claude OAuth credentials file source.</summary>
 public sealed class ClaudeCredentialFileSource : CredentialFileSource
 {
-    public ClaudeCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null)
-        : base(filePath, log) { }
+    public ClaudeCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
 }
 
 /// <summary>Marker for the Codex OAuth credentials file source.</summary>
 public sealed class CodexCredentialFileSource : CredentialFileSource
 {
-    public CodexCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null)
-        : base(filePath, log) { }
+    public CodexCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
 }
 
 /// <summary>Marker for the Gemini OAuth credentials file source.</summary>
 public sealed class GeminiOAuthCredentialFileSource : CredentialFileSource
 {
-    public GeminiOAuthCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null)
-        : base(filePath, log) { }
+    public GeminiOAuthCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
 }
 
 /// <summary>Marker for the Gemini settings file source (not a credential, but
 /// rotates alongside the OAuth file, and the CLI requires both).</summary>
 public sealed class GeminiSettingsCredentialFileSource : CredentialFileSource
 {
-    public GeminiSettingsCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null)
-        : base(filePath, log) { }
+    public GeminiSettingsCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
 }

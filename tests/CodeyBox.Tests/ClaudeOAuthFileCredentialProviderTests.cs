@@ -25,11 +25,63 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         return path;
     }
 
+    private static ClaudeOAuthFileCredentialProvider NewProvider(string path)
+        => new(path, "CLAUDE_CODE_OAUTH_TOKEN", watch: false);
+
+    [Fact]
+    public void PathConstructor_WithWatchFalse_DoesNotCreateWatcher()
+    {
+        var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""");
+
+        using var provider = new ClaudeOAuthFileCredentialProvider(
+            path,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            watch: false);
+
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void Dispose_ReleasesOwnedCredentialFileSourceWatcher()
+    {
+        var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""");
+        var provider = new ClaudeOAuthFileCredentialProvider(
+            path,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            watch: true);
+
+        try
+        {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+        }
+        finally
+        {
+            provider.Dispose();
+        }
+
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void Dispose_DoesNotDisposeExternallyOwnedCredentialFileSource()
+    {
+        const string raw = """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""";
+        var path = WriteCredFile(raw);
+        using var source = new CredentialFileSource(path, watch: false);
+        var provider = new ClaudeOAuthFileCredentialProvider(
+            source,
+            "CLAUDE_CODE_OAUTH_TOKEN");
+
+        provider.Dispose();
+
+        Assert.Equal(raw, source.GetRaw());
+    }
+
     [Fact]
     public async Task ReturnsTokenForClaudeWhenFilePresent()
     {
         var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""");
-        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(path);
 
         var cred = await p.GetAsync(AgentKind.Claude);
 
@@ -48,7 +100,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         const string raw =
             """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz","expiresAt":1234567890}}""";
         var path = WriteCredFile(raw);
-        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(path);
 
         var cred = await p.GetAsync(AgentKind.Claude);
 
@@ -72,7 +124,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         // No expiresAt field in the source file: don't fabricate one.
         const string raw = """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz"}}""";
         var path = WriteCredFile(raw);
-        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(path);
 
         var cred = await p.GetAsync(AgentKind.Claude);
 
@@ -96,7 +148,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         const string raw =
             """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz","expiresAt":9999999999}}""";
         var path = WriteCredFile(raw);
-        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(path);
 
         var taskA = Task.Run(() => p.GetAsync(AgentKind.Claude));
         var taskB = Task.Run(() => p.GetAsync(AgentKind.Claude));
@@ -127,7 +179,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     public async Task RereadsTokenOnEachCall()
     {
         var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"first"}}""");
-        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(path);
 
         var cred1 = await p.GetAsync(AgentKind.Claude);
         File.WriteAllText(path, """{"claudeAiOauth":{"accessToken":"second"}}""");
@@ -141,7 +193,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     public async Task ReturnsNullForNonClaudeAgents()
     {
         var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"x"}}""");
-        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(path);
 
         Assert.Null(await p.GetAsync(AgentKind.Codex));
         Assert.Null(await p.GetAsync(AgentKind.Copilot));
@@ -150,8 +202,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     [Fact]
     public async Task ReturnsNullWhenFileMissing()
     {
-        var p = new ClaudeOAuthFileCredentialProvider(
-            Path.Combine(_tempDir, "nonexistent.json"), "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(Path.Combine(_tempDir, "nonexistent.json"));
 
         Assert.Null(await p.GetAsync(AgentKind.Claude));
     }
@@ -160,7 +211,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     public async Task ReturnsNullWhenJsonMalformed()
     {
         var path = WriteCredFile("not valid json");
-        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(path);
 
         Assert.Null(await p.GetAsync(AgentKind.Claude));
     }
@@ -169,7 +220,16 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     public async Task ReturnsNullWhenAccessTokenFieldAbsent()
     {
         var path = WriteCredFile("""{"claudeAiOauth":{"otherField":"x"}}""");
-        var p = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+        var p = NewProvider(path);
+
+        Assert.Null(await p.GetAsync(AgentKind.Claude));
+    }
+
+    [Fact]
+    public async Task ReturnsNullWhenAccessTokenFieldEmpty()
+    {
+        var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":""}}""");
+        var p = NewProvider(path);
 
         Assert.Null(await p.GetAsync(AgentKind.Claude));
     }
@@ -180,8 +240,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         Environment.SetEnvironmentVariable("CODEYBOX_CHAINED_TEST_KEY", "from-env");
         try
         {
-            var fileProvider = new ClaudeOAuthFileCredentialProvider(
-                Path.Combine(_tempDir, "missing.json"), "CLAUDE_CODE_OAUTH_TOKEN");
+            var fileProvider = NewProvider(Path.Combine(_tempDir, "missing.json"));
             var envProvider = new EnvironmentCredentialProvider(new[]
             {
                 new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CHAINED_TEST_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
@@ -206,7 +265,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         try
         {
             var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"fresh-file"}}""");
-            var fileProvider = new ClaudeOAuthFileCredentialProvider(path, "CLAUDE_CODE_OAUTH_TOKEN");
+            var fileProvider = NewProvider(path);
             var envProvider = new EnvironmentCredentialProvider(new[]
             {
                 new AgentCredentialMapping(AgentKind.Claude, "CODEYBOX_CHAINED_TEST_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),

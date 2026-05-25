@@ -114,6 +114,20 @@ public sealed class CredentialPluginFallthroughTests
         Assert.Equal("AIza-abc123", result!.EnvironmentVariables["GEMINI_API_KEY"]);
     }
 
+    [Fact]
+    public void Dispose_DoesNotDisposeExternallySuppliedProviders()
+    {
+        var first = new DisposableProvider();
+        var second = new DisposableProvider();
+        var chain = new ChainedCredentialProvider([first, new FixedProvider(null), second]);
+
+        chain.Dispose();
+        chain.Dispose();
+
+        Assert.Equal(0, first.DisposeCount);
+        Assert.Equal(0, second.DisposeCount);
+    }
+
     // ── Fakes ────────────────────────────────────────────────────────────────
 
     private sealed class FixedProvider(AgentCredential? result) : ICredentialProvider
@@ -133,5 +147,15 @@ public sealed class CredentialPluginFallthroughTests
     {
         public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
             => Task.FromResult(agent == coveredAgent ? cred : (AgentCredential?)null);
+    }
+
+    private sealed class DisposableProvider : ICredentialProvider, IDisposable
+    {
+        public int DisposeCount { get; private set; }
+
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+            => Task.FromResult<AgentCredential?>(null);
+
+        public void Dispose() => DisposeCount++;
     }
 }

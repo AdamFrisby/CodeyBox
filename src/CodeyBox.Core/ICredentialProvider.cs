@@ -16,9 +16,9 @@ public interface ICredentialProvider
 /// are values the agent's CLI reads at startup; <see cref="Files"/> are
 /// path → contents pairs to materialise as files inside the sandbox;
 /// <see cref="Mounts"/> are bind-mounts the orchestrator merges into the
-/// sandbox spec (used by providers like Codex that want the in-VM CLI's
-/// token rotations to write back to the host file, avoiding refresh-token-reuse
-/// cascades when the same OAuth pair is snapshotted across multiple VMs).
+/// sandbox spec for non-secret credential adjuncts that must come from the
+/// host filesystem. Providers must not mount writable host credential
+/// directories into untrusted agent sandboxes.
 /// </summary>
 public sealed record AgentCredential(
     AgentKind Agent,
@@ -38,10 +38,9 @@ public sealed record AgentCredential(
     /// <summary>
     /// Optional bind-mounts the credential provider wants applied to any
     /// sandbox running this agent. The orchestrator merges these into
-    /// <c>SandboxSpec.Mounts</c> when the credential is in scope. Use this
-    /// for OAuth files whose in-VM refresh must propagate back to the host
-    /// (codex), to avoid every sandbox boot starting from a stale snapshot
-    /// and consuming the same refresh_token.
+    /// <c>SandboxSpec.Mounts</c> when the credential is in scope. Do not use
+    /// this to expose writable host credential directories to untrusted agent
+    /// sandboxes.
     /// </summary>
     public IReadOnlyList<SandboxMount> Mounts { get; init; } = [];
 }
