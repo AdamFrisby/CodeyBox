@@ -183,6 +183,24 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
+    public async Task InsufficientHeadroom_FallsBackToPayPerApiMember()
+    {
+        var cls = FrontierClass(Sub(Claude), Api(Codex));
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, 15.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new FixedHeadroomEstimator(10.0));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+        Assert.Equal(AgentBilling.PayPerApi, decision.Chosen.Billing);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
     public async Task InsufficientHeadroom_UsesProbeResetForSuggestedRetryAt()
     {
         var resetAt = DateTimeOffset.UtcNow.AddHours(2);
@@ -273,6 +291,50 @@ public sealed class AgentClassRouterTests
         Assert.Equal(Claude, afterTtl!.Chosen!.Agent);
         Assert.Equal(1, probe.RefreshCount);
         await afterTtlReservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
+    }
+
+    [Fact]
+    public async Task ReservedHeadroom_UnknownRefreshRetainsReservationUntilCacheTtl()
+    {
+        var cls = FrontierClass(Sub(Claude));
+        var probe = new RefreshingQuotaProbe(
+            Claude,
+            beforeRefreshAvailablePct: 50.0,
+            afterRefreshAvailablePct: -1.0);
+        var router = new AgentClassRouter(
+            [cls],
+            [probe],
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 10.0,
+                QuotaCacheTtl = TimeSpan.FromMilliseconds(100),
+            },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new FixedHeadroomEstimator(35.0));
+
+        var first = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
+        var firstReservation = Assert.IsAssignableFrom<IQuotaReservationLease>(first.QuotaReservation);
+
+        await firstReservation.ReleaseAsync(quotaMayHaveBeenConsumed: true);
+
+        var immediate = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
+        Assert.Null(immediate.Chosen);
+        Assert.True(immediate.ShouldWait);
+        Assert.Contains("headroom", immediate.Reason);
+
+        AgentRoutingDecision? afterTtl = null;
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            afterTtl = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
+            if (afterTtl.Chosen is not null)
+                break;
+
+            await Task.Delay(20);
+        }
+
+        Assert.Equal(1, probe.RefreshCount);
+        Assert.Equal(Claude, afterTtl!.Chosen!.Agent);
     }
 
     [Fact]
@@ -557,6 +619,17 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
+    public async Task ComputeEarliestExhaustedReset_PropagatesProbeFailures()
+    {
+        var cls = FrontierClass(Sub(Claude));
+        var router = BuildRouter([cls], [new ThrowingQuotaProbe(Claude)]);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            router.ComputeEarliestExhaustedResetAsync(
+                MakeItem("frontier"), null, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task ComputeEarliestExhaustedReset_IgnoresPayPerApiMembers()
     {
         // PayPerApi never parks on quota — exclude it even if a custom probe
@@ -585,6 +658,16 @@ public sealed class AgentClassRouterTests
 
         Assert.Null(earliest);
     }
+}
+
+internal sealed class ThrowingQuotaProbe : IAgentQuotaProbe
+{
+    public ThrowingQuotaProbe(AgentKind kind) => Kind = kind;
+
+    public AgentKind Kind { get; }
+
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        => throw new InvalidOperationException("quota probe failed");
 }
 
 /// <summary>Fake probe that always returns a fixed AvailablePct.</summary>

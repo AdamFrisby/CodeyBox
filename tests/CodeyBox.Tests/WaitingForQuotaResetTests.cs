@@ -465,7 +465,7 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
-    public async Task QuotaWaitParker_ResetFallbackFailureUsesDefaultPause()
+    public async Task QuotaWaitParker_ResetFallbackFailurePropagatesAndLeavesItemQueued()
     {
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
         using var store = new SqliteWorkItemStore(stateDb);
@@ -494,17 +494,18 @@ public sealed class WaitingForQuotaResetTests : IDisposable
         };
         await store.CreateAsync(item);
 
-        await parker.ParkAsync(new QuotaWaitParkRequest(
-            item,
-            "insufficient headroom",
-            "work",
-            QuotaResetAt: null,
-            Project: null));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => parker.ParkAsync(
+            new QuotaWaitParkRequest(
+                item,
+                "insufficient headroom",
+                "work",
+                QuotaResetAt: null,
+                Project: null)));
 
-        var parked = await store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
-        Assert.Equal(now.AddMinutes(5), parked.QuotaResetAt);
-        Assert.Equal(now.AddMinutes(5), parked.NextQuotaRetryAt);
+        var stored = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+        Assert.Null(stored.QuotaResetAt);
+        Assert.Null(stored.NextQuotaRetryAt);
     }
 
     [Theory]

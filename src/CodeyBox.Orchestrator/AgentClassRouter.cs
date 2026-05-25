@@ -420,15 +420,25 @@ public sealed class AgentClassRouter
 
         try
         {
-            await probe.RefreshAvailabilityAsync(
-                new AgentMembership
+            var member = new AgentMembership
                 {
                     Agent = reservation.Agent,
                     Billing = AgentBilling.Subscription,
                     ModelId = reservation.ModelId,
                     QualityScore = 0,
-                },
-                ct);
+                };
+            var snapshot = await probe.RefreshAvailabilityAsync(member, ct);
+            var quota = ResolveMemberQuota(snapshot, member);
+            if (quota.AvailablePct < 0)
+            {
+                _log.LogWarning(
+                    "Quota refresh returned unknown availability before releasing {Agent}/{Model} reservation for project {ProjectId}; retaining reserved headroom",
+                    reservation.Agent.Value,
+                    reservation.ModelId ?? "(default)",
+                    reservation.ProjectId.Value);
+                return false;
+            }
+
             return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
@@ -488,9 +498,18 @@ public sealed class AgentClassRouter
             {
                 snapshot = await ProbeAsync(member, ct);
             }
-            catch
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                continue;
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Quota reset probe failed for {Agent}/{Model}",
+                    member.Agent.Value,
+                    member.ModelId ?? "(default)");
+                throw;
             }
 
             var quota = ResolveMemberQuota(snapshot, member);
@@ -595,6 +614,20 @@ public sealed class AgentClassRouter
 
         if (availablePct >= 0)
             return new QuotaGateDecision(false, "quota exhausted", resetAt);
+
+        if (reserveQuota)
+        {
+            var key = new QuotaReservationKey(projectId, member.Agent);
+            var reservedPct = GetReservedHeadroomPct(key);
+            if (reservedPct > 0)
+            {
+                return new QuotaGateDecision(
+                    false,
+                    $"quota unknown while {reservedPct:F1}% reserved headroom is pending release",
+                    resetAt,
+                    InsufficientHeadroom: true);
+            }
+        }
 
         return _opts.UnknownPolicy switch
         {

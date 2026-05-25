@@ -87,10 +87,11 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
             }
             catch (Exception ex)
             {
-                _log.LogDebug(
+                _log.LogWarning(
                     ex,
-                    "Failed to compute quota reset fallback for failed work item {Id}; using default pause",
+                    "Failed to compute quota reset fallback for failed work item {Id}",
                     item.Id);
+                throw;
             }
         }
 
