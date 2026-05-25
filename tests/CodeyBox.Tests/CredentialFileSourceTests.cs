@@ -107,6 +107,37 @@ public sealed class CredentialFileSourceTests : IDisposable
     }
 
     [Fact]
+    public void Dispose_DisposesActiveWatcher()
+    {
+        var path = WriteFile("normal-dispose.json", """{"access_token":"old"}""");
+        DisposeObservingFileSystemWatcher? created = null;
+        FileSystemWatcher? disposed = null;
+        var source = new CredentialFileSource(
+            path,
+            NullLogger.Instance,
+            watch: true,
+            createWatcher: (dir, fileName) =>
+            {
+                created = new DisposeObservingFileSystemWatcher(dir, fileName);
+                return created;
+            },
+            watcherDisposed: watcher => disposed = watcher);
+
+        Assert.NotNull(created);
+        Assert.True(source.IsWatching);
+        Assert.Equal(0, created.DisposeCalls);
+
+        source.Dispose();
+
+        Assert.Equal(1, created.DisposeCalls);
+        Assert.Same(created, disposed);
+        Assert.False(source.IsWatching);
+
+        source.Dispose();
+        Assert.Equal(1, created.DisposeCalls);
+    }
+
+    [Fact]
     public async Task FileWatch_PicksUpFreshTokenWithinOneSecond()
     {
         // The "host-side autonomous OAuth refresh" code path rewrites the file

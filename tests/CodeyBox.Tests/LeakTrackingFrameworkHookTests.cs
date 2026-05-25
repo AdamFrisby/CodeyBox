@@ -31,18 +31,29 @@ public sealed class LeakTrackingFrameworkHookTests
         }
     }
 
-    [Fact]
+    [SentinelFact]
     public void Sentinel_LeaksTrackedWatcher_WhenNestedRunnerEnablesIt()
     {
         var tempDir = Environment.GetEnvironmentVariable(SentinelDirectoryEnvironmentVariable);
-        if (string.IsNullOrWhiteSpace(tempDir))
-            return;
+        Assert.False(
+            string.IsNullOrWhiteSpace(tempDir),
+            $"{SentinelDirectoryEnvironmentVariable} must be set by the nested runner.");
 
         Directory.CreateDirectory(tempDir);
         var path = Path.Combine(tempDir, "sentinel.txt");
         File.WriteAllText(path, "sentinel");
 
         _ = TestFileSystemWatcherLeakTracker.CreateWatcher(tempDir, Path.GetFileName(path));
+        Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    public sealed class SentinelFactAttribute : FactAttribute
+    {
+        public SentinelFactAttribute()
+        {
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(SentinelDirectoryEnvironmentVariable)))
+                Skip = $"Set {SentinelDirectoryEnvironmentVariable} to run the nested leak-tracking sentinel.";
+        }
     }
 
     private static async Task<(int ExitCode, string Stdout, string Stderr)> RunSentinelTestAsync(string tempDir)
