@@ -166,7 +166,43 @@ public sealed class QuotaEndpointTests
         Assert.Equal(10, untrustedProjection.GetProperty("estimatedIterPctCost").GetDouble(), precision: 2);
         Assert.False(untrustedProjection.GetProperty("trustedForEnforcement").GetBoolean());
         Assert.Equal(5, untrustedProjection.GetProperty("projectedAvailablePct").GetDouble(), precision: 2);
-        Assert.True(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
+        Assert.False(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
+        Assert.True(untrustedProjection.GetProperty("insufficientHeadroom").GetBoolean());
+    }
+
+    [Fact]
+    public async Task GetQuota_UnknownQuotaStillReturnsHeadroomProjection()
+    {
+        using var factory = new WorkItemApiFactory();
+        var configuredFactory = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot
+                {
+                    AvailablePct = -1,
+                    Notes = "malformed provider response",
+                }));
+            });
+        });
+
+        var client = configuredFactory.CreateClient();
+        var response = await client.GetAsync("/quota?projectId=test-project");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        var projection = Assert.Single(doc.RootElement
+            .GetProperty("probes")[0]
+            .GetProperty("headroomProjections")
+            .EnumerateArray());
+
+        Assert.Equal("test-project", projection.GetProperty("projectId").GetString());
+        Assert.True(projection.GetProperty("wouldAllow").GetBoolean());
+        Assert.False(projection.GetProperty("insufficientHeadroom").GetBoolean());
+        Assert.False(projection.TryGetProperty("projectedAvailablePct", out var projected)
+            && projected.ValueKind != JsonValueKind.Null);
+        Assert.Contains("quota unavailable", projection.GetProperty("reason").GetString());
     }
 
     [Fact]
@@ -276,6 +312,44 @@ public sealed class QuotaEndpointTests
         Assert.Equal(30, doc.RootElement.GetProperty("headroomProjectionTotalProjectCount").GetInt32());
         Assert.True(doc.RootElement.GetProperty("headroomProjectionTruncated").GetBoolean());
         Assert.Equal(3, doc.RootElement
+            .GetProperty("probes")[0]
+            .GetProperty("headroomProjections")
+            .GetArrayLength());
+    }
+
+    [Fact]
+    public async Task GetQuota_CapsRequestedHeadroomProjectionLimit()
+    {
+        var projects = Enumerable.Range(0, 60)
+            .Select(i => new Project
+            {
+                Id = new ProjectId($"proj-{i:D2}"),
+                DisplayName = $"Project {i:D2}",
+                RepositoryUrl = "https://github.com/test/repo",
+            })
+            .ToArray();
+        using var factory = new WorkItemApiFactory(projects: projects);
+        var configuredFactory = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 80,
+                }));
+            });
+        });
+
+        var client = configuredFactory.CreateClient();
+        var response = await client.GetAsync("/quota?limit=1000");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        Assert.Equal(50, doc.RootElement.GetProperty("headroomProjectionProjectLimit").GetInt32());
+        Assert.Equal(60, doc.RootElement.GetProperty("headroomProjectionTotalProjectCount").GetInt32());
+        Assert.True(doc.RootElement.GetProperty("headroomProjectionTruncated").GetBoolean());
+        Assert.Equal(50, doc.RootElement
             .GetProperty("probes")[0]
             .GetProperty("headroomProjections")
             .GetArrayLength());

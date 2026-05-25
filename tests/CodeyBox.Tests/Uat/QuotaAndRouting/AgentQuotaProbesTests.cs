@@ -247,7 +247,7 @@ public sealed class AgentQuotaProbesTests
 
         Assert.Equal(AgentKind.Claude, decision.Chosen!.Agent);
         Assert.False(decision.ShouldWait);
-        Assert.Contains("-42.0% available", decision.Reason);
+        Assert.Contains("quota unknown", decision.Reason);
     }
 
     [Fact]

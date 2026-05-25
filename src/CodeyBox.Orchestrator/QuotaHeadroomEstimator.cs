@@ -4,25 +4,6 @@ using System.Text.Json;
 
 namespace CodeyBox.Orchestrator;
 
-public interface IQuotaHeadroomEstimator
-{
-    Task<QuotaHeadroomEstimate?> EstimateAsync(
-        QuotaHeadroomRequest request,
-        CancellationToken ct = default);
-}
-
-public sealed record QuotaHeadroomRequest(
-    ProjectId ProjectId,
-    AgentKind Agent,
-    string? ModelId);
-
-public sealed record QuotaHeadroomEstimate(
-    double EstimatedIterPctCost,
-    double AverageTokensPerIteration,
-    int SampledItemCount,
-    string Source,
-    bool TrustedForEnforcement = false);
-
 public sealed class LazyQuotaHeadroomEstimator : IQuotaHeadroomEstimator
 {
     private readonly Func<IQuotaHeadroomEstimator?> _resolver;

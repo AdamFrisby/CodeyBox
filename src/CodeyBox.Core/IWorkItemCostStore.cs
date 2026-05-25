@@ -49,6 +49,14 @@ public interface IWorkItemCostStore
     Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default);
 
     /// <summary>
+    /// Reconciles parser-derived stream usage into a durable cost row. Stores
+    /// that do not persist parser summaries can use the default no-op.
+    /// </summary>
+    Task ReconcileFromAgentStreamSummaryAsync(
+        WorkItemCostReconciliation reconciliation,
+        CancellationToken ct = default) => Task.CompletedTask;
+
+    /// <summary>
     /// Returns the SUM of estimated_usd for all cost records belonging to work items
     /// in <paramref name="projectId"/> whose started_at falls within
     /// [<paramref name="from"/>, <paramref name="to"/>). Uses a single aggregation
@@ -92,3 +100,16 @@ public interface IWorkItemCostStore
         return results;
     }
 }
+
+public sealed record WorkItemCostReconciliation(
+    WorkItemId WorkItemId,
+    string FileName,
+    string Phase,
+    int? Iteration,
+    AgentKind AgentKind,
+    int InputTokens,
+    int CachedInputTokens,
+    int OutputTokens,
+    decimal? EstimatedUsd,
+    TimeSpan TotalDuration,
+    DateTimeOffset SummarisedAt);

@@ -206,6 +206,16 @@ internal sealed class InMemoryProjectRepository : IProjectRepository
         => Task.FromResult(_byId.TryGetValue(id.Value, out var p) ? p : null);
     public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<Project>>([.. _byId.Values]);
+
+    public Task<ProjectListPage> ListPageAsync(int limit, CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        var projects = _byId.Values
+            .OrderBy(p => p.Id.Value, StringComparer.Ordinal)
+            .Take(limit)
+            .ToList();
+        return Task.FromResult(new ProjectListPage(projects, _byId.Count, _byId.Count > projects.Count));
+    }
 }
 
 /// <summary>

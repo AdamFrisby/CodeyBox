@@ -5,52 +5,6 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-public interface IQuotaHeadroomManager
-{
-    Task<QuotaHeadroomGateResult> EvaluateAsync(
-        QuotaHeadroomGateRequest request,
-        CancellationToken ct = default);
-
-    Task<QuotaHeadroomGateResult> TryReserveAsync(
-        QuotaHeadroomGateRequest request,
-        CancellationToken ct = default);
-
-    double GetReservedHeadroomPct(ProjectId projectId, AgentKind agent);
-}
-
-public sealed record QuotaHeadroomGateRequest(
-    ProjectId ProjectId,
-    AgentMembership Member,
-    double AvailablePct,
-    DateTimeOffset? ResetAt,
-    bool AuditOnRefusal = true,
-    double? MinRemainingPct = null);
-
-public sealed record QuotaHeadroomGateResult(
-    bool Allow,
-    string Reason,
-    DateTimeOffset? RetryAt,
-    bool InsufficientHeadroom = false,
-    IQuotaReservationLease? Reservation = null,
-    QuotaHeadroomEstimate? Estimate = null,
-    double ReservedPct = 0,
-    double? ProjectedAvailablePct = null);
-
-public interface IQuotaReservationLease
-{
-    ProjectId ProjectId { get; }
-    AgentKind Agent { get; }
-    string? ModelId { get; }
-    double ReservedPct { get; }
-
-    /// <summary>
-    /// Releases this reservation. Pass <paramref name="quotaMayHaveBeenConsumed"/>
-    /// as true after an agent invocation reached the provider, so the lease can
-    /// refresh provider quota or delay release when the snapshot could be stale.
-    /// </summary>
-    Task ReleaseAsync(bool quotaMayHaveBeenConsumed, CancellationToken ct = default);
-}
-
 public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
 {
     private readonly IQuotaHeadroomEstimator? _headroomEstimator;
@@ -99,6 +53,7 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
 
         var key = new QuotaReservationKey(request.ProjectId, member.Agent);
         var reservedPct = GetReservedHeadroomPct(key);
+        var minRemainingPct = Math.Max(0, request.MinRemainingPct ?? 0);
         if (request.AvailablePct < 0)
         {
             return new QuotaHeadroomGateResult(
@@ -137,27 +92,39 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
         var estimatedCost = estimate?.EstimatedIterPctCost;
         if (estimatedCost is not { } cost || cost <= 0)
         {
+            var projectedWithoutEstimate = request.AvailablePct - reservedPct;
+            if (projectedWithoutEstimate < minRemainingPct)
+            {
+                const string reason = "insufficient headroom";
+                if (request.AuditOnRefusal)
+                {
+                    AuditLog.QuotaDispatchRefused(
+                        member.Agent,
+                        request.ProjectId,
+                        request.AvailablePct,
+                        0,
+                        reason);
+                }
+
+                return new QuotaHeadroomGateResult(
+                    false,
+                    $"insufficient headroom (available={request.AvailablePct:F1}%, reserved={reservedPct:F1}%, projected={projectedWithoutEstimate:F1}% < min={minRemainingPct:F1}%)",
+                    request.ResetAt,
+                    InsufficientHeadroom: true,
+                    Estimate: estimate,
+                    ReservedPct: reservedPct,
+                    ProjectedAvailablePct: projectedWithoutEstimate);
+            }
+
             return new QuotaHeadroomGateResult(
                 true,
                 "quota available",
                 request.ResetAt,
                 Estimate: estimate,
                 ReservedPct: reservedPct,
-                ProjectedAvailablePct: request.AvailablePct - reservedPct);
+                ProjectedAvailablePct: projectedWithoutEstimate);
         }
 
-        if (!estimate!.TrustedForEnforcement)
-        {
-            return new QuotaHeadroomGateResult(
-                true,
-                $"quota available (untrusted headroom estimate {cost:F1}% skipped for enforcement)",
-                request.ResetAt,
-                Estimate: estimate,
-                ReservedPct: reservedPct,
-                ProjectedAvailablePct: request.AvailablePct - reservedPct - cost);
-        }
-
-        var minRemainingPct = Math.Max(0, request.MinRemainingPct ?? 0);
         IQuotaReservationLease? reservation = null;
 
         if (reserve)

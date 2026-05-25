@@ -1384,6 +1384,12 @@ public sealed class WaitingForQuotaResetTests : IDisposable
 
         public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<Project>>([]);
+
+        public Task<ProjectListPage> ListPageAsync(int limit, CancellationToken ct = default)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+            return Task.FromResult(new ProjectListPage([], 0, false));
+        }
     }
 
     private sealed class FixedClock : TimeProvider

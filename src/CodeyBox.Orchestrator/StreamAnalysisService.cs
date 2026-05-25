@@ -63,8 +63,8 @@ public sealed class StreamAnalysisService : BackgroundService
         {
             if (existingSummaries.TryGetValue(file.FileName, out var existing))
             {
-                if (_costs is SqliteWorkItemCostStore cachedSummaryCosts)
-                    await cachedSummaryCosts.ReconcileFromAgentStreamSummaryAsync(existing, ct).ConfigureAwait(false);
+                if (_costs is not null)
+                    await _costs.ReconcileFromAgentStreamSummaryAsync(ToCostReconciliation(existing), ct).ConfigureAwait(false);
                 continue;
             }
 
@@ -96,13 +96,27 @@ public sealed class StreamAnalysisService : BackgroundService
                 summary,
                 DateTimeOffset.UtcNow);
             await _summaries.UpsertAsync(row, ct).ConfigureAwait(false);
-            if (_costs is SqliteWorkItemCostStore sqliteCosts)
-                await sqliteCosts.ReconcileFromAgentStreamSummaryAsync(row, ct).ConfigureAwait(false);
+            if (_costs is not null)
+                await _costs.ReconcileFromAgentStreamSummaryAsync(ToCostReconciliation(row), ct).ConfigureAwait(false);
             count++;
         }
 
         return count;
     }
+
+    private static WorkItemCostReconciliation ToCostReconciliation(AgentStreamSummaryRow row) =>
+        new(
+            row.WorkItemId,
+            row.FileName,
+            row.Phase,
+            row.Iteration,
+            row.AgentKind,
+            row.Summary.InputTokens,
+            row.Summary.CachedInputTokens,
+            row.Summary.OutputTokens,
+            row.Summary.EstimatedUsd,
+            row.Summary.TotalDuration,
+            row.SummarisedAt);
 
     private async Task<AgentKind?> SniffKindAsync(WorkItemId id, string fileName, CancellationToken ct)
     {

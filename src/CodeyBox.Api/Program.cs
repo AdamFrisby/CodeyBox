@@ -1477,13 +1477,10 @@ app.MapGet("/quota", async (
     }
     else
     {
-        var allProjects = await projects.ListAsync(ct);
-        totalProjectCount = allProjects.Count;
-        projectList = allProjects
-            .OrderBy(p => p.Id.Value, StringComparer.Ordinal)
-            .Take(effectiveLimit)
-            .ToList();
-        projectionTruncated = totalProjectCount > projectList.Count;
+        var projectPage = await projects.ListPageAsync(effectiveLimit, ct);
+        totalProjectCount = projectPage.TotalCount;
+        projectList = projectPage.Projects;
+        projectionTruncated = projectPage.HasMore;
     }
 
     var snapshots = new List<object>();

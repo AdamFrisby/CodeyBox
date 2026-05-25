@@ -83,6 +83,17 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
         => Task.FromResult(Volatile.Read(ref _snapshot).List);
 
+    public Task<ProjectListPage> ListPageAsync(int limit, CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        var snapshot = Volatile.Read(ref _snapshot);
+        var page = snapshot.List
+            .OrderBy(p => p.Id.Value, StringComparer.Ordinal)
+            .Take(limit)
+            .ToList();
+        return Task.FromResult(new ProjectListPage(page, snapshot.List.Count, snapshot.List.Count > page.Count));
+    }
+
     public void Dispose() => _changeSubscription?.Dispose();
 
     private Snapshot Build(ProjectsOptions opts, PresetCatalogOptions? presetCatalogOptions)

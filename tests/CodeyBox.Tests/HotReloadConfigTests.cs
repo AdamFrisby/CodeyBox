@@ -596,6 +596,12 @@ public sealed class HotReloadConfigTests
 
         public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<Project>>([Volatile.Read(ref _current)]);
+
+        public Task<ProjectListPage> ListPageAsync(int limit, CancellationToken ct = default)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+            return Task.FromResult(new ProjectListPage([Volatile.Read(ref _current)], 1, false));
+        }
     }
 
     /// <summary>

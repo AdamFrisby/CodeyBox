@@ -13,6 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
 {
+    private const int MaxRecentCostRowsPerItem = 64;
     private readonly string _path;
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -259,17 +260,29 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
                 GROUP BY c.work_item_id
                 ORDER BY latest_ended_at DESC
                 LIMIT $limit
+            ),
+            ranked_costs AS (
+                SELECT c.id, c.work_item_id, c.phase, c.iteration, c.agent_kind, c.model_id,
+                       c.input_tokens, c.cached_input_tokens, c.output_tokens,
+                       c.estimated_usd, c.started_at, c.ended_at, c.raw_metadata_json,
+                       r.latest_ended_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY c.work_item_id
+                           ORDER BY c.started_at DESC, c.id DESC
+                       ) AS cost_row_rank
+                FROM work_item_costs c
+                JOIN recent_items r ON r.work_item_id = c.work_item_id
+                WHERE c.started_at >= $from
+                  AND c.started_at < $to
+                  AND ($agent IS NULL OR lower(c.agent_kind) = lower($agent))
+                  AND ($model IS NULL OR lower(COALESCE(c.model_id, '')) = lower($model))
             )
-            SELECT c.id, c.work_item_id, c.phase, c.iteration, c.agent_kind, c.model_id,
-                   c.input_tokens, c.cached_input_tokens, c.output_tokens,
-                   c.estimated_usd, c.started_at, c.ended_at, c.raw_metadata_json
-            FROM work_item_costs c
-            JOIN recent_items r ON r.work_item_id = c.work_item_id
-            WHERE c.started_at >= $from
-              AND c.started_at < $to
-              AND ($agent IS NULL OR lower(c.agent_kind) = lower($agent))
-              AND ($model IS NULL OR lower(COALESCE(c.model_id, '')) = lower($model))
-            ORDER BY r.latest_ended_at DESC, c.started_at
+            SELECT id, work_item_id, phase, iteration, agent_kind, model_id,
+                   input_tokens, cached_input_tokens, output_tokens,
+                   estimated_usd, started_at, ended_at, raw_metadata_json
+            FROM ranked_costs
+            WHERE cost_row_rank <= $rowsPerItem
+            ORDER BY latest_ended_at DESC, started_at
             """;
         cmd.Parameters.AddWithValue("$proj", projectId);
         cmd.Parameters.AddWithValue("$from", from.ToString("O"));
@@ -277,6 +290,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         cmd.Parameters.AddWithValue("$agent", string.IsNullOrWhiteSpace(agentKind) ? DBNull.Value : agentKind);
         cmd.Parameters.AddWithValue("$model", string.IsNullOrWhiteSpace(modelId) ? DBNull.Value : modelId);
         cmd.Parameters.AddWithValue("$limit", maxItems);
+        cmd.Parameters.AddWithValue("$rowsPerItem", MaxRecentCostRowsPerItem);
 
         var results = new List<WorkItemCost>();
         using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -326,9 +340,14 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         }
     }
 
-    public async Task ReconcileFromAgentStreamSummaryAsync(AgentStreamSummaryRow row, CancellationToken ct = default)
+    public Task ReconcileFromAgentStreamSummaryAsync(AgentStreamSummaryRow row, CancellationToken ct = default) =>
+        ReconcileFromAgentStreamSummaryAsync(ToCostReconciliation(row), ct);
+
+    public async Task ReconcileFromAgentStreamSummaryAsync(
+        WorkItemCostReconciliation reconciliation,
+        CancellationToken ct = default)
     {
-        if (row.Summary.EstimatedUsd is null)
+        if (reconciliation.EstimatedUsd is null)
             return;
 
         await _writeLock.WaitAsync(ct);
@@ -342,7 +361,13 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
                         cached_input_tokens = $cached,
                         output_tokens = $output,
                         estimated_usd = $usd,
-                        raw_metadata_json = $meta
+                        raw_metadata_json = CASE
+                            WHEN raw_metadata_json IS NULL
+                              OR raw_metadata_json = ''
+                              OR raw_metadata_json = '{}'
+                            THEN $meta
+                            ELSE raw_metadata_json
+                        END
                     WHERE id = (
                         SELECT id FROM work_item_costs
                         WHERE work_item_id = $wi
@@ -358,7 +383,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
                         LIMIT 1
                     )
                     """;
-                BindReconcile(update, row);
+                BindReconcile(update, reconciliation);
                 var changed = await update.ExecuteNonQueryAsync(ct);
                 if (changed > 0)
                     return;
@@ -374,10 +399,10 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
                     ($id, $wi, $phase, $iter, $kind, NULL,
                      $input, $cached, $output, $usd, $started, $ended, $meta)
                 """;
-            BindReconcile(insert, row);
-            insert.Parameters.AddWithValue("$id", $"stream-{row.WorkItemId}-{row.FileName}");
-            var ended = row.SummarisedAt;
-            var started = ended - row.Summary.TotalDuration;
+            BindReconcile(insert, reconciliation);
+            insert.Parameters.AddWithValue("$id", $"stream-{reconciliation.WorkItemId}-{reconciliation.FileName}");
+            var ended = reconciliation.SummarisedAt;
+            var started = ended - reconciliation.TotalDuration;
             insert.Parameters.AddWithValue("$started", started.ToString("O"));
             insert.Parameters.AddWithValue("$ended", ended.ToString("O"));
             await insert.ExecuteNonQueryAsync(ct);
@@ -430,18 +455,32 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         RawMetadataJson = r.GetString(12),
     };
 
-    private static void BindReconcile(SqliteCommand cmd, AgentStreamSummaryRow row)
+    private static WorkItemCostReconciliation ToCostReconciliation(AgentStreamSummaryRow row) =>
+        new(
+            row.WorkItemId,
+            row.FileName,
+            row.Phase,
+            row.Iteration,
+            row.AgentKind,
+            row.Summary.InputTokens,
+            row.Summary.CachedInputTokens,
+            row.Summary.OutputTokens,
+            row.Summary.EstimatedUsd,
+            row.Summary.TotalDuration,
+            row.SummarisedAt);
+
+    private static void BindReconcile(SqliteCommand cmd, WorkItemCostReconciliation reconciliation)
     {
-        cmd.Parameters.AddWithValue("$wi", row.WorkItemId.ToString());
-        cmd.Parameters.AddWithValue("$phase", row.Phase);
-        cmd.Parameters.AddWithValue("$canonicalPhase", CanonicalCostPhase(row.Phase));
-        cmd.Parameters.AddWithValue("$iter", row.Iteration.HasValue ? row.Iteration.Value : DBNull.Value);
-        cmd.Parameters.AddWithValue("$kind", row.AgentKind.Value);
-        cmd.Parameters.AddWithValue("$input", row.Summary.InputTokens);
-        cmd.Parameters.AddWithValue("$cached", row.Summary.CachedInputTokens);
-        cmd.Parameters.AddWithValue("$output", row.Summary.OutputTokens);
-        cmd.Parameters.AddWithValue("$usd", (double)(row.Summary.EstimatedUsd ?? 0m));
-        cmd.Parameters.AddWithValue("$meta", $$"""{"source":"agent_stream_analyser","fileName":{{JsonSerializer.Serialize(row.FileName)}},"streamPhase":{{JsonSerializer.Serialize(row.Phase)}}}""");
+        cmd.Parameters.AddWithValue("$wi", reconciliation.WorkItemId.ToString());
+        cmd.Parameters.AddWithValue("$phase", reconciliation.Phase);
+        cmd.Parameters.AddWithValue("$canonicalPhase", CanonicalCostPhase(reconciliation.Phase));
+        cmd.Parameters.AddWithValue("$iter", reconciliation.Iteration.HasValue ? reconciliation.Iteration.Value : DBNull.Value);
+        cmd.Parameters.AddWithValue("$kind", reconciliation.AgentKind.Value);
+        cmd.Parameters.AddWithValue("$input", reconciliation.InputTokens);
+        cmd.Parameters.AddWithValue("$cached", reconciliation.CachedInputTokens);
+        cmd.Parameters.AddWithValue("$output", reconciliation.OutputTokens);
+        cmd.Parameters.AddWithValue("$usd", (double)(reconciliation.EstimatedUsd ?? 0m));
+        cmd.Parameters.AddWithValue("$meta", $$"""{"source":"agent_stream_analyser","fileName":{{JsonSerializer.Serialize(reconciliation.FileName)}},"streamPhase":{{JsonSerializer.Serialize(reconciliation.Phase)}}}""");
     }
 
     private static string CanonicalCostPhase(string phase) =>

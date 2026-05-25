@@ -125,6 +125,16 @@ internal sealed class InMemoryProjectRepository : IProjectRepository
 
     public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<Project>>([.. _projects.Values]);
+
+    public Task<ProjectListPage> ListPageAsync(int limit, CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        var projects = _projects.Values
+            .OrderBy(p => p.Id.Value, StringComparer.Ordinal)
+            .Take(limit)
+            .ToList();
+        return Task.FromResult(new ProjectListPage(projects, _projects.Count, _projects.Count > projects.Count));
+    }
 }
 
 internal sealed class RecordingQueueController : IQueueController

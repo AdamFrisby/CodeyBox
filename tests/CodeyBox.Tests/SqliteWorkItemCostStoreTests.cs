@@ -182,6 +182,35 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(10, row.CachedInputTokens);
         Assert.Equal(20, row.OutputTokens);
         Assert.Equal(0.42, row.EstimatedUsd, precision: 5);
+        Assert.Contains("provider_metadata", row.RawMetadataJson);
+    }
+
+    [Fact]
+    public async Task GetRecentByProjectAsync_BoundsCostRowsPerSelectedWorkItem()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, "proj-row-bound");
+        var now = DateTimeOffset.UtcNow;
+
+        for (var i = 0; i < 70; i++)
+        {
+            await _store.RecordAsync(MakeCost(itemId) with
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                StartedAt = now.AddMinutes(-70 + i),
+                EndedAt = now.AddMinutes(-70 + i).AddSeconds(10),
+            });
+        }
+
+        var rows = await _store.GetRecentByProjectAsync(
+            "proj-row-bound",
+            now.AddHours(-2),
+            now.AddMinutes(1),
+            agentKind: null,
+            modelId: null,
+            maxItems: 1);
+
+        Assert.Equal(64, rows.Count);
     }
 
     [Fact]
