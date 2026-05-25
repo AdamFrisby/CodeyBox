@@ -254,6 +254,15 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
     public int StructuredStreamSupportProbeCount { get; private set; }
     public string? ResultStdout { get; set; }
     public AgentKind Kind { get; init; } = AgentKind.Claude;
+    /// <summary>
+    /// When non-null, <see cref="GetTextOnlyUnavailabilityReason"/> returns this
+    /// value (simulating a missing text-only credential), and
+    /// <see cref="RunTextOnlyAsync"/> records its invocation in
+    /// <see cref="TextOnlyInvocations"/> only when called despite the gate —
+    /// which is the bug under test.
+    /// </summary>
+    public string? TextOnlyUnavailabilityReason { get; set; }
+    public List<string> TextOnlyInvocations { get; } = new();
 
     private sealed record ConflictResolverInputJson(List<ConflictResolverInputFileJson>? Files);
     private sealed record ConflictResolverInputFileJson(string? Path, string? Content);
@@ -269,6 +278,12 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         return Task.FromResult(true);
     }
 
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+    {
+        _ = credential;
+        return TextOnlyUnavailabilityReason;
+    }
+
     public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
@@ -280,6 +295,7 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         _ = modelId;
         _ = reasoningMode;
         _ = ct;
+        TextOnlyInvocations.Add(prompt);
         if (prompt.StartsWith("# Merge conflict resolver", StringComparison.Ordinal))
         {
             if (ConflictResolutionPlan.Count == 0)

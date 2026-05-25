@@ -133,6 +133,11 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         }
     }
 
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+        => string.IsNullOrEmpty(ResolveOpenAiApiKey(credential))
+            ? "OPENAI_API_KEY is required for text-only calls"
+            : null;
+
     public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,

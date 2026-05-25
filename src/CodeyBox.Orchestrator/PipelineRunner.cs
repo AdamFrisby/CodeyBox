@@ -631,6 +631,15 @@ public sealed class PipelineRunner : IPipelineRunner
                 Project = project,
             }, CancellationToken.None);
         }
+        catch (AgentUnavailableException ex)
+        {
+            // Distinct from MergeConflictResolutionFailed: the resolver never
+            // ran because no text-only-capable agent had viable credentials.
+            // Failure is structured so operators can grep failureKind=agent_unavailable
+            // and fix the credential gap rather than chasing a phantom merge bug.
+            _log.LogWarning("Work item {Id} agent unavailable: {Error}", item.Id, ex.Message);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "agent_unavailable");
+        }
         catch (AgentStuckException stuckEx)
         {
             await HandleAgentStuckAsync(item, project, stuckEx);
@@ -851,9 +860,12 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (rebaseConflictFiles.Count > 0)
             {
-                var credential = _credentials is IProjectAwareCredentialProvider pac
-                    ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
-                    : await _credentials.GetAsync(runner.Kind, ct);
+                // Reuse the same routing the resolver used so the advisory
+                // review never tries to call an agent whose text-only path is
+                // unavailable in this configuration. Because we only get here
+                // when the resolver actually ran, ResolveTextOnlyRebaseResolverAsync
+                // is guaranteed not to throw.
+                var (reviewRunner, reviewCredential) = await ResolveTextOnlyRebaseResolverAsync(item, project, runner, ct);
                 await RecordMergeSecurityReviewAsync(
                     item.Id,
                     repoId,
@@ -861,8 +873,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     newTip,
                     rebaseConflictFiles,
                     project,
-                    runner,
-                    credential,
+                    reviewRunner,
+                    reviewCredential,
                     ct);
             }
 
@@ -968,11 +980,13 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         CancellationToken ct)
     {
-        var credential = _credentials is IProjectAwareCredentialProvider pac
-            ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
-            : await _credentials.GetAsync(runner.Kind, ct);
         var conflictFiles = new SortedSet<string>(StringComparer.Ordinal);
         var resolvedAnyConflict = false;
+        // Resolver runner + credential are resolved lazily on first conflict so
+        // a clean rebase (no conflicts) is never blocked when no class member
+        // has viable text-only credentials. The same pair is reused for every
+        // conflict iteration within this rebase.
+        (IAgentRunner Runner, AgentCredential? Credential)? resolverPair = null;
 
         var rebase = await sandbox.ExecAsync(new SandboxExec
         {
@@ -999,14 +1013,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 foreach (var path in hunks.Select(static h => h.Path))
                     conflictFiles.Add(path);
 
+                resolverPair ??= await ResolveTextOnlyRebaseResolverAsync(item, project, runner, ct);
+
                 var baselines = await ReadConflictFilesAsync(sandbox, hunks, ct);
                 var prompt = BuildRebaseConflictResolverPrompt(baseBranch, workBranch, hunks, project.Audit.MergeScopeBufferLines);
                 var agentResult = await RunConstrainedConflictResolverAsync(
-                    runner,
+                    resolverPair.Value.Runner,
                     sandbox,
                     prompt,
                     hunks,
-                    credential,
+                    resolverPair.Value.Credential,
                     item.ModelId,
                     item.ReasoningMode,
                     ct);
@@ -1039,7 +1055,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
                 }, CancellationToken.None);
-                if (ex is MergeConflictResolutionFailedException)
+                // AgentUnavailableException is a routing failure, not a merge
+                // conflict failure — let it propagate so the catch in RunAsync
+                // surfaces failureKind=agent_unavailable instead of overwriting
+                // it as MergeConflictResolutionFailed.
+                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException)
                     throw;
                 throw new MergeConflictResolutionFailedException(
                     $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}: {ex.Message}",
@@ -1050,6 +1070,92 @@ public sealed class PipelineRunner : IPipelineRunner
         _ = repoId;
         _ = oldTip;
         return resolvedAnyConflict ? conflictFiles.ToArray() : [];
+    }
+
+    /// <summary>
+    /// Picks the runner + credential the pickup-time rebase resolver should
+    /// use. Tries <paramref name="primaryRunner"/> (the work item's currently-
+    /// selected agent) first; if it lacks a viable text-only credential, walks
+    /// the work item's agent class chain and returns the first registered
+    /// member whose <see cref="ITextOnlyAgentRunner.GetTextOnlyUnavailabilityReason"/>
+    /// is null.
+    ///
+    /// <para>
+    /// Fixes the long-tail bug where a work item routed to an agent with no
+    /// text-only credential (typically Gemini with OAuth-only, no
+    /// <c>GEMINI_API_KEY</c>) failed the pickup-time rebase with a misleading
+    /// <see cref="WorkItemState.MergeConflictResolutionFailed"/> even when
+    /// every other class member had working credentials. Caller-supplied
+    /// runner is preferred so a single registered/credentialed agent (no
+    /// class) still works.
+    /// </para>
+    ///
+    /// <para>
+    /// Throws <see cref="AgentUnavailableException"/> when no class member
+    /// has viable text-only credentials. The caller surfaces this as
+    /// <c>failureKind=agent_unavailable</c> rather than merging it into the
+    /// merge-conflict failure bucket.
+    /// </para>
+    /// </summary>
+    private async Task<(IAgentRunner Runner, AgentCredential? Credential)>
+        ResolveTextOnlyRebaseResolverAsync(
+            WorkItem item, Project project, IAgentRunner primaryRunner, CancellationToken ct)
+    {
+        var candidateReasons = new List<string>();
+        var seenKinds = new HashSet<AgentKind>();
+
+        var primary = await TryCandidateAsync(primaryRunner, ct);
+        if (primary is { } primaryPair)
+            return primaryPair;
+
+        var classId = item.AgentClassId ?? project.DefaultAgentClass;
+        if (_classRouter is not null && classId is not null)
+        {
+            foreach (var member in _classRouter.OrderedFallbackCandidates(item, project))
+            {
+                if (!seenKinds.Add(member.Agent))
+                    continue;
+                if (!_agents.TryGet(member.Agent, out var memberRunner))
+                {
+                    candidateReasons.Add($"{member.Agent.Value}: no runner registered");
+                    continue;
+                }
+                var memberPair = await TryCandidateAsync(memberRunner, ct);
+                if (memberPair is { } chosen)
+                {
+                    AuditLog.RebaseResolverAgentRerouted(primaryRunner.Kind, member.Agent,
+                        $"{primaryRunner.Kind.Value} text-only credential missing; using class member");
+                    return chosen;
+                }
+            }
+        }
+
+        var reasons = candidateReasons.Count == 0 ? "no text-only-capable agent registered" : string.Join("; ", candidateReasons);
+        AuditLog.RebaseResolverAgentUnavailable(item.Id, reasons);
+        throw new AgentUnavailableException(
+            $"pickup-time rebase resolver could not run: no text-only-capable agent has viable credentials ({reasons})",
+            reasons);
+
+        async Task<(IAgentRunner Runner, AgentCredential? Credential)?> TryCandidateAsync(
+            IAgentRunner candidate, CancellationToken token)
+        {
+            seenKinds.Add(candidate.Kind);
+            if (candidate is not ITextOnlyAgentRunner textOnly)
+            {
+                candidateReasons.Add($"{candidate.Kind.Value}: runner does not implement text-only mode");
+                return null;
+            }
+
+            var credential = await ResolveAgentCredentialAsync(candidate.Kind, project, token);
+            var reason = textOnly.GetTextOnlyUnavailabilityReason(credential);
+            if (reason is not null)
+            {
+                candidateReasons.Add($"{candidate.Kind.Value}: {reason}");
+                return null;
+            }
+
+            return (candidate, credential);
+        }
     }
 
     private static async Task<IReadOnlyList<ConflictHunk>> ExtractSandboxConflictHunksAsync(ISandbox sandbox, CancellationToken ct)

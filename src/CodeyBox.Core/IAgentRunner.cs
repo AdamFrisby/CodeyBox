@@ -67,6 +67,17 @@ public interface ITextOnlyAgentRunner : IAgentRunner
         string? modelId = null,
         string? reasoningMode = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Cheap, credential-only viability probe. Returns <c>null</c> when the
+    /// supplied credential is sufficient for <see cref="RunTextOnlyAsync"/> to
+    /// reach the provider; otherwise returns a short human-readable reason
+    /// (e.g. <c>"GEMINI_API_KEY is required"</c>). The default implementation
+    /// is permissive — runners that need specific env vars override this so
+    /// the rebase-resolver router can walk the class chain past a runner with
+    /// no viable text-only credential rather than hard-failing the work item.
+    /// </summary>
+    string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) => null;
 }
 
 public sealed record TextOnlyAgentResult(bool Success, string Summary, string? Output, string? Error);

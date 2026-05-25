@@ -1,0 +1,279 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Agents;
+using CodeyBox.Core;
+using CodeyBox.Git;
+using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
+using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+
+namespace CodeyBox.Tests;
+
+/// <summary>
+/// Pickup-time rebase resolver must consult an agent's text-only credential
+/// viability before invoking <see cref="ITextOnlyAgentRunner.RunTextOnlyAsync"/>.
+/// Before this fix the resolver hard-routed to whichever agent the work item
+/// had been routed to at pickup-time — so an OAuth-only Gemini configuration
+/// (no <c>GEMINI_API_KEY</c>) failed every pickup-time rebase with a misleading
+/// <see cref="WorkItemState.MergeConflictResolutionFailed"/>, even when the
+/// project's class chain had Claude/Codex available with working credentials.
+///
+/// <para>
+/// Coverage targets the bug's acceptance criteria:
+/// </para>
+/// <list type="number">
+///   <item>Gemini missing API_KEY + Claude/Codex with OAuth → rebase routes to
+///         Claude or Codex and completes (Gemini's text-only path never fires).</item>
+///   <item>Every class member missing text-only credentials → item fails with
+///         <c>failureKind=agent_unavailable</c>, not
+///         <see cref="WorkItemState.MergeConflictResolutionFailed"/>.</item>
+/// </list>
+/// </summary>
+[Collection("Pipeline integration")]
+public sealed class RebaseResolverAgentRoutingTests : IDisposable
+{
+    private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-rebase-route-").FullName;
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_workspace, recursive: true); } catch { }
+    }
+
+    [Fact]
+    public async Task GeminiMissingApiKey_ResolverRoutesToClaude()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var gemini = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Gemini,
+            TextOnlyUnavailabilityReason = "GEMINI_API_KEY is required",
+        };
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Claude,
+        };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+        };
+
+        // Resolver-side conflict plan goes on Claude — the first class member
+        // we expect the router to land on after stepping past Gemini.
+        claude.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildFixture(seed, [gemini, claude, codex]);
+
+        var item = NewItem(AgentKind.Gemini) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Resolver never invoked Gemini — its text-only credential is missing.
+        Assert.Empty(gemini.TextOnlyInvocations);
+        // Resolver did invoke Claude (the next class member with viable creds)
+        // exactly once for the conflict-resolution prompt.
+        Assert.Single(claude.TextOnlyInvocations);
+        Assert.StartsWith("# Merge conflict resolver", claude.TextOnlyInvocations[0]);
+        Assert.Empty(claude.ConflictResolutionPlan);
+        // Codex was the third-rank fallback; never reached.
+        Assert.Empty(codex.TextOnlyInvocations);
+    }
+
+    [Fact]
+    public async Task AllAgentsMissingTextOnlyCredentials_FailsWithAgentUnavailable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var gemini = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Gemini,
+            TextOnlyUnavailabilityReason = "GEMINI_API_KEY is required",
+        };
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Claude,
+            TextOnlyUnavailabilityReason = "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required",
+        };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+            TextOnlyUnavailabilityReason = "OPENAI_API_KEY is required for text-only calls",
+        };
+
+        using var fix = BuildFixture(seed, [gemini, claude, codex]);
+
+        var item = NewItem(AgentKind.Gemini) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+        var preRebaseTip = await RevParseAsync(barePath, item.WorkBranch!);
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // Distinct from MergeConflictResolutionFailed: the resolver never ran.
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("agent_unavailable", final.FailureKind);
+        Assert.Contains("no text-only-capable agent has viable credentials", final.LastError);
+        Assert.Contains("gemini:", final.LastError);
+        Assert.Contains("claude:", final.LastError);
+        Assert.Contains("codex:", final.LastError);
+        // None of the runners' text-only paths were exercised.
+        Assert.Empty(gemini.TextOnlyInvocations);
+        Assert.Empty(claude.TextOnlyInvocations);
+        Assert.Empty(codex.TextOnlyInvocations);
+        // Work branch is untouched — same protection as the merge-failure path.
+        Assert.Equal(preRebaseTip, await RevParseAsync(barePath, item.WorkBranch!));
+    }
+
+    // ── Harness ─────────────────────────────────────────────────────────────
+
+    private RoutingFixture BuildFixture(string seedRepoUrl, IReadOnlyList<ScriptedAgent> agents)
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+
+        var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var prs = new InMemoryPullRequestService();
+        var webhooks = new CapturingWebhookDispatcher();
+        var registry = new AgentRegistry(agents);
+
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = agents
+                .Select((agent, idx) => new AgentMembership
+                {
+                    Agent = agent.Kind,
+                    Billing = AgentBilling.Subscription,
+                    // Descending QualityScore by config order keeps the router's
+                    // tie-break deterministic: first-listed agent ranks first.
+                    QualityScore = 100 - idx,
+                })
+                .ToList(),
+        };
+        var router = new AgentClassRouter(
+            [frontier],
+            probes: [],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = seedRepoUrl,
+            DefaultBaseBranch = "main",
+            DefaultAgent = agents[0].Kind,
+            DefaultAgentClass = "frontier",
+            Audit = new ProjectAudit { MaxIterations = 1 },
+        };
+        var projects = new InMemoryProjectRepository(project);
+
+        var pipeline = new PipelineRunner(
+            sandboxes,
+            gitHost,
+            registry,
+            new PermissiveCredentialProvider(),
+            prs,
+            projects,
+            new TestUpstreamFactory(),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store,
+            webhooks,
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance,
+            classRouter: router);
+
+        return new RoutingFixture(pipeline, store, gitHost);
+    }
+
+    private static WorkItem NewItem(AgentKind agent)
+    {
+        var id = WorkItemId.New();
+        return new WorkItem
+        {
+            Id = id,
+            ProjectId = new ProjectId("test-project"),
+            Title = "test",
+            Prompt = "do thing",
+            BaseBranch = "main",
+            WorkBranch = $"codeybox/{id.ToString()[..8]}",
+            Agent = agent,
+            AgentClassId = "frontier",
+            PushUpstream = false,
+        };
+    }
+
+    private async Task<string> CommitToBareBranchAsync(
+        string barePath, string branch, string fileName, string contents, string subject)
+    {
+        var clone = Path.Combine(_workspace, "clone-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", branch, "origin/main");
+        var fullPath = Path.Combine(clone, fileName);
+        await File.WriteAllTextAsync(fullPath, contents);
+        await TestSupport.RunGit(clone, "add", fileName);
+        await TestSupport.RunGit(clone, "commit", "-m", $"{subject}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+        var sha = await RevParseAsync(clone, "HEAD");
+        await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
+        return sha;
+    }
+
+    private static async Task CommitToSeedAsync(string repoPath, string path, string content, string message)
+    {
+        await TestSupport.RunGit(repoPath, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(repoPath, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoPath, path), content);
+        await TestSupport.RunGit(repoPath, "add", path);
+        await TestSupport.RunGit(repoPath, "commit", "-m", message);
+    }
+
+    private static async Task<string> RevParseAsync(string repoPath, string rev)
+    {
+        var (_, stdout, _) = await TestSupport.RunGit(repoPath, "rev-parse", rev);
+        return stdout.Trim();
+    }
+
+    private sealed class PermissiveCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+            => Task.FromResult<AgentCredential?>(new AgentCredential(
+                agent,
+                EnvironmentVariables: new Dictionary<string, string>(),
+                Files: new Dictionary<string, string>()));
+    }
+
+    private sealed record RoutingFixture(
+        PipelineRunner Pipeline,
+        SqliteWorkItemStore Store,
+        LocalGitHost GitHost) : IDisposable
+    {
+        public void Dispose() => Store.Dispose();
+    }
+}
