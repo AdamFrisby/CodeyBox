@@ -14,6 +14,8 @@ public sealed class WorkItemRetrier
     private readonly IGitHost _gitHost;
     private readonly IAgentStreamSummaryStore? _streamSummaries;
     private readonly IAuditReportStore? _auditReports;
+    private readonly IProjectRepository? _projects;
+    private readonly IReleaseStore? _releases;
     private readonly ILogger<WorkItemRetrier> _log;
 
     public WorkItemRetrier(
@@ -22,23 +24,45 @@ public sealed class WorkItemRetrier
         IGitHost gitHost,
         ILogger<WorkItemRetrier> log,
         IAgentStreamSummaryStore? streamSummaries = null,
-        IAuditReportStore? auditReports = null)
+        IAuditReportStore? auditReports = null,
+        IProjectRepository? projects = null,
+        IReleaseStore? releases = null)
     {
         _store = store;
         _queue = queue;
         _gitHost = gitHost;
         _streamSummaries = streamSummaries;
         _auditReports = auditReports;
+        _projects = projects;
+        _releases = releases;
         _log = log;
     }
 
     public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom)> RetryAsync(
         WorkItem item,
-        string from = "work",
+        string? from = null,
         string trigger = "manual",
         CancellationToken ct = default)
     {
-        var requestedFrom = from.Trim().ToLowerInvariant();
+        // A null/blank `from` means "operator did not specify" — auto-pick
+        // based on work-branch state. Explicit values (including from the
+        // quota auto-retry scheduler, which always passes a normalized phase)
+        // always win.
+        string? autoPickReason = null;
+        if (string.IsNullOrWhiteSpace(from))
+        {
+            try
+            {
+                (from, autoPickReason) = await AutoPickRetryFromAsync(item, ct);
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            {
+                _log.LogWarning(ex, "Failed to auto-pick retry phase for work item {Id}; retry aborted", item.Id);
+                return (false, $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}", null, null);
+            }
+        }
+
+        var requestedFrom = from!.Trim().ToLowerInvariant();
         var resumeState = requestedFrom switch
         {
             "work" => WorkItemState.Queued,
@@ -85,7 +109,8 @@ public sealed class WorkItemRetrier
         var resumed = item.With(resumeState.Value, error: null) with
         {
             RecoveryAttempts = 0,
-            QuotaRetryAttempts = trigger != "manual" ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts
+            QuotaRetryAttempts = trigger != "manual" ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts,
+            StartedAt = null
         };
 
         // Atomic conditional update to prevent race conditions.
@@ -105,10 +130,80 @@ public sealed class WorkItemRetrier
         var auditFrom = actualFrom == requestedFrom
             ? requestedFrom
             : $"{actualFrom} (fallback from '{requestedFrom}': work branch missing)";
+        if (autoPickReason is not null)
+            auditFrom = $"{auditFrom} (auto-pick: {autoPickReason})";
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
         await _queue.EnqueueAsync(resumed.Id, ct);
 
         return (true, null, resumeState, actualFrom);
+    }
+
+    /// <summary>
+    /// Picks a sensible default <c>from</c> phase for retries when the operator
+    /// didn't specify one. The motivating scenario: a long-running item that
+    /// already produced commits on its work branch in a prior iteration is
+    /// retried after a Failed; if we default to <c>from=work</c> the agent
+    /// observes the prior commits, judges "nothing to add", exits cleanly with
+    /// zero diff — and the orchestrator classifies the empty diff as a failure.
+    /// The fix: when the work branch is ahead of base, default to <c>from=audit</c>
+    /// so the existing tip is re-audited (and merged if it passes, reworked if
+    /// it doesn't) rather than discarded.
+    ///
+    /// Returns <c>("work", reason)</c> only for expected "nothing to audit"
+    /// states such as a missing work branch. Unexpected probe failures are
+    /// allowed to abort the retry so we do not silently discard prior work.
+    /// </summary>
+    private async Task<(string From, string Reason)> AutoPickRetryFromAsync(
+        WorkItem item,
+        CancellationToken ct)
+    {
+        var workBranch = item.WorkBranch;
+        if (string.IsNullOrEmpty(workBranch))
+            return ("work", "no work branch on record");
+
+        var repoId = item.Id.ToString();
+        if (!await _gitHost.RepositoryExistsAsync(item.Id, ct))
+            return ("work", "bare repo missing");
+
+        bool branchPresent;
+        try
+        {
+            branchPresent = await _gitHost.BranchExistsAsync(repoId, workBranch, ct);
+        }
+        catch (ArgumentException)
+        {
+            return ("work", "work branch name invalid");
+        }
+        if (!branchPresent)
+            return ("work", "work branch missing");
+
+        var baseBranch = await ResolveBaseBranchAsync(item, repoId, ct);
+        var ahead = await _gitHost.BranchHasCommitsAheadAsync(repoId, baseBranch, workBranch, ct);
+        return ahead
+            ? ("audit", "work branch has prior commits ahead of base")
+            : ("work", "work branch has no commits ahead of base");
+    }
+
+    private async Task<string> ResolveBaseBranchAsync(WorkItem item, string repoId, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(item.BaseBranch))
+            return item.BaseBranch!;
+
+        if (item.ReleaseId is { } releaseId && _releases is not null)
+        {
+            var release = await _releases.GetAsync(releaseId, ct);
+            if (!string.IsNullOrWhiteSpace(release?.BranchName))
+                return release.BranchName!;
+        }
+
+        if (_projects is not null)
+        {
+            var project = await _projects.GetAsync(item.ProjectId, ct);
+            if (!string.IsNullOrWhiteSpace(project?.DefaultBaseBranch))
+                return project.DefaultBaseBranch!;
+        }
+
+        return await _gitHost.GetDefaultBranchAsync(repoId, ct);
     }
 
     /// <summary>

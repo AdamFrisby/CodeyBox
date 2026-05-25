@@ -196,6 +196,45 @@ public sealed class LocalGitHost : IGitHost
         return rc.ExitCode == 0;
     }
 
+    public async Task<bool> BranchHasCommitsAheadAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+    {
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+        Validation.ValidateBranchName(workBranch, nameof(workBranch));
+
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            throw new InvalidOperationException($"bare repo for '{repositoryId}' does not exist at {path}");
+
+        SanitizeBareRepositoryConfig(path);
+        var baseRef = $"refs/heads/{baseBranch}";
+        var workRef = $"refs/heads/{workBranch}";
+        var baseResolved = await RunGitAsync(path, ct, "rev-parse", "--verify", "--quiet", $"{baseRef}^{{commit}}");
+        if (baseResolved.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"cannot compare branch ahead state: base branch '{baseBranch}' did not resolve to a commit: {baseResolved.Stderr}");
+
+        var workResolved = await RunGitAsync(path, ct, "rev-parse", "--verify", "--quiet", $"{workRef}^{{commit}}");
+        if (workResolved.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"cannot compare branch ahead state: work branch '{workBranch}' did not resolve to a commit: {workResolved.Stderr}");
+
+        // rev-list --count base..work prints "0" when work has no commits the
+        // base branch doesn't already have. Use `--` to defend against the
+        // unlikely case a branch name parses as a path-like rev. Branch names
+        // are validated above so they cannot start with "-".
+        var rc = await RunGitAsync(path, ct, "rev-list", "--count", $"{baseRef}..{workRef}", "--");
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git rev-list failed while comparing '{baseBranch}'..'{workBranch}': {rc.Stderr}");
+
+        if (!int.TryParse(rc.Stdout.Trim(), out var count))
+            throw new InvalidOperationException(
+                $"git rev-list returned a non-numeric ahead count while comparing '{baseBranch}'..'{workBranch}': {rc.Stdout}");
+
+        return count > 0;
+    }
+
     public async Task<(string DiffStat, string FullDiff)> GetDiffAsync(
         string repositoryId, string baseBranch, string workBranch,
         CancellationToken ct = default)

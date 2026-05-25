@@ -379,7 +379,7 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default)
         => Task.FromResult(true);
 
-    public Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default)
+    public Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)
         => Task.FromResult(true);
 
     public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default)

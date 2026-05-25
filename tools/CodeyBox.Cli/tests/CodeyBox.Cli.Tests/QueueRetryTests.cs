@@ -16,7 +16,7 @@ public sealed class QueueRetryTests
     }
 
     [Fact]
-    public async Task Retry_DefaultFrom_PostsWithWorkPhase()
+    public async Task Retry_DefaultFrom_PostsWithoutBody()
     {
         HttpRequestMessage? captured = null;
         var factory = MakeFactory(req =>
@@ -37,9 +37,9 @@ public sealed class QueueRetryTests
             Assert.NotNull(captured);
             Assert.Equal(HttpMethod.Post, captured.Method);
             Assert.Contains("retry", captured.RequestUri!.ToString());
-            var body = await captured.Content!.ReadFromJsonAsync(CliJsonContext.Default.RetryRequest);
-            Assert.Equal("work", body!.From);
+            Assert.Null(captured.Content);
             Assert.Contains("Retrying", output.Out.ToString());
+            Assert.Contains("from 'auto'", output.Out.ToString());
             Assert.Empty(output.Error.ToString());
         }
         finally

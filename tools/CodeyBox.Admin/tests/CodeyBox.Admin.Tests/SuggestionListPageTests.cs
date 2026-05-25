@@ -252,7 +252,7 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemDto?>(null);
     public Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default)
         => Task.FromResult(false);
-    public Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default)
+    public Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)
         => Task.FromResult(false);
     public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default)
         => Task.FromResult(false);
@@ -370,7 +370,7 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemDto?>(null);
     public Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default)
         => Task.FromResult(false);
-    public Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default)
+    public Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)
         => Task.FromResult(false);
     public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default)
         => Task.FromResult(false);
