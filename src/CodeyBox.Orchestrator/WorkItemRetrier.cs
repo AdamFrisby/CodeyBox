@@ -34,11 +34,21 @@ public sealed class WorkItemRetrier
 
     public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom)> RetryAsync(
         WorkItem item,
-        string from = "work",
+        string? from = "work",
         string trigger = "manual",
         CancellationToken ct = default)
     {
-        var requestedFrom = from.Trim().ToLowerInvariant();
+        // A null/blank `from` means "operator did not specify" — auto-pick
+        // based on work-branch state. Explicit values (including from the
+        // quota auto-retry scheduler, which always passes a normalized phase)
+        // always win.
+        string? autoPickReason = null;
+        if (string.IsNullOrWhiteSpace(from))
+        {
+            (from, autoPickReason) = await AutoPickRetryFromAsync(item, ct);
+        }
+
+        var requestedFrom = from!.Trim().ToLowerInvariant();
         var resumeState = requestedFrom switch
         {
             "work" => WorkItemState.Queued,
@@ -105,10 +115,82 @@ public sealed class WorkItemRetrier
         var auditFrom = actualFrom == requestedFrom
             ? requestedFrom
             : $"{actualFrom} (fallback from '{requestedFrom}': work branch missing)";
+        if (autoPickReason is not null)
+            auditFrom = $"{auditFrom} (auto-pick: {autoPickReason})";
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
         await _queue.EnqueueAsync(resumed.Id, ct);
 
         return (true, null, resumeState, actualFrom);
+    }
+
+    /// <summary>
+    /// Picks a sensible default <c>from</c> phase for retries when the operator
+    /// didn't specify one. The motivating scenario: a long-running item that
+    /// already produced commits on its work branch in a prior iteration is
+    /// retried after a Failed; if we default to <c>from=work</c> the agent
+    /// observes the prior commits, judges "nothing to add", exits cleanly with
+    /// zero diff — and the orchestrator classifies the empty diff as a failure.
+    /// The fix: when the work branch is ahead of base, default to <c>from=audit</c>
+    /// so the existing tip is re-audited (and merged if it passes, reworked if
+    /// it doesn't) rather than discarded.
+    ///
+    /// Returns <c>("work", reason)</c> on any error or when the branch state
+    /// can't be determined — that preserves the prior default behavior for
+    /// any code path that hits an edge case (missing repo, missing branch,
+    /// invalid branch name).
+    /// </summary>
+    private async Task<(string From, string Reason)> AutoPickRetryFromAsync(
+        WorkItem item,
+        CancellationToken ct)
+    {
+        var workBranch = item.WorkBranch;
+        if (string.IsNullOrEmpty(workBranch))
+            return ("work", "no work branch on record");
+
+        var repoId = item.Id.ToString();
+        if (!await _gitHost.RepositoryExistsAsync(item.Id, ct))
+            return ("work", "bare repo missing");
+
+        bool branchPresent;
+        try
+        {
+            branchPresent = await _gitHost.BranchExistsAsync(repoId, workBranch, ct);
+        }
+        catch (ArgumentException)
+        {
+            return ("work", "work branch name invalid");
+        }
+        if (!branchPresent)
+            return ("work", "work branch missing");
+
+        // Resolve the base branch the work branch was opened against. Items
+        // without a per-item override use the bare repo's default branch (the
+        // pipeline seeds this from the project repo at clone time).
+        string baseBranch;
+        try
+        {
+            baseBranch = !string.IsNullOrEmpty(item.BaseBranch)
+                ? item.BaseBranch!
+                : await _gitHost.GetDefaultBranchAsync(repoId, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Auto-pick: failed to resolve base branch for {Id}; defaulting to from=work", item.Id);
+            return ("work", "base branch unresolved");
+        }
+
+        try
+        {
+            var ahead = await _gitHost.BranchHasCommitsAheadAsync(repoId, baseBranch, workBranch, ct);
+            return ahead
+                ? ("audit", "work branch has prior commits ahead of base")
+                : ("work", "work branch has no commits ahead of base");
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Auto-pick: failed to compute commits-ahead for {Id}; defaulting to from=work", item.Id);
+            return ("work", "commits-ahead probe failed");
+        }
     }
 
     /// <summary>

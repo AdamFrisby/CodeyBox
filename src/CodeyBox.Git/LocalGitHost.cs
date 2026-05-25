@@ -196,6 +196,34 @@ public sealed class LocalGitHost : IGitHost
         return rc.ExitCode == 0;
     }
 
+    public async Task<bool> BranchHasCommitsAheadAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+    {
+        try
+        {
+            Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+            Validation.ValidateBranchName(workBranch, nameof(workBranch));
+        }
+        catch
+        {
+            return false;
+        }
+
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            return false;
+
+        SanitizeBareRepositoryConfig(path);
+        // rev-list --count base..work prints "0" when work has no commits the
+        // base branch doesn't already have. Use `--` to defend against the
+        // unlikely case a branch name parses as a path-like rev. Branch names
+        // are validated above so they cannot start with "-".
+        var rc = await RunGitAsync(path, ct, "rev-list", "--count", $"{baseBranch}..{workBranch}", "--");
+        if (rc.ExitCode != 0)
+            return false;
+        return int.TryParse(rc.Stdout.Trim(), out var count) && count > 0;
+    }
+
     public async Task<(string DiffStat, string FullDiff)> GetDiffAsync(
         string repositoryId, string baseBranch, string workBranch,
         CancellationToken ct = default)

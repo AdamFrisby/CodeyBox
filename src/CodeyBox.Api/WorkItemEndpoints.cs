@@ -486,8 +486,16 @@ internal static class WorkItemEndpoints
             or WorkItemState.WaitingForQuotaReset))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
 
-        var from = (body?.From ?? "work").Trim().ToLowerInvariant();
-        var (success, error, resumeState, actualFrom) = await retrier.RetryAsync(item, from, trigger: "manual", ct);
+        // Pass body.From through verbatim (including null) so the retrier can
+        // auto-pick when the operator didn't specify a phase — defaulting at
+        // the API layer would erase that signal. The echoed `from` field in
+        // the response reflects what was requested ("auto" when unspecified)
+        // so operators can distinguish auto-pick from an explicit choice;
+        // `actualFrom` reflects the phase actually resumed from.
+        var requestedFrom = string.IsNullOrWhiteSpace(body?.From)
+            ? null
+            : body!.From!.Trim().ToLowerInvariant();
+        var (success, error, resumeState, actualFrom) = await retrier.RetryAsync(item, requestedFrom, trigger: "manual", ct);
 
         if (!success)
         {
@@ -499,7 +507,7 @@ internal static class WorkItemEndpoints
 
         return Results.Accepted(
             $"/workitems/{item.Id}",
-            new { id = item.Id.ToString(), from, actualFrom = actualFrom!, state = resumeState!.Value.ToString() });
+            new { id = item.Id.ToString(), from = requestedFrom ?? "auto", actualFrom = actualFrom!, state = resumeState!.Value.ToString() });
     }
 
     /// <summary>

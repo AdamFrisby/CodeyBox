@@ -75,6 +75,25 @@ public interface IGitHost
         => Task.FromResult(true);
 
     /// <summary>
+    /// Returns true when <paramref name="workBranch"/> has at least one commit
+    /// not reachable from <paramref name="baseBranch"/> in the host bare repo
+    /// (equivalent to <c>git rev-list --count base..work &gt; 0</c>). Used by
+    /// the retry endpoint to auto-pick a sensible resume phase: a work branch
+    /// with prior commits should re-audit before discarding work, an empty
+    /// work branch should re-run the work phase.
+    ///
+    /// Returns <c>false</c> when the repo or either branch is missing — the
+    /// auto-pick falls through to "from=work" in that case, which is the
+    /// pre-existing default and matches a fresh-clone retry. Never throws.
+    ///
+    /// Default returns <c>false</c> ("don't know, assume no commits ahead")
+    /// so test fakes that don't implement the check behave as before.
+    /// </summary>
+    Task<bool> BranchHasCommitsAheadAsync(
+        string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+        => Task.FromResult(false);
+
+    /// <summary>
     /// Returns <c>git diff --stat</c> and <c>git diff</c> output comparing
     /// <paramref name="baseBranch"/> and <paramref name="workBranch"/> in the
     /// host bare repo. Returns empty strings when the diff cannot be computed

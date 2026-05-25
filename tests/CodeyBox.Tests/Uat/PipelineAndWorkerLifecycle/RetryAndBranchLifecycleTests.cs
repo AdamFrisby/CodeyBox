@@ -91,6 +91,86 @@ public sealed class RetryAndBranchLifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task RetryWithoutFrom_WhenWorkBranchHasPriorCommits_AutoPicksAudit()
+    {
+        // Acceptance criterion for the "/retry without from=" smart-default:
+        // a Failed item whose work branch carries prior-iteration commits
+        // must resume from the audit phase, not from work — otherwise the
+        // agent re-runs on a tree that already looks done, exits with zero
+        // diff, and gets misclassified as "no changes to commit".
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        const string workBranch = "codeybox/priorcommits";
+        var item = PipelineLifecycleUatHelpers.NewItem(workBranch) with
+        {
+            State = WorkItemState.Failed,
+            LastError = "previous iteration failure",
+        };
+        await store.CreateAsync(item);
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        // Three commits in a single clone — CommitToBareBranchAsync re-clones
+        // and force-checks-out each call, so calling it in a loop would
+        // overwrite the branch tip instead of stacking commits.
+        var clone = Path.Combine(_workspace, "stack-edit-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", workBranch);
+        for (var i = 0; i < 3; i++)
+        {
+            var fileName = $"artifact-{i}.txt";
+            await File.WriteAllTextAsync(Path.Combine(clone, fileName), $"prior iteration commit {i}\n");
+            await TestSupport.RunGit(clone, "add", fileName);
+            await TestSupport.RunGit(clone, "commit", "-m", $"prior commit {i}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+        }
+        await TestSupport.RunGit(clone, "push", "origin", $"{workBranch}:{workBranch}");
+        var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.WorkComplete, result.ResumeState);
+        Assert.Equal("audit", result.ActualFrom);
+        var stored = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, stored!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RetryWithoutFrom_WhenWorkBranchHasNoCommits_AutoPicksWork()
+    {
+        // The companion case: a Failed item whose work branch never got a
+        // commit (work phase died before the agent pushed anything) must
+        // resume from work — there's nothing on the branch to audit, so a
+        // from=audit pick would crash the pipeline with a "branch missing"
+        // error or audit an empty diff.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var item = PipelineLifecycleUatHelpers.NewItem("codeybox/nocommits") with
+        {
+            State = WorkItemState.Failed,
+            LastError = "agent killed before first commit",
+        };
+        await store.CreateAsync(item);
+        await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.ResumeState);
+        Assert.Equal("work", result.ActualFrom);
+        var stored = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task RetryFromAuditWithMissingWorkBranch_FallsBackToWorkAndEnqueues()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
