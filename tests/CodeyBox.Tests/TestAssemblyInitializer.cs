@@ -99,6 +99,8 @@ internal static class TestAssemblyInitializer
 
 internal static class TestFileSystemWatcherLeakTracker
 {
+    internal const string DisableProcessExitReportEnvironmentVariable = "CODEYBOX_TESTS_DISABLE_WATCHER_LEAK_PROCESS_EXIT_REPORT";
+
     private const int MaxReportedWatcherLeaks = 5;
 
     private static readonly AsyncLocal<TestCaseScope?> CurrentScope = new();
@@ -110,8 +112,9 @@ internal static class TestFileSystemWatcherLeakTracker
         if (Interlocked.Exchange(ref _installed, 1) == 1) return;
 
         CredentialFileSourceWatcherDiagnostics.ConfigureForTests(CreateWatcher, MarkDisposed);
-        AppDomain.CurrentDomain.ProcessExit += static (_, _) =>
-            ReportLeaks(Console.Error);
+        if (!string.Equals(Environment.GetEnvironmentVariable(DisableProcessExitReportEnvironmentVariable), "1", StringComparison.Ordinal))
+            AppDomain.CurrentDomain.ProcessExit += static (_, _) =>
+                ReportLeaks(Console.Error);
     }
 
     public static TestCaseScope BeginTestCase(string displayName)
