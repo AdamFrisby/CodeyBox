@@ -478,5 +478,97 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var timersField = typeof(QuotaRetryScheduler).GetField("_targetedTimers", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         var timers = (System.Collections.IDictionary)timersField!.GetValue(scheduler)!;
         Assert.True(timers.Contains(item.Id));
+
+        var notYetDue = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, notYetDue!.State);
+        Assert.Equal(0, notYetDue.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task Scheduler_StartupRearm_ImmediatelyRetriesOverdueWaitingForQuotaResetItem()
+    {
+        var agent = new QuotaFailingAgent();
+        var (_, store, scheduler, _) = BuildPipeline(agent);
+        using var _ = store;
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "test-class",
+            NextQuotaRetryAt = _time.Now.AddDays(-1),
+        };
+        await store.CreateAsync(item);
+
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var retried = await WaitForAttemptsAsync(store, item.Id, expectedAttempts: 1, TimeSpan.FromSeconds(3));
+            Assert.Equal(WorkItemState.Queued, retried.State);
+            Assert.Equal(1, retried.QuotaRetryAttempts);
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task Scheduler_Rearm_OverdueTimerUsesZeroDelayAndRetriesImmediately()
+    {
+        var agent = new QuotaFailingAgent();
+        var (_, store, scheduler, _) = BuildPipeline(agent);
+        using var _ = store;
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "test-class",
+            NextQuotaRetryAt = _time.Now.AddHours(-130),
+        };
+        await store.CreateAsync(item);
+
+        var rearmMethod = typeof(QuotaRetryScheduler).GetMethod("RearmTimersAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        await (Task)rearmMethod!.Invoke(scheduler, [CancellationToken.None])!;
+
+        var retried = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+
+        var timersField = typeof(QuotaRetryScheduler).GetField("_targetedTimers", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var timers = (System.Collections.Concurrent.ConcurrentDictionary<WorkItemId, ITimer>)timersField!.GetValue(scheduler)!;
+        var timer = Assert.IsType<FakeTimer>(timers[item.Id]);
+        Assert.Equal(TimeSpan.Zero, timer.DueTime);
+    }
+
+    private static async Task<WorkItem> WaitForAttemptsAsync(
+        IWorkItemStore store,
+        WorkItemId id,
+        int expectedAttempts,
+        TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var item = await store.GetAsync(id);
+            if (item is not null && item.QuotaRetryAttempts >= expectedAttempts)
+                return item;
+            await Task.Delay(25);
+        }
+
+        var latest = await store.GetAsync(id);
+        throw new TimeoutException(
+            $"Work item {id} did not reach quotaRetryAttempts={expectedAttempts}; latest={latest?.QuotaRetryAttempts}");
     }
 }

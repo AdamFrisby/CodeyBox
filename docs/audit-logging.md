@@ -103,6 +103,12 @@ Audit-tier events additionally carry:
 | `audit.passed` | Info | Same | `Iteration` |
 | `audit.failed` | Warning | Same | `Iteration`, `BlockingCount` |
 
+### Quota retry
+
+| `EventName` | Level | Emitted by | Properties |
+|-------------|-------|-----------|------------|
+| `quota_retry_attempted` | Info | `QuotaRetryScheduler.TryRetryAsync` | `WorkItemId`, `Source` (`periodic`, `targeted`, or `rearm-overdue`), `Outcome`, `State`, `Reason` |
+
 ### Upstream remote
 
 | `EventName` | Level | Emitted by | Properties |

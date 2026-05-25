@@ -422,6 +422,39 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void QuotaRetryAttempted_emits_source_outcome_state_and_reason()
+    {
+        var id = WorkItemId.New();
+
+        AuditLog.QuotaRetryAttempted(id, "periodic", "skipped:quota-still-gated", "WaitingForQuotaReset", "all members exhausted");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("quota_retry_attempted", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(LogEventLevel.Information, evt.Level);
+        Assert.Equal(id.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal("periodic", GetScalar<string>(evt, "Source"));
+        Assert.Equal("skipped:quota-still-gated", GetScalar<string>(evt, "Outcome"));
+        Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
+        Assert.Equal("all members exhausted", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
+    public void QuotaRetryAttempted_NullReason_RoundTripsThroughEmptyStringSentinel()
+    {
+        var id = WorkItemId.New();
+
+        AuditLog.QuotaRetryAttempted(id, "periodic", "skipped:router-unavailable", "WaitingForQuotaReset", reason: null);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("quota_retry_attempted", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(LogEventLevel.Information, evt.Level);
+        Assert.Equal("periodic", GetScalar<string>(evt, "Source"));
+        Assert.Equal("skipped:router-unavailable", GetScalar<string>(evt, "Outcome"));
+        Assert.Equal("", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public void WorkItemResumed_emits_work_item_resumed_event_with_From_and_Reason()
     {
         var id = WorkItemId.New();
@@ -500,9 +533,21 @@ public sealed class AuditLogTests : IDisposable
 /// <summary>In-memory Serilog sink for test assertions.</summary>
 internal sealed class TestSink : Serilog.Core.ILogEventSink
 {
+    private readonly object _gate = new();
     private readonly List<LogEvent> _events = new();
 
-    public IReadOnlyList<LogEvent> Events => _events;
+    public IReadOnlyList<LogEvent> Events
+    {
+        get
+        {
+            lock (_gate)
+                return _events.ToList();
+        }
+    }
 
-    public void Emit(LogEvent logEvent) => _events.Add(logEvent);
+    public void Emit(LogEvent logEvent)
+    {
+        lock (_gate)
+            _events.Add(logEvent);
+    }
 }
