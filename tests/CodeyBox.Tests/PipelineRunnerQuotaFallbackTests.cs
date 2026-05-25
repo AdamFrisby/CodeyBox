@@ -250,7 +250,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         };
         await fix.Store.CreateAsync(item);
 
-        var workStarted = WaitForPhaseStart("work", fix.Codex, fix.Claude);
+        var workStarted = WaitForAgentPhaseStart(AgentKind.Codex, "work", fix.Codex, fix.Claude);
         var fallbackWorkStarted = WaitForAgentPhaseStart(AgentKind.Claude, "work", fix.Codex, fix.Claude);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForPhaseStartAsync("work", workStarted, pipelineTask);
@@ -351,10 +351,23 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         };
         await fix.Store.CreateAsync(item);
 
-        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude);
+        var reworkStarted = WaitForAgentPhaseStart(AgentKind.Codex, "rework", fix.Codex, fix.Claude);
+        var fallbackReworkStarted = WaitForAgentPhaseStart(AgentKind.Claude, "rework", fix.Codex, fix.Claude);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForReworkStartAsync(reworkStarted, pipelineTask);
-        await RunWithAdvancingTimeAsync(pipelineTask, time, step: TimeSpan.FromMilliseconds(100), maxSteps: 1000);
+        await RunWithAdvancingTimeUntilAsync(
+            fallbackReworkStarted,
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 500);
+        var fallbackStartedAt = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
+        await AdvanceManualTimeToElapsedAsync(
+            time,
+            fallbackStartedAt + TimeSpan.FromSeconds(40),
+            pipelineTask,
+            step: TimeSpan.FromMilliseconds(100));
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
@@ -572,7 +585,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         await CreatePreemptCheckpointAsync(fix.GitHost, item, seed);
         await fix.Store.CreateAsync(item);
 
-        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude);
+        var reworkStarted = WaitForAgentPhaseStart(AgentKind.Codex, "rework", fix.Codex, fix.Claude);
         var fallbackReworkStarted = WaitForAgentPhaseStart(AgentKind.Claude, "rework", fix.Codex, fix.Claude);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForReworkStartAsync(reworkStarted, pipelineTask);

@@ -16,6 +16,7 @@ public static class EventSchema
 {
     /// <summary>Current schema version. Bumped per the rules below.</summary>
     public const string CurrentVersion = WebhookEvent.CurrentSchemaVersion;
+    private const string InitialVersion = "1.0";
 
     /// <summary>
     /// Returns the schema document. Plain value type so it serialises cleanly
@@ -25,29 +26,29 @@ public static class EventSchema
         EventSchemaVersion: CurrentVersion,
         EvolutionRules: new EvolutionRules(
             AdditiveOnly: true,
-            MinorBump: ["new optional field", "new event type"],
+            MinorBump: ["new optional field", "new event type", "new details field"],
             MajorBump: ["rename of an existing field", "removal of an existing field", "type change of an existing field"]),
         Envelope: BuildEnvelope(),
         EventTypes: BuildEventTypes());
 
     private static IReadOnlyDictionary<string, FieldSchema> BuildEnvelope() => new Dictionary<string, FieldSchema>
     {
-        ["eventSchemaVersion"] = new("string", "Semver schema version this payload conforms to.", CurrentVersion),
-        ["eventType"] = new("string", "Stable event identifier. Identical to legacy `event`.", CurrentVersion),
-        ["emittedAt"] = new("string", "ISO-8601 UTC timestamp stamped at event construction. Alias of `occurredAt` at schema 1.0; reserved for differentiation from `occurredAt` in a future minor bump.", CurrentVersion),
-        ["event"] = new("string", "Legacy alias of `eventType`, retained for backwards compatibility.", CurrentVersion),
-        ["occurredAt"] = new("string", "ISO-8601 UTC wall-clock time the event was generated.", CurrentVersion),
-        ["workItem"] = new("object|null", "Work-item context; null for queue/agent/sandbox-level events.", CurrentVersion),
-        ["project"] = new("object|null", "Project context; null for non-project-scoped events.", CurrentVersion),
-        ["release"] = new("object|null", "Release context; populated only for `release.*` events.", CurrentVersion),
-        ["details"] = new("object|null", "Event-specific payload. Shape depends on `eventType`.", CurrentVersion),
-        ["usage"] = new("object|null", "Token usage / cost for the most recent iteration. Omitted when unavailable.", CurrentVersion),
-        ["usageTotal"] = new("object|null", "Cumulative token usage / cost across every iteration. Omitted when unavailable.", CurrentVersion),
+        ["eventSchemaVersion"] = new("string", "Semver schema version this payload conforms to.", InitialVersion),
+        ["eventType"] = new("string", "Stable event identifier. Identical to legacy `event`.", InitialVersion),
+        ["emittedAt"] = new("string", "ISO-8601 UTC timestamp stamped at event construction. Alias of `occurredAt` at schema 1.0; reserved for differentiation from `occurredAt` in a future minor bump.", InitialVersion),
+        ["event"] = new("string", "Legacy alias of `eventType`, retained for backwards compatibility.", InitialVersion),
+        ["occurredAt"] = new("string", "ISO-8601 UTC wall-clock time the event was generated.", InitialVersion),
+        ["workItem"] = new("object|null", "Work-item context; null for queue/agent/sandbox-level events.", InitialVersion),
+        ["project"] = new("object|null", "Project context; null for non-project-scoped events.", InitialVersion),
+        ["release"] = new("object|null", "Release context; populated only for `release.*` events.", InitialVersion),
+        ["details"] = new("object|null", "Event-specific payload. Shape depends on `eventType`.", InitialVersion),
+        ["usage"] = new("object|null", "Token usage / cost for the most recent iteration. Omitted when unavailable.", InitialVersion),
+        ["usageTotal"] = new("object|null", "Cumulative token usage / cost across every iteration. Omitted when unavailable.", InitialVersion),
     };
 
     private static IReadOnlyDictionary<string, EventTypeSchema> BuildEventTypes()
         => KnownEventTypes
-            .Select(name => new KeyValuePair<string, EventTypeSchema>(name, new EventTypeSchema(CurrentVersion)))
+            .Select(name => new KeyValuePair<string, EventTypeSchema>(name, new EventTypeSchema(InitialVersion)))
             .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
 
     /// <summary>

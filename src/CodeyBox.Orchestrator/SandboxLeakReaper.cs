@@ -1,6 +1,7 @@
+using CodeyBox.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using CodeyBox.Core;
+using System.Collections.Concurrent;
 
 namespace CodeyBox.Orchestrator;
 
@@ -13,15 +14,17 @@ namespace CodeyBox.Orchestrator;
 /// <para><b>What counts as a leak:</b> a sandbox whose name starts with
 /// <c>codeybox-*</c>, that is not in the current process's in-memory active set
 /// (meaning the current orchestrator did not create it, or the creating instance
-/// crashed before calling DisposeAsync), and whose creation timestamp is older
-/// than <see cref="SandboxLeakOptions.LeakAgeThreshold"/>. The age threshold
-/// guards against mistaking a sandbox that is mid-way through work-phase clone
-/// — typically less than 30 minutes — for a genuine leak.</para>
+/// crashed before calling DisposeAsync, or normal phase disposal failed and
+/// released active ownership), and whose creation timestamp is either older than
+/// <see cref="SandboxLeakOptions.LeakAgeThreshold"/> or missing because staging
+/// metadata was deleted. The age threshold guards against mistaking a sandbox
+/// that is mid-way through work-phase clone — typically less than 30 minutes —
+/// for a genuine leak.</para>
 ///
-/// <para><b>Auto-dispose:</b> off by default. Operators should review leaks
-/// before enabling. When <see cref="SandboxLeakOptions.AutoDispose"/> is true,
-/// each leaked sandbox is purged with a per-sandbox timeout; one failure never
-/// blocks the rest of the sweep.</para>
+/// <para><b>Auto-dispose:</b> on by default. Operators can set
+/// <see cref="SandboxLeakOptions.AutoDispose"/> to false for detection-only
+/// operation. When enabled, each leaked sandbox is purged with a per-sandbox
+/// timeout; one failure never blocks the rest of the sweep.</para>
 ///
 /// <para>Detection-only results (when auto-dispose is off) are still emitted as
 /// audit-tier <c>sandbox.leak_detected</c> events and returned by
@@ -50,7 +53,10 @@ public sealed class SandboxLeakReaper : BackgroundService
         _log = log;
     }
 
-    /// <summary>Returns the most recently detected leaked sandboxes.</summary>
+    /// <summary>
+    /// Returns leaked sandboxes from the latest sweep that have not yet been
+    /// successfully auto-disposed or operator-disposed.
+    /// </summary>
     public IReadOnlyList<LeakedSandboxInfo> GetLatestLeaks() => _latestLeaks;
 
     /// <summary>
@@ -109,11 +115,9 @@ public sealed class SandboxLeakReaper : BackgroundService
                 if (info.IsTrackedActive)
                     continue;
 
-                // No creation timestamp → can't determine age → skip (conservative).
-                if (!info.CreatedAt.HasValue)
-                    continue;
-
-                var age = now - info.CreatedAt.Value;
+                var missingCreationMetadata = !info.CreatedAt.HasValue;
+                var createdAt = info.CreatedAt ?? now - _opts.LeakAgeThreshold;
+                var age = now - createdAt;
                 if (info.HasPreemptMarker && age < _opts.PreemptRetention)
                     continue;
 
@@ -121,8 +125,13 @@ public sealed class SandboxLeakReaper : BackgroundService
                     continue;
 
                 var diskMb = info.DiskBytes.HasValue ? info.DiskBytes.Value / (1024 * 1024) : (long?)null;
-                leaks.Add(new LeakedSandboxInfo(info.Name, info.CreatedAt.Value, age, info.DiskBytes));
-                AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb);
+                var reason = missingCreationMetadata
+                    ? SandboxLeakReasons.UntrackedSandboxMissingCreationMetadata
+                    : (info.HasPreemptMarker
+                        ? SandboxLeakReasons.ExpiredPreemptRetention
+                        : SandboxLeakReasons.UntrackedSandbox);
+                leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason));
+                AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb, reason);
                 _ = _webhooks.PublishAsync(new WebhookEvent
                 {
                     Event = "sandbox.leak_detected",
@@ -131,6 +140,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                         Name = info.Name,
                         AgeMinutes = Math.Round(age.TotalMinutes, 1),
                         DiskMb = diskMb,
+                        Reason = reason,
                     },
                 }, ct);
             }
@@ -148,10 +158,27 @@ public sealed class SandboxLeakReaper : BackgroundService
                 return;
             }
 
-            // Dispose all leaks concurrently, each with an independent timeout.
-            // A single failed disposal must never block the rest of the batch.
-            var disposeTasks = leaks.Select(leak => DisposeSingleAsync(leak, ct));
-            await Task.WhenAll(disposeTasks);
+            var maxConcurrentDisposes = Math.Max(1, _opts.MaxConcurrentAutoDispose);
+            if (_opts.MaxConcurrentAutoDispose < 1)
+                _log.LogWarning(
+                    "SandboxLeakReaper: MaxConcurrentAutoDispose {Configured} is below the 1-dispose minimum; clamped to 1",
+                    _opts.MaxConcurrentAutoDispose);
+
+            // Dispose leaks with bounded host-side pressure; each sandbox still
+            // gets its independent timeout and one failure never blocks the batch.
+            var failedNames = new ConcurrentBag<string>();
+            await Parallel.ForEachAsync(leaks, new ParallelOptions
+            {
+                CancellationToken = ct,
+                MaxDegreeOfParallelism = maxConcurrentDisposes,
+            }, async (leak, token) =>
+            {
+                var failedName = await DisposeSingleAsync(leak, token);
+                if (failedName is not null)
+                    failedNames.Add(failedName);
+            });
+            var failedNameSet = failedNames.ToHashSet(StringComparer.Ordinal);
+            _latestLeaks = leaks.Where(leak => failedNameSet.Contains(leak.Name)).ToList();
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -160,7 +187,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         }
     }
 
-    private async Task DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
+    private async Task<string?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
     {
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
@@ -170,7 +197,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         {
             await _provider.DisposeLeakedAsync(leak.Name, linkedCts.Token);
             var disposedAt = DateTimeOffset.UtcNow;
-            AuditLog.SandboxLeakDisposed(leak.Name, leak.Age.TotalMinutes, diskMb, disposedAt);
+            AuditLog.SandboxLeakDisposed(leak.Name, leak.Age.TotalMinutes, diskMb, disposedAt, leak.Reason);
             _ = _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "sandbox.leak_disposed",
@@ -180,9 +207,15 @@ public sealed class SandboxLeakReaper : BackgroundService
                     AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
                     DiskMb = diskMb,
                     DisposedAt = disposedAt,
+                    Reason = leak.Reason,
                 },
             }, stoppingToken);
-            _log.LogInformation("SandboxLeakReaper: disposed leaked sandbox {Name}", leak.Name);
+            _log.LogInformation(
+                "SandboxLeakReaper: disposed leaked sandbox {Name} age={AgeMinutes:F1}min reason={Reason}",
+                leak.Name,
+                leak.Age.TotalMinutes,
+                leak.Reason);
+            return null;
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -194,7 +227,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         catch (OperationCanceledException)
         {
             // Per-disposal 5-minute timeout fired.
-            AuditLog.SandboxLeakDisposeFailed(leak.Name, leak.Age.TotalMinutes, diskMb, "timeout");
+            AuditLog.SandboxLeakDisposeFailed(leak.Name, leak.Age.TotalMinutes, diskMb, "timeout", leak.Reason);
             _ = _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "sandbox.leak_dispose_failed",
@@ -204,13 +237,15 @@ public sealed class SandboxLeakReaper : BackgroundService
                     AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
                     DiskMb = diskMb,
                     Error = "timeout",
+                    Reason = leak.Reason,
                 },
             }, stoppingToken);
             _log.LogWarning("SandboxLeakReaper: timed out disposing leaked sandbox {Name}", leak.Name);
+            return leak.Name;
         }
         catch (Exception ex)
         {
-            AuditLog.SandboxLeakDisposeFailed(leak.Name, leak.Age.TotalMinutes, diskMb, ex.Message);
+            AuditLog.SandboxLeakDisposeFailed(leak.Name, leak.Age.TotalMinutes, diskMb, ex.Message, leak.Reason);
             _ = _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "sandbox.leak_dispose_failed",
@@ -220,19 +255,14 @@ public sealed class SandboxLeakReaper : BackgroundService
                     AgeMinutes = Math.Round(leak.Age.TotalMinutes, 1),
                     DiskMb = diskMb,
                     Error = ex.Message,
+                    Reason = leak.Reason,
                 },
             }, stoppingToken);
             _log.LogWarning(ex, "SandboxLeakReaper: failed to dispose leaked sandbox {Name}", leak.Name);
+            return leak.Name;
         }
     }
 }
-
-/// <summary>A leaked sandbox detected by <see cref="SandboxLeakReaper"/>.</summary>
-public sealed record LeakedSandboxInfo(
-    string Name,
-    DateTimeOffset CreatedAt,
-    TimeSpan Age,
-    long? DiskBytes);
 
 /// <summary>
 /// Configuration for <see cref="SandboxLeakReaper"/>. Bound from
@@ -262,8 +292,14 @@ public sealed class SandboxLeakOptions
 
     /// <summary>
     /// When true, automatically dispose each detected leak after logging it.
-    /// Default false — start with detection only so operators can review
-    /// before enabling automatic cleanup.
+    /// Default true because sandbox VMs are phase-scoped and old untracked
+    /// instances consume host memory until purged.
     /// </summary>
-    public bool AutoDispose { get; set; } = false;
+    public bool AutoDispose { get; set; } = true;
+
+    /// <summary>
+    /// Maximum number of leaked sandboxes to dispose concurrently in one sweep.
+    /// Default 4 to limit pressure on multipassd during restart cleanup.
+    /// </summary>
+    public int MaxConcurrentAutoDispose { get; set; } = 4;
 }

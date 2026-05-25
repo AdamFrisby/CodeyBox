@@ -15,13 +15,12 @@ namespace CodeyBox.Tests.Uat.SandboxProviders;
 public sealed class SandboxLeakDetectionTests
 {
     [Fact]
-    public async Task Sweep_IgnoresActiveFreshUnknownAndPreservedPreemptSandboxes()
+    public async Task Sweep_IgnoresActiveFreshAndPreservedPreemptSandboxes()
     {
         var threshold = TimeSpan.FromMinutes(30);
         var provider = new UatSandboxProvider();
         provider.Add(new ManagedSandboxInfo("codeybox-active", OldEnough(threshold), null, IsTrackedActive: true));
         provider.Add(new ManagedSandboxInfo("codeybox-fresh", DateTimeOffset.UtcNow.AddMinutes(-5), null, IsTrackedActive: false));
-        provider.Add(new ManagedSandboxInfo("codeybox-unknown", null, null, IsTrackedActive: false));
         provider.Add(new ManagedSandboxInfo(
             "codeybox-preempt",
             DateTimeOffset.UtcNow.AddHours(-2),
@@ -37,8 +36,10 @@ public sealed class SandboxLeakDetectionTests
         var leak = Assert.Single(reaper.GetLatestLeaks());
         Assert.Equal("codeybox-leaked", leak.Name);
         Assert.Equal(5 * 1024 * 1024, leak.DiskBytes);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leak.Reason);
         var evt = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_detected");
-        Assert.NotNull(evt.Details);
+        var details = Assert.IsType<SandboxLeakDetails>(evt.Details);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, details.Reason);
     }
 
     [Fact]
@@ -56,8 +57,16 @@ public sealed class SandboxLeakDetectionTests
 
         Assert.Contains("codeybox-dispose-ok", provider.DisposedNames);
         Assert.DoesNotContain("codeybox-dispose-fails", provider.DisposedNames);
-        Assert.Contains(webhooks.Events, e => e.Event == "sandbox.leak_disposed");
-        Assert.Contains(webhooks.Events, e => e.Event == "sandbox.leak_dispose_failed");
+        var remaining = Assert.Single(reaper.GetLatestLeaks());
+        Assert.Equal("codeybox-dispose-fails", remaining.Name);
+        var disposed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_disposed");
+        var disposedDetails = Assert.IsType<SandboxLeakDetails>(disposed.Details);
+        Assert.Equal("codeybox-dispose-ok", disposedDetails.Name);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, disposedDetails.Reason);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_dispose_failed");
+        var failedDetails = Assert.IsType<SandboxLeakDetails>(failed.Details);
+        Assert.Equal("codeybox-dispose-fails", failedDetails.Name);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, failedDetails.Reason);
     }
 
     [Fact]
@@ -98,9 +107,45 @@ public sealed class SandboxLeakDetectionTests
         var leak = Assert.Single(body.EnumerateArray());
         Assert.Equal("codeybox-endpoint", leak.GetProperty("name").GetString());
         Assert.Equal(2, leak.GetProperty("diskMb").GetInt64());
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, leak.GetProperty("reason").GetString());
         dispose.EnsureSuccessStatusCode();
         Assert.Equal(HttpStatusCode.NotFound, repeat.StatusCode);
         Assert.Contains("codeybox-endpoint", provider.DisposedNames);
+        var disposed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_disposed");
+        var details = Assert.IsType<SandboxLeakDetails>(disposed.Details);
+        Assert.Equal(SandboxLeakReasons.UntrackedSandbox, details.Reason);
+    }
+
+    [Fact]
+    public async Task SandboxLeakAdminEndpoint_ReturnsPendingCountAndAges()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new UatSandboxProvider();
+        provider.Add(new ManagedSandboxInfo(
+            "codeybox-admin",
+            DateTimeOffset.UtcNow - TimeSpan.FromMinutes(67.24),
+            null,
+            false));
+        var reaper = BuildReaper(provider, new CapturingWebhookDispatcher(), leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+        using var factory = new SandboxProviderApiFactory(
+            sandboxProvider: provider,
+            reaper: reaper,
+            webhooks: new CapturingWebhookDispatcher());
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/admin/sandbox-leaks");
+
+        response.EnsureSuccessStatusCode();
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(1, body.GetProperty("count").GetInt32());
+        var summaryAge = Assert.Single(body.GetProperty("agesMinutes").EnumerateArray()).GetDouble();
+        Assert.InRange(summaryAge, 67.2, 67.4);
+        Assert.Equal(Math.Round(summaryAge, 1), summaryAge);
+        var leak = Assert.Single(body.GetProperty("leaks").EnumerateArray());
+        Assert.Equal("codeybox-admin", leak.GetProperty("name").GetString());
+        Assert.Equal(summaryAge, leak.GetProperty("ageMinutes").GetDouble());
+        Assert.Equal("untracked_sandbox_age_threshold_exceeded", leak.GetProperty("reason").GetString());
     }
 
     [Fact]

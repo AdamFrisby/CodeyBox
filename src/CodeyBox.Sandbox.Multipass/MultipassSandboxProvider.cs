@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -65,7 +66,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
     private readonly Dictionary<string, SemaphoreSlim> _baselineLocks = new();
     private readonly object _baselineLocksGuard = new();
 
-    // Tracks sandboxes created by the current process that haven't been disposed.
+    // Tracks sandboxes still owned by a currently-running phase in this process.
     // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
     private readonly ConcurrentDictionary<string, bool> _activeSandboxNames = new(StringComparer.Ordinal);
 
@@ -191,8 +192,26 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
         var workItemId = spec.TimingWorkItemId;
         var timingPhase = spec.TimingPhase ?? "work";
 
+        void MarkTrackedActive(string n)
+        {
+            _activeSandboxNames[n] = true;
+            _listCacheExpiry = DateTimeOffset.MinValue;
+        }
+
+        void MarkNoLongerActive(string n)
+        {
+            _activeSandboxNames.TryRemove(n, out _);
+            _listCacheExpiry = DateTimeOffset.MinValue;
+        }
+
         try
         {
+            // Track ownership before the VM becomes host-visible. A slow launch,
+            // clone, cloud-init wait, mount, or environment transfer can overlap a
+            // leak-reaper sweep; once multipass lists this name, it must already be
+            // protected as an in-flight phase sandbox.
+            MarkTrackedActive(name);
+
             // Choose between two boot paths:
             //   - Baseline-clone path (UseBaselineImages=true + profile is set):
             //     bake one VM per profile lazily on first use, then `multipass
@@ -252,19 +271,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             // already baked into the source VM's filesystem, so the clone
             // inherits it. The codeybox-route systemd service runs on every
             // boot in both paths.
-            _activeSandboxNames[name] = true;
-            // Invalidate the list cache so the next ListAllManagedAsync call reflects
-            // the newly created sandbox immediately rather than serving stale data.
-            _listCacheExpiry = DateTimeOffset.MinValue;
             return new MultipassSandbox(name, sandboxRoot, spec, opts, _log, timingStore, timingItemId, timingPhase,
-                onDisposed: n => { _activeSandboxNames.TryRemove(n, out _); _listCacheExpiry = DateTimeOffset.MinValue; },
+                onDisposed: MarkNoLongerActive,
+                onNoLongerTrackedActive: MarkNoLongerActive,
                 runner: _runner,
                 daemonRetryPolicy: _daemonRetryPolicy);
         }
         catch
         {
             // Best-effort cleanup if launch / mount / transfer half-succeeded.
-            await TryDeleteVmAsync(opts, name);
+            try { await TryDeleteVmAsync(opts, name); }
+            finally { MarkNoLongerActive(name); }
             try { Directory.Delete(sandboxRoot, recursive: true); } catch { }
             throw;
         }
@@ -351,8 +368,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
         if (vmNames.Count == 0) return [];
 
-        // Fetch disk usage for all discovered codeybox VMs in a single multipass info call.
-        var diskByName = await FetchDiskInfoAsync(opts, vmNames, ct);
+        // Fetch host-visible VM details in a single multipass info call. Disk usage
+        // is best-effort; created-at is a fallback when staging metadata was deleted
+        // by a previous failed dispose or an older staging-root configuration.
+        var detailsByName = await FetchSandboxDetailsAsync(opts, vmNames, ct);
 
         var infos = new List<ManagedSandboxInfo>(vmNames.Count);
         foreach (var name in vmNames)
@@ -371,9 +390,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
                 if (created != DateTime.MinValue)
                     createdAt = new DateTimeOffset(created, TimeSpan.Zero);
             }
+            if (!createdAt.HasValue &&
+                detailsByName.TryGetValue(name, out var details) &&
+                details.CreatedAt.HasValue)
+                createdAt = details.CreatedAt;
             var isActive = _activeSandboxNames.ContainsKey(name);
             var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
-            diskByName.TryGetValue(name, out var diskBytes);
+            var diskBytes = detailsByName.TryGetValue(name, out details) ? details.DiskBytes : null;
             infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker));
         }
         return infos;
@@ -381,10 +404,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
     /// <summary>
     /// Runs <c>multipass info --format json</c> for the given VM names and returns
-    /// a map of VM name → disk-used bytes. Returns an empty dictionary on any failure
-    /// so that missing disk info degrades gracefully to null in the caller.
+    /// best-effort metadata. Returns an empty dictionary on any failure so missing
+    /// metadata degrades gracefully in the caller.
     /// </summary>
-    private async Task<Dictionary<string, long>> FetchDiskInfoAsync(
+    private async Task<Dictionary<string, MultipassSandboxDetails>> FetchSandboxDetailsAsync(
         MultipassSandboxOptions opts,
         List<string> names,
         CancellationToken ct)
@@ -399,7 +422,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
             return [];
         }
 
-        var result = new Dictionary<string, long>(StringComparer.Ordinal);
+        var result = new Dictionary<string, MultipassSandboxDetails>(StringComparer.Ordinal);
         try
         {
             using var doc = JsonDocument.Parse(run.Stdout);
@@ -408,23 +431,49 @@ public sealed class MultipassSandboxProvider : ISandboxProvider
 
             foreach (var vmEntry in infoEl.EnumerateObject())
             {
-                if (!vmEntry.Value.TryGetProperty("disks", out var disksEl)) continue;
+                long? diskBytes = null;
+                if (!vmEntry.Value.TryGetProperty("disks", out var disksEl))
+                    disksEl = default;
                 long total = 0;
-                foreach (var diskEntry in disksEl.EnumerateObject())
+                if (disksEl.ValueKind == JsonValueKind.Object)
                 {
-                    if (diskEntry.Value.TryGetProperty("used", out var usedEl) &&
-                        long.TryParse(usedEl.GetString(), out var used))
-                        total += used;
+                    foreach (var diskEntry in disksEl.EnumerateObject())
+                    {
+                        if (diskEntry.Value.TryGetProperty("used", out var usedEl) &&
+                            long.TryParse(usedEl.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var used))
+                            total += used;
+                    }
                 }
                 if (total > 0)
-                    result[vmEntry.Name] = total;
+                    diskBytes = total;
+
+                result[vmEntry.Name] = new MultipassSandboxDetails(
+                    diskBytes,
+                    TryReadCreatedAt(vmEntry.Value));
             }
         }
         catch (JsonException ex)
         {
-            _log.LogWarning(ex, "Failed to parse multipass info output; disk sizes will be omitted");
+            _log.LogWarning(ex, "Failed to parse multipass info output; sandbox details will be omitted");
         }
         return result;
+    }
+
+    private static DateTimeOffset? TryReadCreatedAt(JsonElement vmInfo)
+    {
+        foreach (var propertyName in new[] { "created", "created_at", "creation_time", "creationTimestamp" })
+        {
+            if (!vmInfo.TryGetProperty(propertyName, out var value) || value.ValueKind != JsonValueKind.String)
+                continue;
+            if (DateTimeOffset.TryParse(
+                value.GetString(),
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var parsed))
+                return parsed;
+        }
+
+        return null;
     }
 
     private static bool IsValidSandboxName(string name)
@@ -1507,6 +1556,8 @@ internal readonly record struct RunResult(
     public bool Success => ExitCode == 0;
 }
 
+internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt);
+
 internal sealed class MultipassDaemonRetryPolicy
 {
     public static MultipassDaemonRetryPolicy Default { get; } = new();
@@ -1958,6 +2009,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     private readonly WorkItemId? _workItemId;
     private readonly string _timingPhase;
     private readonly Action<string>? _onDisposed;
+    private readonly Action<string>? _onNoLongerTrackedActive;
     private readonly int _maxScreenshotPngBytes;
     private readonly int _maxScreenshotBase64StdoutBytes;
     private readonly int _maxScreenshotStderrBytes;
@@ -1967,7 +2019,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
-        Action<string>? onDisposed = null, IProcessRunner? runner = null,
+        Action<string>? onDisposed = null, Action<string>? onNoLongerTrackedActive = null, IProcessRunner? runner = null,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         int? maxScreenshotPngBytes = null, int? maxScreenshotStderrBytes = null)
     {
@@ -1983,6 +2035,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         _workItemId = timingItemId.Value == Guid.Empty ? null : timingItemId;
         _timingPhase = timingPhase;
         _onDisposed = onDisposed;
+        _onNoLongerTrackedActive = onNoLongerTrackedActive;
         _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
         _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
         if (_maxScreenshotPngBytes <= 0)
@@ -2349,35 +2402,40 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
-        _disposed = true;
-        if (_preserveOnDispose) return;
-        // Notify provider immediately so it removes the name from the active set and
-        // invalidates the list cache before any subsequent leak scan runs.
-        _onDisposed?.Invoke(_name);
-        AuditLog.SandboxDisposed(_name);
+        if (_preserveOnDispose)
+        {
+            _disposed = true;
+            return;
+        }
         await using var disposeScope = await TimingScope.BeginAsync(
             _timings, _timingItemId, _timingPhase, "vm.dispose", log: _log);
         try
         {
-            using var p = Process.Start(new ProcessStartInfo
-            {
-                FileName = _opts.MultipassBinary,
-                ArgumentList = { "delete", "--purge", _name },
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            });
-            if (p is not null)
-            {
-                _ = await p.StandardOutput.ReadToEndAsync();
-                _ = await p.StandardError.ReadToEndAsync();
-                await p.WaitForExitAsync();
-            }
+            var result = await RunMultipassAsync(
+                [_opts.MultipassBinary, "delete", "--purge", _name],
+                stdin: null,
+                ct: CancellationToken.None);
+            if (result.ExitCode != 0)
+                throw new InvalidOperationException(
+                    $"multipass delete --purge {_name} failed (exit {result.ExitCode}): {result.Stderr}");
         }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to delete multipass VM {Name}", _name);
+            _disposed = true;
+            try
+            {
+                _onNoLongerTrackedActive?.Invoke(_name);
+            }
+            catch (Exception callbackEx)
+            {
+                _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
+            }
+            return;
         }
+        _disposed = true;
+        _onDisposed?.Invoke(_name);
+        AuditLog.SandboxDisposed(_name);
         try { Directory.Delete(_sandboxRoot, recursive: true); }
         catch (Exception ex) { _log.LogWarning(ex, "Failed to clean sandbox root {Root}", _sandboxRoot); }
     }

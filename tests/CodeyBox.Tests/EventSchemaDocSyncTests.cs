@@ -66,7 +66,11 @@ public sealed class EventSchemaDocSyncTests
     public void Doc_DeclaresCurrentSchemaVersion()
     {
         var doc = ReadDoc();
-        Assert.Contains(EventSchema.CurrentVersion, doc);
+        Assert.Equal("1.1", EventSchema.CurrentVersion);
+
+        var declaration = Regex.Match(doc, @"^eventSchemaVersion\s*=\s*""(?<version>\d+\.\d+)""\s*$", RegexOptions.Multiline);
+        Assert.True(declaration.Success, "docs/EVENT_SCHEMA.md must declare the current eventSchemaVersion");
+        Assert.Equal("1.1", declaration.Groups["version"].Value);
     }
 
     [Fact]
@@ -82,7 +86,7 @@ public sealed class EventSchemaDocSyncTests
         using var parsed = JsonDocument.Parse(json);
         var root = parsed.RootElement;
 
-        Assert.Equal("1.0", root.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal("1.1", root.GetProperty("eventSchemaVersion").GetString());
         Assert.True(root.TryGetProperty("evolutionRules", out _));
         Assert.True(root.TryGetProperty("envelope", out var envelope));
         Assert.True(envelope.TryGetProperty("eventSchemaVersion", out _));
@@ -90,5 +94,19 @@ public sealed class EventSchemaDocSyncTests
         Assert.True(envelope.TryGetProperty("emittedAt", out _));
         Assert.True(root.TryGetProperty("eventTypes", out var types));
         Assert.True(types.TryGetProperty("work_item.done", out _));
+    }
+
+    [Fact]
+    public void Schema_PinsExistingEnvelopeFieldsAndEventTypesToInitialVersion()
+    {
+        // Current schema is 1.1, but these fields and event names existed in
+        // 1.0. This guards the compatibility metadata trackers use to decide
+        // whether a payload is safe for their minimum supported schema.
+        var schema = EventSchema.GetSchema();
+
+        Assert.All(schema.Envelope.Values, field =>
+            Assert.Equal("1.0", field.IntroducedIn));
+        Assert.All(schema.EventTypes.Values, eventType =>
+            Assert.Equal("1.0", eventType.IntroducedIn));
     }
 }

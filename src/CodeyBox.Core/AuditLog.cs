@@ -202,20 +202,25 @@ public static class AuditLog
         Audit("sandbox.disposed")
             .Information("Sandbox {VmName} disposed", vmName);
 
-    public static void SandboxLeakDetected(string name, double ageMinutes, long? diskMb) =>
+    public static void SandboxLeakDetected(string name, double ageMinutes, long? diskMb, string? reason = null) =>
         Audit("sandbox.leak_detected")
-            .Warning("Leaked sandbox detected: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB",
-                name, ageMinutes, diskMb);
+            .Warning("Leaked sandbox detected: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB reason={Reason}",
+                name, ageMinutes, diskMb, reason);
 
-    public static void SandboxLeakDisposed(string name, double ageMinutes, long? diskMb, DateTimeOffset disposedAt) =>
+    public static void SandboxLeakDisposed(
+        string name,
+        double ageMinutes,
+        long? diskMb,
+        DateTimeOffset disposedAt,
+        string? reason = null) =>
         Audit("sandbox.leak_disposed")
-            .Information("Leaked sandbox disposed: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB disposedAt={DisposedAt}",
-                name, ageMinutes, diskMb, disposedAt);
+            .Information("Leaked sandbox disposed: {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB reason={Reason} disposedAt={DisposedAt}",
+                name, ageMinutes, diskMb, reason, disposedAt);
 
-    public static void SandboxLeakDisposeFailed(string name, double ageMinutes, long? diskMb, string error) =>
+    public static void SandboxLeakDisposeFailed(string name, double ageMinutes, long? diskMb, string error, string? reason = null) =>
         Audit("sandbox.leak_dispose_failed")
-            .Warning("Failed to dispose leaked sandbox {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB: {Error}",
-                name, ageMinutes, diskMb, error);
+            .Warning("Failed to dispose leaked sandbox {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB reason={Reason}: {Error}",
+                name, ageMinutes, diskMb, reason, error);
 
     // ── Upstream remote ──────────────────────────────────────────────────────
 

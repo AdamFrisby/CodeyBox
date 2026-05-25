@@ -83,7 +83,7 @@ public sealed class PluginFoundationUatTests
 
         var auditor = provider.GetRequiredService<InitializingPluginAuditor>();
         Assert.True(auditor.Initialized);
-        Assert.Equal("1.0", auditor.HostApiVersion);
+        Assert.Equal(CodeyBoxApiVersion.Current, auditor.HostApiVersion);
         Assert.Equal("uat.initializer", auditor.PluginId);
         Assert.Equal("strict", auditor.Mode);
         Assert.Null(auditor.OtherPluginMode);

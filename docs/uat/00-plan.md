@@ -238,13 +238,13 @@ This document is the Phase 1 inventory for the UAT coverage campaign. Phase 2 wo
 
 #### Primary user flows
 1. Reaper scans provider-managed sandboxes - tracked active sandboxes are ignored and stale untracked VMs are reported.
-2. Operator lists leaks via `/sandboxes/leaked` - API returns unmanaged VM metadata.
-3. Operator disposes a leaked sandbox - provider performs best-effort delete/purge.
+2. Operator lists leaks via `/sandboxes/leaked` or `/admin/sandbox-leaks` - API returns unmanaged VM metadata.
+3. Reaper or operator disposes a leaked sandbox - provider performs best-effort delete/purge.
 
 #### Edge cases
 - Preserved preempt marker exists - VM is not treated as a leak.
 - Provider has no persistent lifecycle - leak list is empty.
-- Auto-dispose is enabled - reaper deletes stale entries after configured age.
+- Auto-dispose is enabled (default) - reaper deletes stale entries after configured age.
 
 #### Failure modes
 - Provider list call fails - API/reaper logs and surfaces error without crashing the orchestrator.

@@ -267,6 +267,23 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void SandboxLeakDisposed_emits_reason_for_classification()
+    {
+        AuditLog.SandboxLeakDisposed(
+            "codeybox-stale",
+            ageMinutes: 90.5,
+            diskMb: 512,
+            disposedAt: DateTimeOffset.UtcNow,
+            reason: "untracked_sandbox_age_threshold_exceeded");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("sandbox.leak_disposed", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("codeybox-stale", GetScalar<string>(evt, "SandboxName"));
+        Assert.Equal("untracked_sandbox_age_threshold_exceeded", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public void SandboxLaunchTransientRetry_emits_sandbox_launch_transient_retry_event()
     {
         var workItemId = WorkItemId.New();

@@ -403,11 +403,22 @@ internal sealed record FileWrite(string FileName, string Contents);
 /// </summary>
 internal sealed class CapturingWebhookDispatcher : IWebhookDispatcher
 {
-    public List<WebhookEvent> Events { get; } = [];
+    private readonly object _gate = new();
+    private readonly List<WebhookEvent> _events = [];
+
+    public IReadOnlyList<WebhookEvent> Events
+    {
+        get
+        {
+            lock (_gate)
+                return _events.ToList();
+        }
+    }
 
     public Task PublishAsync(WebhookEvent evt, CancellationToken ct = default)
     {
-        Events.Add(evt);
+        lock (_gate)
+            _events.Add(evt);
         return Task.CompletedTask;
     }
 }

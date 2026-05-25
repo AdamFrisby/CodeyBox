@@ -52,7 +52,7 @@ public sealed class EventSchemaEnvelopeTests
         using var doc = JsonDocument.Parse(json);
 
         Assert.True(doc.RootElement.TryGetProperty("eventSchemaVersion", out var version));
-        Assert.Equal("1.0", version.GetString());
+        Assert.Equal(WebhookEvent.CurrentSchemaVersion, version.GetString());
 
         Assert.True(doc.RootElement.TryGetProperty("eventType", out var type));
         Assert.Equal(eventName, type.GetString());
@@ -271,7 +271,7 @@ public sealed class EventSchemaEnvelopeTests
         // by an SSE-specific builder, this assertion must move with it.
         var json = HttpWebhookDispatcher.BuildPayload(received!.Event);
         using var doc = JsonDocument.Parse(json);
-        Assert.Equal("1.0", doc.RootElement.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal(WebhookEvent.CurrentSchemaVersion, doc.RootElement.GetProperty("eventSchemaVersion").GetString());
         Assert.Equal("work_item.audit_iteration", doc.RootElement.GetProperty("eventType").GetString());
         Assert.True(doc.RootElement.TryGetProperty("emittedAt", out _));
     }

@@ -164,14 +164,27 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
 
 internal sealed class UatSandboxProvider : ISandboxProvider
 {
+    private readonly object _gate = new();
     private readonly List<ManagedSandboxInfo> _managed = [];
+    private readonly List<string> _disposedNames = [];
     private readonly HashSet<string> _throwOnDispose = new(StringComparer.Ordinal);
     private bool _throwOnList;
 
     public string Name => "uat";
-    public List<string> DisposedNames { get; } = [];
+    public IReadOnlyList<string> DisposedNames
+    {
+        get
+        {
+            lock (_gate)
+                return _disposedNames.ToList();
+        }
+    }
 
-    public void Add(ManagedSandboxInfo info) => _managed.Add(info);
+    public void Add(ManagedSandboxInfo info)
+    {
+        lock (_gate)
+            _managed.Add(info);
+    }
     public void ThrowOnDispose(string name) => _throwOnDispose.Add(name);
     public void ThrowOnList() => _throwOnList = true;
 
@@ -182,14 +195,16 @@ internal sealed class UatSandboxProvider : ISandboxProvider
     {
         if (_throwOnList)
             throw new InvalidOperationException("list failed");
-        return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(_managed.ToList());
+        lock (_gate)
+            return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(_managed.ToList());
     }
 
     public Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
         if (_throwOnDispose.Contains(name))
             throw new InvalidOperationException("dispose failed");
-        DisposedNames.Add(name);
+        lock (_gate)
+            _disposedNames.Add(name);
         return Task.CompletedTask;
     }
 }
