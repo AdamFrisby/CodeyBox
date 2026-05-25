@@ -5220,6 +5220,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
     // ── Cost capture ────────────────────────────────────────────────────────
 
+    private const string ProviderMetadataCostSourceJson = """{"usageSource":"provider_metadata"}""";
+
     /// <summary>
     /// Best-effort cost capture: extracts token counts from agent output, calculates
     /// estimated USD, and persists a cost row. Any failure is swallowed with a warning
@@ -5273,6 +5275,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 EstimatedUsd = (double)usd,
                 StartedAt = startedAt,
                 EndedAt = endedAt,
+                RawMetadataJson = ProviderMetadataCostSourceJson,
             }, CancellationToken.None);
         }
         catch (Exception ex)

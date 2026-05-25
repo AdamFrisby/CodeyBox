@@ -63,6 +63,25 @@ public sealed class AgentClassRouterTests
             opts,
             NullLogger<InProcessQuotaHeadroomManager>.Instance);
 
+    private static AgentClassRouter BuildRouterWithHeadroom(
+        IEnumerable<AgentClass> catalog,
+        IReadOnlyList<IAgentQuotaProbe> probes,
+        QuotaRouterOptions opts,
+        IQuotaHeadroomEstimator estimator)
+    {
+        var manager = new InProcessQuotaHeadroomManager(
+            estimator,
+            probes,
+            opts,
+            NullLogger<InProcessQuotaHeadroomManager>.Instance);
+        return new AgentClassRouter(
+            catalog.ToList(),
+            probes,
+            opts,
+            NullLogger<AgentClassRouter>.Instance,
+            headroomManager: manager);
+    }
+
     private static async Task<IQuotaReservationLease> ReserveAsync(
         IQuotaHeadroomManager manager,
         WorkItem item,
@@ -177,12 +196,13 @@ public sealed class AgentClassRouterTests
     public async Task AvailableButProjectedBelowThreshold_ShouldWait()
     {
         var cls = FrontierClass(Sub(Claude));
-        var router = new AgentClassRouter(
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(Claude, 15.0) };
+        var router = BuildRouterWithHeadroom(
             [cls],
-            [new FakeProbe(Claude, 15.0)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: new FixedHeadroomEstimator(10.0));
+            probes,
+            opts,
+            new FixedHeadroomEstimator(10.0));
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
@@ -195,12 +215,13 @@ public sealed class AgentClassRouterTests
     public async Task InsufficientHeadroom_FallsBackToMemberWithMoreQuota()
     {
         var cls = FrontierClass(Sub(Claude), Sub(Codex));
-        var router = new AgentClassRouter(
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(Claude, 15.0), new FakeProbe(Codex, 50.0) };
+        var router = BuildRouterWithHeadroom(
             [cls],
-            [new FakeProbe(Claude, 15.0), new FakeProbe(Codex, 50.0)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: new FixedHeadroomEstimator(10.0));
+            probes,
+            opts,
+            new FixedHeadroomEstimator(10.0));
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
@@ -212,12 +233,13 @@ public sealed class AgentClassRouterTests
     public async Task InsufficientHeadroom_FallsBackToPayPerApiMember()
     {
         var cls = FrontierClass(Sub(Claude), Api(Codex));
-        var router = new AgentClassRouter(
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(Claude, 15.0) };
+        var router = BuildRouterWithHeadroom(
             [cls],
-            [new FakeProbe(Claude, 15.0)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: new FixedHeadroomEstimator(10.0));
+            probes,
+            opts,
+            new FixedHeadroomEstimator(10.0));
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
@@ -231,12 +253,16 @@ public sealed class AgentClassRouterTests
     {
         var resetAt = DateTimeOffset.UtcNow.AddHours(2);
         var cls = FrontierClass(Sub(Claude));
-        var router = new AgentClassRouter(
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[]
+        {
+            new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 15.0, ResetAt = resetAt }),
+        };
+        var router = BuildRouterWithHeadroom(
             [cls],
-            [new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 15.0, ResetAt = resetAt })],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: new FixedHeadroomEstimator(10.0));
+            probes,
+            opts,
+            new FixedHeadroomEstimator(10.0));
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
@@ -465,12 +491,13 @@ public sealed class AgentClassRouterTests
             QualityScore = 100,
             ModelId = "claude-opus-4-7",
         });
-        var router = new AgentClassRouter(
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(Claude, 50.0) };
+        var router = BuildRouterWithHeadroom(
             [cls],
-            [new FakeProbe(Claude, 50.0)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: estimator);
+            probes,
+            opts,
+            estimator);
 
         var item = MakeItem("frontier") with { ProjectId = new ProjectId("scoped-project") };
 
@@ -527,12 +554,13 @@ public sealed class AgentClassRouterTests
     public async Task PayPerApiFallback_IsNotRejectedByHeadroomEstimator()
     {
         var cls = FrontierClass(Sub(Claude), Api(Codex));
-        var router = new AgentClassRouter(
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(Claude, 1.0) };
+        var router = BuildRouterWithHeadroom(
             [cls],
-            [new FakeProbe(Claude, 1.0)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: new ThrowingHeadroomEstimator());
+            probes,
+            opts,
+            new ThrowingHeadroomEstimator());
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
@@ -545,12 +573,13 @@ public sealed class AgentClassRouterTests
     public async Task SubscriptionEstimatorException_FailsClosedToQuotaWait()
     {
         var cls = FrontierClass(Sub(Claude));
-        var router = new AgentClassRouter(
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(Claude, 50.0) };
+        var router = BuildRouterWithHeadroom(
             [cls],
-            [new FakeProbe(Claude, 50.0)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: new ThrowingHeadroomEstimator());
+            probes,
+            opts,
+            new ThrowingHeadroomEstimator());
 
         var decision = await router.ResolveAsync(
             MakeItem("frontier"),
@@ -658,14 +687,20 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task ComputeEarliestExhaustedReset_PropagatesProbeFailures()
+    public async Task ComputeEarliestExhaustedReset_SkipsFailedProbeAndReturnsOtherReset()
     {
-        var cls = FrontierClass(Sub(Claude));
-        var router = BuildRouter([cls], [new ThrowingQuotaProbe(Claude)]);
+        var resetAt = DateTimeOffset.UtcNow.AddHours(2);
+        var cls = FrontierClass(Sub(Claude), Sub(Codex));
+        var router = BuildRouter([cls],
+        [
+            new ThrowingQuotaProbe(Claude),
+            new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = resetAt }),
+        ]);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            router.ComputeEarliestExhaustedResetAsync(
-                MakeItem("frontier"), null, CancellationToken.None));
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(resetAt, earliest);
     }
 
     [Fact]

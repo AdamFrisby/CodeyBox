@@ -230,8 +230,16 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
                 return true;
             }
 
-            return HasTrustedUsageSource(root, "usageSource")
-                || HasTrustedUsageSource(root, "source");
+            if (HasTrustedUsageSource(root, "usageSource")
+                || HasTrustedUsageSource(root, "source"))
+            {
+                return true;
+            }
+
+            // Older production PipelineRunner rows used the database default "{}".
+            // Keep those rows eligible so recent real usage remains available for
+            // proactive headroom estimates after upgrade.
+            return !root.EnumerateObject().Any();
         }
         catch (JsonException)
         {
@@ -242,7 +250,8 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
     private static bool HasTrustedUsageSource(JsonElement root, string propertyName) =>
         root.TryGetProperty(propertyName, out var source)
         && source.ValueKind == JsonValueKind.String
-        && string.Equals(source.GetString(), "provider_metadata", StringComparison.OrdinalIgnoreCase);
+        && (string.Equals(source.GetString(), "provider_metadata", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(source.GetString(), "agent_stream_analyser", StringComparison.OrdinalIgnoreCase));
 
     private static IReadOnlyList<double> BuildPerItemIterationSamples(
         IReadOnlyList<WorkItemCost> rows,

@@ -297,20 +297,28 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task CostHistoryQuotaHeadroomEstimator_IgnoresUntrustedAndOverCapTokenRows()
+    public async Task CostHistoryQuotaHeadroomEstimator_UsesProductionDefaultsAndIgnoresExplicitUntrustedAndOverCapRows()
     {
-        var untrustedItem = Guid.NewGuid().ToString();
+        var productionDefaultItem = Guid.NewGuid().ToString();
+        var explicitUntrustedItem = Guid.NewGuid().ToString();
         var overCapItem = Guid.NewGuid().ToString();
         var trustedItem = Guid.NewGuid().ToString();
-        SeedWorkItem(untrustedItem, "proj-headroom-trust");
+        SeedWorkItem(productionDefaultItem, "proj-headroom-trust");
+        SeedWorkItem(explicitUntrustedItem, "proj-headroom-trust");
         SeedWorkItem(overCapItem, "proj-headroom-trust");
         SeedWorkItem(trustedItem, "proj-headroom-trust");
 
-        await _store.RecordAsync(MakeCost(untrustedItem) with
+        await _store.RecordAsync(MakeCost(productionDefaultItem) with
         {
-            InputTokens = int.MaxValue,
-            OutputTokens = 0,
+            InputTokens = 30_000,
+            OutputTokens = 10_000,
             RawMetadataJson = "{}",
+        });
+        await _store.RecordAsync(MakeCost(explicitUntrustedItem) with
+        {
+            InputTokens = 30_000,
+            OutputTokens = 0,
+            RawMetadataJson = """{"source":"manual_import"}""",
         });
         await _store.RecordAsync(MakeCost(overCapItem) with
         {
@@ -343,9 +351,86 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
 
         Assert.NotNull(estimate);
         Assert.True(estimate!.TrustedForEnforcement);
-        Assert.Equal(5.0, estimate.EstimatedIterPctCost, precision: 2);
-        Assert.Equal(50_000, estimate.AverageTokensPerIteration, precision: 2);
-        Assert.Equal(1, estimate.SampledItemCount);
+        Assert.Equal(4.5, estimate.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(45_000, estimate.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(2, estimate.SampledItemCount);
+    }
+
+    [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_UsesAgentStreamAnalyserRows()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, "proj-headroom-stream");
+        await _store.RecordAsync(MakeCost(itemId) with
+        {
+            InputTokens = 70_000,
+            OutputTokens = 30_000,
+            RawMetadataJson = """{"source":"agent_stream_analyser","fileName":"agent.ndjson"}""",
+        });
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(
+                new ProjectId("proj-headroom-stream"),
+                AgentKind.Claude,
+                "claude-opus-4-7"));
+
+        Assert.NotNull(estimate);
+        Assert.Equal(10.0, estimate!.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(100_000, estimate.AverageTokensPerIteration, precision: 2);
+    }
+
+    [Theory]
+    [InlineData(500_000, 50.0)]
+    [InlineData(0, null)]
+    public async Task CostHistoryQuotaHeadroomEstimator_AppliesIterationTokenCapAndDisabledBranch(
+        int maxTokensPerIteration,
+        double? expectedPctCost)
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, $"proj-headroom-iteration-cap-{maxTokensPerIteration}");
+        await _store.RecordAsync(MakeCost(itemId) with
+        {
+            InputTokens = 800_000,
+            OutputTokens = 0,
+        });
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+                HeadroomMaxTokensPerCostRow = 1_000_000,
+                HeadroomMaxTokensPerIteration = maxTokensPerIteration,
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(
+                new ProjectId($"proj-headroom-iteration-cap-{maxTokensPerIteration}"),
+                AgentKind.Claude,
+                "claude-opus-4-7"));
+
+        if (expectedPctCost is null)
+        {
+            Assert.Null(estimate);
+            return;
+        }
+
+        Assert.NotNull(estimate);
+        Assert.Equal(expectedPctCost.Value, estimate!.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(maxTokensPerIteration, estimate.AverageTokensPerIteration, precision: 2);
     }
 
     [Fact]
@@ -448,12 +533,18 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                 },
             ],
         };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(AgentKind.Claude, 15.0) };
+        var manager = new InProcessQuotaHeadroomManager(
+            estimator,
+            probes,
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<InProcessQuotaHeadroomManager>.Instance);
         var router = new AgentClassRouter(
             [cls],
-            [new FakeProbe(AgentKind.Claude, 15.0)],
+            probes,
             opts,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: estimator);
+            headroomManager: manager);
         var decision = await router.ResolveAsync(new WorkItem
         {
             Id = WorkItemId.New(),
@@ -502,12 +593,18 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                 },
             ],
         };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(AgentKind.Claude, 15.0) };
+        var manager = new InProcessQuotaHeadroomManager(
+            estimator,
+            probes,
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<InProcessQuotaHeadroomManager>.Instance);
         var router = new AgentClassRouter(
             [cls],
-            [new FakeProbe(AgentKind.Claude, 15.0)],
+            probes,
             opts,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: estimator);
+            headroomManager: manager);
         var decision = await router.ResolveAsync(new WorkItem
         {
             Id = WorkItemId.New(),

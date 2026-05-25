@@ -47,6 +47,39 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         var workRows = costStore.Recorded.Where(r => r.Phase == "work").ToList();
         Assert.Single(workRows);
+        Assert.Equal("""{"usageSource":"provider_metadata"}""", workRows[0].RawMetadataJson);
+    }
+
+    [Fact]
+    public async Task PipelineRecordedCostRowsFeedHeadroomEstimator()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("headroom-history.txt", "cost\n"));
+
+        var item = NewItem("feature/headroom-history");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            costStore,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 120,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(1),
+            },
+            NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(item.ProjectId, AgentKind.Claude, "fake-model"));
+
+        Assert.NotNull(estimate);
+        Assert.True(estimate!.TrustedForEnforcement);
+        Assert.Equal(20.0, estimate.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(2_400, estimate.AverageTokensPerIteration, precision: 2);
     }
 
     [Fact]
@@ -312,7 +345,19 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             string? modelId,
             int maxItems,
             CancellationToken ct = default)
-            => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
+        {
+            var filtered = Recorded
+                .Where(r => string.Equals(projectId, "test-project", StringComparison.Ordinal))
+                .Where(r => r.StartedAt >= from && r.StartedAt < to)
+                .Where(r => agentKind is null || string.Equals(r.AgentKind, agentKind, StringComparison.OrdinalIgnoreCase))
+                .Where(r => modelId is null || string.Equals(r.ModelId ?? string.Empty, modelId, StringComparison.OrdinalIgnoreCase))
+                .GroupBy(r => r.WorkItemId, StringComparer.Ordinal)
+                .OrderByDescending(g => g.Max(r => r.EndedAt))
+                .Take(maxItems)
+                .SelectMany(g => g.OrderBy(r => r.StartedAt))
+                .ToList();
+            return Task.FromResult<IReadOnlyList<WorkItemCost>>(filtered);
+        }
 
         public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
             DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)

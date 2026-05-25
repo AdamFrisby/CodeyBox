@@ -38,12 +38,19 @@ public sealed class AgentClassRouterAuditTests : IDisposable
                 },
             ],
         };
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(AgentKind.Claude, 15.0) };
+        var manager = new InProcessQuotaHeadroomManager(
+            new FixedHeadroomEstimator(10.0),
+            probes,
+            opts,
+            NullLogger<InProcessQuotaHeadroomManager>.Instance);
         var router = new AgentClassRouter(
             [cls],
-            [new FakeProbe(AgentKind.Claude, 15.0)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            probes,
+            opts,
             NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: new FixedHeadroomEstimator(10.0));
+            headroomManager: manager);
         var item = new WorkItem
         {
             Id = WorkItemId.New(),

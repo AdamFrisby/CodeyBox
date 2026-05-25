@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -55,7 +54,6 @@ public sealed class AgentClassRouter : IQuotaResetResolver
         TimeProvider? timeProvider = null,
         IReadOnlyList<ParsedTodModifier>? todModifiers = null,
         IQuotaFailureStore? quotaFailures = null,
-        IQuotaHeadroomEstimator? headroomEstimator = null,
         IQuotaHeadroomManager? headroomManager = null)
     {
         _catalog = catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
@@ -72,14 +70,7 @@ public sealed class AgentClassRouter : IQuotaResetResolver
         _time = timeProvider ?? TimeProvider.System;
         _todModifiers = todModifiers ?? [];
         _quotaFailures = quotaFailures;
-        _headroomManager = headroomManager
-            ?? (headroomEstimator is null
-                ? null
-                : new InProcessQuotaHeadroomManager(
-                    headroomEstimator,
-                    probeList,
-                    opts,
-                    NullLogger<InProcessQuotaHeadroomManager>.Instance));
+        _headroomManager = headroomManager;
     }
 
     /// <summary>
@@ -427,10 +418,10 @@ public sealed class AgentClassRouter : IQuotaResetResolver
             {
                 _log.LogWarning(
                     ex,
-                    "Quota reset probe failed for {Agent}/{Model}",
+                    "Quota reset probe failed for {Agent}/{Model}; skipping member while computing earliest exhausted reset",
                     member.Agent.Value,
                     member.ModelId ?? "(default)");
-                throw;
+                continue;
             }
 
             var quota = ResolveMemberQuota(snapshot, member);
