@@ -454,6 +454,159 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.Equal(1, log.WarningCount);
     }
 
+    // ── BuildPersistedJson field preservation ────────────────────────────────
+    //
+    // Each refresher's BuildPersistedJson is deliberately structured to copy
+    // through every property that isn't the rotated access_token / refresh_token
+    // / expiry. If a future change dropped one of those unmodified fields
+    // (client_id/client_secret for Gemini, id_token for Codex, a custom field
+    // like an organisation hint for Claude), the refresh would succeed but the
+    // very next refresh round-trip would fail because PerformRefreshAsync
+    // requires the original client credentials. The "happy path" tests above
+    // only assert that the rotated fields are present, so they would not catch
+    // a regression that silently drops the unrotated ones. These tests close
+    // that gap.
+
+    [Fact]
+    public async Task Gemini_Refresh_PreservesClientIdAndSecretOnDisk()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            GeminiCreds("old-access", "rt-1", DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()));
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK,
+            """{"access_token":"new-access","expires_in":3600}""");
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance);
+
+        Assert.Equal("new-access", await refresher.GetAccessTokenAsync());
+
+        var updated = File.ReadAllText(path);
+        using var doc = System.Text.Json.JsonDocument.Parse(updated);
+        // Rotated fields are present.
+        Assert.Equal("new-access", doc.RootElement.GetProperty("access_token").GetString());
+        Assert.Equal("rt-1", doc.RootElement.GetProperty("refresh_token").GetString());
+        // Unrotated fields survive — without these the next refresh would fail
+        // because PerformRefreshAsync returns null when ClientId/ClientSecret
+        // are missing.
+        Assert.Equal("test-client", doc.RootElement.GetProperty("client_id").GetString());
+        Assert.Equal("test-secret", doc.RootElement.GetProperty("client_secret").GetString());
+    }
+
+    [Fact]
+    public async Task Codex_Refresh_PreservesIdTokenAndLastRefreshOnDisk()
+    {
+        var expiredExp = DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeSeconds();
+        var freshExp = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds();
+        var path = WriteCreds("auth.json", CodexCreds(CodexAccessJwt(expiredExp), "rt-codex", "acct-1"));
+        using var source = new CodexCredentialFileSource(path, watch: false);
+        var newJwt = CodexAccessJwt(freshExp);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK,
+            $$"""{"access_token":"{{newJwt}}","refresh_token":"rt-codex-2","expires_in":3600}""");
+        using var refresher = new CodexOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<CodexOauthCredentialFileRefresher>.Instance);
+
+        var (token, _) = await refresher.GetTokensAsync();
+        Assert.Equal(newJwt, token);
+
+        var updated = File.ReadAllText(path);
+        using var doc = System.Text.Json.JsonDocument.Parse(updated);
+        var tokens = doc.RootElement.GetProperty("tokens");
+        // Rotated.
+        Assert.Equal(newJwt, tokens.GetProperty("access_token").GetString());
+        Assert.Equal("rt-codex-2", tokens.GetProperty("refresh_token").GetString());
+        // Unrotated — id_token and account_id are preserved inside "tokens";
+        // last_refresh is preserved at the top level (its value is rewritten
+        // via TimeProvider, but the property must still exist).
+        Assert.Equal("id-1", tokens.GetProperty("id_token").GetString());
+        Assert.Equal("acct-1", tokens.GetProperty("account_id").GetString());
+        Assert.True(doc.RootElement.TryGetProperty("last_refresh", out _));
+    }
+
+    [Fact]
+    public async Task Claude_Refresh_PreservesUnrotatedClaudeAiOauthFieldsOnDisk()
+    {
+        // Include a non-standard "scopes" field inside claudeAiOauth and a
+        // sibling "userInfo" object at the root — both must survive the
+        // rewrite. Real .credentials.json files emitted by the claude CLI
+        // include extras like these.
+        var path = Path.Combine(_dir, ".credentials.json");
+        var pastMs = DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds();
+        File.WriteAllText(path, $$"""
+        {
+          "claudeAiOauth": {
+            "accessToken": "old",
+            "refreshToken": "rt-claude",
+            "expiresAt": {{pastMs}},
+            "scopes": ["read", "write"]
+          },
+          "userInfo": { "email": "u@example.com" }
+        }
+        """);
+        using var source = new ClaudeCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK,
+            """{"access_token":"sk-ant-new","expires_in":28800}""");
+        using var refresher = new ClaudeOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<ClaudeOauthCredentialFileRefresher>.Instance);
+
+        Assert.Equal("sk-ant-new", await refresher.GetAccessTokenAsync());
+
+        var updated = File.ReadAllText(path);
+        using var doc = System.Text.Json.JsonDocument.Parse(updated);
+        var oauth = doc.RootElement.GetProperty("claudeAiOauth");
+        Assert.Equal("sk-ant-new", oauth.GetProperty("accessToken").GetString());
+        Assert.Equal("rt-claude", oauth.GetProperty("refreshToken").GetString());
+        // Unrotated fields survive both inside claudeAiOauth and at the root.
+        var scopes = oauth.GetProperty("scopes");
+        Assert.Equal(2, scopes.GetArrayLength());
+        Assert.Equal("read", scopes[0].GetString());
+        Assert.Equal("u@example.com",
+            doc.RootElement.GetProperty("userInfo").GetProperty("email").GetString());
+    }
+
+    // ── Atomic write file-permission preservation ────────────────────────────
+    //
+    // The atomic-write codepath sets the tempfile to UnixFileMode 0600 before
+    // the rename so the rotated access_token never lands on a shared host with
+    // world-readable perms. This branch has no other coverage — a regression
+    // that removed the SetUnixFileMode / UnixCreateMode wiring would silently
+    // leave the rewritten creds file at the process umask (typically 0644).
+    [Fact]
+    public async Task Gemini_Refresh_PersistedFileIs0600OnPosix()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // UnixFileMode is not meaningful on Windows; ACLs are validated by
+            // a separate test in CredentialFileSourceTests.
+            return;
+        }
+
+        var path = WriteCreds("oauth_creds.json",
+            GeminiCreds("old", "rt-1", DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()));
+        // Pre-set the existing file to 0644 so we can prove the rewrite tightens
+        // perms to 0600 (rather than relying on whatever umask the test runner
+        // happens to inherit).
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite
+            | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK,
+            """{"access_token":"new-access","expires_in":3600}""");
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance);
+
+        Assert.Equal("new-access", await refresher.GetAccessTokenAsync());
+
+        var mode = File.GetUnixFileMode(path);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, mode);
+    }
+
     // ── Shared: in-process cache ─────────────────────────────────────────────
 
     /// <summary>

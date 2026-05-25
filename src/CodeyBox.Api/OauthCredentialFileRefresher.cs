@@ -12,9 +12,9 @@ namespace CodeyBox.Api;
 /// (Gemini, Codex, Claude). The probes consult the host's credential file each
 /// time the router picks up an agent membership; without a refresher the probe
 /// would happily forward an expired access_token, the provider would 401, the
-/// snapshot would become <see cref="object"/>-shaped "unknown", and the router's
-/// default UnknownPolicy=UseObservedFailures would fall open — assigning work
-/// that subsequently 429s on the real provider call.
+/// snapshot would become "unknown" (AvailablePct=-1), and the router's default
+/// UnknownPolicy=UseObservedFailures would fall open — assigning work that
+/// subsequently 429s on the real provider call.
 ///
 /// <para>Each source wraps the existing <see cref="CredentialFileSource"/> so
 /// out-of-band rewrites by the host CLI are still observed. When the file's
@@ -251,9 +251,12 @@ public abstract class OauthCredentialFileRefresher : IDisposable
     }
 
     /// <summary>
-    /// Atomic-rename write that preserves 0600 perms on POSIX. The tempfile
-    /// lives in the same directory so the rename is atomic on the same
-    /// filesystem.
+    /// Atomic-rename write that preserves 0600 perms on POSIX. The tempfile is
+    /// created with explicit 0600 perms via <see cref="FileStreamOptions.UnixCreateMode"/>
+    /// so the access_token bytes never sit on disk under the process umask
+    /// (typically 0644 = world-readable) — closing the local-user read race that
+    /// a separate post-create chmod would leave open. The tempfile lives in the
+    /// same directory so the rename is atomic on the same filesystem.
     /// </summary>
     private static void AtomicWriteCredsFile(string path, string contents)
     {
@@ -262,20 +265,20 @@ public abstract class OauthCredentialFileRefresher : IDisposable
         var tmp = Path.Combine(dir, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
         try
         {
-            File.WriteAllText(tmp, contents);
+            var options = new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+            };
             if (!OperatingSystem.IsWindows())
             {
-                try
-                {
-                    File.SetUnixFileMode(
-                        tmp,
-                        UnixFileMode.UserRead | UnixFileMode.UserWrite);
-                }
-                catch (PlatformNotSupportedException)
-                {
-                    // SetUnixFileMode is unavailable on this runtime — best
-                    // effort: leave default umask perms in place.
-                }
+                options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            }
+            using (var fs = new FileStream(tmp, options))
+            using (var sw = new StreamWriter(fs, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+            {
+                sw.Write(contents);
             }
             File.Move(tmp, path, overwrite: true);
             tmp = null!;
@@ -590,7 +593,7 @@ public sealed class CodexOauthCredentialFileRefresher
                 }
                 else if (prop.NameEquals("last_refresh"))
                 {
-                    writer.WriteString("last_refresh", DateTimeOffset.UtcNow.ToString("o"));
+                    writer.WriteString("last_refresh", TimeProvider.GetUtcNow().ToString("o"));
                 }
                 else
                 {
