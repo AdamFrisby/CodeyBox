@@ -219,6 +219,7 @@ public sealed class AgentClassRouter : IQuotaResetResolver
                     Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {quota.AvailablePct:F1}% available",
                     ChosenAvailablePct = quota.AvailablePct,
                     ChosenQuotaResetAt = quota.ResetAt,
+                    ChosenMinQuotaPct = _opts.MinQuotaPct,
                 };
             }
 
@@ -445,10 +446,25 @@ public sealed class AgentClassRouter : IQuotaResetResolver
         DateTimeOffset? resetAt,
         CancellationToken ct)
     {
-        if (_headroomManager is not null)
+        if (member.Billing == AgentBilling.PayPerApi)
+            return new QuotaGateDecision(true, "pay-per-api member is never quota-gated", resetAt);
+
+        var reservedPct = _headroomManager?.GetReservedHeadroomPct(projectId, member.Agent) ?? 0;
+        if (availablePct >= 0)
         {
+            if (!QuotaRouter.WouldAllow(availablePct, false, _opts, reservedQuotaPct: reservedPct))
+                return new QuotaGateDecision(false, "quota exhausted", resetAt);
+
+            if (_headroomManager is null)
+                return new QuotaGateDecision(true, "quota available", resetAt);
+
             var result = await _headroomManager.EvaluateAsync(
-                new QuotaHeadroomGateRequest(projectId, member, availablePct, resetAt),
+                new QuotaHeadroomGateRequest(
+                    projectId,
+                    member,
+                    availablePct,
+                    resetAt,
+                    MinRemainingPct: _opts.MinQuotaPct),
                 ct);
             return new QuotaGateDecision(
                 result.Allow,
@@ -457,14 +473,14 @@ public sealed class AgentClassRouter : IQuotaResetResolver
                 result.InsufficientHeadroom);
         }
 
-        if (member.Billing == AgentBilling.PayPerApi)
-            return new QuotaGateDecision(true, "pay-per-api member is never quota-gated", resetAt);
-
-        if (availablePct >= _opts.MinQuotaPct)
-            return new QuotaGateDecision(true, "quota available", resetAt);
-
-        if (availablePct >= 0)
-            return new QuotaGateDecision(false, "quota exhausted", resetAt);
+        if (reservedPct > 0)
+        {
+            return new QuotaGateDecision(
+                false,
+                $"quota unknown while {reservedPct:F1}% reserved headroom is pending release",
+                resetAt,
+                InsufficientHeadroom: true);
+        }
 
         return _opts.UnknownPolicy switch
         {
@@ -603,6 +619,9 @@ public sealed record AgentRoutingDecision
 
     /// <summary>Quota reset observed for <see cref="Chosen"/> at route time.</summary>
     public DateTimeOffset? ChosenQuotaResetAt { get; init; }
+
+    /// <summary>Minimum remaining quota percentage used for route-time gating.</summary>
+    public double? ChosenMinQuotaPct { get; init; }
 
     /// <summary>Suggested delay before re-attempting pickup.</summary>
     public TimeSpan SuggestedRecheckIn { get; init; }

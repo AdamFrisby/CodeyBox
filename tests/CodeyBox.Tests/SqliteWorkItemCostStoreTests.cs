@@ -336,7 +336,8 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
             },
             AvailablePct: 15.0,
             ResetAt: null,
-            AuditOnRefusal: false));
+            AuditOnRefusal: false,
+            MinRemainingPct: opts.MinQuotaPct));
 
         Assert.False(result.Allow);
         Assert.True(result.InsufficientHeadroom);
@@ -382,16 +383,18 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
             RawMetadataJson = """{"quotaHeadroomTrusted":true}""",
         });
 
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            HeadroomTokensPerQuotaPct = 10_000,
+            HeadroomHistoryItemCount = 20,
+            HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            HeadroomMaxTokensPerCostRow = 500_000,
+            HeadroomMaxTokensPerIteration = 500_000,
+        };
         var estimator = new CostHistoryQuotaHeadroomEstimator(
             _store,
-            new QuotaRouterOptions
-            {
-                HeadroomTokensPerQuotaPct = 10_000,
-                HeadroomHistoryItemCount = 20,
-                HeadroomHistoryWindow = TimeSpan.FromDays(7),
-                HeadroomMaxTokensPerCostRow = 500_000,
-                HeadroomMaxTokensPerIteration = 500_000,
-            },
+            opts,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
 
         var estimate = await estimator.EstimateAsync(
@@ -405,6 +408,29 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(4.5, estimate.EstimatedIterPctCost, precision: 2);
         Assert.Equal(45_000, estimate.AverageTokensPerIteration, precision: 2);
         Assert.Equal(2, estimate.SampledItemCount);
+
+        var manager = new InProcessQuotaHeadroomManager(
+            estimator,
+            [new FakeProbe(AgentKind.Claude, 14.0)],
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<InProcessQuotaHeadroomManager>.Instance);
+        var gate = await manager.EvaluateAsync(new QuotaHeadroomGateRequest(
+            new ProjectId("proj-headroom-trust"),
+            new AgentMembership
+            {
+                Agent = AgentKind.Claude,
+                Billing = AgentBilling.Subscription,
+                ModelId = "claude-opus-4-7",
+                QualityScore = 100,
+            },
+            AvailablePct: 14.0,
+            ResetAt: null,
+            AuditOnRefusal: false,
+            MinRemainingPct: opts.MinQuotaPct));
+
+        Assert.False(gate.Allow);
+        Assert.True(gate.InsufficientHeadroom);
+        Assert.Equal(9.5, gate.ProjectedAvailablePct!.Value, precision: 2);
     }
 
     [Fact]

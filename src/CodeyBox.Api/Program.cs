@@ -1102,9 +1102,7 @@ builder.Services.AddSingleton<IQuotaHeadroomManager>(sp => new InProcessQuotaHea
     sp.GetService<IQuotaHeadroomEstimator>(),
     sp.GetServices<IAgentQuotaProbe>(),
     sp.GetRequiredService<QuotaRouterOptions>(),
-    sp.GetRequiredService<ILogger<InProcessQuotaHeadroomManager>>(),
-    sp.GetService<IQuotaFailureStore>(),
-    TimeProvider.System));
+    sp.GetRequiredService<ILogger<InProcessQuotaHeadroomManager>>()));
 builder.Services.AddSingleton<IAgentStreamSummaryStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1444,19 +1442,49 @@ ReleaseEndpoints.Map(app);
 
 app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
 
+const int DefaultQuotaProjectionProjectLimit = 25;
+const int MaxQuotaProjectionProjectLimit = 50;
+
 app.MapGet("/quota", async (
     IEnumerable<IAgentQuotaProbe> probes,
     IQuotaFailureStore? failureStore,
     IQuotaHeadroomManager headroomManager,
     IProjectRepository projects,
     QuotaRouterOptions options,
+    string? projectId,
+    int? limit,
     CancellationToken ct) =>
 {
     var now = DateTimeOffset.UtcNow;
     IReadOnlyList<QuotaFailureObservation> failures = failureStore is null
         ? Array.Empty<QuotaFailureObservation>()
         : await failureStore.ListRecentAsync(TimeSpan.FromMinutes(60), now, ct);
-    var projectList = await projects.ListAsync(ct);
+    if (limit is < 1)
+        return Results.BadRequest(new { error = "limit must be positive" });
+
+    var effectiveLimit = Math.Min(limit ?? DefaultQuotaProjectionProjectLimit, MaxQuotaProjectionProjectLimit);
+    IReadOnlyList<Project> projectList;
+    var totalProjectCount = 0;
+    var projectionTruncated = false;
+    if (!string.IsNullOrWhiteSpace(projectId))
+    {
+        var project = await projects.GetAsync(new ProjectId(projectId), ct);
+        if (project is null)
+            return Results.NotFound(new { error = $"unknown project '{projectId}'" });
+
+        projectList = [project];
+        totalProjectCount = 1;
+    }
+    else
+    {
+        var allProjects = await projects.ListAsync(ct);
+        totalProjectCount = allProjects.Count;
+        projectList = allProjects
+            .OrderBy(p => p.Id.Value, StringComparer.Ordinal)
+            .Take(effectiveLimit)
+            .ToList();
+        projectionTruncated = totalProjectCount > projectList.Count;
+    }
 
     var snapshots = new List<object>();
     foreach (var probe in probes.Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe))
@@ -1477,9 +1505,15 @@ app.MapGet("/quota", async (
                     member,
                     snapshot.AvailablePct,
                     snapshot.ResetAt,
-                    AuditOnRefusal: false),
+                    AuditOnRefusal: false,
+                    MinRemainingPct: options.MinQuotaPct),
                 ct);
             var estimate = gate.Estimate;
+            var baseWouldAllow = QuotaRouter.WouldAllow(
+                snapshot.AvailablePct,
+                false,
+                options,
+                reservedQuotaPct: gate.ReservedPct);
             headroomProjections.Add(new
             {
                 projectId = project.Id.Value,
@@ -1490,9 +1524,9 @@ app.MapGet("/quota", async (
                 trustedForEnforcement = estimate?.TrustedForEnforcement,
                 reservedQuotaPct = gate.ReservedPct,
                 projectedAvailablePct = gate.ProjectedAvailablePct,
-                wouldAllow = gate.Allow,
+                wouldAllow = baseWouldAllow && gate.Allow,
                 insufficientHeadroom = gate.InsufficientHeadroom,
-                reason = gate.Reason,
+                reason = baseWouldAllow ? gate.Reason : "quota exhausted",
             });
         }
         var recentFailuresForProbe = failures
@@ -1539,6 +1573,10 @@ app.MapGet("/quota", async (
     {
         generatedAt = now,
         minQuotaPct = options.MinQuotaPct,
+        headroomProjectionProjectLimit = effectiveLimit,
+        headroomProjectionProjectCount = projectList.Count,
+        headroomProjectionTotalProjectCount = totalProjectCount,
+        headroomProjectionTruncated = projectionTruncated,
         headroomProjectionEnabled = options.HeadroomProjectionEnabled,
         headroomHistoryItemCount = options.HeadroomHistoryItemCount,
         headroomHistoryWindowDays = options.HeadroomHistoryWindow.TotalDays,

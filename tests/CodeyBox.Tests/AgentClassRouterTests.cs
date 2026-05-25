@@ -93,7 +93,8 @@ public sealed class AgentClassRouterTests
                 item.ProjectId,
                 decision.Chosen!,
                 decision.ChosenAvailablePct ?? -1,
-                decision.ChosenQuotaResetAt));
+                decision.ChosenQuotaResetAt,
+                MinRemainingPct: decision.ChosenMinQuotaPct));
         Assert.True(gate.Allow, gate.Reason);
         return Assert.IsAssignableFrom<IQuotaReservationLease>(gate.Reservation);
     }
@@ -212,7 +213,7 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task UntrustedHeadroomEstimate_DoesNotBlockDispatch()
+    public async Task UntrustedHeadroomEstimate_BlocksDispatch()
     {
         var cls = FrontierClass(Sub(Claude));
         var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
@@ -225,8 +226,9 @@ public sealed class AgentClassRouterTests
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
-        Assert.Equal(Claude, decision.Chosen!.Agent);
-        Assert.False(decision.ShouldWait);
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+        Assert.Contains("headroom", decision.Reason);
     }
 
     [Fact]
@@ -324,6 +326,40 @@ public sealed class AgentClassRouterTests
         Assert.Equal(Claude, afterRelease.Chosen!.Agent);
         Assert.False(afterRelease.ShouldWait);
         await afterReleaseReservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
+    }
+
+    [Fact]
+    public async Task TryReserveAsync_RefusesWhenReservedHeadroomWouldCrossThreshold()
+    {
+        var probe = new FakeProbe(Claude, 35.0);
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var manager = BuildHeadroomManager([probe], opts, estimatedPctCost: 15.0);
+        var member = Sub(Claude);
+        var projectId = new ProjectId("proj");
+        var first = await manager.TryReserveAsync(new QuotaHeadroomGateRequest(
+            projectId,
+            member,
+            AvailablePct: 35.0,
+            ResetAt: null,
+            AuditOnRefusal: false,
+            MinRemainingPct: opts.MinQuotaPct));
+        Assert.True(first.Allow, first.Reason);
+        var lease = Assert.IsAssignableFrom<IQuotaReservationLease>(first.Reservation);
+
+        var second = await manager.TryReserveAsync(new QuotaHeadroomGateRequest(
+            projectId,
+            member,
+            AvailablePct: 35.0,
+            ResetAt: null,
+            AuditOnRefusal: false,
+            MinRemainingPct: opts.MinQuotaPct));
+
+        Assert.False(second.Allow);
+        Assert.True(second.InsufficientHeadroom);
+        Assert.Equal(15.0, second.ReservedPct, precision: 2);
+        Assert.Equal(5.0, second.ProjectedAvailablePct!.Value, precision: 2);
+        Assert.Null(second.Reservation);
+        await lease.ReleaseAsync(quotaMayHaveBeenConsumed: false);
     }
 
     [Fact]
@@ -588,7 +624,7 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task SubscriptionEstimatorException_FailsClosedToQuotaWait()
+    public async Task SubscriptionEstimatorException_UsesBaseQuotaGate()
     {
         var cls = FrontierClass(Sub(Claude));
         var opts = new QuotaRouterOptions { MinQuotaPct = 10.0 };
@@ -604,9 +640,8 @@ public sealed class AgentClassRouterTests
             null,
             CancellationToken.None);
 
-        Assert.Null(decision.Chosen);
-        Assert.True(decision.ShouldWait);
-        Assert.Contains("headroom", decision.Reason);
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
     }
 
     // ── No probe registered → unknown policy ────────────────────────────────

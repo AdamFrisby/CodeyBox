@@ -165,8 +165,8 @@ public sealed class QuotaEndpointTests
 
         Assert.Equal(10, untrustedProjection.GetProperty("estimatedIterPctCost").GetDouble(), precision: 2);
         Assert.False(untrustedProjection.GetProperty("trustedForEnforcement").GetBoolean());
-        Assert.Equal(15, untrustedProjection.GetProperty("projectedAvailablePct").GetDouble(), precision: 2);
-        Assert.True(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
+        Assert.Equal(5, untrustedProjection.GetProperty("projectedAvailablePct").GetDouble(), precision: 2);
+        Assert.False(untrustedProjection.GetProperty("wouldAllow").GetBoolean());
     }
 
     [Fact]
@@ -220,7 +220,8 @@ public sealed class QuotaEndpointTests
             },
             AvailablePct: 25,
             ResetAt: null,
-            AuditOnRefusal: false));
+            AuditOnRefusal: false,
+            MinRemainingPct: 10));
         Assert.True(gate.Allow, gate.Reason);
         var lease = Assert.IsAssignableFrom<IQuotaReservationLease>(gate.Reservation);
 
@@ -240,5 +241,72 @@ public sealed class QuotaEndpointTests
         Assert.False(projection.GetProperty("wouldAllow").GetBoolean());
 
         await lease.ReleaseAsync(quotaMayHaveBeenConsumed: false);
+    }
+
+    [Fact]
+    public async Task GetQuota_LimitsHeadroomProjectionProjects()
+    {
+        var projects = Enumerable.Range(0, 30)
+            .Select(i => new Project
+            {
+                Id = new ProjectId($"proj-{i:D2}"),
+                DisplayName = $"Project {i:D2}",
+                RepositoryUrl = "https://github.com/test/repo",
+            })
+            .ToArray();
+        using var factory = new WorkItemApiFactory(projects: projects);
+        var configuredFactory = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 80,
+                }));
+            });
+        });
+
+        var client = configuredFactory.CreateClient();
+        var response = await client.GetAsync("/quota?limit=3");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        Assert.Equal(3, doc.RootElement.GetProperty("headroomProjectionProjectLimit").GetInt32());
+        Assert.Equal(30, doc.RootElement.GetProperty("headroomProjectionTotalProjectCount").GetInt32());
+        Assert.True(doc.RootElement.GetProperty("headroomProjectionTruncated").GetBoolean());
+        Assert.Equal(3, doc.RootElement
+            .GetProperty("probes")[0]
+            .GetProperty("headroomProjections")
+            .GetArrayLength());
+    }
+
+    [Fact]
+    public async Task GetQuota_ProjectIdFiltersHeadroomProjection()
+    {
+        using var factory = new WorkItemApiFactory();
+        var configuredFactory = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 80,
+                }));
+            });
+        });
+
+        var client = configuredFactory.CreateClient();
+        var response = await client.GetAsync("/quota?projectId=second-project");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        var projection = Assert.Single(doc.RootElement
+            .GetProperty("probes")[0]
+            .GetProperty("headroomProjections")
+            .EnumerateArray());
+        Assert.Equal("second-project", projection.GetProperty("projectId").GetString());
+        Assert.False(doc.RootElement.GetProperty("headroomProjectionTruncated").GetBoolean());
     }
 }

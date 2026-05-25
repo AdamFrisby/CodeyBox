@@ -60,7 +60,8 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
             ClaudeMember(),
             AvailablePct: 25,
             ResetAt: null,
-            AuditOnRefusal: false));
+            AuditOnRefusal: false,
+            MinRemainingPct: 10));
         Assert.True(reservation.Allow, reservation.Reason);
         var lease = Assert.IsAssignableFrom<IQuotaReservationLease>(reservation.Reservation);
 
@@ -92,8 +93,7 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
             estimator,
             probes,
             opts,
-            NullLogger<InProcessQuotaHeadroomManager>.Instance,
-            quotaFailures: _failures);
+            NullLogger<InProcessQuotaHeadroomManager>.Instance);
 
         var router = new AgentClassRouter(
             [cls],

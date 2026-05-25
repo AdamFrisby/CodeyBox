@@ -741,7 +741,8 @@ public sealed class OrchestratorService : BackgroundService
                                 item.ProjectId,
                                 chosen,
                                 decision.ChosenAvailablePct ?? -1,
-                                decision.ChosenQuotaResetAt),
+                                decision.ChosenQuotaResetAt,
+                                MinRemainingPct: decision.ChosenMinQuotaPct),
                             ct);
                         if (!reservationGate.Allow)
                         {

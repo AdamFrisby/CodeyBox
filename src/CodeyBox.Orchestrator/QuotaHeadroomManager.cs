@@ -23,7 +23,8 @@ public sealed record QuotaHeadroomGateRequest(
     AgentMembership Member,
     double AvailablePct,
     DateTimeOffset? ResetAt,
-    bool AuditOnRefusal = true);
+    bool AuditOnRefusal = true,
+    double? MinRemainingPct = null);
 
 public sealed record QuotaHeadroomGateResult(
     bool Allow,
@@ -56,18 +57,15 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe> _probesByKind;
     private readonly QuotaRouterOptions _opts;
     private readonly ILogger<InProcessQuotaHeadroomManager> _log;
-    private readonly IQuotaFailureStore? _quotaFailures;
-    private readonly TimeProvider _time;
     private readonly ConcurrentDictionary<QuotaReservationKey, double> _reservedHeadroomPct = new();
     private readonly ConcurrentDictionary<QuotaReservationKey, object> _reservationLocks = new();
+    private const double ReservationReleaseEpsilonPct = 0.000_001;
 
     public InProcessQuotaHeadroomManager(
         IQuotaHeadroomEstimator? headroomEstimator,
         IEnumerable<IAgentQuotaProbe> probes,
         QuotaRouterOptions opts,
-        ILogger<InProcessQuotaHeadroomManager>? log = null,
-        IQuotaFailureStore? quotaFailures = null,
-        TimeProvider? timeProvider = null)
+        ILogger<InProcessQuotaHeadroomManager>? log = null)
     {
         _headroomEstimator = headroomEstimator;
         _probesByKind = probes
@@ -75,8 +73,6 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
             .ToDictionary(p => p.Kind);
         _opts = opts;
         _log = log ?? NullLogger<InProcessQuotaHeadroomManager>.Instance;
-        _quotaFailures = quotaFailures;
-        _time = timeProvider ?? TimeProvider.System;
     }
 
     public Task<QuotaHeadroomGateResult> EvaluateAsync(
@@ -101,149 +97,103 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
         if (member.Billing == AgentBilling.PayPerApi)
             return new QuotaHeadroomGateResult(true, "pay-per-api member is never quota-gated", request.ResetAt);
 
-        if (request.AvailablePct >= _opts.MinQuotaPct)
+        var key = new QuotaReservationKey(request.ProjectId, member.Agent);
+        var reservedPct = GetReservedHeadroomPct(key);
+        if (request.AvailablePct < 0)
         {
-            QuotaHeadroomEstimate? estimate;
-            try
-            {
-                estimate = await EstimateHeadroomAsync(request.ProjectId, member, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(
-                    ex,
-                    "Quota headroom estimation failed for project {ProjectId} agent {Agent} model {Model}; failing closed until quota can be rechecked",
-                    request.ProjectId.Value,
-                    member.Agent.Value,
-                    member.ModelId ?? "(default)");
-                return new QuotaHeadroomGateResult(
-                    false,
-                    "headroom estimation failed",
-                    request.ResetAt,
-                    InsufficientHeadroom: true);
-            }
-
-            var estimatedCost = estimate is { TrustedForEnforcement: true }
-                ? estimate.EstimatedIterPctCost
-                : (double?)null;
-            var key = new QuotaReservationKey(request.ProjectId, member.Agent);
-            var reservedPct = GetReservedHeadroomPct(key);
-            IQuotaReservationLease? reservation = null;
-
-            if (estimatedCost is { } cost && cost > 0 && reserve)
-            {
-                var sync = _reservationLocks.GetOrAdd(key, _ => new object());
-                lock (sync)
-                {
-                    reservedPct = GetReservedHeadroomPct(key);
-                    if (QuotaRouter.WouldAllow(request.AvailablePct, recentFailure: false, _opts, cost, reservedPct))
-                    {
-                        _reservedHeadroomPct.AddOrUpdate(key, cost, (_, existing) => existing + cost);
-                        reservation = new InProcessQuotaReservationLease(this, key, member.ModelId, cost);
-                    }
-                }
-            }
-
-            if (reservation is null
-                && estimatedCost is { } refusedCost
-                && !QuotaRouter.WouldAllow(request.AvailablePct, recentFailure: false, _opts, refusedCost, reservedPct))
-            {
-                var projected = request.AvailablePct - reservedPct - refusedCost;
-                const string reason = "insufficient headroom";
-                if (request.AuditOnRefusal)
-                {
-                    AuditLog.QuotaDispatchRefused(
-                        member.Agent,
-                        request.ProjectId,
-                        request.AvailablePct,
-                        refusedCost,
-                        reason);
-                }
-
-                return new QuotaHeadroomGateResult(
-                    false,
-                    $"insufficient headroom (available={request.AvailablePct:F1}%, reserved={reservedPct:F1}%, estimatedCost={refusedCost:F1}%, projected={projected:F1}% < min={_opts.MinQuotaPct:F1}%)",
-                    request.ResetAt,
-                    InsufficientHeadroom: true,
-                    Estimate: estimate,
-                    ReservedPct: reservedPct,
-                    ProjectedAvailablePct: projected);
-            }
-
-            if (estimate is { TrustedForEnforcement: false })
-            {
-                return new QuotaHeadroomGateResult(
-                    true,
-                    "quota available; untrusted headroom estimate ignored for dispatch enforcement",
-                    request.ResetAt,
-                    Estimate: estimate,
-                    ReservedPct: reservedPct,
-                    ProjectedAvailablePct: request.AvailablePct - reservedPct);
-            }
-
             return new QuotaHeadroomGateResult(
                 true,
-                estimatedCost is { } allowedCost
-                    ? $"quota available; projected headroom {(request.AvailablePct - reservedPct - allowedCost):F1}% after estimated {allowedCost:F1}% iteration"
-                    : "quota available",
+                "quota unavailable for headroom projection",
                 request.ResetAt,
-                Reservation: reservation,
+                ReservedPct: reservedPct);
+        }
+
+        QuotaHeadroomEstimate? estimate;
+        try
+        {
+            estimate = await EstimateHeadroomAsync(request.ProjectId, member, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Quota headroom estimation failed for project {ProjectId} agent {Agent} model {Model}; dispatch will use the base quota gate only",
+                request.ProjectId.Value,
+                member.Agent.Value,
+                member.ModelId ?? "(default)");
+            return new QuotaHeadroomGateResult(
+                true,
+                "headroom estimation unavailable",
+                request.ResetAt,
+                ReservedPct: reservedPct,
+                ProjectedAvailablePct: request.AvailablePct - reservedPct);
+        }
+
+        var estimatedCost = estimate?.EstimatedIterPctCost;
+        if (estimatedCost is not { } cost || cost <= 0)
+        {
+            return new QuotaHeadroomGateResult(
+                true,
+                "quota available",
+                request.ResetAt,
                 Estimate: estimate,
                 ReservedPct: reservedPct,
-                ProjectedAvailablePct: estimatedCost is { } costForProjection
-                    ? request.AvailablePct - reservedPct - costForProjection
-                    : null);
+                ProjectedAvailablePct: request.AvailablePct - reservedPct);
         }
 
-        if (request.AvailablePct >= 0)
-            return new QuotaHeadroomGateResult(false, "quota exhausted", request.ResetAt);
+        var minRemainingPct = Math.Max(0, request.MinRemainingPct ?? 0);
+        IQuotaReservationLease? reservation = null;
 
-        var unknownReservedPct = GetReservedHeadroomPct(request.ProjectId, member.Agent);
-        if (unknownReservedPct > 0)
+        if (reserve)
         {
+            var sync = _reservationLocks.GetOrAdd(key, _ => new object());
+            lock (sync)
+            {
+                reservedPct = GetReservedHeadroomPct(key);
+                if (request.AvailablePct - reservedPct - cost >= minRemainingPct)
+                {
+                    _reservedHeadroomPct.AddOrUpdate(key, cost, (_, existing) => existing + cost);
+                    reservation = new InProcessQuotaReservationLease(this, key, member.ModelId, cost);
+                }
+            }
+        }
+
+        var projected = request.AvailablePct - reservedPct - cost;
+        if (reservation is null && projected < minRemainingPct)
+        {
+            const string reason = "insufficient headroom";
+            if (request.AuditOnRefusal)
+            {
+                AuditLog.QuotaDispatchRefused(
+                    member.Agent,
+                    request.ProjectId,
+                    request.AvailablePct,
+                    cost,
+                    reason);
+            }
+
             return new QuotaHeadroomGateResult(
                 false,
-                $"quota unknown while {unknownReservedPct:F1}% reserved headroom is pending release",
+                $"insufficient headroom (available={request.AvailablePct:F1}%, reserved={reservedPct:F1}%, estimatedCost={cost:F1}%, projected={projected:F1}% < min={minRemainingPct:F1}%)",
                 request.ResetAt,
                 InsufficientHeadroom: true,
-                ReservedPct: unknownReservedPct);
+                Estimate: estimate,
+                ReservedPct: reservedPct,
+                ProjectedAvailablePct: projected);
         }
 
-        return _opts.UnknownPolicy switch
-        {
-            QuotaUnknownPolicy.FailOpen => new QuotaHeadroomGateResult(true, "quota unknown; fail-open", null),
-            QuotaUnknownPolicy.FailCautious => new QuotaHeadroomGateResult(false, "quota unknown; fail-cautious", null),
-            _ => await EvaluateObservedFailuresAsync(member, ct),
-        };
-    }
-
-    private async Task<QuotaHeadroomGateResult> EvaluateObservedFailuresAsync(
-        AgentMembership member,
-        CancellationToken ct)
-    {
-        if (_quotaFailures is null)
-            return new QuotaHeadroomGateResult(true, "quota unknown; no recent quota-shaped failure", null);
-
-        var now = _time.GetUtcNow();
-        var observedAt = await _quotaFailures.GetMostRecentAsync(
-            member.Agent,
-            member.ModelId,
-            _opts.ObservedFailureWindow,
-            now,
-            ct);
-        if (observedAt is { } seenAt)
-        {
-            return new QuotaHeadroomGateResult(
-                false,
-                $"quota unknown; {AgentClassRouter.FormatObservedFailureReason(member, seenAt, now)}",
-                null);
-        }
-
-        return new QuotaHeadroomGateResult(true, "quota unknown; no recent quota-shaped failure", null);
+        return new QuotaHeadroomGateResult(
+            true,
+            $"quota available; projected headroom {projected:F1}% after estimated {cost:F1}% iteration",
+            request.ResetAt,
+            Reservation: reservation,
+            Estimate: estimate,
+            ReservedPct: reservedPct,
+            ProjectedAvailablePct: projected);
     }
 
     private async Task<QuotaHeadroomEstimate?> EstimateHeadroomAsync(
@@ -351,7 +301,7 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
                 return;
 
             var next = existing - amount;
-            if (next <= 0.000_001)
+            if (next <= ReservationReleaseEpsilonPct)
                 _reservedHeadroomPct.TryRemove(key, out _);
             else
                 _reservedHeadroomPct[key] = next;
