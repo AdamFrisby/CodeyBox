@@ -296,6 +296,63 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_AppliesHistoryWindowBoundary()
+    {
+        var now = new DateTimeOffset(2026, 5, 25, 12, 0, 0, TimeSpan.Zero);
+        var boundary = now.AddDays(-7);
+        var staleItem = Guid.NewGuid().ToString();
+        var boundaryItem = Guid.NewGuid().ToString();
+        var freshItem = Guid.NewGuid().ToString();
+        SeedWorkItem(staleItem, "proj-headroom-window");
+        SeedWorkItem(boundaryItem, "proj-headroom-window");
+        SeedWorkItem(freshItem, "proj-headroom-window");
+
+        await _store.RecordAsync(MakeCost(staleItem) with
+        {
+            InputTokens = 1_000_000,
+            OutputTokens = 0,
+            StartedAt = boundary.AddTicks(-1),
+            EndedAt = boundary.AddTicks(-1),
+        });
+        await _store.RecordAsync(MakeCost(boundaryItem) with
+        {
+            InputTokens = 20_000,
+            OutputTokens = 0,
+            StartedAt = boundary,
+            EndedAt = boundary.AddMinutes(1),
+        });
+        await _store.RecordAsync(MakeCost(freshItem) with
+        {
+            InputTokens = 40_000,
+            OutputTokens = 0,
+            StartedAt = now.AddMinutes(-10),
+            EndedAt = now.AddMinutes(-9),
+        });
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance,
+            new FakeTimeProvider(now));
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(
+                new ProjectId("proj-headroom-window"),
+                AgentKind.Claude,
+                "claude-opus-4-7"));
+
+        Assert.NotNull(estimate);
+        Assert.Equal(3.0, estimate!.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(30_000, estimate.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(2, estimate.SampledItemCount);
+    }
+
+    [Fact]
     public async Task CostHistoryQuotaHeadroomEstimator_DisabledProjectionReturnsNullAndRouterAllows()
     {
         var itemId = Guid.NewGuid().ToString();
