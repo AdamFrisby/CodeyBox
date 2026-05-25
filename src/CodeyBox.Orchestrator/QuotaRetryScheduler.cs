@@ -7,7 +7,8 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Hosted service that automatically retries work items that failed due to
-/// quota exhaustion, once quota is available again.
+/// quota exhaustion and parked WaitingForQuotaReset items, once quota is
+/// available again.
 /// </summary>
 public sealed class QuotaRetryScheduler : BackgroundService, IQuotaRetryNotifier, IDisposable
 {

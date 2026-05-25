@@ -722,7 +722,7 @@ public sealed class OrchestratorService : BackgroundService
                         new QuotaWaitParkRequest(
                             item,
                             decision.Reason,
-                            "work",
+                            QuotaRetryPhaseForDispatchState(item.State),
                             decision.SuggestedRetryAt ?? DateTimeOffset.UtcNow.Add(decision.SuggestedRecheckIn),
                             project),
                         ct);
@@ -943,6 +943,14 @@ public sealed class OrchestratorService : BackgroundService
 
     private SemaphoreSlim GetBudgetLock(ProjectId projectId) =>
         _budgetLocks.GetOrAdd(projectId.Value, _ => new SemaphoreSlim(1, 1));
+
+    internal static string QuotaRetryPhaseForDispatchState(WorkItemState state) => state switch
+    {
+        WorkItemState.WorkComplete or WorkItemState.Auditing or WorkItemState.Reworking => "audit",
+        WorkItemState.AuditPassed or WorkItemState.Merging => "merge",
+        WorkItemState.Merged or WorkItemState.UpstreamPushing => "upstream",
+        _ => "work",
+    };
 
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after

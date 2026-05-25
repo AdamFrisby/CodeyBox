@@ -344,6 +344,145 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaWaitParker_ResetFallbackFailureUsesDefaultPause()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var now = DateTimeOffset.UtcNow;
+        var time = new FixedClock(now);
+        var router = new AgentClassRouter(
+            [],
+            [],
+            new QuotaRouterOptions(),
+            NullLogger<AgentClassRouter>.Instance,
+            time);
+        var parker = new QuotaWaitParker(
+            store,
+            projects: new ThrowingProjectRepository(),
+            classRouter: router,
+            timeProvider: time);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p1"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await store.CreateAsync(item);
+
+        await parker.ParkAsync(new QuotaWaitParkRequest(
+            item,
+            "insufficient headroom",
+            "work",
+            QuotaResetAt: null,
+            Project: null));
+
+        var parked = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal(now.AddMinutes(5), parked.QuotaResetAt);
+        Assert.Equal(now.AddMinutes(5), parked.NextQuotaRetryAt);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete, "audit")]
+    [InlineData(WorkItemState.Auditing, "audit")]
+    [InlineData(WorkItemState.Reworking, "audit")]
+    [InlineData(WorkItemState.AuditPassed, "merge")]
+    [InlineData(WorkItemState.Merging, "merge")]
+    [InlineData(WorkItemState.Merged, "upstream")]
+    [InlineData(WorkItemState.UpstreamPushing, "upstream")]
+    public async Task OrchestratorService_QuotaDeferral_PreservesDispatchResumePhase(
+        WorkItemState state,
+        string expectedRetryFrom)
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var now = DateTimeOffset.UtcNow;
+        var time = new FixedClock(now);
+        var pid = new ProjectId("p1");
+        var resetAt = now.AddMinutes(30);
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = pid,
+            DisplayName = "p1",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Claude,
+            DefaultAgentClass = "test-class",
+        });
+        var classes = new List<AgentClass>
+        {
+            new AgentClass
+            {
+                Id = "test-class",
+                DisplayName = "Test",
+                Members =
+                [
+                    new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                ],
+            },
+        };
+        var router = new AgentClassRouter(
+            classes,
+            [new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 5, ResetAt = resetAt })],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, QuotaRecheckInterval = TimeSpan.FromMinutes(5) },
+            NullLogger<AgentClassRouter>.Instance,
+            time);
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var pipeline = new FakePipelineRunner(store);
+        var svc = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = pid,
+            Title = "phase resume",
+            Prompt = "p",
+            State = state,
+            WorkBranch = "codeybox/test",
+        };
+        await store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        try
+        {
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            WorkItem? parked = null;
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                parked = await store.GetAsync(item.Id);
+                if (parked?.State == WorkItemState.WaitingForQuotaReset)
+                    break;
+                await Task.Delay(20);
+            }
+
+            Assert.NotNull(parked);
+            Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+            Assert.Equal(expectedRetryFrom, parked.QuotaRetryFrom);
+            Assert.Equal(resetAt, parked.QuotaResetAt);
+            Assert.DoesNotContain(item.Id, pipeline.Executed);
+        }
+        finally
+        {
+            await svc.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task QuotaRetryScheduler_PeriodicSweep_ReEnqueuesWaitingForQuotaResetItem()
     {
         // The other half of the spec test case "all members exhausted → item
@@ -798,6 +937,15 @@ public sealed class WaitingForQuotaResetTests : IDisposable
             Notifications.Add(item);
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class ThrowingProjectRepository : IProjectRepository
+    {
+        public Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
+            => throw new InvalidOperationException("project lookup failed");
+
+        public Task<IReadOnlyList<Project>> ListAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Project>>([]);
     }
 
     private sealed class FixedClock : TimeProvider

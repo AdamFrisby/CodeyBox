@@ -4,8 +4,9 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Consolidates retry logic for terminal work items, ensuring consistent state
-/// transitions, audit logs, and side effects (e.g. stream summary deletion).
+/// Consolidates retry logic for terminal work items and parked quota items,
+/// ensuring consistent state transitions, audit logs, and side effects
+/// (e.g. stream summary deletion).
 /// </summary>
 public sealed class WorkItemRetrier
 {
