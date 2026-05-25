@@ -155,14 +155,11 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
-    public async Task PrepareSandboxScript_GuardsAgainstClobberingMountedAuthJson()
+    public async Task PrepareSandboxScript_PreservesExistingSandboxAuthJson()
     {
         // The materialisation script must short-circuit when auth.json is
-        // already non-empty inside the sandbox (i.e. provided by a bind-mount
-        // from the host). Writing the env-var snapshot on top of a mounted
-        // host file would clobber any refresh-token rotation the host has
-        // performed since the credential was read, re-introducing the
-        // refresh-token-reuse cascade the mount is supposed to prevent.
+        // already non-empty inside the sandbox. That preserves restored
+        // sandbox home state while still avoiding host credential mounts.
         var sandbox = new RecordingSandbox();
         var runner = new CodexAgentRunner();
 
@@ -190,7 +187,7 @@ public sealed class CodexAgentRunnerTests
         Assert.True(earlyExitIdx >= 0, "script must short-circuit when file is present (exit 0)");
         Assert.True(writeIdx >= 0, "script must still have a printf-from-env fallback");
         Assert.True(earlyExitIdx < writeIdx,
-            "early-exit guard must come before the env-var write so a mounted auth.json is preserved");
+            "early-exit guard must come before the env-var write so an existing auth.json is preserved");
     }
 
     private sealed class RecordingSandbox : ISandbox

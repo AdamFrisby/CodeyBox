@@ -226,6 +226,15 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ReturnsNullWhenAccessTokenFieldEmpty()
+    {
+        var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":""}}""");
+        var p = NewProvider(path);
+
+        Assert.Null(await p.GetAsync(AgentKind.Claude));
+    }
+
+    [Fact]
     public async Task ChainFallsThroughToEnvWhenFileAbsent()
     {
         Environment.SetEnvironmentVariable("CODEYBOX_CHAINED_TEST_KEY", "from-env");

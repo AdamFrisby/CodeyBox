@@ -80,15 +80,11 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task GetAsync_EmitsHostDirBindMountSoInVmRefreshPropagatesBackToHost()
+    public async Task GetAsync_DoesNotEmitHostCredentialMount()
     {
-        // The bug being fixed: previously we shipped only a snapshot of
-        // auth.json into the VM via env-var. The in-VM codex CLI refreshes
-        // tokens, but those refreshes land only in the VM. Every later sandbox
-        // boots with a stale snapshot, consumes the same refresh_token, and
-        // gets "refresh_token already used" → entire OAuth family invalidated.
-        // The fix is a bind-mount so the in-VM and host views are the same
-        // file; the orchestrator threads this mount through SandboxSpec.Mounts.
+        // The provider must not bind-mount the host .codex directory into an
+        // untrusted agent sandbox. CodexAgentRunner materialises a private
+        // auth.json snapshot from CODEX_AUTH_JSON instead.
         var authPath = Path.Combine(_workspace, "auth.json");
         await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"t\"}}");
         var provider = NewFileProvider(authPath);
@@ -96,26 +92,29 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
         var credential = await provider.GetAsync(AgentKind.Codex);
 
         Assert.NotNull(credential);
-        var mount = Assert.Single(credential!.Mounts);
-        Assert.Equal(_workspace, mount.HostPath);
-        Assert.Equal("/home/ubuntu/.codex", mount.SandboxPath);
-        Assert.False(mount.ReadOnly, "must be writable so in-VM refreshes land on host");
-        Assert.False(mount.Tmpfs, "must back to host fs, not a tmpfs that loses refresh on dispose");
+        Assert.Empty(credential!.Mounts);
     }
 
     [Fact]
     public async Task GetAsync_WhenHostDirMissing_OmitsBindMountButStillReturnsEnvVarCredential()
     {
-        // Defensive: if the host dir somehow doesn't exist (file present via
-        // exotic fs handling), don't fabricate a mount entry — fall back to
-        // env-var-only mode. The CredentialMaterialiser path still works.
-        var authPath = Path.Combine(_workspace, "auth.json");
+        // Exercise the stale-cache fallback: if the source has a valid cached
+        // auth.json but the host directory later disappears, the provider can
+        // still return the env-var credential without fabricating any mount.
+        var hostDir = Path.Combine(_workspace, "deleted-codex");
+        Directory.CreateDirectory(hostDir);
+        var authPath = Path.Combine(hostDir, "auth.json");
         await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"t\"}}");
-        var provider = NewFileProvider(authPath);
+        using var source = new CredentialFileSource(authPath, watch: false);
+        var provider = new CodexOAuthFileCredentialProvider(source);
+
+        Directory.Delete(hostDir, recursive: true);
+
         var credential = await provider.GetAsync(AgentKind.Codex);
+
         Assert.NotNull(credential);
-        // sanity: the env var path is unaffected by the new field
         Assert.NotEmpty(credential!.EnvironmentVariables["CODEX_AUTH_JSON"]);
+        Assert.Empty(credential.Mounts);
     }
 
     [Fact]

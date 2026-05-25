@@ -36,6 +36,7 @@ public sealed class CredentialFileTokenExtractorTests
 
     [Theory]
     [InlineData("not-json")]
+    [InlineData("""{"claudeAiOauth":{"accessToken":""}}""")]
     [InlineData("""{"claudeAiOauth":{"refreshToken":"rt-only"}}""")]
     [InlineData("""{"other":true}""")]
     public void ExtractClaudeAccessToken_ReturnsNullForMalformedOrMissingToken(string raw)
