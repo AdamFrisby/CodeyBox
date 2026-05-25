@@ -163,6 +163,11 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider, IDi
         }
     }
 
+    public static string? ExtractAccessToken(string? rawContents)
+        => TryBuildSanitisedBundle(rawContents, out var accessToken, out _)
+            ? accessToken
+            : null;
+
     private static string BuildSandboxBundle(JsonElement oauth, string token)
     {
         using var stream = new MemoryStream();

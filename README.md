@@ -100,6 +100,16 @@ See [`docs/`](docs/README.md) for the full write-up. **Read
 dotnet build CodeyBox.slnx
 ```
 
+## Test Host Prerequisites
+
+The test suite creates host-side file watchers for hot-reload and credential
+rotation coverage. On Linux CI hosts, set a higher inotify watch limit before
+running the full suite:
+
+```bash
+sudo sysctl fs.inotify.max_user_watches=524288
+```
+
 For managed projects, configure the audit language that matches the repo:
 `"Languages": ["python"]`, `"Languages": ["node"]`, or
 `"Languages": ["csharp"]` all use the same preset mechanism.

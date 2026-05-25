@@ -274,7 +274,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
 
         // Targeted timer runs in background Task.Run, so wait for state change
         var retried = await WaitForStateAsync(store, item.Id, WorkItemState.Queued, TimeSpan.FromSeconds(5));
-        
+
         Assert.NotNull(retried);
         Assert.Equal(WorkItemState.Queued, retried!.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);

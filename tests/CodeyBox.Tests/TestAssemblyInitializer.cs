@@ -28,9 +28,7 @@ internal static class TestAssemblyInitializer
 
         SetIfMissing("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing("ASPNETCORE_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
-        
-        // Robustly disable credential watchers via process-wide flag.
-        CredentialFileWatcherSettings.ForceDisabledForTests = true;
+        SetIfMissing(CredentialFileWatcherSettings.EnvironmentVariable, "false");
 
         TestFileSystemWatcherLeakTracker.Install();
 
