@@ -742,14 +742,40 @@ builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteAgentFallbackHistoryStore(cbOpts.StateDatabasePath);
 });
+// OAuth-refreshing quota-token sources. These wrap the raw credential file
+// sources with provider-specific refresh logic so an expired access_token is
+// re-minted via the provider's OAuth refresh endpoint before the probe sends
+// it. Without this, an expired token would 401, the snapshot would become
+// AvailablePct=-1, and the router's default UnknownPolicy=UseObservedFailures
+// would fall open onto an agent that immediately 429s. See
+// OauthCredentialFileRefresher.cs for the per-provider refresh contracts.
+builder.Services.AddSingleton<IClaudeQuotaTokenSource>(sp => new ClaudeOauthCredentialFileRefresher(
+    sp.GetRequiredService<ClaudeCredentialFileSource>(),
+    sp.GetRequiredService<IHttpClientFactory>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<ClaudeOauthCredentialFileRefresher>()));
+builder.Services.AddSingleton<ICodexQuotaTokenSource>(sp => new CodexOauthCredentialFileRefresher(
+    sp.GetRequiredService<CodexCredentialFileSource>(),
+    sp.GetRequiredService<IHttpClientFactory>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<CodexOauthCredentialFileRefresher>()));
+builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp => new GeminiOauthCredentialFileRefresher(
+    sp.GetRequiredService<GeminiOAuthCredentialFileSource>(),
+    sp.GetRequiredService<IHttpClientFactory>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<GeminiOauthCredentialFileRefresher>()));
+
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var source = sp.GetRequiredService<ClaudeCredentialFileSource>();
+    var tokenSource = sp.GetRequiredService<IClaudeQuotaTokenSource>();
     var probe = new ClaudeQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
+        // Sync-over-async is intentional and safe here: ASP.NET Core has no
+        // SynchronizationContext (no deadlock potential), the cache hit-path
+        // is fully synchronous, and only a stale-token miss blocks the thread
+        // on the OAuth refresh round-trip (bounded by the agent-quota client's
+        // 10s timeout).
         () => new AgentQuotaCredentials(
-            CredentialFileTokenExtractor.ExtractClaudeAccessToken(source.GetRaw())
+            tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<ClaudeQuotaProbe>());
@@ -760,11 +786,12 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var source = sp.GetRequiredService<CodexCredentialFileSource>();
+    var tokenSource = sp.GetRequiredService<ICodexQuotaTokenSource>();
     var probe = new CodexQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () =>
         {
-            var codexAuth = CredentialFileTokenExtractor.ExtractCodexAccessTokens(source.GetRaw());
+            var codexAuth = tokenSource.GetTokensAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult();
             return new AgentQuotaCredentials(
                 codexAuth.AccessToken ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
@@ -782,10 +809,11 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
+    var tokenSource = sp.GetRequiredService<IGeminiQuotaTokenSource>();
     var probe = new GeminiQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => new AgentQuotaCredentials(
-            CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
+            tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
