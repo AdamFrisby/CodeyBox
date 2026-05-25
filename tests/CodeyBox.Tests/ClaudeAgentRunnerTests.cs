@@ -291,6 +291,112 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Same(sandbox, pusher.RegisterCalls[0]);
         Assert.Equal(1, pusher.DisposedCount);
     }
+
+    // ── GetTextOnlyUnavailabilityReason ───────────────────────────────────────
+    //
+    // The rebase-resolver router calls this BEFORE invoking RunTextOnlyAsync, so
+    // a divergence between the two (e.g. `&&` flipped to `||`, or one path
+    // checking a renamed env var) would silently route past Claude even when
+    // its credential is valid, OR pick Claude with no credential and fail at
+    // call-time with the misleading-error shape the routing fix was supposed
+    // to eliminate. These tests pin the credential-check contract.
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_NullCredential_ReturnsReason()
+    {
+        var runner = new ClaudeAgentRunner();
+        var reason = runner.GetTextOnlyUnavailabilityReason(credential: null);
+        Assert.Equal("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required", reason);
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_EmptyEnvironment_ReturnsReason()
+    {
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+
+        Assert.Equal("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_OAuthTokenPresent_ReturnsNull()
+    {
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string> { ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-oauth" },
+            new Dictionary<string, string>());
+
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_ApiKeyPresent_ReturnsNull()
+    {
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-api" },
+            new Dictionary<string, string>());
+
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_BothCredentialsPresent_ReturnsNull()
+    {
+        // Guards against an accidental `&&` → `||` flip: with both set, the
+        // OR-shape contract says viable. With AND, both-present would also be
+        // viable, so this case alone doesn't catch the flip — paired with the
+        // single-credential tests above it does.
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string>
+            {
+                ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-oauth",
+                ["ANTHROPIC_API_KEY"] = "sk-api",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_EmptyStringValues_TreatedAsAbsent()
+    {
+        // Operators sometimes export `FOO=` to clear an inherited env var;
+        // the probe must treat empty strings as absent, not as present-and-blank.
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string>
+            {
+                ["CLAUDE_CODE_OAUTH_TOKEN"] = "",
+                ["ANTHROPIC_API_KEY"] = "",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Equal("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public async Task GetTextOnlyUnavailabilityReason_AgreesWithRunTextOnlyAsync_OnMissingCredentials()
+    {
+        // The probe (used by the router) and RunTextOnlyAsync (used at call
+        // time) must agree on what 'viable' means — otherwise the router can
+        // pick Claude as viable and then RunTextOnlyAsync rejects the same
+        // credential, reproducing the original misleading-error bug shape.
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+
+        Assert.NotNull(runner.GetTextOnlyUnavailabilityReason(cred));
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+        Assert.False(result.Success);
+        Assert.Contains("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY", result.Error);
+    }
 }
 
 internal sealed class RecordingRotationPusher : IClaudeTokenRotationPusher

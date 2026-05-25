@@ -208,6 +208,17 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? reasoningMode = null)
         => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: true, captureStructuredStream: false);
 
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+    {
+        string? oauthToken = null;
+        string? apiKey = null;
+        credential?.EnvironmentVariables.TryGetValue("CLAUDE_CODE_OAUTH_TOKEN", out oauthToken);
+        credential?.EnvironmentVariables.TryGetValue("ANTHROPIC_API_KEY", out apiKey);
+        return string.IsNullOrEmpty(oauthToken) && string.IsNullOrEmpty(apiKey)
+            ? "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required"
+            : null;
+    }
+
     public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,

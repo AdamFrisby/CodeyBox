@@ -254,6 +254,92 @@ public sealed class GeminiAgentRunnerTests
         Assert.Equal("Progress: done", result.Stderr);
     }
 
+    // ── GetTextOnlyUnavailabilityReason ───────────────────────────────────────
+    //
+    // The rebase-resolver router consults the probe before RunTextOnlyAsync,
+    // so they must agree on what 'viable' means. A typo in the env-var name
+    // (e.g. "GEMINI_KEY" instead of "GEMINI_API_KEY") would silently
+    // misclassify every OAuth-only operator setup — which is exactly the
+    // configuration the routing fix exists to handle.
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_NullCredential_ReturnsReason()
+    {
+        var runner = new GeminiAgentRunner();
+        Assert.Equal("GEMINI_API_KEY is required",
+            runner.GetTextOnlyUnavailabilityReason(credential: null));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_EmptyEnvironment_ReturnsReason()
+    {
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+
+        Assert.Equal("GEMINI_API_KEY is required",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_OAuthOnlyCredentials_ReturnsReason()
+    {
+        // The bug shape this fix exists to fix: operator has OAuth-only
+        // (CODEYBOX_GEMINI_OAUTH_FILE → mounted into sandbox) but no API key.
+        // The probe must mark Gemini as unavailable so the router walks past
+        // it to Claude/Codex.
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string>
+            {
+                ["GEMINI_OAUTH_TOKEN"] = "ya29.placeholder",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Equal("GEMINI_API_KEY is required",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_ApiKeyPresent_ReturnsNull()
+    {
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string> { ["GEMINI_API_KEY"] = "AIzaSyTest" },
+            new Dictionary<string, string>());
+
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_EmptyApiKey_ReturnsReason()
+    {
+        // Empty-string export (`GEMINI_API_KEY=`) must be treated as absent,
+        // matching RunTextOnlyAsync's IsNullOrEmpty check.
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string> { ["GEMINI_API_KEY"] = "" },
+            new Dictionary<string, string>());
+
+        Assert.Equal("GEMINI_API_KEY is required",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public async Task GetTextOnlyUnavailabilityReason_AgreesWithRunTextOnlyAsync_OnMissingCredentials()
+    {
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+
+        Assert.NotNull(runner.GetTextOnlyUnavailabilityReason(cred));
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+        Assert.False(result.Success);
+        Assert.Contains("GEMINI_API_KEY", result.Error);
+    }
+
     // ── Credential provider ───────────────────────────────────────────────────
 
     [Fact]

@@ -363,6 +363,34 @@ public static class AuditLog
                 "LLM auditor '{AuditorName}' skipped for {WorkItemId}: all {CandidateCount} candidate agent(s) quota-exhausted",
                 auditorName, workItemId.ToString(), candidateCount);
 
+    /// <summary>
+    /// Emitted when the pickup-time rebase resolver routed past a runner whose
+    /// text-only credentials are missing. <paramref name="rejectedAgent"/> is
+    /// the agent the work item's currently-selected runner would have used;
+    /// <paramref name="chosenAgent"/> is the class-chain member that took over.
+    /// </summary>
+    public static void RebaseResolverAgentRerouted(
+        AgentKind rejectedAgent, AgentKind chosenAgent, string reason) =>
+        Audit("rebase_resolver.rerouted")
+            .Information(
+                "Pickup-time rebase resolver rerouted from '{RejectedAgent}' to class member '{ChosenAgent}' ({Reason})",
+                rejectedAgent.Value, chosenAgent.Value, reason);
+
+    /// <summary>
+    /// Emitted when every candidate (item's currently-selected runner + class
+    /// chain) lacked a viable text-only credential, so the pickup-time rebase
+    /// resolver could not run at all. The work item is failed with
+    /// <c>failureKind=agent_unavailable</c>; distinct from
+    /// <c>rebase_resolver.unresolved</c> (the resolver ran but produced an
+    /// unmergeable answer).
+    /// </summary>
+    public static void RebaseResolverAgentUnavailable(
+        WorkItemId workItemId, string candidateReasons) =>
+        Audit("rebase_resolver.agent_unavailable")
+            .Warning(
+                "Pickup-time rebase resolver could not run for {WorkItemId}: no text-only-capable agent had viable credentials ({CandidateReasons})",
+                workItemId.ToString(), candidateReasons);
+
     public static void AuditIterationComplete(int iteration, int maxIterations, int blockingCount, int nonBlockingCount) =>
         Audit("audit.iteration_complete")
             .Information("Audit iteration {Iteration}/{MaxIterations}: blocking={BlockingCount} non-blocking={NonBlockingCount}",

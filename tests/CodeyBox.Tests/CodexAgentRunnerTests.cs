@@ -5,6 +5,109 @@ namespace CodeyBox.Tests;
 
 public sealed class CodexAgentRunnerTests
 {
+    // ── GetTextOnlyUnavailabilityReason ───────────────────────────────────────
+    //
+    // The rebase-resolver router consults the probe BEFORE invoking
+    // RunTextOnlyAsync. The two must agree on what 'viable' means, including
+    // the CODEX_AUTH_JSON fallback path (when the env var carries the parsed
+    // OAuth blob with an OPENAI_API_KEY field). A drift here would either
+    // misroute past Codex when it would in fact work, or pick Codex and then
+    // fail at call-time with the misleading-error bug-shape the routing fix
+    // was supposed to eliminate.
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_NullCredential_ReturnsReason()
+    {
+        var runner = new CodexAgentRunner();
+        Assert.Equal("OPENAI_API_KEY is required for text-only calls",
+            runner.GetTextOnlyUnavailabilityReason(credential: null));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_EmptyEnvironment_ReturnsReason()
+    {
+        var runner = new CodexAgentRunner();
+        var cred = new AgentCredential(AgentKind.Codex,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+
+        Assert.Equal("OPENAI_API_KEY is required for text-only calls",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_OpenAiApiKeyPresent_ReturnsNull()
+    {
+        var runner = new CodexAgentRunner();
+        var cred = new AgentCredential(AgentKind.Codex,
+            new Dictionary<string, string> { ["OPENAI_API_KEY"] = "sk-openai" },
+            new Dictionary<string, string>());
+
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_CodexAuthJsonWithEmbeddedKey_ReturnsNull()
+    {
+        // Operators with OAuth-only setups inject the parsed auth blob via
+        // CODEX_AUTH_JSON. When the blob carries an OPENAI_API_KEY, the probe
+        // must report viable — otherwise the router silently routes past
+        // Codex in a configuration where it would in fact serve.
+        var runner = new CodexAgentRunner();
+        var cred = new AgentCredential(AgentKind.Codex,
+            new Dictionary<string, string>
+            {
+                ["CODEX_AUTH_JSON"] = """{"OPENAI_API_KEY":"sk-from-oauth"}""",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_CodexAuthJsonWithoutKey_ReturnsReason()
+    {
+        // Per the original task, Codex-OAuth-only-with-no-API-key is out of
+        // scope of this fix — the auth JSON without a usable OPENAI_API_KEY
+        // does NOT count as text-only viable. Locks in the documented gap.
+        var runner = new CodexAgentRunner();
+        var cred = new AgentCredential(AgentKind.Codex,
+            new Dictionary<string, string>
+            {
+                ["CODEX_AUTH_JSON"] = """{"tokens":{"access_token":"abc"}}""",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Equal("OPENAI_API_KEY is required for text-only calls",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_CodexAuthJsonInvalidJson_ReturnsReason()
+    {
+        var runner = new CodexAgentRunner();
+        var cred = new AgentCredential(AgentKind.Codex,
+            new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = "not json" },
+            new Dictionary<string, string>());
+
+        Assert.Equal("OPENAI_API_KEY is required for text-only calls",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public async Task GetTextOnlyUnavailabilityReason_AgreesWithRunTextOnlyAsync_OnMissingCredentials()
+    {
+        var runner = new CodexAgentRunner();
+        var cred = new AgentCredential(AgentKind.Codex,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+
+        Assert.NotNull(runner.GetTextOnlyUnavailabilityReason(cred));
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+        Assert.False(result.Success);
+        Assert.Contains("OPENAI_API_KEY", result.Error);
+    }
+
     [Fact]
     public async Task RunResumedAsync_MaterialisesAuthBeforeInvokingCodex()
     {

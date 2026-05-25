@@ -139,6 +139,13 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         return new AgentInvocation(argv, Stdin: prompt);
     }
 
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+    {
+        string? apiKey = null;
+        credential?.EnvironmentVariables.TryGetValue("GEMINI_API_KEY", out apiKey);
+        return string.IsNullOrEmpty(apiKey) ? "GEMINI_API_KEY is required" : null;
+    }
+
     public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
