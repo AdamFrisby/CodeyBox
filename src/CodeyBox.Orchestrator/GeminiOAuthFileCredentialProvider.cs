@@ -1,4 +1,3 @@
-using System.Text.Json;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
 
@@ -114,25 +113,4 @@ public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider, IDi
           }
         }
         """;
-
-    public static string? ExtractAccessToken(string? rawContents)
-    {
-        if (string.IsNullOrWhiteSpace(rawContents))
-            return null;
-
-        try
-        {
-            using var doc = JsonDocument.Parse(rawContents);
-            if (doc.RootElement.TryGetProperty("access_token", out var token) &&
-                token.ValueKind == JsonValueKind.String)
-            {
-                return token.GetString();
-            }
-        }
-        catch (JsonException)
-        {
-        }
-
-        return null;
-    }
 }

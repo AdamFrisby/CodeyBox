@@ -114,41 +114,6 @@ public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider, IDis
     /// </summary>
     internal const string CodexHomeSandboxPath = "/home/ubuntu/.codex";
 
-    public static (string? AccessToken, string? AccountId) ExtractAccessTokens(string? raw)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return (null, null);
-
-        try
-        {
-            using var doc = JsonDocument.Parse(raw);
-            return ExtractAccessTokens(doc.RootElement);
-        }
-        catch (JsonException)
-        {
-            return (null, null);
-        }
-    }
-
-    internal static (string? AccessToken, string? AccountId) ExtractAccessTokens(JsonElement root)
-    {
-        if (root.ValueKind != JsonValueKind.Object ||
-            !root.TryGetProperty("tokens", out var tokens) ||
-            tokens.ValueKind != JsonValueKind.Object)
-        {
-            return (null, null);
-        }
-
-        var accessToken = tokens.TryGetProperty("access_token", out var token) &&
-            token.ValueKind == JsonValueKind.String
-                ? token.GetString()
-                : null;
-        var accountId = tokens.TryGetProperty("account_id", out var account) &&
-            account.ValueKind == JsonValueKind.String
-                ? account.GetString()
-                : null;
-        return (accessToken, accountId);
-    }
 }
 
 /// <summary>
@@ -205,7 +170,7 @@ internal static class CodexAuthJsonCredential
         try
         {
             using var doc = JsonDocument.Parse(raw);
-            var tokens = CodexOAuthFileCredentialProvider.ExtractAccessTokens(doc.RootElement);
+            var tokens = CredentialFileTokenExtractor.ExtractCodexAccessTokens(doc.RootElement);
             var hasTokens = !string.IsNullOrEmpty(tokens.AccessToken);
             var hasApiKey = doc.RootElement.ValueKind == JsonValueKind.Object
                 && doc.RootElement.TryGetProperty("OPENAI_API_KEY", out var k)

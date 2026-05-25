@@ -248,7 +248,7 @@ public class CredentialFileSource : IDisposable
         if (!Directory.Exists(dir))
         {
             _log?.LogDebug(
-                "Credential file directory {Dir} does not exist; deferring file watching until GetRaw is called",
+                "Credential file directory {Dir} does not exist; relying on stat-based reload until process restart",
                 dir);
             return;
         }

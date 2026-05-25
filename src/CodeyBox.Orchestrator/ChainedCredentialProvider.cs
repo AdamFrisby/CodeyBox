@@ -309,12 +309,6 @@ public sealed class ChainedCredentialProvider : IProjectAwareCredentialProvider,
             foreach (var s in _priorityFetchLocks.Values) s.Dispose();
             _fetchLocks.Clear();
             _priorityFetchLocks.Clear();
-
-            // Cascade disposal to any provider that owns a watcher (CredentialFileSource).
-            foreach (var provider in _providers)
-            {
-                if (provider is IDisposable d) d.Dispose();
-            }
         }
     }
 }

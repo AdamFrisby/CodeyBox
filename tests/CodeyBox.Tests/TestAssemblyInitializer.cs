@@ -20,6 +20,9 @@ namespace CodeyBox.Tests;
 /// </summary>
 internal static class TestAssemblyInitializer
 {
+    private const long RecommendedInotifyMaxUserWatches = 524_288;
+    private const long RecommendedInotifyMaxUserInstances = 1_024;
+
     [ModuleInitializer]
     public static void Init()
     {
@@ -29,6 +32,8 @@ internal static class TestAssemblyInitializer
         SetIfMissing("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing("ASPNETCORE_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing(CredentialFileWatcherSettings.EnvironmentVariable, "false");
+
+        WarnOnLowInotifyLimits(Console.Error);
 
         TestFileSystemWatcherLeakTracker.Install();
 
@@ -42,6 +47,53 @@ internal static class TestAssemblyInitializer
     {
         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(name)))
             Environment.SetEnvironmentVariable(name, value);
+    }
+
+    internal static void WarnOnLowInotifyLimits(TextWriter writer)
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        WarnIfLow(
+            "/proc/sys/fs/inotify/max_user_watches",
+            "fs.inotify.max_user_watches",
+            RecommendedInotifyMaxUserWatches,
+            "sudo sysctl fs.inotify.max_user_watches=524288",
+            writer);
+        WarnIfLow(
+            "/proc/sys/fs/inotify/max_user_instances",
+            "fs.inotify.max_user_instances",
+            RecommendedInotifyMaxUserInstances,
+            "sudo sysctl fs.inotify.max_user_instances=1024",
+            writer);
+    }
+
+    private static void WarnIfLow(
+        string path,
+        string sysctlName,
+        long recommended,
+        string command,
+        TextWriter writer)
+    {
+        try
+        {
+            if (!File.Exists(path))
+                return;
+
+            var raw = File.ReadAllText(path).Trim();
+            if (!long.TryParse(raw, out var current) || current >= recommended)
+                return;
+
+            writer.WriteLine(
+                $"warning: {sysctlName} is {current}; CodeyBox full-suite tests can exhaust file watchers at low Linux defaults. " +
+                $"Run `{command}` before `dotnet test CodeyBox.slnx`.");
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 }
 

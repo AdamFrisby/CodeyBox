@@ -92,7 +92,7 @@ public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDis
     internal async Task PushToAllAsync(CancellationToken ct = default)
     {
         var raw = _source.GetRaw();
-        if (!ClaudeOAuthFileCredentialProvider.TryBuildSanitisedBundle(raw, out _, out var bundle))
+        if (!CredentialFileTokenExtractor.TryBuildClaudeSanitisedBundle(raw, out _, out var bundle))
         {
             _log?.LogWarning(
                 "Claude credentials file rotated but did not parse into a sanitised bundle; skipping VM push");

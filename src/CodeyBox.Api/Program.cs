@@ -498,10 +498,10 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 //    from a JSON file (default ~/.claude/.credentials.json, the path the
 //    local `claude` CLI refreshes in-place) on every pickup, so a host-side
 //    token rotation is picked up without an orchestrator restart. The
-//    provider ships the full creds JSON (including refresh_token) to the
-//    sandbox via CODEYBOX_CLAUDE_OAUTH_JSON so ClaudeAgentRunner can
-//    materialise it inside the VM — the in-VM CLI then auto-rotates instead
-//    of 401-ing when the host rotates the access_token mid-run.
+//    provider ships a sanitised creds JSON bundle (access token and expiry
+//    only; no refresh_token) to the sandbox via CODEYBOX_CLAUDE_OAUTH_JSON
+//    so ClaudeAgentRunner can materialise it inside the VM without racing the
+//    host-side CLI's single-use refresh token.
 // 2. Plugin ICredentialProvider implementations — inserted in discovery order
 //    (between OAuth-file and env-var). Vault-issued short-lived credentials
 //    are preferred over env-var fallbacks. Per-project ordering is expressed
@@ -749,7 +749,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     var probe = new ClaudeQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => new AgentQuotaCredentials(
-            ClaudeOAuthFileCredentialProvider.ExtractAccessToken(source.GetRaw())
+            CredentialFileTokenExtractor.ExtractClaudeAccessToken(source.GetRaw())
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<ClaudeQuotaProbe>());
@@ -764,7 +764,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         sp.GetRequiredService<IHttpClientFactory>(),
         () =>
         {
-            var codexAuth = CodexOAuthFileCredentialProvider.ExtractAccessTokens(source.GetRaw());
+            var codexAuth = CredentialFileTokenExtractor.ExtractCodexAccessTokens(source.GetRaw());
             return new AgentQuotaCredentials(
                 codexAuth.AccessToken ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
@@ -785,7 +785,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     var probe = new GeminiQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => new AgentQuotaCredentials(
-            GeminiOAuthFileCredentialProvider.ExtractAccessToken(source.GetRaw())
+            CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
@@ -844,7 +844,7 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
     return new ClaudeModelListProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => (
-            ClaudeOAuthFileCredentialProvider.ExtractAccessToken(source.GetRaw()),
+            CredentialFileTokenExtractor.ExtractClaudeAccessToken(source.GetRaw()),
             Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         loggerFactory.CreateLogger<ClaudeModelListProbe>());
@@ -857,7 +857,7 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
         sp.GetRequiredService<IHttpClientFactory>(),
         () =>
         {
-            var codexAuth = CodexOAuthFileCredentialProvider.ExtractAccessTokens(source.GetRaw());
+            var codexAuth = CredentialFileTokenExtractor.ExtractCodexAccessTokens(source.GetRaw());
             return (
                 codexAuth.AccessToken,
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"),
@@ -873,7 +873,7 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
     return new GeminiModelListProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         () => (
-            GeminiOAuthFileCredentialProvider.ExtractAccessToken(source.GetRaw())
+            CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN"),
             Environment.GetEnvironmentVariable("GEMINI_API_KEY")
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY")),

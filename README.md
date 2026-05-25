@@ -108,7 +108,11 @@ running the full suite:
 
 ```bash
 sudo sysctl fs.inotify.max_user_watches=524288
+sudo sysctl fs.inotify.max_user_instances=1024
 ```
+
+The test assembly also prints this guidance at startup when it detects lower
+Linux inotify limits.
 
 For managed projects, configure the audit language that matches the repo:
 `"Languages": ["python"]`, `"Languages": ["node"]`, or

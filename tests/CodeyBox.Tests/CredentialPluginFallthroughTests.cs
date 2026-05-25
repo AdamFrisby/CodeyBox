@@ -115,7 +115,7 @@ public sealed class CredentialPluginFallthroughTests
     }
 
     [Fact]
-    public void Dispose_DisposesDisposableProvidersInChain()
+    public void Dispose_DoesNotDisposeExternallySuppliedProviders()
     {
         var first = new DisposableProvider();
         var second = new DisposableProvider();
@@ -124,8 +124,8 @@ public sealed class CredentialPluginFallthroughTests
         chain.Dispose();
         chain.Dispose();
 
-        Assert.Equal(1, first.DisposeCount);
-        Assert.Equal(1, second.DisposeCount);
+        Assert.Equal(0, first.DisposeCount);
+        Assert.Equal(0, second.DisposeCount);
     }
 
     // ── Fakes ────────────────────────────────────────────────────────────────
