@@ -152,7 +152,7 @@ internal sealed class DetailFakeClient : ICodeyBoxApiClient
     public Task<WorkItemDto?> CreateWorkItemAsync(CreateWorkItemRequest req, CancellationToken ct = default) => Task.FromResult<WorkItemDto?>(null);
     public Task<WorkItemDto?> PatchWorkItemAsync(string id, PatchWorkItemRequest req, CancellationToken ct = default) => Task.FromResult<WorkItemDto?>(null);
     public Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default) => Task.FromResult(false);
-    public Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default) => Task.FromResult(false);
+    public Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default) => Task.FromResult(false);
     public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default) => Task.FromResult(false);
     public Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default) => Task.FromResult<QueueStatusDto?>(null);
     public Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default) => Task.FromResult<QueueStatusDto?>(null);
@@ -231,7 +231,7 @@ internal sealed class DetailCapturingClient : ICodeyBoxApiClient
     public Task<WorkItemDto?> CreateWorkItemAsync(CreateWorkItemRequest req, CancellationToken ct = default) => Task.FromResult<WorkItemDto?>(null);
     public Task<WorkItemDto?> PatchWorkItemAsync(string id, PatchWorkItemRequest req, CancellationToken ct = default) => Task.FromResult<WorkItemDto?>(null);
     public Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default) => Task.FromResult(false);
-    public Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default) => Task.FromResult(false);
+    public Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default) => Task.FromResult(false);
     public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default) => Task.FromResult(false);
     public Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default) => Task.FromResult<QueueStatusDto?>(null);
     public Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default) => Task.FromResult<QueueStatusDto?>(null);

@@ -64,14 +64,17 @@ internal sealed class CodeyBoxClient
         await EnsureSuccessAsync(resp, ct);
     }
 
-    internal async Task<WorkItemDto> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default)
+    internal async Task<WorkItemDto> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)
     {
-        var req = new RetryRequest { From = from };
-        var resp = await _http.PostAsJsonAsync(
-            $"/workitems/{Uri.EscapeDataString(id)}/retry",
-            req,
-            CliJsonContext.Default.RetryRequest,
-            ct);
+        var path = $"/workitems/{Uri.EscapeDataString(id)}/retry";
+        var requestedFrom = string.IsNullOrWhiteSpace(from) ? null : from;
+        var resp = requestedFrom is null
+            ? await _http.PostAsync(path, content: null, ct)
+            : await _http.PostAsJsonAsync(
+                path,
+                new RetryRequest { From = requestedFrom },
+                CliJsonContext.Default.RetryRequest,
+                ct);
         await EnsureSuccessAsync(resp, ct);
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }

@@ -14,6 +14,7 @@ public sealed class WorkItemRetrier
     private readonly IGitHost _gitHost;
     private readonly IAgentStreamSummaryStore? _streamSummaries;
     private readonly IAuditReportStore? _auditReports;
+    private readonly IProjectRepository? _projects;
     private readonly ILogger<WorkItemRetrier> _log;
 
     public WorkItemRetrier(
@@ -22,19 +23,21 @@ public sealed class WorkItemRetrier
         IGitHost gitHost,
         ILogger<WorkItemRetrier> log,
         IAgentStreamSummaryStore? streamSummaries = null,
-        IAuditReportStore? auditReports = null)
+        IAuditReportStore? auditReports = null,
+        IProjectRepository? projects = null)
     {
         _store = store;
         _queue = queue;
         _gitHost = gitHost;
         _streamSummaries = streamSummaries;
         _auditReports = auditReports;
+        _projects = projects;
         _log = log;
     }
 
     public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom)> RetryAsync(
         WorkItem item,
-        string? from = "work",
+        string? from = null,
         string trigger = "manual",
         CancellationToken ct = default)
     {
@@ -134,10 +137,9 @@ public sealed class WorkItemRetrier
     /// so the existing tip is re-audited (and merged if it passes, reworked if
     /// it doesn't) rather than discarded.
     ///
-    /// Returns <c>("work", reason)</c> on any error or when the branch state
-    /// can't be determined — that preserves the prior default behavior for
-    /// any code path that hits an edge case (missing repo, missing branch,
-    /// invalid branch name).
+    /// Returns <c>("work", reason)</c> only for expected "nothing to audit"
+    /// states such as a missing work branch. Unexpected probe failures are
+    /// allowed to abort the retry so we do not silently discard prior work.
     /// </summary>
     private async Task<(string From, string Reason)> AutoPickRetryFromAsync(
         WorkItem item,
@@ -163,34 +165,26 @@ public sealed class WorkItemRetrier
         if (!branchPresent)
             return ("work", "work branch missing");
 
-        // Resolve the base branch the work branch was opened against. Items
-        // without a per-item override use the bare repo's default branch (the
-        // pipeline seeds this from the project repo at clone time).
-        string baseBranch;
-        try
+        var baseBranch = await ResolveBaseBranchAsync(item, repoId, ct);
+        var ahead = await _gitHost.BranchHasCommitsAheadAsync(repoId, baseBranch, workBranch, ct);
+        return ahead
+            ? ("audit", "work branch has prior commits ahead of base")
+            : ("work", "work branch has no commits ahead of base");
+    }
+
+    private async Task<string> ResolveBaseBranchAsync(WorkItem item, string repoId, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(item.BaseBranch))
+            return item.BaseBranch!;
+
+        if (_projects is not null)
         {
-            baseBranch = !string.IsNullOrEmpty(item.BaseBranch)
-                ? item.BaseBranch!
-                : await _gitHost.GetDefaultBranchAsync(repoId, ct);
-        }
-        catch (Exception ex)
-        {
-            _log.LogDebug(ex, "Auto-pick: failed to resolve base branch for {Id}; defaulting to from=work", item.Id);
-            return ("work", "base branch unresolved");
+            var project = await _projects.GetAsync(item.ProjectId, ct);
+            if (!string.IsNullOrWhiteSpace(project?.DefaultBaseBranch))
+                return project.DefaultBaseBranch!;
         }
 
-        try
-        {
-            var ahead = await _gitHost.BranchHasCommitsAheadAsync(repoId, baseBranch, workBranch, ct);
-            return ahead
-                ? ("audit", "work branch has prior commits ahead of base")
-                : ("work", "work branch has no commits ahead of base");
-        }
-        catch (Exception ex)
-        {
-            _log.LogDebug(ex, "Auto-pick: failed to compute commits-ahead for {Id}; defaulting to from=work", item.Id);
-            return ("work", "commits-ahead probe failed");
-        }
+        return await _gitHost.GetDefaultBranchAsync(repoId, ct);
     }
 
     /// <summary>

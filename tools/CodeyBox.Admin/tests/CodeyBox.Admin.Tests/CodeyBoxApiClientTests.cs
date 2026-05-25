@@ -179,6 +179,16 @@ public sealed class CodeyBoxApiClientTests
     }
 
     [Fact]
+    public async Task RetryWorkItemAsync_WithoutFrom_PostsNoBody()
+    {
+        var (client, handler) = Build("{}", HttpStatusCode.Accepted);
+        await client.RetryWorkItemAsync("id1");
+        Assert.Equal(HttpMethod.Post, handler.LastMethod);
+        Assert.Equal("/workitems/id1/retry", handler.LastPath);
+        Assert.Null(handler.LastBody);
+    }
+
+    [Fact]
     public async Task ReorderWorkItemsAsync_PostsToReorderEndpoint()
     {
         var (client, handler) = Build("{}", HttpStatusCode.NoContent);

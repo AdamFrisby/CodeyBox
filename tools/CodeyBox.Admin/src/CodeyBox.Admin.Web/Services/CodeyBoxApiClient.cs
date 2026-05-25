@@ -63,12 +63,13 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return resp.IsSuccessStatusCode;
     }
 
-    public async Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default)
+    public async Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsJsonAsync(
-            $"/workitems/{Uri.EscapeDataString(id)}/retry",
-            new { From = from },
-            JsonOptions, ct);
+        var path = $"/workitems/{Uri.EscapeDataString(id)}/retry";
+        var requestedFrom = string.IsNullOrWhiteSpace(from) ? null : from;
+        var resp = requestedFrom is null
+            ? await _http.PostAsync(path, content: null, ct)
+            : await _http.PostAsJsonAsync(path, new { From = requestedFrom }, JsonOptions, ct);
         return resp.IsSuccessStatusCode;
     }
 

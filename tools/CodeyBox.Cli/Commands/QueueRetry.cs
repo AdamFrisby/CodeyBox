@@ -14,7 +14,7 @@ internal static class QueueRetry
         var cmd = new Command("retry", "Retry a failed work item");
 
         var idArg = new Argument<string>("id", "Work item ID");
-        var fromOpt = new Option<string>("--from", () => "work", "Retry from phase: work, audit, merge, or upstream");
+        var fromOpt = new Option<string?>("--from", "Retry from phase: work, audit, merge, or upstream");
 
         cmd.AddArgument(idArg);
         cmd.AddOption(fromOpt);
@@ -24,12 +24,12 @@ internal static class QueueRetry
             var ct = ctx.GetCancellationToken();
 
             var id = ctx.ParseResult.GetValueForArgument(idArg);
-            var from = ctx.ParseResult.GetValueForOption(fromOpt)!;
+            var from = ctx.ParseResult.GetValueForOption(fromOpt);
             var flagUrl = ctx.ParseResult.GetValueForOption(apiUrlOpt);
             var flagKey = ctx.ParseResult.GetValueForOption(apiKeyOpt);
 
             string[] validFromValues = ["work", "audit", "merge", "upstream"];
-            if (!validFromValues.Contains(from, StringComparer.OrdinalIgnoreCase))
+            if (!string.IsNullOrWhiteSpace(from) && !validFromValues.Contains(from, StringComparer.OrdinalIgnoreCase))
             {
                 await Console.Error.WriteLineAsync(
                     $"Error: --from must be one of: work, audit, merge, upstream (got '{from}').");
@@ -50,8 +50,9 @@ internal static class QueueRetry
 
             try
             {
-                var item = await client.RetryWorkItemAsync(id, from, ct);
-                Console.WriteLine($"Retrying {item.Id} from '{from}' — state: {item.State}");
+                var requestedFrom = string.IsNullOrWhiteSpace(from) ? null : from;
+                var item = await client.RetryWorkItemAsync(id, requestedFrom, ct);
+                Console.WriteLine($"Retrying {item.Id} from '{requestedFrom ?? "auto"}' — state: {item.State}");
             }
             catch (CodeyBoxApiException ex)
             {

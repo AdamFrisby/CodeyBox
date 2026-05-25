@@ -1250,7 +1250,8 @@ builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
     sp.GetRequiredService<IGitHost>(),
     sp.GetRequiredService<ILogger<WorkItemRetrier>>(),
     sp.GetRequiredService<IAgentStreamSummaryStore>(),
-    sp.GetService<IAuditReportStore>()));
+    sp.GetService<IAuditReportStore>(),
+    sp.GetRequiredService<IProjectRepository>()));
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),

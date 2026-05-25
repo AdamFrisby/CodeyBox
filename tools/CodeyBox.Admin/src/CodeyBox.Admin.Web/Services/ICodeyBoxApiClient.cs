@@ -15,7 +15,7 @@ public interface ICodeyBoxApiClient
     Task<WorkItemDto?> CreateWorkItemAsync(CreateWorkItemRequest req, CancellationToken ct = default);
     Task<WorkItemDto?> PatchWorkItemAsync(string id, PatchWorkItemRequest req, CancellationToken ct = default);
     Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default);
-    Task<bool> RetryWorkItemAsync(string id, string from = "work", CancellationToken ct = default);
+    Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default);
     Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default);
 
     // ── Queue control ─────────────────────────────────────────────────────────
