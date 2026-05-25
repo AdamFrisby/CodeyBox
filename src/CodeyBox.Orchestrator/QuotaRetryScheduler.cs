@@ -89,19 +89,37 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         {
             if (item.FailureKind == "quota" && item.NextQuotaRetryAt.HasValue)
             {
-                await RearmTimerAsync(item, ct);
-                count++;
+                if (await TryRearmTimerAsync(item, ct))
+                    count++;
             }
         }
         await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
         {
             if (item.NextQuotaRetryAt.HasValue)
             {
-                await RearmTimerAsync(item, ct);
-                count++;
+                if (await TryRearmTimerAsync(item, ct))
+                    count++;
             }
         }
         _log.LogInformation("Re-armed {Count} quota retry timers", count);
+    }
+
+    private async Task<bool> TryRearmTimerAsync(WorkItem item, CancellationToken ct)
+    {
+        try
+        {
+            await RearmTimerAsync(item, ct);
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error re-arming quota retry timer for work item {Id}; continuing startup sweep", item.Id);
+            return false;
+        }
     }
 
     private async Task RearmTimerAsync(WorkItem item, CancellationToken ct)
