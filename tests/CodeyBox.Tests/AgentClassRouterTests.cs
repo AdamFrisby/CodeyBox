@@ -182,6 +182,56 @@ public sealed class AgentClassRouterTests
         Assert.False(decision.ShouldWait);
     }
 
+    [Fact]
+    public async Task InsufficientHeadroom_UsesProbeResetForSuggestedRetryAt()
+    {
+        var resetAt = DateTimeOffset.UtcNow.AddHours(2);
+        var cls = FrontierClass(Sub(Claude));
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 15.0, ResetAt = resetAt })],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new FixedHeadroomEstimator(10.0));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.True(decision.ShouldWait);
+        Assert.Equal(resetAt, decision.SuggestedRetryAt);
+    }
+
+    [Fact]
+    public async Task ReservedHeadroom_CapsConcurrentDispatchesAgainstCachedQuota()
+    {
+        var cls = FrontierClass(Sub(Claude));
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, 50.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new FixedHeadroomEstimator(15.0));
+
+        var first = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
+        var second = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
+        var third = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
+
+        var firstReservation = Assert.IsAssignableFrom<IQuotaReservation>(first.QuotaReservation);
+        var secondReservation = Assert.IsAssignableFrom<IQuotaReservation>(second.QuotaReservation);
+        Assert.Equal(Claude, first.Chosen!.Agent);
+        Assert.Equal(Claude, second.Chosen!.Agent);
+        Assert.Null(third.Chosen);
+        Assert.True(third.ShouldWait);
+        Assert.Contains("headroom", third.Reason);
+        firstReservation.Dispose();
+        secondReservation.Dispose();
+
+        var afterRelease = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
+        var afterReleaseReservation = Assert.IsAssignableFrom<IQuotaReservation>(afterRelease.QuotaReservation);
+        Assert.Equal(Claude, afterRelease.Chosen!.Agent);
+        Assert.False(afterRelease.ShouldWait);
+        afterReleaseReservation.Dispose();
+    }
+
     // ── Wait for subscription ─────────────────────────────────────────────────
 
     [Fact]
@@ -220,6 +270,39 @@ public sealed class AgentClassRouterTests
         Assert.Equal(Codex, decision.Chosen!.Agent);
         Assert.Equal(AgentBilling.PayPerApi, decision.Chosen.Billing);
         Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
+    public async Task PayPerApiFallback_IsNotRejectedByHeadroomEstimator()
+    {
+        var cls = FrontierClass(Sub(Claude), Api(Codex));
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, 1.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new ThrowingHeadroomEstimator());
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+        Assert.Equal(AgentBilling.PayPerApi, decision.Chosen.Billing);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
+    public async Task SubscriptionEstimatorException_IsNotTreatedAsMissingEstimate()
+    {
+        var cls = FrontierClass(Sub(Claude));
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, 50.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new ThrowingHeadroomEstimator());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None));
     }
 
     // ── No probe registered → unknown policy ────────────────────────────────
@@ -382,12 +465,19 @@ internal sealed class FixedHeadroomEstimator : IQuotaHeadroomEstimator
     public FixedHeadroomEstimator(double estimatedPctCost) => _estimatedPctCost = estimatedPctCost;
 
     public Task<QuotaHeadroomEstimate?> EstimateAsync(
-        ProjectId projectId,
-        AgentMembership member,
+        QuotaHeadroomRequest request,
         CancellationToken ct = default)
         => Task.FromResult<QuotaHeadroomEstimate?>(new QuotaHeadroomEstimate(
             _estimatedPctCost,
             AverageTokensPerIteration: 100_000,
             SampledItemCount: 1,
             Source: "test"));
+}
+
+internal sealed class ThrowingHeadroomEstimator : IQuotaHeadroomEstimator
+{
+    public Task<QuotaHeadroomEstimate?> EstimateAsync(
+        QuotaHeadroomRequest request,
+        CancellationToken ct = default)
+        => throw new InvalidOperationException("headroom estimator failed");
 }

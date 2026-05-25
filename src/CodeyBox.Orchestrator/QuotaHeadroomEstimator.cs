@@ -6,10 +6,14 @@ namespace CodeyBox.Orchestrator;
 public interface IQuotaHeadroomEstimator
 {
     Task<QuotaHeadroomEstimate?> EstimateAsync(
-        ProjectId projectId,
-        AgentMembership member,
+        QuotaHeadroomRequest request,
         CancellationToken ct = default);
 }
+
+public sealed record QuotaHeadroomRequest(
+    ProjectId ProjectId,
+    AgentKind Agent,
+    string? ModelId);
 
 public sealed record QuotaHeadroomEstimate(
     double EstimatedIterPctCost,
@@ -27,25 +31,13 @@ public sealed class LazyQuotaHeadroomEstimator : IQuotaHeadroomEstimator
     }
 
     public Task<QuotaHeadroomEstimate?> EstimateAsync(
-        ProjectId projectId,
-        AgentMembership member,
+        QuotaHeadroomRequest request,
         CancellationToken ct = default)
     {
-        IQuotaHeadroomEstimator? estimator;
-        try
-        {
-            estimator = _resolver();
-        }
-        catch
-        {
-            // Cost storage is best-effort; if it is not migrated yet, quota
-            // routing should fall back to the ordinary availability gate.
-            return Task.FromResult<QuotaHeadroomEstimate?>(null);
-        }
-
+        var estimator = _resolver();
         return estimator is null
             ? Task.FromResult<QuotaHeadroomEstimate?>(null)
-            : estimator.EstimateAsync(projectId, member, ct);
+            : estimator.EstimateAsync(request, ct);
     }
 }
 
@@ -54,7 +46,6 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
     private readonly IWorkItemCostStore _costs;
     private readonly QuotaRouterOptions _options;
     private readonly TimeProvider _time;
-    private readonly ILogger<CostHistoryQuotaHeadroomEstimator> _log;
 
     public CostHistoryQuotaHeadroomEstimator(
         IWorkItemCostStore costs,
@@ -64,57 +55,66 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
     {
         _costs = costs;
         _options = options;
-        _log = log;
         _time = timeProvider ?? TimeProvider.System;
     }
 
     public async Task<QuotaHeadroomEstimate?> EstimateAsync(
-        ProjectId projectId,
-        AgentMembership member,
+        QuotaHeadroomRequest request,
         CancellationToken ct = default)
     {
         if (!_options.HeadroomProjectionEnabled)
             return null;
 
-        var tokensPerPct = ResolveTokensPerPct(member.Agent);
+        var tokensPerPct = ResolveTokensPerPct(request.Agent);
         if (tokensPerPct <= 0)
             return null;
 
         var now = _time.GetUtcNow();
-        IReadOnlyList<WorkItemCost> rows;
-        try
-        {
-            rows = await _costs.GetByProjectAsync(
-                projectId.Value,
-                now - _options.HeadroomHistoryWindow,
-                now,
-                ct);
-        }
-        catch (Exception ex)
-        {
-            _log.LogDebug(ex, "Failed to read quota headroom cost history for project {ProjectId}", projectId.Value);
+        var from = now - _options.HeadroomHistoryWindow;
+        var maxItems = _options.HeadroomHistoryItemCount;
+        if (maxItems <= 0)
             return null;
-        }
 
-        var hasModel = !string.IsNullOrWhiteSpace(member.ModelId);
-        List<WorkItemCost> scoped = hasModel
-            ? FilterRows(rows, member, matchModel: true).ToList()
+        var hasModel = !string.IsNullOrWhiteSpace(request.ModelId);
+        IReadOnlyList<WorkItemCost> scoped = hasModel
+            ? await _costs.GetRecentByProjectAsync(
+                request.ProjectId.Value,
+                from,
+                now,
+                request.Agent.Value,
+                request.ModelId,
+                maxItems,
+                ct)
             : [];
         var source = "agent+model";
 
         if (scoped.Count == 0)
         {
-            scoped = FilterRows(rows, member, matchModel: false).ToList();
+            scoped = await _costs.GetRecentByProjectAsync(
+                request.ProjectId.Value,
+                from,
+                now,
+                request.Agent.Value,
+                modelId: null,
+                maxItems,
+                ct);
             source = "agent";
         }
 
         if (scoped.Count == 0)
         {
-            scoped = rows.ToList();
+            scoped = await _costs.GetRecentByProjectAsync(
+                request.ProjectId.Value,
+                from,
+                now,
+                agentKind: null,
+                modelId: null,
+                maxItems,
+                ct);
             source = "project";
         }
 
-        var samples = BuildPerItemIterationSamples(scoped, _options.HeadroomHistoryItemCount);
+        var samples = BuildPerItemIterationSamples(scoped, maxItems);
         if (samples.Count == 0)
             return null;
 
@@ -142,27 +142,6 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
         }
 
         return _options.HeadroomTokensPerQuotaPct;
-    }
-
-    private static IEnumerable<WorkItemCost> FilterRows(
-        IEnumerable<WorkItemCost> rows,
-        AgentMembership member,
-        bool matchModel)
-    {
-        foreach (var row in rows)
-        {
-            if (!string.Equals(row.AgentKind, member.Agent.Value, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            if (matchModel
-                && !string.IsNullOrWhiteSpace(member.ModelId)
-                && !string.Equals(row.ModelId, member.ModelId, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            yield return row;
-        }
     }
 
     private static IReadOnlyList<double> BuildPerItemIterationSamples(

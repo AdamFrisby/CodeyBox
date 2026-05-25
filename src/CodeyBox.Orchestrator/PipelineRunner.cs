@@ -58,12 +58,13 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly AgentCostCalculator? _costCalculator;
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     private readonly IAgentStreamStore? _agentStreams;
-    private readonly QuotaRetryScheduler? _retryScheduler;
+    private readonly IQuotaRetryNotifier? _quotaRetryNotifier;
+    private readonly IQuotaWaitParker _quotaWaitParker;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     // Last-resort pause for quota-shaped terminal failures when neither the
     // agent output nor quota probes expose a reset window.
-    internal static readonly TimeSpan DefaultQuotaFailurePause = TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan DefaultQuotaFailurePause = QuotaWaitParker.DefaultQuotaFailurePause;
     // Per-process exhausted-member TTL when the chosen agent hits quota mid-flight.
     // Subscription windows reset on the order of hours; one hour is a conservative
     // upper bound that keeps the in-process cache useful across consecutive pickups
@@ -74,7 +75,7 @@ public sealed class PipelineRunner : IPipelineRunner
     // could park an item arbitrarily far in the future. 24h is the longest legitimate
     // subscription reset cadence we know about (Gemini daily); anything beyond is treated
     // as suspect and clamped.
-    internal static readonly TimeSpan MaxParsedQuotaResetWindow = TimeSpan.FromHours(24);
+    internal static readonly TimeSpan MaxParsedQuotaResetWindow = QuotaWaitParker.MaxParsedQuotaResetWindow;
     // Subscription-billed quota probes, keyed by AgentKind. PayPerApi / Null probes are
     // routing utilities (not real quota sources) and intentionally excluded.
     // Used by both ResolveAuditAgentRunnerAsync (audit-agent quota gate) and
@@ -140,13 +141,14 @@ public sealed class PipelineRunner : IPipelineRunner
         IStdoutBroadcaster? stdoutBroadcaster = null,
         IAgentStreamStore? agentStreams = null,
         IQuotaFailureStore? quotaFailures = null,
-        QuotaRetryScheduler? retryScheduler = null,
+        IQuotaRetryNotifier? retryScheduler = null,
         AgentClassRouter? classRouter = null,
         IAgentFallbackHistoryStore? fallbackHistory = null,
         IQuotaFailureClassifier? quotaClassifier = null,
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         ITaskQueue? taskQueue = null,
-        OrchestratorOptions? orchestratorOptions = null)
+        OrchestratorOptions? orchestratorOptions = null,
+        IQuotaWaitParker? quotaWaitParker = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -166,6 +168,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _stdoutBroadcaster = stdoutBroadcaster;
         _agentStreams = agentStreams;
         _quotaFailures = quotaFailures;
+        _quotaRetryNotifier = retryScheduler;
         if (quotaClassifier is null)
         {
             // No classifier wired — fall back to an empty composite so the pipeline
@@ -182,8 +185,13 @@ public sealed class PipelineRunner : IPipelineRunner
             _quotaClassifier = quotaClassifier;
         }
         _toolCallCounters = toolCallCounters;
-        _retryScheduler = retryScheduler;
         _classRouter = classRouter;
+        _quotaWaitParker = quotaWaitParker ?? new QuotaWaitParker(
+            store,
+            webhooks,
+            retryScheduler,
+            projects,
+            classRouter);
         _fallbackHistory = fallbackHistory;
         _log = log;
         _smokeGate = smokeGate;
@@ -3015,12 +3023,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// instant. Returns null when input is null.
     /// </summary>
     internal static DateTimeOffset? ClampQuotaReset(DateTimeOffset? resetAt)
-    {
-        if (resetAt is not { } parsed) return null;
-        var now = DateTimeOffset.UtcNow;
-        var ceiling = now + MaxParsedQuotaResetWindow;
-        return parsed > ceiling ? ceiling : parsed;
-    }
+        => QuotaWaitParker.ClampQuotaReset(resetAt);
 
     /// <summary>
     /// Normalises a reason string for log / webhook serialisation: strips
@@ -4988,7 +4991,7 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem next;
         if (failureKind == "quota")
         {
-            var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, ct);
+            var effectiveResetAt = await _quotaWaitParker.ResolveResetAtAsync(current, project, quotaResetAt, ct);
             next = current.With(WorkItemState.Failed, error,
                 failureKind: failureKind,
                 quotaResetAt: effectiveResetAt,
@@ -5013,9 +5016,9 @@ public sealed class PipelineRunner : IPipelineRunner
             return;
         }
 
-        if (failureKind == "quota" && _retryScheduler is not null)
+        if (failureKind == "quota" && _quotaRetryNotifier is not null)
         {
-            await _retryScheduler.NotifyQuotaFailureAsync(next);
+            await _quotaRetryNotifier.NotifyQuotaFailureAsync(next);
         }
 
         _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
@@ -5172,41 +5175,6 @@ public sealed class PipelineRunner : IPipelineRunner
         _ => WorkItemState.Queued,
     };
 
-    private async Task<DateTimeOffset> ResolveQuotaResetAtForFailedTransitionAsync(
-        WorkItem item,
-        Project? project,
-        DateTimeOffset? detectedResetAt,
-        CancellationToken ct)
-    {
-        var resetAt = ClampQuotaReset(detectedResetAt);
-        if (resetAt is not null)
-            return resetAt.Value;
-
-        if (_classRouter is not null)
-        {
-            try
-            {
-                var effectiveProject = project ?? await _projects.GetAsync(item.ProjectId, ct);
-                resetAt = await _classRouter.ComputeEarliestExhaustedResetAsync(item, effectiveProject, ct);
-                if (resetAt is not null)
-                    return resetAt.Value;
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _log.LogDebug(
-                    ex,
-                    "Failed to compute quota reset fallback for failed work item {Id}; using default pause",
-                    item.Id);
-            }
-        }
-
-        return DateTimeOffset.UtcNow.Add(DefaultQuotaFailurePause);
-    }
-
     private async Task TransitionWaitingForQuotaResetAsync(
         WorkItem item,
         AgentClassExhaustedException ex,
@@ -5226,60 +5194,9 @@ public sealed class PipelineRunner : IPipelineRunner
         DateTimeOffset? quotaResetAt,
         Project? project,
         int? iteration)
-    {
-        var ct = CancellationToken.None;
-        var current = await _store.GetAsync(item.Id, ct) ?? item;
-        var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, ct);
-        var next = current.With(WorkItemState.WaitingForQuotaReset, error,
-            failureKind: "quota", quotaResetAt: effectiveResetAt) with
-        {
-            NextQuotaRetryAt = effectiveResetAt,
-            QuotaRetryFrom = RetryFromForQuotaPhase(phase),
-        };
-
-        var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
-        if (!updated)
-        {
-            _log.LogInformation(
-                "Work item {Id} state changed concurrently; skipping WaitingForQuotaReset transition",
-                item.Id);
-            return;
-        }
-
-        if (_retryScheduler is not null)
-            await _retryScheduler.NotifyQuotaFailureAsync(next);
-
-        AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForQuotaReset.ToString());
-        var effectiveProject = project ?? new Project
-        {
-            Id = item.ProjectId,
-            DisplayName = item.ProjectId.Value,
-            RepositoryUrl = string.Empty,
-        };
-        await _webhooks.PublishAsync(new WebhookEvent
-        {
-            Event = "work_item.waiting_for_quota_reset",
-            WorkItem = next,
-            Project = effectiveProject,
-            Details = new AgentFallbackDetails(
-                WorkItemId: item.Id.ToString(),
-                Phase: phase,
-                Iteration: iteration,
-                FromAgent: (item.Agent ?? effectiveProject.DefaultAgent).Value,
-                FromModel: item.ModelId,
-                ToAgent: null,
-                ToModel: null,
-                Reason: error),
-        }, ct);
-    }
-
-    private static string RetryFromForQuotaPhase(string phase) => phase switch
-    {
-        "audit" => "audit",
-        "merge" => "merge",
-        "upstream" => "upstream",
-        _ => "work",
-    };
+        => await _quotaWaitParker.ParkAsync(
+            new QuotaWaitParkRequest(item, error, phase, quotaResetAt, project, iteration),
+            CancellationToken.None);
 
     private static string StateToEventName(WorkItemState state) => state switch
     {

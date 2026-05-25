@@ -55,6 +55,8 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
                 ON work_item_costs(work_item_id, phase, iteration);
             CREATE INDEX IF NOT EXISTS idx_costs_project_time
                 ON work_item_costs(work_item_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_costs_agent_model_time
+                ON work_item_costs(agent_kind, model_id, started_at, ended_at, work_item_id);
             """;
         createCmd.ExecuteNonQuery();
 
@@ -220,6 +222,61 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         cmd.Parameters.AddWithValue("$proj", projectId);
         cmd.Parameters.AddWithValue("$from", from.ToString("O"));
         cmd.Parameters.AddWithValue("$to", to.ToString("O"));
+
+        var results = new List<WorkItemCost>();
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            results.Add(ReadRow(reader));
+        return results;
+    }
+
+    public async Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+        string projectId,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        string? agentKind,
+        string? modelId,
+        int maxItems,
+        CancellationToken ct = default)
+    {
+        if (maxItems <= 0)
+            return [];
+
+        using var readConn = new SqliteConnection($"Data Source={_path};Mode=ReadOnly");
+        readConn.Open();
+
+        using var cmd = readConn.CreateCommand();
+        cmd.CommandText = """
+            WITH recent_items AS (
+                SELECT c.work_item_id, MAX(c.ended_at) AS latest_ended_at
+                FROM work_item_costs c
+                JOIN work_items w ON w.id = c.work_item_id
+                WHERE w.project_id = $proj
+                  AND c.started_at >= $from
+                  AND c.started_at < $to
+                  AND ($agent IS NULL OR lower(c.agent_kind) = lower($agent))
+                  AND ($model IS NULL OR lower(COALESCE(c.model_id, '')) = lower($model))
+                GROUP BY c.work_item_id
+                ORDER BY latest_ended_at DESC
+                LIMIT $limit
+            )
+            SELECT c.id, c.work_item_id, c.phase, c.iteration, c.agent_kind, c.model_id,
+                   c.input_tokens, c.cached_input_tokens, c.output_tokens,
+                   c.estimated_usd, c.started_at, c.ended_at, c.raw_metadata_json
+            FROM work_item_costs c
+            JOIN recent_items r ON r.work_item_id = c.work_item_id
+            WHERE c.started_at >= $from
+              AND c.started_at < $to
+              AND ($agent IS NULL OR lower(c.agent_kind) = lower($agent))
+              AND ($model IS NULL OR lower(COALESCE(c.model_id, '')) = lower($model))
+            ORDER BY r.latest_ended_at DESC, c.started_at
+            """;
+        cmd.Parameters.AddWithValue("$proj", projectId);
+        cmd.Parameters.AddWithValue("$from", from.ToString("O"));
+        cmd.Parameters.AddWithValue("$to", to.ToString("O"));
+        cmd.Parameters.AddWithValue("$agent", string.IsNullOrWhiteSpace(agentKind) ? DBNull.Value : agentKind);
+        cmd.Parameters.AddWithValue("$model", string.IsNullOrWhiteSpace(modelId) ? DBNull.Value : modelId);
+        cmd.Parameters.AddWithValue("$limit", maxItems);
 
         var results = new List<WorkItemCost>();
         using var reader = await cmd.ExecuteReaderAsync(ct);

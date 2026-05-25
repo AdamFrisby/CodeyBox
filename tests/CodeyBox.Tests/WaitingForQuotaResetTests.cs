@@ -361,6 +361,83 @@ public sealed class WaitingForQuotaResetTests : IDisposable
         Assert.Equal(WorkItemState.Queued, refetched!.State);
     }
 
+    [Fact]
+    public async Task QuotaRetryScheduler_WaitingForQuotaResetWakeupWorksWhenAutoRetryDisabled()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var time = new FixedClock(DateTimeOffset.UtcNow);
+        var pid = new ProjectId("p1");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = pid,
+            DisplayName = "p1",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Claude,
+            DefaultAgentClass = "test-class",
+        });
+
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+
+        var classes = new List<AgentClass>
+        {
+            new AgentClass
+            {
+                Id = "test-class",
+                DisplayName = "Test",
+                Members =
+                [
+                    new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.PayPerApi, QualityScore = 100 },
+                ],
+            },
+        };
+        var router = new AgentClassRouter(classes, [new PayPerApiQuotaProbe()],
+            new QuotaRouterOptions(), NullLogger<AgentClassRouter>.Instance, time);
+        var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions(),
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            timeProvider: time);
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = pid,
+            Title = "parked",
+            Prompt = "p",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            AgentClassId = "test-class",
+            QuotaResetAt = time.GetUtcNow().AddMinutes(-5),
+            NextQuotaRetryAt = time.GetUtcNow().AddMinutes(-1),
+        };
+        await store.CreateAsync(parked);
+
+        await scheduler.NotifyQuotaFailureAsync(parked);
+
+        var timersField = typeof(QuotaRetryScheduler).GetField(
+            "_targetedTimers",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var timers = (System.Collections.IDictionary)timersField!.GetValue(scheduler)!;
+        Assert.True(timers.Contains(parked.Id));
+
+        var fired = typeof(QuotaRetryScheduler).GetMethod(
+            "OnTargetedTimerFired",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        fired.Invoke(scheduler, [parked.Id]);
+        await Task.Delay(150);
+
+        var refetched = await store.GetAsync(parked.Id);
+        Assert.Equal(WorkItemState.Queued, refetched!.State);
+    }
+
     private sealed class FixedClock : TimeProvider
     {
         private DateTimeOffset _now;

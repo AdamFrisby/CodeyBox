@@ -8,19 +8,21 @@ public static class QuotaRouter
         double availablePct,
         bool recentFailure,
         QuotaRouterOptions options,
-        double? estimatedIterPctCost = null)
+        double? estimatedIterPctCost = null,
+        double reservedQuotaPct = 0)
     {
         if (recentFailure)
             return false;
 
         if (availablePct >= 0)
         {
-            if (availablePct < options.MinQuotaPct)
+            var effectiveAvailablePct = availablePct - Math.Max(0, reservedQuotaPct);
+            if (effectiveAvailablePct < options.MinQuotaPct)
                 return false;
 
             if (estimatedIterPctCost is { } estimate
                 && estimate > 0
-                && availablePct - estimate < options.MinQuotaPct)
+                && effectiveAvailablePct - estimate < options.MinQuotaPct)
             {
                 return false;
             }

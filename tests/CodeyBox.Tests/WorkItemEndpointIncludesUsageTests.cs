@@ -272,6 +272,16 @@ public sealed class ThrowingCostStoreApiFactory : WebApplicationFactory<Program>
             string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
             => throw new InvalidOperationException("injected cost store failure");
 
+        public Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+            string projectId,
+            DateTimeOffset from,
+            DateTimeOffset to,
+            string? agentKind,
+            string? modelId,
+            int maxItems,
+            CancellationToken ct = default)
+            => throw new InvalidOperationException("injected cost store failure");
+
         public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
             DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
             => throw new InvalidOperationException("injected cost store failure");

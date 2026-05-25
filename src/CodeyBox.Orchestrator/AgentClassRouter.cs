@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 
@@ -14,11 +15,11 @@ namespace CodeyBox.Orchestrator;
 ///   <item>If no member is eligible, fail with <c>ROUTING_NO_ELIGIBLE</c> — no silent downgrade.</item>
 ///   <item>Compute each eligible member's effective score: base + sum of applicable time-of-day modifiers.</item>
 ///   <item>Sort descending by effective score; ties broken by Subscription before PayPerApi, then original config order.</item>
-///   <item>Probe quota in sorted order; pick the first member at or above <see cref="QuotaRouterOptions.MinQuotaPct"/>.</item>
+///   <item>Probe quota in sorted order; pick the first subscription member at or above <see cref="QuotaRouterOptions.MinQuotaPct"/> with enough projected headroom after in-flight reservations.</item>
 ///   <item>PayPerApi members use <see cref="PayPerApiQuotaProbe"/> (always 100%).</item>
 ///   <item>Subscription members with no registered probe fall back to <see cref="NullQuotaProbe"/> and follow the configured unknown policy.</item>
-///   <item>If all eligible subscription members are exhausted → ShouldWait=true, re-enqueue later.</item>
-///   <item>If only PayPerApi eligible members remain → fire the first regardless (costs money; never hard-fails).</item>
+///   <item>If all eligible subscription members are exhausted or lack projected headroom and no PayPerApi fallback is eligible → ShouldWait=true, re-enqueue later.</item>
+///   <item>PayPerApi eligible members always fire when reached (costs money; never hard-fails on quota).</item>
 /// </list>
 ///
 /// Called on every pickup attempt; all quota reads go through cached
@@ -37,6 +38,8 @@ public sealed class AgentClassRouter
     private readonly TimeProvider _time;
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaHeadroomEstimator? _headroomEstimator;
+    private readonly ConcurrentDictionary<QuotaReservationKey, double> _reservedHeadroomPct = new();
+    private readonly ConcurrentDictionary<QuotaReservationKey, object> _reservationLocks = new();
     // Pre-parsed TOD modifiers: evaluated on every pickup, zero-alloc.
     private readonly IReadOnlyList<ParsedTodModifier> _todModifiers;
     // In-process short-lived exhaustion cache populated by mid-iteration fallback.
@@ -81,7 +84,7 @@ public sealed class AgentClassRouter
     /// quota probe, preserving legacy behaviour exactly.
     /// </summary>
     public async Task<AgentRoutingDecision> ResolveAsync(
-        WorkItem item, Project? project, CancellationToken ct)
+        WorkItem item, Project? project, CancellationToken ct, bool reserveQuota = false)
     {
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null)
@@ -192,7 +195,7 @@ public sealed class AgentClassRouter
 
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
-            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, quota.ResetAt, ct);
+            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, quota.ResetAt, reserveQuota, ct);
             if (gate.Allow)
             {
                 // Mark all remaining sorted entries as "ranked lower" for the audit event.
@@ -217,6 +220,7 @@ public sealed class AgentClassRouter
                 {
                     Chosen = member,
                     Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {quota.AvailablePct:F1}% available",
+                    QuotaReservation = gate.Reservation,
                 };
             }
 
@@ -431,41 +435,66 @@ public sealed class AgentClassRouter
         ProjectId projectId,
         double availablePct,
         DateTimeOffset? resetAt,
+        bool reserveQuota,
         CancellationToken ct)
     {
+        if (member.Billing == AgentBilling.PayPerApi)
+            return new QuotaGateDecision(true, "pay-per-api member is never quota-gated", resetAt);
+
         if (availablePct >= _opts.MinQuotaPct)
         {
             var estimate = await EstimateHeadroomAsync(projectId, member, ct);
             var estimatedCost = estimate?.EstimatedIterPctCost;
-            if (!QuotaRouter.WouldAllow(availablePct, recentFailure: false, _opts, estimatedCost))
+            var key = new QuotaReservationKey(projectId, member.Agent, member.ModelId ?? string.Empty);
+            var reservedPct = GetReservedHeadroomPct(key);
+            IQuotaReservation? reservation = null;
+
+            if (estimatedCost is { } cost && cost > 0 && reserveQuota)
             {
-                var projected = availablePct - estimatedCost!.Value;
+                var sync = _reservationLocks.GetOrAdd(key, _ => new object());
+                lock (sync)
+                {
+                    reservedPct = GetReservedHeadroomPct(key);
+                    if (QuotaRouter.WouldAllow(availablePct, recentFailure: false, _opts, cost, reservedPct))
+                    {
+                        _reservedHeadroomPct.AddOrUpdate(key, cost, (_, existing) => existing + cost);
+                        reservation = new InProcessQuotaReservation(this, key, cost);
+                    }
+                }
+            }
+
+            if (reservation is null
+                && estimatedCost is { } refusedCost
+                && !QuotaRouter.WouldAllow(availablePct, recentFailure: false, _opts, refusedCost, reservedPct))
+            {
+                var projected = availablePct - reservedPct - refusedCost;
                 const string reason = "insufficient headroom";
                 AuditLog.QuotaDispatchRefused(
                     member.Agent,
                     projectId,
                     availablePct,
-                    estimatedCost.Value,
+                    refusedCost,
                     reason);
 
                 return new QuotaGateDecision(
                     false,
-                    $"insufficient headroom (available={availablePct:F1}%, estimatedCost={estimatedCost.Value:F1}%, projected={projected:F1}% < min={_opts.MinQuotaPct:F1}%)",
+                    $"insufficient headroom (available={availablePct:F1}%, reserved={reservedPct:F1}%, estimatedCost={refusedCost:F1}%, projected={projected:F1}% < min={_opts.MinQuotaPct:F1}%)",
                     resetAt,
                     InsufficientHeadroom: true,
-                    estimatedCost.Value,
+                    refusedCost,
                     projected);
             }
 
             return new QuotaGateDecision(
                 true,
-                estimatedCost is { } cost
-                    ? $"quota available; projected headroom {(availablePct - cost):F1}% after estimated {cost:F1}% iteration"
+                estimatedCost is { } allowedCost
+                    ? $"quota available; projected headroom {(availablePct - reservedPct - allowedCost):F1}% after estimated {allowedCost:F1}% iteration"
                     : "quota available",
                 resetAt,
                 InsufficientHeadroom: false,
                 estimatedCost,
-                estimatedCost is { } estimateValue ? availablePct - estimateValue : null);
+                estimatedCost is { } estimateValue ? availablePct - reservedPct - estimateValue : null,
+                reservation);
         }
 
         if (availablePct >= 0)
@@ -487,17 +516,27 @@ public sealed class AgentClassRouter
         if (_headroomEstimator is null)
             return null;
 
-        try
+        return await _headroomEstimator.EstimateAsync(
+            new QuotaHeadroomRequest(projectId, member.Agent, member.ModelId),
+            ct);
+    }
+
+    private double GetReservedHeadroomPct(QuotaReservationKey key) =>
+        _reservedHeadroomPct.TryGetValue(key, out var reserved) ? reserved : 0;
+
+    private void ReleaseReservation(QuotaReservationKey key, double amount)
+    {
+        var sync = _reservationLocks.GetOrAdd(key, _ => new object());
+        lock (sync)
         {
-            return await _headroomEstimator.EstimateAsync(projectId, member, ct);
-        }
-        catch (Exception ex)
-        {
-            _log.LogDebug(ex,
-                "Failed to estimate quota headroom for project {ProjectId} agent {Agent}; continuing without projection",
-                projectId.Value,
-                member.Agent.Value);
-            return null;
+            if (!_reservedHeadroomPct.TryGetValue(key, out var existing))
+                return;
+
+            var next = existing - amount;
+            if (next <= 0.000_001)
+                _reservedHeadroomPct.TryRemove(key, out _);
+            else
+                _reservedHeadroomPct[key] = next;
         }
     }
 
@@ -634,7 +673,35 @@ public sealed class AgentClassRouter
         DateTimeOffset? RetryAt,
         bool InsufficientHeadroom = false,
         double? EstimatedIterPctCost = null,
-        double? ProjectedAvailablePct = null);
+        double? ProjectedAvailablePct = null,
+        IQuotaReservation? Reservation = null);
+
+    private sealed record QuotaReservationKey(ProjectId ProjectId, AgentKind Agent, string ModelId);
+
+    private sealed class InProcessQuotaReservation : IQuotaReservation
+    {
+        private readonly AgentClassRouter _router;
+        private readonly QuotaReservationKey _key;
+        private int _disposed;
+
+        public InProcessQuotaReservation(AgentClassRouter router, QuotaReservationKey key, double reservedPct)
+        {
+            _router = router;
+            _key = key;
+            ReservedPct = reservedPct;
+        }
+
+        public ProjectId ProjectId => _key.ProjectId;
+        public AgentKind Agent => _key.Agent;
+        public string? ModelId => string.IsNullOrEmpty(_key.ModelId) ? null : _key.ModelId;
+        public double ReservedPct { get; }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                _router.ReleaseReservation(_key, ReservedPct);
+        }
+    }
 }
 
 public sealed record EffectiveQuota(double AvailablePct, DateTimeOffset? ResetAt, string? Window);
@@ -668,10 +735,19 @@ public sealed record AgentRoutingDecision
     public AgentMembership? Chosen { get; init; }
 
     /// <summary>
-    /// True when all subscription-billed members are exhausted and the item
-    /// should be re-enqueued after <see cref="SuggestedRecheckIn"/>.
+    /// True when every eligible subscription-billed member is exhausted or lacks
+    /// projected headroom, and no PayPerApi fallback member is eligible. The
+    /// item should be parked until <see cref="SuggestedRetryAt"/> or
+    /// rechecked after <see cref="SuggestedRecheckIn"/>.
     /// </summary>
     public bool ShouldWait { get; init; }
+
+    /// <summary>
+    /// In-process reservation for projected subscription quota consumed by this
+    /// dispatch. The worker owns and releases it when the run leaves the hot path.
+    /// Null for PayPerApi members, unestimated routes, and dry-run resolver calls.
+    /// </summary>
+    public IQuotaReservation? QuotaReservation { get; init; }
 
     /// <summary>Suggested delay before re-attempting pickup.</summary>
     public TimeSpan SuggestedRecheckIn { get; init; }
@@ -687,6 +763,14 @@ public sealed record AgentRoutingDecision
     /// The caller must fail the item immediately rather than waiting or routing.
     /// </summary>
     public bool NoEligibleMembers { get; init; }
+}
+
+public interface IQuotaReservation : IDisposable
+{
+    ProjectId ProjectId { get; }
+    AgentKind Agent { get; }
+    string? ModelId { get; }
+    double ReservedPct { get; }
 }
 
 /// <summary>

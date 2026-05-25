@@ -172,6 +172,16 @@ internal sealed class ThrowingWorkItemCostStore : IWorkItemCostStore
         string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
         => Task.FromException<IReadOnlyList<WorkItemCost>>(new InvalidOperationException("no such table: work_item_costs"));
 
+    public Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+        string projectId,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        string? agentKind,
+        string? modelId,
+        int maxItems,
+        CancellationToken ct = default)
+        => Task.FromException<IReadOnlyList<WorkItemCost>>(new InvalidOperationException("no such table: work_item_costs"));
+
     public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
         DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
         => Task.FromException<IReadOnlyList<(string, double)>>(new InvalidOperationException("no such table: work_item_costs"));

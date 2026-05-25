@@ -304,6 +304,16 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
 
+        public Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+            string projectId,
+            DateTimeOffset from,
+            DateTimeOffset to,
+            string? agentKind,
+            string? modelId,
+            int maxItems,
+            CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
+
         public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
             DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<(string, double)>>([]);
@@ -340,6 +350,16 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         public Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
             string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
+
+        public Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+            string projectId,
+            DateTimeOffset from,
+            DateTimeOffset to,
+            string? agentKind,
+            string? modelId,
+            int maxItems,
+            CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
 
         public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(

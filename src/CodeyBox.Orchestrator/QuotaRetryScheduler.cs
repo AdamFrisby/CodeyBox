@@ -9,7 +9,7 @@ namespace CodeyBox.Orchestrator;
 /// Hosted service that automatically retries work items that failed due to
 /// quota exhaustion, once quota is available again.
 /// </summary>
-public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
+public sealed class QuotaRetryScheduler : BackgroundService, IQuotaRetryNotifier, IDisposable
 {
     private readonly IWorkItemStore _store;
     private readonly WorkItemRetrier _retrier;
@@ -48,15 +48,18 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (!_opts.AutoRetryOnQuotaFailure.Enabled)
+        var retryFailedQuotaItems = _opts.AutoRetryOnQuotaFailure.Enabled;
+        if (!retryFailedQuotaItems)
         {
-            _log.LogInformation("Quota auto-retry is disabled");
-            return;
+            _log.LogInformation(
+                "Quota auto-retry for Failed items is disabled; WaitingForQuotaReset wakeups remain enabled");
         }
-
-        _log.LogInformation("Quota auto-retry is enabled. Periodic interval: {Interval}, Drift margin: {Margin}",
-            _opts.AutoRetryOnQuotaFailure.PeriodicCheckInterval,
-            _opts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin);
+        else
+        {
+            _log.LogInformation("Quota auto-retry is enabled. Periodic interval: {Interval}, Drift margin: {Margin}",
+                _opts.AutoRetryOnQuotaFailure.PeriodicCheckInterval,
+                _opts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin);
+        }
 
         // Re-arm timers from the DB on startup.
         await RearmTimersAsync(stoppingToken);
@@ -84,12 +87,15 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     {
         _log.LogInformation("Re-arming quota retry timers from database...");
         var count = 0;
-        await foreach (var item in _store.ListByStateAsync(WorkItemState.Failed, ct))
+        if (_opts.AutoRetryOnQuotaFailure.Enabled)
         {
-            if (item.FailureKind == "quota" && item.NextQuotaRetryAt.HasValue)
+            await foreach (var item in _store.ListByStateAsync(WorkItemState.Failed, ct))
             {
-                ScheduleTargetedRetry(item.Id, item.NextQuotaRetryAt.Value);
-                count++;
+                if (item.FailureKind == "quota" && item.NextQuotaRetryAt.HasValue)
+                {
+                    ScheduleTargetedRetry(item.Id, item.NextQuotaRetryAt.Value);
+                    count++;
+                }
             }
         }
         await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
@@ -113,11 +119,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     private async Task RunPeriodicSweepAsync(CancellationToken ct)
     {
         _log.LogDebug("Starting periodic quota retry sweep");
-        await foreach (var item in _store.ListByStateAsync(WorkItemState.Failed, ct))
+        if (_opts.AutoRetryOnQuotaFailure.Enabled)
         {
-            if (item.FailureKind == "quota")
+            await foreach (var item in _store.ListByStateAsync(WorkItemState.Failed, ct))
             {
-                await TryRetryAsync(item, "periodic", ct);
+                if (item.FailureKind == "quota")
+                {
+                    await TryRetryAsync(item, "periodic", ct);
+                }
             }
         }
         await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
@@ -168,7 +177,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     private async Task TryRetryAsync(WorkItem item, string trigger, CancellationToken ct)
     {
         // 1. Check max retries.
-        if (item.QuotaRetryAttempts >= _opts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem)
+        if (item.State == WorkItemState.Failed
+            && item.QuotaRetryAttempts >= _opts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem)
         {
             _log.LogInformation("Work item {Id} reached max quota auto-retries ({Max}); skipping",
                 item.Id, _opts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem);
@@ -268,9 +278,9 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     /// </summary>
     public async Task NotifyQuotaFailureAsync(WorkItem item)
     {
-        if (!_opts.AutoRetryOnQuotaFailure.Enabled) return;
         var isQuotaFailed = item.State == WorkItemState.Failed && item.FailureKind == "quota";
         var isWaitingReset = item.State == WorkItemState.WaitingForQuotaReset;
+        if (!_opts.AutoRetryOnQuotaFailure.Enabled && !isWaitingReset) return;
         if (!isQuotaFailed && !isWaitingReset) return;
 
         // Park time should be the soonest any class member can plausibly become

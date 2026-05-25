@@ -29,7 +29,7 @@ public sealed class OrchestratorService : BackgroundService
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
-    private readonly QuotaRetryScheduler? _quotaRetryScheduler;
+    private readonly IQuotaWaitParker _quotaWaitParker;
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -81,7 +81,7 @@ public sealed class OrchestratorService : BackgroundService
         DeadWorkerOptions? deadWorkerOpts = null,
         DeadWorkerReaper? reaper = null,
         ReleaseService? releaseService = null,
-        QuotaRetryScheduler? quotaRetryScheduler = null)
+        IQuotaWaitParker? quotaWaitParker = null)
     {
         _queue = queue;
         _store = store;
@@ -97,7 +97,12 @@ public sealed class OrchestratorService : BackgroundService
         _deadWorkerOpts = deadWorkerOpts;
         _reaper = reaper;
         _releaseService = releaseService;
-        _quotaRetryScheduler = quotaRetryScheduler;
+        _quotaWaitParker = quotaWaitParker ?? new QuotaWaitParker(
+            store,
+            webhooks,
+            retryNotifier: null,
+            projects,
+            router);
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
     }
 
@@ -602,6 +607,7 @@ public sealed class OrchestratorService : BackgroundService
             }
         }
 
+        IQuotaReservation? quotaReservation = null;
         try
         {
             var current = await _store.GetAsync(id, ct);
@@ -671,15 +677,25 @@ public sealed class OrchestratorService : BackgroundService
             // Skipped entirely (no probe, no wait) when no agent class is configured.
             if (_router is not null)
             {
-                var decision = await _router.ResolveAsync(item, project, ct);
+                var decision = await _router.ResolveAsync(item, project, ct, reserveQuota: true);
                 if (decision.ShouldWait)
                 {
                     AuditLog.QuotaRouterDeferred(item.Id, decision.SuggestedRecheckIn);
-                    await ParkForQuotaResetAsync(item, decision, project, ct);
+                    await _quotaWaitParker.ParkAsync(
+                        new QuotaWaitParkRequest(
+                            item,
+                            decision.Reason,
+                            "work",
+                            decision.SuggestedRetryAt ?? DateTimeOffset.UtcNow.Add(decision.SuggestedRecheckIn),
+                            project),
+                        ct);
                     return;
                 }
                 if (decision.Chosen is { } chosen)
+                {
+                    quotaReservation = decision.QuotaReservation;
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId, ReasoningMode = chosen.ReasoningMode };
+                }
                 else if (decision.NoEligibleMembers)
                 {
                     _log.LogError("Work item {Id}: {Reason}", item.Id, decision.Reason);
@@ -802,6 +818,7 @@ public sealed class OrchestratorService : BackgroundService
         }
         finally
         {
+            quotaReservation?.Dispose();
             _activeItems.TryRemove(id, out _);
 
             // Stop the heartbeat and remove the registry row on any exit path
@@ -885,68 +902,6 @@ public sealed class OrchestratorService : BackgroundService
 
     private SemaphoreSlim GetBudgetLock(ProjectId projectId) =>
         _budgetLocks.GetOrAdd(projectId.Value, _ => new SemaphoreSlim(1, 1));
-
-    private async Task ParkForQuotaResetAsync(
-        WorkItem item,
-        AgentRoutingDecision decision,
-        Project? project,
-        CancellationToken ct)
-    {
-        var now = DateTimeOffset.UtcNow;
-        var retryAt = decision.SuggestedRetryAt ?? now.Add(decision.SuggestedRecheckIn);
-        if (retryAt < now)
-            retryAt = now;
-
-        var next = item.With(
-            WorkItemState.WaitingForQuotaReset,
-            decision.Reason,
-            failureKind: "quota",
-            quotaResetAt: retryAt) with
-        {
-            NextQuotaRetryAt = retryAt,
-            QuotaRetryFrom = "work",
-        };
-
-        var updated = await _store.TryUpdateIfStateAsync(next, item.State, ct);
-        if (!updated)
-        {
-            _log.LogInformation(
-                "Work item {Id} state changed concurrently; skipping WaitingForQuotaReset transition",
-                item.Id);
-            return;
-        }
-
-        AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForQuotaReset.ToString());
-
-        if (_quotaRetryScheduler is not null)
-            await _quotaRetryScheduler.NotifyQuotaFailureAsync(next);
-
-        if (_webhooks is not null)
-        {
-            var effectiveProject = project ?? new Project
-            {
-                Id = item.ProjectId,
-                DisplayName = item.ProjectId.Value,
-                RepositoryUrl = string.Empty,
-            };
-
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "work_item.waiting_for_quota_reset",
-                WorkItem = next,
-                Project = effectiveProject,
-                Details = new AgentFallbackDetails(
-                    WorkItemId: item.Id.ToString(),
-                    Phase: "work",
-                    Iteration: null,
-                    FromAgent: (item.Agent ?? effectiveProject.DefaultAgent).Value,
-                    FromModel: item.ModelId,
-                    ToAgent: null,
-                    ToModel: null,
-                    Reason: decision.Reason),
-            }, ct);
-        }
-    }
 
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after

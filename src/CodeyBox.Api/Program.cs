@@ -1275,13 +1275,14 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IStdoutBroadcaster>(),
     sp.GetService<IAgentStreamStore>(),
     sp.GetService<IQuotaFailureStore>(),
-    sp.GetRequiredService<QuotaRetryScheduler>(),
+    sp.GetRequiredService<IQuotaRetryNotifier>(),
     sp.GetService<AgentClassRouter>(),
     sp.GetService<IAgentFallbackHistoryStore>(),
     sp.GetRequiredService<IQuotaFailureClassifier>(),
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>(),
     sp.GetService<ITaskQueue>(),
-    sp.GetService<OrchestratorOptions>()));
+    sp.GetService<OrchestratorOptions>(),
+    sp.GetRequiredService<IQuotaWaitParker>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1293,6 +1294,14 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
     sp.GetRequiredService<IWebhookDispatcher>()));
+builder.Services.AddSingleton<IQuotaRetryNotifier>(sp => sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<IQuotaWaitParker>(sp => new QuotaWaitParker(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IQuotaRetryNotifier>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<AgentClassRouter>(),
+    sp.GetRequiredService<ILogger<QuotaWaitParker>>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
@@ -1351,7 +1360,7 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<DeadWorkerOptions>(),
     sp.GetRequiredService<DeadWorkerReaper>(),
     sp.GetService<ReleaseService>(),
-    sp.GetRequiredService<QuotaRetryScheduler>()));
+    sp.GetRequiredService<IQuotaWaitParker>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -1452,7 +1461,9 @@ app.MapGet("/quota", async (
         var headroomProjections = new List<object>();
         foreach (var project in projectList)
         {
-            var estimate = await headroomEstimator.EstimateAsync(project.Id, member, ct);
+            var estimate = await headroomEstimator.EstimateAsync(
+                new QuotaHeadroomRequest(project.Id, probe.Kind, ModelId: null),
+                ct);
             var projected = estimate is null || snapshot.AvailablePct < 0
                 ? (double?)null
                 : snapshot.AvailablePct - estimate.EstimatedIterPctCost;

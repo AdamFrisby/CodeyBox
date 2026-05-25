@@ -213,6 +213,15 @@ internal sealed class CapturingCostStore : IWorkItemCostStore
         Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
     public Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
+    public Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+        string projectId,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        string? agentKind,
+        string? modelId,
+        int maxItems,
+        CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<WorkItemCost>>([]);
     public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default) => Task.CompletedTask;
     public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
         DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default) =>

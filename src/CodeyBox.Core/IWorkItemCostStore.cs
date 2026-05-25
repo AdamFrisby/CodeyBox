@@ -21,6 +21,22 @@ public interface IWorkItemCostStore
         string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
 
     /// <summary>
+    /// Returns cost records for the most recent <paramref name="maxItems"/> work
+    /// items in <paramref name="projectId"/> whose cost rows fall within
+    /// [<paramref name="from"/>, <paramref name="to"/>). Optional agent/model
+    /// filters are applied before selecting the recent work-item set, so callers
+    /// can build bounded per-agent projections without scanning every project row.
+    /// </summary>
+    Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+        string projectId,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        string? agentKind,
+        string? modelId,
+        int maxItems,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Fleet aggregation: returns per-project cost totals for cost records whose
     /// <c>started_at</c> falls within [<paramref name="from"/>, <paramref name="to"/>).
     /// Returns one row per project that has any matching records. Used by GET /fleet/summary

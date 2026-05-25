@@ -268,17 +268,159 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
             Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
 
         var estimate = await estimator.EstimateAsync(
-            new ProjectId("proj-headroom"),
-            new AgentMembership
-            {
-                Agent = AgentKind.Claude,
-                Billing = AgentBilling.Subscription,
-                ModelId = "claude-opus-4-7",
-                QualityScore = 100,
-            });
+            new QuotaHeadroomRequest(
+                new ProjectId("proj-headroom"),
+                AgentKind.Claude,
+                "claude-opus-4-7"));
 
         Assert.NotNull(estimate);
         Assert.Equal(7.5, estimate!.EstimatedIterPctCost, precision: 2);
         Assert.Equal(75_000, estimate.AverageTokensPerIteration, precision: 2);
+    }
+
+    [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_DisabledProjectionReturnsNullAndRouterAllows()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, "proj-disabled-headroom");
+        await _store.RecordAsync(MakeCost(itemId) with
+        {
+            InputTokens = 100_000,
+            OutputTokens = 0,
+        });
+        var opts = new QuotaRouterOptions
+        {
+            HeadroomProjectionEnabled = false,
+            HeadroomTokensPerQuotaPct = 10_000,
+            HeadroomHistoryItemCount = 20,
+            HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            MinQuotaPct = 10.0,
+        };
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(new ProjectId("proj-disabled-headroom"), AgentKind.Claude, "claude-opus-4-7"));
+
+        Assert.Null(estimate);
+
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                    ModelId = "claude-opus-4-7",
+                },
+            ],
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(AgentKind.Claude, 15.0)],
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: estimator);
+        var decision = await router.ResolveAsync(new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj-disabled-headroom"),
+            Title = "t",
+            Prompt = "p",
+            AgentClassId = "frontier",
+        }, null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_SelectsBoundedModelAgentAndProjectSources()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var opusOld = Guid.NewGuid().ToString();
+        var opusNew = Guid.NewGuid().ToString();
+        var sonnetNewer = Guid.NewGuid().ToString();
+        var projectOnly = Guid.NewGuid().ToString();
+        foreach (var id in new[] { opusOld, opusNew, sonnetNewer, projectOnly })
+            SeedWorkItem(id, "proj-selection");
+
+        await _store.RecordAsync(MakeCost(opusOld) with
+        {
+            AgentKind = "claude",
+            ModelId = "claude-opus-4-7",
+            InputTokens = 100_000,
+            OutputTokens = 0,
+            StartedAt = now.AddMinutes(-10),
+            EndedAt = now.AddMinutes(-9),
+        });
+        await _store.RecordAsync(MakeCost(opusNew) with
+        {
+            AgentKind = "claude",
+            ModelId = "claude-opus-4-7",
+            InputTokens = 20_000,
+            OutputTokens = 0,
+            StartedAt = now.AddMinutes(-4),
+            EndedAt = now.AddMinutes(-3),
+        });
+        await _store.RecordAsync(MakeCost(sonnetNewer) with
+        {
+            AgentKind = "claude",
+            ModelId = "claude-sonnet-4",
+            InputTokens = 60_000,
+            OutputTokens = 0,
+            StartedAt = now.AddMinutes(-2),
+            EndedAt = now.AddMinutes(-1),
+        });
+        await _store.RecordAsync(MakeCost(projectOnly) with
+        {
+            AgentKind = "codex",
+            ModelId = "gpt-5.2",
+            InputTokens = 90_000,
+            OutputTokens = 0,
+            StartedAt = now.AddMinutes(-6),
+            EndedAt = now.AddMinutes(-5),
+        });
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomTokensPerQuotaPctByAgent = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["claude"] = 5_000,
+                },
+                HeadroomHistoryItemCount = 1,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var modelEstimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(new ProjectId("proj-selection"), AgentKind.Claude, "claude-opus-4-7"));
+        Assert.NotNull(modelEstimate);
+        Assert.Equal("agent+model", modelEstimate!.Source);
+        Assert.Equal(20_000, modelEstimate.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(4.0, modelEstimate.EstimatedIterPctCost, precision: 2);
+
+        var agentFallback = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(new ProjectId("proj-selection"), AgentKind.Claude, "missing-model"));
+        Assert.NotNull(agentFallback);
+        Assert.Equal("agent", agentFallback!.Source);
+        Assert.Equal(60_000, agentFallback.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(12.0, agentFallback.EstimatedIterPctCost, precision: 2);
+
+        var projectFallback = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(new ProjectId("proj-selection"), AgentKind.Gemini, "gemini-pro"));
+        Assert.NotNull(projectFallback);
+        Assert.Equal("project", projectFallback!.Source);
+        Assert.Equal(60_000, projectFallback.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(6.0, projectFallback.EstimatedIterPctCost, precision: 2);
     }
 }
