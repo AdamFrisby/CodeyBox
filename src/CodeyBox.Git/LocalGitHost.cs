@@ -204,7 +204,7 @@ public sealed class LocalGitHost : IGitHost
             Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
             Validation.ValidateBranchName(workBranch, nameof(workBranch));
         }
-        catch
+        catch (ArgumentException)
         {
             return false;
         }

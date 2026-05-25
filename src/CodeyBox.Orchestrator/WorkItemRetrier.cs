@@ -15,6 +15,7 @@ public sealed class WorkItemRetrier
     private readonly IAgentStreamSummaryStore? _streamSummaries;
     private readonly IAuditReportStore? _auditReports;
     private readonly IProjectRepository? _projects;
+    private readonly IReleaseStore? _releases;
     private readonly ILogger<WorkItemRetrier> _log;
 
     public WorkItemRetrier(
@@ -24,7 +25,8 @@ public sealed class WorkItemRetrier
         ILogger<WorkItemRetrier> log,
         IAgentStreamSummaryStore? streamSummaries = null,
         IAuditReportStore? auditReports = null,
-        IProjectRepository? projects = null)
+        IProjectRepository? projects = null,
+        IReleaseStore? releases = null)
     {
         _store = store;
         _queue = queue;
@@ -32,6 +34,7 @@ public sealed class WorkItemRetrier
         _streamSummaries = streamSummaries;
         _auditReports = auditReports;
         _projects = projects;
+        _releases = releases;
         _log = log;
     }
 
@@ -176,6 +179,13 @@ public sealed class WorkItemRetrier
     {
         if (!string.IsNullOrWhiteSpace(item.BaseBranch))
             return item.BaseBranch!;
+
+        if (item.ReleaseId is { } releaseId && _releases is not null)
+        {
+            var release = await _releases.GetAsync(releaseId, ct);
+            if (!string.IsNullOrWhiteSpace(release?.BranchName))
+                return release.BranchName!;
+        }
 
         if (_projects is not null)
         {
