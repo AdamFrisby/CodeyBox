@@ -28,9 +28,10 @@ public sealed class CodexOAuthFileCredentialProvider : ICredentialProvider
 
     public CodexOAuthFileCredentialProvider(
         string filePath,
-        ILogger<CodexOAuthFileCredentialProvider>? log = null)
+        ILogger<CodexOAuthFileCredentialProvider>? log = null,
+        bool watch = true)
         : this(new CredentialFileSource(
-            filePath ?? throw new ArgumentNullException(nameof(filePath)), log), log)
+            filePath ?? throw new ArgumentNullException(nameof(filePath)), log, watch), log)
     {
     }
 

@@ -553,6 +553,7 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 // child-VM writeback — every consumer observes the new token within ~1 s and
 // quota probes invalidate their per-token snapshot, so a stale 401 doesn't pin
 // for the full cache TTL.
+var credentialFileWatchingEnabled = CredentialFileWatchingEnabled(builder.Configuration);
 var claudeOAuthFilePath =
     Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_OAUTH_FILE")
     ?? builder.Configuration["CodeyBox:ClaudeOAuthFile"];
@@ -600,13 +601,13 @@ if (geminiSettingsFilePath.StartsWith("~/", StringComparison.Ordinal))
         geminiSettingsFilePath[2..]);
 
 builder.Services.AddSingleton(sp => new ClaudeCredentialFileSource(
-    claudeOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+    claudeOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>(), watch: credentialFileWatchingEnabled));
 builder.Services.AddSingleton(sp => new CodexCredentialFileSource(
-    codexOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+    codexOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>(), watch: credentialFileWatchingEnabled));
 builder.Services.AddSingleton(sp => new GeminiOAuthCredentialFileSource(
-    geminiOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+    geminiOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>(), watch: credentialFileWatchingEnabled));
 builder.Services.AddSingleton(sp => new GeminiSettingsCredentialFileSource(
-    geminiSettingsFilePath, sp.GetService<ILogger<CredentialFileSource>>()));
+    geminiSettingsFilePath, sp.GetService<ILogger<CredentialFileSource>>(), watch: credentialFileWatchingEnabled));
 
 // Bridges the host-side ClaudeCredentialFileSource watcher to in-flight VMs:
 // when ~/.claude/.credentials.json rotates while a Claude agent is running in
@@ -1589,6 +1590,21 @@ finally
 // File reads happen through CredentialFileSource singletons (file-watched,
 // retry-on-IOException, JSON-validated). These helpers only parse the cached
 // raw bytes — the source has already absorbed the cost of opening the file.
+static bool CredentialFileWatchingEnabled(IConfiguration configuration)
+{
+    var raw = Environment.GetEnvironmentVariable("CODEYBOX_CREDENTIAL_FILE_WATCHERS")
+        ?? configuration["CodeyBox:CredentialFileWatchers"];
+    if (string.IsNullOrWhiteSpace(raw)) return true;
+
+    return raw.Trim() switch
+    {
+        "0" => false,
+        "false" or "False" or "FALSE" => false,
+        "no" or "No" or "NO" => false,
+        _ => true,
+    };
+}
+
 static string? ParseClaudeAccessToken(string? raw, string path, ILogger log)
 {
     if (string.IsNullOrWhiteSpace(raw)) return null;

@@ -34,12 +34,13 @@ public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider
     public GeminiOAuthFileCredentialProvider(
         string oauthCredsPath,
         string settingsPath,
-        ILogger<GeminiOAuthFileCredentialProvider>? log = null)
+        ILogger<GeminiOAuthFileCredentialProvider>? log = null,
+        bool watch = true)
         : this(
             new CredentialFileSource(
-                oauthCredsPath ?? throw new ArgumentNullException(nameof(oauthCredsPath)), log),
+                oauthCredsPath ?? throw new ArgumentNullException(nameof(oauthCredsPath)), log, watch),
             new CredentialFileSource(
-                settingsPath ?? throw new ArgumentNullException(nameof(settingsPath)), log),
+                settingsPath ?? throw new ArgumentNullException(nameof(settingsPath)), log, watch),
             log)
     {
     }

@@ -60,6 +60,7 @@ startup); we add explicit guards as we tighten the contract.
 | `SandboxProvider` | string | — | One of `multipass`, `bubblewrap`, `process`. Required in non-Development environments. |
 | `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Conventional bridge mapping for projects that explicitly select the `graphical` network profile; create it with `scripts/setup-host-networks.sh`. |
 | `MultipassSandbox.CloudInitReadyRetryAttempts` | int | `3` | Number of `cloud-init status --wait` attempts before probing VM readiness when cloud-init returns exit 1. |
+| `CredentialFileWatchers` | bool | `true` | Enables host-side OAuth credential file watchers. Set false only in constrained test hosts; credential reads still use a stat-based freshness check on each access. |
 | `DangerouslyAllowProcessSandbox` | bool | `false` | Allow process sandbox outside Development. Do not use in production. |
 | `UpstreamPushMaxAttempts` | int | `5` | Retry count for upstream push (GitHub PR creation). |
 | `UpstreamPushBackoffSeconds` | int | `15` | Seconds between upstream push retries. |
@@ -332,4 +333,5 @@ See [docs/webhooks.md](webhooks.md).
 | `CODEYBOX_COPILOT_TOKEN` | GitHub Copilot token. Used by the Copilot agent runner. |
 | `CODEYBOX_API_KEY` | REST API authentication key for incoming requests. |
 | `CODEYBOX_EXTRA_CONFIG` | Path to an extra JSON config file loaded last (wins over `appsettings.json`). |
+| `CODEYBOX_CREDENTIAL_FILE_WATCHERS` | Set to `false` to disable host-side OAuth credential file watchers while retaining stat-based reload on reads. |
 | `ASPNETCORE_URLS` | Override the bind address (default `http://127.0.0.1:5000`). |

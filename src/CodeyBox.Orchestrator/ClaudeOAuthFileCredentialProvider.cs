@@ -58,8 +58,9 @@ public sealed class ClaudeOAuthFileCredentialProvider : ICredentialProvider
     public ClaudeOAuthFileCredentialProvider(
         string filePath,
         string sandboxEnvVar,
-        ILogger<ClaudeOAuthFileCredentialProvider>? log = null)
-        : this(new CredentialFileSource(filePath, log), sandboxEnvVar, log)
+        ILogger<ClaudeOAuthFileCredentialProvider>? log = null,
+        bool watch = true)
+        : this(new CredentialFileSource(filePath, log, watch), sandboxEnvVar, log)
     {
     }
 

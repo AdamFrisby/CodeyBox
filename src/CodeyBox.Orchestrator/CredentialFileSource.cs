@@ -51,12 +51,12 @@ public class CredentialFileSource : IDisposable
     /// </summary>
     public event Action? TokenUpdated;
 
-    public CredentialFileSource(string filePath, ILogger? log = null)
+    public CredentialFileSource(string filePath, ILogger? log = null, bool watch = true)
     {
         FilePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
         _log = log;
         TryReload(force: false, out _);
-        StartWatcher();
+        if (watch) StartWatcher();
     }
 
     /// <summary>
@@ -229,23 +229,29 @@ public class CredentialFileSource : IDisposable
             return;
         }
 
+        FileSystemWatcher? w = null;
         try
         {
-            var w = new FileSystemWatcher(dir, fileName)
-            {
-                NotifyFilter = NotifyFilters.LastWrite
-                    | NotifyFilters.FileName
-                    | NotifyFilters.CreationTime
-                    | NotifyFilters.Size,
-                EnableRaisingEvents = true,
-            };
+            w = CredentialFileSourceWatcherDiagnostics.CreateWatcher(dir, fileName);
+            w.NotifyFilter = NotifyFilters.LastWrite
+                | NotifyFilters.FileName
+                | NotifyFilters.CreationTime
+                | NotifyFilters.Size;
+            w.EnableRaisingEvents = true;
             w.Changed += OnFsEvent;
             w.Created += OnFsEvent;
             w.Renamed += OnFsRenamed;
             _watcher = w;
+            w = null;
         }
         catch (Exception ex)
         {
+            if (w is not null)
+            {
+                try { w.Dispose(); }
+                catch { }
+                CredentialFileSourceWatcherDiagnostics.WatcherDisposed(w);
+            }
             _log?.LogWarning(ex, "Failed to register FileSystemWatcher for {Path}; relying on stat-based reload", FilePath);
         }
     }
@@ -284,35 +290,60 @@ public class CredentialFileSource : IDisposable
                 w.Dispose();
             }
             catch { }
+            finally
+            {
+                CredentialFileSourceWatcherDiagnostics.WatcherDisposed(w);
+            }
         }
+    }
+}
+
+internal static class CredentialFileSourceWatcherDiagnostics
+{
+    private static Func<string, string, FileSystemWatcher> _createWatcher =
+        static (dir, fileName) => new FileSystemWatcher(dir, fileName);
+    private static Action<FileSystemWatcher> _watcherDisposed = static _ => { };
+
+    public static FileSystemWatcher CreateWatcher(string dir, string fileName)
+        => _createWatcher(dir, fileName);
+
+    public static void WatcherDisposed(FileSystemWatcher watcher)
+        => _watcherDisposed(watcher);
+
+    internal static void ConfigureForTests(
+        Func<string, string, FileSystemWatcher> createWatcher,
+        Action<FileSystemWatcher> watcherDisposed)
+    {
+        _createWatcher = createWatcher ?? throw new ArgumentNullException(nameof(createWatcher));
+        _watcherDisposed = watcherDisposed ?? throw new ArgumentNullException(nameof(watcherDisposed));
     }
 }
 
 /// <summary>Marker for the Claude OAuth credentials file source.</summary>
 public sealed class ClaudeCredentialFileSource : CredentialFileSource
 {
-    public ClaudeCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null)
-        : base(filePath, log) { }
+    public ClaudeCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
 }
 
 /// <summary>Marker for the Codex OAuth credentials file source.</summary>
 public sealed class CodexCredentialFileSource : CredentialFileSource
 {
-    public CodexCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null)
-        : base(filePath, log) { }
+    public CodexCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
 }
 
 /// <summary>Marker for the Gemini OAuth credentials file source.</summary>
 public sealed class GeminiOAuthCredentialFileSource : CredentialFileSource
 {
-    public GeminiOAuthCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null)
-        : base(filePath, log) { }
+    public GeminiOAuthCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
 }
 
 /// <summary>Marker for the Gemini settings file source (not a credential, but
 /// rotates alongside the OAuth file, and the CLI requires both).</summary>
 public sealed class GeminiSettingsCredentialFileSource : CredentialFileSource
 {
-    public GeminiSettingsCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null)
-        : base(filePath, log) { }
+    public GeminiSettingsCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
 }

@@ -55,6 +55,22 @@ public sealed class CredentialFileSourceTests : IDisposable
     }
 
     [Fact]
+    public void WatchFalse_DisablesWatcherButKeepsStatBasedReload()
+    {
+        var path = WriteFile("polling-creds.json", """{"access_token":"old"}""");
+        using var source = new CredentialFileSource(path, watch: false);
+
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+        Assert.Equal("""{"access_token":"old"}""", source.GetRaw());
+
+        File.WriteAllText(path, """{"access_token":"new-longer"}""");
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMilliseconds(100));
+
+        Assert.Equal("""{"access_token":"new-longer"}""", source.GetRaw());
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
     public async Task FileWatch_PicksUpFreshTokenWithinOneSecond()
     {
         // The "host-side autonomous OAuth refresh" code path rewrites the file
@@ -87,6 +103,25 @@ public sealed class CredentialFileSourceTests : IDisposable
         // while the event is still in flight.
         var fired = await Task.WhenAny(observed.Task, Task.Delay(TimeSpan.FromSeconds(2)));
         Assert.Same(observed.Task, fired);
+    }
+
+    [Fact]
+    public void LeakTracker_PrintsWarning_WhenCredentialWatcherIsNotDisposed()
+    {
+        var path = WriteFile("leaky-creds.json", """{"access_token":"leaky"}""");
+        var source = new CredentialFileSource(path);
+        try
+        {
+            using var writer = new StringWriter();
+            Assert.True(TestFileSystemWatcherLeakTracker.ReportLeaks(writer));
+            var output = writer.ToString();
+            Assert.Contains("FileSystemWatcher", output);
+            Assert.Contains(path, output);
+        }
+        finally
+        {
+            source.Dispose();
+        }
     }
 
     [Fact]
