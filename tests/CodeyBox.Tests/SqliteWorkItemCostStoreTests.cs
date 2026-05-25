@@ -411,6 +411,50 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.False(decision.ShouldWait);
     }
 
+    [Theory]
+    [InlineData(0.0)]
+    [InlineData(-10_000.0)]
+    public async Task CostHistoryQuotaHeadroomEstimator_InvalidTokensPerQuotaPctReturnsNullWithoutHistoryQuery(
+        double tokensPerPct)
+    {
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            new ThrowingCostStore(),
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = tokensPerPct,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(new ProjectId("proj-invalid-headroom"), AgentKind.Claude, "claude-opus-4-7"));
+
+        Assert.Null(estimate);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task CostHistoryQuotaHeadroomEstimator_InvalidHistoryItemCountReturnsNullWithoutHistoryQuery(
+        int historyItemCount)
+    {
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            new ThrowingCostStore(),
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomHistoryItemCount = historyItemCount,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(new ProjectId("proj-invalid-headroom"), AgentKind.Claude, "claude-opus-4-7"));
+
+        Assert.Null(estimate);
+    }
+
     [Fact]
     public async Task CostHistoryQuotaHeadroomEstimator_SelectsBoundedModelAgentAndProjectSources()
     {
@@ -493,5 +537,45 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal("project", projectFallback!.Source);
         Assert.Equal(60_000, projectFallback.AverageTokensPerIteration, precision: 2);
         Assert.Equal(6.0, projectFallback.EstimatedIterPctCost, precision: 2);
+    }
+
+    private sealed class ThrowingCostStore : IWorkItemCostStore
+    {
+        public Task RecordAsync(WorkItemCost cost, CancellationToken ct = default) => throw UnexpectedQuery();
+
+        public Task<IReadOnlyList<WorkItemCost>> GetByWorkItemAsync(
+            string workItemId,
+            CancellationToken ct = default) => throw UnexpectedQuery();
+
+        public Task<IReadOnlyList<WorkItemCost>> GetByProjectAsync(
+            string projectId,
+            DateTimeOffset from,
+            DateTimeOffset to,
+            CancellationToken ct = default) => throw UnexpectedQuery();
+
+        public Task<IReadOnlyList<WorkItemCost>> GetRecentByProjectAsync(
+            string projectId,
+            DateTimeOffset from,
+            DateTimeOffset to,
+            string? agentKind,
+            string? modelId,
+            int maxItems,
+            CancellationToken ct = default) => throw UnexpectedQuery();
+
+        public Task<IReadOnlyList<(string ProjectId, double TotalUsd)>> GetFleetCostSummaryAsync(
+            DateTimeOffset from,
+            DateTimeOffset to,
+            CancellationToken ct = default) => throw UnexpectedQuery();
+
+        public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default) => throw UnexpectedQuery();
+
+        public Task<decimal> SumEstimatedUsdAsync(
+            string projectId,
+            DateTimeOffset from,
+            DateTimeOffset to,
+            CancellationToken ct = default) => throw UnexpectedQuery();
+
+        private static InvalidOperationException UnexpectedQuery() =>
+            new("Invalid headroom configuration should short-circuit before querying cost history.");
     }
 }

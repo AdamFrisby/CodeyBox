@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Data.Sqlite;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -160,6 +161,84 @@ public sealed class WaitingForQuotaResetTests : IDisposable
         Assert.Equal(WorkItemCancellationReason.OperatorRequested, refetched.CancellationReason);
         Assert.Null(refetched.QuotaResetAt);
         Assert.Null(refetched.NextQuotaRetryAt);
+    }
+
+    [Fact]
+    public async Task QuotaWaitParker_DoesNotOverwriteTerminalItem()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var terminal = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p1"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Done,
+        };
+        await store.CreateAsync(terminal);
+
+        var notifier = new CapturingQuotaRetryNotifier();
+        var parker = new QuotaWaitParker(
+            store,
+            retryNotifier: notifier,
+            timeProvider: new FixedClock(DateTimeOffset.UtcNow));
+
+        await parker.ParkAsync(new QuotaWaitParkRequest(
+            terminal,
+            "insufficient headroom",
+            "work",
+            DateTimeOffset.UtcNow.AddHours(1)));
+
+        var refetched = await store.GetAsync(terminal.Id);
+        Assert.NotNull(refetched);
+        Assert.Equal(WorkItemState.Done, refetched!.State);
+        Assert.Null(refetched.FailureKind);
+        Assert.Null(refetched.QuotaResetAt);
+        Assert.Null(refetched.NextQuotaRetryAt);
+        Assert.Empty(notifier.Notifications);
+    }
+
+    [Fact]
+    public async Task QuotaWaitParker_DeletedStoreRowReturnsWithoutNotification()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var deletedSnapshot = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p1"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await store.CreateAsync(deletedSnapshot);
+
+        await using (var deleteConn = new SqliteConnection($"Data Source={stateDb}"))
+        {
+            await deleteConn.OpenAsync();
+            await using var deleteCmd = deleteConn.CreateCommand();
+            deleteCmd.CommandText = "DELETE FROM work_items WHERE id = $id";
+            deleteCmd.Parameters.AddWithValue("$id", deletedSnapshot.Id.ToString());
+            await deleteCmd.ExecuteNonQueryAsync();
+        }
+
+        var notifier = new CapturingQuotaRetryNotifier();
+        var parker = new QuotaWaitParker(
+            store,
+            retryNotifier: notifier,
+            timeProvider: new FixedClock(DateTimeOffset.UtcNow));
+
+        await parker.ParkAsync(new QuotaWaitParkRequest(
+            deletedSnapshot,
+            "insufficient headroom",
+            "work",
+            DateTimeOffset.UtcNow.AddHours(1)));
+
+        Assert.Null(await store.GetAsync(deletedSnapshot.Id));
+        Assert.Empty(notifier.Notifications);
     }
 
     [Fact]
