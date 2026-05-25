@@ -19,6 +19,13 @@ public interface IAgentQuotaProbe
     Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct);
 
     /// <summary>
+    /// Returns a quota snapshot after bypassing or invalidating any in-process cache.
+    /// Implementations with no cache can delegate to <see cref="GetAvailabilityAsync"/>.
+    /// </summary>
+    Task<AgentQuotaSnapshot> RefreshAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        => GetAvailabilityAsync(member, ct);
+
+    /// <summary>
     /// Marks <paramref name="member"/> as exhausted for the duration <paramref name="ttl"/>
     /// without waiting for the next periodic probe. Called by the pipeline when an
     /// agent invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>:

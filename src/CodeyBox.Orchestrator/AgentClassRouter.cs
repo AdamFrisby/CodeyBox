@@ -264,6 +264,40 @@ public sealed class AgentClassRouter
     }
 
     /// <summary>
+    /// Releases a dispatch quota reservation. When the worker has invoked the
+    /// pipeline, refresh the provider quota snapshot before freeing projected
+    /// headroom so subsequent pickups cannot combine a stale cached quota value
+    /// with an already-consumed reservation.
+    /// </summary>
+    public async Task ReleaseQuotaReservationAsync(
+        IQuotaReservation reservation,
+        bool quotaMayHaveBeenConsumed,
+        CancellationToken ct = default)
+    {
+        if (!quotaMayHaveBeenConsumed)
+        {
+            reservation.Dispose();
+            return;
+        }
+
+        var refreshed = await TryRefreshReservationQuotaAsync(reservation, ct);
+        if (refreshed || _opts.QuotaCacheTtl <= TimeSpan.Zero)
+        {
+            reservation.Dispose();
+            return;
+        }
+
+        _log.LogWarning(
+            "Could not force-refresh quota before releasing {Agent}/{Model} reservation for project {ProjectId}; retaining {ReservedPct:F1}% reserved headroom for {Delay}",
+            reservation.Agent.Value,
+            reservation.ModelId ?? "(default)",
+            reservation.ProjectId.Value,
+            reservation.ReservedPct,
+            _opts.QuotaCacheTtl);
+        _ = ReleaseReservationAfterDelayAsync(reservation, _opts.QuotaCacheTtl);
+    }
+
+    /// <summary>
     /// Looks up the canonical <see cref="AgentMembership"/> for a class member.
     /// Returns null if the class is unknown or no member matches the (agent, model)
     /// pair. Match is exact on Agent and ModelId (treating null and "" as
@@ -376,6 +410,48 @@ public sealed class AgentClassRouter
         if (_probesByKind.TryGetValue(member.Agent, out var probe))
             return probe.GetAvailabilityAsync(member, ct);
         return _nullProbe.GetAvailabilityAsync(member, ct);
+    }
+
+    private async Task<bool> TryRefreshReservationQuotaAsync(IQuotaReservation reservation, CancellationToken ct)
+    {
+        if (!_probesByKind.TryGetValue(reservation.Agent, out var probe))
+            return false;
+
+        try
+        {
+            await probe.RefreshAvailabilityAsync(
+                new AgentMembership
+                {
+                    Agent = reservation.Agent,
+                    Billing = AgentBilling.Subscription,
+                    ModelId = reservation.ModelId,
+                    QualityScore = 0,
+                },
+                ct);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _log.LogWarning(
+                ex,
+                "Quota refresh failed before releasing {Agent}/{Model} reservation for project {ProjectId}",
+                reservation.Agent.Value,
+                reservation.ModelId ?? "(default)",
+                reservation.ProjectId.Value);
+            return false;
+        }
+    }
+
+    private static async Task ReleaseReservationAfterDelayAsync(IQuotaReservation reservation, TimeSpan delay)
+    {
+        try
+        {
+            await Task.Delay(delay);
+        }
+        finally
+        {
+            reservation.Dispose();
+        }
     }
 
     /// <summary>

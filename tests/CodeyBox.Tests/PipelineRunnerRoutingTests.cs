@@ -299,6 +299,62 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaReservationRefreshesProbeBeforeRelease()
+    {
+        var probe = new RefreshingQuotaProbe(
+            AgentKind.Claude,
+            beforeRefreshAvailablePct: 60.0,
+            afterRefreshAvailablePct: 15.0);
+        var router = BuildReservationRouter(probe, estimatedPctCost: 45.0);
+        var pickupCount = 0;
+        var pipeline = new CountingPipelineRunner(
+            _store,
+            onRun: () => Interlocked.Increment(ref pickupCount));
+
+        var first = MakeRoutedItem() with { Title = "first", CreatedAt = DateTimeOffset.UtcNow.AddSeconds(-1) };
+        var second = MakeRoutedItem() with { Title = "second", CreatedAt = DateTimeOffset.UtcNow };
+        await _store.CreateAsync(first);
+        await _store.CreateAsync(second);
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: null);
+
+        await queue.EnqueueAsync(first.Id);
+        await queue.EnqueueAsync(second.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        WorkItem? secondState = null;
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            secondState = await _store.GetAsync(second.Id);
+            if (secondState?.State == WorkItemState.WaitingForQuotaReset
+                || Volatile.Read(ref pickupCount) > 1)
+            {
+                break;
+            }
+            await Task.Delay(20);
+        }
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, Volatile.Read(ref pickupCount));
+        Assert.Equal(1, probe.RefreshCount);
+        Assert.Equal(WorkItemState.Done, (await _store.GetAsync(first.Id))!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, secondState?.State);
+    }
+
+    [Fact]
     public async Task ConcurrentWorkers_ReserveQuotaAndParkSecondItemUntilFirstCompletes()
     {
         var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);
@@ -438,6 +494,9 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     };
 
     private static AgentClassRouter BuildReservationRouter(double availablePct, double estimatedPctCost)
+        => BuildReservationRouter(new FakeProbe(AgentKind.Claude, availablePct), estimatedPctCost);
+
+    private static AgentClassRouter BuildReservationRouter(IAgentQuotaProbe probe, double estimatedPctCost)
     {
         var agentClass = new AgentClass
         {
@@ -451,7 +510,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
 
         return new AgentClassRouter(
             [agentClass],
-            [new FakeProbe(AgentKind.Claude, availablePct)],
+            [probe],
             new QuotaRouterOptions
             {
                 MinQuotaPct = 10.0,
@@ -459,6 +518,43 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             },
             NullLogger<AgentClassRouter>.Instance,
             headroomEstimator: new FixedHeadroomEstimator(estimatedPctCost));
+    }
+}
+
+internal sealed class RefreshingQuotaProbe : IAgentQuotaProbe
+{
+    private readonly object _gate = new();
+    private readonly AgentQuotaSnapshot _afterRefresh;
+    private AgentQuotaSnapshot _current;
+
+    public RefreshingQuotaProbe(
+        AgentKind kind,
+        double beforeRefreshAvailablePct,
+        double afterRefreshAvailablePct)
+    {
+        Kind = kind;
+        _current = new AgentQuotaSnapshot { AvailablePct = beforeRefreshAvailablePct };
+        _afterRefresh = new AgentQuotaSnapshot { AvailablePct = afterRefreshAvailablePct };
+    }
+
+    public AgentKind Kind { get; }
+
+    public int RefreshCount { get; private set; }
+
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+    {
+        lock (_gate)
+            return Task.FromResult(_current);
+    }
+
+    public Task<AgentQuotaSnapshot> RefreshAvailabilityAsync(AgentMembership member, CancellationToken ct)
+    {
+        lock (_gate)
+        {
+            RefreshCount++;
+            _current = _afterRefresh;
+            return Task.FromResult(_current);
+        }
     }
 }
 

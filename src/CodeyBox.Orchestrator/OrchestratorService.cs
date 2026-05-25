@@ -641,6 +641,7 @@ public sealed class OrchestratorService : BackgroundService
         }
 
         IQuotaReservation? quotaReservation = null;
+        var pipelineInvoked = false;
         try
         {
             var current = await _store.GetAsync(id, ct);
@@ -825,6 +826,7 @@ public sealed class OrchestratorService : BackgroundService
             CompleteQuotaRouting();
             try
             {
+                pipelineInvoked = true;
                 await _pipeline.RunAsync(item, registration.Token, ct);
             }
             catch (PhaseCancellationException pex) when (ct.IsCancellationRequested)
@@ -859,7 +861,13 @@ public sealed class OrchestratorService : BackgroundService
         finally
         {
             CompleteQuotaRouting();
-            quotaReservation?.Dispose();
+            if (quotaReservation is not null)
+            {
+                if (_router is not null)
+                    await _router.ReleaseQuotaReservationAsync(quotaReservation, pipelineInvoked, CancellationToken.None);
+                else
+                    quotaReservation.Dispose();
+            }
             _activeItems.TryRemove(id, out _);
 
             // Stop the heartbeat and remove the registry row on any exit path

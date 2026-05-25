@@ -154,6 +154,12 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         finally { _lock.Release(); }
     }
 
+    public async Task<AgentQuotaSnapshot> RefreshAvailabilityAsync(AgentMembership member, CancellationToken ct)
+    {
+        InvalidateCache();
+        return await GetAvailabilityAsync(member, ct);
+    }
+
     private async Task<AgentQuotaSnapshot> FetchAsync(string token, string? accountId, CancellationToken ct)
     {
         try

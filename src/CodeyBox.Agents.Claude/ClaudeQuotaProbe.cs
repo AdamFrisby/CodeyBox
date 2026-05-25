@@ -141,6 +141,12 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         finally { _lock.Release(); }
     }
 
+    public async Task<AgentQuotaSnapshot> RefreshAvailabilityAsync(AgentMembership member, CancellationToken ct)
+    {
+        InvalidateCache();
+        return await GetAvailabilityAsync(member, ct);
+    }
+
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
 
     private async Task<AgentQuotaSnapshot> FetchAsync(string token, CancellationToken ct)

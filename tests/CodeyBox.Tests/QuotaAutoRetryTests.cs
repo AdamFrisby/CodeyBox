@@ -249,6 +249,34 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task Scheduler_RetriesWaitingForQuotaResetItemsPastMaxRetryCap()
+    {
+        var agent = new QuotaFailingAgent();
+        var (pipeline, store, scheduler, _) = BuildPipeline(agent);
+        using var _ = store;
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 3, // Max is 3, but parked waits are not capped.
+            AgentClassId = "test-class"
+        };
+        await store.CreateAsync(item);
+
+        var sweepMethod = typeof(QuotaRetryScheduler).GetMethod("RunPeriodicSweepAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        await (Task)sweepMethod!.Invoke(scheduler, [CancellationToken.None])!;
+
+        var retried = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(4, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
     public async Task Scheduler_TargetedTimer_FiresRetry()
     {
         var agent = new QuotaFailingAgent();
