@@ -144,6 +144,62 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         Assert.Equal(preRebaseTip, await RevParseAsync(barePath, item.WorkBranch!));
     }
 
+    [Fact]
+    public async Task CleanRebase_NoConflicts_SucceedsEvenWhenNoResolverHasViableCredentials()
+    {
+        // Guards the lazy-resolution branch in RebaseCheckedOutBranchWithScopeFenceAsync:
+        // resolverPair is materialised on FIRST conflict, not up-front. A regression
+        // that hoists ResolveTextOnlyRebaseResolverAsync above the conflict-detection
+        // loop would make every clean pickup-time rebase fail with
+        // failureKind=agent_unavailable in an OAuth-only-Gemini-no-fallback setup —
+        // exactly the misleading-failure shape the routing fix is supposed to
+        // eliminate for the no-conflict case.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var gemini = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Gemini,
+            TextOnlyUnavailabilityReason = "GEMINI_API_KEY is required",
+        };
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Claude,
+            TextOnlyUnavailabilityReason = "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required",
+        };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+            TextOnlyUnavailabilityReason = "OPENAI_API_KEY is required for text-only calls",
+        };
+
+        using var fix = BuildFixture(seed, [gemini, claude, codex]);
+
+        var item = NewItem(AgentKind.Gemini) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        // Work branch and main touch DIFFERENT files — rebase has no conflicts,
+        // so the lazy resolverPair is never materialised and the missing
+        // text-only credentials never matter.
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "feature.md", "work added a feature file\n", "work changes feature");
+        await CommitToSeedAsync(seed, "docs.md", "main added a docs file\n", "main changes docs");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // The crucial assertion: a clean rebase with no viable text-only
+        // resolver MUST NOT fail with agent_unavailable. The lazy-resolution
+        // branch lets the rebase finish without ever consulting the router.
+        Assert.NotEqual("agent_unavailable", final!.FailureKind);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
+        // None of the runners' text-only paths were exercised — there was
+        // no conflict, so the resolver never needed to run.
+        Assert.Empty(gemini.TextOnlyInvocations);
+        Assert.Empty(claude.TextOnlyInvocations);
+        Assert.Empty(codex.TextOnlyInvocations);
+    }
+
     // ── Harness ─────────────────────────────────────────────────────────────
 
     private RoutingFixture BuildFixture(string seedRepoUrl, IReadOnlyList<ScriptedAgent> agents)
