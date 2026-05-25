@@ -138,6 +138,24 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
     }
 
     [Fact]
+    public async Task RefreshAvailabilityAsync_InvalidatesCacheAndRefetchesFixedMember()
+    {
+        var handler = new QuotaMutableResponseHandler(
+            """{"buckets":[{"modelId":"gemini-2.5-pro","remainingFraction":0.2,"tokenType":"REQUESTS"}]}""");
+
+        var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromHours(1));
+        var first = await probe.GetAvailabilityAsync(FixedMember, CancellationToken.None);
+        handler.Body = """{"buckets":[{"modelId":"gemini-2.5-pro","remainingFraction":0.9,"tokenType":"REQUESTS"}]}""";
+        var cached = await probe.GetAvailabilityAsync(FixedMember, CancellationToken.None);
+        var refreshed = await probe.RefreshAvailabilityAsync(FixedMember, CancellationToken.None);
+
+        Assert.Equal(20, first.AvailablePct);
+        Assert.Equal(20, cached.AvailablePct);
+        Assert.Equal(90, refreshed.AvailablePct);
+        Assert.Equal(2, handler.CallCount);
+    }
+
+    [Fact]
     public async Task AutoAndFixed_CacheKeysAreIndependent()
     {
         var handler = new GeminiAutoFanOutHandler(

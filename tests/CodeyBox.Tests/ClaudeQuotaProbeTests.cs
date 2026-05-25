@@ -223,6 +223,23 @@ public sealed class ClaudeQuotaProbeTests
 
         Assert.Equal(2, callCount);
     }
+
+    [Fact]
+    public async Task RefreshAvailabilityAsync_InvalidatesCacheAndRefetches()
+    {
+        var handler = new QuotaMutableResponseHandler(Rollup(90));
+
+        var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromHours(1));
+        var first = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        handler.Body = Rollup(10);
+        var cached = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        var refreshed = await probe.RefreshAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.Equal(10.0, first.AvailablePct, precision: 5);
+        Assert.Equal(10.0, cached.AvailablePct, precision: 5);
+        Assert.Equal(90.0, refreshed.AvailablePct, precision: 5);
+        Assert.Equal(2, handler.CallCount);
+    }
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
@@ -276,4 +293,43 @@ internal sealed class QuotaThrowingHandler : HttpMessageHandler
 
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         => Task.FromException<HttpResponseMessage>(_ex);
+}
+
+internal sealed class QuotaMutableResponseHandler : HttpMessageHandler
+{
+    private readonly object _gate = new();
+    private HttpStatusCode _status;
+    private string _body;
+
+    public QuotaMutableResponseHandler(string body, HttpStatusCode status = HttpStatusCode.OK)
+    {
+        _body = body;
+        _status = status;
+    }
+
+    public int CallCount { get; private set; }
+
+    public string Body
+    {
+        get { lock (_gate) return _body; }
+        set { lock (_gate) _body = value; }
+    }
+
+    public HttpStatusCode Status
+    {
+        get { lock (_gate) return _status; }
+        set { lock (_gate) _status = value; }
+    }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        lock (_gate)
+        {
+            CallCount++;
+            return Task.FromResult(new HttpResponseMessage(_status)
+            {
+                Content = new StringContent(_body),
+            });
+        }
+    }
 }

@@ -245,6 +245,24 @@ public sealed class CodexQuotaProbeTests
     }
 
     [Fact]
+    public async Task RefreshAvailabilityAsync_InvalidatesCacheAndRefetches()
+    {
+        var handler = new QuotaMutableResponseHandler(
+            """{"rate_limit":{"primary_window":{"used_percent":90}}}""");
+
+        var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromHours(1));
+        var first = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        handler.Body = """{"rate_limit":{"primary_window":{"used_percent":10}}}""";
+        var cached = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        var refreshed = await probe.RefreshAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.Equal(10.0, first.AvailablePct, precision: 5);
+        Assert.Equal(10.0, cached.AvailablePct, precision: 5);
+        Assert.Equal(90.0, refreshed.AvailablePct, precision: 5);
+        Assert.Equal(2, handler.CallCount);
+    }
+
+    [Fact]
     public async Task InvalidateCache_ForcesRefetchOnNextCall()
     {
         // Direct unit test for the public InvalidateCache surface that

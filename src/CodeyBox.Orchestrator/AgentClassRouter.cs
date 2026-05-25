@@ -233,20 +233,21 @@ public sealed class AgentClassRouter
         // No member is above the threshold.
         if (hasSubscription)
         {
-            AuditLog.QuotaRouterWaiting(classId, item.Id, _opts.QuotaRecheckInterval);
             var nowForWait = _time.GetUtcNow();
             var suggestedRetryAt = earliestRetryAt ?? nowForWait.Add(_opts.QuotaRecheckInterval);
             var suggestedRecheckIn = suggestedRetryAt > nowForWait
                 ? suggestedRetryAt - nowForWait
                 : TimeSpan.Zero;
+            var waitReason = sawInsufficientHeadroom
+                ? $"all members of class '{classId}' lack projected quota headroom"
+                : $"all members of class '{classId}' are below {_opts.MinQuotaPct}% threshold";
+            AuditLog.QuotaRouterWaiting(classId, item.Id, suggestedRecheckIn, waitReason);
             return new AgentRoutingDecision
             {
                 ShouldWait = true,
                 SuggestedRecheckIn = suggestedRecheckIn,
                 SuggestedRetryAt = suggestedRetryAt,
-                Reason = sawInsufficientHeadroom
-                    ? $"all members of class '{classId}' lack projected quota headroom"
-                    : $"all members of class '{classId}' are below {_opts.MinQuotaPct}% threshold",
+                Reason = waitReason,
             };
         }
 
@@ -269,21 +270,21 @@ public sealed class AgentClassRouter
     /// headroom so subsequent pickups cannot combine a stale cached quota value
     /// with an already-consumed reservation.
     /// </summary>
-    public async Task ReleaseQuotaReservationAsync(
-        IQuotaReservation reservation,
+    private async Task ReleaseQuotaReservationAsync(
+        InProcessQuotaReservationLease reservation,
         bool quotaMayHaveBeenConsumed,
         CancellationToken ct = default)
     {
         if (!quotaMayHaveBeenConsumed)
         {
-            reservation.Dispose();
+            reservation.ReleaseReservedHeadroom();
             return;
         }
 
         var refreshed = await TryRefreshReservationQuotaAsync(reservation, ct);
         if (refreshed || _opts.QuotaCacheTtl <= TimeSpan.Zero)
         {
-            reservation.Dispose();
+            reservation.ReleaseReservedHeadroom();
             return;
         }
 
@@ -412,7 +413,7 @@ public sealed class AgentClassRouter
         return _nullProbe.GetAvailabilityAsync(member, ct);
     }
 
-    private async Task<bool> TryRefreshReservationQuotaAsync(IQuotaReservation reservation, CancellationToken ct)
+    private async Task<bool> TryRefreshReservationQuotaAsync(IQuotaReservationLease reservation, CancellationToken ct)
     {
         if (!_probesByKind.TryGetValue(reservation.Agent, out var probe))
             return false;
@@ -442,7 +443,7 @@ public sealed class AgentClassRouter
         }
     }
 
-    private static async Task ReleaseReservationAfterDelayAsync(IQuotaReservation reservation, TimeSpan delay)
+    private static async Task ReleaseReservationAfterDelayAsync(InProcessQuotaReservationLease reservation, TimeSpan delay)
     {
         try
         {
@@ -450,7 +451,7 @@ public sealed class AgentClassRouter
         }
         finally
         {
-            reservation.Dispose();
+            reservation.ReleaseReservedHeadroom();
         }
     }
 
@@ -546,7 +547,7 @@ public sealed class AgentClassRouter
             var estimatedCost = estimate?.EstimatedIterPctCost;
             var key = new QuotaReservationKey(projectId, member.Agent);
             var reservedPct = GetReservedHeadroomPct(key);
-            IQuotaReservation? reservation = null;
+            IQuotaReservationLease? reservation = null;
 
             if (estimatedCost is { } cost && cost > 0 && reserveQuota)
             {
@@ -557,7 +558,7 @@ public sealed class AgentClassRouter
                     if (QuotaRouter.WouldAllow(availablePct, recentFailure: false, _opts, cost, reservedPct))
                     {
                         _reservedHeadroomPct.AddOrUpdate(key, cost, (_, existing) => existing + cost);
-                        reservation = new InProcessQuotaReservation(this, key, member.ModelId, cost);
+                        reservation = new InProcessQuotaReservationLease(this, key, member.ModelId, cost);
                     }
                 }
             }
@@ -579,9 +580,7 @@ public sealed class AgentClassRouter
                     false,
                     $"insufficient headroom (available={availablePct:F1}%, reserved={reservedPct:F1}%, estimatedCost={refusedCost:F1}%, projected={projected:F1}% < min={_opts.MinQuotaPct:F1}%)",
                     resetAt,
-                    InsufficientHeadroom: true,
-                    refusedCost,
-                    projected);
+                    InsufficientHeadroom: true);
             }
 
             return new QuotaGateDecision(
@@ -591,9 +590,7 @@ public sealed class AgentClassRouter
                     : "quota available",
                 resetAt,
                 InsufficientHeadroom: false,
-                estimatedCost,
-                estimatedCost is { } estimateValue ? availablePct - reservedPct - estimateValue : null,
-                reservation);
+                Reservation: reservation);
         }
 
         if (availablePct >= 0)
@@ -771,20 +768,19 @@ public sealed class AgentClassRouter
         string Reason,
         DateTimeOffset? RetryAt,
         bool InsufficientHeadroom = false,
-        double? EstimatedIterPctCost = null,
-        double? ProjectedAvailablePct = null,
-        IQuotaReservation? Reservation = null);
+        IQuotaReservationLease? Reservation = null);
 
     private sealed record QuotaReservationKey(ProjectId ProjectId, AgentKind Agent);
 
-    private sealed class InProcessQuotaReservation : IQuotaReservation
+    private sealed class InProcessQuotaReservationLease : IQuotaReservationLease
     {
         private readonly AgentClassRouter _router;
         private readonly QuotaReservationKey _key;
         private readonly string? _modelId;
         private int _disposed;
+        private int _releaseStarted;
 
-        public InProcessQuotaReservation(AgentClassRouter router, QuotaReservationKey key, string? modelId, double reservedPct)
+        public InProcessQuotaReservationLease(AgentClassRouter router, QuotaReservationKey key, string? modelId, double reservedPct)
         {
             _router = router;
             _key = key;
@@ -797,7 +793,15 @@ public sealed class AgentClassRouter
         public string? ModelId => string.IsNullOrEmpty(_modelId) ? null : _modelId;
         public double ReservedPct { get; }
 
-        public void Dispose()
+        public Task ReleaseAsync(bool quotaMayHaveBeenConsumed, CancellationToken ct = default)
+        {
+            if (Interlocked.Exchange(ref _releaseStarted, 1) != 0)
+                return Task.CompletedTask;
+
+            return _router.ReleaseQuotaReservationAsync(this, quotaMayHaveBeenConsumed, ct);
+        }
+
+        public void ReleaseReservedHeadroom()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
                 _router.ReleaseReservation(_key, ReservedPct);
@@ -848,7 +852,7 @@ public sealed record AgentRoutingDecision
     /// dispatch. The worker owns and releases it when the run leaves the hot path.
     /// Null for PayPerApi members, unestimated routes, and dry-run resolver calls.
     /// </summary>
-    public IQuotaReservation? QuotaReservation { get; init; }
+    public IQuotaReservationLease? QuotaReservation { get; init; }
 
     /// <summary>Suggested delay before re-attempting pickup.</summary>
     public TimeSpan SuggestedRecheckIn { get; init; }
@@ -866,12 +870,19 @@ public sealed record AgentRoutingDecision
     public bool NoEligibleMembers { get; init; }
 }
 
-public interface IQuotaReservation : IDisposable
+public interface IQuotaReservationLease
 {
     ProjectId ProjectId { get; }
     AgentKind Agent { get; }
     string? ModelId { get; }
     double ReservedPct { get; }
+
+    /// <summary>
+    /// Releases this reservation. Pass <paramref name="quotaMayHaveBeenConsumed"/>
+    /// as true after an agent invocation reached the provider, so the lease can
+    /// refresh provider quota or delay release when the snapshot could be stale.
+    /// </summary>
+    Task ReleaseAsync(bool quotaMayHaveBeenConsumed, CancellationToken ct = default);
 }
 
 /// <summary>

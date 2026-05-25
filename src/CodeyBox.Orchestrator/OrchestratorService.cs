@@ -640,7 +640,7 @@ public sealed class OrchestratorService : BackgroundService
             }
         }
 
-        IQuotaReservation? quotaReservation = null;
+        IQuotaReservationLease? quotaReservation = null;
         var pipelineInvoked = false;
         try
         {
@@ -863,10 +863,7 @@ public sealed class OrchestratorService : BackgroundService
             CompleteQuotaRouting();
             if (quotaReservation is not null)
             {
-                if (_router is not null)
-                    await _router.ReleaseQuotaReservationAsync(quotaReservation, pipelineInvoked, CancellationToken.None);
-                else
-                    quotaReservation.Dispose();
+                await quotaReservation.ReleaseAsync(pipelineInvoked, CancellationToken.None);
             }
             _activeItems.TryRemove(id, out _);
 

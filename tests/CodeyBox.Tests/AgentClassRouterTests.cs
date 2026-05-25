@@ -215,21 +215,21 @@ public sealed class AgentClassRouterTests
         var second = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
         var third = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
 
-        var firstReservation = Assert.IsAssignableFrom<IQuotaReservation>(first.QuotaReservation);
-        var secondReservation = Assert.IsAssignableFrom<IQuotaReservation>(second.QuotaReservation);
+        var firstReservation = Assert.IsAssignableFrom<IQuotaReservationLease>(first.QuotaReservation);
+        var secondReservation = Assert.IsAssignableFrom<IQuotaReservationLease>(second.QuotaReservation);
         Assert.Equal(Claude, first.Chosen!.Agent);
         Assert.Equal(Claude, second.Chosen!.Agent);
         Assert.Null(third.Chosen);
         Assert.True(third.ShouldWait);
         Assert.Contains("headroom", third.Reason);
-        firstReservation.Dispose();
-        secondReservation.Dispose();
+        await firstReservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
+        await secondReservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
 
         var afterRelease = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None, reserveQuota: true);
-        var afterReleaseReservation = Assert.IsAssignableFrom<IQuotaReservation>(afterRelease.QuotaReservation);
+        var afterReleaseReservation = Assert.IsAssignableFrom<IQuotaReservationLease>(afterRelease.QuotaReservation);
         Assert.Equal(Claude, afterRelease.Chosen!.Agent);
         Assert.False(afterRelease.ShouldWait);
-        afterReleaseReservation.Dispose();
+        await afterReleaseReservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
     }
 
     [Fact]
@@ -287,7 +287,7 @@ public sealed class AgentClassRouterTests
             null,
             CancellationToken.None,
             reserveQuota: true);
-        var reservation = Assert.IsAssignableFrom<IQuotaReservation>(first.QuotaReservation);
+        var reservation = Assert.IsAssignableFrom<IQuotaReservationLease>(first.QuotaReservation);
 
         try
         {
@@ -304,7 +304,7 @@ public sealed class AgentClassRouterTests
         }
         finally
         {
-            reservation.Dispose();
+            await reservation.ReleaseAsync(quotaMayHaveBeenConsumed: false);
         }
     }
 

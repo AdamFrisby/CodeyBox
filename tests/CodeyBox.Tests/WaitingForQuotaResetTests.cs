@@ -164,6 +164,47 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaWaitParker_ConditionalUpdateRaceReturnsWithoutNotification()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var innerStore = new SqliteWorkItemStore(stateDb);
+        var store = new ConcurrentChangeOnTryUpdateStore(innerStore);
+
+        var queuedSnapshot = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p1"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await store.CreateAsync(queuedSnapshot);
+
+        var notifier = new CapturingQuotaRetryNotifier();
+        var webhooks = new CapturingWebhookDispatcher();
+        var parker = new QuotaWaitParker(
+            store,
+            webhooks,
+            notifier,
+            timeProvider: new FixedClock(DateTimeOffset.UtcNow));
+
+        await parker.ParkAsync(new QuotaWaitParkRequest(
+            queuedSnapshot,
+            "insufficient headroom",
+            "work",
+            DateTimeOffset.UtcNow.AddHours(1)));
+
+        var refetched = await store.GetAsync(queuedSnapshot.Id);
+        Assert.NotNull(refetched);
+        Assert.Equal(WorkItemState.Cancelled, refetched!.State);
+        Assert.Equal("cancelled during conditional update", refetched.LastError);
+        Assert.Null(refetched.QuotaResetAt);
+        Assert.Null(refetched.NextQuotaRetryAt);
+        Assert.Empty(notifier.Notifications);
+        Assert.Empty(webhooks.Events);
+    }
+
+    [Fact]
     public async Task QuotaWaitParker_DoesNotOverwriteTerminalItem()
     {
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -564,6 +605,89 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaRetryScheduler_PeriodicSweep_ReEnqueuesWaitingForQuotaResetItemWhenSubscriptionQuotaRestored()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var time = new FixedClock(DateTimeOffset.UtcNow);
+        var pid = new ProjectId("p1");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = pid,
+            DisplayName = "p1",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Claude,
+            DefaultAgentClass = "test-class",
+        });
+
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+
+        var classes = new List<AgentClass>
+        {
+            new AgentClass
+            {
+                Id = "test-class",
+                DisplayName = "Test",
+                Members =
+                [
+                    new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                ],
+            },
+        };
+        var router = new AgentClassRouter(
+            classes,
+            [new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 100 })],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            time);
+        var opts = new OrchestratorOptions
+        {
+            AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+            {
+                Enabled = true,
+                PeriodicCheckInterval = TimeSpan.FromHours(1),
+                MaxAutoRetriesPerWorkItem = 3,
+            },
+        };
+        var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            opts,
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            timeProvider: time);
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = pid,
+            Title = "parked",
+            Prompt = "p",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            AgentClassId = "test-class",
+            QuotaResetAt = time.GetUtcNow().AddMinutes(-5),
+            NextQuotaRetryAt = time.GetUtcNow().AddMinutes(-1),
+        };
+        await store.CreateAsync(parked);
+
+        var sweep = typeof(QuotaRetryScheduler).GetMethod(
+            "RunPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)sweep.Invoke(scheduler, [CancellationToken.None])!;
+
+        var refetched = await store.GetAsync(parked.Id);
+        Assert.NotNull(refetched);
+        Assert.Equal(WorkItemState.Queued, refetched!.State);
+        Assert.Equal(1, refetched.QuotaRetryAttempts);
+    }
+
+    [Fact]
     public void OrchestratorService_StartupRecovery_DoesNotRecoverWaitingForQuotaReset()
     {
         // WaitingForQuotaReset must be a resting point on startup recovery —
@@ -937,6 +1061,84 @@ public sealed class WaitingForQuotaResetTests : IDisposable
             Notifications.Add(item);
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class ConcurrentChangeOnTryUpdateStore : IWorkItemStore
+    {
+        private readonly IWorkItemStore _inner;
+        private int _changed;
+
+        public ConcurrentChangeOnTryUpdateStore(IWorkItemStore inner) => _inner = inner;
+
+        public Task CreateAsync(WorkItem item, CancellationToken ct = default) =>
+            _inner.CreateAsync(item, ct);
+
+        public Task UpdateAsync(WorkItem item, CancellationToken ct = default) =>
+            _inner.UpdateAsync(item, ct);
+
+        public async Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default)
+        {
+            if (Interlocked.Exchange(ref _changed, 1) == 0)
+            {
+                var current = await _inner.GetAsync(item.Id, ct);
+                if (current is not null)
+                {
+                    await _inner.UpdateAsync(
+                        current.With(WorkItemState.Cancelled, "cancelled during conditional update"),
+                        ct);
+                }
+            }
+
+            return await _inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
+        }
+
+        public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+            _inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
+
+        public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) =>
+            _inner.GetAsync(id, ct);
+
+        public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) =>
+            _inner.ListAsync(ct);
+
+        public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) =>
+            _inner.ListByStateAsync(state, ct);
+
+        public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) =>
+            _inner.CountByStateAsync(state, ct);
+
+        public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) =>
+            _inner.ReorderAsync(orderedIds, ct);
+
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) =>
+            _inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+
+        public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) =>
+            _inner.CountStartedInWindowAsync(projectId, since, ct);
+
+        public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) =>
+            _inner.CountInFlightAsync(projectId, ct);
+
+        public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) =>
+            _inner.GetByExternalIdAsync(projectId, externalId, ct);
+
+        public Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default) =>
+            _inner.GetFleetStateCountsAsync(ct);
+
+        public Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default) =>
+            _inner.GetFleetRecentOutcomesAsync(perProject, ct);
+
+        public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default) =>
+            _inner.GetFleetPauseStatesAsync(ct);
+
+        public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) =>
+            _inner.ListByReplaySourceAsync(sourceId, ct);
+
+        public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) =>
+            _inner.OrphanReplaysAsync(sourceId, ct);
+
+        public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) =>
+            _inner.ListByReleaseAsync(releaseId, ct);
     }
 
     private sealed class ThrowingProjectRepository : IProjectRepository

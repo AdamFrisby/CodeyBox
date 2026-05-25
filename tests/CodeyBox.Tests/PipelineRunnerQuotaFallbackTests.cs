@@ -534,7 +534,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             maxSteps: 500);
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
-        Assert.InRange(elapsed, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(32));
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(33));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);

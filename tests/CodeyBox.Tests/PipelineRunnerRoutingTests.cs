@@ -355,6 +355,59 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaReservationRefreshFailureRetainsReservationUntilCacheTtl()
+    {
+        var probe = new ThrowingRefreshQuotaProbe(AgentKind.Claude, availablePct: 60.0);
+        var router = BuildReservationRouter(probe, estimatedPctCost: 45.0);
+        var pickupCount = 0;
+        var pipeline = new CountingPipelineRunner(
+            _store,
+            onRun: () => Interlocked.Increment(ref pickupCount));
+
+        var first = MakeRoutedItem() with { Title = "first", CreatedAt = DateTimeOffset.UtcNow.AddSeconds(-1) };
+        var second = MakeRoutedItem() with { Title = "second", CreatedAt = DateTimeOffset.UtcNow };
+        await _store.CreateAsync(first);
+        await _store.CreateAsync(second);
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: null);
+
+        await queue.EnqueueAsync(first.Id);
+        await queue.EnqueueAsync(second.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        WorkItem? secondState = null;
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            secondState = await _store.GetAsync(second.Id);
+            if (secondState?.State == WorkItemState.WaitingForQuotaReset
+                || Volatile.Read(ref pickupCount) > 1)
+            {
+                break;
+            }
+            await Task.Delay(20);
+        }
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, Volatile.Read(ref pickupCount));
+        Assert.Equal(1, probe.RefreshCount);
+        Assert.Equal(WorkItemState.Done, (await _store.GetAsync(first.Id))!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, secondState?.State);
+    }
+
+    [Fact]
     public async Task ConcurrentWorkers_ReserveQuotaAndParkSecondItemUntilFirstCompletes()
     {
         var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);
@@ -555,6 +608,30 @@ internal sealed class RefreshingQuotaProbe : IAgentQuotaProbe
             _current = _afterRefresh;
             return Task.FromResult(_current);
         }
+    }
+}
+
+internal sealed class ThrowingRefreshQuotaProbe : IAgentQuotaProbe
+{
+    private readonly AgentQuotaSnapshot _snapshot;
+
+    public ThrowingRefreshQuotaProbe(AgentKind kind, double availablePct)
+    {
+        Kind = kind;
+        _snapshot = new AgentQuotaSnapshot { AvailablePct = availablePct };
+    }
+
+    public AgentKind Kind { get; }
+
+    public int RefreshCount { get; private set; }
+
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        => Task.FromResult(_snapshot);
+
+    public Task<AgentQuotaSnapshot> RefreshAvailabilityAsync(AgentMembership member, CancellationToken ct)
+    {
+        RefreshCount++;
+        throw new InvalidOperationException("refresh failed");
     }
 }
 
