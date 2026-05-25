@@ -9,6 +9,14 @@ public interface IQuotaRetryNotifier
     Task NotifyQuotaFailureAsync(WorkItem item);
 }
 
+public interface IQuotaResetResolver
+{
+    Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
+        WorkItem item,
+        Project? project,
+        CancellationToken ct);
+}
+
 public interface IQuotaWaitParker
 {
     Task<DateTimeOffset> ResolveResetAtAsync(
@@ -34,7 +42,7 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
     private readonly IWebhookDispatcher? _webhooks;
     private readonly IQuotaRetryNotifier? _retryNotifier;
     private readonly IProjectRepository? _projects;
-    private readonly AgentClassRouter? _classRouter;
+    private readonly IQuotaResetResolver? _resetResolver;
     private readonly ILogger<QuotaWaitParker> _log;
     private readonly TimeProvider _time;
 
@@ -46,7 +54,7 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
         IWebhookDispatcher? webhooks = null,
         IQuotaRetryNotifier? retryNotifier = null,
         IProjectRepository? projects = null,
-        AgentClassRouter? classRouter = null,
+        IQuotaResetResolver? resetResolver = null,
         ILogger<QuotaWaitParker>? log = null,
         TimeProvider? timeProvider = null)
     {
@@ -54,7 +62,7 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
         _webhooks = webhooks;
         _retryNotifier = retryNotifier;
         _projects = projects;
-        _classRouter = classRouter;
+        _resetResolver = resetResolver;
         _log = log ?? NullLogger<QuotaWaitParker>.Instance;
         _time = timeProvider ?? TimeProvider.System;
     }
@@ -69,7 +77,7 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
         if (resetAt is not null)
             return resetAt.Value;
 
-        if (_classRouter is not null)
+        if (_resetResolver is not null)
         {
             try
             {
@@ -77,7 +85,7 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
                 if (effectiveProject is null && _projects is not null)
                     effectiveProject = await _projects.GetAsync(item.ProjectId, ct);
 
-                resetAt = await _classRouter.ComputeEarliestExhaustedResetAsync(item, effectiveProject, ct);
+                resetAt = await _resetResolver.ComputeEarliestExhaustedResetAsync(item, effectiveProject, ct);
                 if (resetAt is not null)
                     return resetAt.Value;
             }
@@ -91,7 +99,6 @@ public sealed class QuotaWaitParker : IQuotaWaitParker
                     ex,
                     "Failed to compute quota reset fallback for failed work item {Id}",
                     item.Id);
-                throw;
             }
         }
 

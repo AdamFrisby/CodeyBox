@@ -58,6 +58,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         EstimatedUsd = 0.168525,
         StartedAt = DateTimeOffset.UtcNow.AddSeconds(-5),
         EndedAt = DateTimeOffset.UtcNow,
+        RawMetadataJson = """{"usageSource":"provider_metadata"}""",
     };
 
     [Fact]
@@ -293,6 +294,58 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(7.0, estimate!.EstimatedIterPctCost, precision: 2);
         Assert.Equal(70_000, estimate.AverageTokensPerIteration, precision: 2);
         Assert.Equal(3, estimate.SampledItemCount);
+    }
+
+    [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_IgnoresUntrustedAndOverCapTokenRows()
+    {
+        var untrustedItem = Guid.NewGuid().ToString();
+        var overCapItem = Guid.NewGuid().ToString();
+        var trustedItem = Guid.NewGuid().ToString();
+        SeedWorkItem(untrustedItem, "proj-headroom-trust");
+        SeedWorkItem(overCapItem, "proj-headroom-trust");
+        SeedWorkItem(trustedItem, "proj-headroom-trust");
+
+        await _store.RecordAsync(MakeCost(untrustedItem) with
+        {
+            InputTokens = int.MaxValue,
+            OutputTokens = 0,
+            RawMetadataJson = "{}",
+        });
+        await _store.RecordAsync(MakeCost(overCapItem) with
+        {
+            InputTokens = 600_000,
+            OutputTokens = 1,
+        });
+        await _store.RecordAsync(MakeCost(trustedItem) with
+        {
+            InputTokens = 40_000,
+            OutputTokens = 10_000,
+        });
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+                HeadroomMaxTokensPerCostRow = 500_000,
+                HeadroomMaxTokensPerIteration = 500_000,
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(
+                new ProjectId("proj-headroom-trust"),
+                AgentKind.Claude,
+                "claude-opus-4-7"));
+
+        Assert.NotNull(estimate);
+        Assert.True(estimate!.TrustedForEnforcement);
+        Assert.Equal(5.0, estimate.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(50_000, estimate.AverageTokensPerIteration, precision: 2);
+        Assert.Equal(1, estimate.SampledItemCount);
     }
 
     [Fact]

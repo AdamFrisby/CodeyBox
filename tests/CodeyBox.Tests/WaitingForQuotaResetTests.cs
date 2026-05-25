@@ -438,7 +438,7 @@ public sealed class WaitingForQuotaResetTests : IDisposable
         var parker = new QuotaWaitParker(
             store,
             projects: projects,
-            classRouter: router,
+            resetResolver: router,
             timeProvider: time);
 
         var item = new WorkItem
@@ -465,7 +465,7 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
-    public async Task QuotaWaitParker_ResetFallbackFailurePropagatesAndLeavesItemQueued()
+    public async Task QuotaWaitParker_ResetFallbackFailureUsesDefaultPauseAndParksItem()
     {
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
         using var store = new SqliteWorkItemStore(stateDb);
@@ -481,7 +481,7 @@ public sealed class WaitingForQuotaResetTests : IDisposable
         var parker = new QuotaWaitParker(
             store,
             projects: new ThrowingProjectRepository(),
-            classRouter: router,
+            resetResolver: router,
             timeProvider: time);
 
         var item = new WorkItem
@@ -494,18 +494,18 @@ public sealed class WaitingForQuotaResetTests : IDisposable
         };
         await store.CreateAsync(item);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => parker.ParkAsync(
+        await parker.ParkAsync(
             new QuotaWaitParkRequest(
                 item,
                 "insufficient headroom",
                 "work",
                 QuotaResetAt: null,
-                Project: null)));
+                Project: null));
 
         var stored = await store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Queued, stored!.State);
-        Assert.Null(stored.QuotaResetAt);
-        Assert.Null(stored.NextQuotaRetryAt);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stored!.State);
+        Assert.Equal(now.Add(QuotaWaitParker.DefaultQuotaFailurePause), stored.QuotaResetAt);
+        Assert.Equal(now.Add(QuotaWaitParker.DefaultQuotaFailurePause), stored.NextQuotaRetryAt);
     }
 
     [Theory]

@@ -713,6 +713,8 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         HeadroomTokensPerQuotaPctByAgent = new Dictionary<string, double>(
             qr.HeadroomTokensPerQuotaPctByAgent,
             StringComparer.OrdinalIgnoreCase),
+        HeadroomMaxTokensPerCostRow = qr.HeadroomMaxTokensPerCostRow,
+        HeadroomMaxTokensPerIteration = qr.HeadroomMaxTokensPerIteration,
     };
 });
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
@@ -801,7 +803,7 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         TimeProvider.System,
         todModifiers,
         sp.GetService<IQuotaFailureStore>(),
-        sp.GetService<IQuotaHeadroomEstimator>());
+        headroomManager: sp.GetService<IQuotaHeadroomManager>());
 });
 
 // --- Credential smoke probes -------------------------------------------------
@@ -1096,6 +1098,11 @@ builder.Services.AddSingleton<CostHistoryQuotaHeadroomEstimator>(sp => new CostH
     TimeProvider.System));
 builder.Services.AddSingleton<IQuotaHeadroomEstimator>(sp => new LazyQuotaHeadroomEstimator(
     () => sp.GetService<CostHistoryQuotaHeadroomEstimator>()));
+builder.Services.AddSingleton<IQuotaHeadroomManager>(sp => new InProcessQuotaHeadroomManager(
+    sp.GetService<IQuotaHeadroomEstimator>(),
+    sp.GetServices<IAgentQuotaProbe>(),
+    sp.GetRequiredService<QuotaRouterOptions>(),
+    sp.GetRequiredService<ILogger<InProcessQuotaHeadroomManager>>()));
 builder.Services.AddSingleton<IAgentStreamSummaryStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1360,7 +1367,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<DeadWorkerOptions>(),
     sp.GetRequiredService<DeadWorkerReaper>(),
     sp.GetService<ReleaseService>(),
-    sp.GetRequiredService<IQuotaWaitParker>()));
+    sp.GetRequiredService<IQuotaWaitParker>(),
+    sp.GetRequiredService<IQuotaHeadroomManager>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -1438,6 +1446,7 @@ app.MapGet("/quota", async (
     IEnumerable<IAgentQuotaProbe> probes,
     IQuotaFailureStore? failureStore,
     IQuotaHeadroomEstimator headroomEstimator,
+    IQuotaHeadroomManager headroomManager,
     IProjectRepository projects,
     QuotaRouterOptions options,
     CancellationToken ct) =>
@@ -1466,7 +1475,10 @@ app.MapGet("/quota", async (
                 ct);
             var projected = estimate is null || snapshot.AvailablePct < 0
                 ? (double?)null
-                : snapshot.AvailablePct - estimate.EstimatedIterPctCost;
+                : snapshot.AvailablePct
+                    - headroomManager.GetReservedHeadroomPct(project.Id, probe.Kind)
+                    - (estimate.TrustedForEnforcement ? estimate.EstimatedIterPctCost : 0);
+            var reservedQuotaPct = headroomManager.GetReservedHeadroomPct(project.Id, probe.Kind);
             headroomProjections.Add(new
             {
                 projectId = project.Id.Value,
@@ -1474,13 +1486,16 @@ app.MapGet("/quota", async (
                 averageTokensPerIteration = estimate?.AverageTokensPerIteration,
                 sampledItemCount = estimate?.SampledItemCount,
                 source = estimate?.Source,
+                trustedForEnforcement = estimate?.TrustedForEnforcement,
+                reservedQuotaPct,
                 projectedAvailablePct = projected,
                 wouldAllow = QuotaRouter.WouldAllow(
                     snapshot.AvailablePct,
                     failures.Any(f => f.Agent == probe.Kind
                         && f.ObservedAt >= now - options.ObservedFailureWindow),
                     options,
-                    estimate?.EstimatedIterPctCost),
+                    estimate is { TrustedForEnforcement: true } ? estimate.EstimatedIterPctCost : null,
+                    reservedQuotaPct),
             });
         }
         var recentFailuresForProbe = failures
@@ -2017,6 +2032,10 @@ namespace CodeyBox.Api
         public double HeadroomTokensPerQuotaPct { get; set; } = 10_000.0;
         /// <summary>Per-agent override for token count treated as one quota percentage point.</summary>
         public Dictionary<string, double> HeadroomTokensPerQuotaPctByAgent { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>Maximum trusted tokens accepted from a single cost row for headroom projection. Default 500000.</summary>
+        public int HeadroomMaxTokensPerCostRow { get; set; } = 500_000;
+        /// <summary>Maximum trusted tokens accepted from one sampled iteration. Default 500000.</summary>
+        public int HeadroomMaxTokensPerIteration { get; set; } = 500_000;
     }
 
     /// <summary>

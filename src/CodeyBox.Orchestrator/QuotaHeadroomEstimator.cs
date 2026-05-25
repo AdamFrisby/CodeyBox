@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using System.Text.Json;
 
 namespace CodeyBox.Orchestrator;
 
@@ -19,7 +20,8 @@ public sealed record QuotaHeadroomEstimate(
     double EstimatedIterPctCost,
     double AverageTokensPerIteration,
     int SampledItemCount,
-    string Source);
+    string Source,
+    bool TrustedForEnforcement = false);
 
 public sealed class LazyQuotaHeadroomEstimator : IQuotaHeadroomEstimator
 {
@@ -98,35 +100,39 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
                 maxItems,
                 ct)
             : [];
+        scoped = FilterTrustedRows(scoped);
         var source = "agent+model";
 
         if (scoped.Count == 0)
         {
-            scoped = await _costs.GetRecentByProjectAsync(
+            scoped = FilterTrustedRows(await _costs.GetRecentByProjectAsync(
                 request.ProjectId.Value,
                 from,
                 now,
                 request.Agent.Value,
                 modelId: null,
                 maxItems,
-                ct);
+                ct));
             source = "agent";
         }
 
         if (scoped.Count == 0)
         {
-            scoped = await _costs.GetRecentByProjectAsync(
+            scoped = FilterTrustedRows(await _costs.GetRecentByProjectAsync(
                 request.ProjectId.Value,
                 from,
                 now,
                 agentKind: null,
                 modelId: null,
                 maxItems,
-                ct);
+                ct));
             source = "project";
         }
 
-        var samples = BuildPerItemIterationSamples(scoped, maxItems);
+        var samples = BuildPerItemIterationSamples(
+            scoped,
+            maxItems,
+            _options.HeadroomMaxTokensPerIteration);
         if (samples.Count == 0)
         {
             _log.LogDebug(
@@ -163,7 +169,8 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
             EstimatedIterPctCost: Math.Round(estimatedPct, 2, MidpointRounding.AwayFromZero),
             AverageTokensPerIteration: Math.Round(averageTokens, 2, MidpointRounding.AwayFromZero),
             SampledItemCount: samples.Count,
-            Source: source);
+            Source: source,
+            TrustedForEnforcement: true);
     }
 
     private double ResolveTokensPerPct(AgentKind agent)
@@ -177,11 +184,72 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
         return _options.HeadroomTokensPerQuotaPct;
     }
 
+    private IReadOnlyList<WorkItemCost> FilterTrustedRows(IReadOnlyList<WorkItemCost> rows)
+    {
+        if (rows.Count == 0)
+            return rows;
+
+        var maxTokensPerRow = _options.HeadroomMaxTokensPerCostRow;
+        if (maxTokensPerRow <= 0)
+        {
+            _log.LogWarning(
+                "Quota headroom projection disabled: HeadroomMaxTokensPerCostRow must be positive");
+            return [];
+        }
+
+        return rows
+            .Where(row => IsTrustedHeadroomRow(row)
+                && IsValidTokenRow(row, maxTokensPerRow))
+            .ToList();
+    }
+
+    private static bool IsValidTokenRow(WorkItemCost row, int maxTokensPerRow)
+    {
+        if (row.InputTokens < 0 || row.OutputTokens < 0 || row.CachedInputTokens < 0)
+            return false;
+
+        var totalTokens = (long)row.InputTokens + row.OutputTokens;
+        return totalTokens > 0 && totalTokens <= maxTokensPerRow;
+    }
+
+    internal static bool IsTrustedHeadroomRow(WorkItemCost row)
+    {
+        if (string.IsNullOrWhiteSpace(row.RawMetadataJson))
+            return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(row.RawMetadataJson);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return false;
+
+            if (root.TryGetProperty("quotaHeadroomTrusted", out var trusted)
+                && trusted.ValueKind == JsonValueKind.True)
+            {
+                return true;
+            }
+
+            return HasTrustedUsageSource(root, "usageSource")
+                || HasTrustedUsageSource(root, "source");
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool HasTrustedUsageSource(JsonElement root, string propertyName) =>
+        root.TryGetProperty(propertyName, out var source)
+        && source.ValueKind == JsonValueKind.String
+        && string.Equals(source.GetString(), "provider_metadata", StringComparison.OrdinalIgnoreCase);
+
     private static IReadOnlyList<double> BuildPerItemIterationSamples(
         IReadOnlyList<WorkItemCost> rows,
-        int maxItems)
+        int maxItems,
+        int maxTokensPerIteration)
     {
-        if (rows.Count == 0 || maxItems <= 0)
+        if (rows.Count == 0 || maxItems <= 0 || maxTokensPerIteration <= 0)
             return [];
 
         return rows
@@ -190,6 +258,7 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
             .Take(maxItems)
             .Select(ItemTokensPerIteration)
             .Where(tokens => tokens > 0)
+            .Select(tokens => Math.Min(tokens, maxTokensPerIteration))
             .ToList();
     }
 

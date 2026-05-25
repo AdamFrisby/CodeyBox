@@ -30,6 +30,7 @@ public sealed class OrchestratorService : BackgroundService
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
     private readonly IQuotaWaitParker _quotaWaitParker;
+    private readonly IQuotaHeadroomManager? _quotaHeadroomManager;
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -81,7 +82,8 @@ public sealed class OrchestratorService : BackgroundService
         DeadWorkerOptions? deadWorkerOpts = null,
         DeadWorkerReaper? reaper = null,
         ReleaseService? releaseService = null,
-        IQuotaWaitParker? quotaWaitParker = null)
+        IQuotaWaitParker? quotaWaitParker = null,
+        IQuotaHeadroomManager? quotaHeadroomManager = null)
     {
         _queue = queue;
         _store = store;
@@ -103,6 +105,7 @@ public sealed class OrchestratorService : BackgroundService
             retryNotifier: null,
             projects,
             router);
+        _quotaHeadroomManager = quotaHeadroomManager;
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
     }
 
@@ -714,7 +717,7 @@ public sealed class OrchestratorService : BackgroundService
             // Skipped entirely (no probe, no wait) when no agent class is configured.
             if (_router is not null)
             {
-                var decision = await _router.ResolveAsync(item, project, ct, reserveQuota: true);
+                var decision = await _router.ResolveAsync(item, project, ct);
                 if (decision.ShouldWait)
                 {
                     CompleteQuotaRouting();
@@ -731,7 +734,37 @@ public sealed class OrchestratorService : BackgroundService
                 }
                 if (decision.Chosen is { } chosen)
                 {
-                    quotaReservation = decision.QuotaReservation;
+                    if (_quotaHeadroomManager is not null && chosen.Billing == AgentBilling.Subscription)
+                    {
+                        var reservationGate = await _quotaHeadroomManager.TryReserveAsync(
+                            new QuotaHeadroomGateRequest(
+                                item.ProjectId,
+                                chosen,
+                                decision.ChosenAvailablePct ?? -1,
+                                decision.ChosenQuotaResetAt),
+                            ct);
+                        if (!reservationGate.Allow)
+                        {
+                            var retryAt = reservationGate.RetryAt
+                                ?? DateTimeOffset.UtcNow.Add(QuotaWaitParker.DefaultQuotaFailurePause);
+                            var recheckIn = retryAt > DateTimeOffset.UtcNow
+                                ? retryAt - DateTimeOffset.UtcNow
+                                : TimeSpan.Zero;
+                            CompleteQuotaRouting();
+                            AuditLog.QuotaRouterDeferred(item.Id, recheckIn);
+                            await _quotaWaitParker.ParkAsync(
+                                new QuotaWaitParkRequest(
+                                    item,
+                                    reservationGate.Reason,
+                                    QuotaRetryPhaseForDispatchState(item.State),
+                                    retryAt,
+                                    project),
+                                ct);
+                            return;
+                        }
+
+                        quotaReservation = reservationGate.Reservation;
+                    }
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId, ReasoningMode = chosen.ReasoningMode };
                 }
                 else if (decision.NoEligibleMembers)

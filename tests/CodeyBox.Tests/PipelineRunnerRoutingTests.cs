@@ -259,7 +259,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     [Fact]
     public async Task QuotaReservationReleasedAfterPipelineCompletion_AllowsNextItem()
     {
-        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);
+        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0, out var headroomManager);
         var pickupCount = 0;
         var pipeline = new CountingPipelineRunner(
             _store,
@@ -280,7 +280,8 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
             NullLogger<OrchestratorService>.Instance,
             router,
-            projects: null);
+            projects: null,
+            quotaHeadroomManager: headroomManager);
 
         await queue.EnqueueAsync(first.Id);
         await queue.EnqueueAsync(second.Id);
@@ -305,7 +306,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             AgentKind.Claude,
             beforeRefreshAvailablePct: 60.0,
             afterRefreshAvailablePct: 15.0);
-        var router = BuildReservationRouter(probe, estimatedPctCost: 45.0);
+        var router = BuildReservationRouter(probe, estimatedPctCost: 45.0, out var headroomManager);
         var pickupCount = 0;
         var pipeline = new CountingPipelineRunner(
             _store,
@@ -326,7 +327,8 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
             NullLogger<OrchestratorService>.Instance,
             router,
-            projects: null);
+            projects: null,
+            quotaHeadroomManager: headroomManager);
 
         await queue.EnqueueAsync(first.Id);
         await queue.EnqueueAsync(second.Id);
@@ -358,7 +360,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     public async Task QuotaReservationRefreshFailureRetainsReservationUntilCacheTtl()
     {
         var probe = new ThrowingRefreshQuotaProbe(AgentKind.Claude, availablePct: 60.0);
-        var router = BuildReservationRouter(probe, estimatedPctCost: 45.0);
+        var router = BuildReservationRouter(probe, estimatedPctCost: 45.0, out var headroomManager);
         var pickupCount = 0;
         var pipeline = new CountingPipelineRunner(
             _store,
@@ -379,7 +381,8 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
             NullLogger<OrchestratorService>.Instance,
             router,
-            projects: null);
+            projects: null,
+            quotaHeadroomManager: headroomManager);
 
         await queue.EnqueueAsync(first.Id);
         await queue.EnqueueAsync(second.Id);
@@ -410,7 +413,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     [Fact]
     public async Task ConcurrentWorkers_ReserveQuotaAndParkSecondItemUntilFirstCompletes()
     {
-        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);
+        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0, out var headroomManager);
         var started = 0;
         var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var proceed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -440,7 +443,8 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 2 },
             NullLogger<OrchestratorService>.Instance,
             router,
-            projects: null);
+            projects: null,
+            quotaHeadroomManager: headroomManager);
 
         await queue.EnqueueAsync(first.Id);
         await queue.EnqueueAsync(second.Id);
@@ -478,7 +482,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     [Fact]
     public async Task QuotaReservationReleasedAfterProjectPauseGate_AllowsRetryAfterResume()
     {
-        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);
+        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0, out var headroomManager);
         var pickupCount = 0;
         var pipeline = new CountingPipelineRunner(
             _store,
@@ -506,7 +510,8 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             NullLogger<OrchestratorService>.Instance,
             router,
             projects: projects,
-            queueController: queueController);
+            queueController: queueController,
+            quotaHeadroomManager: headroomManager);
 
         await queue.EnqueueAsync(item.Id);
         using var _ = registry;
@@ -546,10 +551,16 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
         AgentClassId = "quota-reservation",
     };
 
-    private static AgentClassRouter BuildReservationRouter(double availablePct, double estimatedPctCost)
-        => BuildReservationRouter(new FakeProbe(AgentKind.Claude, availablePct), estimatedPctCost);
+    private static AgentClassRouter BuildReservationRouter(
+        double availablePct,
+        double estimatedPctCost,
+        out IQuotaHeadroomManager headroomManager) =>
+        BuildReservationRouter(new FakeProbe(AgentKind.Claude, availablePct), estimatedPctCost, out headroomManager);
 
-    private static AgentClassRouter BuildReservationRouter(IAgentQuotaProbe probe, double estimatedPctCost)
+    private static AgentClassRouter BuildReservationRouter(
+        IAgentQuotaProbe probe,
+        double estimatedPctCost,
+        out IQuotaHeadroomManager headroomManager)
     {
         var agentClass = new AgentClass
         {
@@ -560,17 +571,23 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
                 new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
             ],
         };
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            QuotaRecheckInterval = TimeSpan.FromHours(1),
+        };
+        headroomManager = new InProcessQuotaHeadroomManager(
+            new FixedHeadroomEstimator(estimatedPctCost),
+            [probe],
+            opts,
+            NullLogger<InProcessQuotaHeadroomManager>.Instance);
 
         return new AgentClassRouter(
             [agentClass],
             [probe],
-            new QuotaRouterOptions
-            {
-                MinQuotaPct = 10.0,
-                QuotaRecheckInterval = TimeSpan.FromHours(1),
-            },
+            opts,
             NullLogger<AgentClassRouter>.Instance,
-            headroomEstimator: new FixedHeadroomEstimator(estimatedPctCost));
+            headroomManager: headroomManager);
     }
 }
 

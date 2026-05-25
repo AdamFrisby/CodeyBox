@@ -569,8 +569,8 @@ public static class AuditLog
 
     public static void QuotaRouterWaiting(string classId, WorkItemId id, TimeSpan recheckIn, string reason) =>
         Audit("quota_router.waiting")
-            .Warning("Quota router: work item {WorkItemId} waiting — {Reason}; recheck in {RecheckMs}ms",
-                id.ToString(), reason, (long)recheckIn.TotalMilliseconds);
+            .Warning("Quota router: work item {WorkItemId} class={ClassId} waiting — {Reason}; recheck in {RecheckMs}ms",
+                id.ToString(), classId, reason, (long)recheckIn.TotalMilliseconds);
 
     public static void QuotaRouterDeferred(WorkItemId id, TimeSpan recheckIn) =>
         Audit("quota_router.deferred")
