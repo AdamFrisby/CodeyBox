@@ -232,6 +232,82 @@ public sealed class AgentClassRouterTests
         afterReleaseReservation.Dispose();
     }
 
+    [Fact]
+    public async Task ReservedHeadroom_IsSharedAcrossModelsForSameProjectAndAgent()
+    {
+        var projectId = new ProjectId("shared-project");
+        var opusClass = new AgentClass
+        {
+            Id = "claude-opus",
+            DisplayName = "Claude Opus",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                    ModelId = "opus",
+                },
+            ],
+        };
+        var sonnetClass = new AgentClass
+        {
+            Id = "claude-sonnet",
+            DisplayName = "Claude Sonnet",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                    ModelId = "sonnet",
+                },
+            ],
+        };
+        var snapshot = new AgentQuotaSnapshot
+        {
+            AvailablePct = 60.0,
+            PerModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["opus"] = new() { AvailablePct = 60.0 },
+                ["sonnet"] = new() { AvailablePct = 60.0 },
+            },
+        };
+        var router = new AgentClassRouter(
+            [opusClass, sonnetClass],
+            [new FakeProbe(Claude, snapshot)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new FixedHeadroomEstimator(45.0));
+
+        var first = await router.ResolveAsync(
+            MakeItem("claude-opus") with { ProjectId = projectId },
+            null,
+            CancellationToken.None,
+            reserveQuota: true);
+        var reservation = Assert.IsAssignableFrom<IQuotaReservation>(first.QuotaReservation);
+
+        try
+        {
+            var second = await router.ResolveAsync(
+                MakeItem("claude-sonnet") with { ProjectId = projectId },
+                null,
+                CancellationToken.None,
+                reserveQuota: true);
+
+            Assert.Equal("opus", first.Chosen!.ModelId);
+            Assert.Null(second.Chosen);
+            Assert.True(second.ShouldWait);
+            Assert.Contains("headroom", second.Reason);
+        }
+        finally
+        {
+            reservation.Dispose();
+        }
+    }
+
     // ── Wait for subscription ─────────────────────────────────────────────────
 
     [Fact]
@@ -291,7 +367,7 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task SubscriptionEstimatorException_IsNotTreatedAsMissingEstimate()
+    public async Task SubscriptionEstimatorException_FailsOpenToBinaryQuotaGate()
     {
         var cls = FrontierClass(Sub(Claude));
         var router = new AgentClassRouter(
@@ -301,8 +377,15 @@ public sealed class AgentClassRouterTests
             NullLogger<AgentClassRouter>.Instance,
             headroomEstimator: new ThrowingHeadroomEstimator());
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None));
+        var decision = await router.ResolveAsync(
+            MakeItem("frontier"),
+            null,
+            CancellationToken.None,
+            reserveQuota: true);
+
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+        Assert.Null(decision.QuotaReservation);
     }
 
     // ── No probe registered → unknown policy ────────────────────────────────

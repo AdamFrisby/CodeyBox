@@ -299,6 +299,74 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task ConcurrentWorkers_ReserveQuotaAndParkSecondItemUntilFirstCompletes()
+    {
+        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);
+        var started = 0;
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var proceed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = new BlockingPipelineRunner(
+            _store,
+            onStart: () =>
+            {
+                if (Interlocked.Increment(ref started) == 1)
+                    firstStarted.TrySetResult();
+            },
+            proceed.Task,
+            onComplete: () => { });
+
+        var now = DateTimeOffset.UtcNow;
+        var first = MakeRoutedItem() with { Title = "first", CreatedAt = now.AddSeconds(-1) };
+        var second = MakeRoutedItem() with { Title = "second", CreatedAt = now };
+        await _store.CreateAsync(first);
+        await _store.CreateAsync(second);
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 2 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: null);
+
+        await queue.EnqueueAsync(first.Id);
+        await queue.EnqueueAsync(second.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        try
+        {
+            await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            WorkItem? parked = null;
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                parked = await _store.GetAsync(second.Id);
+                if (parked?.State == WorkItemState.WaitingForQuotaReset
+                    || Volatile.Read(ref started) > 1)
+                {
+                    break;
+                }
+                await Task.Delay(20);
+            }
+
+            Assert.Equal(1, Volatile.Read(ref started));
+            Assert.Equal(WorkItemState.WaitingForQuotaReset, parked?.State);
+            Assert.Equal("quota", parked?.FailureKind);
+        }
+        finally
+        {
+            proceed.TrySetResult();
+            await svc.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task QuotaReservationReleasedAfterProjectPauseGate_AllowsRetryAfterResume()
     {
         var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);

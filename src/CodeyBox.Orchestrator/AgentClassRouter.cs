@@ -445,7 +445,7 @@ public sealed class AgentClassRouter
         {
             var estimate = await EstimateHeadroomAsync(projectId, member, ct);
             var estimatedCost = estimate?.EstimatedIterPctCost;
-            var key = new QuotaReservationKey(projectId, member.Agent, member.ModelId ?? string.Empty);
+            var key = new QuotaReservationKey(projectId, member.Agent);
             var reservedPct = GetReservedHeadroomPct(key);
             IQuotaReservation? reservation = null;
 
@@ -458,7 +458,7 @@ public sealed class AgentClassRouter
                     if (QuotaRouter.WouldAllow(availablePct, recentFailure: false, _opts, cost, reservedPct))
                     {
                         _reservedHeadroomPct.AddOrUpdate(key, cost, (_, existing) => existing + cost);
-                        reservation = new InProcessQuotaReservation(this, key, cost);
+                        reservation = new InProcessQuotaReservation(this, key, member.ModelId, cost);
                     }
                 }
             }
@@ -516,9 +516,26 @@ public sealed class AgentClassRouter
         if (_headroomEstimator is null)
             return null;
 
-        return await _headroomEstimator.EstimateAsync(
-            new QuotaHeadroomRequest(projectId, member.Agent, member.ModelId),
-            ct);
+        try
+        {
+            return await _headroomEstimator.EstimateAsync(
+                new QuotaHeadroomRequest(projectId, member.Agent, member.ModelId),
+                ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Quota headroom estimation failed for project {ProjectId} agent {Agent} model {Model}; falling back to binary quota gate",
+                projectId.Value,
+                member.Agent.Value,
+                member.ModelId ?? "(default)");
+            return null;
+        }
     }
 
     private double GetReservedHeadroomPct(QuotaReservationKey key) =>
@@ -676,24 +693,26 @@ public sealed class AgentClassRouter
         double? ProjectedAvailablePct = null,
         IQuotaReservation? Reservation = null);
 
-    private sealed record QuotaReservationKey(ProjectId ProjectId, AgentKind Agent, string ModelId);
+    private sealed record QuotaReservationKey(ProjectId ProjectId, AgentKind Agent);
 
     private sealed class InProcessQuotaReservation : IQuotaReservation
     {
         private readonly AgentClassRouter _router;
         private readonly QuotaReservationKey _key;
+        private readonly string? _modelId;
         private int _disposed;
 
-        public InProcessQuotaReservation(AgentClassRouter router, QuotaReservationKey key, double reservedPct)
+        public InProcessQuotaReservation(AgentClassRouter router, QuotaReservationKey key, string? modelId, double reservedPct)
         {
             _router = router;
             _key = key;
+            _modelId = modelId;
             ReservedPct = reservedPct;
         }
 
         public ProjectId ProjectId => _key.ProjectId;
         public AgentKind Agent => _key.Agent;
-        public string? ModelId => string.IsNullOrEmpty(_key.ModelId) ? null : _key.ModelId;
+        public string? ModelId => string.IsNullOrEmpty(_modelId) ? null : _modelId;
         public double ReservedPct { get; }
 
         public void Dispose()
