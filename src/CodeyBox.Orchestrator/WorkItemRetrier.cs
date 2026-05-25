@@ -109,7 +109,8 @@ public sealed class WorkItemRetrier
         var resumed = item.With(resumeState.Value, error: null) with
         {
             RecoveryAttempts = 0,
-            QuotaRetryAttempts = trigger != "manual" ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts
+            QuotaRetryAttempts = trigger != "manual" ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts,
+            StartedAt = null
         };
 
         // Atomic conditional update to prevent race conditions.

@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Logging.Abstractions;
 using Serilog;
@@ -69,10 +70,30 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
             Scalar<string>(evt, "From"));
     }
 
+    [Fact]
+    public async Task AutoPickAudit_ClearsStaleStartedAt()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = new RecordingGitHost { Ahead = true };
+        var item = NewFailedItem(baseBranch: "main") with { StartedAt = DateTimeOffset.UtcNow.AddMinutes(-10) };
+        await store.CreateAsync(item);
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.WorkComplete, result.ResumeState);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, persisted!.State);
+        Assert.Null(persisted.StartedAt);
+    }
+
     [Theory]
     [InlineData("no-work-branch")]
     [InlineData("missing-repo")]
     [InlineData("missing-work-branch")]
+    [InlineData("invalid-work-branch")]
     public async Task AutoPickAbsentWorkBranchState_DefaultsToWork(string scenario)
     {
         using var store = NewStore();
@@ -90,6 +111,10 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
             case "missing-work-branch":
                 gitHost.BranchExists = false;
                 break;
+            case "invalid-work-branch":
+                item = item with { WorkBranch = "bad..branch" };
+                gitHost.ThrowBranchExistsArgumentException = true;
+                break;
         }
         await store.CreateAsync(item);
         var retrier = NewRetrier(store, queue, gitHost);
@@ -100,6 +125,39 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
         Assert.Equal(WorkItemState.Queued, result.ResumeState);
         Assert.Equal("work", result.ActualFrom);
         Assert.Equal(0, gitHost.BranchHasCommitsAheadCalls);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AutoPick_DefaultsToWorkWhenBaseAdvancedAfterWorkBranchWasCut()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]),
+            },
+            NullLogger<LocalGitHost>.Instance);
+        var item = NewFailedItem(workBranch: "codeybox/stale", baseBranch: "main");
+        await store.CreateAsync(item);
+
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        await TestSupport.RunGit(barePath, "update-ref", "refs/heads/codeybox/stale", "refs/heads/main");
+        await File.WriteAllTextAsync(Path.Combine(seed, "base-advance.txt"), "base advance\n");
+        await TestSupport.RunGit(seed, "add", "base-advance.txt");
+        await TestSupport.RunGit(seed, "commit", "-m", "advance base after work branch cut");
+        await gitHost.EnsureRepositoryAsync(item.Id, seed, "main");
+
+        var retrier = NewRetrier(store, queue, gitHost);
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.ResumeState);
+        Assert.Equal("work", result.ActualFrom);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
         Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
     }
@@ -248,6 +306,7 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
     {
         public bool RepositoryExists { get; set; } = true;
         public bool BranchExists { get; set; } = true;
+        public bool ThrowBranchExistsArgumentException { get; set; }
         public bool Ahead { get; set; }
         public string DefaultBranch { get; set; } = "main";
         public Func<string, string, string, bool>? AheadSelector { get; set; }
@@ -290,7 +349,12 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
             => Task.FromResult(RepositoryExists);
 
         public Task<bool> BranchExistsAsync(string repositoryId, string branch, CancellationToken ct = default)
-            => Task.FromResult(BranchExists);
+        {
+            if (ThrowBranchExistsArgumentException)
+                throw new ArgumentException("invalid work branch name", nameof(branch));
+
+            return Task.FromResult(BranchExists);
+        }
 
         public Task<bool> BranchHasCommitsAheadAsync(
             string repositoryId,
