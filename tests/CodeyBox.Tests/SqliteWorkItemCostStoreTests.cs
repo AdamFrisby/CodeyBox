@@ -294,7 +294,56 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(7.0, estimate!.EstimatedIterPctCost, precision: 2);
         Assert.Equal(70_000, estimate.AverageTokensPerIteration, precision: 2);
         Assert.Equal(3, estimate.SampledItemCount);
-        Assert.False(estimate.TrustedForEnforcement);
+        Assert.True(estimate.TrustedForEnforcement);
+    }
+
+    [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_ProviderMetadataRowsEnableManagerEnforcement()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, "proj-provider-headroom");
+        await _store.RecordAsync(MakeCost(itemId) with
+        {
+            InputTokens = 80_000,
+            OutputTokens = 20_000,
+        });
+
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            HeadroomTokensPerQuotaPct = 10_000,
+            HeadroomHistoryItemCount = 20,
+            HeadroomHistoryWindow = TimeSpan.FromDays(7),
+        };
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+        var manager = new InProcessQuotaHeadroomManager(
+            estimator,
+            [new FakeProbe(AgentKind.Claude, 15.0)],
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<InProcessQuotaHeadroomManager>.Instance);
+
+        var result = await manager.EvaluateAsync(new QuotaHeadroomGateRequest(
+            new ProjectId("proj-provider-headroom"),
+            new AgentMembership
+            {
+                Agent = AgentKind.Claude,
+                Billing = AgentBilling.Subscription,
+                ModelId = "claude-opus-4-7",
+                QualityScore = 100,
+            },
+            AvailablePct: 15.0,
+            ResetAt: null,
+            AuditOnRefusal: false));
+
+        Assert.False(result.Allow);
+        Assert.True(result.InsufficientHeadroom);
+        Assert.NotNull(result.Estimate);
+        Assert.True(result.Estimate!.TrustedForEnforcement);
+        Assert.Equal(10.0, result.Estimate.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(5.0, result.ProjectedAvailablePct!.Value, precision: 2);
     }
 
     [Fact]
@@ -721,6 +770,40 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
 
         var estimate = await estimator.EstimateAsync(
             new QuotaHeadroomRequest(new ProjectId("proj-invalid-headroom"), AgentKind.Claude, "claude-opus-4-7"));
+
+        Assert.Null(estimate);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task CostHistoryQuotaHeadroomEstimator_InvalidMaxTokensPerCostRowReturnsNull(
+        int maxTokensPerCostRow)
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, $"proj-invalid-row-cap-{maxTokensPerCostRow}");
+        await _store.RecordAsync(MakeCost(itemId) with
+        {
+            InputTokens = 100_000,
+            OutputTokens = 0,
+        });
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+                HeadroomMaxTokensPerCostRow = maxTokensPerCostRow,
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(
+                new ProjectId($"proj-invalid-row-cap-{maxTokensPerCostRow}"),
+                AgentKind.Claude,
+                "claude-opus-4-7"));
 
         Assert.Null(estimate);
     }

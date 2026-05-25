@@ -1102,7 +1102,9 @@ builder.Services.AddSingleton<IQuotaHeadroomManager>(sp => new InProcessQuotaHea
     sp.GetService<IQuotaHeadroomEstimator>(),
     sp.GetServices<IAgentQuotaProbe>(),
     sp.GetRequiredService<QuotaRouterOptions>(),
-    sp.GetRequiredService<ILogger<InProcessQuotaHeadroomManager>>()));
+    sp.GetRequiredService<ILogger<InProcessQuotaHeadroomManager>>(),
+    sp.GetService<IQuotaFailureStore>(),
+    TimeProvider.System));
 builder.Services.AddSingleton<IAgentStreamSummaryStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1445,7 +1447,6 @@ app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
 app.MapGet("/quota", async (
     IEnumerable<IAgentQuotaProbe> probes,
     IQuotaFailureStore? failureStore,
-    IQuotaHeadroomEstimator headroomEstimator,
     IQuotaHeadroomManager headroomManager,
     IProjectRepository projects,
     QuotaRouterOptions options,
@@ -1470,15 +1471,15 @@ app.MapGet("/quota", async (
         var headroomProjections = new List<object>();
         foreach (var project in projectList)
         {
-            var estimate = await headroomEstimator.EstimateAsync(
-                new QuotaHeadroomRequest(project.Id, probe.Kind, ModelId: null),
+            var gate = await headroomManager.EvaluateAsync(
+                new QuotaHeadroomGateRequest(
+                    project.Id,
+                    member,
+                    snapshot.AvailablePct,
+                    snapshot.ResetAt,
+                    AuditOnRefusal: false),
                 ct);
-            var projected = estimate is null || snapshot.AvailablePct < 0
-                ? (double?)null
-                : snapshot.AvailablePct
-                    - headroomManager.GetReservedHeadroomPct(project.Id, probe.Kind)
-                    - (estimate.TrustedForEnforcement ? estimate.EstimatedIterPctCost : 0);
-            var reservedQuotaPct = headroomManager.GetReservedHeadroomPct(project.Id, probe.Kind);
+            var estimate = gate.Estimate;
             headroomProjections.Add(new
             {
                 projectId = project.Id.Value,
@@ -1487,15 +1488,11 @@ app.MapGet("/quota", async (
                 sampledItemCount = estimate?.SampledItemCount,
                 source = estimate?.Source,
                 trustedForEnforcement = estimate?.TrustedForEnforcement,
-                reservedQuotaPct,
-                projectedAvailablePct = projected,
-                wouldAllow = QuotaRouter.WouldAllow(
-                    snapshot.AvailablePct,
-                    failures.Any(f => f.Agent == probe.Kind
-                        && f.ObservedAt >= now - options.ObservedFailureWindow),
-                    options,
-                    estimate is { TrustedForEnforcement: true } ? estimate.EstimatedIterPctCost : null,
-                    reservedQuotaPct),
+                reservedQuotaPct = gate.ReservedPct,
+                projectedAvailablePct = gate.ProjectedAvailablePct,
+                wouldAllow = gate.Allow,
+                insufficientHeadroom = gate.InsufficientHeadroom,
+                reason = gate.Reason,
             });
         }
         var recentFailuresForProbe = failures

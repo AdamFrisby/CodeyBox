@@ -22,7 +22,8 @@ public sealed record QuotaHeadroomGateRequest(
     ProjectId ProjectId,
     AgentMembership Member,
     double AvailablePct,
-    DateTimeOffset? ResetAt);
+    DateTimeOffset? ResetAt,
+    bool AuditOnRefusal = true);
 
 public sealed record QuotaHeadroomGateResult(
     bool Allow,
@@ -55,6 +56,8 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe> _probesByKind;
     private readonly QuotaRouterOptions _opts;
     private readonly ILogger<InProcessQuotaHeadroomManager> _log;
+    private readonly IQuotaFailureStore? _quotaFailures;
+    private readonly TimeProvider _time;
     private readonly ConcurrentDictionary<QuotaReservationKey, double> _reservedHeadroomPct = new();
     private readonly ConcurrentDictionary<QuotaReservationKey, object> _reservationLocks = new();
 
@@ -62,7 +65,9 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
         IQuotaHeadroomEstimator? headroomEstimator,
         IEnumerable<IAgentQuotaProbe> probes,
         QuotaRouterOptions opts,
-        ILogger<InProcessQuotaHeadroomManager>? log = null)
+        ILogger<InProcessQuotaHeadroomManager>? log = null,
+        IQuotaFailureStore? quotaFailures = null,
+        TimeProvider? timeProvider = null)
     {
         _headroomEstimator = headroomEstimator;
         _probesByKind = probes
@@ -70,6 +75,8 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
             .ToDictionary(p => p.Kind);
         _opts = opts;
         _log = log ?? NullLogger<InProcessQuotaHeadroomManager>.Instance;
+        _quotaFailures = quotaFailures;
+        _time = timeProvider ?? TimeProvider.System;
     }
 
     public Task<QuotaHeadroomGateResult> EvaluateAsync(
@@ -147,12 +154,15 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
             {
                 var projected = request.AvailablePct - reservedPct - refusedCost;
                 const string reason = "insufficient headroom";
-                AuditLog.QuotaDispatchRefused(
-                    member.Agent,
-                    request.ProjectId,
-                    request.AvailablePct,
-                    refusedCost,
-                    reason);
+                if (request.AuditOnRefusal)
+                {
+                    AuditLog.QuotaDispatchRefused(
+                        member.Agent,
+                        request.ProjectId,
+                        request.AvailablePct,
+                        refusedCost,
+                        reason);
+                }
 
                 return new QuotaHeadroomGateResult(
                     false,
@@ -171,7 +181,8 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
                     "quota available; untrusted headroom estimate ignored for dispatch enforcement",
                     request.ResetAt,
                     Estimate: estimate,
-                    ReservedPct: reservedPct);
+                    ReservedPct: reservedPct,
+                    ProjectedAvailablePct: request.AvailablePct - reservedPct);
             }
 
             return new QuotaHeadroomGateResult(
@@ -206,8 +217,33 @@ public sealed class InProcessQuotaHeadroomManager : IQuotaHeadroomManager
         {
             QuotaUnknownPolicy.FailOpen => new QuotaHeadroomGateResult(true, "quota unknown; fail-open", null),
             QuotaUnknownPolicy.FailCautious => new QuotaHeadroomGateResult(false, "quota unknown; fail-cautious", null),
-            _ => new QuotaHeadroomGateResult(true, "quota unknown; no recent quota-shaped failure", null),
+            _ => await EvaluateObservedFailuresAsync(member, ct),
         };
+    }
+
+    private async Task<QuotaHeadroomGateResult> EvaluateObservedFailuresAsync(
+        AgentMembership member,
+        CancellationToken ct)
+    {
+        if (_quotaFailures is null)
+            return new QuotaHeadroomGateResult(true, "quota unknown; no recent quota-shaped failure", null);
+
+        var now = _time.GetUtcNow();
+        var observedAt = await _quotaFailures.GetMostRecentAsync(
+            member.Agent,
+            member.ModelId,
+            _opts.ObservedFailureWindow,
+            now,
+            ct);
+        if (observedAt is { } seenAt)
+        {
+            return new QuotaHeadroomGateResult(
+                false,
+                $"quota unknown; {AgentClassRouter.FormatObservedFailureReason(member, seenAt, now)}",
+                null);
+        }
+
+        return new QuotaHeadroomGateResult(true, "quota unknown; no recent quota-shaped failure", null);
     }
 
     private async Task<QuotaHeadroomEstimate?> EstimateHeadroomAsync(

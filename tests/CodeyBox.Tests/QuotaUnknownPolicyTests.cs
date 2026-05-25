@@ -49,7 +49,33 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
         Assert.Null(decision.Chosen);
     }
 
-    private AgentClassRouter Build(QuotaUnknownPolicy policy)
+    [Fact]
+    public async Task FailOpen_BlocksUnknownQuotaWhenReservedHeadroomIsPending()
+    {
+        var (router, manager) = BuildWithManager(
+            QuotaUnknownPolicy.FailOpen,
+            new FixedHeadroomEstimator(10.0));
+        var reservation = await manager.TryReserveAsync(new QuotaHeadroomGateRequest(
+            new ProjectId("proj"),
+            ClaudeMember(),
+            AvailablePct: 25,
+            ResetAt: null,
+            AuditOnRefusal: false));
+        Assert.True(reservation.Allow, reservation.Reason);
+        var lease = Assert.IsAssignableFrom<IQuotaReservationLease>(reservation.Reservation);
+
+        var decision = await router.ResolveAsync(Item(), null, CancellationToken.None);
+
+        Assert.True(decision.ShouldWait);
+        Assert.Null(decision.Chosen);
+        await lease.ReleaseAsync(quotaMayHaveBeenConsumed: false);
+    }
+
+    private AgentClassRouter Build(QuotaUnknownPolicy policy) => BuildWithManager(policy).Router;
+
+    private (AgentClassRouter Router, IQuotaHeadroomManager Manager) BuildWithManager(
+        QuotaUnknownPolicy policy,
+        IQuotaHeadroomEstimator? estimator = null)
     {
         var cls = new AgentClass
         {
@@ -57,23 +83,35 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
             DisplayName = "Frontier",
             Members =
             [
-                new AgentMembership
-                {
-                    Agent = AgentKind.Claude,
-                    Billing = AgentBilling.Subscription,
-                    ModelId = "claude-opus-4-7",
-                    QualityScore = 100,
-                },
+                ClaudeMember(),
             ],
         };
-
-        return new AgentClassRouter(
-            [cls],
-            [new FakeProbe(AgentKind.Claude, -1)],
-            new QuotaRouterOptions { MinQuotaPct = 10, UnknownPolicy = policy },
-            NullLogger<AgentClassRouter>.Instance,
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(AgentKind.Claude, -1) };
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10, UnknownPolicy = policy };
+        var manager = new InProcessQuotaHeadroomManager(
+            estimator,
+            probes,
+            opts,
+            NullLogger<InProcessQuotaHeadroomManager>.Instance,
             quotaFailures: _failures);
+
+        var router = new AgentClassRouter(
+            [cls],
+            probes,
+            opts,
+            NullLogger<AgentClassRouter>.Instance,
+            quotaFailures: _failures,
+            headroomManager: manager);
+        return (router, manager);
     }
+
+    private static AgentMembership ClaudeMember() => new()
+    {
+        Agent = AgentKind.Claude,
+        Billing = AgentBilling.Subscription,
+        ModelId = "claude-opus-4-7",
+        QualityScore = 100,
+    };
 
     private static WorkItem Item() => new()
     {

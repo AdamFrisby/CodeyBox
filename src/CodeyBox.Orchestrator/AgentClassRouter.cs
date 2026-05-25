@@ -658,13 +658,30 @@ public sealed class QuotaRouterOptions
 
     public TimeSpan HeadroomHistoryWindow { get; set; } = TimeSpan.FromDays(14);
 
+    /// <summary>
+    /// Conservative token-to-quota conversion used when provider APIs expose
+    /// quota only as a percentage. The default treats 100% as roughly one
+    /// million input+output tokens, so a 100k-token iteration consumes 10%.
+    /// Operators should override this per agent when provider quota units are
+    /// known to be materially larger or smaller.
+    /// </summary>
     public double HeadroomTokensPerQuotaPct { get; set; } = 10_000.0;
 
     public Dictionary<string, double> HeadroomTokensPerQuotaPctByAgent { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Rejects single cost rows above the estimated one-iteration blast radius.
+    /// This prevents corrupted or whole-job aggregate rows from reserving most
+    /// of the quota window from one history sample.
+    /// </summary>
     public int HeadroomMaxTokensPerCostRow { get; set; } = 500_000;
 
+    /// <summary>
+    /// Caps each per-item sample after rows are grouped by work item. The
+    /// default is intentionally below the implied full quota window so one
+    /// unusually large item cannot dominate the moving average.
+    /// </summary>
     public int HeadroomMaxTokensPerIteration { get; set; } = 500_000;
 }
 

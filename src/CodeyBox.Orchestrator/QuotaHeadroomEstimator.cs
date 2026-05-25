@@ -247,8 +247,11 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
                 return HeadroomRowTrust.Trusted;
             }
 
-            if (HasStdoutDerivedUsageSource(root, "usageSource")
-                || HasStdoutDerivedUsageSource(root, "source"))
+            if (HasUsageSource(root, "usageSource", "provider_metadata"))
+                return HeadroomRowTrust.Trusted;
+
+            if (HasUsageSource(root, "usageSource", "agent_stream_analyser")
+                || HasUsageSource(root, "source", "agent_stream_analyser"))
             {
                 return HeadroomRowTrust.Untrusted;
             }
@@ -266,11 +269,10 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
         }
     }
 
-    private static bool HasStdoutDerivedUsageSource(JsonElement root, string propertyName) =>
+    private static bool HasUsageSource(JsonElement root, string propertyName, string expectedValue) =>
         root.TryGetProperty(propertyName, out var source)
         && source.ValueKind == JsonValueKind.String
-        && (string.Equals(source.GetString(), "provider_metadata", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(source.GetString(), "agent_stream_analyser", StringComparison.OrdinalIgnoreCase));
+        && string.Equals(source.GetString(), expectedValue, StringComparison.OrdinalIgnoreCase);
 
     private enum HeadroomRowTrust
     {
