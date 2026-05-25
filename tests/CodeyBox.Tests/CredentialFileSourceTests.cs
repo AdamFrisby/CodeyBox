@@ -145,12 +145,13 @@ public sealed class CredentialFileSourceTests : IDisposable
     public void LeakTracker_PrintsWarning_WhenCredentialWatcherIsNotDisposed()
     {
         var path = WriteFile("leaky-creds.json", """{"access_token":"leaky"}""");
+        using var scope = TestFileSystemWatcherLeakTracker.BeginTestCase(nameof(LeakTracker_PrintsWarning_WhenCredentialWatcherIsNotDisposed));
         var source = new CredentialFileSource(path);
         try
         {
             Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
             using var writer = new StringWriter();
-            Assert.True(TestFileSystemWatcherLeakTracker.ReportLeaks(writer));
+            Assert.True(scope.ReportLeaks(writer));
             var output = writer.ToString();
             Assert.Contains("FileSystemWatcher", output);
             Assert.Contains(path, output);
@@ -166,12 +167,13 @@ public sealed class CredentialFileSourceTests : IDisposable
     public void LeakTracker_PrintsWarning_WhenTrackedFileSystemWatcherIsNotDisposed()
     {
         var path = Path.Combine(_tempDir, "direct.txt");
+        using var scope = TestFileSystemWatcherLeakTracker.BeginTestCase(nameof(LeakTracker_PrintsWarning_WhenTrackedFileSystemWatcherIsNotDisposed));
         var watcher = TestFileSystemWatcherLeakTracker.CreateWatcher(_tempDir, "direct.txt");
         try
         {
             Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
             using var writer = new StringWriter();
-            Assert.True(TestFileSystemWatcherLeakTracker.ReportLeaks(writer));
+            Assert.True(scope.ReportLeaks(writer));
             var output = writer.ToString();
             Assert.Contains("FileSystemWatcher", output);
             Assert.Contains(path, output);
@@ -187,6 +189,7 @@ public sealed class CredentialFileSourceTests : IDisposable
     public void LeakTracker_PrintsWarning_WhenReloadingConfigurationIsNotDisposed()
     {
         var path = WriteFile("reload-config.json", """{"CodeyBox":{"CredentialFileWatchers":false}}""");
+        using var scope = TestFileSystemWatcherLeakTracker.BeginTestCase(nameof(LeakTracker_PrintsWarning_WhenReloadingConfigurationIsNotDisposed));
         var tracked = TestFileSystemWatcherLeakTracker.TrackReloadingConfiguration(
             new ConfigurationBuilder()
                 .AddJsonFile(path, optional: false, reloadOnChange: true)
@@ -196,7 +199,7 @@ public sealed class CredentialFileSourceTests : IDisposable
         {
             Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
             using var writer = new StringWriter();
-            Assert.True(TestFileSystemWatcherLeakTracker.ReportLeaks(writer));
+            Assert.True(scope.ReportLeaks(writer));
             var output = writer.ToString();
             Assert.Contains("reloadOnChange configuration", output);
             Assert.Contains(path, output);
@@ -206,6 +209,44 @@ public sealed class CredentialFileSourceTests : IDisposable
             tracked.Dispose();
         }
         Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void LeakTracker_ReportsOnlyLeaksCreatedByTheCurrentTestScope()
+    {
+        var ownerPath = WriteFile("owner-scope.json", """{"access_token":"owner"}""");
+        var otherPath = WriteFile("other-scope.json", """{"access_token":"other"}""");
+        using var ownerScope = TestFileSystemWatcherLeakTracker.BeginTestCase("owner test");
+        var ownerSource = new CredentialFileSource(ownerPath);
+        try
+        {
+            using (var otherScope = TestFileSystemWatcherLeakTracker.BeginTestCase("other test"))
+            {
+                var otherSource = new CredentialFileSource(otherPath);
+                try
+                {
+                    using var otherWriter = new StringWriter();
+                    Assert.True(otherScope.ReportLeaks(otherWriter));
+                    var otherOutput = otherWriter.ToString();
+                    Assert.Contains(otherPath, otherOutput);
+                    Assert.DoesNotContain(ownerPath, otherOutput);
+                }
+                finally
+                {
+                    otherSource.Dispose();
+                }
+            }
+
+            using var ownerWriter = new StringWriter();
+            Assert.True(ownerScope.ReportLeaks(ownerWriter));
+            var ownerOutput = ownerWriter.ToString();
+            Assert.Contains(ownerPath, ownerOutput);
+            Assert.DoesNotContain(otherPath, ownerOutput);
+        }
+        finally
+        {
+            ownerSource.Dispose();
+        }
     }
 
     [Fact]

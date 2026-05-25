@@ -553,7 +553,6 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 // child-VM writeback — every consumer observes the new token within ~1 s and
 // quota probes invalidate their per-token snapshot, so a stale 401 doesn't pin
 // for the full cache TTL.
-var credentialFileWatchingEnabled = CredentialFileWatcherSettings.IsEnabled(builder.Configuration);
 var claudeOAuthFilePath =
     Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_OAUTH_FILE")
     ?? builder.Configuration["CodeyBox:ClaudeOAuthFile"];
@@ -601,13 +600,21 @@ if (geminiSettingsFilePath.StartsWith("~/", StringComparison.Ordinal))
         geminiSettingsFilePath[2..]);
 
 builder.Services.AddSingleton(sp => new ClaudeCredentialFileSource(
-    claudeOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>(), watch: credentialFileWatchingEnabled));
+    claudeOAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new CodexCredentialFileSource(
-    codexOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>(), watch: credentialFileWatchingEnabled));
+    codexOAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new GeminiOAuthCredentialFileSource(
-    geminiOAuthFilePath, sp.GetService<ILogger<CredentialFileSource>>(), watch: credentialFileWatchingEnabled));
+    geminiOAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new GeminiSettingsCredentialFileSource(
-    geminiSettingsFilePath, sp.GetService<ILogger<CredentialFileSource>>(), watch: credentialFileWatchingEnabled));
+    geminiSettingsFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 
 // Bridges the host-side ClaudeCredentialFileSource watcher to in-flight VMs:
 // when ~/.claude/.credentials.json rotates while a Claude agent is running in

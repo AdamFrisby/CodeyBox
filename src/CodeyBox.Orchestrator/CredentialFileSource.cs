@@ -314,7 +314,22 @@ public class CredentialFileSource : IDisposable
         _watcher = null;
         if (w is not null)
         {
-            try { w.EnableRaisingEvents = false; } catch { }
+            try
+            {
+                w.EnableRaisingEvents = false;
+            }
+            catch (ObjectDisposedException ex)
+            {
+                _log?.LogDebug(ex, "FileSystemWatcher for {Path} was already disposed before event shutdown", FilePath);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _log?.LogWarning(ex, "Failed to disable FileSystemWatcher events for {Path}; continuing disposal", FilePath);
+            }
+            catch (IOException ex)
+            {
+                _log?.LogWarning(ex, "Failed to disable FileSystemWatcher events for {Path}; continuing disposal", FilePath);
+            }
             w.Changed -= OnFsEvent;
             w.Created -= OnFsEvent;
             w.Renamed -= OnFsRenamed;

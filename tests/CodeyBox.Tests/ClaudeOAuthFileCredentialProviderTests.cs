@@ -63,6 +63,21 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
+    public void Dispose_DoesNotDisposeExternallyOwnedCredentialFileSource()
+    {
+        const string raw = """{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""";
+        var path = WriteCredFile(raw);
+        using var source = new CredentialFileSource(path, watch: false);
+        var provider = new ClaudeOAuthFileCredentialProvider(
+            source,
+            "CLAUDE_CODE_OAUTH_TOKEN");
+
+        provider.Dispose();
+
+        Assert.Equal(raw, source.GetRaw());
+    }
+
+    [Fact]
     public async Task ReturnsTokenForClaudeWhenFilePresent()
     {
         var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""");

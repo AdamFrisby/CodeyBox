@@ -353,12 +353,26 @@ public sealed class WaitingForQuotaResetTests : IDisposable
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         fired.Invoke(scheduler, [parked.Id]);
 
-        // Background task — give it a moment to complete the retry call.
-        await Task.Delay(150);
-
-        var refetched = await store.GetAsync(parked.Id);
+        var refetched = await WaitForStateAsync(store, parked.Id, WorkItemState.Queued);
         Assert.NotNull(refetched);
         Assert.Equal(WorkItemState.Queued, refetched!.State);
+    }
+
+    private static async Task<WorkItem?> WaitForStateAsync(
+        IWorkItemStore store,
+        WorkItemId id,
+        WorkItemState expected,
+        int attempts = 100)
+    {
+        WorkItem? current = null;
+        for (var i = 0; i < attempts; i++)
+        {
+            current = await store.GetAsync(id);
+            if (current?.State == expected)
+                return current;
+            await Task.Delay(25);
+        }
+        return current;
     }
 
     private sealed class FixedClock : TimeProvider

@@ -10,13 +10,7 @@ using Microsoft.Extensions.Hosting;
 
 namespace CodeyBox.Tests;
 
-[CollectionDefinition(EnvironmentVariableCollection.Name, DisableParallelization = true)]
-public sealed class EnvironmentVariableCollection
-{
-    public const string Name = "EnvironmentVariables";
-}
-
-[Collection(EnvironmentVariableCollection.Name)]
+[Collection("GlobalSerilog")]
 public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
 {
     private readonly string _tempDir = Directory.CreateTempSubdirectory("codeybox-program-watchers-").FullName;
@@ -51,6 +45,34 @@ public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
         Assert.Equal(
             new[] { paths.Claude, paths.Codex, paths.GeminiOAuth, paths.GeminiSettings },
             sources.Select(source => source.FilePath));
+        Assert.All(sources, source => Assert.Equal(expectedWatching, source.IsWatching));
+    }
+
+    [Theory]
+    [InlineData("false", false)]
+    [InlineData("true", true)]
+    public void ProgramWiresCredentialSourcesWithConfigurationKeyWhenEnvironmentUnset(
+        string configuredValue,
+        bool expectedWatching)
+    {
+        var paths = CredentialWatcherPaths.Create(_tempDir);
+        using var env = new EnvironmentVariablesScope(
+            (CredentialFileWatcherSettings.EnvironmentVariable, null),
+            ("CodeyBox__CredentialFileWatchers", null),
+            ("CODEYBOX_CLAUDE_OAUTH_FILE", paths.Claude),
+            ("CODEYBOX_CODEX_OAUTH_FILE", paths.Codex),
+            ("CODEYBOX_GEMINI_OAUTH_FILE", paths.GeminiOAuth),
+            ("CODEYBOX_GEMINI_SETTINGS_FILE", paths.GeminiSettings));
+        using var factory = new CredentialWatcherProgramFactory(_tempDir, configuredValue);
+
+        var sources = new CredentialFileSource[]
+        {
+            factory.Services.GetRequiredService<ClaudeCredentialFileSource>(),
+            factory.Services.GetRequiredService<CodexCredentialFileSource>(),
+            factory.Services.GetRequiredService<GeminiOAuthCredentialFileSource>(),
+            factory.Services.GetRequiredService<GeminiSettingsCredentialFileSource>(),
+        };
+
         Assert.All(sources, source => Assert.Equal(expectedWatching, source.IsWatching));
     }
 
@@ -104,10 +126,12 @@ public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
     private sealed class CredentialWatcherProgramFactory : WebApplicationFactory<Program>
     {
         private readonly string _root;
+        private readonly string? _credentialFileWatchers;
 
-        public CredentialWatcherProgramFactory(string root)
+        public CredentialWatcherProgramFactory(string root, string? credentialFileWatchers = null)
         {
             _root = root;
+            _credentialFileWatchers = credentialFileWatchers;
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -118,6 +142,7 @@ public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    [CredentialFileWatcherSettings.ConfigurationKey] = _credentialFileWatchers,
                     ["CodeyBox:StateDatabasePath"] = Path.Combine(_root, "state.db"),
                     ["CodeyBox:GitRootDirectory"] = Path.Combine(_root, "git"),
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(_root, "logs", "api-.json"),

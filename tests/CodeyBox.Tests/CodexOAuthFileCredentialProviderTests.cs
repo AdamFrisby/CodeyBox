@@ -51,6 +51,20 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task Dispose_DoesNotDisposeExternallyOwnedCredentialFileSource()
+    {
+        var authPath = Path.Combine(_workspace, "auth.json");
+        const string authJson = "{\"tokens\":{\"access_token\":\"test-token\"}}";
+        await File.WriteAllTextAsync(authPath, authJson);
+        using var source = new CredentialFileSource(authPath, watch: false);
+        var provider = new CodexOAuthFileCredentialProvider(source);
+
+        provider.Dispose();
+
+        Assert.Equal(authJson, source.GetRaw());
+    }
+
+    [Fact]
     public async Task GetAsync_ReadsCodexAuthJsonForCodex()
     {
         var authPath = Path.Combine(_workspace, "auth.json");

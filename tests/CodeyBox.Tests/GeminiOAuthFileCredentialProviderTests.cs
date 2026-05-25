@@ -67,6 +67,22 @@ public sealed class GeminiOAuthFileCredentialProviderTests : IDisposable
     }
 
     [Fact]
+    public void Dispose_DoesNotDisposeExternallyOwnedCredentialFileSources()
+    {
+        var paths = WriteGeminiFiles();
+        using var oauthSource = new CredentialFileSource(paths.OAuth, watch: false);
+        using var settingsSource = new CredentialFileSource(paths.Settings, watch: false);
+        var provider = new GeminiOAuthFileCredentialProvider(oauthSource, settingsSource);
+
+        provider.Dispose();
+
+        Assert.Equal("""{"access_token":"gemini-token"}""", oauthSource.GetRaw());
+        Assert.Equal(
+            """{"security":{"auth":{"selectedType":"oauth-personal"}}}""",
+            settingsSource.GetRaw());
+    }
+
+    [Fact]
     public async Task GetAsync_ReadsGeminiOAuthAndSettingsFilesForGemini()
     {
         var paths = WriteGeminiFiles();

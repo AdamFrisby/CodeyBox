@@ -47,6 +47,7 @@ internal static class TestFileSystemWatcherLeakTracker
 {
     private const int MaxReportedWatcherLeaks = 5;
 
+    private static readonly AsyncLocal<TestCaseScope?> CurrentScope = new();
     private static readonly ConcurrentDictionary<object, WatcherRecord> Active = new();
     private static int _installed;
 
@@ -59,9 +60,21 @@ internal static class TestFileSystemWatcherLeakTracker
             ReportLeaks(Console.Error);
     }
 
+    public static TestCaseScope BeginTestCase(string displayName)
+    {
+        var previous = CurrentScope.Value;
+        var scope = new TestCaseScope(Guid.NewGuid().ToString("N"), displayName, previous);
+        CurrentScope.Value = scope;
+        return scope;
+    }
+
     public static bool ReportLeaks(TextWriter writer)
+        => ReportLeaks(writer, scopeId: null);
+
+    private static bool ReportLeaks(TextWriter writer, string? scopeId)
     {
         var leaks = Active.Values
+            .Where(l => scopeId is null || l.TestScopeId == scopeId)
             .OrderBy(l => l.Path, StringComparer.Ordinal)
             .ToArray();
         if (leaks.Length == 0) return false;
@@ -70,9 +83,18 @@ internal static class TestFileSystemWatcherLeakTracker
             $"warning: {leaks.Length} FileSystemWatcher-backed resource(s) created by tests were not disposed. " +
             "Dispose CredentialFileSource, tracked FileSystemWatcher, or tracked reload configuration in the owning test Dispose()/DisposeAsync or a using block.");
         foreach (var leak in leaks.Take(MaxReportedWatcherLeaks))
-            writer.WriteLine($"warning: undisposed {leak.Kind} for {leak.Path}");
+            writer.WriteLine($"warning: undisposed {leak.Kind} for {leak.Path} (created by {leak.TestDisplayName})");
         if (leaks.Length > MaxReportedWatcherLeaks)
             writer.WriteLine($"warning: {leaks.Length - MaxReportedWatcherLeaks} additional undisposed FileSystemWatcher-backed resource(s) omitted.");
+        return true;
+    }
+
+    private static bool ReportLeaks(Action<string> writeLine, string? scopeId)
+    {
+        using var writer = new StringWriter();
+        if (!ReportLeaks(writer, scopeId)) return false;
+        foreach (var line in writer.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries))
+            writeLine(line);
         return true;
     }
 
@@ -100,7 +122,12 @@ internal static class TestFileSystemWatcherLeakTracker
 
     private static void Track(object owner, string path, string kind)
     {
-        Active[owner] = new WatcherRecord(path, kind);
+        var scope = CurrentScope.Value;
+        Active[owner] = new WatcherRecord(
+            path,
+            kind,
+            scope?.Id,
+            scope?.DisplayName ?? "unknown test");
     }
 
     private static void MarkDisposed(object owner)
@@ -108,7 +135,40 @@ internal static class TestFileSystemWatcherLeakTracker
         Active.TryRemove(owner, out _);
     }
 
-    private sealed record WatcherRecord(string Path, string Kind);
+    private sealed record WatcherRecord(
+        string Path,
+        string Kind,
+        string? TestScopeId,
+        string TestDisplayName);
+
+    public sealed class TestCaseScope : IDisposable
+    {
+        private readonly TestCaseScope? _previous;
+        private bool _disposed;
+
+        internal TestCaseScope(string id, string displayName, TestCaseScope? previous)
+        {
+            Id = id;
+            DisplayName = displayName;
+            _previous = previous;
+        }
+
+        internal string Id { get; }
+        internal string DisplayName { get; }
+
+        public bool ReportLeaks(TextWriter writer)
+            => TestFileSystemWatcherLeakTracker.ReportLeaks(writer, Id);
+
+        public bool ReportLeaks(Action<string> writeLine)
+            => TestFileSystemWatcherLeakTracker.ReportLeaks(writeLine, Id);
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            CurrentScope.Value = _previous;
+        }
+    }
 
     public sealed class TrackedConfigurationRoot(IConfigurationRoot configuration, string path) : IDisposable
     {
