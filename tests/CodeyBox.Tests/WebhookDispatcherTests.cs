@@ -265,6 +265,44 @@ public sealed class WebhookDispatcherTests
         Assert.Equal("proj", proj.GetProperty("id").GetString());
         Assert.Equal("Test Project", proj.GetProperty("displayName").GetString());
     }
+
+    [Fact]
+    public void BuildPayload_StampsEventSchemaVersion()
+    {
+        var evt = MakeEvent("audit.completed");
+        var json = HttpWebhookDispatcher.BuildPayload(evt);
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.True(doc.RootElement.TryGetProperty("eventSchemaVersion", out var version),
+            "every webhook payload must carry the eventSchemaVersion envelope field");
+        Assert.Equal(HttpWebhookDispatcher.EventSchemaVersion, version.GetString());
+    }
+
+    // ── EventFilter respects new intermediate event names ────────────────────
+
+    [Theory]
+    [InlineData("iteration.started")]
+    [InlineData("iteration.completed")]
+    [InlineData("audit.started")]
+    [InlineData("audit.findings.emitted")]
+    [InlineData("audit.completed")]
+    [InlineData("merge.started")]
+    [InlineData("merge.completed")]
+    public async Task EventFilter_AllowsNewIntermediateEvents(string eventName)
+    {
+        var (dispatcher, requests, _) = BuildDispatcher(
+            HttpStatusCode.OK,
+            Endpoint(filter: [eventName]));
+
+        // Same-shaped event with a non-matching name must NOT be delivered.
+        await dispatcher.PublishAsync(MakeEvent("work_item.working"), CancellationToken.None);
+        await dispatcher.PublishAsync(MakeEvent(eventName), CancellationToken.None);
+        await dispatcher.DisposeAsync();
+
+        var req = Assert.Single(requests);
+        Assert.True(req.Headers.TryGetValues("X-CodeyBox-Event", out var values));
+        Assert.Equal(eventName, values!.Single());
+    }
 }
 
 // ── Test fakes ────────────────────────────────────────────────────────────────
