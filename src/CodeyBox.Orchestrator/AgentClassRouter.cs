@@ -443,7 +443,30 @@ public sealed class AgentClassRouter
 
         if (availablePct >= _opts.MinQuotaPct)
         {
-            var estimate = await EstimateHeadroomAsync(projectId, member, ct);
+            QuotaHeadroomEstimate? estimate;
+            try
+            {
+                estimate = await EstimateHeadroomAsync(projectId, member, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Quota headroom estimation failed for project {ProjectId} agent {Agent} model {Model}; failing closed until quota can be rechecked",
+                    projectId.Value,
+                    member.Agent.Value,
+                    member.ModelId ?? "(default)");
+                return new QuotaGateDecision(
+                    false,
+                    "headroom estimation failed",
+                    resetAt,
+                    InsufficientHeadroom: true);
+            }
+
             var estimatedCost = estimate?.EstimatedIterPctCost;
             var key = new QuotaReservationKey(projectId, member.Agent);
             var reservedPct = GetReservedHeadroomPct(key);
@@ -516,26 +539,9 @@ public sealed class AgentClassRouter
         if (_headroomEstimator is null)
             return null;
 
-        try
-        {
-            return await _headroomEstimator.EstimateAsync(
-                new QuotaHeadroomRequest(projectId, member.Agent, member.ModelId),
-                ct);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(
-                ex,
-                "Quota headroom estimation failed for project {ProjectId} agent {Agent} model {Model}; falling back to binary quota gate",
-                projectId.Value,
-                member.Agent.Value,
-                member.ModelId ?? "(default)");
-            return null;
-        }
+        return await _headroomEstimator.EstimateAsync(
+            new QuotaHeadroomRequest(projectId, member.Agent, member.ModelId),
+            ct);
     }
 
     private double GetReservedHeadroomPct(QuotaReservationKey key) =>

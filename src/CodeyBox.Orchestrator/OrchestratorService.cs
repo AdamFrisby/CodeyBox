@@ -254,6 +254,7 @@ public sealed class OrchestratorService : BackgroundService
             var workerIndex = Interlocked.Increment(ref _nextWorkerId);
 
             var capturedId = id.Value;
+            var quotaRoutingCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             // Increment before Task.Run so the counter is never transiently negative
             // if the task's finally block executes before we reach the increment.
             Interlocked.Increment(ref _currentlyRunning);
@@ -262,7 +263,7 @@ public sealed class OrchestratorService : BackgroundService
                 AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
                 try
                 {
-                    await RunItemAsync(workerIndex, capturedId, stoppingToken);
+                    await RunItemAsync(workerIndex, capturedId, stoppingToken, quotaRoutingCompleted);
                 }
                 finally
                 {
@@ -275,6 +276,13 @@ public sealed class OrchestratorService : BackgroundService
             inFlight.Add(task);
             // Prune completed tasks on every iteration to prevent unbounded growth.
             inFlight.RemoveAll(t => t.IsCompleted);
+
+            // Preserve priority order for quota headroom reservations. The worker
+            // signals as soon as routing has either reserved quota, parked, or
+            // determined that no quota routing applies; the pipeline itself still
+            // runs concurrently after this point.
+            try { await quotaRoutingCompleted.Task.WaitAsync(stoppingToken); }
+            catch (OperationCanceledException) { break; }
         }
 
         // Drain in-flight tasks before the hosted service exits.
@@ -530,12 +538,33 @@ public sealed class OrchestratorService : BackgroundService
         return item.With(targetState.Value) with { RecoveryAttempts = newAttempts };
     }
 
-    private async Task RunItemAsync(int workerIndex, WorkItemId id, CancellationToken ct)
+    private async Task RunItemAsync(
+        int workerIndex,
+        WorkItemId id,
+        CancellationToken ct,
+        TaskCompletionSource? quotaRoutingCompleted = null)
     {
-        var item = await _store.GetAsync(id, ct);
+        var quotaRoutingSignaled = 0;
+        void CompleteQuotaRouting()
+        {
+            if (Interlocked.Exchange(ref quotaRoutingSignaled, 1) == 0)
+                quotaRoutingCompleted?.TrySetResult();
+        }
+
+        WorkItem? item;
+        try
+        {
+            item = await _store.GetAsync(id, ct);
+        }
+        catch
+        {
+            CompleteQuotaRouting();
+            throw;
+        }
         if (item is null)
         {
             _log.LogWarning("Worker {WorkerId} dequeued unknown work item {Id}", workerIndex, id);
+            CompleteQuotaRouting();
             _activeItems.TryRemove(id, out _);
             return;
         }
@@ -545,6 +574,7 @@ public sealed class OrchestratorService : BackgroundService
             or WorkItemState.AbandonedAfterRecoveryAttempts)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
+            CompleteQuotaRouting();
             _activeItems.TryRemove(id, out _);
             return;
         }
@@ -554,6 +584,7 @@ public sealed class OrchestratorService : BackgroundService
         if (item.State is WorkItemState.NeedsOperatorInput)
         {
             _log.LogWarning("Worker {WorkerId} skipping {Id}: still in NeedsOperatorInput state", workerIndex, id);
+            CompleteQuotaRouting();
             _activeItems.TryRemove(id, out _);
             return;
         }
@@ -565,6 +596,7 @@ public sealed class OrchestratorService : BackgroundService
         if (item.State is WorkItemState.WaitingForQuotaReset)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForQuotaReset", workerIndex, id);
+            CompleteQuotaRouting();
             _activeItems.TryRemove(id, out _);
             return;
         }
@@ -615,6 +647,7 @@ public sealed class OrchestratorService : BackgroundService
             if (current is null)
             {
                 _log.LogWarning("Worker {WorkerId} dequeued unknown work item {Id} after claiming active slot", workerIndex, id);
+                CompleteQuotaRouting();
                 return;
             }
 
@@ -624,6 +657,7 @@ public sealed class OrchestratorService : BackgroundService
                 or WorkItemState.AbandonedAfterRecoveryAttempts)
             {
                 _log.LogInformation("Worker {WorkerId} skipping {Id} after active claim: terminal state {State}", workerIndex, id, current.State);
+                CompleteQuotaRouting();
                 return;
             }
 
@@ -639,6 +673,7 @@ public sealed class OrchestratorService : BackgroundService
                 {
                     _log.LogInformation(
                         "Worker {WorkerId} skipping {Id}: dependencies not yet terminal", workerIndex, id);
+                    CompleteQuotaRouting();
                     return;
                 }
             }
@@ -681,6 +716,7 @@ public sealed class OrchestratorService : BackgroundService
                 var decision = await _router.ResolveAsync(item, project, ct, reserveQuota: true);
                 if (decision.ShouldWait)
                 {
+                    CompleteQuotaRouting();
                     AuditLog.QuotaRouterDeferred(item.Id, decision.SuggestedRecheckIn);
                     await _quotaWaitParker.ParkAsync(
                         new QuotaWaitParkRequest(
@@ -699,12 +735,14 @@ public sealed class OrchestratorService : BackgroundService
                 }
                 else if (decision.NoEligibleMembers)
                 {
+                    CompleteQuotaRouting();
                     _log.LogError("Work item {Id}: {Reason}", item.Id, decision.Reason);
                     AuditLog.WorkItemFailed(item.Id, decision.Reason);
                     await _store.UpdateAsync(item.With(WorkItemState.Failed, decision.Reason), ct);
                     return;
                 }
             }
+            CompleteQuotaRouting();
 
             // Per-project pause gate: check before the budget lock so paused projects
             // don't consume a budget lock slot. Block is pickup-only; in-flight items
@@ -784,6 +822,7 @@ public sealed class OrchestratorService : BackgroundService
 
             using var registration = _cancellations.Register(item.Id);
             AuditLog.WorkItemPickedUp(workerIndex, item.Id);
+            CompleteQuotaRouting();
             try
             {
                 await _pipeline.RunAsync(item, registration.Token, ct);
@@ -819,6 +858,7 @@ public sealed class OrchestratorService : BackgroundService
         }
         finally
         {
+            CompleteQuotaRouting();
             quotaReservation?.Dispose();
             _activeItems.TryRemove(id, out _);
 

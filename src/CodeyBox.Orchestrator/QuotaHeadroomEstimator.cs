@@ -45,6 +45,7 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
 {
     private readonly IWorkItemCostStore _costs;
     private readonly QuotaRouterOptions _options;
+    private readonly ILogger<CostHistoryQuotaHeadroomEstimator> _log;
     private readonly TimeProvider _time;
 
     public CostHistoryQuotaHeadroomEstimator(
@@ -55,6 +56,7 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
     {
         _costs = costs;
         _options = options;
+        _log = log;
         _time = timeProvider ?? TimeProvider.System;
     }
 
@@ -67,13 +69,23 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
 
         var tokensPerPct = ResolveTokensPerPct(request.Agent);
         if (tokensPerPct <= 0)
+        {
+            _log.LogWarning(
+                "Quota headroom projection disabled for agent {Agent}: HeadroomTokensPerQuotaPct must be positive",
+                request.Agent.Value);
             return null;
+        }
 
         var now = _time.GetUtcNow();
         var from = now - _options.HeadroomHistoryWindow;
         var maxItems = _options.HeadroomHistoryItemCount;
         if (maxItems <= 0)
+        {
+            _log.LogWarning(
+                "Quota headroom projection disabled for project {ProjectId}: HeadroomHistoryItemCount must be positive",
+                request.ProjectId.Value);
             return null;
+        }
 
         var hasModel = !string.IsNullOrWhiteSpace(request.ModelId);
         IReadOnlyList<WorkItemCost> scoped = hasModel
@@ -116,15 +128,36 @@ public sealed class CostHistoryQuotaHeadroomEstimator : IQuotaHeadroomEstimator
 
         var samples = BuildPerItemIterationSamples(scoped, maxItems);
         if (samples.Count == 0)
+        {
+            _log.LogDebug(
+                "No quota headroom cost history for project {ProjectId} agent {Agent} model {Model}",
+                request.ProjectId.Value,
+                request.Agent.Value,
+                request.ModelId ?? "(default)");
             return null;
+        }
 
         var averageTokens = samples.Average();
         if (averageTokens <= 0)
+        {
+            _log.LogDebug(
+                "Quota headroom cost history for project {ProjectId} agent {Agent} model {Model} has no positive token samples",
+                request.ProjectId.Value,
+                request.Agent.Value,
+                request.ModelId ?? "(default)");
             return null;
+        }
 
         var estimatedPct = averageTokens / tokensPerPct;
         if (estimatedPct <= 0)
+        {
+            _log.LogDebug(
+                "Quota headroom estimate for project {ProjectId} agent {Agent} model {Model} was nonpositive",
+                request.ProjectId.Value,
+                request.Agent.Value,
+                request.ModelId ?? "(default)");
             return null;
+        }
 
         return new QuotaHeadroomEstimate(
             EstimatedIterPctCost: Math.Round(estimatedPct, 2, MidpointRounding.AwayFromZero),

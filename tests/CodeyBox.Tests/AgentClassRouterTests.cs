@@ -367,7 +367,7 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task SubscriptionEstimatorException_FailsOpenToBinaryQuotaGate()
+    public async Task SubscriptionEstimatorException_FailsClosedToQuotaWait()
     {
         var cls = FrontierClass(Sub(Claude));
         var router = new AgentClassRouter(
@@ -383,8 +383,9 @@ public sealed class AgentClassRouterTests
             CancellationToken.None,
             reserveQuota: true);
 
-        Assert.Equal(Claude, decision.Chosen!.Agent);
-        Assert.False(decision.ShouldWait);
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+        Assert.Contains("headroom", decision.Reason);
         Assert.Null(decision.QuotaReservation);
     }
 

@@ -358,6 +358,60 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_EmptyHistoryReturnsNullAndRouterAllows()
+    {
+        var opts = new QuotaRouterOptions
+        {
+            HeadroomTokensPerQuotaPct = 10_000,
+            HeadroomHistoryItemCount = 20,
+            HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            MinQuotaPct = 10.0,
+        };
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new QuotaHeadroomRequest(new ProjectId("proj-empty-headroom"), AgentKind.Claude, "claude-opus-4-7"));
+
+        Assert.Null(estimate);
+
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                    ModelId = "claude-opus-4-7",
+                },
+            ],
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(AgentKind.Claude, 15.0)],
+            opts,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: estimator);
+        var decision = await router.ResolveAsync(new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj-empty-headroom"),
+            Title = "t",
+            Prompt = "p",
+            AgentClassId = "frontier",
+        }, null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
     public async Task CostHistoryQuotaHeadroomEstimator_SelectsBoundedModelAgentAndProjectSources()
     {
         var now = DateTimeOffset.UtcNow;
