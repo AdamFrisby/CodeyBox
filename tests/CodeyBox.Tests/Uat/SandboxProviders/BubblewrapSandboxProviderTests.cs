@@ -102,7 +102,7 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         if (OperatingSystem.IsWindows()) return;
         var ackPath = Path.Combine(_workspace, "stdout-ack.fifo");
         var fakeBwrap = Path.Combine(_workspace, "fake-stdin-bwrap.sh");
-        await File.WriteAllTextAsync(fakeBwrap, """
+        WriteExecutableScript(fakeBwrap, """
             #!/bin/sh
             mkfifo "$ACK_FIFO"
             bytes=$(wc -c | tr -d ' ')
@@ -110,8 +110,6 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
             IFS= read -r _ < "$ACK_FIFO"
             rm -f "$ACK_FIFO"
             """);
-        File.SetUnixFileMode(fakeBwrap,
-            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var provider = new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions
             {
@@ -149,13 +147,11 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         if (OperatingSystem.IsWindows()) return;
         var readyPath = Path.Combine(_workspace, "fake-bwrap.ready");
         var fakeBwrap = Path.Combine(_workspace, "fake-bwrap.sh");
-        await File.WriteAllTextAsync(fakeBwrap, """
+        WriteExecutableScript(fakeBwrap, """
             #!/bin/sh
             printf ready > "$READY_FILE"
             exec tail -f /dev/null
             """);
-        File.SetUnixFileMode(fakeBwrap,
-            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var watcher = TestFileSystemWatcherLeakTracker.CreateWatcher(_workspace, Path.GetFileName(readyPath));
@@ -196,6 +192,16 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
 
     private static string[] SplitEcho(string stdout) =>
         stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries);
+
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    private static void WriteExecutableScript(string path, string contents)
+    {
+        var tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        File.WriteAllText(tempPath, contents);
+        File.SetUnixFileMode(tempPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.Move(tempPath, path);
+    }
 
     private static void AssertOption(string[] argv, string option, params string[] values)
     {

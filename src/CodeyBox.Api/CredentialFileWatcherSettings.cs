@@ -17,12 +17,20 @@ internal static class CredentialFileWatcherSettings
         var raw = environmentValue ?? configuration[ConfigurationKey];
         if (string.IsNullOrWhiteSpace(raw)) return true;
 
-        return raw.Trim() switch
+        var value = raw.Trim();
+        if (bool.TryParse(value, out var enabled))
+            return enabled;
+
+        return value switch
         {
             "0" => false,
-            var value when value.Equals("false", StringComparison.OrdinalIgnoreCase) => false,
-            var value when value.Equals("no", StringComparison.OrdinalIgnoreCase) => false,
-            _ => true,
+            "1" => true,
+            var v when v.Equals("no", StringComparison.OrdinalIgnoreCase) => false,
+            var v when v.Equals("off", StringComparison.OrdinalIgnoreCase) => false,
+            var v when v.Equals("yes", StringComparison.OrdinalIgnoreCase) => true,
+            var v when v.Equals("on", StringComparison.OrdinalIgnoreCase) => true,
+            _ => throw new InvalidOperationException(
+                $"{EnvironmentVariable} or {ConfigurationKey} must be a boolean-like value: true/false, 1/0, yes/no, or on/off."),
         };
     }
 }

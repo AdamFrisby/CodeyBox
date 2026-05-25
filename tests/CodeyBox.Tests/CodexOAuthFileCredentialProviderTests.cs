@@ -21,6 +21,36 @@ public sealed class CodexOAuthFileCredentialProviderTests : IDisposable
         => new(path, watch: false);
 
     [Fact]
+    public async Task PathConstructor_WithWatchFalse_DoesNotCreateWatcher()
+    {
+        var authPath = Path.Combine(_workspace, "auth.json");
+        await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"test-token\"}}");
+
+        using var provider = new CodexOAuthFileCredentialProvider(authPath, watch: false);
+
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(authPath));
+    }
+
+    [Fact]
+    public async Task Dispose_ReleasesOwnedCredentialFileSourceWatcher()
+    {
+        var authPath = Path.Combine(_workspace, "auth.json");
+        await File.WriteAllTextAsync(authPath, "{\"tokens\":{\"access_token\":\"test-token\"}}");
+        var provider = new CodexOAuthFileCredentialProvider(authPath, watch: true);
+
+        try
+        {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(authPath));
+        }
+        finally
+        {
+            provider.Dispose();
+        }
+
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(authPath));
+    }
+
+    [Fact]
     public async Task GetAsync_ReadsCodexAuthJsonForCodex()
     {
         var authPath = Path.Combine(_workspace, "auth.json");

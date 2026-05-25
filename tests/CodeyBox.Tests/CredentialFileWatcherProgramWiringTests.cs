@@ -59,7 +59,11 @@ public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
     [InlineData(null, "false", false)]
     [InlineData(null, "0", false)]
     [InlineData(null, "no", false)]
+    [InlineData(null, "off", false)]
     [InlineData(null, "true", true)]
+    [InlineData(null, "1", true)]
+    [InlineData(null, "yes", true)]
+    [InlineData(null, "on", true)]
     [InlineData("true", "false", true)]
     [InlineData("false", "true", false)]
     [InlineData("", "false", true)]
@@ -76,6 +80,25 @@ public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
             .Build();
 
         Assert.Equal(expected, CredentialFileWatcherSettings.IsEnabled(configuration, environmentValue));
+    }
+
+    [Theory]
+    [InlineData("flase", null)]
+    [InlineData(null, "tru")]
+    public void CredentialFileWatcherSetting_RejectsUnknownValues(
+        string? environmentValue,
+        string? configuredValue)
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                [CredentialFileWatcherSettings.ConfigurationKey] = configuredValue,
+            })
+            .Build();
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => CredentialFileWatcherSettings.IsEnabled(configuration, environmentValue));
+        Assert.Contains(CredentialFileWatcherSettings.EnvironmentVariable, ex.Message);
     }
 
     private sealed class CredentialWatcherProgramFactory : WebApplicationFactory<Program>

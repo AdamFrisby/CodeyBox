@@ -64,11 +64,46 @@ public sealed class CredentialFileSourceTests : IDisposable
         Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
         Assert.Equal("""{"access_token":"old"}""", source.GetRaw());
 
+        var notifications = 0;
+        source.TokenUpdated += () => Interlocked.Increment(ref notifications);
+
         File.WriteAllText(path, """{"access_token":"new-longer"}""");
         File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMilliseconds(100));
 
         Assert.Equal("""{"access_token":"new-longer"}""", source.GetRaw());
+        Assert.Equal(1, Volatile.Read(ref notifications));
         Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void WatcherRegistrationFailure_DisposesCreatedWatcherAndKeepsStatBasedReload()
+    {
+        var path = WriteFile("registration-fails.json", """{"access_token":"old"}""");
+        DisposeObservingFileSystemWatcher? created = null;
+        FileSystemWatcher? disposed = null;
+
+        using var source = new CredentialFileSource(
+            path,
+            NullLogger.Instance,
+            watch: true,
+            createWatcher: (dir, fileName) =>
+            {
+                created = new DisposeObservingFileSystemWatcher(dir, fileName);
+                created.Dispose();
+                created.ResetDisposeCalls();
+                return created;
+            },
+            watcherDisposed: watcher => disposed = watcher);
+
+        Assert.NotNull(created);
+        Assert.Equal(1, created.DisposeCalls);
+        Assert.Same(created, disposed);
+        Assert.False(source.IsWatching);
+
+        File.WriteAllText(path, """{"access_token":"new-longer"}""");
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMilliseconds(100));
+
+        Assert.Equal("""{"access_token":"new-longer"}""", source.GetRaw());
     }
 
     [Fact]
@@ -398,5 +433,24 @@ public sealed class CredentialFileSourceTests : IDisposable
             await Task.Delay(25);
         }
         return null;
+    }
+
+    private sealed class DisposeObservingFileSystemWatcher : FileSystemWatcher
+    {
+        public DisposeObservingFileSystemWatcher(string path, string filter)
+            : base(path, filter)
+        {
+        }
+
+        public int DisposeCalls { get; private set; }
+
+        public void ResetDisposeCalls() => DisposeCalls = 0;
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                DisposeCalls++;
+            base.Dispose(disposing);
+        }
     }
 }

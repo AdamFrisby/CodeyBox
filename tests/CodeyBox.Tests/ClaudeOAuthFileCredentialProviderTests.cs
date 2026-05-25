@@ -29,6 +29,40 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
         => new(path, "CLAUDE_CODE_OAUTH_TOKEN", watch: false);
 
     [Fact]
+    public void PathConstructor_WithWatchFalse_DoesNotCreateWatcher()
+    {
+        var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""");
+
+        using var provider = new ClaudeOAuthFileCredentialProvider(
+            path,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            watch: false);
+
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
+    public void Dispose_ReleasesOwnedCredentialFileSourceWatcher()
+    {
+        var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""");
+        var provider = new ClaudeOAuthFileCredentialProvider(
+            path,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            watch: true);
+
+        try
+        {
+            Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+        }
+        finally
+        {
+            provider.Dispose();
+        }
+
+        Assert.False(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
+    }
+
+    [Fact]
     public async Task ReturnsTokenForClaudeWhenFilePresent()
     {
         var path = WriteCredFile("""{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc"}}""");

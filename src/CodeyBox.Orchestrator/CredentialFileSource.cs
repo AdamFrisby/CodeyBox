@@ -36,6 +36,8 @@ public class CredentialFileSource : IDisposable
     private const int RetryDelayMs = 100;
 
     private readonly ILogger? _log;
+    private readonly Func<string, string, FileSystemWatcher> _createWatcher;
+    private readonly Action<FileSystemWatcher> _watcherDisposed;
     private readonly object _gate = new();
     private string? _cached;
     private DateTime _cachedMtimeUtc = DateTime.MinValue;
@@ -57,9 +59,26 @@ public class CredentialFileSource : IDisposable
     public event Action? TokenUpdated;
 
     public CredentialFileSource(string filePath, ILogger? log = null, bool watch = true)
+        : this(
+            filePath,
+            log,
+            watch,
+            CredentialFileSourceWatcherDiagnostics.CreateWatcher,
+            CredentialFileSourceWatcherDiagnostics.WatcherDisposed)
+    {
+    }
+
+    internal CredentialFileSource(
+        string filePath,
+        ILogger? log,
+        bool watch,
+        Func<string, string, FileSystemWatcher> createWatcher,
+        Action<FileSystemWatcher> watcherDisposed)
     {
         FilePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
         _log = log;
+        _createWatcher = createWatcher ?? throw new ArgumentNullException(nameof(createWatcher));
+        _watcherDisposed = watcherDisposed ?? throw new ArgumentNullException(nameof(watcherDisposed));
         TryReload(force: false, out _);
         if (watch) StartWatcher();
     }
@@ -237,7 +256,7 @@ public class CredentialFileSource : IDisposable
         FileSystemWatcher? w = null;
         try
         {
-            w = CredentialFileSourceWatcherDiagnostics.CreateWatcher(dir, fileName);
+            w = _createWatcher(dir, fileName);
             w.NotifyFilter = NotifyFilters.LastWrite
                 | NotifyFilters.FileName
                 | NotifyFilters.CreationTime
@@ -256,7 +275,7 @@ public class CredentialFileSource : IDisposable
                 try
                 {
                     w.Dispose();
-                    CredentialFileSourceWatcherDiagnostics.WatcherDisposed(w);
+                    _watcherDisposed(w);
                 }
                 catch (Exception disposeEx)
                 {
@@ -302,7 +321,7 @@ public class CredentialFileSource : IDisposable
             try
             {
                 w.Dispose();
-                CredentialFileSourceWatcherDiagnostics.WatcherDisposed(w);
+                _watcherDisposed(w);
             }
             catch (Exception ex)
             {
