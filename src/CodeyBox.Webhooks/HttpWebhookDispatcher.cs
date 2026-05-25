@@ -165,8 +165,12 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
     /// payload envelope (top-level fields, identifier semantics, or signing
     /// contract) changes in a non-additive way. New event types or new
     /// optional <c>details</c> fields are additive and do NOT bump this.
+    ///
+    /// Kept in sync with <see cref="WebhookEvent.CurrentSchemaVersion"/> — the
+    /// authoritative version now lives on the event itself; this const is
+    /// retained for callers that read the dispatcher's compile-time default.
     /// </summary>
-    public const string EventSchemaVersion = "1.0";
+    public const string EventSchemaVersion = WebhookEvent.CurrentSchemaVersion;
 
     public static string BuildPayload(WebhookEvent evt)
     {
