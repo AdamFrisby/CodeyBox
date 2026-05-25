@@ -163,6 +163,43 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaWaitParker_NotifiesRetryNotifierAfterSuccessfulPark()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var resetAt = DateTimeOffset.UtcNow.AddHours(1);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p1"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await store.CreateAsync(item);
+
+        var notifier = new CapturingQuotaRetryNotifier();
+        var parker = new QuotaWaitParker(
+            store,
+            retryNotifier: notifier,
+            timeProvider: new FixedClock(DateTimeOffset.UtcNow));
+
+        await parker.ParkAsync(new QuotaWaitParkRequest(
+            item,
+            "insufficient headroom",
+            "work",
+            resetAt));
+
+        var notified = Assert.Single(notifier.Notifications);
+        Assert.Equal(item.Id, notified.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, notified.State);
+        Assert.Equal("quota", notified.FailureKind);
+        Assert.Equal(resetAt, notified.QuotaResetAt);
+        Assert.Equal(resetAt, notified.NextQuotaRetryAt);
+    }
+
+    [Fact]
     public async Task QuotaRetryScheduler_PeriodicSweep_ReEnqueuesWaitingForQuotaResetItem()
     {
         // The other half of the spec test case "all members exhausted → item
@@ -320,6 +357,81 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
+    public async Task OrchestratorService_WaitingForQuotaResetRace_ReleasesActiveSlot()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var pipeline = new FakePipelineRunner(store);
+        var resetAt = DateTimeOffset.UtcNow.AddHours(1);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p1"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await store.CreateAsync(item);
+
+        var spawnCount = 0;
+        var opts = new OrchestratorOptions
+        {
+            MaxConcurrentWorkers = 1,
+            OnWorkerSpawned = () =>
+            {
+                if (Interlocked.Increment(ref spawnCount) != 1)
+                    return;
+
+                var current = store.GetAsync(item.Id).GetAwaiter().GetResult();
+                store.UpdateAsync(current!.With(
+                    WorkItemState.WaitingForQuotaReset,
+                    "parked after pickup",
+                    failureKind: "quota",
+                    quotaResetAt: resetAt) with
+                {
+                    NextQuotaRetryAt = resetAt,
+                }).GetAwaiter().GetResult();
+            },
+        };
+
+        var svc = new OrchestratorService(queue, store, pipeline, registry, opts,
+            NullLogger<OrchestratorService>.Instance);
+
+        await queue.EnqueueAsync(item.Id);
+        await svc.StartAsync(CancellationToken.None);
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        WorkItem? parked = null;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            parked = await store.GetAsync(item.Id);
+            if (parked?.State == WorkItemState.WaitingForQuotaReset)
+                break;
+            await Task.Delay(20);
+        }
+
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.DoesNotContain(item.Id, pipeline.Executed);
+
+        await store.UpdateAsync(parked.With(WorkItemState.Queued));
+        await queue.EnqueueAsync(item.Id);
+
+        deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline && !pipeline.Executed.Contains(item.Id))
+            await Task.Delay(20);
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Contains(item.Id, pipeline.Executed);
+        var final = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+    }
+
+    [Fact]
     public async Task QuotaRetryScheduler_TargetedTimer_FiresForWaitingForQuotaReset()
     {
         // Sanity that the timer path (not just the periodic sweep) treats
@@ -473,6 +585,17 @@ public sealed class WaitingForQuotaResetTests : IDisposable
 
         var refetched = await store.GetAsync(parked.Id);
         Assert.Equal(WorkItemState.Queued, refetched!.State);
+    }
+
+    private sealed class CapturingQuotaRetryNotifier : IQuotaRetryNotifier
+    {
+        public List<WorkItem> Notifications { get; } = [];
+
+        public Task NotifyQuotaFailureAsync(WorkItem item)
+        {
+            Notifications.Add(item);
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class FixedClock : TimeProvider

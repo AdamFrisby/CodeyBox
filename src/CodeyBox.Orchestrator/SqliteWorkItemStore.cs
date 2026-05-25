@@ -388,7 +388,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         using var cmd = _conn.CreateCommand();
-        // Exclude terminal states and parked NeedsOperatorInput. The remaining set
+        // Exclude terminal states and parked states. The remaining set
         // mirrors what the FIFO dispatcher used to process via the channel:
         // Queued plus the mid-pipeline resumable states (Working, WorkComplete,
         // Auditing, Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
@@ -401,7 +401,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 {(int)WorkItemState.AuditFailed},
                 {(int)WorkItemState.MergeConflictResolutionFailed},
                 {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
-                {(int)WorkItemState.NeedsOperatorInput}
+                {(int)WorkItemState.NeedsOperatorInput},
+                {(int)WorkItemState.WaitingForQuotaReset}
             )
             ORDER BY priority DESC, created_at ASC;
             """;

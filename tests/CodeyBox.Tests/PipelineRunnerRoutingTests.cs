@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
 
 namespace CodeyBox.Tests;
 
@@ -254,6 +255,143 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
         Assert.NotNull(finalItem?.QuotaResetAt);
         Assert.NotNull(finalItem?.NextQuotaRetryAt);
     }
+
+    [Fact]
+    public async Task QuotaReservationReleasedAfterPipelineCompletion_AllowsNextItem()
+    {
+        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);
+        var pickupCount = 0;
+        var pipeline = new CountingPipelineRunner(
+            _store,
+            onRun: () => Interlocked.Increment(ref pickupCount));
+
+        var first = MakeRoutedItem();
+        var second = MakeRoutedItem();
+        await _store.CreateAsync(first);
+        await _store.CreateAsync(second);
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: null);
+
+        await queue.EnqueueAsync(first.Id);
+        await queue.EnqueueAsync(second.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline && Volatile.Read(ref pickupCount) < 2)
+            await Task.Delay(20);
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Equal(2, Volatile.Read(ref pickupCount));
+        Assert.Equal(WorkItemState.Done, (await _store.GetAsync(first.Id))!.State);
+        Assert.Equal(WorkItemState.Done, (await _store.GetAsync(second.Id))!.State);
+    }
+
+    [Fact]
+    public async Task QuotaReservationReleasedAfterProjectPauseGate_AllowsRetryAfterResume()
+    {
+        var router = BuildReservationRouter(availablePct: 60.0, estimatedPctCost: 45.0);
+        var pickupCount = 0;
+        var pipeline = new CountingPipelineRunner(
+            _store,
+            onRun: () => Interlocked.Increment(ref pickupCount));
+        var queueController = new ToggleProjectPauseQueueController(paused: true);
+
+        var item = MakeRoutedItem();
+        await _store.CreateAsync(item);
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = item.ProjectId,
+            DisplayName = item.ProjectId.Value,
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "quota-reservation",
+        });
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: projects,
+            queueController: queueController);
+
+        await queue.EnqueueAsync(item.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        await queueController.ProjectStateChecked.WaitAsync(TimeSpan.FromSeconds(5));
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var status = await svc.GetStatusAsync();
+            if (status.CurrentlyRunning == 0)
+                break;
+            await Task.Delay(20);
+        }
+
+        Assert.Equal(0, Volatile.Read(ref pickupCount));
+
+        queueController.ResumeProject();
+        await queue.EnqueueAsync(item.Id);
+
+        deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline && Volatile.Read(ref pickupCount) == 0)
+            await Task.Delay(20);
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, Volatile.Read(ref pickupCount));
+        Assert.Equal(WorkItemState.Done, (await _store.GetAsync(item.Id))!.State);
+    }
+
+    private static WorkItem MakeRoutedItem() => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("proj"),
+        Title = "t",
+        Prompt = "p",
+        AgentClassId = "quota-reservation",
+    };
+
+    private static AgentClassRouter BuildReservationRouter(double availablePct, double estimatedPctCost)
+    {
+        var agentClass = new AgentClass
+        {
+            Id = "quota-reservation",
+            DisplayName = "Quota reservation",
+            Members =
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+        };
+
+        return new AgentClassRouter(
+            [agentClass],
+            [new FakeProbe(AgentKind.Claude, availablePct)],
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 10.0,
+                QuotaRecheckInterval = TimeSpan.FromHours(1),
+            },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new FixedHeadroomEstimator(estimatedPctCost));
+    }
 }
 
 /// <summary>
@@ -274,5 +412,45 @@ internal sealed class AgentTrackingPipeline : IPipelineRunner
         LastAgent = item.Agent;
         ReceivedNullAgent = item.Agent is null;
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+    }
+}
+
+internal sealed class ToggleProjectPauseQueueController : IQueueController
+{
+    private volatile bool _paused;
+    private readonly TaskCompletionSource _projectStateChecked =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public ToggleProjectPauseQueueController(bool paused) => _paused = paused;
+
+    public QueueState State => QueueState.Running;
+    public DateTimeOffset? PausedAt => null;
+    public string? PausedReason => null;
+    public Task ProjectStateChecked => _projectStateChecked.Task;
+
+    public Task PauseAsync(string reason, CancellationToken ct = default) => Task.CompletedTask;
+    public Task ResumeAsync(CancellationToken ct = default) => Task.CompletedTask;
+    public Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct = default)
+    {
+        _paused = true;
+        return Task.CompletedTask;
+    }
+
+    public Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct = default)
+    {
+        _paused = false;
+        return Task.CompletedTask;
+    }
+
+    public void ResumeProject() => _paused = false;
+
+    public Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct = default)
+    {
+        _projectStateChecked.TrySetResult();
+        return Task.FromResult<ProjectQueueState?>(new ProjectQueueState(
+            projectId,
+            _paused,
+            _paused ? DateTimeOffset.UtcNow : null,
+            _paused ? "paused for test" : null));
     }
 }

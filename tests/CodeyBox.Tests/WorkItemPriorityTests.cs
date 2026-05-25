@@ -98,12 +98,14 @@ public sealed class WorkItemPriorityTests : IDisposable
         var done = MakeItem(priority: 999) with { State = WorkItemState.Done };
         var failed = MakeItem(priority: 999) with { State = WorkItemState.Failed };
         var parked = MakeItem(priority: 999) with { State = WorkItemState.NeedsOperatorInput };
+        var quotaParked = MakeItem(priority: 999) with { State = WorkItemState.WaitingForQuotaReset };
         var working = MakeItem(priority: 200) with { State = WorkItemState.Working };
 
         await _store.CreateAsync(queued);
         await _store.CreateAsync(done);
         await _store.CreateAsync(failed);
         await _store.CreateAsync(parked);
+        await _store.CreateAsync(quotaParked);
         await _store.CreateAsync(working);
 
         var ordered = new List<WorkItemId>();

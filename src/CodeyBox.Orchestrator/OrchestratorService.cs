@@ -565,6 +565,7 @@ public sealed class OrchestratorService : BackgroundService
         if (item.State is WorkItemState.WaitingForQuotaReset)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForQuotaReset", workerIndex, id);
+            _activeItems.TryRemove(id, out _);
             return;
         }
 
