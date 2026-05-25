@@ -5,6 +5,7 @@ using CodeyBox.Tests;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Net;
+using System.Net.Http.Json;
 using System.Text.Json;
 
 namespace CodeyBox.Tests.Uat.PipelineAndWorkerLifecycle;
@@ -221,8 +222,10 @@ public sealed class RetryAndBranchLifecycleTests : IDisposable
             new ThrowingBranchProbeGitHost(),
             NullLogger<WorkItemRetrier>.Instance);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => retrier.RetryAsync(item, from: null));
+        var result = await retrier.RetryAsync(item, from: null);
 
+        Assert.False(result.Success);
+        Assert.Contains("cannot auto-pick retry phase", result.Error);
         var stored = await store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, stored!.State);
         Assert.Equal("previous failure", stored.LastError);
@@ -261,6 +264,40 @@ public sealed class RetryAndBranchLifecycleTests : IDisposable
         Assert.Equal("audit", body.RootElement.GetProperty("actualFrom").GetString());
         Assert.Equal("WorkComplete", body.RootElement.GetProperty("state").GetString());
         Assert.Equal(WorkItemState.WorkComplete, (await factory.Store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task RetryEndpointWithExplicitFromWork_OverridesAutoPickWhenWorkBranchHasPriorCommits()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = new Project
+        {
+            Id = PipelineLifecycleUatHelpers.TestProjectId,
+            DisplayName = "Retry endpoint UAT",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+        };
+        using var factory = new WorkItemApiFactory(null, project);
+        using var client = factory.CreateClient();
+        var gitHost = factory.Services.GetRequiredService<IGitHost>();
+        const string workBranch = "codeybox/http-explicit-work";
+        var item = PipelineLifecycleUatHelpers.NewItem(workBranch) with
+        {
+            State = WorkItemState.Failed,
+            LastError = "previous iteration failure",
+        };
+        await factory.Store.CreateAsync(item);
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await AddCommitsToBareBranchAsync(_workspace, gitHost.GetRepoPath(repoId), workBranch, "main", count: 3);
+
+        var response = await client.PostAsJsonAsync($"/workitems/{item.Id}/retry", new { from = "work" });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("work", body.RootElement.GetProperty("from").GetString());
+        Assert.Equal("work", body.RootElement.GetProperty("actualFrom").GetString());
+        Assert.Equal("Queued", body.RootElement.GetProperty("state").GetString());
+        Assert.Equal(WorkItemState.Queued, (await factory.Store.GetAsync(item.Id))!.State);
     }
 
     [Fact]

@@ -51,7 +51,15 @@ public sealed class WorkItemRetrier
         string? autoPickReason = null;
         if (string.IsNullOrWhiteSpace(from))
         {
-            (from, autoPickReason) = await AutoPickRetryFromAsync(item, ct);
+            try
+            {
+                (from, autoPickReason) = await AutoPickRetryFromAsync(item, ct);
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            {
+                _log.LogWarning(ex, "Failed to auto-pick retry phase for work item {Id}; retry aborted", item.Id);
+                return (false, $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}", null, null);
+            }
         }
 
         var requestedFrom = from!.Trim().ToLowerInvariant();

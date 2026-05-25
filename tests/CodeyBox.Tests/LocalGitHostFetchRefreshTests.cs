@@ -271,6 +271,57 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
     }
 
     [Fact]
+    public async Task BranchHasCommitsAheadAsync_ReturnsTrueOnlyForConfirmedAheadCommits()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitHost = CreateGitHost();
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        await TestSupport.RunGit(barePath, "update-ref", "refs/heads/codeybox/equal", "refs/heads/main");
+        await CommitToBareBranchAsync(
+            barePath,
+            "codeybox/ahead",
+            "ahead.txt",
+            "ahead\n",
+            "ahead branch");
+
+        Assert.False(await gitHost.BranchHasCommitsAheadAsync(repoId, "main", "codeybox/equal"));
+        Assert.True(await gitHost.BranchHasCommitsAheadAsync(repoId, "main", "codeybox/ahead"));
+    }
+
+    [Fact]
+    public async Task BranchHasCommitsAheadAsync_ThrowsWhenComparedBranchIsMissing()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitHost = CreateGitHost();
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        await TestSupport.RunGit(barePath, "update-ref", "refs/heads/codeybox/equal", "refs/heads/main");
+
+        var missingBase = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => gitHost.BranchHasCommitsAheadAsync(repoId, "missing-base", "codeybox/equal"));
+        Assert.Contains("base branch 'missing-base'", missingBase.Message);
+
+        var missingWork = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => gitHost.BranchHasCommitsAheadAsync(repoId, "main", "codeybox/missing-work"));
+        Assert.Contains("work branch 'codeybox/missing-work'", missingWork.Message);
+    }
+
+    [Fact]
+    public async Task BranchHasCommitsAheadAsync_ThrowsWhenBareRepositoryIsMissing()
+    {
+        var gitHost = CreateGitHost();
+        var missingRepoId = WorkItemId.New().ToString();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => gitHost.BranchHasCommitsAheadAsync(missingRepoId, "main", "codeybox/work"));
+
+        Assert.Contains("bare repo", ex.Message);
+    }
+
+    [Fact]
     public async Task ExistingBareRepo_RespectsConfiguredBaseBranch()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

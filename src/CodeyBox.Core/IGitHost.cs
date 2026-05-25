@@ -82,9 +82,10 @@ public interface IGitHost
     /// with prior commits should re-audit before discarding work, an empty
     /// work branch should re-run the work phase.
     ///
-    /// Returns <c>false</c> when the repo or either branch is missing — the
-    /// auto-pick falls through to "from=work" in that case, which is the
-    /// pre-existing default and matches a fresh-clone retry. Never throws.
+    /// Implementations should fail loudly when the comparison cannot be trusted
+    /// (for example, when a compared branch cannot resolve or git exits
+    /// non-zero). Callers that want "fresh start" behavior for expected missing
+    /// state should preflight that state before calling this probe.
     ///
     /// Default returns <c>false</c> ("don't know, assume no commits ahead")
     /// so test fakes that don't implement the check behave as before.

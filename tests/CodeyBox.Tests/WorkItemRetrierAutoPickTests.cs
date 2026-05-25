@@ -134,6 +134,35 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
     }
 
     [Fact]
+    public async Task AutoPick_UsesExplicitItemBaseBranchBeforeProjectDefault()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = new RecordingGitHost
+        {
+            AheadSelector = (_, baseBranch, _) => string.Equals(baseBranch, "main", StringComparison.Ordinal),
+        };
+        var item = NewFailedItem(baseBranch: "release/item-base");
+        await store.CreateAsync(item);
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = TestProjectId,
+            DisplayName = "Retry autopick",
+            RepositoryUrl = "file:///tmp/retry-autopick",
+            DefaultBaseBranch = "main",
+        });
+        var retrier = NewRetrier(store, queue, gitHost, projects: projects);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.ResumeState);
+        Assert.Equal("work", result.ActualFrom);
+        Assert.Equal("release/item-base", gitHost.LastBaseBranch);
+        Assert.Equal(0, gitHost.GetDefaultBranchCalls);
+    }
+
+    [Fact]
     public async Task AutoPick_UsesPersistedReleaseBranchBeforeProjectDefault()
     {
         using var store = NewStore();
