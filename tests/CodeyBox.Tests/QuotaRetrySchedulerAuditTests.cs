@@ -11,6 +11,7 @@ namespace CodeyBox.Tests;
 [Collection("GlobalSerilog")]
 public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 {
+    private static readonly ProjectId TestProjectId = new("test-project");
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-quota-audit-").FullName;
     private readonly TestSink _sink = new();
 
@@ -29,22 +30,153 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
-    public async Task PeriodicSweep_AuditLogsEveryWalkedWaitingForQuotaResetItem()
+    public async Task PeriodicSweep_AuditLogsEveryWalkedQuotaStateItem()
     {
-        var dbPath = Path.Combine(_workspace, "state.db");
-        using var store = new SqliteWorkItemStore(dbPath);
-        var gitHost = new LocalGitHost(
-            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos") },
-            NullLogger<LocalGitHost>.Instance);
-        var retrier = new WorkItemRetrier(store, new InMemoryTaskQueue(), gitHost, NullLogger<WorkItemRetrier>.Instance);
-        var projects = new InMemoryProjectRepository(new Project
+        using var fixture = BuildScheduler(BuildRouter(availablePct: 0), BuildProjects());
+        var failed = CreateQuotaItem(WorkItemState.Failed);
+        var waiting = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        await fixture.Store.CreateAsync(failed);
+        await fixture.Store.CreateAsync(waiting);
+
+        await RunPeriodicSweepAsync(fixture.Scheduler);
+
+        AssertQuotaAttempt(failed, "periodic", "skipped:quota-still-gated", "Failed");
+        AssertQuotaAttempt(waiting, "periodic", "skipped:quota-still-gated", "WaitingForQuotaReset");
+    }
+
+    [Theory]
+    [MemberData(nameof(AuditOutcomeCases))]
+    public async Task TryRetry_AuditLogsOutcomeForSkippedAndFailedBranches(
+        string expectedOutcome,
+        Func<QuotaRetrySchedulerAuditTests, SchedulerFixture> buildFixture,
+        Func<WorkItem> buildItem,
+        string expectedState,
+        string? expectedReason)
+    {
+        using var fixture = buildFixture(this);
+        var item = buildItem();
+        await fixture.Store.CreateAsync(item);
+
+        await RunPeriodicSweepAsync(fixture.Scheduler);
+
+        var evt = AssertQuotaAttempt(item, "periodic", expectedOutcome, expectedState);
+        if (expectedReason is not null)
+            Assert.Equal(expectedReason, GetScalar<string>(evt, "Reason"));
+    }
+
+    public static TheoryData<string, Func<QuotaRetrySchedulerAuditTests, SchedulerFixture>, Func<WorkItem>, string, string?> AuditOutcomeCases()
+    {
+        return new TheoryData<string, Func<QuotaRetrySchedulerAuditTests, SchedulerFixture>, Func<WorkItem>, string, string?>
         {
-            Id = new ProjectId("test-project"),
-            DisplayName = "Test",
-            RepositoryUrl = "https://example.invalid/repo.git",
-            DefaultAgentClass = "frontier",
-        });
-        var router = new AgentClassRouter(
+            {
+                "skipped:max-retries",
+                self => self.BuildScheduler(BuildRouter(availablePct: 100), BuildProjects()),
+                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with { QuotaRetryAttempts = 3 },
+                "WaitingForQuotaReset",
+                "attempts=3; max=3"
+            },
+            {
+                "skipped:global-queue-paused",
+                self => self.BuildScheduler(BuildRouter(availablePct: 100), BuildProjects(), new FakeQueueController(QueueState.Paused)),
+                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset),
+                "WaitingForQuotaReset",
+                ""
+            },
+            {
+                "skipped:project-queue-paused",
+                self => self.BuildScheduler(BuildRouter(availablePct: 100), BuildProjects(), new FakeQueueController(QueueState.Running, projectPaused: true)),
+                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset),
+                "WaitingForQuotaReset",
+                "projectId=test-project"
+            },
+            {
+                "skipped:project-repository-unavailable",
+                self => self.BuildScheduler(BuildRouter(availablePct: 100), projects: null),
+                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset),
+                "WaitingForQuotaReset",
+                ""
+            },
+            {
+                "skipped:project-not-found",
+                self => self.BuildScheduler(BuildRouter(availablePct: 100), new InMemoryProjectRepository()),
+                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset),
+                "WaitingForQuotaReset",
+                "projectId=test-project"
+            },
+            {
+                "skipped:router-unavailable",
+                self => self.BuildScheduler(router: null, BuildProjects()),
+                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset),
+                "WaitingForQuotaReset",
+                ""
+            },
+            {
+                "skipped:no-eligible-members",
+                self => self.BuildScheduler(BuildRouter(availablePct: 100, memberQualityScore: 80), BuildProjects()),
+                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset),
+                "WaitingForQuotaReset",
+                "ROUTING_NO_ELIGIBLE: no member of class 'frontier' meets MinModelScore=95 (best available=80)"
+            },
+            {
+                "retry-failed",
+                self => self.BuildScheduler(BuildRouter(availablePct: 100), BuildProjects()),
+                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with { QuotaRetryFrom = "audit" },
+                "WaitingForQuotaReset",
+                null
+            },
+        };
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_ContinuesAfterRetryExceptionAndAuditsError()
+    {
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            BuildProjects(),
+            webhooks: new ThrowingWebhookDispatcher());
+        var first = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        var second = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        await fixture.Store.CreateAsync(first);
+        await fixture.Store.CreateAsync(second);
+
+        await RunPeriodicSweepAsync(fixture.Scheduler);
+
+        Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(first.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(second.Id))!.State);
+        AssertQuotaAttempt(first, "periodic", "error", "WaitingForQuotaReset");
+        AssertQuotaAttempt(second, "periodic", "error", "WaitingForQuotaReset");
+    }
+
+    [Fact]
+    public async Task RearmTimers_SurfacesOverdueRetryFailure()
+    {
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            BuildProjects(),
+            webhooks: new ThrowingWebhookDispatcher());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => RearmTimersAsync(fixture.Scheduler));
+
+        Assert.Equal("webhook failed", ex.Message);
+        AssertQuotaAttempt(item, "rearm-overdue", "error", "WaitingForQuotaReset");
+    }
+
+    private sealed class StaticQuotaProbe : IAgentQuotaProbe
+    {
+        private readonly double _availablePct;
+        public StaticQuotaProbe(double availablePct) => _availablePct = availablePct;
+        public AgentKind Kind => AgentKind.Claude;
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+            => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
+    }
+
+    private static AgentClassRouter BuildRouter(double availablePct, int memberQualityScore = 100)
+        => new(
             [
                 new AgentClass
                 {
@@ -56,14 +188,28 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
                         {
                             Agent = AgentKind.Claude,
                             Billing = AgentBilling.Subscription,
-                            QualityScore = 100,
+                            QualityScore = memberQualityScore,
                         },
                     ],
                 },
             ],
-            [new StaticQuotaProbe(0)],
+            [new StaticQuotaProbe(availablePct)],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance);
+
+    private SchedulerFixture BuildScheduler(
+        AgentClassRouter? router,
+        IProjectRepository? projects,
+        IQueueController? queueController = null,
+        IWebhookDispatcher? webhooks = null)
+    {
+        var dbPath = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N") + ".db");
+        var store = new SqliteWorkItemStore(dbPath);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")) },
+            NullLogger<LocalGitHost>.Instance);
+        var retrier = new WorkItemRetrier(store, new InMemoryTaskQueue(), gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var time = new InertTimeProvider(DateTimeOffset.UtcNow);
         var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -78,41 +224,126 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             },
             NullLogger<QuotaRetryScheduler>.Instance,
             router,
-            projects);
+            projects,
+            queueController,
+            webhooks,
+            time);
+        return new SchedulerFixture(store, scheduler);
+    }
 
-        var item = new WorkItem
+    private static IProjectRepository BuildProjects()
+        => new InMemoryProjectRepository(new Project
+        {
+            Id = TestProjectId,
+            DisplayName = "Test",
+            RepositoryUrl = "https://example.invalid/repo.git",
+            DefaultAgentClass = "frontier",
+        });
+
+    private static WorkItem CreateQuotaItem(WorkItemState state)
+        => new()
         {
             Id = WorkItemId.New(),
-            ProjectId = new ProjectId("test-project"),
+            ProjectId = TestProjectId,
             Title = "parked",
             Prompt = "p",
-            State = WorkItemState.WaitingForQuotaReset,
+            State = state,
             FailureKind = "quota",
             AgentClassId = "frontier",
             NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(-2),
         };
-        await store.CreateAsync(item);
 
+    private static async Task RunPeriodicSweepAsync(QuotaRetryScheduler scheduler)
+    {
         var sweep = typeof(QuotaRetryScheduler).GetMethod(
             "RunPeriodicSweepAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         await (Task)sweep.Invoke(scheduler, [CancellationToken.None])!;
-
-        var evt = Assert.Single(_sink.Events, e =>
-            string.Equals(GetScalar<string>(e, "EventName"), "quota_retry_attempted", StringComparison.Ordinal)
-            && string.Equals(GetScalar<string>(e, "WorkItemId"), item.Id.ToString(), StringComparison.Ordinal));
-        Assert.Equal("periodic", GetScalar<string>(evt, "Source"));
-        Assert.Equal("skipped:quota-still-gated", GetScalar<string>(evt, "Outcome"));
-        Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
     }
 
-    private sealed class StaticQuotaProbe : IAgentQuotaProbe
+    private static async Task RearmTimersAsync(QuotaRetryScheduler scheduler)
     {
-        private readonly double _availablePct;
-        public StaticQuotaProbe(double availablePct) => _availablePct = availablePct;
-        public AgentKind Kind => AgentKind.Claude;
-        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-            => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
+        var rearm = typeof(QuotaRetryScheduler).GetMethod(
+            "RearmTimersAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)rearm.Invoke(scheduler, [CancellationToken.None])!;
+    }
+
+    private LogEvent AssertQuotaAttempt(WorkItem item, string source, string outcome, string state)
+    {
+        var evt = Assert.Single(_sink.Events, e =>
+            string.Equals(GetScalar<string>(e, "EventName"), "quota_retry_attempted", StringComparison.Ordinal)
+            && string.Equals(GetScalar<string>(e, "WorkItemId"), item.Id.ToString(), StringComparison.Ordinal)
+            && string.Equals(GetScalar<string>(e, "Source"), source, StringComparison.Ordinal)
+            && string.Equals(GetScalar<string>(e, "Outcome"), outcome, StringComparison.Ordinal));
+        Assert.Equal(state, GetScalar<string>(evt, "State"));
+        return evt;
+    }
+
+    public sealed class SchedulerFixture : IDisposable
+    {
+        public SchedulerFixture(SqliteWorkItemStore store, QuotaRetryScheduler scheduler)
+        {
+            Store = store;
+            Scheduler = scheduler;
+        }
+
+        public SqliteWorkItemStore Store { get; }
+        public QuotaRetryScheduler Scheduler { get; }
+
+        public void Dispose()
+        {
+            Scheduler.Dispose();
+            Store.Dispose();
+        }
+    }
+
+    private sealed class FakeQueueController : IQueueController
+    {
+        private readonly bool _projectPaused;
+
+        public FakeQueueController(QueueState state, bool projectPaused = false)
+        {
+            State = state;
+            _projectPaused = projectPaused;
+        }
+
+        public QueueState State { get; }
+        public DateTimeOffset? PausedAt => null;
+        public string? PausedReason => null;
+        public Task PauseAsync(string reason, CancellationToken ct) => Task.CompletedTask;
+        public Task ResumeAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct) => Task.CompletedTask;
+        public Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct) => Task.CompletedTask;
+        public Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct)
+            => Task.FromResult<ProjectQueueState?>(new ProjectQueueState(projectId, _projectPaused, null, null));
+        public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyDictionary<string, bool>>(new Dictionary<string, bool>());
+    }
+
+    private sealed class ThrowingWebhookDispatcher : IWebhookDispatcher
+    {
+        public Task PublishAsync(WebhookEvent evt, CancellationToken ct)
+            => throw new InvalidOperationException("webhook failed");
+    }
+
+    private sealed class InertTimeProvider : TimeProvider
+    {
+        private readonly DateTimeOffset _now;
+
+        public InertTimeProvider(DateTimeOffset now) => _now = now;
+
+        public override DateTimeOffset GetUtcNow() => _now;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+            => new InertTimer();
+    }
+
+    private sealed class InertTimer : ITimer
+    {
+        public bool Change(TimeSpan dueTime, TimeSpan period) => true;
+        public void Dispose() { }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private static T? GetScalar<T>(LogEvent evt, string key)

@@ -478,6 +478,10 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var timersField = typeof(QuotaRetryScheduler).GetField("_targetedTimers", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         var timers = (System.Collections.IDictionary)timersField!.GetValue(scheduler)!;
         Assert.True(timers.Contains(item.Id));
+
+        var notYetDue = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, notYetDue!.State);
+        Assert.Equal(0, notYetDue.QuotaRetryAttempts);
     }
 
     [Fact]

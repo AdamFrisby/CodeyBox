@@ -24,6 +24,7 @@ public sealed class QuotaRetryStatusEndpointTests : IDisposable
         var now = DateTimeOffset.UtcNow.AddMinutes(-10);
         await CreateItemAsync(WorkItemState.WaitingForQuotaReset, "quota", now.AddHours(-130));
         await CreateItemAsync(WorkItemState.WaitingForQuotaReset, "quota", now.AddHours(-130));
+        await CreateItemAsync(WorkItemState.WaitingForQuotaReset, "quota", now.AddHours(3));
         await CreateItemAsync(WorkItemState.WaitingForQuotaReset, "quota", nextRetryAt: null);
         await CreateItemAsync(WorkItemState.Failed, "quota", now.AddHours(-5));
         await CreateItemAsync(WorkItemState.Failed, "agent", now.AddHours(-10));
@@ -33,9 +34,14 @@ public sealed class QuotaRetryStatusEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         var root = doc.RootElement;
-        Assert.Equal(4, root.GetProperty("totalParked").GetInt32());
+        Assert.Equal(5, root.GetProperty("totalParked").GetInt32());
         var buckets = root.GetProperty("buckets").EnumerateArray().ToArray();
 
+        Assert.Contains(buckets, b =>
+            b.GetProperty("state").GetString() == "WaitingForQuotaReset"
+            && b.GetProperty("hoursSinceNextQuotaRetryAtDeadline").ValueKind == JsonValueKind.Number
+            && b.GetProperty("hoursSinceNextQuotaRetryAtDeadline").GetInt32() == -3
+            && b.GetProperty("count").GetInt32() == 1);
         Assert.Contains(buckets, b =>
             b.GetProperty("state").GetString() == "WaitingForQuotaReset"
             && b.GetProperty("hoursSinceNextQuotaRetryAtDeadline").ValueKind == JsonValueKind.Number

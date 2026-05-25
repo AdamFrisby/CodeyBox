@@ -439,6 +439,20 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void QuotaRetryAttempted_NullReason_RoundTripsThroughEmptyStringSentinel()
+    {
+        var id = WorkItemId.New();
+
+        AuditLog.QuotaRetryAttempted(id, "periodic", "skipped:router-unavailable", "WaitingForQuotaReset", reason: null);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("quota_retry_attempted", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("periodic", GetScalar<string>(evt, "Source"));
+        Assert.Equal("skipped:router-unavailable", GetScalar<string>(evt, "Outcome"));
+        Assert.Equal("", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public void WorkItemResumed_emits_work_item_resumed_event_with_From_and_Reason()
     {
         var id = WorkItemId.New();

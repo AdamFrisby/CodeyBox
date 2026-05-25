@@ -118,21 +118,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         if (!isOverdue)
             return;
 
-        try
-        {
-            var outcome = await TryRetryAsync(item, "rearm-overdue", ct);
-            _log.LogInformation(
-                "Quota retry startup re-arm walked overdue work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
-                item.Id, item.State, outcome.Outcome, outcome.Reason);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "Error during overdue quota retry startup re-arm for work item {Id}", item.Id);
-        }
+        var outcome = await TryRetryAsync(item, "rearm-overdue", ct);
+        _log.LogInformation(
+            "Quota retry startup re-arm walked overdue work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
+            item.Id, item.State, outcome.Outcome, outcome.Reason);
     }
 
     // The periodic sweep is the safety net: it walks every Failed/quota item
@@ -149,18 +138,31 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         {
             if (item.FailureKind == "quota")
             {
-                var outcome = await TryRetryAsync(item, "periodic", ct);
-                _log.LogInformation(
-                    "Quota retry periodic sweep walked work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
-                    item.Id, item.State, outcome.Outcome, outcome.Reason);
+                await TryPeriodicRetryAsync(item, ct);
             }
         }
         await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        {
+            await TryPeriodicRetryAsync(item, ct);
+        }
+    }
+
+    private async Task TryPeriodicRetryAsync(WorkItem item, CancellationToken ct)
+    {
+        try
         {
             var outcome = await TryRetryAsync(item, "periodic", ct);
             _log.LogInformation(
                 "Quota retry periodic sweep walked work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
                 item.Id, item.State, outcome.Outcome, outcome.Reason);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error during periodic quota retry for work item {Id}; continuing sweep", item.Id);
         }
     }
 
