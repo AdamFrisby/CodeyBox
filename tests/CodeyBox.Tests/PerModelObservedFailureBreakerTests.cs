@@ -135,6 +135,24 @@ public sealed class PerModelObservedFailureBreakerTests : IDisposable
         Assert.True(QuotaRouter.WouldAllow(availablePct: 100, recentFailure: hasRecentOther, opts));
     }
 
+    [Fact]
+    public void QuotaRouter_WouldAllow_RejectsWhenEstimatedIterationWouldCrossThreshold()
+    {
+        var opts = new QuotaRouterOptions { MinQuotaPct = 10 };
+
+        Assert.False(QuotaRouter.WouldAllow(
+            availablePct: 15,
+            recentFailure: false,
+            opts,
+            estimatedIterPctCost: 10));
+
+        Assert.True(QuotaRouter.WouldAllow(
+            availablePct: 50,
+            recentFailure: false,
+            opts,
+            estimatedIterPctCost: 10));
+    }
+
     private AgentClassRouter BuildRouter(double perAgentAvailablePct)
     {
         // Two gemini models in the class. The probe returns a per-agent

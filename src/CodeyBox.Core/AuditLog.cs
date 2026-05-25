@@ -577,6 +577,17 @@ public static class AuditLog
             .Information("Quota router: work item {WorkItemId} deferred — re-enqueue scheduled in {RecheckMs}ms",
                 id.ToString(), (long)recheckIn.TotalMilliseconds);
 
+    public static void QuotaDispatchRefused(
+        AgentKind agent,
+        ProjectId projectId,
+        double availablePct,
+        double estimatedCost,
+        string reason) =>
+        Audit("quota_dispatch_refused")
+            .Warning(
+                "quota_dispatch_refused, agent={Agent}, project={ProjectId}, availablePct={AvailablePct:F1}, estimatedCost={EstimatedCost:F1}, reason=\"{Reason}\"",
+                agent.Value, projectId.Value, availablePct, estimatedCost, reason);
+
     /// <summary>
     /// Emitted when all class members fail the MinModelScore floor check. Records
     /// the rejected members and their below-floor reasons so the audit log captures

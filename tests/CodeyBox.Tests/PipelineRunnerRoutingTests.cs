@@ -247,6 +247,12 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
         // Pipeline must NOT have been invoked.
         Assert.Null(tracking.LastAgent);
         Assert.False(tracking.ReceivedNullAgent);
+
+        var finalItem = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, finalItem?.State);
+        Assert.Equal("quota", finalItem?.FailureKind);
+        Assert.NotNull(finalItem?.QuotaResetAt);
+        Assert.NotNull(finalItem?.NextQuotaRetryAt);
     }
 }
 

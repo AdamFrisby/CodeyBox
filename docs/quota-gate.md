@@ -90,6 +90,21 @@ breaker hits apart from probe-derived rejections:
 
 Records are retained for `ObservedFailureRetentionMinutes`.
 
+## Headroom Projection
+
+For subscription members whose probe reports `AvailablePct >= MinQuotaPct`, the
+router also estimates the next iteration's quota cost from recent project cost
+rows. It averages `(usageTotal.tokensInput + usageTotal.tokensOutput)` per
+iteration over the most recent `HeadroomHistoryItemCount` work items inside
+`HeadroomHistoryWindowDays`, preferring rows for the same agent/model, then the
+same agent, then the project overall.
+
+The average token count is converted to quota percentage points with
+`HeadroomTokensPerQuotaPct` or a `HeadroomTokensPerQuotaPctByAgent` override.
+If `AvailablePct - estimatedIterPctCost < MinQuotaPct`, that member is refused
+with reason `insufficient headroom`. If no other class member can run, the item
+is parked in `WaitingForQuotaReset` with quota retry timestamps populated.
+
 ## Operator Endpoint
 
 `GET /quota` returns:
@@ -99,6 +114,7 @@ Records are retained for `ObservedFailureRetentionMinutes`.
 - per-model quota breakdowns
 - observed failure counters from the last 60 minutes
 - overall and per-model `wouldAllow` decisions
+- per-project headroom projections for each probe
 
 The endpoint requires the normal API bearer token; it is not included in the
 anonymous health-check surface.

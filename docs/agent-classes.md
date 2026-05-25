@@ -233,7 +233,12 @@ Configured under `CodeyBox:QuotaRouter`:
       "QuotaCacheTtlSeconds": 60,
       "UnknownPolicy": "UseObservedFailures",
       "ObservedFailureWindowMinutes": 10,
-      "ObservedFailureRetentionMinutes": 30
+      "ObservedFailureRetentionMinutes": 30,
+      "HeadroomProjectionEnabled": true,
+      "HeadroomHistoryItemCount": 20,
+      "HeadroomHistoryWindowDays": 14,
+      "HeadroomTokensPerQuotaPct": 10000,
+      "HeadroomTokensPerQuotaPctByAgent": {}
     }
   }
 }
@@ -247,6 +252,11 @@ Configured under `CodeyBox:QuotaRouter`:
 | `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. |
 | `ObservedFailureWindowMinutes` | `10` | Minutes a quota-shaped stderr failure blocks the same agent/model. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed failures are retained in `state.db`. |
+| `HeadroomProjectionEnabled` | `true` | Refuse a subscription member when recent project cost history predicts the next iteration would cross below `MinQuotaPct`. |
+| `HeadroomHistoryItemCount` | `20` | Number of recent project work items sampled for the estimate. |
+| `HeadroomHistoryWindowDays` | `14` | Maximum age of cost rows used for the estimate. |
+| `HeadroomTokensPerQuotaPct` | `10000` | Fallback conversion from recent iteration tokens to quota percentage points. |
+| `HeadroomTokensPerQuotaPctByAgent` | `{}` | Optional per-agent conversion overrides. |
 
 ---
 

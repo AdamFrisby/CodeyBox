@@ -170,7 +170,12 @@ Tuning knobs for the quota probe and deferred-requeue logic.
   "QuotaCacheTtlSeconds": 60,
   "UnknownPolicy": "UseObservedFailures",
   "ObservedFailureWindowMinutes": 10,
-  "ObservedFailureRetentionMinutes": 30
+  "ObservedFailureRetentionMinutes": 30,
+  "HeadroomProjectionEnabled": true,
+  "HeadroomHistoryItemCount": 20,
+  "HeadroomHistoryWindowDays": 14,
+  "HeadroomTokensPerQuotaPct": 10000,
+  "HeadroomTokensPerQuotaPctByAgent": {}
 }
 ```
 
@@ -182,6 +187,11 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `UnknownPolicy` | `UseObservedFailures` | How to treat unknown probe snapshots: `UseObservedFailures`, `FailCautious`, or opt-in `FailOpen`. |
 | `ObservedFailureWindowMinutes` | `10` | Minutes a recent quota-shaped failure blocks the same agent/model across all projects. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed quota failures remain in `state.db`. |
+| `HeadroomProjectionEnabled` | `true` | When true, subscription dispatch also checks whether the estimated next iteration would leave quota below `MinQuotaPct`. |
+| `HeadroomHistoryItemCount` | `20` | Number of recent project work items sampled for the estimate. |
+| `HeadroomHistoryWindowDays` | `14` | Maximum age of cost rows used for the estimate. |
+| `HeadroomTokensPerQuotaPct` | `10000` | Fallback conversion from recent iteration tokens to quota percentage points. |
+| `HeadroomTokensPerQuotaPctByAgent` | `{}` | Optional per-agent overrides for the token-to-quota conversion, keyed by agent kind. |
 
 ---
 

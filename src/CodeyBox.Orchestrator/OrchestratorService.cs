@@ -29,6 +29,7 @@ public sealed class OrchestratorService : BackgroundService
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
+    private readonly QuotaRetryScheduler? _quotaRetryScheduler;
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -79,7 +80,8 @@ public sealed class OrchestratorService : BackgroundService
         IWorkerRegistry? workerRegistry = null,
         DeadWorkerOptions? deadWorkerOpts = null,
         DeadWorkerReaper? reaper = null,
-        ReleaseService? releaseService = null)
+        ReleaseService? releaseService = null,
+        QuotaRetryScheduler? quotaRetryScheduler = null)
     {
         _queue = queue;
         _store = store;
@@ -95,6 +97,7 @@ public sealed class OrchestratorService : BackgroundService
         _deadWorkerOpts = deadWorkerOpts;
         _reaper = reaper;
         _releaseService = releaseService;
+        _quotaRetryScheduler = quotaRetryScheduler;
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
     }
 
@@ -672,7 +675,7 @@ public sealed class OrchestratorService : BackgroundService
                 if (decision.ShouldWait)
                 {
                     AuditLog.QuotaRouterDeferred(item.Id, decision.SuggestedRecheckIn);
-                    ScheduleDeferredRequeue(item.Id, decision.SuggestedRecheckIn, ct);
+                    await ParkForQuotaResetAsync(item, decision, project, ct);
                     return;
                 }
                 if (decision.Chosen is { } chosen)
@@ -883,21 +886,82 @@ public sealed class OrchestratorService : BackgroundService
     private SemaphoreSlim GetBudgetLock(ProjectId projectId) =>
         _budgetLocks.GetOrAdd(projectId.Value, _ => new SemaphoreSlim(1, 1));
 
+    private async Task ParkForQuotaResetAsync(
+        WorkItem item,
+        AgentRoutingDecision decision,
+        Project? project,
+        CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var retryAt = decision.SuggestedRetryAt ?? now.Add(decision.SuggestedRecheckIn);
+        if (retryAt < now)
+            retryAt = now;
+
+        var next = item.With(
+            WorkItemState.WaitingForQuotaReset,
+            decision.Reason,
+            failureKind: "quota",
+            quotaResetAt: retryAt) with
+        {
+            NextQuotaRetryAt = retryAt,
+            QuotaRetryFrom = "work",
+        };
+
+        var updated = await _store.TryUpdateIfStateAsync(next, item.State, ct);
+        if (!updated)
+        {
+            _log.LogInformation(
+                "Work item {Id} state changed concurrently; skipping WaitingForQuotaReset transition",
+                item.Id);
+            return;
+        }
+
+        AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForQuotaReset.ToString());
+
+        if (_quotaRetryScheduler is not null)
+            await _quotaRetryScheduler.NotifyQuotaFailureAsync(next);
+
+        if (_webhooks is not null)
+        {
+            var effectiveProject = project ?? new Project
+            {
+                Id = item.ProjectId,
+                DisplayName = item.ProjectId.Value,
+                RepositoryUrl = string.Empty,
+            };
+
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.waiting_for_quota_reset",
+                WorkItem = next,
+                Project = effectiveProject,
+                Details = new AgentFallbackDetails(
+                    WorkItemId: item.Id.ToString(),
+                    Phase: "work",
+                    Iteration: null,
+                    FromAgent: (item.Agent ?? effectiveProject.DefaultAgent).Value,
+                    FromModel: item.ModelId,
+                    ToAgent: null,
+                    ToModel: null,
+                    Reason: decision.Reason),
+            }, ct);
+        }
+    }
+
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after
-    /// <paramref name="delay"/>. Used when the quota router defers a work item
-    /// because all subscription-billed members are exhausted. The item remains
-    /// in Queued state; the deferred task simply puts it back on the channel so
-    /// the next pickup attempt re-probes quota. On shutdown (stoppingToken
-    /// cancelled), the delayed task exits cleanly; the item is recovered via
-    /// ReplayPendingAsync on the next start.
+    /// <paramref name="delay"/>. Used for budget and pause deferrals where the
+    /// item remains in Queued state; quota deferrals are persisted as
+    /// WaitingForQuotaReset so the quota retry scheduler owns the wakeup. On
+    /// shutdown (stoppingToken cancelled), the delayed task exits cleanly; the
+    /// item is recovered via ReplayPendingAsync on the next start.
     /// </summary>
     private void ScheduleDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken)
     {
         var count = Interlocked.Increment(ref _pendingDeferrals);
         if (count > DeferralWarningThreshold)
             _log.LogWarning(
-                "Deferred requeue backlog is {Count} items; quota exhaustion may be sustained across many work items",
+                "Deferred requeue backlog is {Count} items; budget or pause gates may be sustained across many work items",
                 count);
 
         // Mark the item as currently-deferred so the priority pickup query skips it

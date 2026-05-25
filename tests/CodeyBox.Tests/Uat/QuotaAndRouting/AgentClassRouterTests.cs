@@ -210,7 +210,7 @@ public sealed class AgentClassRouterTests : IDisposable
     }
 
     [Fact]
-    public async Task AllSubscriptionMembersExhausted_ReenqueuesItemAfterConfiguredRecheckInterval()
+    public async Task AllSubscriptionMembersExhausted_ParksItemForQuotaRetry()
     {
         var interval = TimeSpan.FromMilliseconds(50);
         var router = BuildRouter(
@@ -239,13 +239,22 @@ public sealed class AgentClassRouterTests : IDisposable
         await service.StartAsync(CancellationToken.None);
         try
         {
-            var reenqueuedId = await queue.SecondEnqueue.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            var stored = await _items.GetAsync(item.Id);
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            WorkItem? stored;
+            do
+            {
+                stored = await _items.GetAsync(item.Id);
+                if (stored?.State == WorkItemState.WaitingForQuotaReset)
+                    break;
+                await Task.Delay(20);
+            } while (DateTimeOffset.UtcNow < deadline);
 
-            Assert.Equal(item.Id, reenqueuedId);
-            Assert.Equal(WorkItemState.Queued, stored!.State);
+            Assert.Equal(WorkItemState.WaitingForQuotaReset, stored!.State);
+            Assert.Equal("quota", stored.FailureKind);
+            Assert.NotNull(stored.QuotaResetAt);
+            Assert.NotNull(stored.NextQuotaRetryAt);
             Assert.Equal(0, pipeline.RunCount);
-            Assert.Equal([item.Id, item.Id], queue.EnqueuedIds.Take(2).ToArray());
+            Assert.Equal([item.Id], queue.EnqueuedIds.Take(1).ToArray());
         }
         finally
         {

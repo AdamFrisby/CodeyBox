@@ -147,6 +147,41 @@ public sealed class AgentClassRouterTests
         Assert.Equal(Codex, decision.Chosen!.Agent);
     }
 
+    [Fact]
+    public async Task AvailableButProjectedBelowThreshold_ShouldWait()
+    {
+        var cls = FrontierClass(Sub(Claude));
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, 15.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new FixedHeadroomEstimator(10.0));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+        Assert.Contains("headroom", decision.Reason);
+    }
+
+    [Fact]
+    public async Task InsufficientHeadroom_FallsBackToMemberWithMoreQuota()
+    {
+        var cls = FrontierClass(Sub(Claude), Sub(Codex));
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, 15.0), new FakeProbe(Codex, 50.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            headroomEstimator: new FixedHeadroomEstimator(10.0));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+    }
+
     // ── Wait for subscription ─────────────────────────────────────────────────
 
     [Fact]
@@ -338,4 +373,21 @@ internal sealed class FakeProbe : IAgentQuotaProbe
         CallCount++;
         return Task.FromResult(_snapshot);
     }
+}
+
+internal sealed class FixedHeadroomEstimator : IQuotaHeadroomEstimator
+{
+    private readonly double _estimatedPctCost;
+
+    public FixedHeadroomEstimator(double estimatedPctCost) => _estimatedPctCost = estimatedPctCost;
+
+    public Task<QuotaHeadroomEstimate?> EstimateAsync(
+        ProjectId projectId,
+        AgentMembership member,
+        CancellationToken ct = default)
+        => Task.FromResult<QuotaHeadroomEstimate?>(new QuotaHeadroomEstimate(
+            _estimatedPctCost,
+            AverageTokensPerIteration: 100_000,
+            SampledItemCount: 1,
+            Source: "test"));
 }

@@ -235,4 +235,50 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
 
         Assert.Empty(rows);
     }
+
+    [Fact]
+    public async Task CostHistoryQuotaHeadroomEstimator_AveragesRecentProjectIterationTokens()
+    {
+        var itemA = Guid.NewGuid().ToString();
+        var itemB = Guid.NewGuid().ToString();
+        SeedWorkItem(itemA, "proj-headroom");
+        SeedWorkItem(itemB, "proj-headroom");
+
+        await _store.RecordAsync(MakeCost(itemA) with
+        {
+            InputTokens = 80_000,
+            OutputTokens = 20_000,
+            EstimatedUsd = 1.0,
+        });
+        await _store.RecordAsync(MakeCost(itemB) with
+        {
+            InputTokens = 40_000,
+            OutputTokens = 10_000,
+            EstimatedUsd = 1.0,
+        });
+
+        var estimator = new CostHistoryQuotaHeadroomEstimator(
+            _store,
+            new QuotaRouterOptions
+            {
+                HeadroomTokensPerQuotaPct = 10_000,
+                HeadroomHistoryItemCount = 20,
+                HeadroomHistoryWindow = TimeSpan.FromDays(7),
+            },
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CostHistoryQuotaHeadroomEstimator>.Instance);
+
+        var estimate = await estimator.EstimateAsync(
+            new ProjectId("proj-headroom"),
+            new AgentMembership
+            {
+                Agent = AgentKind.Claude,
+                Billing = AgentBilling.Subscription,
+                ModelId = "claude-opus-4-7",
+                QualityScore = 100,
+            });
+
+        Assert.NotNull(estimate);
+        Assert.Equal(7.5, estimate!.EstimatedIterPctCost, precision: 2);
+        Assert.Equal(75_000, estimate.AverageTokensPerIteration, precision: 2);
+    }
 }

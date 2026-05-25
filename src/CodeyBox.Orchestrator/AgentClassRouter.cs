@@ -36,6 +36,7 @@ public sealed class AgentClassRouter
     private readonly ILogger<AgentClassRouter> _log;
     private readonly TimeProvider _time;
     private readonly IQuotaFailureStore? _quotaFailures;
+    private readonly IQuotaHeadroomEstimator? _headroomEstimator;
     // Pre-parsed TOD modifiers: evaluated on every pickup, zero-alloc.
     private readonly IReadOnlyList<ParsedTodModifier> _todModifiers;
     // In-process short-lived exhaustion cache populated by mid-iteration fallback.
@@ -52,7 +53,8 @@ public sealed class AgentClassRouter
         ILogger<AgentClassRouter> log,
         TimeProvider? timeProvider = null,
         IReadOnlyList<ParsedTodModifier>? todModifiers = null,
-        IQuotaFailureStore? quotaFailures = null)
+        IQuotaFailureStore? quotaFailures = null,
+        IQuotaHeadroomEstimator? headroomEstimator = null)
     {
         _catalog = catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
         var probeList = probes.ToList();
@@ -68,6 +70,7 @@ public sealed class AgentClassRouter
         _time = timeProvider ?? TimeProvider.System;
         _todModifiers = todModifiers ?? [];
         _quotaFailures = quotaFailures;
+        _headroomEstimator = headroomEstimator;
     }
 
     /// <summary>
@@ -149,6 +152,15 @@ public sealed class AgentClassRouter
         }
 
         var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
+        DateTimeOffset? earliestRetryAt = null;
+        var sawInsufficientHeadroom = false;
+
+        void TrackRetryAt(DateTimeOffset? retryAt)
+        {
+            if (retryAt is null) return;
+            if (earliestRetryAt is null || retryAt.Value < earliestRetryAt.Value)
+                earliestRetryAt = retryAt.Value;
+        }
 
         // Step 4: probe quota in sorted order; pick the first viable member.
         foreach (var entry in sorted)
@@ -180,7 +192,7 @@ public sealed class AgentClassRouter
 
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
-            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, ct);
+            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, quota.ResetAt, ct);
             if (gate.Allow)
             {
                 // Mark all remaining sorted entries as "ranked lower" for the audit event.
@@ -208,6 +220,9 @@ public sealed class AgentClassRouter
                 };
             }
 
+            TrackRetryAt(gate.RetryAt);
+            if (gate.InsufficientHeadroom)
+                sawInsufficientHeadroom = true;
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
@@ -215,11 +230,19 @@ public sealed class AgentClassRouter
         if (hasSubscription)
         {
             AuditLog.QuotaRouterWaiting(classId, item.Id, _opts.QuotaRecheckInterval);
+            var nowForWait = _time.GetUtcNow();
+            var suggestedRetryAt = earliestRetryAt ?? nowForWait.Add(_opts.QuotaRecheckInterval);
+            var suggestedRecheckIn = suggestedRetryAt > nowForWait
+                ? suggestedRetryAt - nowForWait
+                : TimeSpan.Zero;
             return new AgentRoutingDecision
             {
                 ShouldWait = true,
-                SuggestedRecheckIn = _opts.QuotaRecheckInterval,
-                Reason = $"all members of class '{classId}' are below {_opts.MinQuotaPct}% threshold",
+                SuggestedRecheckIn = suggestedRecheckIn,
+                SuggestedRetryAt = suggestedRetryAt,
+                Reason = sawInsufficientHeadroom
+                    ? $"all members of class '{classId}' lack projected quota headroom"
+                    : $"all members of class '{classId}' are below {_opts.MinQuotaPct}% threshold",
             };
         }
 
@@ -403,33 +426,92 @@ public sealed class AgentClassRouter
         return earliest;
     }
 
-    private async Task<QuotaGateDecision> EvaluateGateAsync(AgentMembership member, ProjectId projectId, double availablePct, CancellationToken ct)
+    private async Task<QuotaGateDecision> EvaluateGateAsync(
+        AgentMembership member,
+        ProjectId projectId,
+        double availablePct,
+        DateTimeOffset? resetAt,
+        CancellationToken ct)
     {
         if (availablePct >= _opts.MinQuotaPct)
-            return new QuotaGateDecision(true, "quota available");
+        {
+            var estimate = await EstimateHeadroomAsync(projectId, member, ct);
+            var estimatedCost = estimate?.EstimatedIterPctCost;
+            if (!QuotaRouter.WouldAllow(availablePct, recentFailure: false, _opts, estimatedCost))
+            {
+                var projected = availablePct - estimatedCost!.Value;
+                const string reason = "insufficient headroom";
+                AuditLog.QuotaDispatchRefused(
+                    member.Agent,
+                    projectId,
+                    availablePct,
+                    estimatedCost.Value,
+                    reason);
+
+                return new QuotaGateDecision(
+                    false,
+                    $"insufficient headroom (available={availablePct:F1}%, estimatedCost={estimatedCost.Value:F1}%, projected={projected:F1}% < min={_opts.MinQuotaPct:F1}%)",
+                    resetAt,
+                    InsufficientHeadroom: true,
+                    estimatedCost.Value,
+                    projected);
+            }
+
+            return new QuotaGateDecision(
+                true,
+                estimatedCost is { } cost
+                    ? $"quota available; projected headroom {(availablePct - cost):F1}% after estimated {cost:F1}% iteration"
+                    : "quota available",
+                resetAt,
+                InsufficientHeadroom: false,
+                estimatedCost,
+                estimatedCost is { } estimateValue ? availablePct - estimateValue : null);
+        }
 
         if (availablePct >= 0)
-            return new QuotaGateDecision(false, "quota exhausted");
+            return new QuotaGateDecision(false, "quota exhausted", resetAt);
 
         return _opts.UnknownPolicy switch
         {
-            QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open"),
-            QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
+            QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open", null),
+            QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious", null),
             _ => await EvaluateObservedFailuresAsync(member, ct),
         };
+    }
+
+    private async Task<QuotaHeadroomEstimate?> EstimateHeadroomAsync(
+        ProjectId projectId,
+        AgentMembership member,
+        CancellationToken ct)
+    {
+        if (_headroomEstimator is null)
+            return null;
+
+        try
+        {
+            return await _headroomEstimator.EstimateAsync(projectId, member, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Failed to estimate quota headroom for project {ProjectId} agent {Agent}; continuing without projection",
+                projectId.Value,
+                member.Agent.Value);
+            return null;
+        }
     }
 
     private async Task<QuotaGateDecision> EvaluateObservedFailuresAsync(AgentMembership member, CancellationToken ct)
     {
         if (_quotaFailures is null)
-            return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure");
+            return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure", null);
 
         var observedAt = await _quotaFailures.GetMostRecentAsync(
             member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct);
         if (observedAt is { } seenAt)
-            return new QuotaGateDecision(false, $"quota unknown; {FormatObservedFailureReason(member, seenAt, _time.GetUtcNow())}");
+            return new QuotaGateDecision(false, $"quota unknown; {FormatObservedFailureReason(member, seenAt, _time.GetUtcNow())}", null);
 
-        return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure");
+        return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure", null);
     }
 
     /// <summary>
@@ -546,7 +628,13 @@ public sealed class AgentClassRouter
         int EffectiveScore,
         int ConfigIndex);
 
-    private sealed record QuotaGateDecision(bool Allow, string Reason);
+    private sealed record QuotaGateDecision(
+        bool Allow,
+        string Reason,
+        DateTimeOffset? RetryAt,
+        bool InsufficientHeadroom = false,
+        double? EstimatedIterPctCost = null,
+        double? ProjectedAvailablePct = null);
 }
 
 public sealed record EffectiveQuota(double AvailablePct, DateTimeOffset? ResetAt, string? Window);
@@ -587,6 +675,9 @@ public sealed record AgentRoutingDecision
 
     /// <summary>Suggested delay before re-attempting pickup.</summary>
     public TimeSpan SuggestedRecheckIn { get; init; }
+
+    /// <summary>Suggested absolute retry time when the wait can be aligned to a quota reset.</summary>
+    public DateTimeOffset? SuggestedRetryAt { get; init; }
 
     /// <summary>Human-readable reason for log output.</summary>
     public string Reason { get; init; } = "";
@@ -629,6 +720,17 @@ public sealed class QuotaRouterOptions
     public TimeSpan ObservedFailureWindow { get; set; } = TimeSpan.FromMinutes(10);
 
     public TimeSpan ObservedFailureRetention { get; set; } = TimeSpan.FromMinutes(30);
+
+    public bool HeadroomProjectionEnabled { get; set; } = true;
+
+    public int HeadroomHistoryItemCount { get; set; } = 20;
+
+    public TimeSpan HeadroomHistoryWindow { get; set; } = TimeSpan.FromDays(14);
+
+    public double HeadroomTokensPerQuotaPct { get; set; } = 10_000.0;
+
+    public Dictionary<string, double> HeadroomTokensPerQuotaPctByAgent { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
 }
 
 public enum QuotaUnknownPolicy

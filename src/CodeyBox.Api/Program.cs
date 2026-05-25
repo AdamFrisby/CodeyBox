@@ -706,6 +706,13 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         UnknownPolicy = qr.UnknownPolicy,
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
+        HeadroomProjectionEnabled = qr.HeadroomProjectionEnabled,
+        HeadroomHistoryItemCount = qr.HeadroomHistoryItemCount,
+        HeadroomHistoryWindow = TimeSpan.FromDays(qr.HeadroomHistoryWindowDays),
+        HeadroomTokensPerQuotaPct = qr.HeadroomTokensPerQuotaPct,
+        HeadroomTokensPerQuotaPctByAgent = new Dictionary<string, double>(
+            qr.HeadroomTokensPerQuotaPctByAgent,
+            StringComparer.OrdinalIgnoreCase),
     };
 });
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
@@ -793,7 +800,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentClassRouter>(),
         TimeProvider.System,
         todModifiers,
-        sp.GetService<IQuotaFailureStore>());
+        sp.GetService<IQuotaFailureStore>(),
+        sp.GetService<IQuotaHeadroomEstimator>());
 });
 
 // --- Credential smoke probes -------------------------------------------------
@@ -1081,6 +1089,13 @@ builder.Services.AddSingleton<IWorkItemCostStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemCostStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<CostHistoryQuotaHeadroomEstimator>(sp => new CostHistoryQuotaHeadroomEstimator(
+    sp.GetRequiredService<IWorkItemCostStore>(),
+    sp.GetRequiredService<QuotaRouterOptions>(),
+    sp.GetRequiredService<ILogger<CostHistoryQuotaHeadroomEstimator>>(),
+    TimeProvider.System));
+builder.Services.AddSingleton<IQuotaHeadroomEstimator>(sp => new LazyQuotaHeadroomEstimator(
+    () => sp.GetService<CostHistoryQuotaHeadroomEstimator>()));
 builder.Services.AddSingleton<IAgentStreamSummaryStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1335,7 +1350,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IWorkerRegistry>(),
     sp.GetRequiredService<DeadWorkerOptions>(),
     sp.GetRequiredService<DeadWorkerReaper>(),
-    sp.GetService<ReleaseService>()));
+    sp.GetService<ReleaseService>(),
+    sp.GetRequiredService<QuotaRetryScheduler>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -1412,6 +1428,8 @@ app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
 app.MapGet("/quota", async (
     IEnumerable<IAgentQuotaProbe> probes,
     IQuotaFailureStore? failureStore,
+    IQuotaHeadroomEstimator headroomEstimator,
+    IProjectRepository projects,
     QuotaRouterOptions options,
     CancellationToken ct) =>
 {
@@ -1419,6 +1437,7 @@ app.MapGet("/quota", async (
     IReadOnlyList<QuotaFailureObservation> failures = failureStore is null
         ? Array.Empty<QuotaFailureObservation>()
         : await failureStore.ListRecentAsync(TimeSpan.FromMinutes(60), now, ct);
+    var projectList = await projects.ListAsync(ct);
 
     var snapshots = new List<object>();
     foreach (var probe in probes.Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe))
@@ -1430,6 +1449,29 @@ app.MapGet("/quota", async (
             QualityScore = 100,
         };
         var snapshot = await probe.GetAvailabilityAsync(member, ct);
+        var headroomProjections = new List<object>();
+        foreach (var project in projectList)
+        {
+            var estimate = await headroomEstimator.EstimateAsync(project.Id, member, ct);
+            var projected = estimate is null || snapshot.AvailablePct < 0
+                ? (double?)null
+                : snapshot.AvailablePct - estimate.EstimatedIterPctCost;
+            headroomProjections.Add(new
+            {
+                projectId = project.Id.Value,
+                estimatedIterPctCost = estimate?.EstimatedIterPctCost,
+                averageTokensPerIteration = estimate?.AverageTokensPerIteration,
+                sampledItemCount = estimate?.SampledItemCount,
+                source = estimate?.Source,
+                projectedAvailablePct = projected,
+                wouldAllow = QuotaRouter.WouldAllow(
+                    snapshot.AvailablePct,
+                    failures.Any(f => f.Agent == probe.Kind
+                        && f.ObservedAt >= now - options.ObservedFailureWindow),
+                    options,
+                    estimate?.EstimatedIterPctCost),
+            });
+        }
         var recentFailuresForProbe = failures
             .Where(f => f.Agent == probe.Kind && f.ObservedAt >= now - options.ObservedFailureWindow)
             .ToList();
@@ -1455,6 +1497,7 @@ app.MapGet("/quota", async (
                     latestObservedAt = g.Max(x => x.ObservedAt),
                 })
                 .ToList(),
+            headroomProjections,
             wouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentFailure, options),
             defaultModelWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options),
             perModelWouldAllow = modelKeys.ToDictionary(
@@ -1473,6 +1516,10 @@ app.MapGet("/quota", async (
     {
         generatedAt = now,
         minQuotaPct = options.MinQuotaPct,
+        headroomProjectionEnabled = options.HeadroomProjectionEnabled,
+        headroomHistoryItemCount = options.HeadroomHistoryItemCount,
+        headroomHistoryWindowDays = options.HeadroomHistoryWindow.TotalDays,
+        headroomTokensPerQuotaPct = options.HeadroomTokensPerQuotaPct,
         unknownPolicy = options.UnknownPolicy.ToString(),
         observedFailureWindowMinutes = options.ObservedFailureWindow.TotalMinutes,
         probes = snapshots,
@@ -1949,6 +1996,16 @@ namespace CodeyBox.Api
         public int ObservedFailureWindowMinutes { get; set; } = 10;
         /// <summary>Minutes observed quota failures are retained in state.db. Default 30.</summary>
         public int ObservedFailureRetentionMinutes { get; set; } = 30;
+        /// <summary>Enable historical per-iteration cost projection before dispatch. Default true.</summary>
+        public bool HeadroomProjectionEnabled { get; set; } = true;
+        /// <summary>Number of recent project work items sampled for headroom projection. Default 20.</summary>
+        public int HeadroomHistoryItemCount { get; set; } = 20;
+        /// <summary>Days of cost history considered for headroom projection. Default 14.</summary>
+        public int HeadroomHistoryWindowDays { get; set; } = 14;
+        /// <summary>Fallback token count treated as one quota percentage point. Default 10000.</summary>
+        public double HeadroomTokensPerQuotaPct { get; set; } = 10_000.0;
+        /// <summary>Per-agent override for token count treated as one quota percentage point.</summary>
+        public Dictionary<string, double> HeadroomTokensPerQuotaPctByAgent { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>
