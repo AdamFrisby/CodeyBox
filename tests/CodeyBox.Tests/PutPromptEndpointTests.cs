@@ -120,6 +120,39 @@ public sealed class PutPromptEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task IdempotencyKey_CrossEndpointReplay_IsTreatedAsConflict()
+    {
+        // The dedupe digest mixes (method, path, body), so a client that
+        // accidentally reuses the same Idempotency-Key across two unrelated
+        // endpoints (e.g. two empty-body mutations like DELETE /workitems/{id}
+        // and POST /workitems/{id}/retry — both hash to SHA-256-of-empty
+        // without scoping) must NOT receive the first endpoint's cached
+        // response. We exercise the scoping with two DIFFERENT work items here
+        // because the test factory does not run the orchestrator (so POST
+        // /retry has no scheduler). The middleware behaviour is the same:
+        // same key + different path = same-body-but-different-digest = 409.
+        var item1 = WorkingItem();
+        var item2 = WorkingItem();
+        await _factory.Store.CreateAsync(item1);
+        await _factory.Store.CreateAsync(item2);
+
+        var key = Guid.NewGuid().ToString();
+        var first = await PutWithKeyAsync($"/workitems/{item1.Id}/prompt", "{\"prompt\":\"shared body\"}", key);
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+
+        // Same key + same JSON body but different path → must NOT replay item1's
+        // cached response and must NOT silently skip item2's mutation. The
+        // middleware sees a different digest under the same key and returns 409.
+        var crossEndpoint = await PutWithKeyAsync($"/workitems/{item2.Id}/prompt", "{\"prompt\":\"shared body\"}", key);
+        Assert.Equal(HttpStatusCode.Conflict, crossEndpoint.StatusCode);
+
+        // The second item must be untouched — no silent skip, no silent apply.
+        var read2 = await _factory.Store.GetAsync(item2.Id);
+        Assert.Equal("original", read2!.Prompt);
+        Assert.Equal(1, read2.PromptRevision);
+    }
+
+    [Fact]
     public async Task IdempotencyKey_OmittedHeader_BehavesLikeBefore_NoCaching()
     {
         var item = WorkingItem();

@@ -23,8 +23,9 @@ internal static class IdempotencyMiddleware
     public const int MaxKeyLength = 200;
 
     /// <summary>
-    /// Default TTL for cached responses. The spec calls out a 24-hour window;
-    /// clients that need a different TTL pass <c>?ttl=</c> on registration.
+    /// TTL applied to every cached response. The spec calls out a 24-hour
+    /// window; this is currently a single global value with no per-route
+    /// override (a follow-up could add one if a real use case appears).
     /// </summary>
     public static readonly TimeSpan DefaultTtl = TimeSpan.FromHours(24);
 
@@ -67,7 +68,16 @@ internal static class IdempotencyMiddleware
             }
 
             ctx.Request.EnableBuffering();
-            var bodyHash = await ComputeBodyHashAsync(ctx.Request);
+            // Scope the dedupe by (method, path, body) so a key reused against a
+            // different endpoint with a coincidentally identical body (e.g. two
+            // empty-body mutations like DELETE /workitems/{id} and POST
+            // /workitems/{id}/retry) is treated as Conflict rather than silently
+            // replaying the first endpoint's response and skipping the second
+            // endpoint's mutation. RFC-style idempotency keys are intended to
+            // make a SINGLE logical operation safe to retry — they are not a
+            // cross-endpoint replay cache.
+            var bodyHash = await ComputeBodyHashAsync(
+                ctx.Request, ctx.Request.Method, ctx.Request.Path.ToString());
 
             var lookup = await store.LookupAsync(key, bodyHash, DateTimeOffset.UtcNow, ctx.RequestAborted);
             switch (lookup.Outcome)
@@ -127,23 +137,31 @@ internal static class IdempotencyMiddleware
         HttpMethods.IsPost(method) || HttpMethods.IsPut(method) ||
         HttpMethods.IsPatch(method) || HttpMethods.IsDelete(method);
 
-    private static async Task<string> ComputeBodyHashAsync(HttpRequest request)
+    private static async Task<string> ComputeBodyHashAsync(HttpRequest request, string method, string path)
     {
         request.Body.Position = 0;
         using var sha = SHA256.Create();
+
+        // Mix method + path into the digest BEFORE the body, with explicit
+        // length-prefixed separators, so an empty-body DELETE /a and an
+        // empty-body POST /b can never collide (and a body that happens to
+        // contain "POST\n/a\n" can't masquerade as a different request either).
+        var prefix = Encoding.UTF8.GetBytes(
+            $"{method.ToUpperInvariant()}\n{path}\n");
+        sha.TransformBlock(prefix, 0, prefix.Length, null, 0);
+
         var buffer = new byte[8192];
         int read;
-        var total = 0;
         while ((read = await request.Body.ReadAsync(buffer)) > 0)
         {
             sha.TransformBlock(buffer, 0, read, null, 0);
-            total += read;
         }
         sha.TransformFinalBlock([], 0, 0);
         request.Body.Position = 0;
 
-        // Empty body still produces a stable hash (SHA-256 of zero bytes) so
-        // empty-payload mutations dedupe correctly across replays.
+        // Empty body still produces a stable hash (SHA-256 of "METHOD\nPATH\n")
+        // so empty-payload mutations dedupe correctly across replays of the
+        // SAME endpoint without colliding across DIFFERENT endpoints.
         return ToHex(sha.Hash ?? []);
     }
 

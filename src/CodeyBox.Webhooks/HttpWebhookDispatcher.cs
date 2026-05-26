@@ -190,7 +190,10 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
             Release: evt.Release is { } rel ? MapRelease(rel) : null,
             Details: evt.Details,
             Usage: evt.Usage,
-            UsageTotal: evt.UsageTotal);
+            UsageTotal: evt.UsageTotal,
+            PromptRevision: evt.PromptRevision,
+            RevisionAtCompletion: evt.RevisionAtCompletion,
+            RevisionMatches: evt.RevisionMatches);
 
         return JsonSerializer.Serialize(payload, JsonOptions);
     }
@@ -267,7 +270,13 @@ internal sealed record WebhookPayload(
     WebhookReleasePayload? Release,
     object? Details,
     WorkItemIterationUsage? Usage,
-    WorkItemUsageTotal? UsageTotal);
+    WorkItemUsageTotal? UsageTotal,
+    // Top-level revision attribution: see WebhookEvent.PromptRevision et al.
+    // Lifted out of Details so trackers can read payload.promptRevision
+    // directly (matching the task-spec contract). Null on non-terminal events.
+    int? PromptRevision,
+    int? RevisionAtCompletion,
+    bool? RevisionMatches);
 
 internal sealed record WebhookWorkItemPayload(
     string Id,

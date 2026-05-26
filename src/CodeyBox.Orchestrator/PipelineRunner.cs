@@ -613,12 +613,15 @@ public sealed class PipelineRunner : IPipelineRunner
             var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
             var failed = current.With(WorkItemState.AuditFailed, ex.Message);
             await _store.UpdateAsync(failed, CancellationToken.None);
+            var auditFailedRevision = await BuildTerminalRevisionAsync(failed, CancellationToken.None);
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "work_item.audit_failed",
                 WorkItem = failed,
                 Project = project,
-                Details = await BuildTerminalDetailsAsync(failed, CancellationToken.None),
+                PromptRevision = auditFailedRevision?.PromptRevision,
+                RevisionAtCompletion = auditFailedRevision?.RevisionAtCompletion,
+                RevisionMatches = auditFailedRevision?.RevisionMatches,
             }, CancellationToken.None);
         }
         catch (MergeConflictResolutionFailedException ex)
@@ -627,12 +630,15 @@ public sealed class PipelineRunner : IPipelineRunner
             var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
             var failed = current.With(WorkItemState.MergeConflictResolutionFailed, ex.Message);
             await _store.UpdateAsync(failed, CancellationToken.None);
+            var mergeFailedRevision = await BuildTerminalRevisionAsync(failed, CancellationToken.None);
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "work_item.merge_conflict_resolution_failed",
                 WorkItem = failed,
                 Project = project,
-                Details = await BuildTerminalDetailsAsync(failed, CancellationToken.None),
+                PromptRevision = mergeFailedRevision?.PromptRevision,
+                RevisionAtCompletion = mergeFailedRevision?.RevisionAtCompletion,
+                RevisionMatches = mergeFailedRevision?.RevisionMatches,
             }, CancellationToken.None);
         }
         catch (AgentUnavailableException ex)
@@ -2115,9 +2121,14 @@ public sealed class PipelineRunner : IPipelineRunner
             var reworkIterationNumber = iteration + 1;
             await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
             var reworkStart = DateTimeOffset.UtcNow;
-            // Snapshot the prompt revision now, before the rework agent runs.
+            // Snapshot the prompt and revision now, before the rework agent runs.
             // A concurrent PUT /workitems/{id}/prompt landing during this iteration
-            // will bump the revision but must not be attributed to it.
+            // will bump the revision but must not be attributed to it. The
+            // re-read also ensures the agent receives the LATEST prompt content,
+            // not the orchestrator's stale in-memory snapshot — otherwise the
+            // dispatch row, env-var, and trailer would all agree on revision N
+            // while the agent was looking at revision N-1's text, defeating the
+            // entire point of Layer 1.
             var freshForRework = await _store.GetAsync(item.Id, ct) ?? item;
             await _store.RecordIterationDispatchAsync(
                 item.Id, reworkIterationNumber, freshForRework.PromptRevision, reworkStart, ct);
@@ -2125,7 +2136,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
                 : (IReadOnlyList<WorkItemQuestion>)[];
-            var reworkPrompt = ReworkPromptBuilder.Build(item.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions, project.AllowAgentQuestions);
+            var reworkPrompt = ReworkPromptBuilder.Build(freshForRework.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions, project.AllowAgentQuestions);
             using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
             reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
             reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
@@ -5318,34 +5329,42 @@ public sealed class PipelineRunner : IPipelineRunner
         if (project is not null)
         {
             var usage = await TryGetUsageSummaryAsync(item.Id);
+            var revision = await BuildTerminalRevisionAsync(next, ct);
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = StateToEventName(state),
                 WorkItem = next,
                 Project = project,
-                Details = await BuildTerminalDetailsAsync(next, ct),
                 Usage = usage?.Iteration,
                 UsageTotal = usage?.Total,
+                PromptRevision = revision?.PromptRevision,
+                RevisionAtCompletion = revision?.RevisionAtCompletion,
+                RevisionMatches = revision?.RevisionMatches,
             }, CancellationToken.None);
         }
     }
 
     /// <summary>
     /// Adds revision-attribution fields to webhook payloads on terminal-state
-    /// events. <c>revisionAtCompletion</c> is the highest dispatched iteration's
-    /// snapshotted revision; comparing it to <see cref="WorkItem.PromptRevision"/>
-    /// lets JobTrack tell "agent finished against the latest prompt" from
-    /// "agent finished an older revision; the latest prompt edit was not yet
-    /// visible". Non-terminal transitions return null so the existing payload
-    /// shape is unchanged.
+    /// events. <c>revisionAtCompletion</c> is the revision recorded for the
+    /// iteration with the largest iteration number; comparing it to
+    /// <see cref="WorkItem.PromptRevision"/> lets JobTrack tell "agent finished
+    /// against the latest prompt" from "agent finished an older revision; the
+    /// latest prompt edit was not yet visible". Non-terminal transitions
+    /// return null so the existing payload shape is unchanged.
     /// </summary>
-    private async Task<TerminalRevisionDetails?> BuildTerminalDetailsAsync(WorkItem item, CancellationToken ct)
+    private async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
     {
         if (!WorkItemDependencies.TerminalStates.Contains(item.State)) return null;
         var iterations = await _store.GetIterationsAsync(item.Id, ct);
+        // Pick the row with the largest iteration number — i.e. the last
+        // iteration that actually ran. Using .Max(i => i.PromptRevisionAtDispatch)
+        // would only agree when iteration numbers and recorded revisions are
+        // monotonic; future out-of-order or backfilled dispatch rows could
+        // diverge from "the revision attributed to the LAST iteration."
         int? lastDispatched = iterations.Count == 0
             ? null
-            : iterations.Max(i => i.PromptRevisionAtDispatch);
+            : iterations.OrderByDescending(i => i.Iteration).First().PromptRevisionAtDispatch;
         return new TerminalRevisionDetails(
             PromptRevision: item.PromptRevision,
             RevisionAtCompletion: lastDispatched,
@@ -5413,12 +5432,15 @@ public sealed class PipelineRunner : IPipelineRunner
             DisplayName = item.ProjectId.Value,
             RepositoryUrl = string.Empty,
         };
+        var failedRevision = await BuildTerminalRevisionAsync(next, CancellationToken.None);
         await _webhooks.PublishAsync(new WebhookEvent
         {
             Event = "work_item.failed",
             WorkItem = next,
             Project = effectiveProject,
-            Details = await BuildTerminalDetailsAsync(next, CancellationToken.None),
+            PromptRevision = failedRevision?.PromptRevision,
+            RevisionAtCompletion = failedRevision?.RevisionAtCompletion,
+            RevisionMatches = failedRevision?.RevisionMatches,
         }, CancellationToken.None);
     }
 
@@ -5447,12 +5469,15 @@ public sealed class PipelineRunner : IPipelineRunner
             DisplayName = item.ProjectId.Value,
             RepositoryUrl = string.Empty,
         };
+        var cancelledRevision = await BuildTerminalRevisionAsync(cancelled, CancellationToken.None);
         await _webhooks.PublishAsync(new WebhookEvent
         {
             Event = "work_item.cancelled",
             WorkItem = cancelled,
             Project = effectiveProject,
-            Details = await BuildTerminalDetailsAsync(cancelled, CancellationToken.None),
+            PromptRevision = cancelledRevision?.PromptRevision,
+            RevisionAtCompletion = cancelledRevision?.RevisionAtCompletion,
+            RevisionMatches = cancelledRevision?.RevisionMatches,
         }, CancellationToken.None);
     }
 
@@ -5966,13 +5991,15 @@ public sealed record AgentFallbackDetails(
     string Reason);
 
 /// <summary>
-/// Attached to webhook events emitted on a terminal-state transition (Done /
-/// Failed / Cancelled / AuditFailed / MergeConflictResolutionFailed). Lets
-/// JobTrack and equivalent trackers distinguish "agent finished the latest
-/// prompt" from "agent finished a stale prompt; the latest edit landed too
-/// late to be picked up" — the latter case warrants a one-click re-run.
+/// Internal carrier for revision-attribution fields lifted onto webhook
+/// payloads at terminal-state transitions (Done / Failed / Cancelled /
+/// AuditFailed / MergeConflictResolutionFailed). The fields themselves are
+/// serialised at the TOP LEVEL of the webhook payload (see
+/// <see cref="WebhookEvent.PromptRevision"/> et al.) so trackers like
+/// JobTrack can read <c>payload.promptRevision</c> directly; this record is
+/// just the in-process plumbing.
 /// </summary>
-public sealed record TerminalRevisionDetails(
+internal sealed record TerminalRevisionDetails(
     int PromptRevision,
     int? RevisionAtCompletion,
     bool RevisionMatches);

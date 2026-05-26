@@ -102,7 +102,9 @@ public sealed record AuditContext(
     /// auditor compares this against the HEAD commit's
     /// <c>CodeyBox-Prompt-Revision</c> trailer to detect agents that finished
     /// against a stale prompt. Null when the orchestrator did not record a
-    /// dispatch row (legacy data); auditors degrade to a warning in that case.
+    /// dispatch row (legacy data) — the trailer auditor emits a non-blocking
+    /// Warning finding in that case so the missing row is visible to operators
+    /// rather than silently disabling the check.
     /// </summary>
     int? PromptRevisionAtDispatch = null);
 

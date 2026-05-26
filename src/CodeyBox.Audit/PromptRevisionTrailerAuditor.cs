@@ -29,11 +29,20 @@ public sealed class PromptRevisionTrailerAuditor : IAuditor
         AuditContext context,
         CancellationToken ct = default)
     {
-        // Legacy / unknown dispatch revision — no expectation to enforce. Pass
-        // silently so the auditor never fails an item whose iteration predates
-        // the dispatch-tracking table.
+        // Legacy / unknown dispatch revision — no expectation to enforce. Emit
+        // a non-blocking Warning so the missing dispatch row is visible (the
+        // dispatch ledger is now always populated by the orchestrator before
+        // Working/Reworking transitions; this branch should be unreachable
+        // for items created after the prompt-revision feature shipped). Pass
+        // the audit verdict so the auditor never blocks a legacy item.
         if (context.PromptRevisionAtDispatch is not { } expected)
-            return new AuditResult(true, []);
+            return new AuditResult(true,
+            [
+                new AuditFinding(
+                    Name, AuditSeverity.Warning,
+                    "no prompt_revision_at_dispatch recorded for this iteration",
+                    "The orchestrator did not record a dispatch row for this iteration (legacy data, or the iteration ledger was cleared). The prompt-revision trailer cannot be verified; treat the result as informational."),
+            ]);
 
         // %(trailers:key=...) prints only the matching trailer values. --unfold
         // collapses continuation lines so multi-line trailer values are joined

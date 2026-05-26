@@ -16,14 +16,18 @@ public sealed class PromptRevisionTrailerAuditorTests
         PromptRevisionAtDispatch: dispatched);
 
     [Fact]
-    public async Task NoDispatchedRevision_PassesSilently()
+    public async Task NoDispatchedRevision_PassesWithWarningFinding()
     {
-        // Legacy item with no iteration row recorded — auditor must not block.
+        // Legacy item with no iteration row recorded — auditor must not block
+        // (Passed=true) but must surface a non-blocking Warning so the missing
+        // dispatch row is visible to operators rather than silently disabling
+        // the check.
         var sandbox = new StubSandbox(_ => new SandboxExecResult(0, "", ""));
         var result = await new PromptRevisionTrailerAuditor()
             .RunAsync(sandbox, "/work", Ctx(dispatched: null));
         Assert.True(result.Passed);
-        Assert.Empty(result.Findings);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
     }
 
     [Fact]

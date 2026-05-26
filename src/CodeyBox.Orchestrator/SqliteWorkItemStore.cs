@@ -153,11 +153,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // endpoint increments this on every successful write.
         RunMigration("ALTER TABLE work_items ADD COLUMN prompt_revision INTEGER NOT NULL DEFAULT 1;");
 
-        // Per-iteration dispatch record. One row per iteration; rows are
-        // append-only — never updated after dispatch. The work item's
-        // current prompt_revision is snapshotted into prompt_revision_at_dispatch
-        // so a prompt edit landing mid-iteration cannot be misattributed to the
-        // already-running iteration. Cascade-delete with the parent work item.
+        // Per-iteration dispatch record. One row per (work_item_id, iteration);
+        // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
+        // restart-recovery for the same iteration) overwrites the row via
+        // ON CONFLICT DO UPDATE in RecordIterationDispatchAsync. The work
+        // item's current prompt_revision is snapshotted into
+        // prompt_revision_at_dispatch so a prompt edit landing mid-iteration
+        // cannot be misattributed to the already-running iteration. Cascade-
+        // delete with the parent work item.
         using (var iterCmd = _conn.CreateCommand())
         {
             iterCmd.CommandText = """
