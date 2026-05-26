@@ -11,7 +11,7 @@ namespace CodeyBox.Orchestrator;
 ///
 /// A prepared INSERT keeps the hot-path overhead well under 50 ms per call.
 /// </summary>
-public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
+public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsByAgentQueryable, IDisposable
 {
     private readonly string _path;
     private readonly SqliteConnection _conn;
@@ -251,6 +251,56 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         while (await reader.ReadAsync(ct))
             results.Add((reader.GetString(0), reader.GetDouble(1)));
         return results;
+    }
+
+    /// <summary>
+    /// Server-side aggregation for <see cref="IAgentBurnEstimator"/>: returns
+    /// the avg per-item token total (input + output + cached) across the most
+    /// recent <paramref name="limit"/> distinct <b>Done</b> work items that
+    /// used <paramref name="agentKind"/>. "Most recent" is ordered by each
+    /// work item's latest cost row. Items in non-Done states (in-flight,
+    /// failed, cancelled) are excluded so partial cost rows don't bias the
+    /// rolling average — the spec's Part B item 6 requires Done-only samples.
+    /// </summary>
+    public async Task<(long AvgTokens, int Samples)> GetAvgTokensPerItemAsync(
+        string agentKind, int limit, CancellationToken ct = default)
+    {
+        if (limit <= 0) return (0, 0);
+
+        // Read-only connection: this query is invoked from the rate-aware gate
+        // on every dispatch tick. The shared writer connection `_conn` is not
+        // safe to use for concurrent commands, so opening a dedicated read
+        // connection avoids racing the writer (RecordAsync, DeleteByWorkItemAsync,
+        // ReconcileFromAgentStreamSummaryAsync). Matches the pattern used by
+        // GetByProjectAsync, GetFleetCostSummaryAsync, SummariseManyAsync.
+        using var readConn = new SqliteConnection($"Data Source={_path};Mode=ReadOnly");
+        readConn.Open();
+
+        using var cmd = readConn.CreateCommand();
+        cmd.CommandText = """
+            SELECT AVG(total) AS avg_tokens, COUNT(*) AS n
+            FROM (
+                SELECT c.work_item_id,
+                       SUM(c.input_tokens + c.output_tokens + c.cached_input_tokens) AS total,
+                       MAX(c.started_at) AS latest
+                FROM work_item_costs c
+                JOIN work_items w ON w.id = c.work_item_id
+                WHERE c.agent_kind = $kind
+                  AND w.state = $done
+                GROUP BY c.work_item_id
+                ORDER BY latest DESC
+                LIMIT $lim
+            )
+            """;
+        cmd.Parameters.AddWithValue("$kind", agentKind);
+        cmd.Parameters.AddWithValue("$done", (int)WorkItemState.Done);
+        cmd.Parameters.AddWithValue("$lim", limit);
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct)) return (0, 0);
+        if (reader.IsDBNull(0)) return (0, 0);
+        var avg = reader.GetDouble(0);
+        var n = reader.GetInt32(1);
+        return ((long)Math.Round(avg), n);
     }
 
     public async Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)

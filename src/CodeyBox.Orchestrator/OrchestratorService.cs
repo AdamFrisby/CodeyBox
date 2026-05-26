@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters
 {
     private readonly ITaskQueue _queue;
     private readonly IWorkItemStore _store;
@@ -29,6 +29,17 @@ public sealed class OrchestratorService : BackgroundService
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
+    private readonly AgentConcurrencyOptions _agentConcurrency;
+
+    // Live in-flight count keyed by routed agent kind. Incremented after the
+    // router pins an item to a member, decremented when the worker exits.
+    // Surfaced via /concurrency and consumed by the rate-aware gate.
+    private readonly ConcurrentDictionary<AgentKind, int> _runningPerAgent = new();
+
+    // Re-pickup delay applied when a routed agent's per-agent cap is at ceiling.
+    // Short enough that the deferred item is reconsidered as soon as another
+    // worker on the same agent finishes; long enough not to busy-loop.
+    private static readonly TimeSpan _agentCapRetryDelay = TimeSpan.FromSeconds(15);
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -79,7 +90,8 @@ public sealed class OrchestratorService : BackgroundService
         IWorkerRegistry? workerRegistry = null,
         DeadWorkerOptions? deadWorkerOpts = null,
         DeadWorkerReaper? reaper = null,
-        ReleaseService? releaseService = null)
+        ReleaseService? releaseService = null,
+        AgentConcurrencyOptions? agentConcurrency = null)
     {
         _queue = queue;
         _store = store;
@@ -95,7 +107,116 @@ public sealed class OrchestratorService : BackgroundService
         _deadWorkerOpts = deadWorkerOpts;
         _reaper = reaper;
         _releaseService = releaseService;
+        _agentConcurrency = agentConcurrency ?? new AgentConcurrencyOptions();
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
+    }
+
+    /// <inheritdoc />
+    public int GetRunning(AgentKind agent) =>
+        _runningPerAgent.TryGetValue(agent, out var n) ? n : 0;
+
+    /// <inheritdoc />
+    public IReadOnlyDictionary<AgentKind, int> Snapshot()
+    {
+        // Materialise so callers can iterate safely while the dispatcher mutates.
+        var snap = new Dictionary<AgentKind, int>(_runningPerAgent.Count);
+        foreach (var kv in _runningPerAgent)
+            if (kv.Value > 0) snap[kv.Key] = kv.Value;
+        return snap;
+    }
+
+    /// <summary>
+    /// Returns the per-agent cap configured for <paramref name="agent"/>, or 0
+    /// when no cap is configured (treated as "unlimited within global pool").
+    /// </summary>
+    internal int GetAgentCap(AgentKind agent) =>
+        _agentConcurrency.Members.TryGetValue(agent.Value, out var entry) && entry.MaxConcurrent > 0
+            ? entry.MaxConcurrent
+            : 0;
+
+    /// <summary>
+    /// Snapshot of concurrency state for the <c>/concurrency</c> endpoint:
+    /// global cap, configured per-agent caps, and live per-agent in-flight counts.
+    /// </summary>
+    public ConcurrencyStateSnapshot GetConcurrencyState()
+    {
+        var caps = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in _agentConcurrency.Members)
+        {
+            if (kv.Value.MaxConcurrent > 0)
+                caps[kv.Key] = kv.Value.MaxConcurrent;
+        }
+        var running = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in _runningPerAgent)
+            if (kv.Value > 0) running[kv.Key.Value] = kv.Value;
+
+        return new ConcurrencyStateSnapshot(
+            GlobalMaxConcurrent: _opts.MaxConcurrentWorkers,
+            CurrentlyRunningTotal: Volatile.Read(ref _currentlyRunning),
+            PerAgentCaps: caps,
+            CurrentlyRunningPerAgent: running);
+    }
+
+    /// <summary>
+    /// Atomically tries to reserve a per-agent slot for <paramref name="agent"/>.
+    /// Returns true and increments the count when the routed agent has no cap
+    /// or running &lt; cap; returns false when the cap is at ceiling.
+    ///
+    /// <para>
+    /// Lock-free; the read-modify-write uses
+    /// <see cref="ConcurrentDictionary{TKey,TValue}.AddOrUpdate(TKey, Func{TKey, TValue}, Func{TKey, TValue, TValue})"/>
+    /// with a check-before-update factory so multiple dispatchers/workers can
+    /// race without exceeding the cap.
+    /// </para>
+    /// </summary>
+    private bool TryReserveAgentSlot(AgentKind agent)
+    {
+        var cap = GetAgentCap(agent);
+        if (cap <= 0)
+        {
+            // No per-agent cap configured — still increment so /concurrency reflects reality.
+            _runningPerAgent.AddOrUpdate(agent, 1, static (_, v) => v + 1);
+            return true;
+        }
+
+        while (true)
+        {
+            if (_runningPerAgent.TryGetValue(agent, out var current))
+            {
+                if (current >= cap) return false;
+                if (_runningPerAgent.TryUpdate(agent, current + 1, current)) return true;
+                // Lost a race; retry the read and re-evaluate the cap.
+            }
+            else
+            {
+                // First reservation for this agent kind in this process.
+                if (_runningPerAgent.TryAdd(agent, 1)) return true;
+                // Lost the add race against another reserver; fall through to the
+                // TryGetValue branch which will TryUpdate against the observed value.
+            }
+        }
+    }
+
+    private void ReleaseAgentSlot(AgentKind agent)
+    {
+        // Decrement-or-remove: drop the key when it hits 0 so the next
+        // TryReserveAgentSlot takes the TryAdd branch cleanly. Holding the key
+        // at 0 would cause TryUpdate(..., 1, 0) to be the only valid path —
+        // which works, but leaves stale zero-valued entries accumulating in
+        // the dictionary and turns Snapshot/GetConcurrencyState into a fuller scan.
+        while (true)
+        {
+            if (!_runningPerAgent.TryGetValue(agent, out var current)) return;
+            if (current <= 1)
+            {
+                if (_runningPerAgent.TryRemove(new KeyValuePair<AgentKind, int>(agent, current))) return;
+            }
+            else
+            {
+                if (_runningPerAgent.TryUpdate(agent, current - 1, current)) return;
+            }
+            // Lost a race; retry.
+        }
     }
 
     /// <summary>Snapshot for the /workers/status endpoint.</summary>
@@ -337,6 +458,14 @@ public sealed class OrchestratorService : BackgroundService
         => PickNextEligibleAsync(ct);
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
+
+    // Exposed as internal so tests can directly exercise the per-agent cap
+    // reservation/release cycle without spinning the full BackgroundService.
+    // The hot-spin bug in the first revision of this code (TryAdd against an
+    // existing key) is only visible across a Release-then-Reserve cycle, which
+    // PinnedPipelineRunner-based integration tests do not produce.
+    internal bool TryReserveAgentSlotForTest(AgentKind agent) => TryReserveAgentSlot(agent);
+    internal void ReleaseAgentSlotForTest(AgentKind agent) => ReleaseAgentSlot(agent);
 
     /// <summary>
     /// On startup, re-enqueue work items that were mid-flight when we last
@@ -599,6 +728,12 @@ public sealed class OrchestratorService : BackgroundService
             }
         }
 
+        // Per-agent slot tracking: set when the router pins the item to an agent
+        // and the reservation succeeds. Cleared in the outer finally so a deferral
+        // or crash cannot leak the slot.
+        AgentKind? agentForRelease = null;
+        bool agentSlotReserved = false;
+
         try
         {
             var current = await _store.GetAsync(id, ct);
@@ -684,6 +819,30 @@ public sealed class OrchestratorService : BackgroundService
                     await _store.UpdateAsync(item.With(WorkItemState.Failed, decision.Reason), ct);
                     return;
                 }
+            }
+
+            // Per-agent concurrency cap: applied after routing has settled the agent
+            // so a class-routed item is gated by the cap of the *chosen* member, not
+            // by whatever override the operator put on the work item. When the cap
+            // is hit, defer-requeue with a short delay so the next pickup (after
+            // some agent slot frees up) finds it again. Reservation is held for the
+            // life of the worker and released in the outer finally.
+            agentForRelease = item.Agent;
+            if (item.Agent is { } routedAgent)
+            {
+                if (!TryReserveAgentSlot(routedAgent))
+                {
+                    var cap = GetAgentCap(routedAgent);
+                    var running = GetRunning(routedAgent);
+                    _log.LogInformation(
+                        "Worker {WorkerId} deferring {Id}: per-agent cap reached for {Agent} (running={Running} cap={Cap})",
+                        workerIndex, id, routedAgent.Value, running, cap);
+                    AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
+                    ScheduleDeferredRequeue(item.Id, _agentCapRetryDelay, ct);
+                    return;
+                }
+                // Reservation successful — outer finally releases on exit.
+                agentSlotReserved = true;
             }
 
             // Per-project pause gate: check before the budget lock so paused projects
@@ -827,6 +986,15 @@ public sealed class OrchestratorService : BackgroundService
         finally
         {
             _activeItems.TryRemove(id, out _);
+
+            // Release the per-agent slot if we reserved one (the only state in
+            // which it was incremented). Doing this here — rather than at the
+            // call site — guarantees we never leak a slot on the disk-deferred /
+            // budget-deferred / pipeline-exception code paths.
+            if (agentSlotReserved && agentForRelease is { } releaseAgent)
+            {
+                ReleaseAgentSlot(releaseAgent);
+            }
 
             // Stop the heartbeat and remove the registry row on any exit path
             // (success, failure, or cancellation). On clean exit this clears
@@ -1064,3 +1232,15 @@ public sealed record WorkerPoolStatus(
     int CurrentlyRunning,
     int QueuedCount,
     DateTimeOffset? LastSpawnAt);
+
+/// <summary>
+/// Snapshot of the per-agent concurrency state surfaced by the
+/// <c>/concurrency</c> endpoint. <see cref="PerAgentCaps"/> reflects the
+/// configured ceiling per agent kind; <see cref="CurrentlyRunningPerAgent"/>
+/// is the live in-flight count.
+/// </summary>
+public sealed record ConcurrencyStateSnapshot(
+    int GlobalMaxConcurrent,
+    int CurrentlyRunningTotal,
+    IReadOnlyDictionary<string, int> PerAgentCaps,
+    IReadOnlyDictionary<string, int> CurrentlyRunningPerAgent);
