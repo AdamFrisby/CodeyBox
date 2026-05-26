@@ -11,7 +11,7 @@ namespace CodeyBox.Orchestrator;
 ///
 /// A prepared INSERT keeps the hot-path overhead well under 50 ms per call.
 /// </summary>
-public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
+public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsByAgentQueryable, IDisposable
 {
     private readonly string _path;
     private readonly SqliteConnection _conn;
@@ -251,6 +251,42 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IDisposable
         while (await reader.ReadAsync(ct))
             results.Add((reader.GetString(0), reader.GetDouble(1)));
         return results;
+    }
+
+    /// <summary>
+    /// Server-side aggregation for <see cref="IAgentBurnEstimator"/>: returns
+    /// the avg per-item token total (input + output + cached) across the most
+    /// recent <paramref name="limit"/> distinct work items that used
+    /// <paramref name="agentKind"/>. "Most recent" is ordered by each work
+    /// item's latest cost row. Items with zero matching rows are excluded.
+    /// </summary>
+    public async Task<(long AvgTokens, int Samples)> GetAvgTokensPerItemAsync(
+        string agentKind, int limit, CancellationToken ct = default)
+    {
+        if (limit <= 0) return (0, 0);
+
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT AVG(total) AS avg_tokens, COUNT(*) AS n
+            FROM (
+                SELECT work_item_id,
+                       SUM(input_tokens + output_tokens + cached_input_tokens) AS total,
+                       MAX(started_at) AS latest
+                FROM work_item_costs
+                WHERE agent_kind = $kind
+                GROUP BY work_item_id
+                ORDER BY latest DESC
+                LIMIT $lim
+            )
+            """;
+        cmd.Parameters.AddWithValue("$kind", agentKind);
+        cmd.Parameters.AddWithValue("$lim", limit);
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct)) return (0, 0);
+        if (reader.IsDBNull(0)) return (0, 0);
+        var avg = reader.GetDouble(0);
+        var n = reader.GetInt32(1);
+        return ((long)Math.Round(avg), n);
     }
 
     public async Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default)

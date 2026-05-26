@@ -885,8 +885,31 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentClassRouter>(),
         TimeProvider.System,
         todModifiers,
-        sp.GetService<IQuotaFailureStore>());
+        sp.GetService<IQuotaFailureStore>(),
+        sp.GetService<IAgentBurnEstimator>(),
+        sp.GetService<IAgentRunningCounters>());
 });
+
+// --- Per-agent concurrency / rate-aware dispatch -----------------------------
+builder.Services.AddSingleton<AgentConcurrencyOptions>(sp =>
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentConcurrency);
+builder.Services.AddSingleton<AgentBurnEstimatorOptions>(sp =>
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentBurnEstimator);
+builder.Services.AddSingleton<IAgentBurnEstimator>(sp => new AgentBurnEstimator(
+    // Deferred resolution: the cost store backs onto a SQLite file that may
+    // not yet be initialised when the router is constructed (e.g. in unit
+    // tests that only build the router DI subgraph). Resolving lazily on the
+    // first GetEstimateAsync keeps router construction allocation-only.
+    () => sp.GetRequiredService<IWorkItemCostStore>(),
+    sp.GetRequiredService<AgentBurnEstimatorOptions>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentBurnEstimator>(),
+    TimeProvider.System));
+// OrchestratorService implements IAgentRunningCounters. AgentClassRouter also
+// depends on it, and OrchestratorService depends on AgentClassRouter — using a
+// deferred wrapper breaks that cycle by resolving the singleton lazily on the
+// first read, after both have been constructed.
+builder.Services.AddSingleton<IAgentRunningCounters>(sp =>
+    new DeferredAgentRunningCounters(() => sp.GetRequiredService<OrchestratorService>()));
 
 // --- Credential smoke probes -------------------------------------------------
 // Registered as IEnumerable<IAgentSmokeProbe>; the gate resolves by Kind.
@@ -1432,7 +1455,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IWorkerRegistry>(),
     sp.GetRequiredService<DeadWorkerOptions>(),
     sp.GetRequiredService<DeadWorkerReaper>(),
-    sp.GetService<ReleaseService>()));
+    sp.GetService<ReleaseService>(),
+    sp.GetRequiredService<AgentConcurrencyOptions>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -1604,6 +1628,61 @@ app.MapGet("/quota", async (
     });
 });
 
+app.MapGet("/concurrency", async (
+    OrchestratorService orchestrator,
+    AgentClassRouter router,
+    IAgentBurnEstimator burnEstimator,
+    CancellationToken ct) =>
+{
+    var state = orchestrator.GetConcurrencyState();
+
+    // Latest avg-burn per agent for every kind appearing in caps or running.
+    var allAgents = new HashSet<string>(
+        state.PerAgentCaps.Keys
+            .Concat(state.CurrentlyRunningPerAgent.Keys),
+        StringComparer.OrdinalIgnoreCase);
+
+    var burns = new List<object>(allAgents.Count);
+    foreach (var name in allAgents)
+    {
+        var est = await burnEstimator.GetEstimateAsync(new AgentKind(name), ct);
+        burns.Add(new
+        {
+            agent = name,
+            avgBurnPctPerItem = est.AvgBurnPctPerItem,
+            sampleCount = est.SampleCount,
+        });
+    }
+
+    // Per-class rate-aware fit estimates (one entry per subscription member).
+    var fits = new List<MemberFitView>();
+    foreach (var classId in router.ClassIds)
+    {
+        var classFits = await router.SummariseFitsAsync(classId, ct);
+        fits.AddRange(classFits);
+    }
+
+    return Results.Ok(new
+    {
+        globalMaxConcurrent = state.GlobalMaxConcurrent,
+        currentlyRunningTotal = state.CurrentlyRunningTotal,
+        perAgentCaps = state.PerAgentCaps,
+        currentlyRunningPerAgent = state.CurrentlyRunningPerAgent,
+        burnEstimates = burns,
+        memberFits = fits.Select(f => new
+        {
+            classId = f.ClassId,
+            agent = f.Agent.Value,
+            modelId = f.ModelId,
+            availablePct = f.AvailablePct,
+            avgBurnPctPerItem = f.AvgBurnPctPerItem,
+            sampleCount = f.SampleCount,
+            fitInWindow = double.IsNaN(f.FitInWindow) ? (double?)null : f.FitInWindow,
+            runningOnAgent = f.RunningOnAgent,
+        }),
+    });
+});
+
 app.MapGet("/events/schema", () => Results.Ok(EventSchema.GetSchema()));
 
 app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
@@ -1682,6 +1761,12 @@ namespace CodeyBox.Api
 
         /// <summary>Worker pool sizing and spawn-pacing configuration.</summary>
         public WorkerPoolOptions WorkerPool { get; set; } = new();
+
+        /// <summary>Per-agent concurrency caps (codex/claude/gemini/...) layered on top of WorkerPool.</summary>
+        public AgentConcurrencyOptions AgentConcurrency { get; set; } = new();
+
+        /// <summary>Per-agent burn-rate estimator config (rate-aware dispatch gate).</summary>
+        public AgentBurnEstimatorOptions AgentBurnEstimator { get; set; } = new();
 
         /// <summary>Graceful shutdown drain and preemption timing.</summary>
         public ShutdownOptions Shutdown { get; set; } = new();

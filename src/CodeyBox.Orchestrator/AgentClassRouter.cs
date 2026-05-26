@@ -36,6 +36,12 @@ public sealed class AgentClassRouter
     private readonly ILogger<AgentClassRouter> _log;
     private readonly TimeProvider _time;
     private readonly IQuotaFailureStore? _quotaFailures;
+    private readonly IAgentBurnEstimator? _burnEstimator;
+    private readonly IAgentRunningCounters? _runningCounters;
+    // Default fit when no historical samples exist (spec: "fits 2 concurrent
+    // burns" so the queue does not stall on cold start). Exposed as a constant
+    // so /concurrency surface and tests reference the same value.
+    public const double DefaultColdStartFitInWindow = 2.0;
     // Pre-parsed TOD modifiers: evaluated on every pickup, zero-alloc.
     private readonly IReadOnlyList<ParsedTodModifier> _todModifiers;
     // In-process short-lived exhaustion cache populated by mid-iteration fallback.
@@ -52,7 +58,9 @@ public sealed class AgentClassRouter
         ILogger<AgentClassRouter> log,
         TimeProvider? timeProvider = null,
         IReadOnlyList<ParsedTodModifier>? todModifiers = null,
-        IQuotaFailureStore? quotaFailures = null)
+        IQuotaFailureStore? quotaFailures = null,
+        IAgentBurnEstimator? burnEstimator = null,
+        IAgentRunningCounters? runningCounters = null)
     {
         _catalog = catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
         var probeList = probes.ToList();
@@ -68,6 +76,8 @@ public sealed class AgentClassRouter
         _time = timeProvider ?? TimeProvider.System;
         _todModifiers = todModifiers ?? [];
         _quotaFailures = quotaFailures;
+        _burnEstimator = burnEstimator;
+        _runningCounters = runningCounters;
     }
 
     /// <summary>
@@ -406,7 +416,10 @@ public sealed class AgentClassRouter
     private async Task<QuotaGateDecision> EvaluateGateAsync(AgentMembership member, ProjectId projectId, double availablePct, CancellationToken ct)
     {
         if (availablePct >= _opts.MinQuotaPct)
-            return new QuotaGateDecision(true, "quota available");
+        {
+            var rateAware = await EvaluateRateAwareGateAsync(member, availablePct, ct);
+            return rateAware ?? new QuotaGateDecision(true, "quota available");
+        }
 
         if (availablePct >= 0)
             return new QuotaGateDecision(false, "quota exhausted");
@@ -418,6 +431,105 @@ public sealed class AgentClassRouter
             _ => await EvaluateObservedFailuresAsync(member, ct),
         };
     }
+
+    /// <summary>
+    /// Rate-aware gate: returns a denying <see cref="QuotaGateDecision"/> when
+    /// the number of items already running on <paramref name="member"/>'s agent
+    /// already meets or exceeds the number of additional concurrent burns that
+    /// will fit in the remaining quota window. Returns null when no rate-aware
+    /// inputs are wired (legacy callers preserve their existing fail-open) or
+    /// when the gate would let the dispatch through.
+    ///
+    /// <para>
+    /// Formula (spec part B): <c>FitInWindow = AvailablePct / AvgBurnPctPerItem</c>.
+    /// When the estimator has no historical samples yet, the cold-start
+    /// fallback at <see cref="DefaultColdStartFitInWindow"/> is used so the
+    /// queue does not stall on first boot. PayPerApi members are never gated
+    /// here — pay-per-API has no window to overrun.
+    /// </para>
+    /// </summary>
+    private async Task<QuotaGateDecision?> EvaluateRateAwareGateAsync(
+        AgentMembership member, double availablePct, CancellationToken ct)
+    {
+        if (_burnEstimator is null || _runningCounters is null) return null;
+        if (member.Billing == AgentBilling.PayPerApi) return null;
+        if (availablePct < 0) return null;
+
+        AgentBurnEstimate estimate;
+        try { estimate = await _burnEstimator.GetEstimateAsync(member.Agent, ct); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Rate-aware gate: burn estimator threw for {Agent}; treating as no-data fallback",
+                member.Agent.Value);
+            estimate = new AgentBurnEstimate { AvgBurnPctPerItem = -1, SampleCount = 0 };
+        }
+
+        double fit;
+        if (estimate.SampleCount <= 0 || estimate.AvgBurnPctPerItem <= 0)
+        {
+            fit = DefaultColdStartFitInWindow;
+        }
+        else
+        {
+            fit = availablePct / estimate.AvgBurnPctPerItem;
+        }
+
+        var running = _runningCounters.GetRunning(member.Agent);
+        if (running < fit) return null;
+
+        var reason =
+            $"rate-aware gate: running={running} >= fit={fit:F2} " +
+            $"(avgBurn={estimate.AvgBurnPctPerItem:F1}% available={availablePct:F1}% samples={estimate.SampleCount})";
+        AuditLog.RateAwareGated(member.Agent, member.ModelId, running, fit, estimate.AvgBurnPctPerItem, availablePct, estimate.SampleCount);
+        return new QuotaGateDecision(false, reason);
+    }
+
+    /// <summary>
+    /// Computes the rate-aware fit estimate for every subscription-billed
+    /// member of <paramref name="classId"/> using the same formula
+    /// <see cref="EvaluateRateAwareGateAsync"/> applies. Pure-read; used by the
+    /// <c>/concurrency</c> endpoint to surface the router's current view.
+    /// </summary>
+    public async Task<IReadOnlyList<MemberFitView>> SummariseFitsAsync(string classId, CancellationToken ct = default)
+    {
+        var results = new List<MemberFitView>();
+        if (!_catalog.TryGetValue(classId, out var agentClass)) return results;
+        if (_burnEstimator is null) return results;
+
+        foreach (var member in agentClass.Members)
+        {
+            if (member.Billing == AgentBilling.PayPerApi) continue;
+
+            AgentQuotaSnapshot snapshot;
+            try { snapshot = await ProbeAsync(member, ct); }
+            catch { continue; }
+            var quota = ResolveMemberQuota(snapshot, member);
+
+            AgentBurnEstimate est;
+            try { est = await _burnEstimator.GetEstimateAsync(member.Agent, ct); }
+            catch { est = new AgentBurnEstimate { AvgBurnPctPerItem = -1, SampleCount = 0 }; }
+
+            double fit;
+            if (est.SampleCount <= 0 || est.AvgBurnPctPerItem <= 0) fit = DefaultColdStartFitInWindow;
+            else if (quota.AvailablePct < 0) fit = double.NaN;
+            else fit = quota.AvailablePct / est.AvgBurnPctPerItem;
+
+            results.Add(new MemberFitView(
+                ClassId: classId,
+                Agent: member.Agent,
+                ModelId: member.ModelId,
+                AvailablePct: quota.AvailablePct,
+                AvgBurnPctPerItem: est.AvgBurnPctPerItem,
+                SampleCount: est.SampleCount,
+                FitInWindow: fit,
+                RunningOnAgent: _runningCounters?.GetRunning(member.Agent) ?? 0));
+        }
+        return results;
+    }
+
+    /// <summary>Returns every class id known to the router. Used by /concurrency to enumerate fits.</summary>
+    public IReadOnlyCollection<string> ClassIds => _catalog.Keys.ToList();
 
     private async Task<QuotaGateDecision> EvaluateObservedFailuresAsync(AgentMembership member, CancellationToken ct)
     {
@@ -550,6 +662,23 @@ public sealed class AgentClassRouter
 }
 
 public sealed record EffectiveQuota(double AvailablePct, DateTimeOffset? ResetAt, string? Window);
+
+/// <summary>
+/// Snapshot of the router's rate-aware view for one class member, surfaced via
+/// the <c>/concurrency</c> endpoint. <see cref="FitInWindow"/> is the number
+/// of additional concurrent burns the router believes will fit in the
+/// remaining quota window. <see cref="RunningOnAgent"/> is the live in-flight
+/// count compared against it.
+/// </summary>
+public sealed record MemberFitView(
+    string ClassId,
+    AgentKind Agent,
+    string? ModelId,
+    double AvailablePct,
+    double AvgBurnPctPerItem,
+    int SampleCount,
+    double FitInWindow,
+    int RunningOnAgent);
 
 /// <summary>
 /// A pre-parsed time-of-day modifier entry, built once at startup from

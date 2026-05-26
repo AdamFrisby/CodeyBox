@@ -681,6 +681,41 @@ public static class AuditLog
                 appliedModifiers,
                 string.Join("; ", rejected.Select(r => $"{r.Agent.Value}/{r.ModelId ?? "(default)"}:eff={r.EffectiveScore}:{r.RejectReason}")));
 
+    // ── Per-agent concurrency + rate-aware gate ──────────────────────────────
+
+    /// <summary>
+    /// Emitted when the orchestrator skips a dispatch because the routed agent's
+    /// per-agent concurrency cap is at its ceiling. Distinct from
+    /// <c>quota_router.deferred</c>: quota was fine, the operator-set cap was the
+    /// constraint.
+    /// </summary>
+    public static void ConcurrencyGated(WorkItemId id, AgentKind agent, int running, int cap) =>
+        Audit("concurrency.gated_per_agent")
+            .Information(
+                "Concurrency gate: work item {WorkItemId} skipped — per-agent cap reached for {Agent}: running={Running} cap={Cap}",
+                id.ToString(), agent.Value, running, cap);
+
+    /// <summary>
+    /// Emitted when the router's rate-aware gate refuses a member because adding
+    /// another concurrent burn would not fit in the remaining quota window —
+    /// even though the raw <c>availablePct</c> is still above the MinQuotaPct
+    /// floor. Distinct from <c>quota_router.scored</c>'s "quota exhausted"
+    /// reject reason so operators can tell apart "no quota" from "would overrun
+    /// the window if we run another".
+    /// </summary>
+    public static void RateAwareGated(
+        AgentKind agent,
+        string? modelId,
+        int running,
+        double fitInWindow,
+        double avgBurnPct,
+        double availablePct,
+        int sampleCount) =>
+        Audit("concurrency.gated_rate_aware")
+            .Information(
+                "Rate-aware gate: {Agent}/{Model} running={Running} >= fit={FitInWindow:F2} (avgBurn={AvgBurnPct:F1}% available={AvailablePct:F1}% samples={Samples})",
+                agent.Value, modelId ?? "(default)", running, fitInWindow, avgBurnPct, availablePct, sampleCount);
+
     // ── Plugin loading ───────────────────────────────────────────────────────
 
     public static void PluginLoaded(string pluginId, string displayName, string assemblyPath) =>
