@@ -141,7 +141,7 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
-    public async Task CompleteAsync_MergeReturns405_ReturnsPrUrlWithNullMergedSha()
+    public async Task CompleteAsync_MergeReturns405_FlagsAutoMergeRacedSoOrchestratorCanRecover()
     {
         var gitHost = new FakeGitHost();
         var handler = new FakeHttpMessageHandler();
@@ -155,10 +155,65 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.True(outcome.BranchPushed);
         Assert.Equal("https://github.com/myorg/myrepo/pull/99", outcome.PullRequestUrl);
         Assert.Equal(99, outcome.PullRequestNumber);
-        Assert.Null(outcome.MergedSha);  // graceful — PR left open
+        Assert.Null(outcome.MergedSha);  // PR left open for the orchestrator's race recovery
         // Notes must be populated so operators get an orchestrator-level diagnostic.
         Assert.NotNull(outcome.Notes);
         Assert.Contains("405", outcome.Notes);
+        // AutoMergeRaced is the signal the orchestrator's retry loop watches
+        // to trigger the "re-fetch base + re-run merge phase + retry merge"
+        // recovery path — without it, the item would be parked at the cap.
+        Assert.True(outcome.AutoMergeRaced);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_ExistingPrNumber_SkipsCreatePrAndCallsMergeDirectly()
+    {
+        // Simulates the orchestrator's race-recovery retry: it re-runs the merge
+        // phase locally and then re-invokes CompleteAsync, passing the PR number
+        // from the prior attempt so we don't re-create (which would 422).
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(MergeOkResponse("merged-after-retry"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var request = SampleRequest with { ExistingPullRequestNumber = 42 };
+        var outcome = await remote.CompleteAsync(request, CancellationToken.None);
+
+        // Push still happens — we may have advanced the work branch locally
+        // to the new merge sha and need to publish it.
+        Assert.Single(gitHost.Pushes);
+        Assert.Equal(SampleRequest.WorkBranch, gitHost.Pushes[0].Branch);
+
+        // Only the PUT /merge call — no POST /pulls re-creation.
+        Assert.Single(handler.Requests);
+        Assert.Equal(HttpMethod.Put, handler.Requests[0].Method);
+        Assert.Contains("/pulls/42/merge", handler.Requests[0].RequestUri!.PathAndQuery);
+
+        Assert.True(outcome.BranchPushed);
+        Assert.Equal(42, outcome.PullRequestNumber);
+        Assert.Equal("merged-after-retry", outcome.MergedSha);
+        Assert.False(outcome.AutoMergeRaced);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_ExistingPrNumberWith405_StillFlagsAutoMergeRaced()
+    {
+        // The race may recur — re-running the merge phase doesn't help if a
+        // third writer is hammering base. The orchestrator caps total attempts;
+        // each retry CompleteAsync still surfaces AutoMergeRaced.
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(JsonResponse(HttpStatusCode.MethodNotAllowed,
+            """{"message":"Pull Request is not mergeable"}"""));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var request = SampleRequest with { ExistingPullRequestNumber = 7 };
+        var outcome = await remote.CompleteAsync(request, CancellationToken.None);
+
+        Assert.True(outcome.BranchPushed);
+        Assert.Equal(7, outcome.PullRequestNumber);
+        Assert.Null(outcome.MergedSha);
+        Assert.True(outcome.AutoMergeRaced);
     }
 
     [Fact]

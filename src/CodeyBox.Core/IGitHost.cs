@@ -49,6 +49,41 @@ public interface IGitHost
         UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// Fetches a branch from the configured upstream URL into the host bare
+    /// repo, overwriting the local ref of the same name. Returns the new sha
+    /// the local ref points at, or <c>null</c> when the upstream does not
+    /// advertise the branch. Throws on transport / auth errors.
+    ///
+    /// Default returns <c>null</c> for hosts that do not model an upstream
+    /// (so test fakes that don't implement the call behave as "branch not
+    /// found" rather than crashing).
+    /// </summary>
+    Task<string?> FetchUpstreamBranchAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Force-sets <paramref name="branch"/> in the host bare repo to point at
+    /// <paramref name="sha"/>. Used by the auto-merge race recovery to advance
+    /// the work branch so its tip contains the freshly-resolved merge commit
+    /// (which has both upstream base and original work branch tip as parents),
+    /// making a subsequent push-and-merge succeed cleanly.
+    ///
+    /// Default throws — only hosts that expose a real bare repo need to
+    /// implement this.
+    /// </summary>
+    Task SetBranchToCommitAsync(
+        string repositoryId,
+        string branch,
+        string sha,
+        CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side branch updates.");
+
     /// <summary>Discards the host-side state for a finished work item.</summary>
     Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default);
 

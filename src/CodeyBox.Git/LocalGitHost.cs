@@ -159,6 +159,71 @@ public sealed class LocalGitHost : IGitHost
             throw new InvalidOperationException($"git push to upstream failed after reconcile: {rc.Stderr}");
     }
 
+    public async Task<string?> FetchUpstreamBranchAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+    {
+        Validation.ValidateRepositoryUrl(upstreamUrl, nameof(upstreamUrl));
+        Validation.ValidateBranchName(branch, nameof(branch));
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            throw new InvalidOperationException($"bare repo for '{repositoryId}' does not exist at {path}");
+        SanitizeBareRepositoryConfig(path);
+
+        // Force-update local refs/heads/<branch> to upstream's tip — this is
+        // the race-recovery path; we WANT to overwrite the local view because
+        // we just discovered upstream has moved.
+        var fetch = await RunGitAsync(
+            workdir: path,
+            ct,
+            extraEnv: upstreamEnv,
+            "fetch", "--no-tags", upstreamUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+        if (fetch.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git fetch upstream branch '{branch}' failed: {fetch.Stderr}");
+
+        var revParse = await RunGitAsync(
+            workdir: path, ct,
+            "rev-parse", "--verify", "--quiet", $"refs/heads/{branch}^{{commit}}");
+        if (revParse.ExitCode != 0)
+            return null;
+        return revParse.Stdout.Trim();
+    }
+
+    public async Task SetBranchToCommitAsync(
+        string repositoryId,
+        string branch,
+        string sha,
+        CancellationToken ct = default)
+    {
+        Validation.ValidateBranchName(branch, nameof(branch));
+        Validation.ValidateCommitSha(sha, nameof(sha));
+
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            throw new InvalidOperationException($"bare repo for '{repositoryId}' does not exist at {path}");
+        SanitizeBareRepositoryConfig(path);
+
+        // Verify the target sha resolves before pointing the ref at it; an
+        // invalid sha would silently break the branch ref.
+        var verify = await RunGitAsync(
+            workdir: path, ct,
+            "rev-parse", "--verify", $"{sha}^{{commit}}");
+        if (verify.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"cannot set branch '{branch}' to '{sha}': sha did not resolve to a commit: {verify.Stderr}");
+
+        var update = await RunGitAsync(
+            workdir: path, ct,
+            "update-ref", $"refs/heads/{branch}", sha);
+        if (update.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git update-ref to set '{branch}' to {sha} failed: {update.Stderr}");
+    }
+
     public async Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);
