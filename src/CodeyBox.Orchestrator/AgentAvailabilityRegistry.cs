@@ -156,9 +156,13 @@ public sealed class AgentAvailabilityRegistry
     }
 
     /// <summary>
-    /// Clears the exclusion state and fast-fail counter for <paramref name="kind"/>.
-    /// Called by the <c>/admin/agent/{name}/reset</c> endpoint after the operator
-    /// has corrected the underlying issue (e.g. installed the missing binary).
+    /// Clears the exclusion state, fast-fail counter, and prior probe
+    /// timestamps for <paramref name="kind"/>. Called by the
+    /// <c>/admin/agent/{name}/reset</c> endpoint after the operator has
+    /// corrected the underlying issue (e.g. installed the missing binary).
+    /// A subsequent probe / run repopulates the timestamps from the new
+    /// observation, so the snapshot accurately reflects post-reset state
+    /// rather than mixing stale and fresh evidence.
     /// </summary>
     public void Reset(AgentKind kind)
     {
@@ -169,6 +173,8 @@ public sealed class AgentAvailabilityRegistry
             entry.ExcludedReason = null;
             entry.LastFastFailAt = null;
             entry.LastFastFailDuration = null;
+            entry.LastSmokePassedAt = null;
+            entry.LastSmokeFailedAt = null;
         }
         _log.LogInformation("Agent {Agent} availability reset by operator", kind.Value);
     }

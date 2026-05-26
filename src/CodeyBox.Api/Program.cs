@@ -1760,9 +1760,14 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     });
 });
 
-app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry registry) =>
+app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry registry, IAgentRegistry agents) =>
 {
     var kind = new AgentKind(name);
+    // Validate the agent is actually registered; without this, a typo
+    // (e.g. /admin/agent/curser/reset) silently returns 200 and the operator
+    // never realises the call did nothing.
+    if (!agents.Available.Contains(kind))
+        return Results.NotFound(new { error = $"unknown agent '{name}'" });
     registry.Reset(kind);
     var availability = registry.GetAvailability(kind);
     return Results.Ok(new

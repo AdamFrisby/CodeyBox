@@ -26,8 +26,15 @@ public sealed record SandboxLeakDetails
 }
 
 /// <summary>
-/// Details payload for the <c>agent.smoke_failed</c> event, fired when a
-/// credential smoke test fails at startup or at work-item pickup.
+/// Details payload for the <c>agent.smoke_failed</c> and <c>agent.smoke_recovered</c>
+/// events. Fired on three distinct edge transitions: a credential smoke test
+/// fails at startup or on a periodic sweep; a periodic sweep recovers a
+/// previously-excluded agent; the fast-fail circuit breaker excludes the agent
+/// after consecutive sub-threshold non-zero exits. The <see cref="Reason"/>
+/// field distinguishes credential failures (e.g. "auth", "timeout") from
+/// fast-fail trips (which contain the phrase
+/// <c>"fast-fail circuit breaker"</c>); <see cref="Reason"/> is null on the
+/// <c>agent.smoke_recovered</c> variant.
 /// </summary>
 public sealed record AgentSmokeFailedDetails
 {

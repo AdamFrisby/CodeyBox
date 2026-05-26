@@ -83,7 +83,8 @@ subscribe to.
 |---|---|---|
 | `queue.paused` | 1.0 | Operator paused the global pickup queue. |
 | `queue.resumed` | 1.0 | Operator resumed the global pickup queue. |
-| `agent.smoke_failed` | 1.0 | Credential smoke probe failed at startup or pickup. |
+| `agent.smoke_failed` | 1.0 | Credential smoke probe failed at startup or pickup, or fast-fail circuit breaker excluded the agent after consecutive sub-threshold non-zero exits. |
+| `agent.smoke_recovered` | 1.0 | Previously-excluded agent recovered: a subsequent smoke probe passed. |
 | `agent.fallback` | 1.0 | Agent class router fell back to an alternate agent. |
 | `sandbox.leak_detected` | 1.0 | Leaked `codeybox-*` sandbox detected by reaper. |
 | `sandbox.leak_disposed` | 1.0 | Reaper successfully disposed a leaked sandbox. |
