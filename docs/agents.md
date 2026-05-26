@@ -22,6 +22,28 @@ when building the credential bundle. They are intentionally namespaced
 differently so the host environment can hold multiple agents'
 credentials at once without collision.
 
+## Sandbox install commands
+
+Each agent CLI must be present in the sandbox baseline image, or dispatch fails
+with exit 127 (`<binary>: No such file or directory`). The orchestrator does
+**not** install agent binaries — that is operator-owned config under
+`CodeyBox:MultipassExtraRuncmd` (see [`baseline-bake-examples.md`](baseline-bake-examples.md)).
+Adding an `AgentKind` to an agent class without also adding its install line is
+the most common cause of fresh-class dispatch failures.
+
+| Kind | Sandbox install command | Notes |
+|------|-------------------------|-------|
+| `claude`  | `npm install -g @anthropic-ai/claude-code` | Needs Node.js on the image. |
+| `copilot` | `gh extension install github/gh-copilot` (or operator-supplied — verify with current GitHub Copilot CLI docs) | The shipped binary name is `copilot`. |
+| `codex`   | `npm install -g @openai/codex` | Reuses the Node.js stack from Claude. |
+| `gemini`  | `npm install -g @google/gemini-cli` | Use ≥ 0.1.9 for `--thinking` support if any class member sets `ReasoningMode=high`. |
+| `cursor`  | `curl -fsSL https://cursor.com/install \| bash` | Installs as `agent` (not `cursor-agent`). |
+
+Verify each command against its upstream install docs at the time of baking —
+versions and install URLs change. After updating
+`CodeyBox:MultipassExtraRuncmd`, delete any cached `cb-baseline-*` images to
+force a fresh bake on the next sandbox launch.
+
 ## Adding a new agent
 
 1. Create a project `CodeyBox.Agents.<Name>`.
@@ -45,7 +67,28 @@ credentials at once without collision.
    new AgentCredentialMapping(new AgentKind("aider"), "CODEYBOX_AIDER_KEY", "OPENAI_API_KEY"),
    ```
 
-5. Make sure the binary is present in your sandbox image. (Pin by digest.)
+5. **Install the binary in the sandbox baseline image.** This is **not
+   optional** — without it, every dispatch to the new agent fails with
+   exit 127 (`<binary>: No such file or directory`). The orchestrator does
+   not auto-install; the install line lives in operator config under
+   `CodeyBox:MultipassExtraRuncmd` (see
+   [`baseline-bake-examples.md`](baseline-bake-examples.md)). After
+   editing operator config, delete the cached baseline image so the next
+   sandbox launch re-bakes with the new tool. Pin by digest where the
+   upstream supports it.
+
+6. **Document the install command** in the "Sandbox install commands"
+   table above and add a "Per-agent quirks" subsection covering the
+   binary name, non-interactive invocation, credential layout, and any
+   reasoning-flag / quota-probe specifics. Doc parity keeps the next
+   class-edit from rediscovering this footgun.
+
+7. **Add a smoke probe** (`IAgentSmokeProbe`) so the credential gets
+   verified before work-item pickup — see `ClaudeSmokeProbe` /
+   `CursorSmokeProbe` for the two shapes (HTTP-endpoint probe vs.
+   credential-bundle-presence probe). Today's smoke probes do not
+   exec the CLI inside a sandbox, so they will not catch a missing
+   binary; that gap is tracked separately.
 
 ## Why one-shot CLI invocation
 

@@ -97,6 +97,33 @@ tool and re-run audit to get enforcement.
 }
 ```
 
+## Agent CLIs
+
+Every `AgentKind` registered in an agent class needs its CLI baked into the
+sandbox image. The orchestrator does not install agent binaries; missing
+binaries surface as exit-127 dispatch failures only after the work item
+starts (today's smoke probes verify credentials, not binary presence).
+Bake them at baseline time so the first dispatch can actually run.
+
+```json
+{
+  "CodeyBox": {
+    "MultipassExtraRuncmd": [
+      "set -eux\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y curl ca-certificates nodejs npm",
+      "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+      "curl -fsSL https://cursor.com/install | bash"
+    ]
+  }
+}
+```
+
+Pick the subset that matches the agents you have registered. The
+`@google/gemini-cli` install must be ≥ 0.1.9 if any agent-class member sets
+`ReasoningMode=high`. Cursor installs the binary as `agent` (not
+`cursor-agent`) — verify it lands on `$PATH` after the bake. After changing
+any entry, delete cached `cb-baseline-*` images so the next sandbox launch
+re-runs the bake.
+
 ## Security Tooling
 
 The `security:gitleaks` and `security:semgrep` auditors skip with an Info
