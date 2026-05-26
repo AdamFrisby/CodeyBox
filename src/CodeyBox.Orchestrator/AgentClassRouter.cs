@@ -38,6 +38,7 @@ public sealed class AgentClassRouter
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IAgentBurnEstimator? _burnEstimator;
     private readonly IAgentRunningCounters? _runningCounters;
+    private readonly AgentAvailabilityRegistry? _availability;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -60,7 +61,8 @@ public sealed class AgentClassRouter
         IReadOnlyList<ParsedTodModifier>? todModifiers = null,
         IQuotaFailureStore? quotaFailures = null,
         IAgentBurnEstimator? burnEstimator = null,
-        IAgentRunningCounters? runningCounters = null)
+        IAgentRunningCounters? runningCounters = null,
+        AgentAvailabilityRegistry? availability = null)
     {
         _catalog = catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
         var probeList = probes.ToList();
@@ -78,6 +80,7 @@ public sealed class AgentClassRouter
         _quotaFailures = quotaFailures;
         _burnEstimator = burnEstimator;
         _runningCounters = runningCounters;
+        _availability = availability;
     }
 
     /// <summary>
@@ -171,6 +174,20 @@ public sealed class AgentClassRouter
             {
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "in-process exhaustion cache"));
                 continue;
+            }
+            // Smoke gate / fast-fail circuit breaker excluded this agent. Skip
+            // it without probing — the binary or credentials are known-broken
+            // and a dispatch would either exit 127 immediately or fail auth.
+            if (_availability is { } reg)
+            {
+                var av = reg.GetAvailability(member.Agent);
+                if (!av.Available)
+                {
+                    var smokeReason = $"smoke gate: {av.Reason}";
+                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
+                    rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
+                    continue;
+                }
             }
             if (member.Billing == AgentBilling.Subscription && _quotaFailures is not null)
             {
@@ -311,6 +328,7 @@ public sealed class AgentClassRouter
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
             .Where(x => !IsExhausted(x.Member, nowUtc))
+            .Where(x => _availability is null || _availability.GetAvailability(x.Member.Agent).Available)
             .Select(x => new
             {
                 x.Member,

@@ -887,7 +887,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         todModifiers,
         sp.GetService<IQuotaFailureStore>(),
         sp.GetService<IAgentBurnEstimator>(),
-        sp.GetService<IAgentRunningCounters>());
+        sp.GetService<IAgentRunningCounters>(),
+        sp.GetService<AgentAvailabilityRegistry>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -990,6 +991,21 @@ builder.Services.AddSingleton<SmokeOptions>(sp =>
         StartupTimeoutSeconds = s.StartupTimeoutSeconds,
     };
 });
+builder.Services.AddSingleton<AvailabilityOptions>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var a = cbOpts.Smoke.Availability;
+    return new AvailabilityOptions
+    {
+        FastFailThresholdSeconds = a.FastFailThresholdSeconds,
+        MaxConsecutiveFastFails = a.MaxConsecutiveFastFails,
+        PeriodicSweepInterval = TimeSpan.FromSeconds(Math.Max(0, a.PeriodicSweepIntervalSeconds)),
+    };
+});
+builder.Services.AddSingleton<AgentAvailabilityRegistry>(sp => new AgentAvailabilityRegistry(
+    sp.GetRequiredService<AvailabilityOptions>(),
+    TimeProvider.System,
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentAvailabilityRegistry>()));
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
 {
     var opts = sp.GetRequiredService<SmokeOptions>();
@@ -1386,7 +1402,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IQuotaFailureClassifier>(),
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>(),
     sp.GetService<ITaskQueue>(),
-    sp.GetService<OrchestratorOptions>()));
+    sp.GetService<OrchestratorOptions>(),
+    sp.GetService<AgentAvailabilityRegistry>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1464,7 +1481,17 @@ builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetServices<IAgentSmokeProbe>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<SmokeOptions>(),
-    sp.GetRequiredService<ILogger<StartupSmokeProbeService>>()));
+    sp.GetRequiredService<ILogger<StartupSmokeProbeService>>(),
+    sp.GetService<AgentAvailabilityRegistry>()));
+builder.Services.AddSingleton<PeriodicSmokeProbeService>(sp => new PeriodicSmokeProbeService(
+    sp.GetRequiredService<ICredentialProvider>(),
+    sp.GetServices<IAgentSmokeProbe>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<SmokeOptions>(),
+    sp.GetRequiredService<AvailabilityOptions>(),
+    sp.GetRequiredService<AgentAvailabilityRegistry>(),
+    sp.GetRequiredService<ILogger<PeriodicSmokeProbeService>>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<PeriodicSmokeProbeService>());
 builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<ICredentialProvider>(),
@@ -1632,6 +1659,7 @@ app.MapGet("/concurrency", async (
     OrchestratorService orchestrator,
     AgentClassRouter router,
     IAgentBurnEstimator burnEstimator,
+    AgentAvailabilityRegistry? availability,
     CancellationToken ct) =>
 {
     var state = orchestrator.GetConcurrencyState();
@@ -1662,6 +1690,12 @@ app.MapGet("/concurrency", async (
         fits.AddRange(classFits);
     }
 
+    // Smoke-gate / fast-fail exclusion state, one entry per agent the registry
+    // has seen. The /concurrency endpoint is the canonical operator surface for
+    // "why isn't this agent picking up work" — exclusion has to live alongside
+    // burn / fit so the operator sees the full picture without joining JSON.
+    var availabilityView = availability?.Snapshot() ?? Array.Empty<AgentAvailabilitySnapshot>();
+
     return Results.Ok(new
     {
         globalMaxConcurrent = state.GlobalMaxConcurrent,
@@ -1679,6 +1713,82 @@ app.MapGet("/concurrency", async (
             sampleCount = f.SampleCount,
             fitInWindow = double.IsNaN(f.FitInWindow) ? (double?)null : f.FitInWindow,
             runningOnAgent = f.RunningOnAgent,
+        }),
+        agentAvailability = availabilityView.Select(s => new
+        {
+            agent = s.Agent.Value,
+            excluded = s.Excluded,
+            reason = s.Reason,
+            consecutiveFastFails = s.ConsecutiveFastFails,
+            lastSmokePassedAt = s.LastSmokePassedAt,
+            lastSmokeFailedAt = s.LastSmokeFailedAt,
+            lastFastFailAt = s.LastFastFailAt,
+        }),
+    });
+});
+
+// ── Admin: agent availability ─────────────────────────────────────────────
+// Operators use these endpoints after correcting a smoke / fast-fail
+// exclusion (e.g. installing the missing binary, rotating credentials) to
+// either trigger an immediate probe or to clear the fast-fail counter.
+
+app.MapPost("/admin/agent/{name}/smoke", async (
+    string name,
+    PeriodicSmokeProbeService periodic,
+    AgentAvailabilityRegistry registry,
+    CancellationToken ct) =>
+{
+    var kind = new AgentKind(name);
+    var result = await periodic.ProbeAsync(kind, ct);
+    if (result is null)
+        return Results.NotFound(new { error = $"no smoke probe registered for agent '{name}'" });
+    var availability = registry.GetAvailability(kind);
+    return Results.Ok(new
+    {
+        agent = name,
+        smoke = new
+        {
+            ok = result.Ok,
+            reason = result.FailureReason,
+            durationMs = (long)result.Duration.TotalMilliseconds,
+        },
+        availability = new
+        {
+            available = availability.Available,
+            reason = availability.Reason,
+        },
+    });
+});
+
+app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry registry) =>
+{
+    var kind = new AgentKind(name);
+    registry.Reset(kind);
+    var availability = registry.GetAvailability(kind);
+    return Results.Ok(new
+    {
+        agent = name,
+        availability = new
+        {
+            available = availability.Available,
+            reason = availability.Reason,
+        },
+    });
+});
+
+app.MapGet("/admin/agents/availability", (AgentAvailabilityRegistry registry) =>
+{
+    return Results.Ok(new
+    {
+        agents = registry.Snapshot().Select(s => new
+        {
+            agent = s.Agent.Value,
+            excluded = s.Excluded,
+            reason = s.Reason,
+            consecutiveFastFails = s.ConsecutiveFastFails,
+            lastSmokePassedAt = s.LastSmokePassedAt,
+            lastSmokeFailedAt = s.LastSmokeFailedAt,
+            lastFastFailAt = s.LastFastFailAt,
         }),
     });
 });
@@ -2119,6 +2229,25 @@ namespace CodeyBox.Api
 
         /// <summary>Per-agent timeout for the startup probe in seconds. Default 10.</summary>
         public int StartupTimeoutSeconds { get; set; } = 10;
+
+        /// <summary>
+        /// Tuning for the availability registry (fast-fail circuit breaker +
+        /// periodic smoke probe sweep). Bound from <c>CodeyBox:Smoke:Availability</c>.
+        /// </summary>
+        public AvailabilityConfig Availability { get; set; } = new();
+    }
+
+    /// <summary>Config binding for the availability registry.</summary>
+    public sealed class AvailabilityConfig
+    {
+        /// <summary>Fast-fail threshold in seconds. Default 10.</summary>
+        public int FastFailThresholdSeconds { get; set; } = 10;
+
+        /// <summary>Consecutive sub-threshold non-zero exits before excluding. Default 3.</summary>
+        public int MaxConsecutiveFastFails { get; set; } = 3;
+
+        /// <summary>Background sweep interval in seconds. Default 300 (5 min); set 0 to disable.</summary>
+        public int PeriodicSweepIntervalSeconds { get; set; } = 300;
     }
 
     /// <summary>Config binding for a single agent class (see CodeyBox:AgentClasses).</summary>

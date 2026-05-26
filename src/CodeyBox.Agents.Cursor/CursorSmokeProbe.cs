@@ -25,6 +25,15 @@ namespace CodeyBox.Agents.Cursor;
 /// same way it would a smoke-probe auth failure. Per the operator's stated
 /// preference (<c>feedback-vendor-api-drift</c>), this reactive surface is
 /// preferred over speculative HTTP coverage.</para>
+///
+/// <para>This probe deliberately does NOT verify that the <c>agent</c> binary
+/// is present in the sandbox image — see the comment above re. multipass
+/// cold-start cost. The missing-binary case (the cb-216a2230 incident) is
+/// caught by the <b>fast-fail circuit breaker</b> in <c>AgentAvailabilityRegistry</c>:
+/// runs that exit non-zero in under <c>FastFailThresholdSeconds</c> for
+/// <c>MaxConsecutiveFastFails</c> consecutive attempts exclude the agent from
+/// routing until a smoke probe passes or an operator calls
+/// <c>/admin/agent/cursor/reset</c>.</para>
 /// </summary>
 public sealed class CursorSmokeProbe : IAgentSmokeProbe
 {

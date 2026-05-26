@@ -61,6 +61,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly QuotaRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
+    private readonly AgentAvailabilityRegistry? _availability;
     // Last-resort pause for quota-shaped terminal failures when neither the
     // agent output nor quota probes expose a reset window.
     internal static readonly TimeSpan DefaultQuotaFailurePause = TimeSpan.FromMinutes(5);
@@ -146,7 +147,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IQuotaFailureClassifier? quotaClassifier = null,
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         ITaskQueue? taskQueue = null,
-        OrchestratorOptions? orchestratorOptions = null)
+        OrchestratorOptions? orchestratorOptions = null,
+        AgentAvailabilityRegistry? availability = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -200,6 +202,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _questionStore = questionStore;
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
+        _availability = availability;
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
     }
@@ -1531,6 +1534,29 @@ public sealed class PipelineRunner : IPipelineRunner
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt);
         agentSw.Stop();
+        // Feed the availability registry so the fast-fail circuit breaker can
+        // exclude an agent that exits non-zero in under FastFailThresholdSeconds
+        // for MaxConsecutiveFastFails attempts in a row. Captures the exit-127
+        // missing-binary cascade scenario explicitly — see
+        // docs/agent-availability.md.
+        if (_availability is { } regOnFinish)
+        {
+            var transition = regOnFinish.RecordRunOutcome(runner.Kind, agentResult.Success, agentSw.Elapsed);
+            if (!transition.PreviouslyExcluded && transition.NowExcluded)
+            {
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.smoke_failed",
+                    WorkItem = item,
+                    Project = project,
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = runner.Kind.Value,
+                        Reason = transition.Reason,
+                    },
+                }, CancellationToken.None);
+            }
+        }
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed,
             stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
         // Always log a truncated tail of agent output, regardless of
@@ -3356,6 +3382,24 @@ public sealed class PipelineRunner : IPipelineRunner
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt);
         mergeSw.Stop();
+        if (_availability is { } regOnMergeFinish)
+        {
+            var transition = regOnMergeFinish.RecordRunOutcome(runner.Kind, agentResult.Success, mergeSw.Elapsed);
+            if (!transition.PreviouslyExcluded && transition.NowExcluded)
+            {
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.smoke_failed",
+                    WorkItem = item,
+                    Project = project,
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = runner.Kind.Value,
+                        Reason = transition.Reason,
+                    },
+                }, CancellationToken.None);
+            }
+        }
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
             stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
         LogAgentOutput(_log, runner.Kind, agentResult);

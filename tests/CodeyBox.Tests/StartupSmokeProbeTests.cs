@@ -20,14 +20,16 @@ public sealed class StartupSmokeProbeTests
         CapturingWebhookDispatcher webhooks,
         ICredentialProvider? credentials = null,
         bool enabled = true,
-        int timeoutSeconds = 5)
+        int timeoutSeconds = 5,
+        AgentAvailabilityRegistry? availability = null)
     {
         return new StartupSmokeProbeService(
             credentials ?? new ConstantCredentialProvider(AnyClaudeCred),
             probes,
             webhooks,
             new SmokeOptions { Enabled = enabled, StartupTimeoutSeconds = timeoutSeconds },
-            NullLogger<StartupSmokeProbeService>.Instance);
+            NullLogger<StartupSmokeProbeService>.Instance,
+            availability);
     }
 
     // ── Failure events ────────────────────────────────────────────────────────
@@ -140,5 +142,43 @@ public sealed class StartupSmokeProbeTests
 
         Assert.Equal(0, probe.CallCount);
         Assert.Empty(webhooks.Events);
+    }
+
+    // ── Availability registry integration ─────────────────────────────────────
+
+    [Fact]
+    public async Task FailingProbe_MarksAgentExcludedInRegistry()
+    {
+        var webhooks = new CapturingWebhookDispatcher();
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        var svc = Build(
+            [new FakeSmokeProbe(AgentKind.Claude, shouldPass: false)],
+            webhooks,
+            availability: registry);
+
+        await svc.StartAsync(CancellationToken.None);
+        await svc.StartupTask;
+
+        var av = registry.GetAvailability(AgentKind.Claude);
+        Assert.False(av.Available);
+        Assert.Contains("auth", av.Reason);
+    }
+
+    [Fact]
+    public async Task PassingProbe_LeavesAgentAvailableInRegistry()
+    {
+        var webhooks = new CapturingWebhookDispatcher();
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        var svc = Build(
+            [new FakeSmokeProbe(AgentKind.Claude, shouldPass: true)],
+            webhooks,
+            availability: registry);
+
+        await svc.StartAsync(CancellationToken.None);
+        await svc.StartupTask;
+
+        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
     }
 }
