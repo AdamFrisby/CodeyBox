@@ -477,36 +477,43 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             // -------- Phase 2: Merge (agent-driven) --------
+            // The merge phase is wrapped in a reusable async helper so the
+            // upstream-push phase can re-invoke it on a 405 auto-merge race
+            // against upstream main motion without duplicating the
+            // PhaseCancellation + quota-fallback + stuck-probe wiring.
+            async Task<(string MergeSha, string? AgentStdout)> RunMergePhase(CancellationToken phaseCt)
+            {
+                using var mergePhase = new PhaseCancellation("merge", phaseCt, _opts.TimeProvider);
+                mergePhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.MergeTimeout));
+                mergePhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+                try
+                {
+                    return await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
+                        async (runner, trialItem, attemptCt) =>
+                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergePhase, phaseCt, mergeCt =>
+                                RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
+                                    networkProfile: project.NetworkProfiles.Merge,
+                                    project: project,
+                                    mergeCt,
+                                    hostShutdownToken),
+                                workToken: attemptCt),
+                        phaseCt,
+                        phaseCancellation: mergePhase,
+                        attemptTimeout: item.MergeTimeout);
+                }
+                catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+                {
+                    throw mergePhase.Wrap(oce);
+                }
+            }
+
             string? mergeSha = null;
             string? agentStdout = null;
             if (!skipMerge)
             {
                 await PublishMergeStartedAsync(item, project, baseBranch, workBranch, ct);
                 await Transition(item, WorkItemState.Merging, ct, project);
-                using (var mergePhase = new PhaseCancellation("merge", ct, _opts.TimeProvider))
-                {
-                    mergePhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.MergeTimeout));
-                    mergePhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
-                    try
-                    {
-                        (mergeSha, agentStdout) = await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
-                            async (runner, trialItem, attemptCt) =>
-                                await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergePhase, ct, phaseCt =>
-                                    RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                        networkProfile: project.NetworkProfiles.Merge,
-                                        project: project,
-                                        phaseCt,
-                                        hostShutdownToken),
-                                    workToken: attemptCt),
-                            ct,
-                            phaseCancellation: mergePhase,
-                            attemptTimeout: item.MergeTimeout);
-                    }
-                    catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
-                    {
-                        throw mergePhase.Wrap(oce);
-                    }
-                }
+                (mergeSha, agentStdout) = await RunMergePhase(ct);
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
                 await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
                 await Transition(item, WorkItemState.Merged, ct, project);
@@ -517,7 +524,10 @@ public sealed class PipelineRunner : IPipelineRunner
             var upstream = _upstreamFactory.Create(project);
             if (item.PushUpstream && project.Upstream.Kind != "noop")
             {
-                await RunUpstreamPushPhaseAsync(item, project, upstream, repoId, baseBranch, workBranch, mergeSha, agentStdout, ct, hostShutdownToken);
+                await RunUpstreamPushPhaseAsync(
+                    item, project, upstream, repoId, baseBranch, workBranch, mergeSha, agentStdout,
+                    reRunMergePhase: RunMergePhase,
+                    ct, hostShutdownToken);
             }
             else
             {
@@ -4446,6 +4456,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string workBranch,
         string? mergeSha,
         string? agentStdout,
+        Func<CancellationToken, Task<(string MergeSha, string? AgentStdout)>>? reRunMergePhase,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
@@ -4516,8 +4527,27 @@ public sealed class PipelineRunner : IPipelineRunner
             // after a successful CompleteAsync, the loop would re-invoke the remote
             // API call, creating duplicate PRs or merge attempts.
             UpstreamCompletionOutcome? completed = null;
+            // Set when the most recent CompleteAsync attempt returned with the
+            // AutoMergeRaced flag and we never escaped before hitting the cap.
+            // The post-loop block uses this to emit the "main is being hammered"
+            // diagnostic distinct from the normal infrastructure-failure path.
+            var lastIterationRaced = false;
+            // Set when race recovery already transitioned the item to a
+            // terminal state with its own park message ("base didn't move",
+            // could not advance work branch, etc.). Suppresses the post-loop
+            // "main is being hammered" message which would otherwise clobber
+            // the more specific diagnostic.
+            var raceRecoveryParked = false;
+            // Each iteration may either retry transient failures OR recover from
+            // an auto-merge race (405 on PUT /pulls/N/merge). The shared cap
+            // prevents pathological loops since each race-recovery iteration
+            // costs a full LLM merge phase invocation.
             for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
             {
+                // Reset per-iteration so a race in iteration N does not leak
+                // into iteration N+1's post-loop attribution if the next
+                // iteration fails with a non-race exception.
+                lastIterationRaced = false;
                 var current = await _store.GetAsync(item.Id, ct) ?? item;
                 await _store.UpdateAsync(current with { UpstreamPushAttempts = attempt }, ct);
 
@@ -4537,10 +4567,66 @@ public sealed class PipelineRunner : IPipelineRunner
                         _log.LogInformation("Upstream PR auto-merged: {Sha}", outcome.MergedSha);
                     if (outcome.Notes is not null)
                         _log.LogInformation("Upstream notes: {Notes}", outcome.Notes);
+
+                    lastIterationRaced = outcome.AutoMergeRaced;
+                    if (outcome.AutoMergeRaced && reRunMergePhase is not null)
+                    {
+                        // GitHub said the PR is unmergeable. Two plausible causes:
+                        //   1) Upstream main moved (a race we can fix by re-running
+                        //      the LLM merger against the fresh base).
+                        //   2) Branch protection / unrelated unmergeability (re-running
+                        //      won't help; base sha will be unchanged).
+                        // Distinguish via the base sha before/after refetch.
+                        var raceRecovery = await TryRecoverFromAutoMergeRaceAsync(
+                            item, project, upstream, repoId, baseBranch, workBranch,
+                            outcome.PullRequestNumber,
+                            reRunMergePhase,
+                            attempt,
+                            ct);
+                        if (raceRecovery.ParkReason is not null)
+                        {
+                            _log.LogWarning(
+                                "Auto-merge race recovery declined to retry (attempt {Attempt}): {Reason}",
+                                attempt, raceRecovery.ParkReason);
+                            var failed = await _store.GetAsync(item.Id, ct) ?? item;
+                            var failedWithReason = failed.With(WorkItemState.MergeConflictResolutionFailed, raceRecovery.ParkReason);
+                            await _store.UpdateAsync(failedWithReason, ct);
+                            var revision = await BuildTerminalRevisionAsync(failedWithReason, ct);
+                            await _webhooks.PublishAsync(new WebhookEvent
+                            {
+                                Event = "work_item.merge_conflict_resolution_failed",
+                                WorkItem = failedWithReason,
+                                Project = project,
+                                PromptRevision = revision?.PromptRevision,
+                                RevisionAtCompletion = revision?.RevisionAtCompletion,
+                                RevisionMatches = revision?.RevisionMatches,
+                            }, ct);
+                            raceRecoveryParked = true;
+                            break;
+                        }
+
+                        // Race recovery succeeded — update local state and loop.
+                        mergeSha = raceRecovery.NewMergeSha;
+                        agentStdout = raceRecovery.NewAgentStdout;
+                        request = request with
+                        {
+                            MergeSha = mergeSha,
+                            AgentStdout = agentStdout,
+                            ExistingPullRequestNumber = outcome.PullRequestNumber,
+                        };
+                        continue;
+                    }
+
                     completed = outcome;
                     break;
                 }
-                catch (Exception ex)
+                // MergeConflictResolutionFailedException intentionally passes
+                // through this catch — it identifies an LLM-merger failure and
+                // must reach RunAsync's MergeConflictResolutionFailedException
+                // handler to be attributed correctly. If we caught it here we
+                // would relabel it as "infrastructure" and (worse) on success
+                // backoffs misclassify the next iteration's terminal state.
+                catch (Exception ex) when (ex is not MergeConflictResolutionFailedException)
                 {
                     if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                     {
@@ -4555,6 +4641,40 @@ public sealed class PipelineRunner : IPipelineRunner
                     else
                         await TransitionFailed(item, $"upstream complete failed after {attempt} attempts: {ex.Message}", ct, project, failureKind: "infrastructure");
                 }
+            }
+
+            // If the loop exited at the cap with the most recent outcome still
+            // flagged as AutoMergeRaced (i.e., we never escaped the race), park
+            // the item with the new distinct "main is being hammered" message.
+            // Distinguish from MergeConflictResolutionFailed-from-LLM-failure
+            // and from the generic infrastructure-failure path so an operator
+            // inspecting lastError can tell "LLM gave up" from "main was a
+            // moving target".
+            //
+            // raceRecoveryParked guards against clobbering a more specific
+            // park message (e.g., "base didn't move") that recovery already
+            // wrote — we should not overwrite that with the generic cap
+            // diagnostic.
+            if (completed is null && lastIterationRaced && reRunMergePhase is not null && !raceRecoveryParked)
+            {
+                var lastAttemptItem = await _store.GetAsync(item.Id, ct) ?? item;
+                const string raceExhaustionMessage =
+                    "GitHub merge failed repeatedly after re-running LLM merger; baseBranch likely being mutated by another writer. Resolve manually.";
+                _log.LogWarning(
+                    "Work item {Id} hit auto-merge race cap ({Cap}) without resolving",
+                    item.Id, _opts.UpstreamPushMaxAttempts);
+                var failed = lastAttemptItem.With(WorkItemState.MergeConflictResolutionFailed, raceExhaustionMessage);
+                await _store.UpdateAsync(failed, ct);
+                var revision = await BuildTerminalRevisionAsync(failed, ct);
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.merge_conflict_resolution_failed",
+                    WorkItem = failed,
+                    Project = project,
+                    PromptRevision = revision?.PromptRevision,
+                    RevisionAtCompletion = revision?.RevisionAtCompletion,
+                    RevisionMatches = revision?.RevisionMatches,
+                }, ct);
             }
 
             if (completed is not null)
@@ -4588,6 +4708,168 @@ public sealed class PipelineRunner : IPipelineRunner
             // routed to the new attributed catches in RunAsync.
             throw upstreamPhase.Wrap(oce);
         }
+    }
+
+    /// <summary>
+    /// Carrier for the auto-merge race recovery outcome. When
+    /// <see cref="ParkReason"/> is non-null the caller transitions the item to
+    /// MergeConflictResolutionFailed with that message and stops retrying; the
+    /// "base didn't move" case is the canonical example (re-running the LLM
+    /// merger cannot fix a 405 that isn't actually a race). Otherwise the
+    /// caller updates its local merge-sha and stdout fields and loops to the
+    /// next CompleteAsync attempt.
+    /// </summary>
+    private readonly record struct AutoMergeRaceRecovery(
+        string? ParkReason,
+        string NewMergeSha,
+        string? NewAgentStdout);
+
+    private async Task<AutoMergeRaceRecovery> TryRecoverFromAutoMergeRaceAsync(
+        WorkItem item,
+        Project project,
+        IUpstreamRemote upstream,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        int? existingPrNumber,
+        Func<CancellationToken, Task<(string MergeSha, string? AgentStdout)>> reRunMergePhase,
+        int attempt,
+        CancellationToken ct)
+    {
+        if (existingPrNumber is null)
+        {
+            // CompleteAsync set AutoMergeRaced=true but produced no PR number;
+            // we have nothing to retry against. Treat as a hard failure.
+            return new AutoMergeRaceRecovery(
+                ParkReason: "auto-merge raced but no PR number returned; cannot retry merge",
+                NewMergeSha: string.Empty,
+                NewAgentStdout: null);
+        }
+
+        // Step 1: capture the upstream base sha at merge time. We can't read
+        // the current local base ref because the local merge phase already
+        // advanced it to mergeSha (the merge commit). The merge commit's first
+        // parent IS the upstream base sha we just merged against — so we
+        // compare that against the post-fetch upstream tip to decide whether
+        // upstream actually moved (real race) or didn't (likely branch
+        // protection / a different conflict we can't fix by re-merging).
+        string? preMergeBaseSha = null;
+        var currentItem = await _store.GetAsync(item.Id, ct) ?? item;
+        var localMergeSha = currentItem.MergeSha;
+        if (!string.IsNullOrEmpty(localMergeSha))
+        {
+            try
+            {
+                preMergeBaseSha = await _gitHost.ResolveCommitAsync(repoId, $"{localMergeSha}^1", ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogDebug(ex,
+                    "Auto-merge race recovery: could not read first parent of merge sha {Sha}; falling back to local base ref",
+                    localMergeSha);
+            }
+        }
+        // Fallback: a fast-forward merge (no merge commit) leaves localMergeSha
+        // with a single-parent history — `^1` still resolves but to an
+        // arbitrary ancestor of work. Use the current local base ref as a
+        // best-effort sentinel; the next branch decides whether to proceed.
+        if (preMergeBaseSha is null)
+        {
+            try
+            {
+                preMergeBaseSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogWarning(ex, "Auto-merge race recovery: could not resolve local base sha before refetch");
+                return new AutoMergeRaceRecovery(
+                    ParkReason: $"could not inspect local base branch '{baseBranch}' before refetch: {ex.Message}",
+                    NewMergeSha: string.Empty,
+                    NewAgentStdout: null);
+            }
+        }
+
+        // Step 2: refetch base from upstream.
+        string? postFetchBaseSha;
+        try
+        {
+            postFetchBaseSha = await upstream.FetchBaseBranchAsync(repoId, baseBranch, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Auto-merge race recovery: refetch of upstream base failed");
+            return new AutoMergeRaceRecovery(
+                ParkReason: $"could not refetch upstream base '{baseBranch}': {ex.Message}",
+                NewMergeSha: string.Empty,
+                NewAgentStdout: null);
+        }
+
+        if (postFetchBaseSha is null)
+        {
+            return new AutoMergeRaceRecovery(
+                ParkReason: $"upstream does not advertise base branch '{baseBranch}' for race recovery",
+                NewMergeSha: string.Empty,
+                NewAgentStdout: null);
+        }
+
+        // Step 3: if upstream base sha didn't change, this isn't a race —
+        // re-running the LLM merger won't help. Park with a distinct message
+        // so the operator knows to look at branch protection or other
+        // unmergeability causes rather than chasing a phantom main-motion bug.
+        if (string.Equals(preMergeBaseSha, postFetchBaseSha, StringComparison.Ordinal))
+        {
+            return new AutoMergeRaceRecovery(
+                ParkReason: "GitHub said unmergeable but base didn't move, likely a different conflict — manual inspection needed",
+                NewMergeSha: string.Empty,
+                NewAgentStdout: null);
+        }
+
+        _log.LogInformation(
+            "Auto-merge race detected (attempt {Attempt}): upstream base '{Branch}' moved {Old} → {New}; re-running merge phase",
+            attempt, baseBranch, preMergeBaseSha, postFetchBaseSha);
+
+        // Step 4: re-run the merge phase against the freshly-fetched base. The
+        // merge phase reads local baseBranch via ResolveCommitAsync, which now
+        // reflects the upstream tip after step 2. The LLM merger produces a new
+        // merge commit M with parents (postFetchBaseSha, workBranch_tip).
+        string newMergeSha;
+        string? newAgentStdout;
+        try
+        {
+            (newMergeSha, newAgentStdout) = await reRunMergePhase(ct);
+        }
+        catch (MergeConflictResolutionFailedException ex)
+        {
+            // The LLM merger itself failed against the new base — distinct
+            // failure path from the race (existing semantics handle this).
+            // Bubble up so the standard MergeConflictResolutionFailed catch in
+            // RunAsync attributes it correctly.
+            throw new MergeConflictResolutionFailedException(
+                $"re-run of merge phase against refreshed base '{baseBranch}' (auto-merge race recovery) failed: {ex.Message}", ex);
+        }
+
+        // Step 5: advance local workBranch to the new merge commit. The push
+        // step inside CompleteAsync will then publish this tip to upstream as
+        // a fast-forward (M has the prior workBranch tip as a parent, so the
+        // upstream workBranch fast-forwards without a force).
+        try
+        {
+            await _gitHost.SetBranchToCommitAsync(repoId, workBranch, newMergeSha, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Auto-merge race recovery: could not advance local work branch to new merge sha");
+            return new AutoMergeRaceRecovery(
+                ParkReason: $"could not advance local work branch '{workBranch}' to new merge sha {newMergeSha}: {ex.Message}",
+                NewMergeSha: string.Empty,
+                NewAgentStdout: null);
+        }
+
+        await _store.UpdateAsync((await _store.GetAsync(item.Id, ct) ?? item) with { MergeSha = newMergeSha }, ct);
+        return new AutoMergeRaceRecovery(
+            ParkReason: null,
+            NewMergeSha: newMergeSha,
+            NewAgentStdout: newAgentStdout);
     }
 
     private static bool TryGetUpstreamReconcileConflict(Exception ex, out UpstreamPushReconcileConflictException conflict)

@@ -152,70 +152,112 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             }
         }
 
-        // Step 2: build PR description (LLM or static fallback)
-        var description = await BuildDescriptionAsync(request, ct);
-
-        // Step 3: open PR
-        var prTitle = BuildPrTitle(request.Title, request.WorkBranch);
-        GitHubPrResponse? pr;
-        await using (var createPrScope = await TimingScope.BeginAsync(
-            _timings, request.WorkItemId, "upstream_push", "upstream.api_create_pr",
-            log: _log))
+        // Step 2 + 3: build PR description and open PR (or reuse a PR from a
+        // prior race-recovery attempt). When the orchestrator's auto-merge race
+        // recovery re-runs CompleteAsync, it passes the PR number from the
+        // first attempt so we skip create (which would 422) and go straight to
+        // the merge call.
+        int prNumber;
+        string? prHtmlUrl;
+        if (request.ExistingPullRequestNumber is { } existingPr)
         {
-            pr = await CreatePullRequestAsync(request, prTitle, description, ct);
+            prNumber = existingPr;
+            prHtmlUrl = $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{existingPr}";
         }
-
-        if (pr is null)
+        else
         {
-            // 422 — branch already has an open PR or the request was otherwise
-            // unprocessable; leave it open for a human to sort out.
-            return new UpstreamCompletionOutcome
+            var description = await BuildDescriptionAsync(request, ct);
+            var prTitle = BuildPrTitle(request.Title, request.WorkBranch);
+            GitHubPrResponse? pr;
+            await using (var createPrScope = await TimingScope.BeginAsync(
+                _timings, request.WorkItemId, "upstream_push", "upstream.api_create_pr",
+                log: _log))
             {
-                BranchPushed = true,
-                Notes = "PR creation skipped (422 — branch may already have an open PR)",
-            };
+                pr = await CreatePullRequestAsync(request, prTitle, description, ct);
+            }
+
+            if (pr is null)
+            {
+                // 422 — branch already has an open PR or the request was otherwise
+                // unprocessable; leave it open for a human to sort out.
+                return new UpstreamCompletionOutcome
+                {
+                    BranchPushed = true,
+                    Notes = "PR creation skipped (422 — branch may already have an open PR)",
+                };
+            }
+
+            _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
+            AuditLog.UpstreamPrOpened(pr.Number, pr.HtmlUrl, request.WorkBranch, request.BaseBranch);
+
+            if (pr.HtmlUrl is null)
+                _log.LogWarning("GitHub PR response did not include html_url; pull_request_opened webhook event will not fire");
+
+            prNumber = pr.Number;
+            prHtmlUrl = pr.HtmlUrl;
         }
-
-        _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
-        AuditLog.UpstreamPrOpened(pr.Number, pr.HtmlUrl, request.WorkBranch, request.BaseBranch);
-
-        if (pr.HtmlUrl is null)
-            _log.LogWarning("GitHub PR response did not include html_url; pull_request_opened webhook event will not fire");
 
         if (!_opts.AutoMerge)
         {
             return new UpstreamCompletionOutcome
             {
                 BranchPushed = true,
-                PullRequestUrl = pr.HtmlUrl,
-                PullRequestNumber = pr.Number,
+                PullRequestUrl = prHtmlUrl,
+                PullRequestNumber = prNumber,
             };
         }
 
         // Step 4: auto-merge
         string? mergedSha;
         string? mergeNotes;
+        bool autoMergeRaced;
         await using (var mergeScope = await TimingScope.BeginAsync(
             _timings, request.WorkItemId, "upstream_push", "upstream.api_merge_pr",
             log: _log))
         {
-            (mergedSha, mergeNotes) = await MergePullRequestAsync(pr.Number, ct);
+            (mergedSha, mergeNotes, autoMergeRaced) = await MergePullRequestAsync(prNumber, ct);
         }
 
         if (mergedSha is not null)
         {
-            _log.LogInformation("GitHub PR #{N} auto-merged: {Sha}", pr.Number, mergedSha);
-            AuditLog.UpstreamPrMerged(pr.Number, mergedSha);
+            _log.LogInformation("GitHub PR #{N} auto-merged: {Sha}", prNumber, mergedSha);
+            AuditLog.UpstreamPrMerged(prNumber, mergedSha);
         }
 
         return new UpstreamCompletionOutcome
         {
             BranchPushed = true,
-            PullRequestUrl = pr.HtmlUrl,
-            PullRequestNumber = pr.Number,
+            PullRequestUrl = prHtmlUrl,
+            PullRequestNumber = prNumber,
             MergedSha = mergedSha,
             Notes = mergeNotes,
+            AutoMergeRaced = autoMergeRaced,
         };
+    }
+
+    /// <summary>
+    /// Fetches the current head of <paramref name="baseBranch"/> from this
+    /// upstream GitHub repo into the host bare repo, overwriting the local
+    /// ref. Returns the new sha. The orchestrator calls this on auto-merge
+    /// 405 (race against upstream base motion) to decide whether the race
+    /// is real (base sha changed → re-run merge phase) or a different kind
+    /// of unmergeability (base unchanged → branch protection etc.).
+    /// </summary>
+    public async Task<string?> FetchBaseBranchAsync(string repositoryId, string baseBranch, CancellationToken ct = default)
+    {
+        // Reject control/whitespace in the branch name — same defence as the
+        // CompleteAsync branch-name guard. A clean string is required because
+        // we'll embed it in a refspec passed to git via Process argv.
+        static bool HasInvalidChars(string s) =>
+            s.Any(c => char.IsWhiteSpace(c) || (char.IsControl(c) && c != '\t'));
+        if (string.IsNullOrEmpty(baseBranch) || HasInvalidChars(baseBranch))
+            throw new ArgumentException(
+                $"baseBranch contains invalid characters (whitespace/control chars not allowed): '{SanitizeForLog(baseBranch)}'",
+                nameof(baseBranch));
+
+        var repoUrl = RepoUrl();
+        using var askpass = GitCredentialHelper.CreateAskPassFor(_opts.Token, "x-access-token");
+        return await _gitHost.FetchUpstreamBranchAsync(repositoryId, repoUrl, baseBranch, askpass.Environment, ct);
     }
 
     /// <summary>
@@ -387,7 +429,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 $"GitHub POST /pulls returned success but response body could not be deserialised (head={request.WorkBranch})");
     }
 
-    private async Task<(string? Sha, string? Notes)> MergePullRequestAsync(int prNumber, CancellationToken ct)
+    private async Task<(string? Sha, string? Notes, bool AutoMergeRaced)> MergePullRequestAsync(int prNumber, CancellationToken ct)
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}/merge";
         var body = new GitHubMergeRequest(_opts.MergeMethod);
@@ -404,12 +446,19 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         if (response.StatusCode == HttpStatusCode.MethodNotAllowed)
         {
-            const string note = "Auto-merge blocked (405 — branch protection or PR not mergeable); PR left open";
+            // 405 here is conventionally "PR not mergeable" — usually a race
+            // against upstream main motion (someone pushed to base between our
+            // local merge phase and this PUT). The orchestrator catches the
+            // AutoMergeRaced flag, re-fetches base, re-runs the merge phase
+            // against the new tip, and retries this PUT. Branch protection can
+            // also surface as 405; in that case re-fetching shows base unchanged
+            // and the orchestrator parks the item rather than spinning.
+            const string note = "GitHub PUT /pulls/N/merge returned 405 (PR not mergeable — likely a race against upstream base; orchestrator will re-fetch base and re-run merge phase)";
             _log.LogWarning(
-                "GitHub PUT /pulls/{N}/merge returned 405 (PR not mergeable, e.g. branch protection); leaving PR open",
+                "GitHub PUT /pulls/{N}/merge returned 405 (PR not mergeable); orchestrator will re-fetch base and re-run merge phase",
                 prNumber);
             AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", 405, _opts.Owner, _opts.Repository);
-            return (null, note);
+            return (null, note, true);
         }
 
         if (!response.IsSuccessStatusCode)
@@ -417,7 +466,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         response.EnsureSuccessStatusCode();
         var result = await response.Content.ReadFromJsonAsync<GitHubMergeResponse>(ct);
-        return (result?.Sha, null);
+        return (result?.Sha, null, false);
     }
 
     private HttpRequestMessage BuildRequest(HttpMethod method, string url)

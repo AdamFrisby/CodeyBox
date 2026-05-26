@@ -46,6 +46,22 @@ public interface IUpstreamRemote
     /// </summary>
     Task<string?> CreateTagAndReleaseAsync(string tagName, string sha, string? releaseNotes, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Fetches the current head of <paramref name="baseBranch"/> from the
+    /// upstream forge into the host bare repo, overwriting the local ref, and
+    /// returns the new commit sha. Used by the auto-merge race recovery flow
+    /// in the orchestrator when GitHub returns 405 on the merge call: we
+    /// refetch the upstream main to detect whether the race is real (base
+    /// moved → re-run merge phase) or a different kind of unmergeability
+    /// (base unchanged → branch protection or some other issue we can't fix
+    /// by retrying).
+    ///
+    /// Default returns <c>null</c> for upstream kinds that don't model a
+    /// remote base branch (noop, git-generic without a configured base).
+    /// </summary>
+    Task<string?> FetchBaseBranchAsync(string repositoryId, string baseBranch, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
 }
 
 public sealed record UpstreamPushResult(bool Success, string? Error);
@@ -83,6 +99,15 @@ public sealed record UpstreamCompletionRequest
     public bool AutoMerge { get; init; }
     /// <summary>Merge strategy: "merge", "squash", or "rebase". Matches <c>Upstream.MergeMethod</c>.</summary>
     public string MergeMethod { get; init; } = "merge";
+
+    /// <summary>
+    /// PR number already opened on the forge from a prior CompleteAsync attempt.
+    /// When set, the implementation skips PR creation and proceeds directly to
+    /// the merge step using this PR number. Used by the orchestrator's
+    /// auto-merge race recovery (re-fetch base + re-run merge phase + retry
+    /// merge against the still-open PR).
+    /// </summary>
+    public int? ExistingPullRequestNumber { get; init; }
 }
 
 /// <summary>Result of <see cref="IUpstreamRemote.CompleteAsync"/>.</summary>
@@ -100,4 +125,11 @@ public sealed record UpstreamCompletionOutcome
     public string? MergedSha { get; init; }
     /// <summary>Diagnostic notes, populated on partial or graceful-degraded outcomes.</summary>
     public string? Notes { get; init; }
+    /// <summary>
+    /// True when auto-merge requested but the forge rejected the merge call
+    /// with a "PR not mergeable" race (GitHub HTTP 405 on PUT /pulls/N/merge).
+    /// The orchestrator treats this as a retryable race against upstream base
+    /// motion: re-fetch base, re-run the merge phase, and retry the merge.
+    /// </summary>
+    public bool AutoMergeRaced { get; init; }
 }
