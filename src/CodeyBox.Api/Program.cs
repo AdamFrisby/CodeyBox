@@ -1479,6 +1479,9 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
     sp.GetRequiredService<IAuditReportStore>(),
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog.RetainedDays,
     sp.GetRequiredService<ILogger<AuditReportRetentionService>>()));
+builder.Services.AddHostedService(sp => new IdempotencyKeyRetentionService(
+    sp.GetRequiredService<IIdempotencyStore>(),
+    sp.GetRequiredService<ILogger<IdempotencyKeyRetentionService>>()));
 builder.Services.AddHostedService(sp => new AgentStreamRetentionService(
     sp.GetRequiredService<IAgentStreamStore>(),
     sp.GetRequiredService<ILogger<AgentStreamRetentionService>>()));

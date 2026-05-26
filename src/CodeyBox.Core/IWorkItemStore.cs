@@ -49,13 +49,17 @@ public interface IWorkItemStore
 {
     Task CreateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
-    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>.
-    /// Use <see cref="UpdatePriorityAsync"/> for priority changes so worker writes
-    /// from stale snapshots cannot revert a concurrent PATCH /priority update.
+    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
+    /// <see cref="WorkItem.Prompt"/>, and <see cref="WorkItem.PromptRevision"/>.
+    /// Use <see cref="UpdatePriorityAsync"/> for priority changes and
+    /// <see cref="TryReplacePromptAsync"/> for prompt changes so worker writes
+    /// from stale in-memory snapshots cannot revert a concurrent PATCH /priority
+    /// or PUT /workitems/{id}/prompt update.
     /// </summary>
     Task UpdateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
-    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>
+    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
+    /// <see cref="WorkItem.Prompt"/>, and <see cref="WorkItem.PromptRevision"/>
     /// only when the persisted state still matches <paramref name="onlyIfState"/>.
     /// Returns true if the row was updated.
     /// </summary>

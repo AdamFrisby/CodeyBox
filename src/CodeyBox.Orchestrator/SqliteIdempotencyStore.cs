@@ -85,10 +85,28 @@ public sealed class SqliteIdempotencyStore : IIdempotencyStore, IDisposable
         try
         {
             using var cmd = _conn.CreateCommand();
+            // Overwrite the row when the existing entry has already expired so
+            // a replay after the 24-hour TTL re-caches a fresh response. Live
+            // rows (expires_at > excluded.expires_at AT INSERT-TIME implies the
+            // existing row was inserted later AND has not expired) are left
+            // untouched — the first writer wins for a given key within the TTL
+            // window, which preserves the spec's "same key + same body returns
+            // the cached response" guarantee.
+            //
+            // The WHERE clause compares the EXISTING row's expires_at against
+            // the new row's expires_at: when the existing row's TTL has elapsed
+            // (i.e. it predates the new insert by >= TTL) we overwrite; when it
+            // is still live, DO UPDATE is a no-op and the existing row stays.
             cmd.CommandText = """
                 INSERT INTO idempotency_keys (key, body_hash, response_status, response_body, response_content_type, expires_at)
                 VALUES ($key, $hash, $status, $body, $ct, $exp)
-                ON CONFLICT(key) DO NOTHING;
+                ON CONFLICT(key) DO UPDATE SET
+                    body_hash             = excluded.body_hash,
+                    response_status       = excluded.response_status,
+                    response_body         = excluded.response_body,
+                    response_content_type = excluded.response_content_type,
+                    expires_at            = excluded.expires_at
+                WHERE idempotency_keys.expires_at <= $now;
                 """;
             cmd.Parameters.AddWithValue("$key", entry.Key);
             cmd.Parameters.AddWithValue("$hash", entry.BodyHash);
@@ -96,6 +114,7 @@ public sealed class SqliteIdempotencyStore : IIdempotencyStore, IDisposable
             cmd.Parameters.AddWithValue("$body", entry.ResponseBody);
             cmd.Parameters.AddWithValue("$ct", entry.ResponseContentType);
             cmd.Parameters.AddWithValue("$exp", entry.ExpiresAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
         }
         finally

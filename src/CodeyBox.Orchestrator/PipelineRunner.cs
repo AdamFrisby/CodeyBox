@@ -707,12 +707,12 @@ public sealed class PipelineRunner : IPipelineRunner
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
 
     /// <summary>
-    /// Env-var name passed into the sandbox carrying the prompt revision that
-    /// was active when this iteration was dispatched. Agents include the same
-    /// value as the <c>CodeyBox-Prompt-Revision: N</c> commit trailer so the
-    /// audit suite can detect "agent committed against an older prompt".
+    /// Alias for <see cref="CodeyBoxTrailers.PromptRevisionEnvVar"/>. Kept as an
+    /// internal const so existing call sites in this assembly keep the short
+    /// name; the canonical definition is shared via Core so audit modules and
+    /// rework-prompt templates reference the same symbol.
     /// </summary>
-    internal const string PromptRevisionEnvVar = "CODEYBOX_PROMPT_REVISION";
+    internal const string PromptRevisionEnvVar = CodeyBoxTrailers.PromptRevisionEnvVar;
 
     /// <summary>
     /// Reads the prompt revision snapshotted into <c>work_item_iterations</c> at
@@ -1326,7 +1326,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyList<IAuditor>? auditors = null)
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append($"Every commit message MUST end with the following trailers, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.PromptRevisionTrailerKey}: $CODEYBOX_PROMPT_REVISION\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nThe `{CodeyBoxTrailers.PromptRevisionTrailerKey}` value MUST be the literal integer from the `CODEYBOX_PROMPT_REVISION` environment variable — the orchestrator uses it to detect when an agent finished work against an older prompt. Copy the number verbatim; do not include the variable syntax in the commit.\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
+        sb.Append($"Every commit message MUST end with the following trailers, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.PromptRevisionTrailerKey}: ${CodeyBoxTrailers.PromptRevisionEnvVar}\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nThe `{CodeyBoxTrailers.PromptRevisionTrailerKey}` value MUST be the literal integer from the `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable — the orchestrator uses it to detect when an agent finished work against an older prompt. Copy the number verbatim; do not include the variable syntax in the commit.\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
 
         // Pre-flight self-check: surface the project's mechanical (shell-kind)
         // auditors so the agent runs them before declaring done. Language-agnostic
@@ -2144,7 +2144,7 @@ public sealed class PipelineRunner : IPipelineRunner
             string? reworkStdout;
             try
             {
-                reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: iteration,
+                reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
                     async (workerRunner, trialItem, attemptCt) =>
                         await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
                             phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
@@ -2154,7 +2154,7 @@ public sealed class PipelineRunner : IPipelineRunner
                                 project: project,
                                 phaseCt,
                                 hostShutdownToken,
-                                iteration: iteration),
+                                iteration: reworkIterationNumber),
                             workToken: attemptCt),
                     ct,
                     phaseCancellation: reworkPhase,
@@ -5365,10 +5365,16 @@ public sealed class PipelineRunner : IPipelineRunner
         int? lastDispatched = iterations.Count == 0
             ? null
             : iterations.OrderByDescending(i => i.Iteration).First().PromptRevisionAtDispatch;
+        // RevisionMatches is null when no iteration was ever dispatched (e.g.
+        // the item failed during dependency resolution before any work began).
+        // Returning `false` here would tell a tracker like JobTrack that the
+        // agent finished against a stale prompt, prompting a spurious one-click
+        // re-run for an item that never actually ran. The contract is:
+        // null ↔ RevisionAtCompletion null.
         return new TerminalRevisionDetails(
             PromptRevision: item.PromptRevision,
             RevisionAtCompletion: lastDispatched,
-            RevisionMatches: lastDispatched is { } r && r == item.PromptRevision);
+            RevisionMatches: lastDispatched is { } r ? r == item.PromptRevision : null);
     }
 
     /// <summary>
@@ -6002,7 +6008,7 @@ public sealed record AgentFallbackDetails(
 internal sealed record TerminalRevisionDetails(
     int PromptRevision,
     int? RevisionAtCompletion,
-    bool RevisionMatches);
+    bool? RevisionMatches);
 
 internal sealed record AuditIterationDetails(
     int Iteration,

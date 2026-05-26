@@ -53,15 +53,47 @@ public sealed class PatchWorkItemTests : IDisposable
     [Fact]
     public async Task PatchPrompt_WhenQueued_Succeeds()
     {
+        // PATCH-prompt persistence is routed through TryReplacePromptAsync —
+        // the only write path that touches prompt + prompt_revision atomically.
+        // TryUpdateIfStateAsync deliberately omits both columns (see
+        // IWorkItemStore.UpdateAsync docstring) so a worker's stale in-memory
+        // snapshot cannot revert a concurrent PUT /workitems/{id}/prompt.
         var item = Sample(WorkItemState.Queued);
         await _store.CreateAsync(item);
 
-        var patched = item with { Prompt = "updated prompt", UpdatedAt = DateTimeOffset.UtcNow };
-        var written = await _store.TryUpdateIfStateAsync(patched, WorkItemState.Queued);
+        var result = await _store.TryReplacePromptAsync(item.Id, "updated prompt", DateTimeOffset.UtcNow);
+        Assert.Equal(PromptReplaceOutcome.Updated, result.Outcome);
+        Assert.Equal(item.PromptRevision + 1, result.NewRevision);
 
-        Assert.True(written);
         var read = await _store.GetAsync(item.Id);
         Assert.Equal("updated prompt", read!.Prompt);
+        Assert.Equal(item.PromptRevision + 1, read.PromptRevision);
+    }
+
+    [Fact]
+    public async Task TryUpdateIfStateAsync_DoesNotClobberPrompt_OnStaleSnapshot()
+    {
+        // Regression guard: the orchestrator routinely calls UpdateAsync /
+        // TryUpdateIfStateAsync with an in-memory snapshot of the work item to
+        // record state transitions. Earlier rows of that pipeline may carry an
+        // older PromptRevision than the row currently in SQLite (a PUT
+        // /workitems/{id}/prompt landed mid-flight). The full-row UPDATE must
+        // therefore exclude the prompt + prompt_revision columns; otherwise the
+        // mid-flight bump silently disappears and the next iteration dispatches
+        // against the wrong revision.
+        var item = Sample(WorkItemState.Queued);
+        await _store.CreateAsync(item);
+
+        await _store.TryReplacePromptAsync(item.Id, "fresh-prompt", DateTimeOffset.UtcNow);
+
+        var stale = item with { Title = "stale-update", UpdatedAt = DateTimeOffset.UtcNow };
+        var written = await _store.TryUpdateIfStateAsync(stale, WorkItemState.Queued);
+        Assert.True(written);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.Equal("stale-update", read!.Title);
+        Assert.Equal("fresh-prompt", read.Prompt);
+        Assert.Equal(item.PromptRevision + 1, read.PromptRevision);
     }
 
     [Fact]

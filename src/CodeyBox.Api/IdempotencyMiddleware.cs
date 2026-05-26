@@ -23,6 +23,17 @@ internal static class IdempotencyMiddleware
     public const int MaxKeyLength = 200;
 
     /// <summary>
+    /// Hard cap on cached response body size. Responses larger than this skip
+    /// the cache write entirely — the response still returns to the caller,
+    /// but a replay with the same key falls through to the downstream
+    /// endpoint. Prevents storage exhaustion: without this, a single key
+    /// could pin up to Kestrel's body-size limit (~30 MB) in the SQLite
+    /// state DB per entry, and an unauthenticated /webhooks/* caller could
+    /// fill the table at attacker-controlled cardinality.
+    /// </summary>
+    public const int MaxCachedResponseBytes = 256 * 1024;
+
+    /// <summary>
     /// TTL applied to every cached response. The spec calls out a 24-hour
     /// window; this is currently a single global value with no per-route
     /// override (a follow-up could add one if a real use case appears).
@@ -100,24 +111,36 @@ internal static class IdempotencyMiddleware
             }
 
             // Capture downstream response so we can persist it on success.
+            // The finally block is the single restore point for ctx.Response.Body
+            // so the invariant is: "the capture stream is in place from the line
+            // below until the finally executes."
             var originalBody = ctx.Response.Body;
             using var capture = new MemoryStream();
             ctx.Response.Body = capture;
             try
             {
                 await next();
-                ctx.Response.Body = originalBody;
                 capture.Position = 0;
                 var bytes = capture.ToArray();
 
-                // Cache 2xx/4xx (deterministic outcomes); skip 5xx which usually
-                // reflect transient state the client should be allowed to retry.
-                if (ctx.Response.StatusCode < 500)
+                // Cache only 2xx outcomes. 4xx replies often reflect transient
+                // state (a 404 because the resource has not been created YET, a
+                // 409 because the item is in a state that cannot accept the
+                // mutation right now) and caching them for 24 hours would lock
+                // a retry into the failure even after the underlying state
+                // changes. 5xx are always skipped — the client should be allowed
+                // to retry against a recovered backend.
+                //
+                // Bytes.Length cap prevents a single oversized response from
+                // dominating storage (see <see cref="MaxCachedResponseBytes"/>).
+                var status = ctx.Response.StatusCode;
+                var shouldCache = status >= 200 && status < 300;
+                if (shouldCache && bytes.Length <= MaxCachedResponseBytes)
                 {
                     var entry = new IdempotencyEntry(
                         Key: key,
                         BodyHash: bodyHash,
-                        ResponseStatus: ctx.Response.StatusCode,
+                        ResponseStatus: status,
                         ResponseBody: bytes,
                         ResponseContentType: ctx.Response.ContentType ?? "application/json",
                         ExpiresAt: DateTimeOffset.UtcNow + DefaultTtl);
@@ -142,10 +165,13 @@ internal static class IdempotencyMiddleware
         request.Body.Position = 0;
         using var sha = SHA256.Create();
 
-        // Mix method + path into the digest BEFORE the body, with explicit
-        // length-prefixed separators, so an empty-body DELETE /a and an
-        // empty-body POST /b can never collide (and a body that happens to
-        // contain "POST\n/a\n" can't masquerade as a different request either).
+        // Mix method + path into the digest BEFORE the body, newline-separated
+        // (HTTP methods and paths contain no embedded newlines), so an
+        // empty-body DELETE /a and an empty-body POST /b can never collide.
+        // A request body that begins with "POST\n/a\n" cannot masquerade as a
+        // different request either because the prefix is consumed before the
+        // body bytes are fed in — the digest sees "POST\n/b\nPOST\n/a\n…",
+        // not "POST\n/a\n…".
         var prefix = Encoding.UTF8.GetBytes(
             $"{method.ToUpperInvariant()}\n{path}\n");
         sha.TransformBlock(prefix, 0, prefix.Length, null, 0);

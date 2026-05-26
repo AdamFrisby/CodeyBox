@@ -122,6 +122,45 @@ public sealed class PromptRevisionStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task PrimaryAcceptanceScenario_MidIterationPromptEdit_NextIterationCapturesNewRevision()
+    {
+        // Acceptance scenario from the task spec, exercised end-to-end against
+        // the real store (the orchestrator's pickup + dispatch logic depends
+        // entirely on this primitive): update a prompt while an iteration is
+        // already in flight, then observe that
+        //   (a) the in-flight iteration's recorded revision stays at 1
+        //   (b) the next iteration is dispatched at revision 2
+        //   (c) the next iteration is fed a snapshot reflecting the new revision
+        // The PipelineRunner's rework-dispatch code re-reads the work item from
+        // the store just before recording the dispatch row precisely so that
+        // (c) holds — this test pins that behaviour at the store level.
+        var item = Sample(WorkItemState.Working);
+        await _store.CreateAsync(item);
+
+        // Iteration 1 dispatches at the original revision.
+        await _store.RecordIterationDispatchAsync(item.Id, 1, item.PromptRevision, DateTimeOffset.UtcNow);
+
+        // Operator edits the prompt mid-iteration.
+        var put = await _store.TryReplacePromptAsync(item.Id, "edited", DateTimeOffset.UtcNow);
+        Assert.Equal(2, put.NewRevision);
+
+        // Orchestrator re-reads before scheduling the NEXT iteration.
+        var fresh = await _store.GetAsync(item.Id);
+        Assert.NotNull(fresh);
+        Assert.Equal(2, fresh!.PromptRevision);
+        Assert.Equal("edited", fresh.Prompt);
+        await _store.RecordIterationDispatchAsync(item.Id, 2, fresh.PromptRevision, DateTimeOffset.UtcNow);
+
+        // Assertion (a) + (b): both rows landed with the expected dispatch revs.
+        var rows = await _store.GetIterationsAsync(item.Id);
+        Assert.Equal(2, rows.Count);
+        var iter1 = rows.Single(r => r.Iteration == 1);
+        var iter2 = rows.Single(r => r.Iteration == 2);
+        Assert.Equal(1, iter1.PromptRevisionAtDispatch);
+        Assert.Equal(2, iter2.PromptRevisionAtDispatch);
+    }
+
+    [Fact]
     public async Task RecordIterationDispatchAsync_IsIdempotent_OverwritesOnReDispatch()
     {
         // Restart-recovery re-dispatches the same iteration; the row must update

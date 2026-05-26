@@ -86,8 +86,12 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
 
         store.ForceMaxPageCountForTesting(1);
 
-        var bigPrompt = item with { Prompt = new string('z', 256 * 1024) };
-        var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(() => store.UpdateAsync(bigPrompt));
+        // UpdateAsync no longer writes the prompt column (see IWorkItemStore
+        // docstring — TryReplacePromptAsync is the dedicated path). Force the
+        // page-count cap via a large LastError instead, which is still part
+        // of the full-row UPDATE.
+        var bigError = item with { LastError = new string('z', 256 * 1024) };
+        var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(() => store.UpdateAsync(bigError));
         Assert.Equal("UpdateAsync", ex.Operation);
         Assert.IsType<SqliteException>(ex.InnerException);
         AssertAuditEmitted("UpdateAsync");
@@ -118,10 +122,12 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
         store.ForceMaxPageCountForTesting(1);
 
         // Force a write large enough that SQLite has to grow the file and
-        // cannot satisfy that growth under max_page_count=1.
-        var bigPrompt = item with { Prompt = new string('z', 256 * 1024) };
+        // cannot satisfy that growth under max_page_count=1. TryUpdateIfStateAsync
+        // no longer writes the prompt column; LastError is the convenient
+        // unbounded text field that still flows through the full-row UPDATE.
+        var bigError = item with { LastError = new string('z', 256 * 1024) };
         var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(
-            () => store.TryUpdateIfStateAsync(bigPrompt, item.State));
+            () => store.TryUpdateIfStateAsync(bigError, item.State));
         Assert.Equal("TryUpdateIfStateAsync", ex.Operation);
         Assert.IsType<SqliteException>(ex.InnerException);
         AssertAuditEmitted("TryUpdateIfStateAsync");

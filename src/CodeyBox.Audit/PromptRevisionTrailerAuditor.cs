@@ -11,9 +11,8 @@ namespace CodeyBox.Audit;
 /// against a stale prompt (the operator updated the prompt mid-iteration via
 /// PUT /workitems/{id}/prompt) or did not emit the required trailer at all.
 ///
-/// Tool-only auditor: needs neither agent credentials nor network. Pairs with
-/// the existing <c>Co-Authored-By</c> trailer expectation; runs cheap before
-/// any LLM-based audits.
+/// Tool-only auditor: needs neither agent credentials nor network. Runs cheap
+/// before any LLM-based audits.
 /// </summary>
 public sealed class PromptRevisionTrailerAuditor : IAuditor
 {
@@ -44,9 +43,10 @@ public sealed class PromptRevisionTrailerAuditor : IAuditor
                     "The orchestrator did not record a dispatch row for this iteration (legacy data, or the iteration ledger was cleared). The prompt-revision trailer cannot be verified; treat the result as informational."),
             ]);
 
-        // %(trailers:key=...) prints only the matching trailer values. --unfold
-        // collapses continuation lines so multi-line trailer values are joined
-        // into one. Empty output means the trailer is absent.
+        // %(trailers:key=...) prints only the matching trailer values. The
+        // unfold=true format option (inside the directive) joins multi-line
+        // trailer continuation lines into one. Empty output means the trailer
+        // is absent.
         var trailers = await sandbox.ExecAsync(new SandboxExec
         {
             Argv =
@@ -76,7 +76,7 @@ public sealed class PromptRevisionTrailerAuditor : IAuditor
                 new AuditFinding(
                     Name, AuditSeverity.Error,
                     $"missing {CodeyBoxTrailers.PromptRevisionTrailerKey} trailer on HEAD commit",
-                    $"Expected `{CodeyBoxTrailers.PromptRevisionTrailerKey}: {expected}` (the value of `$CODEYBOX_PROMPT_REVISION` when this iteration was dispatched). Add the trailer to your commit message and create a new commit."),
+                    $"Expected `{CodeyBoxTrailers.PromptRevisionTrailerKey}: {expected}` (the value of `${CodeyBoxTrailers.PromptRevisionEnvVar}` when this iteration was dispatched). Add the trailer to your commit message and create a new commit."),
             ],
             RawOutput: trailers.Stdout);
         }
@@ -104,7 +104,7 @@ public sealed class PromptRevisionTrailerAuditor : IAuditor
                 new AuditFinding(
                     Name, AuditSeverity.Error,
                     $"stale {CodeyBoxTrailers.PromptRevisionTrailerKey} trailer (found {found}, expected {expected})",
-                    "The work item's prompt was updated after this iteration started. Re-read the latest prompt from the work-item context and commit again with the current value of `$CODEYBOX_PROMPT_REVISION`."),
+                    $"The work item's prompt was updated after this iteration started. Re-read the latest prompt from the work-item context and commit again with the current value of `${CodeyBoxTrailers.PromptRevisionEnvVar}`."),
             ],
             RawOutput: trailers.Stdout);
         }

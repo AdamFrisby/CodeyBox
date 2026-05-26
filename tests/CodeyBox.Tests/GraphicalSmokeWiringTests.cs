@@ -30,6 +30,13 @@ public sealed class GraphicalSmokeWiringTests
 
         Assert.Contains(registeredAuditors, a => a is GraphicalSmokeAuditor && a.Name == "gui:smoke");
         var composed = composer.Compose(project, new ScriptedAgent([]));
-        Assert.IsType<GraphicalSmokeAuditor>(Assert.Single(composed));
+
+        // gui:smoke is composed FIRST (prepended for graphical projects); the
+        // always-on prompt-revision trailer auditor is appended after preset
+        // auditors. With no language/auditType presets this project ends up
+        // with both registered auditors composed.
+        Assert.Equal(2, composed.Count);
+        Assert.IsType<GraphicalSmokeAuditor>(composed[0]);
+        Assert.IsType<PromptRevisionTrailerAuditor>(composed[1]);
     }
 }

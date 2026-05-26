@@ -78,10 +78,13 @@ public sealed class SqliteIdempotencyStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task PutAsync_IsIdempotent_DoesNotOverwriteExistingRow()
+    public async Task PutAsync_IsIdempotent_DoesNotOverwriteLiveRow()
     {
-        // ON CONFLICT DO NOTHING — the first writer wins. This protects against
-        // a successful response getting clobbered by a slower in-flight retry.
+        // The first writer wins within the TTL window — a concurrent retry that
+        // wins the race after the response was already cached must not clobber
+        // a live entry with potentially-different bytes. This is what makes the
+        // "same key + same body" replay return the SAME bytes the first caller
+        // received.
         var key = Guid.NewGuid().ToString();
         await _store.PutAsync(Entry(key, "hashA", status: 201, body: "first"));
         await _store.PutAsync(Entry(key, "hashA", status: 202, body: "second"));
@@ -89,6 +92,29 @@ public sealed class SqliteIdempotencyStoreTests : IDisposable
         var result = await _store.LookupAsync(key, "hashA", DateTimeOffset.UtcNow);
         Assert.Equal(201, result.Entry!.ResponseStatus);
         Assert.Equal("first", System.Text.Encoding.UTF8.GetString(result.Entry.ResponseBody));
+    }
+
+    [Fact]
+    public async Task PutAsync_OverwritesRow_AfterExpirationWindow()
+    {
+        // Once the existing row has expired the next PutAsync MUST overwrite it
+        // — otherwise the stale tombstone keeps every same-key replay falling
+        // through to the downstream endpoint as a "Miss", which breaks the
+        // spec's "same key + same body returns cached response" guarantee for
+        // any key whose first use was >24h ago. The expired row is also a slot
+        // that the sweep service may not have reclaimed yet.
+        var key = Guid.NewGuid().ToString();
+        await _store.PutAsync(Entry(key, "hashA", status: 201, body: "stale",
+            expires: DateTimeOffset.UtcNow.AddMinutes(-1)));
+
+        // Fresh entry — different hash, different body, future expiry.
+        await _store.PutAsync(Entry(key, "hashB", status: 200, body: "fresh",
+            expires: DateTimeOffset.UtcNow.AddHours(24)));
+
+        var result = await _store.LookupAsync(key, "hashB", DateTimeOffset.UtcNow);
+        Assert.Equal(IdempotencyLookupOutcome.Hit, result.Outcome);
+        Assert.Equal(200, result.Entry!.ResponseStatus);
+        Assert.Equal("fresh", System.Text.Encoding.UTF8.GetString(result.Entry.ResponseBody));
     }
 
     [Fact]

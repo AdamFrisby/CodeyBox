@@ -54,6 +54,29 @@ public sealed class PutPromptEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task PatchPrompt_BumpsPromptRevision_EndToEnd()
+    {
+        // The PATCH /workitems/{id} endpoint must increment PromptRevision when
+        // the prompt field is patched. Regression guard: a refactor that
+        // removed the bump from the PATCH path (or routed the prompt write
+        // through the full-row UPDATE which no longer touches prompt columns)
+        // would silently lose the revision contract for Queued items.
+        var item = WorkingItem() with { State = WorkItemState.Queued };
+        await _factory.Store.CreateAsync(item);
+
+        var req = new HttpRequestMessage(new HttpMethod("PATCH"), $"/workitems/{item.Id}")
+        {
+            Content = JsonContent.Create(new { prompt = "patched prompt" }),
+        };
+        var resp = await _client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var read = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal("patched prompt", read!.Prompt);
+        Assert.Equal(item.PromptRevision + 1, read.PromptRevision);
+    }
+
+    [Fact]
     public async Task PutPrompt_OnTerminalItem_Returns409()
     {
         var item = WorkingItem() with { State = WorkItemState.Done };
@@ -150,6 +173,73 @@ public sealed class PutPromptEndpointTests : IDisposable
         var read2 = await _factory.Store.GetAsync(item2.Id);
         Assert.Equal("original", read2!.Prompt);
         Assert.Equal(1, read2.PromptRevision);
+    }
+
+    [Fact]
+    public async Task IdempotencyKey_OversizedKey_Returns400()
+    {
+        // The middleware rejects keys longer than IdempotencyMiddleware.MaxKeyLength
+        // BEFORE attempting any cache lookup or downstream call. Guards against an
+        // attacker stuffing the cache table with arbitrarily-long composite keys.
+        var item = WorkingItem();
+        await _factory.Store.CreateAsync(item);
+
+        var oversized = new string('a', 201); // MaxKeyLength is 200
+        var resp = await PutWithKeyAsync($"/workitems/{item.Id}/prompt", "{\"prompt\":\"x\"}", oversized);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+
+        // Body must not have been touched by the rejected request.
+        var read = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal("original", read!.Prompt);
+        Assert.Equal(1, read.PromptRevision);
+    }
+
+    [Fact]
+    public async Task IdempotencyKey_NonSuccessResponse_IsNotCached()
+    {
+        // A 409 from the handler (e.g. terminal-state guard) must NOT be cached
+        // — caching the failure would lock subsequent retries into the 409 even
+        // after the state changes. The middleware only caches 2xx outcomes.
+        var item = WorkingItem() with { State = WorkItemState.Done };
+        await _factory.Store.CreateAsync(item);
+
+        var key = Guid.NewGuid().ToString();
+        var first = await PutWithKeyAsync($"/workitems/{item.Id}/prompt", "{\"prompt\":\"x\"}", key);
+        Assert.Equal(HttpStatusCode.Conflict, first.StatusCode);
+        // The replay header signals a cache hit; the first call must NOT carry it.
+        Assert.False(first.Headers.Contains("Idempotent-Replayed"));
+
+        // Second call with the same key + same body must STILL reach the handler
+        // (cache miss because non-2xx was not stored) — it returns the SAME 409
+        // because the underlying state still rejects, but it is NOT a cached
+        // replay. Locking the contract: the response must not carry the
+        // Idempotent-Replayed header.
+        var second = await PutWithKeyAsync($"/workitems/{item.Id}/prompt", "{\"prompt\":\"x\"}", key);
+        Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
+        Assert.False(second.Headers.Contains("Idempotent-Replayed"));
+    }
+
+    [Fact]
+    public async Task IdempotencyKey_GetRequest_BypassesMiddleware()
+    {
+        // The middleware only intercepts mutating methods (POST, PUT, PATCH,
+        // DELETE). GETs pass through unchanged regardless of the header so a
+        // client that defensively stamps every request never sees a phantom
+        // 409 because of accidental key reuse on a read.
+        var item = WorkingItem();
+        await _factory.Store.CreateAsync(item);
+
+        var key = Guid.NewGuid().ToString();
+        var req1 = new HttpRequestMessage(HttpMethod.Get, $"/workitems/{item.Id}");
+        req1.Headers.Add("Idempotency-Key", key);
+        var resp1 = await _client.SendAsync(req1);
+        Assert.Equal(HttpStatusCode.OK, resp1.StatusCode);
+
+        var req2 = new HttpRequestMessage(HttpMethod.Get, $"/workitems/{item.Id}");
+        req2.Headers.Add("Idempotency-Key", key);
+        var resp2 = await _client.SendAsync(req2);
+        Assert.Equal(HttpStatusCode.OK, resp2.StatusCode);
+        Assert.False(resp2.Headers.Contains("Idempotent-Replayed"));
     }
 
     [Fact]

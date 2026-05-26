@@ -101,6 +101,18 @@ public sealed class ProjectAuditorComposer
             IncludeRegisteredAuditor("gui:smoke", auditors, prepend: true);
         }
 
+        // Always include the deterministic prompt-revision trailer auditor.
+        // It is cheap (single git log -1), requires no agent credentials, and
+        // enforces the cross-iteration invariant that the agent's HEAD commit
+        // carries the CodeyBox-Prompt-Revision trailer the orchestrator
+        // snapshotted at dispatch time. A missing or stale trailer means the
+        // agent finished against an old prompt — a blocking finding.
+        if (!auditors.Any(a => a.Name.Equals(
+                "process:prompt-revision-trailer", StringComparison.OrdinalIgnoreCase)))
+        {
+            IncludeRegisteredAuditor("process:prompt-revision-trailer", auditors, prepend: false);
+        }
+
         if (project.Audit.ExcludedAuditors.Count > 0)
         {
             var excluded = new HashSet<string>(project.Audit.ExcludedAuditors, StringComparer.OrdinalIgnoreCase);

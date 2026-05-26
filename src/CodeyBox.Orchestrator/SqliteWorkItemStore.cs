@@ -241,9 +241,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         try
         {
             using var cmd = _conn.CreateCommand();
+            // prompt / prompt_revision / priority are excluded from this UPDATE.
+            // Callers commonly pass a STALE in-memory WorkItem snapshot taken at
+            // pickup time; writing those columns from the snapshot would clobber
+            // a concurrent PUT /workitems/{id}/prompt or POST /workitems/{id}/priority
+            // that landed mid-pipeline. Use TryReplacePromptAsync /
+            // UpdatePriorityAsync to mutate them safely; routine state transitions
+            // leave them alone.
             cmd.CommandText = """
                 UPDATE work_items SET
-                    project_id = $project_id, title = $title, prompt = $prompt,
+                    project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
@@ -264,8 +271,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
-                    transient_cancel_retries = $transient_cancel_retries,
-                    prompt_revision = $prompt_revision
+                    transient_cancel_retries = $transient_cancel_retries
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -287,9 +293,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         try
         {
             using var cmd = _conn.CreateCommand();
+            // See UpdateAsync — prompt / prompt_revision / priority are excluded
+            // from the full-row UPDATE to avoid stale-snapshot clobber.
             cmd.CommandText = """
                 UPDATE work_items SET
-                    project_id = $project_id, title = $title, prompt = $prompt,
+                    project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
@@ -310,8 +318,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
-                    transient_cancel_retries = $transient_cancel_retries,
-                    prompt_revision = $prompt_revision
+                    transient_cancel_retries = $transient_cancel_retries
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);

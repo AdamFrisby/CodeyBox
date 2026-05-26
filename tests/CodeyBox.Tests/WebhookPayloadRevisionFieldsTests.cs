@@ -109,6 +109,10 @@ public sealed class WebhookPayloadRevisionFieldsTests
         // A non-terminal event (the orchestrator only stamps the fields on
         // terminal transitions) must still serialise without crashing and the
         // fields must be absent or null — never carry a stale value.
+        // The non-conditional assert on `event` ensures the payload is still
+        // intact: a refactor that dropped the entire payload shape would now
+        // fail loudly instead of passing all three conditional null checks
+        // vacuously.
         var evt = new WebhookEvent
         {
             Event = "work_item.audit_iteration",
@@ -117,6 +121,8 @@ public sealed class WebhookPayloadRevisionFieldsTests
         };
         var json = HttpWebhookDispatcher.BuildPayload(evt);
         using var doc = JsonDocument.Parse(json);
+
+        Assert.Equal("work_item.audit_iteration", doc.RootElement.GetProperty("event").GetString());
 
         if (doc.RootElement.TryGetProperty("promptRevision", out var pr))
             Assert.Equal(JsonValueKind.Null, pr.ValueKind);

@@ -28,6 +28,17 @@ public static class CodeyBoxTrailers
     public const string PromptRevisionTrailerKey = "CodeyBox-Prompt-Revision";
     public const string FallbacksTrailerKey = "CodeyBox-Fallbacks";
 
+    /// <summary>
+    /// Env-var name passed into the agent's sandbox carrying the prompt revision
+    /// that was active when the current iteration was dispatched. The agent
+    /// echoes this value back as the <see cref="PromptRevisionTrailerKey"/>
+    /// trailer on every commit; <c>process:prompt-revision-trailer</c> verifies
+    /// the trailer matches. Single shared constant so the orchestrator (writer),
+    /// the audit module (verifier), and the rework-prompt template (reader)
+    /// reference the same symbol — a future rename touches one place.
+    /// </summary>
+    public const string PromptRevisionEnvVar = "CODEYBOX_PROMPT_REVISION";
+
     private static readonly Regex CollapseWhitespace = new(@"\s+", RegexOptions.Compiled);
 
     /// <summary>

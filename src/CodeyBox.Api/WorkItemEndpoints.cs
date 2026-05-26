@@ -953,11 +953,22 @@ internal static class WorkItemEndpoints
         if (body.Prompt is not null)
         {
             if (body.Prompt.Length > 64 * 1024) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
-            // Bump the monotonic revision so any later iteration captures the new value.
+            // Route through TryReplacePromptAsync — the only write path that
+            // touches prompt + prompt_revision. The full-row UPDATE below
+            // deliberately does NOT carry the prompt columns (they would
+            // clobber a concurrent PUT /workitems/{id}/prompt). The state
+            // guard inside TryReplacePromptAsync mirrors the Queued check
+            // above; success refreshes our in-memory snapshot for the rest
+            // of the PATCH so the response DTO reflects the new revision.
+            var promptResult = await store.TryReplacePromptAsync(updated.Id, body.Prompt, now, ct);
+            if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
+                return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+            if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
+                return Results.Conflict(new { error = $"cannot edit item in terminal state" });
             updated = updated with
             {
                 Prompt = body.Prompt,
-                PromptRevision = updated.PromptRevision + 1,
+                PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
                 UpdatedAt = now,
             };
         }
