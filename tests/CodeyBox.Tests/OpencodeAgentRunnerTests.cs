@@ -1,5 +1,6 @@
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -137,5 +138,187 @@ public sealed class OpencodeAgentRunnerTests
         {
             Environment.SetEnvironmentVariable("OPENCODE_REASONING_FLAG", prior);
         }
+    }
+
+    // --- PrepareSandboxAsync credential-materialisation -------------------
+    // The runner's PrepareSandboxAsync writes the opencode auth.json inside
+    // the sandbox from the OPENCODE_AUTH_JSON credential env var. These
+    // tests pin:
+    //   - the materialisation script runs BEFORE the opencode CLI invocation;
+    //   - it references the correct env-var names and default destination;
+    //   - it honours OPENCODE_AUTH_DEST_PATH for non-XDG destinations;
+    //   - it is skipped entirely when no credential is supplied;
+    //   - a failed write fails the run with a meaningful summary and
+    //     prevents the opencode CLI from being invoked.
+
+    private static AgentCredential OpencodeCred(string authJson, string? destPath = null)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["OPENCODE_AUTH_JSON"] = authJson,
+        };
+        if (destPath is not null) env["OPENCODE_AUTH_DEST_PATH"] = destPath;
+        return new AgentCredential(AgentKind.Opencode, env, new Dictionary<string, string>());
+    }
+
+    private static int FindOpencodeExecIndex(IReadOnlyList<SandboxExec> execs)
+    {
+        for (var i = 0; i < execs.Count; i++)
+        {
+            var argv = execs[i].Argv;
+            if (argv.Count > 0 && argv[0] == "opencode") return i;
+        }
+        return -1;
+    }
+
+    private static int FindMaterialisationScriptIndex(IReadOnlyList<SandboxExec> execs)
+    {
+        for (var i = 0; i < execs.Count; i++)
+        {
+            var argv = execs[i].Argv;
+            if (argv.Count >= 3
+                && argv[0] == "bash"
+                && argv[1] == "-c"
+                && argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+                return i;
+        }
+        return -1;
+    }
+
+    [Fact]
+    public async Task RunAsync_NoCredential_DoesNotRunMaterialisationScript()
+    {
+        // Short-circuit when no opencode credential is supplied: the runner
+        // must not emit a no-op bash heredoc just for ceremony.
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: null);
+
+        Assert.Equal(-1, FindMaterialisationScriptIndex(sandbox.Execs));
+        Assert.True(FindOpencodeExecIndex(sandbox.Execs) >= 0);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithCredential_MaterialisationRunsBeforeOpencodeCli()
+    {
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"providers":{"deepseek":{"apiKey":"sk-test"}}}""");
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        var matIdx = FindMaterialisationScriptIndex(sandbox.Execs);
+        var cliIdx = FindOpencodeExecIndex(sandbox.Execs);
+        Assert.True(matIdx >= 0, "materialisation script must be executed");
+        Assert.True(cliIdx >= 0, "opencode CLI must be invoked");
+        Assert.True(matIdx < cliIdx, "materialisation must run before the opencode CLI");
+    }
+
+    [Fact]
+    public async Task RunAsync_MaterialisationScript_UsesXdgDefaultWhenDestPathUnset()
+    {
+        // No OPENCODE_AUTH_DEST_PATH supplied ⇒ the in-sandbox script must
+        // fall back to the XDG default at $HOME/.local/share/opencode/auth.json.
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"x":1}""");
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        var matIdx = FindMaterialisationScriptIndex(sandbox.Execs);
+        Assert.True(matIdx >= 0);
+        var script = sandbox.Execs[matIdx].Argv[2];
+        Assert.Contains("$HOME/.local/share/opencode/auth.json", script);
+        Assert.Contains("OPENCODE_AUTH_DEST_PATH", script);
+    }
+
+    [Fact]
+    public async Task RunAsync_MaterialisationScript_HasUmask077_BeforeWrite()
+    {
+        // Auth file must end up at 0600. Order: umask 077 must precede the
+        // printf that writes the file, else the file gets the inherited
+        // umask (typically 022 → 0644 — world-readable).
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"x":1}""");
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
+        var umaskIdx = script.IndexOf("umask 077", StringComparison.Ordinal);
+        var printfIdx = script.IndexOf("printf", StringComparison.Ordinal);
+        Assert.True(umaskIdx >= 0, "script must set umask 077");
+        Assert.True(printfIdx >= 0, "script must write the auth file via printf");
+        Assert.True(umaskIdx < printfIdx, "umask 077 must come before the printf write");
+    }
+
+    [Fact]
+    public async Task RunAsync_MaterialisationFailure_FailsRunAndDoesNotInvokeOpencode()
+    {
+        // If the bash heredoc fails (e.g. sandbox FS readonly), the runner
+        // must surface a meaningful Summary and skip the opencode CLI rather
+        // than charge ahead with no auth file in place.
+        var sandbox = new RecordingSandbox(authWriteExitCode: 13);
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"x":1}""");
+
+        var result = await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        Assert.False(result.Success);
+        Assert.Contains("opencode auth", result.Summary, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("13", result.Summary);
+        Assert.Equal(-1, FindOpencodeExecIndex(sandbox.Execs));
+    }
+
+    [Fact]
+    public async Task RunAsync_MaterialisationScript_DoesNotEmbedCredentialBytesInArgv()
+    {
+        // The credential bytes must flow via the env-var, NOT be interpolated
+        // into the bash heredoc — otherwise the secret would appear in any
+        // command-line audit log the orchestrator captures.
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+        const string secret = "sk-deepseek-supersecretvalue-do-not-leak";
+        var cred = OpencodeCred("{\"providers\":{\"deepseek\":{\"apiKey\":\"" + secret + "\"}}}");
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
+        Assert.DoesNotContain(secret, script);
+        // It should reference the env-var name instead.
+        Assert.Contains("OPENCODE_AUTH_JSON", script);
+    }
+
+    /// <summary>
+    /// Sandbox that records every exec invocation and lets the test stub a
+    /// specific exit code for the auth-materialisation bash script.
+    /// </summary>
+    private sealed class RecordingSandbox : ISandbox
+    {
+        private readonly int _authWriteExitCode;
+
+        public RecordingSandbox(int authWriteExitCode = 0)
+        {
+            _authWriteExitCode = authWriteExitCode;
+        }
+
+        public string Id => "recording";
+        public List<SandboxExec> Execs { get; } = [];
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            Execs.Add(exec);
+            if (exec.Argv.Count >= 3
+                && exec.Argv[0] == "bash"
+                && exec.Argv[1] == "-c"
+                && exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
+            }
+            return Task.FromResult(new SandboxExecResult(0, "ok", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

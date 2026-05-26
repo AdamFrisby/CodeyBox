@@ -95,7 +95,7 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
         if (usage.TryGetProperty("completion_tokens", out var ct) && ct.TryGetInt32(out var ctv)) output = ctv;
         else if (usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv)) output = otv;
 
-        if (root.TryGetProperty("model", out var m))
+        if (root.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String)
         {
             var raw = m.GetString();
             modelId = raw is { Length: > 128 } ? raw[..128] : raw;

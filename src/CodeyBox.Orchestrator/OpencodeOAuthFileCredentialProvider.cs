@@ -19,21 +19,44 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class OpencodeOAuthFileCredentialProvider : ICredentialProvider, IDisposable
 {
-    private readonly OpencodeCredentialFileSource _source;
+    private readonly CredentialFileSource _source;
     private readonly string? _destinationPath;
     private readonly ILogger<OpencodeOAuthFileCredentialProvider>? _log;
     private readonly bool _ownsSource;
     private bool _disposed;
 
     public OpencodeOAuthFileCredentialProvider(
-        OpencodeCredentialFileSource source,
+        string filePath,
+        string? destinationPath = null,
+        ILogger<OpencodeOAuthFileCredentialProvider>? log = null,
+        bool watch = true)
+        : this(
+            new CredentialFileSource(
+                filePath ?? throw new ArgumentNullException(nameof(filePath)), log, watch),
+            destinationPath,
+            log,
+            ownsSource: true)
+    {
+    }
+
+    public OpencodeOAuthFileCredentialProvider(
+        CredentialFileSource source,
         string? destinationPath = null,
         ILogger<OpencodeOAuthFileCredentialProvider>? log = null)
+        : this(source, destinationPath, log, ownsSource: false)
+    {
+    }
+
+    private OpencodeOAuthFileCredentialProvider(
+        CredentialFileSource source,
+        string? destinationPath,
+        ILogger<OpencodeOAuthFileCredentialProvider>? log,
+        bool ownsSource)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _destinationPath = string.IsNullOrWhiteSpace(destinationPath) ? null : destinationPath;
         _log = log;
-        _ownsSource = false;
+        _ownsSource = ownsSource;
     }
 
     public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
