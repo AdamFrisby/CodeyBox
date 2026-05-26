@@ -4,6 +4,7 @@
     <Project Path="src/CodeyBox.Agents.Claude/CodeyBox.Agents.Claude.csproj" />
     <Project Path="src/CodeyBox.Agents.Codex/CodeyBox.Agents.Codex.csproj" />
     <Project Path="src/CodeyBox.Agents.Gemini/CodeyBox.Agents.Gemini.csproj" />
+    <Project Path="src/CodeyBox.Agents.Cursor/CodeyBox.Agents.Cursor.csproj" />
     <Project Path="src/CodeyBox.Agents.Copilot/CodeyBox.Agents.Copilot.csproj" />
     <Project Path="src/CodeyBox.Agents/CodeyBox.Agents.csproj" />
     <Project Path="src/CodeyBox.Api/CodeyBox.Api.csproj" />

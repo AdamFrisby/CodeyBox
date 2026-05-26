@@ -1,0 +1,62 @@
+using System.Diagnostics;
+using Microsoft.Extensions.Logging;
+using CodeyBox.Core;
+
+namespace CodeyBox.Agents.Cursor;
+
+/// <summary>
+/// Credential smoke test for Cursor.
+///
+/// <para>Cursor does not currently document a usage / status HTTP endpoint
+/// reachable from a subscription token (the way Claude has
+/// <c>/v1/messages</c>, Codex has <c>/v1/chat/completions</c>, Gemini has
+/// <c>/v1beta/.../generateContent</c>). The probe therefore performs a cheap
+/// credential-presence check — it verifies that the credential bundle carries
+/// either <c>CODEYBOX_CURSOR_AUTH_JSON</c> (subscription flow) and surfaces a
+/// human-readable failure reason otherwise. This is intentionally lighter than
+/// the HTTP probes used by other agents: a real <c>agent --version</c>
+/// invocation requires a sandbox, which is too heavy for the startup-time
+/// smoke gate (and we'd be paying multipass cold-start at every restart).</para>
+///
+/// <para>The first real Cursor invocation in the pipeline is the authoritative
+/// credential check; <see cref="CursorQuotaFailureDetector"/> classifies any
+/// <c>401</c> response that surfaces there as
+/// <see cref="QuotaFailureKind.Unauthorized"/>, which the pipeline treats the
+/// same way it would a smoke-probe auth failure. Per the operator's stated
+/// preference (<c>feedback-vendor-api-drift</c>), this reactive surface is
+/// preferred over speculative HTTP coverage.</para>
+/// </summary>
+public sealed class CursorSmokeProbe : IAgentSmokeProbe
+{
+    private readonly ILogger<CursorSmokeProbe> _log;
+
+    public AgentKind Kind => AgentKind.Cursor;
+
+    public CursorSmokeProbe(ILogger<CursorSmokeProbe> log)
+    {
+        _log = log;
+    }
+
+    public Task<AgentSmokeResult> SmokeTestAsync(AgentCredential credential, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var hasAuthJson = credential.EnvironmentVariables.ContainsKey("CODEYBOX_CURSOR_AUTH_JSON");
+            sw.Stop();
+            if (hasAuthJson)
+                return Task.FromResult(new AgentSmokeResult(true, null, sw.Elapsed));
+
+            return Task.FromResult(new AgentSmokeResult(
+                false,
+                "no Cursor credential configured (set CODEYBOX_CURSOR_AUTH_FILE or CODEYBOX_CURSOR_AUTH_JSON)",
+                sw.Elapsed));
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Cursor smoke probe threw; treating as transient");
+            sw.Stop();
+            return Task.FromResult(new AgentSmokeResult(false, "transient: try later", sw.Elapsed));
+        }
+    }
+}

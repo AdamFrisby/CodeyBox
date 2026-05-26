@@ -14,6 +14,7 @@ tooling, not in the agent runner contract.
 | `copilot`   | `copilot`         | `GH_TOKEN`              | `CODEYBOX_COPILOT_TOKEN`  |
 | `codex`     | `codex`           | `OPENAI_API_KEY`        | `CODEYBOX_CODEX_API_KEY`  |
 | `gemini`    | `gemini`          | `GEMINI_API_KEY`        | `CODEYBOX_GEMINI_API_KEY` |
+| `cursor`    | `agent`           | `CODEYBOX_CURSOR_AUTH_JSON` (subscription credentials JSON) | `CODEYBOX_CURSOR_AUTH_FILE` (file path on host) |
 
 The sandbox-side env name is what the agent CLI reads. The host-side env
 name is what the orchestrator's `EnvironmentCredentialProvider` looks up
@@ -136,6 +137,79 @@ This requires a custom `ICredentialProvider` that materialises the JSON into
 the sandbox via `AgentCredential.Files` — the `Files` map on `AgentCredential`
 is designed for exactly this use case.
 
+### Cursor CLI (`agent`)
+
+> **HARD CONSTRAINT — never invoke in fast mode.**
+> Cursor's fast mode burns ~6× more credits for the same output with no
+> parallelism-relevant speed benefit. This pipeline optimises for throughput,
+> not per-iteration latency. `CursorAgentRunner.BuildInvocation` **never**
+> emits `--fast` or any equivalent flag, and the
+> `CursorAgentRunner_FastModeRegressionTests` fixture pins this. **Do not
+> add a fast-mode toggle**; if a future Cursor release flips the default to
+> fast-by-default the runner must explicitly opt out. Any proposal to expose
+> a fast-mode option must be evaluated against the 6× cost penalty in writing.
+
+**Binary name:** the Cursor CLI installs as `agent` (NOT `cursor-agent`).
+
+**Install in the sandbox image:** follow Cursor's official install
+instructions for your distro. For example, on the Ubuntu baseline used by
+the multipass provider:
+```sh
+curl -fsSL https://cursor.com/install | bash
+```
+Add the install command to `CodeyBox:MultipassExtraRuncmd`. The binary must
+end up on `$PATH` as `agent`.
+
+**Subscription auth setup:**
+
+1. On the host (NOT in the sandbox image), run `agent login` once and
+   complete the Cursor subscription auth flow. This writes a credentials
+   file to disk (defaults to `~/.cursor/credentials.json`).
+2. Point CodeyBox at it with `CODEYBOX_CURSOR_AUTH_FILE=/path/to/credentials.json`
+   (or leave unset to use the default path).
+3. The orchestrator reads the file on every pickup (rotations propagate
+   without restart) and ships its contents into the sandbox via the
+   `CODEYBOX_CURSOR_AUTH_JSON` env var; `CursorAgentRunner` materialises a
+   private copy at `~/.cursor/credentials.json` inside the VM before
+   invoking the CLI.
+4. The host's credential directory is **not** bind-mounted into the agent
+   sandbox; only the file contents flow through (same pattern as Codex's
+   `~/.codex/auth.json` handling).
+
+**Non-interactive invocation:** `agent --print --model composer-2.5`
+(the prompt is delivered on stdin, not as a positional argv, so audit-
+finding prompts that exceed Linux's 128 KiB MAX_ARG_STRLEN keep working).
+
+**Default model:** `composer-2.5` — operator-graded as Opus-4.6-equivalent
+quality. Override by setting `ModelId` on the agent-class member:
+```json
+{ "Agent": "cursor", "Billing": "Subscription", "ModelId": "composer-2.5", "QualityScore": 98 }
+```
+
+**Reasoning level:** the Cursor CLI does not currently expose a reasoning-
+effort flag analogous to Claude's `--effort`. `ReasoningMode` on the
+agent-class member is accepted (so the schema stays uniform across agents)
+but is not threaded into argv. If a future Cursor release adds one, wire it
+in `CursorAgentRunner.BuildInvocation`.
+
+**Quota probe:** Cursor does not currently document a usage / rate-limit
+endpoint reachable from a subscription token. `CursorQuotaProbe` always
+reports `AvailablePct=-1` ("no probe endpoint"); the router's
+`UnknownPolicy=UseObservedFailures` applies observation-based back-pressure
+via `CursorQuotaFailureDetector` instead. Per the operator's stated
+preference for reactive over speculative coverage, this is intentional.
+
+**Smoke probe:** the Cursor smoke probe performs a credential-bundle
+presence check (it verifies that `CODEYBOX_CURSOR_AUTH_JSON` is set);
+authoritative credential validation happens on the first real CLI call,
+where any `401 Unauthorized` is classified by
+`CursorQuotaFailureDetector`.
+
+**Billing flip:** the agent-class member's `Billing` field accepts
+`Subscription` (default) or `PayPerApi`, mirroring Gemini. Cursor's
+pay-per-api surface is undocumented at the time of writing; treat
+`PayPerApi` as a forward hook.
+
 ## Credential smoke test
 
 Before spending sandbox resources on a work item, CodeyBox performs a
@@ -162,6 +236,7 @@ credentials before they waste expensive compute.
 | `codex` | `https://api.openai.com/v1/chat/completions` | `Authorization: Bearer <api-key>` |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent` | `x-goog-api-key: <api-key>` |
 | `copilot` | *(no probe)* — always passes | — |
+| `cursor` | *(no HTTP probe — Cursor exposes no public usage endpoint)* — verifies the credential bundle carries `CODEYBOX_CURSOR_AUTH_JSON`; real auth check happens on first CLI call | — |
 
 Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
 means the credential is valid. 401/403 is classified as `"auth"` failure.
