@@ -25,6 +25,7 @@ namespace CodeyBox.Tests;
 /// the wrong stopwatch into the duration argument) would silently bring the
 /// cascade back; these tests are the trap for that.
 /// </summary>
+[Collection("Pipeline integration")]
 public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 {
     private readonly string _workspace;
@@ -150,9 +151,58 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
     }
 
+    [Fact]
+    public async Task MergePhaseFastFail_ExcludesAgent_AndPublishesWebhookWithMergeContext()
+    {
+        // Pin the second RecordRunOutcome call site in PipelineRunner —
+        // RunAgentMergePhaseAsync, which fires *after* the work phase has
+        // already reset the fast-fail counter to 0 on a successful work-phase
+        // exit. A regression that deletes the merge-phase block (or wires it
+        // to the wrong stopwatch/event name) would leave the counter at 0
+        // because the work-phase reset masks the merge-phase fast-fail.
+        //
+        // Build a fixture with MaxConsecutiveFastFails=1 so a single merge-
+        // phase fast-fail trips the breaker. The work phase succeeds (counter
+        // ← 0); then the merge phase returns a non-quota, sub-threshold
+        // failure (counter ← 1 = threshold, exclusion + webhook fire).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, maxConsecutiveFastFails: 1);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
+        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "merge agent exited 127",
+            Stdout: null,
+            Stderr: "env: 'agent': No such file or directory"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("fast-fail circuit breaker", availability.Reason);
+
+        // The merge-phase block attaches both WorkItem and Project to the
+        // event (the work-phase block does the same). Verify presence — a
+        // regression that switched the call site to a payload-less variant
+        // would silently drop these.
+        var transitions = fix.Webhooks.Events
+            .Where(e => e.Event == "agent.smoke_failed")
+            .ToList();
+        var transition = Assert.Single(transitions);
+        var details = Assert.IsType<AgentSmokeFailedDetails>(transition.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Contains("fast-fail circuit breaker", details.Reason);
+        Assert.NotNull(transition.WorkItem);
+        Assert.Equal(item.Id, transition.WorkItem.Id);
+        Assert.NotNull(transition.Project);
+        Assert.Equal("test-project", transition.Project.Id.Value);
+    }
+
     // ── Harness ──────────────────────────────────────────────────────────────
 
-    private TestFixture BuildPipeline(string seedRepoUrl)
+    private TestFixture BuildPipeline(string seedRepoUrl, int maxConsecutiveFastFails = 3)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -186,7 +236,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
 
         var availability = new AgentAvailabilityRegistry(
-            new AvailabilityOptions { FastFailThresholdSeconds = 10, MaxConsecutiveFastFails = 3 },
+            new AvailabilityOptions
+            {
+                FastFailThresholdSeconds = 10,
+                MaxConsecutiveFastFails = maxConsecutiveFastFails,
+            },
             TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
 

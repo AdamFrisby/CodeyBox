@@ -1738,14 +1738,18 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     AgentAvailabilityRegistry registry,
     CancellationToken ct) =>
 {
-    var kind = new AgentKind(name);
+    // Canonical AgentKind values are lowercase ("cursor", "claude", ...) so a
+    // capitalised typo (POST /admin/agent/Cursor/smoke) used to return 404
+    // even when the underlying probe was registered. Normalise so case
+    // never silently shadows the operator's intent.
+    var kind = new AgentKind(name.ToLowerInvariant());
     var result = await periodic.ProbeAsync(kind, ct);
     if (result is null)
         return Results.NotFound(new { error = $"no smoke probe registered for agent '{name}'" });
     var availability = registry.GetAvailability(kind);
     return Results.Ok(new
     {
-        agent = name,
+        agent = kind.Value,
         smoke = new
         {
             ok = result.Ok,
@@ -1762,7 +1766,9 @@ app.MapPost("/admin/agent/{name}/smoke", async (
 
 app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry registry, IAgentRegistry agents) =>
 {
-    var kind = new AgentKind(name);
+    // Mirror /smoke: normalise to lowercase so case-mismatched names match the
+    // canonical kinds returned by IAgentRegistry.Available.
+    var kind = new AgentKind(name.ToLowerInvariant());
     // Validate the agent is actually registered; without this, a typo
     // (e.g. /admin/agent/curser/reset) silently returns 200 and the operator
     // never realises the call did nothing.
@@ -1772,7 +1778,7 @@ app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry
     var availability = registry.GetAvailability(kind);
     return Results.Ok(new
     {
-        agent = name,
+        agent = kind.Value,
         availability = new
         {
             available = availability.Available,

@@ -1537,8 +1537,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // Feed the availability registry so the fast-fail circuit breaker can
         // exclude an agent that exits non-zero in under FastFailThresholdSeconds
         // for MaxConsecutiveFastFails attempts in a row. Captures the exit-127
-        // missing-binary cascade scenario explicitly — see
-        // docs/agent-availability.md.
+        // missing-binary cascade scenario explicitly.
         if (_availability is { } regOnFinish)
         {
             var transition = regOnFinish.RecordRunOutcome(runner.Kind, agentResult.Success, agentSw.Elapsed);

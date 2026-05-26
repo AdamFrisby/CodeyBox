@@ -26,6 +26,7 @@ namespace CodeyBox.Tests;
 /// regression that swapped Reset/GetAvailability or 200'd an unknown name
 /// would ship undetected.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class AgentAvailabilityAdminEndpointTests
     : IClassFixture<AgentAvailabilityAdminEndpointTests.AvailabilityAdminApiFactory>
 {
@@ -126,6 +127,34 @@ public sealed class AgentAvailabilityAdminEndpointTests
         var resp = await client.PostAsync("/admin/agent/curser/reset", content: null);
 
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task PostReset_CapitalisedAgentName_NormalisesToCanonicalLowercase()
+    {
+        // Canonical AgentKind values are lowercase. A capitalised but otherwise
+        // valid name (POST /admin/agent/Claude/reset) used to return 404 because
+        // AgentKind equality is case-sensitive. The endpoint now lowercases the
+        // route value before lookup so case-mismatched typos resolve to the
+        // canonical kind rather than masquerading as "unknown agent".
+        var client = _factory.CreateClient();
+        var resp = await client.PostAsync("/admin/agent/Claude/reset", content: null);
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("claude", body.GetProperty("agent").GetString());
+    }
+
+    [Fact]
+    public async Task PostSmoke_CapitalisedAgentName_NormalisesToCanonicalLowercase()
+    {
+        _factory.SetProbeResult(AgentKind.Claude, pass: true);
+        var client = _factory.CreateClient();
+        var resp = await client.PostAsync("/admin/agent/Claude/smoke", content: null);
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("claude", body.GetProperty("agent").GetString());
     }
 
     [Fact]
