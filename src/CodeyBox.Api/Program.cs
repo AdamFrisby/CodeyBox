@@ -601,11 +601,10 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // when an operator wants to inject the JSON directly via env var
         // without an on-host credential file.
         new AgentCredentialMapping(AgentKind.Cursor, "CODEYBOX_CURSOR_AUTH_JSON", "CODEYBOX_CURSOR_AUTH_JSON"),
-        // opencode subscription is the canonical credential path; this entry
-        // covers the operator-supplied "OPENCODE_API_KEY" env-var fallback
-        // for deployments that issue a non-subscription token. Do NOT add a
-        // DEEPSEEK_API_KEY-style side-channel — opencode owns provider auth.
-        new AgentCredentialMapping(AgentKind.Opencode, "CODEYBOX_OPENCODE_API_KEY", "OPENCODE_API_KEY"),
+        // Note: no OPENCODE_API_KEY mapping. The opencode subscription IS the
+        // credential path; auth flows exclusively through the auth.json file
+        // materialised by OpencodeOAuthFileCredentialProvider. See the brief
+        // for the relevant 'Don't do' rule and docs/agents.md for setup.
     }));
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {

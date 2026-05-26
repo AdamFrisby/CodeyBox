@@ -13,6 +13,12 @@ namespace CodeyBox.Agents.Opencode;
 /// <c>QuotaUnknownPolicy=UseObservedFailures</c> behaviour for opencode
 /// members until a real probe endpoint is confirmed.</para>
 ///
+/// <para>The class is intentionally a typed alias of
+/// <c>NullQuotaProbe</c>'s shape — registering an explicit per-agent
+/// instance keeps the dependency-injection graph symmetrical with the
+/// other agents and gives future contributors a clear seam to swap in a
+/// real implementation. Do NOT delete it as dead code.</para>
+///
 /// <para>To wire a real endpoint later: replace
 /// <see cref="GetAvailabilityAsync"/> with an <c>HttpClient</c> call mirroring
 /// <c>CodexQuotaProbe</c> (named client <c>agent-quota</c>, never log the

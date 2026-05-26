@@ -200,6 +200,34 @@ public sealed class OpencodeAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_CredentialWithoutAuthJsonKey_DoesNotRunMaterialisationScript()
+    {
+        // Distinct branch from the null-credential case: a non-null credential
+        // whose env dict does NOT contain OPENCODE_AUTH_JSON (e.g. a bundle
+        // assembled from an unrelated env-var mapping) must also skip
+        // materialisation rather than write empty content to the destination
+        // file. Pins the OR shape in PrepareSandboxAsync so a regression that
+        // swapped it for AND, or renamed the OPENCODE_AUTH_JSON key, would
+        // be caught here.
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Opencode,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                // Intentionally a different key — represents a bundle that
+                // somehow reached the runner without the auth file payload.
+                ["SOMETHING_ELSE"] = "value",
+            },
+            new Dictionary<string, string>());
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        Assert.Equal(-1, FindMaterialisationScriptIndex(sandbox.Execs));
+        Assert.True(FindOpencodeExecIndex(sandbox.Execs) >= 0);
+    }
+
+    [Fact]
     public async Task RunAsync_WithCredential_MaterialisationRunsBeforeOpencodeCli()
     {
         var sandbox = new RecordingSandbox();
@@ -234,11 +262,12 @@ public sealed class OpencodeAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_MaterialisationScript_HasUmask077_BeforeWrite()
+    public async Task RunAsync_MaterialisationScript_HasUmask077_BeforeMkdirAndWrite()
     {
-        // Auth file must end up at 0600. Order: umask 077 must precede the
-        // printf that writes the file, else the file gets the inherited
-        // umask (typically 022 → 0644 — world-readable).
+        // Auth file (and parent dir) must end up at 0700/0600. Order:
+        // umask 077 must precede BOTH mkdir -p (so the dir inherits 0700,
+        // not the typical 0755) AND the printf that writes the file (so
+        // newly created files inherit 0600, not 0644).
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
         var cred = OpencodeCred("""{"x":1}""");
@@ -247,10 +276,33 @@ public sealed class OpencodeAgentRunnerTests
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
         var umaskIdx = script.IndexOf("umask 077", StringComparison.Ordinal);
+        var mkdirIdx = script.IndexOf("mkdir -p", StringComparison.Ordinal);
         var printfIdx = script.IndexOf("printf", StringComparison.Ordinal);
         Assert.True(umaskIdx >= 0, "script must set umask 077");
+        Assert.True(mkdirIdx >= 0, "script must mkdir the parent directory");
         Assert.True(printfIdx >= 0, "script must write the auth file via printf");
+        Assert.True(umaskIdx < mkdirIdx, "umask 077 must come before mkdir so the parent dir is 0700");
         Assert.True(umaskIdx < printfIdx, "umask 077 must come before the printf write");
+    }
+
+    [Fact]
+    public async Task RunAsync_MaterialisationScript_ChmodsAuthFileTo600()
+    {
+        // chmod 600 is a defense-in-depth backstop: umask only affects newly
+        // created files, so a pre-existing auth.json with looser modes
+        // would keep them after a truncate-rewrite. Explicit chmod pins the
+        // mode regardless of pre-existing state.
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"x":1}""");
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
+        var printfIdx = script.IndexOf("printf", StringComparison.Ordinal);
+        var chmodIdx = script.IndexOf("chmod 600", StringComparison.Ordinal);
+        Assert.True(chmodIdx >= 0, "script must chmod the auth file to 0600");
+        Assert.True(printfIdx < chmodIdx, "chmod must run after the printf write");
     }
 
     [Fact]

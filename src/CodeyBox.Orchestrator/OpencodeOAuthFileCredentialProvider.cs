@@ -8,10 +8,13 @@ namespace CodeyBox.Orchestrator;
 /// exposes its raw bytes to the sandbox as <c>OPENCODE_AUTH_JSON</c>, plus
 /// an optional in-sandbox destination path under <c>OPENCODE_AUTH_DEST_PATH</c>.
 ///
-/// <para><see cref="CodeyBox.Agents.Opencode.OpencodeAgentRunner"/> writes
-/// the bytes back to disk inside the VM before invoking <c>opencode run</c>.
+/// <para>The opencode runner (in CodeyBox.Agents.Opencode) writes the
+/// bytes back to disk inside the VM before invoking <c>opencode run</c>.
 /// Re-reading on each pickup picks up token rotations from the host's
-/// opencode CLI without an orchestrator restart, mirroring the Codex flow.</para>
+/// opencode CLI without an orchestrator restart, mirroring the Codex flow.
+/// The cref is intentionally prose rather than <c>&lt;see cref="..."/&gt;</c>
+/// because CodeyBox.Orchestrator does not (and must not) reference the
+/// per-agent project — that would invert the dependency direction.</para>
 ///
 /// <para>This provider only handles <see cref="AgentKind.Opencode"/>; it
 /// returns null for any other agent so the chained env-var provider can

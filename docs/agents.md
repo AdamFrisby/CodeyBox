@@ -15,7 +15,7 @@ tooling, not in the agent runner contract.
 | `codex`     | `codex`           | `OPENAI_API_KEY`        | `CODEYBOX_CODEX_API_KEY`  |
 | `gemini`    | `gemini`          | `GEMINI_API_KEY`        | `CODEYBOX_GEMINI_API_KEY` |
 | `cursor`    | `agent`           | `CODEYBOX_CURSOR_AUTH_JSON` (subscription credentials JSON) | `CODEYBOX_CURSOR_AUTH_FILE` (file path on host) |
-| `opencode`  | `opencode`        | `OPENCODE_API_KEY` or `OPENCODE_AUTH_JSON` (file-materialised) | `CODEYBOX_OPENCODE_API_KEY` or `CODEYBOX_OPENCODE_AUTH_FILE` |
+| `opencode`  | `opencode`        | `OPENCODE_AUTH_JSON` (file-materialised) | `CODEYBOX_OPENCODE_AUTH_FILE` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side env
 name is what the orchestrator's `EnvironmentCredentialProvider` looks up
@@ -151,26 +151,26 @@ curl -fsSL https://opencode.ai/install | bash
 
 **Authentication.** opencode bundles access to multiple model providers
 (DeepSeek, Anthropic, OpenAI, …) under a single "opencode Go" subscription
-credential written by `opencode auth login`. CodeyBox supports two auth paths:
+credential written by `opencode auth login`. The subscription auth file is
+the only supported credential path; there is intentionally no API-key
+side-channel (per the brief's "Don't do" rule — provider-specific keys
+like `DEEPSEEK_API_KEY` are NOT honoured).
 
-* **Subscription (preferred):** point `CODEYBOX_OPENCODE_AUTH_FILE` at the
-  host file `opencode auth login` writes (default
-  `~/.local/share/opencode/auth.json`; verify with the CLI on the host).
-  CodeyBox watches the file, ships its raw bytes to the sandbox as
-  `OPENCODE_AUTH_JSON`, and the runner materialises them inside the VM
-  before invoking `opencode run`. Token rotations from the host CLI are
-  picked up without an orchestrator restart.
+Point `CODEYBOX_OPENCODE_AUTH_FILE` at the host file `opencode auth login`
+writes (default `~/.local/share/opencode/auth.json`; verify with the CLI
+on the host). CodeyBox watches the file, ships its raw bytes to the
+sandbox as `OPENCODE_AUTH_JSON`, and the runner materialises them inside
+the VM before invoking `opencode run`. Token rotations from the host CLI
+are picked up without an orchestrator restart.
 
-  If `opencode auth login` writes its credential file somewhere other than
-  the XDG default, set `CODEYBOX_OPENCODE_AUTH_DEST` on the host to the
-  sandbox-side path opencode expects to find the file at. The default value
-  is the XDG path which appears to be opencode's current default but has
-  not been verified in this environment.
-
-* **API key fallback:** set `CODEYBOX_OPENCODE_API_KEY` on the host. The
-  orchestrator injects it as `OPENCODE_API_KEY` inside the sandbox. Do
-  NOT add provider-specific keys (`DEEPSEEK_API_KEY`, etc.) as side
-  channels — the opencode subscription IS the credential path.
+If `opencode auth login` writes its credential file somewhere other than
+the XDG default, set `CODEYBOX_OPENCODE_AUTH_DEST` on the host to the
+sandbox-side path opencode expects to find the file at. The default value
+is the XDG path which appears to be opencode's current default but has
+not been verified in this environment. Operator-trust boundary: the value
+flows into the in-sandbox materialisation script as-is, so keep it under
+`$HOME` and avoid pointing at `/etc/*` or symlinks unless you intend to
+overwrite the target.
 
 **Default model.** The runner ships with `DefaultModelId` pointed at a
 DeepSeek-coder variant. DeepSeek is the differentiated capability opencode
@@ -415,7 +415,7 @@ credentials before they waste expensive compute.
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent` | `x-goog-api-key: <api-key>` |
 | `copilot` | *(no probe)* — always passes | — |
 | `cursor` | *(no HTTP probe — Cursor exposes no public usage endpoint)* — verifies the credential bundle carries `CODEYBOX_CURSOR_AUTH_JSON`; real auth check happens on first CLI call | — |
-| `opencode` | *(no network call)* — credential-presence check only | `OPENCODE_AUTH_JSON` or `OPENCODE_API_KEY` |
+| `opencode` | *(no network call)* — credential-presence check only | `OPENCODE_AUTH_JSON` |
 
 Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
 means the credential is valid. 401/403 is classified as `"auth"` failure.

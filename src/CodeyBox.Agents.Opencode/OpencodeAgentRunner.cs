@@ -68,13 +68,23 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         // credential provider on the host from CODEYBOX_OPENCODE_AUTH_DEST).
         // The runner does not parse the JSON; opencode owns its schema and
         // any drift there is the operator's to verify with `opencode auth`.
+        //
+        // Order matters:
+        //   1. umask 077 BEFORE mkdir -p, so the parent directory is 0700
+        //      (not 0755 inherited from the system umask).
+        //   2. printf truncate-rewrite, then explicit chmod 600 — umask
+        //      only affects NEWLY created files; if a destination auth.json
+        //      already exists with looser modes (e.g. 0644 from a prior
+        //      `opencode auth login`), the truncate does not change the
+        //      mode. chmod pins 0600 regardless of pre-existing state.
         var script =
             "set -eu\n" +
             "dest=\"${OPENCODE_AUTH_DEST_PATH:-$HOME/.local/share/opencode/auth.json}\"\n" +
-            "mkdir -p \"$(dirname \"$dest\")\"\n" +
             "umask 077\n" +
+            "mkdir -p \"$(dirname \"$dest\")\"\n" +
             "if [ -n \"${OPENCODE_AUTH_JSON:-}\" ]; then\n" +
             "  printf '%s' \"$OPENCODE_AUTH_JSON\" > \"$dest\"\n" +
+            "  chmod 600 \"$dest\"\n" +
             "fi\n";
         var write = await sandbox.ExecAsync(new SandboxExec
         {
@@ -91,6 +101,15 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         return null;
     }
 
+    /// <summary>
+    /// Builds the <c>opencode run</c> argv. The <paramref name="captureStructuredStream"/>
+    /// parameter is currently discarded — opencode's structured stream
+    /// format has not been verified against a live invocation in this
+    /// environment, so the runner does not implement
+    /// <see cref="IStructuredStreamAgentRunner"/>. If you flip a caller to
+    /// request structured stream capture, expect plain stdout/stderr back
+    /// rather than parsed events.
+    /// </summary>
     protected override AgentInvocation BuildInvocation(
         string prompt,
         AgentCredential? credential,

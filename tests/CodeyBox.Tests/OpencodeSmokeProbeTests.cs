@@ -34,8 +34,13 @@ public sealed class OpencodeSmokeProbeTests
     }
 
     [Fact]
-    public async Task SmokeTest_ApiKeyPresent_ReturnsOk()
+    public async Task SmokeTest_ApiKeyOnly_ReturnsFail()
     {
+        // OPENCODE_API_KEY is intentionally NOT a credential path — the
+        // opencode subscription auth file is the only supported route. A
+        // bundle that contains only an API-key entry must NOT pass the
+        // smoke probe (it would surface as a misconfiguration at dispatch
+        // time instead).
         var probe = new OpencodeSmokeProbe();
         var cred = new AgentCredential(AgentKind.Opencode,
             new Dictionary<string, string> { ["OPENCODE_API_KEY"] = "sk-opencode-test" },
@@ -43,7 +48,7 @@ public sealed class OpencodeSmokeProbeTests
 
         var result = await probe.SmokeTestAsync(cred, CancellationToken.None);
 
-        Assert.True(result.Ok);
+        Assert.False(result.Ok);
     }
 
     [Fact]
@@ -54,7 +59,6 @@ public sealed class OpencodeSmokeProbeTests
             new Dictionary<string, string>
             {
                 ["OPENCODE_AUTH_JSON"] = string.Empty,
-                ["OPENCODE_API_KEY"] = string.Empty,
             },
             new Dictionary<string, string>());
 

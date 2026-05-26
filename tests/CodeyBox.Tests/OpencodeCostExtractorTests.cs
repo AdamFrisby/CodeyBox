@@ -210,6 +210,22 @@ public sealed class OpencodeCostExtractorTests
     }
 
     [Fact]
+    public void HumanReadable_PromptCompletionForm_IsCaseInsensitive()
+    {
+        // UsagePromptPattern / UsageCompletionPattern also carry IgnoreCase
+        // so uppercase final-summary emissions (e.g. "PROMPT TOKENS:" from
+        // shouty CLIs) still parse. Pins the symmetry with the
+        // Input/Output form above.
+        var stdout = "PROMPT TOKENS: 11  COMPLETION TOKENS: 4";
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(11, result!.InputTokens);
+        Assert.Equal(4, result.OutputTokens);
+    }
+
+    [Fact]
     public void HumanReadable_OnlyPromptNoCompletion_ReturnsNull()
     {
         // Both halves of the human-readable form must match — otherwise we

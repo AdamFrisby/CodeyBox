@@ -28,18 +28,25 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
 
     public ModelRateConfig? DefaultPricing { get; } = null;
 
+    // Cap on the model id recorded for cost attribution. Bounded so a
+    // pathological provider response can't blow past the schema column
+    // width on the downstream cost-summary table.
+    private const int MaxModelIdLength = 128;
+
+    // All four patterns are IgnoreCase to avoid mismatches against
+    // uppercase emissions like "PROMPT TOKENS:" / "COMPLETION TOKENS:" that
+    // some opencode model wrappers produce.
+    private const RegexOptions PatternOptions =
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
+
     private static readonly Regex UsagePromptPattern = new(
-        @"[Pp]rompt\s+tokens?[:\s]+(\d[\d,]*)",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+        @"prompt\s+tokens?[:\s]+(\d[\d,]*)", PatternOptions);
     private static readonly Regex UsageCompletionPattern = new(
-        @"[Cc]ompletion\s+tokens?[:\s]+(\d[\d,]*)",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+        @"completion\s+tokens?[:\s]+(\d[\d,]*)", PatternOptions);
     private static readonly Regex InputPattern = new(
-        @"(\d[\d,]*)\s+input\s+tokens?",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        @"(\d[\d,]*)\s+input\s+tokens?", PatternOptions);
     private static readonly Regex OutputPattern = new(
-        @"(\d[\d,]*)\s+output\s+tokens?",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        @"(\d[\d,]*)\s+output\s+tokens?", PatternOptions);
 
     public AgentCostSnapshot? TryExtract(string? agentStdout, string? agentStderr)
     {
@@ -61,14 +68,21 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
             StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             if (!line.Contains("usage", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!line.StartsWith('{') && !line.Contains('{')) continue;
+            // StartsWith('{') would be implied by Contains('{'), so just
+            // Contains. Skip lines that obviously aren't a JSON fragment.
+            if (!line.Contains('{')) continue;
             try
             {
                 using var doc = JsonDocument.Parse(line);
                 var snapshot = ExtractFromDoc(doc.RootElement);
                 if (snapshot is not null) return snapshot;
             }
-            catch (JsonException) { }
+            catch (JsonException)
+            {
+                // Intentional: many opencode emissions interleave non-JSON
+                // chatter with usage hints, so the loop is best-effort
+                // per-line and continues to the next candidate.
+            }
         }
 
         try
@@ -98,7 +112,7 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
         if (root.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String)
         {
             var raw = m.GetString();
-            modelId = raw is { Length: > 128 } ? raw[..128] : raw;
+            modelId = raw is { Length: > MaxModelIdLength } ? raw[..MaxModelIdLength] : raw;
         }
 
         if (input == 0 && output == 0) return null;
