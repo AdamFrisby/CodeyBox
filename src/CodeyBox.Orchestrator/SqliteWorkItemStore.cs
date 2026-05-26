@@ -153,6 +153,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // endpoint increments this on every successful write.
         RunMigration("ALTER TABLE work_items ADD COLUMN prompt_revision INTEGER NOT NULL DEFAULT 1;");
 
+        // Additive migration: counts conflict-rework iterations executed on
+        // this work item. Capped at 1 per merge attempt; the pipeline parks at
+        // MergeConflictResolutionFailed past the cap rather than re-engaging
+        // the original work agent a second time.
+        RunMigration("ALTER TABLE work_items ADD COLUMN conflict_rework_attempts INTEGER NOT NULL DEFAULT 0;");
+
         // Per-iteration dispatch record. One row per (work_item_id, iteration);
         // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
         // restart-recovery for the same iteration) overwrites the row via
@@ -209,12 +215,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                     min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
                     failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
-                    cancellation_source, transient_cancel_retries, prompt_revision)
+                    cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                     $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                     $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                     $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
-                    $cancellation_source, $transient_cancel_retries, $prompt_revision);
+                    $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -271,7 +277,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
-                    transient_cancel_retries = $transient_cancel_retries
+                    transient_cancel_retries = $transient_cancel_retries,
+                    conflict_rework_attempts = $conflict_rework_attempts
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -318,7 +325,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
-                    transient_cancel_retries = $transient_cancel_retries
+                    transient_cancel_retries = $transient_cancel_retries,
+                    conflict_rework_attempts = $conflict_rework_attempts
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -831,6 +839,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$cancellation_source", (object?)item.CancellationSource ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$transient_cancel_retries", item.TransientCancelRetries);
         cmd.Parameters.AddWithValue("$prompt_revision", item.PromptRevision);
+        cmd.Parameters.AddWithValue("$conflict_rework_attempts", item.ConflictReworkAttempts);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -874,6 +883,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         CancellationSource = ReadNullableString(r, "cancellation_source"),
         TransientCancelRetries = ReadInt32OrDefault(r, "transient_cancel_retries", defaultValue: 0),
         PromptRevision = ReadInt32OrDefault(r, "prompt_revision", defaultValue: 1),
+        ConflictReworkAttempts = ReadInt32OrDefault(r, "conflict_rework_attempts", defaultValue: 0),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)

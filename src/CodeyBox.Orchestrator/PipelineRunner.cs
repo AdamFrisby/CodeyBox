@@ -513,7 +513,43 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 await PublishMergeStartedAsync(item, project, baseBranch, workBranch, ct);
                 await Transition(item, WorkItemState.Merging, ct, project);
-                (mergeSha, agentStdout) = await RunMergePhase(ct);
+                try
+                {
+                    (mergeSha, agentStdout) = await RunMergePhase(ct);
+                }
+                catch (MergeConflictResolutionFailedException firstFailure)
+                {
+                    // Third-line fallback: c9fd5b75 (preventive auto-rebase) and the
+                    // merge-phase agent (77ce33c667 on 405 race) have both run their
+                    // course. Re-engage the ORIGINAL work agent — who knows why this
+                    // PR was written — with a focused conflict-resolution prompt on
+                    // the existing work branch. Capped at one iteration per merge
+                    // attempt; a second failure parks at MergeConflictResolutionFailed.
+                    var current = await _store.GetAsync(item.Id, ct) ?? item;
+                    if (current.ConflictReworkAttempts > 0)
+                    {
+                        _log.LogWarning(
+                            "Work item {Id} merge conflict-rework already ran ({Attempts}); not re-engaging the agent",
+                            item.Id, current.ConflictReworkAttempts);
+                        throw;
+                    }
+
+                    var reworkOutcome = await RunConflictReworkIterationAsync(
+                        current, project, agentRunner, repoId, baseBranch, workBranch,
+                        firstFailure, ct, hostShutdownToken);
+                    if (!reworkOutcome.Success)
+                    {
+                        throw new MergeConflictResolutionFailedException(reworkOutcome.ParkReason!, firstFailure);
+                    }
+
+                    // Refresh the local snapshot so subsequent UpdateAsync
+                    // calls (which use UPDATE … SET … from a stale `item`)
+                    // don't clobber the bumped ConflictReworkAttempts and the
+                    // new state recorded during the rework iteration.
+                    item = await _store.GetAsync(item.Id, ct) ?? item;
+                    await Transition(item, WorkItemState.Merging, ct, project);
+                    (mergeSha, agentStdout) = await RunMergePhase(ct);
+                }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
                 await _store.UpdateAsync(item with { MergeSha = mergeSha }, ct);
                 await Transition(item, WorkItemState.Merged, ct, project);
@@ -4872,6 +4908,756 @@ public sealed class PipelineRunner : IPipelineRunner
             NewAgentStdout: newAgentStdout);
     }
 
+    // ── Conflict-rework iteration (third-line merge fallback) ────────────────
+
+    /// <summary>
+    /// Phase key for cost/timing rows captured during the focused
+    /// conflict-rework iteration. Kept distinct from <c>work</c>/<c>rework</c>
+    /// so operators can measure how much budget the third-line fallback is
+    /// burning per failed merge.
+    /// </summary>
+    internal const string ConflictReworkPhaseKey = "conflict_rework";
+
+    /// <summary>
+    /// Marker the rework agent prints when it believes the upstream change and
+    /// its own intent cannot coexist at the semantic level. The orchestrator
+    /// detects this prefix in the agent's stdout (case-sensitive), parks the
+    /// item at <see cref="WorkItemState.MergeConflictResolutionFailed"/> with
+    /// the verbatim reason, and stops re-engaging the agent.
+    /// </summary>
+    internal const string SemanticIncompatibleMarker = "SEMANTIC_INCOMPATIBLE:";
+
+    /// <summary>
+    /// Outcome of <see cref="RunConflictReworkIterationAsync"/>. When
+    /// <see cref="Success"/> is true the caller advances the work branch and
+    /// re-runs the merge phase; otherwise <see cref="ParkReason"/> carries the
+    /// message the outer catch will record on
+    /// <see cref="WorkItemState.MergeConflictResolutionFailed"/>.
+    /// </summary>
+    private readonly record struct ConflictReworkResult(bool Success, string? ParkReason);
+
+    /// <summary>
+    /// Runs the focused conflict-rework iteration: re-engages the original
+    /// work agent (same class) on the existing work branch with a prompt that
+    /// explicitly preserves prior commits and resolves the upstream conflict.
+    ///
+    /// <para>
+    /// Contract — must hold at agent invocation:
+    ///   1. HEAD is the existing work branch tip (not main).
+    ///   2. A rebase against current <paramref name="baseBranch"/> is in progress
+    ///      and paused at the conflict; conflict markers are in the worktree
+    ///      and the index is in a conflicted state.
+    ///   3. No commits have been discarded; <c>git log HEAD..ORIG_HEAD</c>
+    ///      lists the work agent's prior commits.
+    /// </para>
+    ///
+    /// <para>
+    /// Anti-abandonment guard: after the agent finishes, every commit that
+    /// was on the work branch before the rework must remain in the new tip's
+    /// ancestry. A destructive action (typically <c>git reset --hard</c> /
+    /// <c>git rebase --abort</c> / <c>git checkout main</c>) fails this check
+    /// and the item parks instead of force-pushing a salvage.
+    /// </para>
+    /// </summary>
+    private async Task<ConflictReworkResult> RunConflictReworkIterationAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        MergeConflictResolutionFailedException originalFailure,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        var startedAt = DateTimeOffset.UtcNow;
+
+        string baseTip;
+        string priorWorkTip;
+        try
+        {
+            baseTip = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
+            priorWorkTip = await _gitHost.ResolveCommitAsync(repoId, workBranch, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "Conflict rework: could not resolve branch SHAs for work item {Id}; declining to engage agent",
+                item.Id);
+            return new ConflictReworkResult(false,
+                $"could not resolve branch tips before conflict rework: {ex.Message}");
+        }
+
+        var bumped = await BumpConflictReworkAttemptsAsync(item, ct);
+        item = bumped ?? item;
+
+        await Transition(item, WorkItemState.ReworkingForConflict, ct, project);
+
+        // Capture the file-set the work agent's prior commits modified. `git
+        // rebase` re-creates commits with new SHAs so an ancestor-SHA check
+        // doesn't survive a clean rebase; the *changed-file set* does. A
+        // destructive `git reset --hard origin/<base>` produces an empty new
+        // diff while the prior diff is non-empty, which is the anti-
+        // abandonment signal.
+        IReadOnlyList<string> priorChangedFiles;
+        try
+        {
+            priorChangedFiles = await ListChangedFilesAsync(repoId, baseTip, priorWorkTip, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "Conflict rework: could not enumerate prior changed files on '{Branch}' for work item {Id}",
+                workBranch, item.Id);
+            priorChangedFiles = [];
+        }
+
+        var conflictFiles = ExtractConflictFilesFromMessage(originalFailure.Message);
+
+        await TryPublishEventAsync(item, project, "work_item.conflict_rework_started",
+            new ConflictReworkStartedDetails
+            {
+                WorkItemId = item.Id.ToString(),
+                BaseBranch = baseBranch,
+                WorkBranch = workBranch,
+                WorkBranchTip = priorWorkTip,
+                BaseTip = baseTip,
+                ConflictFiles = conflictFiles,
+            }, ct);
+
+        ConflictReworkAgentOutcome outcome;
+        try
+        {
+            outcome = await RunConflictReworkAgentAsync(
+                item, project, runner, repoId, baseBranch, workBranch,
+                priorWorkTip, baseTip, conflictFiles, originalFailure,
+                ct, hostShutdownToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "Conflict rework agent invocation failed for work item {Id}: {Message}",
+                item.Id, ex.Message);
+            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                success: false, newTip: null, filesChanged: null,
+                insertions: null, deletions: null, semanticIncompatible: null,
+                parkReason: ex.Message, ct);
+            return new ConflictReworkResult(false,
+                $"conflict-rework agent failed: {ex.Message}");
+        }
+
+        if (outcome.SemanticIncompatibleReason is not null)
+        {
+            var parkMsg = $"{SemanticIncompatibleMarker} {outcome.SemanticIncompatibleReason}";
+            _log.LogWarning(
+                "Work item {Id} conflict-rework declared semantic-incompatible: {Reason}",
+                item.Id, outcome.SemanticIncompatibleReason);
+            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
+                insertions: outcome.Insertions, deletions: outcome.Deletions,
+                semanticIncompatible: outcome.SemanticIncompatibleReason,
+                parkReason: parkMsg, ct);
+            return new ConflictReworkResult(false, parkMsg);
+        }
+
+        if (!outcome.AgentSucceeded || outcome.NewTip is null)
+        {
+            var parkMsg = $"conflict-rework agent did not produce a clean resolution: {outcome.FailureReason ?? "agent reported failure"}";
+            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
+                insertions: outcome.Insertions, deletions: outcome.Deletions,
+                semanticIncompatible: null, parkReason: parkMsg, ct);
+            return new ConflictReworkResult(false, parkMsg);
+        }
+
+        // Anti-abandonment guard: the file-set the work agent touched
+        // (relative to `baseTip`) must remain reflected in the rework's diff
+        // against the same base. A clean rebase preserves these — the SHAs
+        // change but the files do not. A destructive `git reset --hard
+        // origin/<base>` produces an empty diff and trips this check.
+        if (priorChangedFiles.Count > 0)
+        {
+            IReadOnlyList<string> newChangedFiles;
+            try
+            {
+                newChangedFiles = await ListChangedFilesAsync(repoId, baseTip, outcome.NewTip, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogWarning(ex,
+                    "Conflict rework: could not enumerate rework changed files for work item {Id}; refusing to advance",
+                    item.Id);
+                var listFailMsg = $"could not verify rework diff for anti-abandonment guard: {ex.Message}";
+                await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                    success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
+                    insertions: outcome.Insertions, deletions: outcome.Deletions,
+                    semanticIncompatible: null, parkReason: listFailMsg, ct);
+                return new ConflictReworkResult(false, listFailMsg);
+            }
+
+            var newSet = newChangedFiles.ToHashSet(StringComparer.Ordinal);
+            var missing = priorChangedFiles
+                .Where(f => !newSet.Contains(f))
+                .ToArray();
+            if (missing.Length > 0 || newChangedFiles.Count == 0)
+            {
+                var hint = missing.Length > 0 ? missing[0] : "(all)";
+                var parkMsg = $"conflict-rework agent discarded prior commits (e.g. work to {hint} lost); refusing to update work branch";
+                _log.LogWarning(
+                    "Work item {Id} conflict-rework dropped work-agent changes; missing={Missing}, priorTouched={Prior}, newTouched={New}",
+                    item.Id, string.Join(',', missing), priorChangedFiles.Count, newChangedFiles.Count);
+                await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                    success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
+                    insertions: outcome.Insertions, deletions: outcome.Deletions,
+                    semanticIncompatible: null, parkReason: parkMsg, ct);
+                return new ConflictReworkResult(false, parkMsg);
+            }
+        }
+
+        // All checks passed. Advance the host-side work branch to the new tip
+        // so the upcoming RunMergePhase reads it.
+        try
+        {
+            await _gitHost.SetBranchToCommitAsync(repoId, workBranch, outcome.NewTip, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var parkMsg = $"could not advance work branch '{workBranch}' to rework tip {outcome.NewTip}: {ex.Message}";
+            _log.LogWarning(ex,
+                "Conflict rework: failed to set work branch to rework tip for work item {Id}",
+                item.Id);
+            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
+                insertions: outcome.Insertions, deletions: outcome.Deletions,
+                semanticIncompatible: null, parkReason: parkMsg, ct);
+            return new ConflictReworkResult(false, parkMsg);
+        }
+
+        _ = startedAt; // currently unused; future: emit conflict_rework duration metric.
+
+        await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+            success: true, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
+            insertions: outcome.Insertions, deletions: outcome.Deletions,
+            semanticIncompatible: null, parkReason: null, ct);
+
+        return new ConflictReworkResult(true, null);
+    }
+
+    /// <summary>
+    /// Bundle of state the rework iteration produced for the host to inspect.
+    /// </summary>
+    private readonly record struct ConflictReworkAgentOutcome(
+        bool AgentSucceeded,
+        string? NewTip,
+        string? FailureReason,
+        string? SemanticIncompatibleReason,
+        IReadOnlyList<string>? FilesChanged,
+        int? Insertions,
+        int? Deletions);
+
+    /// <summary>
+    /// Drives the agent through a single conflict-rework iteration inside an
+    /// isolated sandbox. Returns the new branch tip + diff stats on success, or
+    /// the failure reason. Does NOT mutate the host bare repo on its own — the
+    /// caller is responsible for the anti-abandonment ancestry check and the
+    /// final force-update of the host work branch.
+    /// </summary>
+    private async Task<ConflictReworkAgentOutcome> RunConflictReworkAgentAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        string priorWorkTip,
+        string baseTip,
+        IReadOnlyList<string> conflictFiles,
+        MergeConflictResolutionFailedException originalFailure,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        // The conflict-rework iteration uses an isolated bare repo clone so a
+        // destructive agent action (rebase --abort, reset --hard, etc.) cannot
+        // damage the durable host bare repo. The caller still verifies prior
+        // commits remain in ancestry before applying the result.
+        var isolatedRepoPath = await CreateIsolatedMergeRepositoryAsync(repoId, item.Id, ct);
+        try
+        {
+            var credential = _credentials is IProjectAwareCredentialProvider pac
+                ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
+                : await _credentials.GetAsync(runner.Kind, ct);
+            var access = new SandboxRepositoryAccess(
+                LocalGitHost.SandboxRepoMountPath,
+                [new SandboxMount { SandboxPath = LocalGitHost.SandboxRepoMountPath, HostPath = isolatedRepoPath, ReadOnly = false }],
+                SandboxNetworkPolicy.Denied);
+            var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
+                hostNetworkProfile: project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
+                timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey);
+
+            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            if (credential is not null && credential.Files.Count > 0)
+                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+
+            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+
+            // Fetch the work branch + base into the sandbox clone, then check out
+            // the work branch at its existing tip and start a rebase against base.
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", workBranch);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", baseBranch);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
+
+            // Start the rebase. We expect it to fail with conflicts (that's the
+            // whole reason we're here); the agent receives the worktree in that
+            // exact paused-at-conflict state.
+            var rebaseStart = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", $"origin/{baseBranch}"],
+            }, ct);
+            if (rebaseStart.Success)
+            {
+                // The host saw conflicts, but the sandbox rebase came back
+                // clean. Most likely: upstream advanced after the merge phase
+                // ran. Treat as a successful no-op resolution and push.
+                _log.LogInformation(
+                    "Conflict rework: sandbox rebase of '{Work}' onto '{Base}' completed without conflicts; treating as recovered",
+                    workBranch, baseBranch);
+                return await PushAndStatConflictReworkAsync(sandbox, isolatedRepoPath, repoId, workBranch, priorWorkTip, baseBranch, ct);
+            }
+
+            // Verify the rebase is actually paused — guard against transient
+            // git errors that aren't conflict-related.
+            var statusBefore = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
+            }, ct);
+            if (!statusBefore.Success || string.IsNullOrWhiteSpace(statusBefore.Stdout))
+            {
+                return new ConflictReworkAgentOutcome(
+                    AgentSucceeded: false,
+                    NewTip: null,
+                    FailureReason: $"rebase failed but status came back clean: {rebaseStart.Stderr.Trim()}",
+                    SemanticIncompatibleReason: null,
+                    FilesChanged: null, Insertions: null, Deletions: null);
+            }
+
+            // Collect the actual sandbox-side conflict file list (more reliable
+            // than the host's pre-merge probe). Fall back to the caller's list
+            // when git ls-files is empty for any reason.
+            var sandboxConflictFiles = await ListSandboxConflictFilesAsync(sandbox, ct);
+            if (sandboxConflictFiles.Count == 0) sandboxConflictFiles = conflictFiles;
+
+            var prompt = BuildConflictReworkPrompt(
+                item.Prompt, baseBranch, workBranch, sandboxConflictFiles, originalFailure.Message);
+
+            // Run the agent. We use the same agent identity/class as the
+            // original work agent (this method's `runner` parameter); the
+            // contract is `IAgentRunner.RunAsync`, identical to the work phase.
+            using var phase = new PhaseCancellation(ConflictReworkPhaseKey, ct, _opts.TimeProvider);
+            phase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+            phase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+            AgentResult agentResult;
+            var startedAt = DateTimeOffset.UtcNow;
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                agentResult = await runner.RunAsync(
+                    sandbox, SandboxConventions.WorkDir, prompt, credential,
+                    item.ModelId, item.ReasoningMode, phase.Token);
+            }
+            catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+            {
+                throw phase.Wrap(oce);
+            }
+            stopwatch.Stop();
+            var endedAt = DateTimeOffset.UtcNow;
+            await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
+                runner.Kind, item.Id, ConflictReworkPhaseKey, iteration: null, startedAt, endedAt);
+
+            var combined = (agentResult.Stdout ?? string.Empty) + "\n" + (agentResult.Stderr ?? string.Empty);
+            var semanticIncompatible = ExtractSemanticIncompatibleReason(combined);
+            if (semanticIncompatible is not null)
+            {
+                return new ConflictReworkAgentOutcome(
+                    AgentSucceeded: false,
+                    NewTip: null,
+                    FailureReason: null,
+                    SemanticIncompatibleReason: semanticIncompatible,
+                    FilesChanged: null, Insertions: null, Deletions: null);
+            }
+
+            if (!agentResult.Success)
+            {
+                return new ConflictReworkAgentOutcome(
+                    AgentSucceeded: false,
+                    NewTip: null,
+                    FailureReason: agentResult.Summary,
+                    SemanticIncompatibleReason: null,
+                    FilesChanged: null, Insertions: null, Deletions: null);
+            }
+
+            // Some agents may have already advanced HEAD via `git rebase
+            // --continue`; others leave the rebase in progress. If a rebase is
+            // still in flight after a "successful" exit, try to continue once;
+            // if that fails, treat as agent failure.
+            var rebaseInProgress = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "test -d \"$0/.git/rebase-merge\" -o -d \"$0/.git/rebase-apply\"", SandboxConventions.WorkDir],
+            }, ct);
+            if (rebaseInProgress.ExitCode == 0)
+            {
+                var continueResult = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--continue"],
+                    ExtraEnvironment = new Dictionary<string, string>
+                    {
+                        ["GIT_EDITOR"] = "true",
+                        ["GIT_SEQUENCE_EDITOR"] = "true",
+                    },
+                }, ct);
+                if (!continueResult.Success)
+                {
+                    return new ConflictReworkAgentOutcome(
+                        AgentSucceeded: false,
+                        NewTip: null,
+                        FailureReason: $"agent left rebase in progress and 'rebase --continue' failed: {continueResult.Stderr.Trim()}",
+                        SemanticIncompatibleReason: null,
+                        FilesChanged: null, Insertions: null, Deletions: null);
+                }
+            }
+
+            return await PushAndStatConflictReworkAsync(sandbox, isolatedRepoPath, repoId, workBranch, priorWorkTip, baseBranch, ct);
+        }
+        finally
+        {
+            DeleteDirectoryBestEffort(isolatedRepoPath);
+        }
+    }
+
+    private async Task<ConflictReworkAgentOutcome> PushAndStatConflictReworkAsync(
+        ISandbox sandbox,
+        string isolatedRepoPath,
+        string repoId,
+        string workBranch,
+        string priorWorkTip,
+        string baseBranch,
+        CancellationToken ct)
+    {
+        var headSha = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+        }, ct);
+        if (!headSha.Success || string.IsNullOrWhiteSpace(headSha.Stdout))
+        {
+            return new ConflictReworkAgentOutcome(
+                AgentSucceeded: false,
+                NewTip: null,
+                FailureReason: $"could not resolve HEAD after rework: {headSha.Stderr.Trim()}",
+                SemanticIncompatibleReason: null,
+                FilesChanged: null, Insertions: null, Deletions: null);
+        }
+        var newTip = headSha.Stdout.Trim();
+
+        // Verify the work tree is clean (no unresolved conflicts, no straggling edits).
+        var status = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
+        }, ct);
+        if (!status.Success)
+        {
+            return new ConflictReworkAgentOutcome(
+                AgentSucceeded: false,
+                NewTip: newTip,
+                FailureReason: $"could not read post-rework status: {status.Stderr.Trim()}",
+                SemanticIncompatibleReason: null,
+                FilesChanged: null, Insertions: null, Deletions: null);
+        }
+        if (!string.IsNullOrWhiteSpace(status.Stdout))
+        {
+            return new ConflictReworkAgentOutcome(
+                AgentSucceeded: false,
+                NewTip: newTip,
+                FailureReason: $"rework left dirty worktree:\n{status.Stdout.Trim()}",
+                SemanticIncompatibleReason: null,
+                FilesChanged: null, Insertions: null, Deletions: null);
+        }
+
+        // Push the rebased tip back into the isolated bare repo so the caller's
+        // host-side SetBranchToCommitAsync can read it from there. The push is
+        // safe inside the sandbox because the only mount is the isolated clone.
+        var pushRef = $"refs/codeybox/conflict-rework/{Guid.NewGuid():N}";
+        var push = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{pushRef}"],
+        }, ct);
+        if (!push.Success)
+        {
+            return new ConflictReworkAgentOutcome(
+                AgentSucceeded: false,
+                NewTip: newTip,
+                FailureReason: $"failed to publish rework tip to isolated repo: {push.Stderr.Trim()}",
+                SemanticIncompatibleReason: null,
+                FilesChanged: null, Insertions: null, Deletions: null);
+        }
+
+        // Verify the push landed in the isolated repo and pull the resulting
+        // commit back into the durable host bare repo so SetBranchToCommit can
+        // find it.
+        await ImportIsolatedMergeCommitAsync(repoId, isolatedRepoPath, pushRef, ct);
+        try
+        {
+            // Resolve via the durable host repo to confirm the sha matches what
+            // we expect, then drop the temporary ref.
+            var resolved = await _gitHost.ResolveCommitAsync(repoId, pushRef, ct);
+            if (!string.Equals(resolved, newTip, StringComparison.Ordinal))
+            {
+                return new ConflictReworkAgentOutcome(
+                    AgentSucceeded: false,
+                    NewTip: newTip,
+                    FailureReason: $"imported rework tip {resolved} disagrees with sandbox HEAD {newTip}",
+                    SemanticIncompatibleReason: null,
+                    FilesChanged: null, Insertions: null, Deletions: null);
+            }
+        }
+        finally
+        {
+            await DeleteHostRefBestEffortAsync(repoId, pushRef, CancellationToken.None);
+        }
+
+        // Best-effort diff stats from sandbox: prior tip vs new tip.
+        IReadOnlyList<string>? changed = null;
+        int? ins = null, dels = null;
+        try
+        {
+            var nameOnly = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--name-only", priorWorkTip, "HEAD"],
+            }, ct);
+            if (nameOnly.Success)
+            {
+                changed = nameOnly.Stdout
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .ToArray();
+            }
+            var stat = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--numstat", priorWorkTip, "HEAD"],
+            }, ct);
+            if (stat.Success)
+            {
+                var totalIns = 0;
+                var totalDel = 0;
+                var any = false;
+                foreach (var line in stat.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var parts = line.Split('\t');
+                    if (parts.Length < 2) continue;
+                    if (int.TryParse(parts[0], out var i)) { totalIns += i; any = true; }
+                    if (int.TryParse(parts[1], out var d)) { totalDel += d; any = true; }
+                }
+                if (any) { ins = totalIns; dels = totalDel; }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "Conflict rework: best-effort diff stat collection failed");
+        }
+
+        _ = baseBranch; // baseBranch kept in signature for future symmetry with merge-phase stats.
+        return new ConflictReworkAgentOutcome(
+            AgentSucceeded: true,
+            NewTip: newTip,
+            FailureReason: null,
+            SemanticIncompatibleReason: null,
+            FilesChanged: changed,
+            Insertions: ins,
+            Deletions: dels);
+    }
+
+    /// <summary>
+    /// Extracts the operator-facing reason that follows
+    /// <see cref="SemanticIncompatibleMarker"/> in agent output. Returns null
+    /// when the marker is absent or the captured tail is empty whitespace.
+    /// </summary>
+    private static string? ExtractSemanticIncompatibleReason(string output)
+    {
+        var idx = output.IndexOf(SemanticIncompatibleMarker, StringComparison.Ordinal);
+        if (idx < 0) return null;
+        var tail = output[(idx + SemanticIncompatibleMarker.Length)..];
+        // Reason ends at the first newline so multi-line agent output doesn't
+        // accidentally get folded into LastError.
+        var nl = tail.IndexOfAny(['\r', '\n']);
+        var reason = (nl < 0 ? tail : tail[..nl]).Trim();
+        return reason.Length == 0 ? null : reason;
+    }
+
+    /// <summary>
+    /// Best-effort parse of the conflict-file list from
+    /// <see cref="MergeConflictResolutionFailedException.Message"/>. The
+    /// merge-phase failure message contains
+    /// <c>"... conflicts in &lt;file&gt;, &lt;file&gt;"</c>; we split on commas
+    /// and clean trailing punctuation. The agent gets a sandbox-side
+    /// re-derivation anyway, so this is only used for the started-event
+    /// payload and for telemetry.
+    /// </summary>
+    private static IReadOnlyList<string> ExtractConflictFilesFromMessage(string message)
+    {
+        const string marker = "conflicts in ";
+        var idx = message.IndexOf(marker, StringComparison.Ordinal);
+        if (idx < 0) return [];
+        var tail = message[(idx + marker.Length)..];
+        var endIdx = tail.IndexOfAny(['\n', '\r']);
+        if (endIdx >= 0) tail = tail[..endIdx];
+        return tail
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(static s => s.TrimEnd('.', ';'))
+            .Where(static s => s.Length > 0)
+            .ToArray();
+    }
+
+    private static async Task<IReadOnlyList<string>> ListSandboxConflictFilesAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        var r = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--name-only", "--diff-filter=U"],
+        }, ct);
+        if (!r.Success || string.IsNullOrWhiteSpace(r.Stdout))
+            return [];
+        return r.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Builds the focused conflict-rework prompt. Mirrors the template in
+    /// <c>docs/work-items.md</c> guidance for this feature: explains the
+    /// in-progress rebase state, prohibits destructive actions, and documents
+    /// the <c>SEMANTIC_INCOMPATIBLE:</c> escape hatch.
+    /// </summary>
+    private static string BuildConflictReworkPrompt(
+        string originalPrompt,
+        string baseBranch,
+        string workBranch,
+        IReadOnlyList<string> conflictFiles,
+        string mergePhaseFailureMessage)
+    {
+        var conflictList = conflictFiles.Count == 0
+            ? "  - (no files reported; inspect `git status` inside the worktree)"
+            : string.Join('\n', conflictFiles.Select(f => $"  - {f}"));
+        return $"""
+{originalPrompt}
+
+# Conflict-resolution mode (third-line fallback)
+
+Your previous work on this task produced commits on the work branch
+`{workBranch}`. Upstream `{baseBranch}` has since advanced with sibling
+work that conflicts with your branch.
+
+The repository is currently in a rebase-in-progress state. Your previous
+commits are still present on the branch. The working tree contains
+conflict markers for the files listed below; the index is in a conflicted
+state. The work tree is at $PWD; HEAD is your prior work branch tip.
+
+Your job is to resolve the conflicts IN PLACE, preserving:
+  - All of your original feature changes (the diff you produced).
+  - The intent of the new commits on upstream `{baseBranch}` (the diff
+    that landed after you forked).
+
+Workflow:
+  1. Inspect the conflict markers in each file. The HEAD/ours side is the
+     upstream change; the incoming/theirs side is your prior work.
+  2. For each conflict, produce a resolution that keeps both intents.
+     Read commit messages from `git log HEAD..ORIG_HEAD` (your work) and
+     `git log ORIG_HEAD..HEAD` (upstream) for context.
+  3. Run the project build + tests after each file's resolution.
+  4. When all conflicts are resolved, complete the rebase with
+     `git rebase --continue`.
+
+Do NOT:
+  - Run `git reset --hard`, `git rebase --abort`, `git merge --abort`,
+    `git checkout {baseBranch}`, or anything else that throws away your
+    prior commits. We want to KEEP the work.
+  - Refactor unrelated areas.
+  - Change anything outside the conflicted files plus mechanical rebase
+    fixups needed for those files to compile.
+
+If — after careful analysis — the two intents are genuinely incompatible
+at a semantic level (one truly cannot coexist with the other), print a
+single line to stdout starting with `{SemanticIncompatibleMarker}` followed
+by a one-line reason, for example:
+
+    {SemanticIncompatibleMarker} events have diverged
+
+The operator will decide whether to abandon the PR or restructure either
+side. Do NOT silently produce a half-resolution.
+
+Conflict files:
+{conflictList}
+
+Original merge-phase failure (for context):
+  {mergePhaseFailureMessage}
+""";
+    }
+
+    /// <summary>
+    /// Persists the <c>ConflictReworkAttempts++</c> bump on the store. Returns
+    /// the updated work-item snapshot, or null if the store row vanished
+    /// between calls (e.g. a concurrent delete — the caller should treat this
+    /// as a stale-write race and stop).
+    /// </summary>
+    private async Task<WorkItem?> BumpConflictReworkAttemptsAsync(WorkItem item, CancellationToken ct)
+    {
+        var current = await _store.GetAsync(item.Id, ct);
+        if (current is null) return null;
+        var bumped = current with { ConflictReworkAttempts = current.ConflictReworkAttempts + 1 };
+        await _store.UpdateAsync(bumped, ct);
+        return bumped;
+    }
+
+    /// <summary>
+    /// Returns the file paths changed between <paramref name="fromTip"/> and
+    /// <paramref name="toTip"/> in the host bare repo, in lexical order.
+    /// Anti-abandonment uses this to detect a rework that discarded the
+    /// work agent's prior diff — rebase changes commit SHAs but preserves
+    /// changed-file sets, so a file-set comparison is the right signal.
+    /// </summary>
+    private async Task<IReadOnlyList<string>> ListChangedFilesAsync(
+        string repoId, string fromTip, string toTip, CancellationToken ct)
+    {
+        var (stdout, _) = await RunHostGitCaptureAsync(_gitHost.GetRepoPath(repoId), ct,
+            "diff", "--name-only", fromTip, toTip);
+        return stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+    }
+
+    private async Task PublishConflictReworkFinishedAsync(
+        WorkItem item, Project project, string baseBranch, string workBranch,
+        bool success, string? newTip, IReadOnlyList<string>? filesChanged,
+        int? insertions, int? deletions,
+        string? semanticIncompatible, string? parkReason, CancellationToken ct)
+    {
+        // Refresh the item snapshot so webhook subscribers see the live
+        // ConflictReworkAttempts and any updated LastError.
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        await TryPublishEventAsync(current, project, "work_item.conflict_rework_finished",
+            new ConflictReworkFinishedDetails
+            {
+                WorkItemId = current.Id.ToString(),
+                BaseBranch = baseBranch,
+                WorkBranch = workBranch,
+                Success = success,
+                NewWorkBranchTip = newTip,
+                FilesChanged = filesChanged,
+                Insertions = insertions,
+                Deletions = deletions,
+                SemanticIncompatibleReason = semanticIncompatible,
+                ParkReason = parkReason,
+            }, ct);
+    }
+
     private static bool TryGetUpstreamReconcileConflict(Exception ex, out UpstreamPushReconcileConflictException conflict)
     {
         for (var current = ex; current is not null; current = current.InnerException)
@@ -5202,6 +5988,33 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private async Task RunHostGitAsync(string workdir, CancellationToken ct, params string[] args)
     {
+        var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(workdir, ct, args);
+        if (exitCode != 0)
+            throw new InvalidOperationException($"host git command failed (exit {exitCode}): git {string.Join(' ', args)}\n{stderr}{stdout}");
+    }
+
+    /// <summary>
+    /// Runs a host-side git command and returns its captured stdout/stderr.
+    /// Throws on non-zero exit. Conflict-rework helpers (rev-list, etc.) call
+    /// this when they need the command's output rather than just success.
+    /// </summary>
+    private async Task<(string Stdout, string Stderr)> RunHostGitCaptureAsync(
+        string workdir, CancellationToken ct, params string[] args)
+    {
+        var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(workdir, ct, args);
+        if (exitCode != 0)
+            throw new InvalidOperationException($"host git command failed (exit {exitCode}): git {string.Join(' ', args)}\n{stderr}{stdout}");
+        return (stdout, stderr);
+    }
+
+    /// <summary>
+    /// Runs a host-side git command and captures stdout, stderr, and the exit
+    /// code without throwing. Used for probes like <c>merge-base --is-ancestor</c>
+    /// where a non-zero exit is a meaningful answer rather than an error.
+    /// </summary>
+    private async Task<(string Stdout, string Stderr, int ExitCode)> RunHostGitCaptureNoThrowAsync(
+        string workdir, CancellationToken ct, params string[] args)
+    {
         SanitizeBareRepositoryConfigIfPresent(workdir);
         var psi = new ProcessStartInfo
         {
@@ -5222,8 +6035,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var stdout = await process.StandardOutput.ReadToEndAsync(ct);
         var stderr = await process.StandardError.ReadToEndAsync(ct);
         await process.WaitForExitAsync(ct);
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException($"host git command failed (exit {process.ExitCode}): git {string.Join(' ', args)}\n{stderr}{stdout}");
+        return (stdout, stderr, process.ExitCode);
     }
 
     private static void SanitizeBareRepositoryConfigIfPresent(string workdir)
@@ -6033,6 +6845,7 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItemState.Auditing => "work_item.auditing",
         WorkItemState.AuditPassed => "work_item.audit_passed",
         WorkItemState.Reworking => "work_item.reworking",
+        WorkItemState.ReworkingForConflict => "work_item.reworking_for_conflict",
         WorkItemState.AuditFailed => "work_item.audit_failed",
         WorkItemState.Merging => "work_item.merging",
         WorkItemState.Merged => "work_item.merged",

@@ -130,6 +130,17 @@ Queued → Working → WorkComplete ─┬─→ Auditing ─pass─→ AuditPas
 Merging can also terminate as `MergeConflictResolutionFailed` when host-side
 merge verification or the scope fence rejects a conflict resolution.
 
+When the merge phase fails with a conflict the preventive pickup-time rebase
+and the merge-phase agent could not resolve, the orchestrator falls through
+to a focused conflict-rework iteration: `Merging` → `ReworkingForConflict` →
+back to `Merging`. The original work agent is re-engaged on the existing
+work branch (commits intact) with a prompt that explains the rebase-in-progress
+state, forbids destructive actions, and documents the `SEMANTIC_INCOMPATIBLE:`
+escape hatch. Capped at one iteration per merge attempt; the second failure
+parks at `MergeConflictResolutionFailed`. Cost rows for this iteration use the
+phase key `conflict_rework` so operators can measure how much budget the
+third-line fallback is burning.
+
 Cancelled (via DELETE /workitems/{id}) is reachable from any non-terminal state.
 ```
 

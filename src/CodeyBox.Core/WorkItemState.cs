@@ -27,6 +27,15 @@ public enum WorkItemState
     /// this state captures items that exhausted every fallback in one pickup.
     /// </summary>
     WaitingForQuotaReset = 11,
+    /// <summary>
+    /// Third-line fallback for merge-phase conflicts: the original work agent
+    /// is being re-engaged with a focused conflict-resolution prompt on the
+    /// existing work branch (commits intact). Distinct from
+    /// <see cref="Reworking"/>, which is part of the audit/rework loop and
+    /// pre-merge; this state is post-merge-phase, after both the preventive
+    /// auto-rebase and the merge-phase LLM rerun have already failed.
+    /// </summary>
+    ReworkingForConflict = 12,
     Failed = 100,
     Cancelled = 101,
     AuditFailed = 102,
