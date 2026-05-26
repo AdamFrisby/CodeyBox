@@ -147,6 +147,30 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // (unattributed) host-side cancellations. Default 0 keeps existing rows
         // eligible for the auto-retry path on their next transient failure.
         RunMigration("ALTER TABLE work_items ADD COLUMN transient_cancel_retries INTEGER NOT NULL DEFAULT 0;");
+
+        // Additive migration: monotonic prompt-generation counter. Default 1 so
+        // legacy rows behave as "never edited"; the PUT /workitems/{id}/prompt
+        // endpoint increments this on every successful write.
+        RunMigration("ALTER TABLE work_items ADD COLUMN prompt_revision INTEGER NOT NULL DEFAULT 1;");
+
+        // Per-iteration dispatch record. One row per iteration; rows are
+        // append-only — never updated after dispatch. The work item's
+        // current prompt_revision is snapshotted into prompt_revision_at_dispatch
+        // so a prompt edit landing mid-iteration cannot be misattributed to the
+        // already-running iteration. Cascade-delete with the parent work item.
+        using (var iterCmd = _conn.CreateCommand())
+        {
+            iterCmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS work_item_iterations (
+                    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                    iteration INTEGER NOT NULL,
+                    prompt_revision_at_dispatch INTEGER NOT NULL,
+                    dispatched_at TEXT NOT NULL,
+                    PRIMARY KEY (work_item_id, iteration)
+                );
+                """;
+            iterCmd.ExecuteNonQuery();
+        }
     }
 
     private void RunMigration(string sql)
@@ -182,12 +206,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                     min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
                     failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
-                    cancellation_source, transient_cancel_retries)
+                    cancellation_source, transient_cancel_retries, prompt_revision)
                 VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                     $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                     $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                     $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
-                    $cancellation_source, $transient_cancel_retries);
+                    $cancellation_source, $transient_cancel_retries, $prompt_revision);
                 """;
             Bind(cmd, item);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -237,7 +261,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
-                    transient_cancel_retries = $transient_cancel_retries
+                    transient_cancel_retries = $transient_cancel_retries,
+                    prompt_revision = $prompt_revision
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -282,7 +307,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
-                    transient_cancel_retries = $transient_cancel_retries
+                    transient_cancel_retries = $transient_cancel_retries,
+                    prompt_revision = $prompt_revision
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -640,6 +666,112 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
     }
 
 
+    public async Task<PromptReplaceResult> TryReplacePromptAsync(
+        WorkItemId id,
+        string newPrompt,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            WorkItem? current;
+            using (var read = _conn.CreateCommand())
+            {
+                read.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                read.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await read.ExecuteReaderAsync(ct);
+                current = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+
+            if (current is null)
+                return new PromptReplaceResult(PromptReplaceOutcome.NotFound, null);
+            if (WorkItemDependencies.TerminalStates.Contains(current.State))
+                return new PromptReplaceResult(PromptReplaceOutcome.TerminalState, null);
+
+            var newRevision = current.PromptRevision + 1;
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items
+                SET prompt = $prompt, prompt_revision = $rev, updated_at = $ua
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$prompt", newPrompt);
+            cmd.Parameters.AddWithValue("$rev", newRevision);
+            cmd.Parameters.AddWithValue("$ua", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+            return new PromptReplaceResult(PromptReplaceOutcome.Updated, newRevision);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryReplacePromptAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task RecordIterationDispatchAsync(
+        WorkItemId workItemId,
+        int iteration,
+        int promptRevisionAtDispatch,
+        DateTimeOffset dispatchedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO work_item_iterations (work_item_id, iteration, prompt_revision_at_dispatch, dispatched_at)
+                VALUES ($wi, $iter, $rev, $at)
+                ON CONFLICT(work_item_id, iteration) DO UPDATE SET
+                    prompt_revision_at_dispatch = excluded.prompt_revision_at_dispatch,
+                    dispatched_at = excluded.dispatched_at;
+                """;
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+            cmd.Parameters.AddWithValue("$iter", iteration);
+            cmd.Parameters.AddWithValue("$rev", promptRevisionAtDispatch);
+            cmd.Parameters.AddWithValue("$at", dispatchedAt.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("RecordIterationDispatchAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(
+        WorkItemId workItemId,
+        CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT iteration, prompt_revision_at_dispatch, dispatched_at
+            FROM work_item_iterations
+            WHERE work_item_id = $wi
+            ORDER BY iteration ASC;
+            """;
+        cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+        var results = new List<WorkItemIteration>();
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            results.Add(new WorkItemIteration(
+                workItemId,
+                reader.GetInt32(0),
+                reader.GetInt32(1),
+                DateTimeOffset.Parse(reader.GetString(2), System.Globalization.CultureInfo.InvariantCulture)));
+        }
+        return results;
+    }
+
     public void Dispose()
     {
         _conn.Dispose();
@@ -688,6 +820,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$priority", item.Priority);
         cmd.Parameters.AddWithValue("$cancellation_source", (object?)item.CancellationSource ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$transient_cancel_retries", item.TransientCancelRetries);
+        cmd.Parameters.AddWithValue("$prompt_revision", item.PromptRevision);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -730,6 +863,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         Priority = ReadInt32OrDefault(r, "priority", defaultValue: 0),
         CancellationSource = ReadNullableString(r, "cancellation_source"),
         TransientCancelRetries = ReadInt32OrDefault(r, "transient_cancel_retries", defaultValue: 0),
+        PromptRevision = ReadInt32OrDefault(r, "prompt_revision", defaultValue: 1),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)

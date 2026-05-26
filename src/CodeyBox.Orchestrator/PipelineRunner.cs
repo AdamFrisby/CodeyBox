@@ -344,6 +344,8 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 await PublishIterationStartedAsync(item, project, IterationPhase.Work, WorkPhaseIterationNumber, ct);
                 var workIterationStart = DateTimeOffset.UtcNow;
+                await _store.RecordIterationDispatchAsync(
+                    item.Id, WorkPhaseIterationNumber, item.PromptRevision, workIterationStart, ct);
                 await Transition(item, WorkItemState.Working, ct, project);
                 string? workAgentStdout = null;
                 using (var workPhase = new PhaseCancellation("work", ct, _opts.TimeProvider))
@@ -616,6 +618,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 Event = "work_item.audit_failed",
                 WorkItem = failed,
                 Project = project,
+                Details = await BuildTerminalDetailsAsync(failed, CancellationToken.None),
             }, CancellationToken.None);
         }
         catch (MergeConflictResolutionFailedException ex)
@@ -629,6 +632,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 Event = "work_item.merge_conflict_resolution_failed",
                 WorkItem = failed,
                 Project = project,
+                Details = await BuildTerminalDetailsAsync(failed, CancellationToken.None),
             }, CancellationToken.None);
         }
         catch (AgentUnavailableException ex)
@@ -697,6 +701,35 @@ public sealed class PipelineRunner : IPipelineRunner
     internal const string CoAuthoredByTrailer = "\n\n" + CodeyBoxTrailers.CoAuthoredBy;
 
     /// <summary>
+    /// Env-var name passed into the sandbox carrying the prompt revision that
+    /// was active when this iteration was dispatched. Agents include the same
+    /// value as the <c>CodeyBox-Prompt-Revision: N</c> commit trailer so the
+    /// audit suite can detect "agent committed against an older prompt".
+    /// </summary>
+    internal const string PromptRevisionEnvVar = "CODEYBOX_PROMPT_REVISION";
+
+    /// <summary>
+    /// Reads the prompt revision snapshotted into <c>work_item_iterations</c> at
+    /// iteration-dispatch time, falling back to the item's current revision if
+    /// no row exists yet (e.g. legacy data, or RunAgentPhaseAsync is invoked
+    /// from a code path that did not pre-record the iteration).
+    /// </summary>
+    private async Task<int> ResolveIterationRevisionAsync(WorkItem item, int iteration, CancellationToken ct)
+        => (await TryLookupIterationRevisionAsync(item.Id, iteration, ct)) ?? item.PromptRevision;
+
+    /// <summary>
+    /// Reads the prompt revision snapshotted at iteration-dispatch time, or null
+    /// if no row exists. Used by the audit context where "no record" must surface
+    /// distinctly from "record found, value = item.PromptRevision".
+    /// </summary>
+    private async Task<int?> TryLookupIterationRevisionAsync(WorkItemId workItemId, int iteration, CancellationToken ct)
+    {
+        var rows = await _store.GetIterationsAsync(workItemId, ct);
+        var row = rows.FirstOrDefault(i => i.Iteration == iteration);
+        return row?.PromptRevisionAtDispatch;
+    }
+
+    /// <summary>
     /// Builds the trailer block to append to an orchestrator-emitted commit
     /// message. Always includes <c>CodeyBox-WorkItem</c>, <c>CodeyBox-Agent</c>,
     /// and the terminal <c>Co-Authored-By</c> trailer; conditionally includes
@@ -709,7 +742,8 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItemId workItemId,
         AgentKind finalAgent,
         string? finalModel,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? promptRevisionAtDispatch = null)
     {
         IReadOnlyList<AgentFallbackRecord>? history = null;
         if (_fallbackHistory is not null)
@@ -723,7 +757,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogDebug(ex, "fallback history fetch failed for commit-trailer composition (work item {WorkItemId})", workItemId);
             }
         }
-        return CodeyBoxTrailers.Compose(workItemId, finalAgent, finalModel, history);
+        return CodeyBoxTrailers.Compose(workItemId, finalAgent, finalModel, history, promptRevisionAtDispatch);
     }
 
     private TimeSpan ResolvePhaseAbsoluteTimeout(TimeSpan perAttemptTimeout) =>
@@ -1286,7 +1320,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyList<IAuditor>? auditors = null)
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append($"Every commit message MUST end with the following trailer, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
+        sb.Append($"Every commit message MUST end with the following trailers, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.PromptRevisionTrailerKey}: $CODEYBOX_PROMPT_REVISION\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nThe `{CodeyBoxTrailers.PromptRevisionTrailerKey}` value MUST be the literal integer from the `CODEYBOX_PROMPT_REVISION` environment variable — the orchestrator uses it to detect when an agent finished work against an older prompt. Copy the number verbatim; do not include the variable syntax in the commit.\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
 
         // Pre-flight self-check: surface the project's mechanical (shell-kind)
         // auditors so the agent runs them before declaring done. Language-agnostic
@@ -1366,9 +1400,21 @@ public sealed class PipelineRunner : IPipelineRunner
             : await _credentials.GetAsync(runner.Kind, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
         var agentPhase = isInitial ? "work" : "rework";
+
+        // Look up the prompt revision snapshotted at iteration-dispatch time.
+        // The orchestrator records this row before transitioning the item to
+        // Working/Reworking; a concurrent PUT /workitems/{id}/prompt cannot
+        // change what we read here.
+        var dispatchIteration = isInitial ? WorkPhaseIterationNumber : (iteration ?? WorkPhaseIterationNumber);
+        var promptRevisionAtDispatch = await ResolveIterationRevisionAsync(item, dispatchIteration, ct);
+
+        var extraEnv = new Dictionary<string, string>
+        {
+            [PromptRevisionEnvVar] = promptRevisionAtDispatch.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        };
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase,
-            flavor: sandboxFlavor);
+            flavor: sandboxFlavor, extraEnvironment: extraEnv);
 
         var sandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
@@ -1637,7 +1683,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (hasStagedDiff)
         {
-            var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct);
+            var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct,
+                promptRevisionAtDispatch: promptRevisionAtDispatch);
             var commitMessage = isInitial
                 ? $"codeybox: {item.Title}\n\n{trailerBlock}"
                 : $"codeybox rework: address audit findings\n\n{trailerBlock}";
@@ -1985,8 +2032,10 @@ public sealed class PipelineRunner : IPipelineRunner
             AgentKind? activeAuditAgentKind;
             try
             {
+                var revisionForCtx = await TryLookupIterationRevisionAsync(item.Id, iteration, ct);
                 var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt,
-                    ModelId: item.ModelId, ReasoningMode: item.ReasoningMode);
+                    ModelId: item.ModelId, ReasoningMode: item.ReasoningMode,
+                    PromptRevisionAtDispatch: revisionForCtx);
                 var collectTask = CollectFindingsAsync(item, project, runner, auditors, repoId, ctx, auditPhase.Token);
                 var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completedAuditTask != collectTask)
@@ -2066,6 +2115,12 @@ public sealed class PipelineRunner : IPipelineRunner
             var reworkIterationNumber = iteration + 1;
             await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
             var reworkStart = DateTimeOffset.UtcNow;
+            // Snapshot the prompt revision now, before the rework agent runs.
+            // A concurrent PUT /workitems/{id}/prompt landing during this iteration
+            // will bump the revision but must not be attributed to it.
+            var freshForRework = await _store.GetAsync(item.Id, ct) ?? item;
+            await _store.RecordIterationDispatchAsync(
+                item.Id, reworkIterationNumber, freshForRework.PromptRevision, reworkStart, ct);
             await Transition(item, WorkItemState.Reworking, ct, project);
             var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
@@ -4727,7 +4782,8 @@ public sealed class PipelineRunner : IPipelineRunner
         string? hostNetworkProfile = null,
         WorkItemId? timingWorkItemId = null,
         string? timingPhase = null,
-        SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless)
+        SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless,
+        IReadOnlyDictionary<string, string>? extraEnvironment = null)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
@@ -4747,6 +4803,14 @@ public sealed class PipelineRunner : IPipelineRunner
                 env[k] = v;
             foreach (var m in includeAgentCredential.Mounts)
                 mounts.Add(m);
+        }
+        if (extraEnvironment is not null)
+        {
+            // Extra env overrides credential env on key collision so the
+            // orchestrator can stamp known-good values (e.g. revision counters)
+            // without a credential provider silently shadowing them.
+            foreach (var (k, v) in extraEnvironment)
+                env[k] = v;
         }
 
         var allowedHosts = allowAgentNetwork
@@ -5259,10 +5323,33 @@ public sealed class PipelineRunner : IPipelineRunner
                 Event = StateToEventName(state),
                 WorkItem = next,
                 Project = project,
+                Details = await BuildTerminalDetailsAsync(next, ct),
                 Usage = usage?.Iteration,
                 UsageTotal = usage?.Total,
             }, CancellationToken.None);
         }
+    }
+
+    /// <summary>
+    /// Adds revision-attribution fields to webhook payloads on terminal-state
+    /// events. <c>revisionAtCompletion</c> is the highest dispatched iteration's
+    /// snapshotted revision; comparing it to <see cref="WorkItem.PromptRevision"/>
+    /// lets JobTrack tell "agent finished against the latest prompt" from
+    /// "agent finished an older revision; the latest prompt edit was not yet
+    /// visible". Non-terminal transitions return null so the existing payload
+    /// shape is unchanged.
+    /// </summary>
+    private async Task<TerminalRevisionDetails?> BuildTerminalDetailsAsync(WorkItem item, CancellationToken ct)
+    {
+        if (!WorkItemDependencies.TerminalStates.Contains(item.State)) return null;
+        var iterations = await _store.GetIterationsAsync(item.Id, ct);
+        int? lastDispatched = iterations.Count == 0
+            ? null
+            : iterations.Max(i => i.PromptRevisionAtDispatch);
+        return new TerminalRevisionDetails(
+            PromptRevision: item.PromptRevision,
+            RevisionAtCompletion: lastDispatched,
+            RevisionMatches: lastDispatched is { } r && r == item.PromptRevision);
     }
 
     /// <summary>
@@ -5331,6 +5418,7 @@ public sealed class PipelineRunner : IPipelineRunner
             Event = "work_item.failed",
             WorkItem = next,
             Project = effectiveProject,
+            Details = await BuildTerminalDetailsAsync(next, CancellationToken.None),
         }, CancellationToken.None);
     }
 
@@ -5364,6 +5452,7 @@ public sealed class PipelineRunner : IPipelineRunner
             Event = "work_item.cancelled",
             WorkItem = cancelled,
             Project = effectiveProject,
+            Details = await BuildTerminalDetailsAsync(cancelled, CancellationToken.None),
         }, CancellationToken.None);
     }
 
@@ -5875,6 +5964,18 @@ public sealed record AgentFallbackDetails(
     string? ToAgent,
     string? ToModel,
     string Reason);
+
+/// <summary>
+/// Attached to webhook events emitted on a terminal-state transition (Done /
+/// Failed / Cancelled / AuditFailed / MergeConflictResolutionFailed). Lets
+/// JobTrack and equivalent trackers distinguish "agent finished the latest
+/// prompt" from "agent finished a stale prompt; the latest edit landed too
+/// late to be picked up" — the latter case warrants a one-click re-run.
+/// </summary>
+public sealed record TerminalRevisionDetails(
+    int PromptRevision,
+    int? RevisionAtCompletion,
+    bool RevisionMatches);
 
 internal sealed record AuditIterationDetails(
     int Iteration,

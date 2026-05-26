@@ -1025,6 +1025,7 @@ builder.Services.AddSingleton(_ =>
 });
 builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(sp.GetRequiredService<PresetCatalogOptions>()));
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
+builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------
@@ -1171,6 +1172,11 @@ builder.Services.AddSingleton<IWorkItemStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemStore(opts.StateDatabasePath);
+});
+builder.Services.AddSingleton<IIdempotencyStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteIdempotencyStore(opts.StateDatabasePath);
 });
 builder.Services.AddSingleton<ISuggestionStore>(sp =>
 {
@@ -1537,6 +1543,11 @@ app.Use(async (ctx, next) =>
 });
 
 app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
+
+// Idempotency-Key support for mutating endpoints — see IdempotencyMiddleware
+// for behaviour. Ordered after auth so unauthenticated requests can't poison
+// the cache, and before endpoint mapping so all mutating handlers benefit.
+IdempotencyMiddleware.Use(app);
 
 WorkItemEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);

@@ -95,7 +95,16 @@ public sealed record AuditContext(
     /// the work item's <c>AgentMembership.ReasoningMode</c>. The runner maps
     /// this onto the agent CLI's effort/reasoning flag.
     /// </summary>
-    string? ReasoningMode = null);
+    string? ReasoningMode = null,
+    /// <summary>
+    /// Prompt revision snapshotted when the iteration that produced the commit
+    /// under audit was dispatched. The <c>process:prompt-revision-trailer</c>
+    /// auditor compares this against the HEAD commit's
+    /// <c>CodeyBox-Prompt-Revision</c> trailer to detect agents that finished
+    /// against a stale prompt. Null when the orchestrator did not record a
+    /// dispatch row (legacy data); auditors degrade to a warning in that case.
+    /// </summary>
+    int? PromptRevisionAtDispatch = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(

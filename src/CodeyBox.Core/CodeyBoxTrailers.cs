@@ -14,6 +14,7 @@ namespace CodeyBox.Core;
 ///   <list type="bullet">
 ///     <item><description><c>CodeyBox-WorkItem: &lt;id&gt;</c> — the full work-item id (always present).</description></item>
 ///     <item><description><c>CodeyBox-Agent: &lt;agent&gt;[/&lt;model&gt;]</c> — the final agent/model that produced the work (always present).</description></item>
+///     <item><description><c>CodeyBox-Prompt-Revision: &lt;N&gt;</c> — the prompt revision that was active when the iteration was dispatched. Present when the orchestrator dispatched the iteration with a known revision.</description></item>
 ///     <item><description><c>CodeyBox-Fallbacks: from→to (×N reason); …</c> — emitted only when fallback events occurred this run.</description></item>
 ///     <item><description><c>Co-Authored-By: CodeyBox &lt;noreply@codeybox.invalid&gt;</c> — terminal co-author trailer (always present).</description></item>
 ///   </list>
@@ -24,6 +25,7 @@ public static class CodeyBoxTrailers
     public const string CoAuthoredBy = "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>";
     public const string WorkItemTrailerKey = "CodeyBox-WorkItem";
     public const string AgentTrailerKey = "CodeyBox-Agent";
+    public const string PromptRevisionTrailerKey = "CodeyBox-Prompt-Revision";
     public const string FallbacksTrailerKey = "CodeyBox-Fallbacks";
 
     private static readonly Regex CollapseWhitespace = new(@"\s+", RegexOptions.Compiled);
@@ -39,7 +41,8 @@ public static class CodeyBoxTrailers
         WorkItemId workItemId,
         AgentKind finalAgent,
         string? finalModel = null,
-        IReadOnlyList<AgentFallbackRecord>? fallbackHistory = null)
+        IReadOnlyList<AgentFallbackRecord>? fallbackHistory = null,
+        int? promptRevisionAtDispatch = null)
     {
         var sb = new StringBuilder();
         sb.Append(WorkItemTrailerKey).Append(": ").Append(workItemId).Append('\n');
@@ -49,6 +52,9 @@ public static class CodeyBoxTrailers
         if (model.Length > 0)
             sb.Append('/').Append(model);
         sb.Append('\n');
+
+        if (promptRevisionAtDispatch is { } rev)
+            sb.Append(PromptRevisionTrailerKey).Append(": ").Append(rev).Append('\n');
 
         var fallbackLine = ComposeFallbackSummary(fallbackHistory);
         if (fallbackLine is not null)
