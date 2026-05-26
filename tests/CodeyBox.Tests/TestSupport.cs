@@ -93,14 +93,19 @@ internal static class TestSupport
         ProjectNetworkProfiles? networkProfiles = null,
         ICredentialProvider? credentials = null,
         IProjectRepository? projectRepository = null,
-        AgentClassRouter? classRouter = null)
+        AgentClassRouter? classRouter = null,
+        Func<IGitHost, IGitHost>? gitHostDecorator = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
         var queue = new InMemoryTaskQueue();
-        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var realGitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        // Tests that need to inject failures (e.g. SetBranchToCommitAsync throw)
+        // wrap the real host. PipelineRunner sees the decorator; tests still
+        // hold a handle to the underlying LocalGitHost via TestPipeline.GitHost.
+        IGitHost gitHost = gitHostDecorator?.Invoke(realGitHost) ?? realGitHost;
         var sandboxes = sandboxProvider ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
         var agent = new ScriptedAgent(mergeStrategy?.ToList() ?? [MergeStrategy.RealMerge]);
@@ -161,7 +166,7 @@ internal static class TestSupport
                 new GeminiQuotaFailureDetector(),
             }));
 
-        return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
+        return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot);
     }
 }
 

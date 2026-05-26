@@ -4501,6 +4501,10 @@ public sealed class PipelineRunner : IPipelineRunner
             // costs a full LLM merge phase invocation.
             for (var attempt = 1; attempt <= _opts.UpstreamPushMaxAttempts; attempt++)
             {
+                // Reset per-iteration so a race in iteration N does not leak
+                // into iteration N+1's post-loop attribution if the next
+                // iteration fails with a non-race exception.
+                lastIterationRaced = false;
                 var current = await _store.GetAsync(item.Id, ct) ?? item;
                 await _store.UpdateAsync(current with { UpstreamPushAttempts = attempt }, ct);
 
@@ -4573,7 +4577,13 @@ public sealed class PipelineRunner : IPipelineRunner
                     completed = outcome;
                     break;
                 }
-                catch (Exception ex)
+                // MergeConflictResolutionFailedException intentionally passes
+                // through this catch — it identifies an LLM-merger failure and
+                // must reach RunAsync's MergeConflictResolutionFailedException
+                // handler to be attributed correctly. If we caught it here we
+                // would relabel it as "infrastructure" and (worse) on success
+                // backoffs misclassify the next iteration's terminal state.
+                catch (Exception ex) when (ex is not MergeConflictResolutionFailedException)
                 {
                     if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                     {

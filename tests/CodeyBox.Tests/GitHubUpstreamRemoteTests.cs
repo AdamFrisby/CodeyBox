@@ -193,6 +193,9 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Equal(42, outcome.PullRequestNumber);
         Assert.Equal("merged-after-retry", outcome.MergedSha);
         Assert.False(outcome.AutoMergeRaced);
+        // URL must be synthesized for the existing PR so consumers (webhooks,
+        // logging, operator surface) can link back to the forge view.
+        Assert.Equal("https://github.com/myorg/myrepo/pull/42", outcome.PullRequestUrl);
     }
 
     [Fact]
@@ -267,6 +270,66 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
+    public async Task FetchBaseBranchAsync_RejectsBranchWithWhitespaceOrControl()
+    {
+        var gitHost = new FakeGitHost();
+        var handler = new FakeHttpMessageHandler();
+        var remote = BuildRemote(gitHost, handler);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => remote.FetchBaseBranchAsync("repo-id", "main\n", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => remote.FetchBaseBranchAsync("repo-id", "main with space", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => remote.FetchBaseBranchAsync("repo-id", "main", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => remote.FetchBaseBranchAsync("repo-id", string.Empty, CancellationToken.None));
+
+        // Validation must short-circuit before the git host runs — no fetch was
+        // dispatched so an attacker can't bypass argv validation by piggybacking
+        // on the askpass plumbing.
+        Assert.Empty(gitHost.Fetches);
+    }
+
+    [Fact]
+    public async Task FetchBaseBranchAsync_DelegatesToGitHostWithRepoUrlAndAskpassEnv()
+    {
+        var gitHost = new FakeGitHost { FetchUpstreamShaToReturn = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" };
+        var handler = new FakeHttpMessageHandler();
+        var remote = BuildRemote(gitHost, handler);
+
+        var sha = await remote.FetchBaseBranchAsync("repo-id-x", "main", CancellationToken.None);
+
+        Assert.Equal("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", sha);
+        var call = Assert.Single(gitHost.Fetches);
+        Assert.Equal("repo-id-x", call.RepositoryId);
+        // Bare URL only (no credentials embedded — those flow via askpass env).
+        Assert.Equal("https://github.com/myorg/myrepo.git", call.Url);
+        Assert.Equal("main", call.Branch);
+        // The askpass env must carry the configured token so git can authenticate
+        // the fetch against private repos. Validates the credential plumbing
+        // didn't silently change to e.g. ambient environment.
+        Assert.True(call.Env.ContainsKey("GIT_ASKPASS"));
+        Assert.Equal(DefaultOpts.Token, call.Env["CODEYBOX_GIT_PASS"]);
+        Assert.Equal("x-access-token", call.Env["CODEYBOX_GIT_USER"]);
+    }
+
+    [Fact]
+    public async Task FetchBaseBranchAsync_PropagatesNullFromGitHost()
+    {
+        var gitHost = new FakeGitHost { FetchUpstreamShaToReturn = null };
+        var handler = new FakeHttpMessageHandler();
+        var remote = BuildRemote(gitHost, handler);
+
+        // Upstream not advertising the branch → propagated as null so the
+        // orchestrator can park with a distinct "upstream does not advertise"
+        // message rather than treating it as a successful fetch.
+        var sha = await remote.FetchBaseBranchAsync("repo-id", "main", CancellationToken.None);
+        Assert.Null(sha);
+        Assert.Single(gitHost.Fetches);
+    }
+
+    [Fact]
     public async Task CompleteAsync_PushToUpstreamThrows_PropagatesExceptionWithoutCallingGitHubApi()
     {
         // Verifies that a PushToUpstreamAsync failure is rethrown so the
@@ -291,6 +354,14 @@ public sealed class GitHubUpstreamRemoteTests
 internal sealed class FakeGitHost : IGitHost
 {
     public List<(string RepositoryId, string Url, string Branch, UpstreamPushReconcileStrategy ReconcileStrategy)> Pushes { get; } = new();
+    public List<(string RepositoryId, string Url, string Branch, IReadOnlyDictionary<string, string> Env)> Fetches { get; } = new();
+
+    /// <summary>
+    /// When set, <see cref="FetchUpstreamBranchAsync"/> returns this sha rather
+    /// than the default-interface null. Lets tests assert the sha is propagated
+    /// out of <see cref="GitHubUpstreamRemote.FetchBaseBranchAsync"/>.
+    /// </summary>
+    public string? FetchUpstreamShaToReturn { get; set; }
 
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
@@ -313,6 +384,17 @@ internal sealed class FakeGitHost : IGitHost
     {
         Pushes.Add((repositoryId, upstreamUrl, branch, reconcileStrategy));
         return Task.CompletedTask;
+    }
+
+    public Task<string?> FetchUpstreamBranchAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+    {
+        Fetches.Add((repositoryId, upstreamUrl, branch, upstreamEnv));
+        return Task.FromResult(FetchUpstreamShaToReturn);
     }
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
