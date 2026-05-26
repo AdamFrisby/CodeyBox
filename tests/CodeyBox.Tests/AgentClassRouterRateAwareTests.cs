@@ -144,6 +144,194 @@ public sealed class AgentClassRouterRateAwareTests
     }
 
     [Fact]
+    public async Task RateAware_PayPerApiMember_IsNotGatedRegardlessOfRunningCount()
+    {
+        // Spec calls out the PayPerApi exemption: pay-per-API has no window to
+        // overrun, so the rate-aware gate must let it through even when the
+        // running count would otherwise trigger the gate.
+        var payPerApi = new AgentMembership
+        { Agent = Codex, Billing = AgentBilling.PayPerApi, QualityScore = 100 };
+        var cls = FrontierClass(payPerApi);
+
+        var counters = new FakeCounters();
+        // Pile up running counters far above what would gate a Subscription member.
+        for (var i = 0; i < 50; i++) counters.Increment(Codex);
+
+        var estimator = new FakeBurnEstimator
+        {
+            EstimatesByAgent =
+            {
+                [Codex] = new AgentBurnEstimate { AvgBurnPctPerItem = 90.0, SampleCount = 10 },
+            }
+        };
+        var router = BuildRouter([cls], [new FakeProbe(Codex, 10.0)], estimator, counters);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
+    public async Task RateAware_BurnEstimatorThrows_FallsBackToColdStartFitAndAllowsDispatch()
+    {
+        // A failing estimator must not lock the dispatcher out. The gate's
+        // catch-and-default path keeps fit=ColdStart so first/second dispatches
+        // still go through.
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        var estimator = new ThrowingBurnEstimator();
+        var router = BuildRouter([cls], [new FakeProbe(Codex, 100.0)], estimator, counters);
+
+        var d1 = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        Assert.Equal(Codex, d1.Chosen!.Agent);
+        counters.Increment(Codex);
+
+        var d2 = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        Assert.Equal(Codex, d2.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task SummariseFitsAsync_UnknownClass_ReturnsEmpty()
+    {
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        var estimator = new FakeBurnEstimator();
+        var router = BuildRouter([cls], [new FakeProbe(Codex, 100.0)], estimator, counters);
+
+        var fits = await router.SummariseFitsAsync("does-not-exist");
+
+        Assert.Empty(fits);
+    }
+
+    [Fact]
+    public async Task SummariseFitsAsync_SkipsPayPerApiMembers()
+    {
+        // PayPerApi members are not rate-gated, so they should not appear in
+        // the fits summary.
+        var cls = new AgentClass
+        {
+            Id = "mixed",
+            DisplayName = "mixed",
+            Members =
+            [
+                new AgentMembership { Agent = Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = Claude, Billing = AgentBilling.PayPerApi, QualityScore = 100 },
+            ],
+        };
+        var counters = new FakeCounters();
+        var estimator = new FakeBurnEstimator();
+        var router = BuildRouter(
+            [cls],
+            [new FakeProbe(Codex, 100.0), new FakeProbe(Claude, 100.0)],
+            estimator, counters);
+
+        var fits = await router.SummariseFitsAsync("mixed");
+
+        Assert.Single(fits);
+        Assert.Equal(Codex, fits[0].Agent);
+    }
+
+    [Fact]
+    public async Task SummariseFitsAsync_ColdStartUsesDefaultFit_AndIncludesRunningCount()
+    {
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        counters.Increment(Codex);
+        var estimator = new FakeBurnEstimator(); // no samples
+        var router = BuildRouter([cls], [new FakeProbe(Codex, 100.0)], estimator, counters);
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        var view = Assert.Single(fits);
+        Assert.Equal("frontier", view.ClassId);
+        Assert.Equal(Codex, view.Agent);
+        Assert.Equal(AgentClassRouter.DefaultColdStartFitInWindow, view.FitInWindow);
+        Assert.Equal(0, view.SampleCount);
+        Assert.Equal(1, view.RunningOnAgent);
+    }
+
+    [Fact]
+    public async Task SummariseFitsAsync_WithSamples_ReturnsEmpiricalFit()
+    {
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        var estimator = new FakeBurnEstimator
+        {
+            EstimatesByAgent =
+            {
+                [Codex] = new AgentBurnEstimate { AvgBurnPctPerItem = 25.0, SampleCount = 8 },
+            }
+        };
+        var router = BuildRouter([cls], [new FakeProbe(Codex, 100.0)], estimator, counters);
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        var view = Assert.Single(fits);
+        Assert.Equal(4.0, view.FitInWindow); // 100 / 25
+        Assert.Equal(8, view.SampleCount);
+        Assert.Equal(25.0, view.AvgBurnPctPerItem);
+    }
+
+    [Fact]
+    public async Task SummariseFitsAsync_UnknownAvailability_ReturnsNaNFit()
+    {
+        // Probe returned AvailablePct = -1 (unknown). With samples present,
+        // the divisor is positive but there's no meaningful availability — so
+        // the surface uses double.NaN as the sentinel.
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        var estimator = new FakeBurnEstimator
+        {
+            EstimatesByAgent =
+            {
+                [Codex] = new AgentBurnEstimate { AvgBurnPctPerItem = 25.0, SampleCount = 8 },
+            }
+        };
+        var router = BuildRouter([cls], [new FakeProbe(Codex, -1.0)], estimator, counters);
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        var view = Assert.Single(fits);
+        Assert.True(double.IsNaN(view.FitInWindow));
+    }
+
+    [Fact]
+    public async Task SummariseFitsAsync_ProbeThrows_OmitsMember()
+    {
+        // SummariseFitsAsync swallows probe exceptions so the /concurrency
+        // endpoint doesn't 5xx on a flaky probe; the affected member is
+        // silently absent from the response.
+        var cls = FrontierClass(Sub(Codex), Sub(Claude));
+        var counters = new FakeCounters();
+        var estimator = new FakeBurnEstimator();
+        var router = BuildRouter(
+            [cls],
+            [new ThrowingProbe(Codex), new FakeProbe(Claude, 100.0)],
+            estimator, counters);
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        Assert.Single(fits);
+        Assert.Equal(Claude, fits[0].Agent);
+    }
+
+    [Fact]
+    public async Task SummariseFitsAsync_NoBurnEstimator_ReturnsEmpty()
+    {
+        // /concurrency must not crash on a router with no burn estimator wired.
+        var cls = FrontierClass(Sub(Codex));
+        var opts = new QuotaRouterOptions { MinQuotaPct = 5.0 };
+        var router = new AgentClassRouter(
+            [cls], [new FakeProbe(Codex, 100.0)], opts,
+            NullLogger<AgentClassRouter>.Instance);
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        Assert.Empty(fits);
+    }
+
+    [Fact]
     public async Task RateAware_NoEstimator_PreservesLegacyBehaviour()
     {
         // No burn estimator and no running counters → rate-aware gate is silent.
@@ -189,6 +377,24 @@ internal sealed class FakeBurnEstimator : IAgentBurnEstimator
         // No samples → router uses cold-start fit = 2.
         return Task.FromResult(new AgentBurnEstimate { AvgBurnPctPerItem = -1, SampleCount = 0 });
     }
+}
+
+/// <summary>Burn estimator that throws on every call — used by the
+/// rate-aware gate fallback tests.</summary>
+internal sealed class ThrowingBurnEstimator : IAgentBurnEstimator
+{
+    public Task<AgentBurnEstimate> GetEstimateAsync(AgentKind agent, CancellationToken ct = default) =>
+        throw new InvalidOperationException("burn estimator failure (simulated)");
+}
+
+/// <summary>Probe that throws on every probe — used by SummariseFitsAsync
+/// resiliency tests.</summary>
+internal sealed class ThrowingProbe : IAgentQuotaProbe
+{
+    public ThrowingProbe(AgentKind kind) { Kind = kind; }
+    public AgentKind Kind { get; }
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
+        throw new InvalidOperationException("probe failure (simulated)");
 }
 
 /// <summary>Probe whose AvailablePct can be re-assigned between dispatches.</summary>

@@ -7,8 +7,7 @@ namespace CodeyBox.Core;
 /// this into an "EstimatedConcurrentBurnsFitInWindow" gate: when the number of
 /// items already running on the agent meets or exceeds the fit estimate, the
 /// router refuses to dispatch another concurrent burn even though the raw
-/// availability is still above its
-/// <see cref="CodeyBox.Orchestrator.QuotaRouterOptions.MinQuotaPct"/> floor.
+/// availability is still above its configured minimum-quota floor.
 ///
 /// <para>
 /// Implementations MUST be thread-safe (the router probes from concurrent

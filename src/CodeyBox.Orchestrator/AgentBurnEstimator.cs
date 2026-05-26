@@ -144,19 +144,27 @@ public sealed class AgentBurnEstimator : IAgentBurnEstimator
         }
 
         double avgBurnPct;
+        int reportedSamples;
         if (samples > 0 && _opts.WindowTokenBudget.TryGetValue(agent.Value, out var budget) && budget > 0)
         {
             avgBurnPct = Math.Min(100.0, (avgTokens / (double)budget) * 100.0);
+            reportedSamples = samples;
         }
         else
         {
+            // Falling back to the configured default — per the AgentBurnEstimate.SampleCount
+            // contract, that field counts only Done items that *contributed* to
+            // AvgBurnPctPerItem. A default value is not empirical, so SampleCount must
+            // be 0 so the router takes its cold-start fit fallback rather than treating
+            // the default as a measured average.
             avgBurnPct = _opts.DefaultBurnPercentPerItem.TryGetValue(agent.Value, out var d) ? d : -1;
+            reportedSamples = 0;
         }
 
         return new AgentBurnEstimate
         {
             AvgBurnPctPerItem = avgBurnPct,
-            SampleCount = samples,
+            SampleCount = reportedSamples,
         };
     }
 

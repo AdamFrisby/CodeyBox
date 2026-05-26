@@ -181,23 +181,42 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         while (true)
         {
-            var current = _runningPerAgent.TryGetValue(agent, out var c) ? c : 0;
-            if (current >= cap) return false;
-            if (current == 0)
+            if (_runningPerAgent.TryGetValue(agent, out var current))
             {
-                if (_runningPerAgent.TryAdd(agent, 1)) return true;
+                if (current >= cap) return false;
+                if (_runningPerAgent.TryUpdate(agent, current + 1, current)) return true;
+                // Lost a race; retry the read and re-evaluate the cap.
             }
             else
             {
-                if (_runningPerAgent.TryUpdate(agent, current + 1, current)) return true;
+                // First reservation for this agent kind in this process.
+                if (_runningPerAgent.TryAdd(agent, 1)) return true;
+                // Lost the add race against another reserver; fall through to the
+                // TryGetValue branch which will TryUpdate against the observed value.
             }
-            // Lost a race; retry the read and re-evaluate the cap.
         }
     }
 
     private void ReleaseAgentSlot(AgentKind agent)
     {
-        _runningPerAgent.AddOrUpdate(agent, 0, static (_, v) => v > 0 ? v - 1 : 0);
+        // Decrement-or-remove: drop the key when it hits 0 so the next
+        // TryReserveAgentSlot takes the TryAdd branch cleanly. Holding the key
+        // at 0 would cause TryUpdate(..., 1, 0) to be the only valid path —
+        // which works, but leaves stale zero-valued entries accumulating in
+        // the dictionary and turns Snapshot/GetConcurrencyState into a fuller scan.
+        while (true)
+        {
+            if (!_runningPerAgent.TryGetValue(agent, out var current)) return;
+            if (current <= 1)
+            {
+                if (_runningPerAgent.TryRemove(new KeyValuePair<AgentKind, int>(agent, current))) return;
+            }
+            else
+            {
+                if (_runningPerAgent.TryUpdate(agent, current - 1, current)) return;
+            }
+            // Lost a race; retry.
+        }
     }
 
     /// <summary>Snapshot for the /workers/status endpoint.</summary>
@@ -439,6 +458,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         => PickNextEligibleAsync(ct);
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
+
+    // Exposed as internal so tests can directly exercise the per-agent cap
+    // reservation/release cycle without spinning the full BackgroundService.
+    // The hot-spin bug in the first revision of this code (TryAdd against an
+    // existing key) is only visible across a Release-then-Reserve cycle, which
+    // PinnedPipelineRunner-based integration tests do not produce.
+    internal bool TryReserveAgentSlotForTest(AgentKind agent) => TryReserveAgentSlot(agent);
+    internal void ReleaseAgentSlotForTest(AgentKind agent) => ReleaseAgentSlot(agent);
 
     /// <summary>
     /// On startup, re-enqueue work items that were mid-flight when we last

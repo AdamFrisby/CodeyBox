@@ -122,13 +122,15 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
         }
 
         var observed = new ConcurrentBag<(AgentKind Agent, int Count)>();
+        using var monitorCts = new CancellationTokenSource();
         var monitor = Task.Run(async () =>
         {
-            while (true)
+            while (!monitorCts.IsCancellationRequested)
             {
                 foreach (var kv in orchestrator.Snapshot())
                     observed.Add((kv.Key, kv.Value));
-                try { await Task.Delay(25); } catch { return; }
+                try { await Task.Delay(25, monitorCts.Token); }
+                catch (OperationCanceledException) { return; }
             }
         });
 
@@ -158,6 +160,134 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
         // Release the pipelines and let everything drain.
         pipeline.Release();
         await orchestrator.StopAsync(CancellationToken.None);
+        monitorCts.Cancel();
+        await monitor;
+    }
+
+    [Fact]
+    public async Task TryReserveAgentSlot_AfterRelease_AllowsReReservation()
+    {
+        // Regression: an earlier revision of TryReserveAgentSlot used TryAdd
+        // when the dictionary key existed at 0, which always failed and pinned
+        // a CPU core in the while(true) loop. This test reserves cap, releases,
+        // and re-reserves — the buggy version hangs here.
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members = { ["codex"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } }
+        };
+        var orchestrator = new OrchestratorService(
+            new InMemoryTaskQueue(), _store, new PinnedPipelineRunner(_store),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            agentConcurrency: concurrency);
+
+        Assert.True(orchestrator.TryReserveAgentSlotForTest(Codex));
+        Assert.False(orchestrator.TryReserveAgentSlotForTest(Codex));
+        Assert.Equal(1, orchestrator.GetRunning(Codex));
+
+        orchestrator.ReleaseAgentSlotForTest(Codex);
+        Assert.Equal(0, orchestrator.GetRunning(Codex));
+
+        // The buggy version would spin forever here.
+        var task = Task.Run(() => orchestrator.TryReserveAgentSlotForTest(Codex));
+        var completed = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(task, completed); // TryReserveAgentSlot hung after Release — hot-spin regression
+        Assert.True(await task);
+        Assert.Equal(1, orchestrator.GetRunning(Codex));
+
+        orchestrator.ReleaseAgentSlotForTest(Codex);
+        Assert.Equal(0, orchestrator.GetRunning(Codex));
+    }
+
+    [Fact]
+    public async Task TryReserveAgentSlot_UnderConcurrentReservers_DoesNotExceedCap()
+    {
+        // Spec acceptance: per-agent cap is never violated under concurrent
+        // dispatch. 100 parallel reservers against cap=3 must give exactly 3
+        // successes; the loop's TryUpdate-CAS path must serialise the increment.
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members = { ["codex"] = new AgentConcurrencyEntry { MaxConcurrent = 3 } }
+        };
+        var orchestrator = new OrchestratorService(
+            new InMemoryTaskQueue(), _store, new PinnedPipelineRunner(_store),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 100 },
+            NullLogger<OrchestratorService>.Instance,
+            agentConcurrency: concurrency);
+
+        var successes = 0;
+        await Parallel.ForEachAsync(Enumerable.Range(0, 100), async (_, _) =>
+        {
+            if (orchestrator.TryReserveAgentSlotForTest(Codex))
+                Interlocked.Increment(ref successes);
+            await Task.Yield();
+        });
+
+        Assert.Equal(3, successes);
+        Assert.Equal(3, orchestrator.GetRunning(Codex));
+    }
+
+    [Fact]
+    public void TryReserveAgentSlot_NoCapConfigured_AlwaysSucceedsAndIncrementsCounter()
+    {
+        // The "no per-agent cap" branch goes through AddOrUpdate so the
+        // /concurrency surface still reflects the live in-flight count.
+        var orchestrator = new OrchestratorService(
+            new InMemoryTaskQueue(), _store, new PinnedPipelineRunner(_store),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 10 },
+            NullLogger<OrchestratorService>.Instance);
+
+        for (var i = 0; i < 5; i++)
+            Assert.True(orchestrator.TryReserveAgentSlotForTest(Codex));
+        Assert.Equal(5, orchestrator.GetRunning(Codex));
+
+        for (var i = 0; i < 5; i++) orchestrator.ReleaseAgentSlotForTest(Codex);
+        Assert.Equal(0, orchestrator.GetRunning(Codex));
+
+        // After full drain, key is removed from the dictionary so Snapshot is empty.
+        Assert.Empty(orchestrator.Snapshot());
+    }
+
+    [Fact]
+    public void GetConcurrencyState_ReflectsLiveRunningCounts()
+    {
+        // The empty-state shape is asserted by GetConcurrencyState_ReflectsCapsAndCounts;
+        // this test exercises the >0 filter and the per-agent count surface.
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members =
+            {
+                ["codex"]  = new AgentConcurrencyEntry { MaxConcurrent = 2 },
+                ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 2 },
+            }
+        };
+        var orchestrator = new OrchestratorService(
+            new InMemoryTaskQueue(), _store, new PinnedPipelineRunner(_store),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            NullLogger<OrchestratorService>.Instance,
+            agentConcurrency: concurrency);
+
+        orchestrator.TryReserveAgentSlotForTest(Codex);
+        orchestrator.TryReserveAgentSlotForTest(Codex);
+        orchestrator.TryReserveAgentSlotForTest(Claude);
+
+        var state = orchestrator.GetConcurrencyState();
+        Assert.Equal(2, state.CurrentlyRunningPerAgent["codex"]);
+        Assert.Equal(1, state.CurrentlyRunningPerAgent["claude"]);
+        // Gemini cap not configured and not running → not in the snapshot.
+        Assert.False(state.CurrentlyRunningPerAgent.ContainsKey("gemini"));
+
+        orchestrator.ReleaseAgentSlotForTest(Codex);
+        orchestrator.ReleaseAgentSlotForTest(Codex);
+        orchestrator.ReleaseAgentSlotForTest(Claude);
+
+        var drained = orchestrator.GetConcurrencyState();
+        // After draining, no agent has running > 0 — the >0 filter excludes them.
+        Assert.Empty(drained.CurrentlyRunningPerAgent);
     }
 
     [Fact]

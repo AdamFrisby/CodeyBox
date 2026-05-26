@@ -35,12 +35,13 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         try { File.Delete(_dbPath); } catch { /* best-effort */ }
     }
 
-    private void SeedWorkItem(string id, string projectId = "test-project")
+    private void SeedWorkItem(string id, string projectId = "test-project", WorkItemState state = WorkItemState.Queued)
     {
         using var cmd = _rawConn.CreateCommand();
-        cmd.CommandText = "INSERT INTO work_items (id, project_id, state, updated_at) VALUES ($id, $proj, 0, $now)";
+        cmd.CommandText = "INSERT INTO work_items (id, project_id, state, updated_at) VALUES ($id, $proj, $state, $now)";
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$proj", projectId);
+        cmd.Parameters.AddWithValue("$state", (int)state);
         cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
         cmd.ExecuteNonQuery();
     }
@@ -211,6 +212,131 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         // Single-row work cost: iter delta == total.
         Assert.Equal(12345, summaries[withCostsA].Iteration.TokensInput);
         Assert.Equal(12345, summaries[withCostsA].Total.TokensInput);
+    }
+
+    [Fact]
+    public async Task GetAvgTokensPerItemAsync_LimitZero_ShortCircuitsToEmpty()
+    {
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+        await _store.RecordAsync(MakeCost(itemId));
+
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("claude", 0);
+
+        Assert.Equal(0, avg);
+        Assert.Equal(0, samples);
+    }
+
+    [Fact]
+    public async Task GetAvgTokensPerItemAsync_EmptyTable_ReturnsZeros()
+    {
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("claude", 10);
+        Assert.Equal(0, avg);
+        Assert.Equal(0, samples);
+    }
+
+    [Fact]
+    public async Task GetAvgTokensPerItemAsync_AveragesPerItemSumAcrossMostRecentItems()
+    {
+        // Two Done items, one with 2 cost rows (so the per-item SUM is exercised).
+        // item1: input=100 + output=10 + cached=5 = 115; second row: 200+20+5 = 225 → total 340
+        // item2: input=400 + output=30 + cached=5 = 435 → total 435
+        // expected avg = (340 + 435) / 2 = 387.5 → rounded 388
+        var itemA = "item-a";
+        var itemB = "item-b";
+        SeedWorkItem(itemA, state: WorkItemState.Done);
+        SeedWorkItem(itemB, state: WorkItemState.Done);
+
+        await _store.RecordAsync(MakeCost(itemA) with
+        {
+            AgentKind = "codex", InputTokens = 100, OutputTokens = 10, CachedInputTokens = 5,
+        });
+        await _store.RecordAsync(MakeCost(itemA) with
+        {
+            AgentKind = "codex", InputTokens = 200, OutputTokens = 20, CachedInputTokens = 5,
+        });
+        await _store.RecordAsync(MakeCost(itemB) with
+        {
+            AgentKind = "codex", InputTokens = 400, OutputTokens = 30, CachedInputTokens = 5,
+        });
+
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("codex", 10);
+
+        Assert.Equal(2, samples);
+        Assert.Equal(388, avg);
+    }
+
+    [Fact]
+    public async Task GetAvgTokensPerItemAsync_FiltersByAgentKind()
+    {
+        var itemA = "item-codex";
+        var itemB = "item-claude";
+        SeedWorkItem(itemA, state: WorkItemState.Done);
+        SeedWorkItem(itemB, state: WorkItemState.Done);
+
+        await _store.RecordAsync(MakeCost(itemA) with
+        { AgentKind = "codex", InputTokens = 1000, OutputTokens = 0, CachedInputTokens = 0 });
+        await _store.RecordAsync(MakeCost(itemB) with
+        { AgentKind = "claude", InputTokens = 2000, OutputTokens = 0, CachedInputTokens = 0 });
+
+        var (codexAvg, codexN) = await _store.GetAvgTokensPerItemAsync("codex", 10);
+        var (claudeAvg, claudeN) = await _store.GetAvgTokensPerItemAsync("claude", 10);
+
+        Assert.Equal(1, codexN);
+        Assert.Equal(1000, codexAvg);
+        Assert.Equal(1, claudeN);
+        Assert.Equal(2000, claudeAvg);
+    }
+
+    [Fact]
+    public async Task GetAvgTokensPerItemAsync_LimitsToMostRecentByLatestStartedAt()
+    {
+        // 3 Done items with distinct started_at; limit=2 should keep the two most recent.
+        var older = "old";
+        var middle = "mid";
+        var newest = "new";
+        SeedWorkItem(older, state: WorkItemState.Done);
+        SeedWorkItem(middle, state: WorkItemState.Done);
+        SeedWorkItem(newest, state: WorkItemState.Done);
+        var baseTime = DateTimeOffset.UtcNow.AddHours(-3);
+
+        await _store.RecordAsync(MakeCost(older) with
+        { AgentKind = "codex", InputTokens = 100, OutputTokens = 0, CachedInputTokens = 0, StartedAt = baseTime, EndedAt = baseTime.AddSeconds(1) });
+        await _store.RecordAsync(MakeCost(middle) with
+        { AgentKind = "codex", InputTokens = 200, OutputTokens = 0, CachedInputTokens = 0, StartedAt = baseTime.AddHours(1), EndedAt = baseTime.AddHours(1).AddSeconds(1) });
+        await _store.RecordAsync(MakeCost(newest) with
+        { AgentKind = "codex", InputTokens = 300, OutputTokens = 0, CachedInputTokens = 0, StartedAt = baseTime.AddHours(2), EndedAt = baseTime.AddHours(2).AddSeconds(1) });
+
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("codex", 2);
+
+        Assert.Equal(2, samples);
+        // Average of newest two (200, 300) = 250.
+        Assert.Equal(250, avg);
+    }
+
+    [Fact]
+    public async Task GetAvgTokensPerItemAsync_ExcludesNonDoneItems()
+    {
+        // Spec requires Done-only samples so partial in-flight cost rows don't
+        // bias the rolling average (the codex-heavy scenario in the goal).
+        var done = "i-done";
+        var queued = "i-queued";
+        var failed = "i-failed";
+        SeedWorkItem(done, state: WorkItemState.Done);
+        SeedWorkItem(queued, state: WorkItemState.Queued);
+        SeedWorkItem(failed, state: WorkItemState.Failed);
+
+        await _store.RecordAsync(MakeCost(done) with
+        { AgentKind = "codex", InputTokens = 100, OutputTokens = 0, CachedInputTokens = 0 });
+        await _store.RecordAsync(MakeCost(queued) with
+        { AgentKind = "codex", InputTokens = 1, OutputTokens = 0, CachedInputTokens = 0 });
+        await _store.RecordAsync(MakeCost(failed) with
+        { AgentKind = "codex", InputTokens = 2, OutputTokens = 0, CachedInputTokens = 0 });
+
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("codex", 10);
+
+        Assert.Equal(1, samples);
+        Assert.Equal(100, avg);
     }
 
     [Fact]
