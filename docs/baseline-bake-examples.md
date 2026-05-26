@@ -109,7 +109,8 @@ Bake them at baseline time so the first dispatch can actually run.
 {
   "CodeyBox": {
     "MultipassExtraRuncmd": [
-      "set -eux\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y curl ca-certificates nodejs npm",
+      "apt-get update",
+      "apt-get install -y curl ca-certificates nodejs npm",
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "curl -fsSL https://cursor.com/install | bash"
     ]
@@ -117,12 +118,19 @@ Bake them at baseline time so the first dispatch can actually run.
 }
 ```
 
-Pick the subset that matches the agents you have registered. The
-`@google/gemini-cli` install must be ≥ 0.1.9 if any agent-class member sets
-`ReasoningMode=high`. Cursor installs the binary as `agent` (not
-`cursor-agent`) — verify it lands on `$PATH` after the bake. After changing
-any entry, delete cached `cb-baseline-*` images so the next sandbox launch
-re-runs the bake.
+Pick the subset that matches the agents you have registered. For Gemini,
+reasoning level is encoded in the model id (e.g. `gemini-3-flash-preview`),
+not a CLI flag — there is no `--thinking` flag to pin a version against.
+Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
+on `$PATH` after the bake. The standalone Copilot CLI (binary name
+`copilot`) is operator-supplied; do **not** substitute
+`gh extension install github/gh-copilot`, which produces a `gh copilot`
+subcommand and will not satisfy the runner. opencode does not yet ship a
+runner in this repo; operators tracking the integration can pre-stage with
+`curl -fsSL https://opencode.ai/install | bash`, but the orchestrator will
+not dispatch to it until a runner is registered. After changing any entry,
+delete cached `cb-baseline-*` images so the next sandbox launch re-runs the
+bake.
 
 ## Security Tooling
 
