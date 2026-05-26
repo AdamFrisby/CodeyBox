@@ -106,6 +106,25 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
     }
 
     [Fact]
+    public async Task AutoMember_OneOkOthers429_Notes_NamesTheOkModel()
+    {
+        // The acceptance test the operator asked for: with one model up and
+        // others 429'd, AvailablePct is 100 and Notes identifies which
+        // specific model the live probe routed via — so /quota and audit
+        // logs can pin the actual route, not just "available somewhere".
+        var handler = new GeminiAutoFanOutHandler(modelStatus: modelId =>
+            modelId == "gemini-2.5-flash" ? HttpStatusCode.OK : HttpStatusCode.TooManyRequests);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(AutoMember, CancellationToken.None);
+
+        Assert.Equal(100, snapshot.AvailablePct);
+        Assert.Equal("auto routed via gemini-2.5-flash", snapshot.Notes);
+        Assert.Equal(100, snapshot.PerModel["gemini-2.5-flash"].AvailablePct);
+        Assert.Equal(0, snapshot.PerModel["gemini-2.5-pro"].AvailablePct);
+    }
+
+    [Fact]
     public async Task AutoMember_CachedUnderAutoKey_DoesNotReprobeWithinTtl()
     {
         var handler = new GeminiAutoFanOutHandler(modelStatus: _ => HttpStatusCode.OK);
@@ -120,29 +139,72 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
     }
 
     [Fact]
-    public async Task FixedMember_DoesNotInvokeAutoFanOut_UsesUsageEndpoint()
+    public async Task FixedMember_DoesNotInvokeAutoFanOut_LiveProbesSingleModel()
     {
-        // For a non-auto member, the existing retrieveUserQuota path applies —
-        // a single HTTP call to that endpoint, not the fan-out generateContent.
-        var handler = new GeminiAutoFanOutHandler(
-            modelStatus: _ => HttpStatusCode.OK,
-            usageBody: """{"buckets":[{"modelId":"gemini-2.5-pro","remainingFraction":0.8,"resetTime":"2026-05-17T12:00:00Z","tokenType":"REQUESTS"}]}""");
+        // For a non-auto member with a fixed ModelId, the probe issues exactly
+        // one live :generateContent call at that model — not a fan-out, and
+        // not the legacy retrieveUserQuota endpoint.
+        var handler = new GeminiAutoFanOutHandler(modelStatus: _ => HttpStatusCode.OK);
 
         var probe = BuildProbe(handler);
         var snapshot = await probe.GetAvailabilityAsync(FixedMember, CancellationToken.None);
 
-        Assert.Equal(80, snapshot.AvailablePct);
-        // Single request to the retrieveUserQuota endpoint, not generateContent.
+        Assert.Equal(100, snapshot.AvailablePct);
         var req = Assert.Single(handler.Requests);
-        Assert.Equal(new Uri(GeminiQuotaProbe.UsageEndpoint), req.Uri);
+        Assert.Equal(new Uri(GeminiQuotaProbe.GenerateContentEndpoint), req.Uri);
+        // Body targets the configured model and only that model.
+        Assert.Contains("models/gemini-2.5-pro", req.Body);
+        Assert.True(snapshot.PerModel.ContainsKey("gemini-2.5-pro"));
+    }
+
+    [Fact]
+    public async Task FixedMember_LiveProbe429_Reports0PctWithReset()
+    {
+        // The whole reason for replacing retrieveUserQuota as the primary
+        // signal: a single model can be 429'd while the aggregated fraction
+        // still reads "available". The live probe surfaces that directly.
+        var now = DateTimeOffset.UtcNow;
+        var resetAt = now + TimeSpan.FromMinutes(7);
+        var handler = new GeminiAutoFanOutHandler(
+            modelStatus: _ => HttpStatusCode.TooManyRequests,
+            retryAfterFor: _ => resetAt);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(FixedMember, CancellationToken.None);
+
+        Assert.Equal(0, snapshot.AvailablePct);
+        Assert.NotNull(snapshot.ResetAt);
+        Assert.True((snapshot.ResetAt!.Value - resetAt).Duration() < TimeSpan.FromSeconds(5));
+        Assert.Equal(0, snapshot.PerModel["gemini-2.5-pro"].AvailablePct);
+        var req = Assert.Single(handler.Requests);
+        Assert.Equal(new Uri(GeminiQuotaProbe.GenerateContentEndpoint), req.Uri);
+    }
+
+    [Fact]
+    public async Task FixedMember_LiveProbe404_ReportsUnknown()
+    {
+        // Typo / unknown model id: :generateContent returns 404. The probe
+        // reports Unknown so the router falls through to its QuotaUnknownPolicy
+        // rather than silently fail-opening.
+        var handler = new GeminiAutoFanOutHandler(modelStatus: _ => HttpStatusCode.NotFound);
+
+        var typoMember = FixedMember with { ModelId = "gemini-3-flash-preview-typo" };
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(typoMember, CancellationToken.None);
+
+        Assert.Equal(-1, snapshot.AvailablePct);
+        Assert.NotNull(snapshot.Notes);
+        Assert.Contains("gemini-3-flash-preview-typo", snapshot.Notes!);
+        Assert.Contains("404", snapshot.Notes!);
     }
 
     [Fact]
     public async Task AutoAndFixed_CacheKeysAreIndependent()
     {
-        var handler = new GeminiAutoFanOutHandler(
-            modelStatus: _ => HttpStatusCode.OK,
-            usageBody: """{"buckets":[{"modelId":"gemini-2.5-pro","remainingFraction":1.0,"tokenType":"REQUESTS"}]}""");
+        // Both auto and fixed members now go via :generateContent; what differs
+        // is the cache key (auto sentinel vs the specific model id). Two
+        // probes against the same token must populate distinct cache entries.
+        var handler = new GeminiAutoFanOutHandler(modelStatus: _ => HttpStatusCode.OK);
 
         var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromMinutes(5));
 
@@ -152,9 +214,8 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
         Assert.Equal(100, autoSnap.AvailablePct);
         Assert.Equal(100, fixedSnap.AvailablePct);
 
-        // The fixed-member fetch hit the usage endpoint; the auto fetch hit
-        // generateContent four times. Verify both cache entries coexist by
-        // calling each again with no extra HTTP traffic.
+        // Verify both cache entries coexist by calling each again with no
+        // extra HTTP traffic.
         var totalAfterPopulate = handler.Requests.Count;
         await probe.GetAvailabilityAsync(AutoMember, CancellationToken.None);
         await probe.GetAvailabilityAsync(FixedMember, CancellationToken.None);
