@@ -190,7 +190,11 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         Assert.Contains(files, f => f.Phase == "work" && f.Iteration == 1);
         Assert.Contains(files, f => f.Phase == "audit-llm-security:llm-review" && f.Iteration == 1);
         Assert.Contains(files, f => f.Phase == "audit-llm-completeness:llm-review" && f.Iteration == 1);
-        Assert.Contains(files, f => f.Phase == "rework" && f.Iteration == 1);
+        // Rework that addresses audit iteration N is dispatched as iteration N+1
+        // (the input audit iteration N+1 will evaluate); the stream filename
+        // therefore carries iteration=2 for the first rework, matching the
+        // work_item_iterations dispatch row.
+        Assert.Contains(files, f => f.Phase == "rework" && f.Iteration == 2);
         Assert.Contains(files, f => f.Phase == "audit-llm-security:llm-review" && f.Iteration == 2);
         Assert.Contains(files, f => f.Phase == "audit-llm-completeness:llm-review" && f.Iteration == 2);
         Assert.Contains(files, f => f.Phase == "merge" && f.Iteration == 1);

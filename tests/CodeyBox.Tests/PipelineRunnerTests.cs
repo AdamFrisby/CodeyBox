@@ -182,7 +182,13 @@ public sealed class PipelineRunnerTests
     public void BuildInitialWorkPrompt_TrailerSeparatedByBlankLine()
     {
         var prompt = PipelineRunner.BuildInitialWorkPrompt("do work");
-        Assert.Contains("\n\n    Co-Authored-By:", prompt);
+        // The prompt now mandates a two-line trailer block: CodeyBox-Prompt-Revision
+        // and Co-Authored-By, separated from the subject by a blank line. The
+        // Prompt-Revision line precedes Co-Authored-By inside the same block so
+        // the existing "blank line before the Co-Authored-By line" assertion no
+        // longer holds; verify the block separator and each trailer key instead.
+        Assert.Contains("\n\n    CodeyBox-Prompt-Revision: $CODEYBOX_PROMPT_REVISION", prompt);
+        Assert.Contains("    Co-Authored-By: CodeyBox <noreply@codeybox.invalid>", prompt);
     }
 
     [Fact]

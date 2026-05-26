@@ -25,6 +25,14 @@ public sealed record WorkItem
     /// <summary>The natural-language task to give to the agent.</summary>
     public required string Prompt { get; init; }
 
+    /// <summary>
+    /// Monotonic generation counter for <see cref="Prompt"/>. Starts at 1 on
+    /// creation; the operator-facing prompt-update endpoint increments it on
+    /// every successful write. Dispatched iterations capture this value so the
+    /// orchestrator can detect "agent finished against an older prompt".
+    /// </summary>
+    public int PromptRevision { get; init; } = 1;
+
     /// <summary>If set, overrides the project's default base branch.</summary>
     public string? BaseBranch { get; init; }
 

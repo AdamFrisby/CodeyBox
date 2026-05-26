@@ -121,7 +121,12 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         var reworkRows = costStore.Recorded.Where(r => r.Phase == "rework").ToList();
         Assert.Single(reworkRows);
-        Assert.Equal(1, reworkRows[0].Iteration);
+        // The rework following audit iteration N is dispatched as iteration N+1
+        // (the input the next audit pass will evaluate); the cost row therefore
+        // records iteration=2 for the first rework — matching the
+        // work_item_iterations dispatch row that drives the prompt-revision
+        // trailer check.
+        Assert.Equal(2, reworkRows[0].Iteration);
     }
 
     private static WorkItem NewItem(string branch) => new()

@@ -70,4 +70,30 @@ public sealed record WebhookEvent
     /// work item. Paired with <see cref="Usage"/>; null under the same conditions.
     /// </summary>
     public WorkItemUsageTotal? UsageTotal { get; init; }
+
+    /// <summary>
+    /// Current monotonic prompt-generation counter on the work item at terminal
+    /// state. Top-level (not in <see cref="Details"/>) so JobTrack and other
+    /// trackers can read <c>payload.promptRevision</c> directly without first
+    /// resolving the polymorphic details object. Null for non-terminal events
+    /// and for any event whose work item predates the prompt-revision feature.
+    /// </summary>
+    public int? PromptRevision { get; init; }
+
+    /// <summary>
+    /// Revision that was active when the LAST dispatched iteration began. Lets
+    /// a tracker tell "agent finished against the latest prompt" from "agent
+    /// finished against a stale prompt; the operator's mid-iteration edit was
+    /// not yet visible." Null when no iteration rows exist (e.g. the item
+    /// failed before any dispatch).
+    /// </summary>
+    public int? RevisionAtCompletion { get; init; }
+
+    /// <summary>
+    /// Convenience flag: <see cref="RevisionAtCompletion"/> equals
+    /// <see cref="PromptRevision"/>. False means the last iteration ran against
+    /// a stale prompt and the tracker should offer a one-click re-run. Null
+    /// when <see cref="RevisionAtCompletion"/> is null.
+    /// </summary>
+    public bool? RevisionMatches { get; init; }
 }

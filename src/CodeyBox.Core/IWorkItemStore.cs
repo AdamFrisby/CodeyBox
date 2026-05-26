@@ -22,6 +22,26 @@ public enum PriorityUpdateOutcome
 public readonly record struct PriorityUpdateResult(PriorityUpdateOutcome Outcome, WorkItem? Item, int? OldPriority);
 
 /// <summary>
+/// Outcome of <see cref="IWorkItemStore.TryReplacePromptAsync"/>. <see cref="NewRevision"/>
+/// is populated on <see cref="PromptReplaceOutcome.Updated"/>; null otherwise.
+/// </summary>
+public readonly record struct PromptReplaceResult(PromptReplaceOutcome Outcome, int? NewRevision);
+
+public enum PromptReplaceOutcome { Updated, NotFound, TerminalState }
+
+/// <summary>
+/// Snapshot of a single dispatched iteration. <see cref="PromptRevisionAtDispatch"/>
+/// is the value of <see cref="WorkItem.PromptRevision"/> at the moment the iteration
+/// was handed to the agent; the orchestrator compares it against the trailer on the
+/// agent's commit to detect "agent finished against a stale prompt".
+/// </summary>
+public sealed record WorkItemIteration(
+    WorkItemId WorkItemId,
+    int Iteration,
+    int PromptRevisionAtDispatch,
+    DateTimeOffset DispatchedAt);
+
+/// <summary>
 /// Durable store of work items. Survives orchestrator restart so in-flight
 /// items can be recovered and replayed.
 /// </summary>
@@ -29,13 +49,17 @@ public interface IWorkItemStore
 {
     Task CreateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
-    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>.
-    /// Use <see cref="UpdatePriorityAsync"/> for priority changes so worker writes
-    /// from stale snapshots cannot revert a concurrent PATCH /priority update.
+    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
+    /// <see cref="WorkItem.Prompt"/>, and <see cref="WorkItem.PromptRevision"/>.
+    /// Use <see cref="UpdatePriorityAsync"/> for priority changes and
+    /// <see cref="TryReplacePromptAsync"/> for prompt changes so worker writes
+    /// from stale in-memory snapshots cannot revert a concurrent PATCH /priority
+    /// or PUT /workitems/{id}/prompt update.
     /// </summary>
     Task UpdateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
-    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>
+    /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
+    /// <see cref="WorkItem.Prompt"/>, and <see cref="WorkItem.PromptRevision"/>
     /// only when the persisted state still matches <paramref name="onlyIfState"/>.
     /// Returns true if the row was updated.
     /// </summary>
@@ -142,4 +166,37 @@ public interface IWorkItemStore
     /// state machine to check whether all items have reached a terminal state.
     /// </summary>
     IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically replaces <see cref="WorkItem.Prompt"/> and increments
+    /// <see cref="WorkItem.PromptRevision"/> by 1. Returns the new revision so the
+    /// caller can echo it in the response. <see cref="PromptReplaceOutcome.TerminalState"/>
+    /// means the item is already Done/Failed/Cancelled and was not modified.
+    /// </summary>
+    Task<PromptReplaceResult> TryReplacePromptAsync(
+        WorkItemId id,
+        string newPrompt,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Records that iteration <paramref name="iteration"/> of work item
+    /// <paramref name="workItemId"/> was dispatched with the prompt revision
+    /// <paramref name="promptRevisionAtDispatch"/>. Idempotent: re-dispatching
+    /// the same iteration (e.g. orchestrator restart-recovery) overwrites the
+    /// row so the captured revision reflects the latest dispatch.
+    /// </summary>
+    Task RecordIterationDispatchAsync(
+        WorkItemId workItemId,
+        int iteration,
+        int promptRevisionAtDispatch,
+        DateTimeOffset dispatchedAt,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns all dispatched iterations for a work item in iteration order.
+    /// </summary>
+    Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(
+        WorkItemId workItemId,
+        CancellationToken ct = default);
 }

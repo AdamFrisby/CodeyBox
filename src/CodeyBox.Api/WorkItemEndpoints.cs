@@ -20,6 +20,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/dependents", GetDependentsAsync);
         group.MapGet("/{id}/replays", GetReplaysAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
+        group.MapPut("/{id}/prompt", PutPromptAsync);
         group.MapPatch("/{id}/priority", PatchPriorityAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
         group.MapGet("/{id}/questions", GetQuestionsAsync);
@@ -375,7 +376,9 @@ internal static class WorkItemEndpoints
         var project = await projects.GetAsync(item.ProjectId, ct);
         var usage = await TryGetUsageSummaryAsync(
             costs, item.Id, loggerFactory.CreateLogger("CodeyBox.Api.WorkItemEndpoints"), ct);
-        var dto = ToDto(item, project, statesById, depExternalIds, usage);
+        var iterations = await store.GetIterationsAsync(item.Id, ct);
+        var dto = ToDto(item, project, statesById, depExternalIds, usage,
+            iterations: iterations.Count > 0 ? iterations : null);
         if (fallbackHistory is not null)
         {
             var history = await fallbackHistory.ListByWorkItemAsync(item.Id, ct);
@@ -950,7 +953,24 @@ internal static class WorkItemEndpoints
         if (body.Prompt is not null)
         {
             if (body.Prompt.Length > 64 * 1024) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
-            updated = updated with { Prompt = body.Prompt, UpdatedAt = now };
+            // Route through TryReplacePromptAsync — the only write path that
+            // touches prompt + prompt_revision. The full-row UPDATE below
+            // deliberately does NOT carry the prompt columns (they would
+            // clobber a concurrent PUT /workitems/{id}/prompt). The state
+            // guard inside TryReplacePromptAsync mirrors the Queued check
+            // above; success refreshes our in-memory snapshot for the rest
+            // of the PATCH so the response DTO reflects the new revision.
+            var promptResult = await store.TryReplacePromptAsync(updated.Id, body.Prompt, now, ct);
+            if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
+                return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+            if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
+                return Results.Conflict(new { error = $"cannot edit item in terminal state" });
+            updated = updated with
+            {
+                Prompt = body.Prompt,
+                PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
+                UpdatedAt = now,
+            };
         }
 
         if (body.Agent is not null)
@@ -999,6 +1019,45 @@ internal static class WorkItemEndpoints
 
         var project = await projects.GetAsync(updated.ProjectId, ct);
         return Results.Ok(ToDto(updated, project, statesById, depExternalIds));
+    }
+
+    /// <summary>
+    /// Atomically replaces the prompt of a non-terminal work item and bumps
+    /// <see cref="WorkItem.PromptRevision"/> by 1. The new revision is echoed in
+    /// the response so the caller (JobTrack et al.) can correlate with the
+    /// agent commit's <c>CodeyBox-Prompt-Revision</c> trailer. Mid-iteration
+    /// edits do not affect the already-dispatched iteration — the snapshotted
+    /// <c>prompt_revision_at_dispatch</c> wins for that iteration.
+    /// </summary>
+    private static async Task<IResult> PutPromptAsync(
+        string id,
+        PutPromptRequest body,
+        IWorkItemStore store,
+        CancellationToken ct)
+    {
+        if (body is null || string.IsNullOrEmpty(body.Prompt))
+            return Results.BadRequest(new { error = "prompt is required" });
+        if (body.Prompt.Length > 64 * 1024)
+            return Results.BadRequest(new { error = "prompt must be <= 64KB" });
+
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var result = await store.TryReplacePromptAsync(item!.Id, body.Prompt, DateTimeOffset.UtcNow, ct);
+        return result.Outcome switch
+        {
+            PromptReplaceOutcome.NotFound => Results.NotFound(new { error = $"work item '{id}' no longer exists" }),
+            PromptReplaceOutcome.TerminalState => Results.Conflict(new
+            {
+                error = $"cannot replace prompt of work item in terminal state '{item.State}'",
+            }),
+            PromptReplaceOutcome.Updated => Results.Ok(new
+            {
+                id = item.Id.ToString(),
+                promptRevision = result.NewRevision!.Value,
+            }),
+            _ => throw new InvalidOperationException($"Unexpected prompt replace outcome '{result.Outcome}'."),
+        };
     }
 
     /// <summary>
@@ -1440,7 +1499,8 @@ internal static class WorkItemEndpoints
         Project? project,
         IReadOnlyDictionary<WorkItemId, WorkItemState> statesById,
         IReadOnlyDictionary<WorkItemId, string?>? depExternalIds = null,
-        WorkItemUsageSummary? usage = null)
+        WorkItemUsageSummary? usage = null,
+        IReadOnlyList<WorkItemIteration>? iterations = null)
     {
         var depsSatisfied = WorkItemDependencies.AreSatisfied(item.DependsOn, statesById);
         var depExtIds = item.DependsOn.ToDictionary(
@@ -1480,7 +1540,11 @@ internal static class WorkItemEndpoints
             UsageTotal: usage?.Total,
             Priority: item.Priority,
             CancellationSource: item.CancellationSource,
-            TransientCancelRetries: item.TransientCancelRetries);
+            TransientCancelRetries: item.TransientCancelRetries,
+            PromptRevision: item.PromptRevision,
+            Iterations: iterations?
+                .Select(i => new WorkItemIterationDto(i.Iteration, i.PromptRevisionAtDispatch, i.DispatchedAt))
+                .ToList());
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -1648,6 +1712,10 @@ public sealed record PatchWorkItemRequest(
 
 public sealed record PatchPriorityRequest(int Priority);
 
+public sealed record PutPromptRequest(string Prompt);
+
+public sealed record WorkItemIterationDto(int Iteration, int PromptRevision, DateTimeOffset DispatchedAt);
+
 public sealed record ReorderWorkItemsRequest(string[]? Ids = null);
 
 public sealed record PauseQueueRequest(string Reason = "");
@@ -1693,7 +1761,9 @@ public sealed record WorkItemDto(
     IReadOnlyList<AgentFallbackDto>? FallbackHistory = null,
     int Priority = 0,
     string? CancellationSource = null,
-    int TransientCancelRetries = 0);
+    int TransientCancelRetries = 0,
+    int PromptRevision = 1,
+    IReadOnlyList<WorkItemIterationDto>? Iterations = null);
 
 public sealed record AgentFallbackDto(
     string Id,

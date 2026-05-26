@@ -229,6 +229,12 @@ public sealed class DiskFullApiBoundaryTests
         public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) => Empty();
         public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => Task.CompletedTask;
         public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => Empty();
+        public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default)
+            => Task.FromResult(new PromptReplaceResult(PromptReplaceOutcome.NotFound, null));
+        public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default)
+            => Task.CompletedTask;
+        public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<WorkItemIteration>>([]);
 
         private static async IAsyncEnumerable<WorkItem> Empty([EnumeratorCancellation] CancellationToken ct = default)
         {
@@ -267,6 +273,12 @@ public sealed class DiskFullApiBoundaryTests
         public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) => Empty();
         public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => Task.CompletedTask;
         public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => Empty();
+        public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default)
+            => Task.FromResult(new PromptReplaceResult(PromptReplaceOutcome.NotFound, null));
+        public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default)
+            => Task.CompletedTask;
+        public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<WorkItemIteration>>([]);
 
         private static async IAsyncEnumerable<WorkItem> Empty([EnumeratorCancellation] CancellationToken ct = default)
         {

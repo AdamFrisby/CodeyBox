@@ -28,9 +28,12 @@ public static class ReworkPromptBuilder
         sb.AppendLine();
         sb.AppendLine("Make new commits — do not amend.");
         sb.AppendLine();
-        sb.AppendLine("Every commit message MUST end with the following trailer, separated from the subject by a blank line:");
+        sb.AppendLine("Every commit message MUST end with the following trailers, separated from the subject by a blank line:");
         sb.AppendLine();
+        sb.AppendLine("    " + CodeyBoxTrailers.PromptRevisionTrailerKey + ": $" + CodeyBoxTrailers.PromptRevisionEnvVar);
         sb.AppendLine("    " + CodeyBoxTrailers.CoAuthoredBy);
+        sb.AppendLine();
+        sb.AppendLine("The `" + CodeyBoxTrailers.PromptRevisionTrailerKey + "` value MUST be the literal integer from the `" + CodeyBoxTrailers.PromptRevisionEnvVar + "` environment variable. The orchestrator audits this trailer to detect agents that finished against a stale prompt; missing or mismatched values are a blocking finding.");
         sb.AppendLine();
 
         if (allowAgentQuestions)
