@@ -63,6 +63,7 @@ public static class EventSchema
         "queue.resumed",
         // Agent-level (smoke probe, fallback)
         "agent.smoke_failed",
+        "agent.smoke_recovered",
         "agent.fallback",
         // Sandbox lifecycle (leak reaper only — provisioning is audit-log not webhook)
         "sandbox.leak_detected",

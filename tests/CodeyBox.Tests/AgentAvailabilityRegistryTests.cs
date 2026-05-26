@@ -1,0 +1,209 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Core;
+using CodeyBox.Orchestrator;
+
+namespace CodeyBox.Tests;
+
+/// <summary>
+/// Unit tests for <see cref="AgentAvailabilityRegistry"/> — covers the two
+/// load-bearing signals (smoke probe + fast-fail circuit breaker) and the
+/// router-side exclusion that prevents the exit-127 cascade described in
+/// the cb-216a2230 bug report (14 Cursor items lost after the binary was
+/// missing from the multipass image).
+/// </summary>
+public sealed class AgentAvailabilityRegistryTests
+{
+    private static readonly AgentKind Claude = AgentKind.Claude;
+    private static readonly AgentKind Codex = AgentKind.Codex;
+
+    private static AgentAvailabilityRegistry NewRegistry(int fastFailThreshold = 10, int maxConsecutive = 3)
+    {
+        var opts = new AvailabilityOptions
+        {
+            FastFailThresholdSeconds = fastFailThreshold,
+            MaxConsecutiveFastFails = maxConsecutive,
+        };
+        return new AgentAvailabilityRegistry(opts, TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+    }
+
+    // ── Smoke probe signal ────────────────────────────────────────────────────
+
+    [Fact]
+    public void NewRegistry_AnyAgent_IsAvailable()
+    {
+        var reg = NewRegistry();
+        Assert.True(reg.GetAvailability(Claude).Available);
+        Assert.Null(reg.GetAvailability(Claude).Reason);
+    }
+
+    [Fact]
+    public void SmokeFail_ExcludesAgent()
+    {
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(false, "auth", TimeSpan.FromMilliseconds(5)));
+
+        var av = reg.GetAvailability(Claude);
+        Assert.False(av.Available);
+        Assert.Contains("auth", av.Reason);
+    }
+
+    [Fact]
+    public void SmokePass_AfterFail_RestoresAgent()
+    {
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(true, null, TimeSpan.Zero));
+
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void SmokeFail_Transition_IsReported()
+    {
+        var reg = NewRegistry();
+        var first = reg.MarkSmokeResult(Claude, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+        var second = reg.MarkSmokeResult(Claude, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+
+        Assert.False(first.PreviouslyExcluded);
+        Assert.True(first.NowExcluded);
+        // Steady-state failure does not look like a transition.
+        Assert.True(second.PreviouslyExcluded);
+        Assert.True(second.NowExcluded);
+    }
+
+    [Fact]
+    public void SmokeRecover_Transition_IsReported()
+    {
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+        var transition = reg.MarkSmokeResult(Claude, new AgentSmokeResult(true, null, TimeSpan.Zero));
+
+        Assert.True(transition.PreviouslyExcluded);
+        Assert.False(transition.NowExcluded);
+    }
+
+    // ── Fast-fail circuit breaker ─────────────────────────────────────────────
+
+    [Fact]
+    public void SingleFastFail_DoesNotExclude()
+    {
+        var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void ThreeConsecutiveFastFails_ExcludesAgent()
+    {
+        var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        for (var i = 0; i < 3; i++)
+            reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+
+        var av = reg.GetAvailability(Claude);
+        Assert.False(av.Available);
+        Assert.Contains("fast-fail circuit breaker", av.Reason);
+    }
+
+    [Fact]
+    public void SlowFailure_DoesNotCountAsFastFail()
+    {
+        // The exit-127 reported in cb-216a2230 fired in <5s. A 30-second
+        // failure is a real-work failure and must not pollute the breaker.
+        var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        for (var i = 0; i < 5; i++)
+            reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(30));
+
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void SuccessfulRun_ResetsFastFailCounter()
+    {
+        var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        reg.RecordRunOutcome(Claude, success: true, duration: TimeSpan.FromSeconds(30));
+
+        // Two more fast fails — counter starts from zero so 2 < 3 means still available.
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void SlowFailure_AfterFastFails_ResetsCounter()
+    {
+        // A slow-failure run completed real work, so it cancels the breaker
+        // even though success=false. Otherwise long-running quota failures
+        // would pile up alongside genuine fast-fails.
+        var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(30));
+
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    // ── Reset ────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Reset_ClearsFastFailExclusion()
+    {
+        var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        for (var i = 0; i < 3; i++)
+            reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        Assert.False(reg.GetAvailability(Claude).Available);
+
+        reg.Reset(Claude);
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void Reset_ClearsSmokeExclusion()
+    {
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+        Assert.False(reg.GetAvailability(Claude).Available);
+
+        reg.Reset(Claude);
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void Reset_UnknownAgent_DoesNotThrow()
+    {
+        var reg = NewRegistry();
+        reg.Reset(Codex);
+        Assert.True(reg.GetAvailability(Codex).Available);
+    }
+
+    // ── Per-agent isolation ───────────────────────────────────────────────────
+
+    [Fact]
+    public void OneAgentExcluded_OtherUnaffected()
+    {
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+        Assert.False(reg.GetAvailability(Claude).Available);
+        Assert.True(reg.GetAvailability(Codex).Available);
+    }
+
+    // ── Snapshot ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Snapshot_EmitsAllTrackedAgents()
+    {
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(true, null, TimeSpan.Zero));
+        reg.MarkSmokeResult(Codex, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+
+        var snap = reg.Snapshot();
+        Assert.Equal(2, snap.Count);
+        var c = snap.Single(s => s.Agent == Claude);
+        var x = snap.Single(s => s.Agent == Codex);
+        Assert.False(c.Excluded);
+        Assert.True(x.Excluded);
+    }
+}
