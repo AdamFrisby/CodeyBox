@@ -97,6 +97,41 @@ tool and re-run audit to get enforcement.
 }
 ```
 
+## Agent CLIs
+
+Every `AgentKind` registered in an agent class needs its CLI baked into the
+sandbox image. The orchestrator does not install agent binaries; missing
+binaries surface as exit-127 dispatch failures only after the work item
+starts (today's smoke probes verify credentials, not binary presence).
+Bake them at baseline time so the first dispatch can actually run.
+
+```json
+{
+  "CodeyBox": {
+    "MultipassExtraRuncmd": [
+      "apt-get update",
+      "apt-get install -y curl ca-certificates nodejs npm",
+      "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+      "curl -fsSL https://cursor.com/install | bash"
+    ]
+  }
+}
+```
+
+Pick the subset that matches the agents you have registered. For Gemini,
+reasoning level is encoded in the model id (e.g. `gemini-3-flash-preview`),
+not a CLI flag — there is no `--thinking` flag to pin a version against.
+Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
+on `$PATH` after the bake. The standalone Copilot CLI (binary name
+`copilot`) is operator-supplied; do **not** substitute
+`gh extension install github/gh-copilot`, which produces a `gh copilot`
+subcommand and will not satisfy the runner. opencode does not yet ship a
+runner in this repo; operators tracking the integration can pre-stage with
+`curl -fsSL https://opencode.ai/install | bash`, but the orchestrator will
+not dispatch to it until a runner is registered. After changing any entry,
+delete cached `cb-baseline-*` images so the next sandbox launch re-runs the
+bake.
+
 ## Security Tooling
 
 The `security:gitleaks` and `security:semgrep` auditors skip with an Info

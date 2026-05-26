@@ -22,6 +22,29 @@ when building the credential bundle. They are intentionally namespaced
 differently so the host environment can hold multiple agents'
 credentials at once without collision.
 
+## Sandbox install commands
+
+Each agent CLI must be present in the sandbox baseline image, or dispatch fails
+with exit 127 (`<binary>: No such file or directory`). The orchestrator does
+**not** install agent binaries — that is operator-owned config under
+`CodeyBox:MultipassExtraRuncmd` (see [`baseline-bake-examples.md`](baseline-bake-examples.md)).
+Adding an `AgentKind` to an agent class without also adding its install line is
+the most common cause of fresh-class dispatch failures.
+
+| Kind | Sandbox install command | Notes |
+|------|-------------------------|-------|
+| `claude`  | `npm install -g @anthropic-ai/claude-code` | Needs Node.js on the image. |
+| `copilot` | *operator-supplied — verify with current [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) docs* | The runner execs the standalone `copilot` binary (NOT `gh copilot`); `gh extension install github/gh-copilot` is the wrong CLI and will not satisfy the runner. |
+| `codex`   | `npm install -g @openai/codex` | Reuses the Node.js stack from Claude. |
+| `gemini`  | `npm install -g @google/gemini-cli` | `ReasoningMode` is **not** wired into argv — Gemini's reasoning level is encoded in `ModelId` (pick a `gemini-3-*-preview` model for HIGH). See [Gemini quirks](#google-gemini-cli-googlegemini-cli). |
+| `cursor`  | `curl -fsSL https://cursor.com/install \| bash` | Installs as `agent` (not `cursor-agent`). See [Cursor quirks](#cursor-cli-agent). |
+| `opencode` | *not yet integrated in this repo — no `IAgentRunner` for opencode has shipped.* Operators tracking the integration can pre-stage with `curl -fsSL https://opencode.ai/install \| bash`, but the orchestrator will not route work to it until a runner is registered. | Listed for doc parity with the install-checklist; **does not** imply opencode is dispatchable today. |
+
+Verify each command against its upstream install docs at the time of baking —
+versions and install URLs change. After updating
+`CodeyBox:MultipassExtraRuncmd`, delete any cached `cb-baseline-*` images to
+force a fresh bake on the next sandbox launch.
+
 ## Adding a new agent
 
 1. Create a project `CodeyBox.Agents.<Name>`.
@@ -45,7 +68,36 @@ credentials at once without collision.
    new AgentCredentialMapping(new AgentKind("aider"), "CODEYBOX_AIDER_KEY", "OPENAI_API_KEY"),
    ```
 
-5. Make sure the binary is present in your sandbox image. (Pin by digest.)
+5. **Install the binary in the sandbox baseline image.** This is **not
+   optional** — without it, every dispatch to the new agent fails with
+   exit 127 (`<binary>: No such file or directory`). The orchestrator does
+   not auto-install; the install line lives in operator config under
+   `CodeyBox:MultipassExtraRuncmd` (see
+   [`baseline-bake-examples.md`](baseline-bake-examples.md)). After
+   editing operator config, delete the cached baseline image so the next
+   sandbox launch re-bakes with the new tool. Pin by digest where the
+   upstream supports it.
+
+6. **Document the install command** in the "Sandbox install commands"
+   table above and add a "Per-agent quirks" subsection covering the
+   binary name, non-interactive invocation, credential layout, and any
+   reasoning-flag / quota-probe specifics. Doc parity keeps the next
+   class-edit from rediscovering this footgun.
+
+7. **Add a smoke probe** (`IAgentSmokeProbe`) so the credential gets
+   verified before work-item pickup — see `ClaudeSmokeProbe` /
+   `CursorSmokeProbe` for the two shapes (HTTP-endpoint probe vs.
+   credential-bundle-presence probe).
+
+   > **Scope note — pre-dispatch binary check.** Today's smoke probes run
+   > on the host (HTTP-endpoint or credential-bundle presence) and do
+   > **not** exec the CLI inside a freshly-cloned sandbox, so a missing
+   > binary still surfaces as exit-127 at first dispatch rather than at
+   > smoke time. Closing that loop (sandbox-side `--version` execution
+   > gating dispatch) is the **companion smoke-gate ticket**; it is
+   > intentionally out of scope for this configuration-side fix, which
+   > only documents the canonical install commands. Until the gate ships,
+   > the operator's defence against exit-127 is the install table above.
 
 ## Why one-shot CLI invocation
 
