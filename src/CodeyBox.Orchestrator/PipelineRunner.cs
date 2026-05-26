@@ -5353,7 +5353,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// latest prompt edit was not yet visible". Non-terminal transitions
     /// return null so the existing payload shape is unchanged.
     /// </summary>
-    private async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
+    internal async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
     {
         if (!WorkItemDependencies.TerminalStates.Contains(item.State)) return null;
         var iterations = await _store.GetIterationsAsync(item.Id, ct);
