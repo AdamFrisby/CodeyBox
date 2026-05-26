@@ -409,3 +409,10 @@ public sealed class GeminiSettingsCredentialFileSource : CredentialFileSource
     public GeminiSettingsCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
         : base(filePath, log, watch) { }
 }
+
+/// <summary>Marker for the Cursor (agent CLI) subscription credentials file source.</summary>
+public sealed class CursorCredentialFileSource : CredentialFileSource
+{
+    public CursorCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
+}

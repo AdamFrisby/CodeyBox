@@ -7,6 +7,7 @@ using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
@@ -479,6 +480,7 @@ builder.Services.AddSingleton<IAgentRunner, ClaudeAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CopilotAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 
 // Plugin discovery result captured before builder.Build() so the credential
@@ -573,6 +575,23 @@ if (geminiSettingsFilePath.StartsWith("~/", StringComparison.Ordinal))
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         geminiSettingsFilePath[2..]);
 
+// Cursor subscription credentials. Path is operator-configurable; default
+// matches what `agent login` typically writes. The orchestrator never bind-
+// mounts this path into the sandbox — only the file contents are shipped via
+// CODEYBOX_CURSOR_AUTH_JSON and CursorAgentRunner re-materialises them inside
+// the VM.
+var cursorAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_CURSOR_AUTH_FILE")
+    ?? builder.Configuration["CodeyBox:CursorAuthFile"]
+    ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".cursor",
+        "credentials.json");
+if (cursorAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
+    cursorAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        cursorAuthFilePath[2..]);
+
 builder.Services.AddSingleton(sp => new ClaudeCredentialFileSource(
     claudeOAuthFilePath,
     sp.GetService<ILogger<CredentialFileSource>>(),
@@ -587,6 +606,10 @@ builder.Services.AddSingleton(sp => new GeminiOAuthCredentialFileSource(
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new GeminiSettingsCredentialFileSource(
     geminiSettingsFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
+builder.Services.AddSingleton(sp => new CursorCredentialFileSource(
+    cursorAuthFilePath,
     sp.GetService<ILogger<CredentialFileSource>>(),
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 
@@ -636,6 +659,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         sp.GetRequiredService<GeminiSettingsCredentialFileSource>(),
         sp.GetService<ILogger<GeminiOAuthFileCredentialProvider>>()));
 
+    // Cursor subscription credentials. Same pattern as Codex: the CLI hard-
+    // reads its own credentials file, we ship the contents into the sandbox
+    // via CODEYBOX_CURSOR_AUTH_JSON and the runner re-materialises them.
+    builtInFirst.Add(new CursorOAuthFileCredentialProvider(
+        sp.GetRequiredService<CursorCredentialFileSource>(),
+        sp.GetService<ILogger<CursorOAuthFileCredentialProvider>>()));
+
     // Enumerate plugin-registered ICredentialProvider types using the list captured
     // from AddCodeyBoxPlugins (called before builder.Build()). Each plugin type is
     // registered in DI under its concrete type by PluginLoader.RegisterPlugins;
@@ -659,6 +689,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
+        // Cursor: the CLI uses subscription auth via ~/.cursor/credentials.json
+        // (NOT an env-var key). The orchestrator ships the file's contents to
+        // the sandbox via CODEYBOX_CURSOR_AUTH_JSON and CursorAgentRunner
+        // materialises it inside the VM. This env-var mapping is the fallback
+        // when an operator wants to inject the JSON directly via env var
+        // without an on-host credential file.
+        new AgentCredentialMapping(AgentKind.Cursor, "CODEYBOX_CURSOR_AUTH_JSON", "CODEYBOX_CURSOR_AUTH_JSON"),
     }));
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
@@ -820,6 +857,12 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     source.TokenUpdated += probe.InvalidateCache;
     return probe;
 });
+// Cursor has no programmatic usage endpoint reachable from a subscription
+// token; CursorQuotaProbe always reports Unknown and the router's
+// UnknownPolicy=UseObservedFailures applies observation-based back-pressure
+// via CursorQuotaFailureDetector. Per feedback-vendor-api-drift, reactive
+// is preferred over speculative coverage.
+builder.Services.AddSingleton<IAgentQuotaProbe, CursorQuotaProbe>();
 
 // --- Agent class router ------------------------------------------------------
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
@@ -860,6 +903,9 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new GeminiSmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<GeminiSmokeProbe>()));
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new CursorSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CursorSmokeProbe>()));
 
 // --- Model-list probes (used by AgentClassConfigValidator at startup) --------
 // Registered as IEnumerable<IAgentModelListProbe>; the validator resolves by Kind.
@@ -907,6 +953,7 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_API_KEY")),
         loggerFactory.CreateLogger<GeminiModelListProbe>());
 });
+builder.Services.AddSingleton<IAgentModelListProbe, CursorModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -1183,6 +1230,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Claude] = new ClaudeCostExtractor(),
         [AgentKind.Codex] = new CodexCostExtractor(),
         [AgentKind.Gemini] = new GeminiCostExtractor(),
+        [AgentKind.Cursor] = new CursorCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -1252,6 +1300,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentToolCallCount
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, ClaudeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CodexQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, GeminiQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, CursorQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
 
