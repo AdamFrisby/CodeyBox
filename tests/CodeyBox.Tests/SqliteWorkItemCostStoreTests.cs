@@ -249,15 +249,24 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
 
         await _store.RecordAsync(MakeCost(itemA) with
         {
-            AgentKind = "codex", InputTokens = 100, OutputTokens = 10, CachedInputTokens = 5,
+            AgentKind = "codex",
+            InputTokens = 100,
+            OutputTokens = 10,
+            CachedInputTokens = 5,
         });
         await _store.RecordAsync(MakeCost(itemA) with
         {
-            AgentKind = "codex", InputTokens = 200, OutputTokens = 20, CachedInputTokens = 5,
+            AgentKind = "codex",
+            InputTokens = 200,
+            OutputTokens = 20,
+            CachedInputTokens = 5,
         });
         await _store.RecordAsync(MakeCost(itemB) with
         {
-            AgentKind = "codex", InputTokens = 400, OutputTokens = 30, CachedInputTokens = 5,
+            AgentKind = "codex",
+            InputTokens = 400,
+            OutputTokens = 30,
+            CachedInputTokens = 5,
         });
 
         var (avg, samples) = await _store.GetAvgTokensPerItemAsync("codex", 10);
