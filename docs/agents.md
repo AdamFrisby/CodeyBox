@@ -15,6 +15,7 @@ tooling, not in the agent runner contract.
 | `codex`     | `codex`           | `OPENAI_API_KEY`        | `CODEYBOX_CODEX_API_KEY`  |
 | `gemini`    | `gemini`          | `GEMINI_API_KEY`        | `CODEYBOX_GEMINI_API_KEY` |
 | `cursor`    | `agent`           | `CODEYBOX_CURSOR_AUTH_JSON` (subscription credentials JSON) | `CODEYBOX_CURSOR_AUTH_FILE` (file path on host) |
+| `opencode`  | `opencode`        | `OPENCODE_API_KEY` or `OPENCODE_AUTH_JSON` (file-materialised) | `CODEYBOX_OPENCODE_API_KEY` or `CODEYBOX_OPENCODE_AUTH_FILE` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side env
 name is what the orchestrator's `EnvironmentCredentialProvider` looks up
@@ -134,6 +135,78 @@ that cannot push to your real repos. Sandbox network policy must
 ### OpenAI Codex CLI
 Reads `OPENAI_API_KEY`. The `--full-auto` flag skips Codex's per-edit
 confirmations — appropriate inside a sandbox.
+
+### Opencode CLI (`sst/opencode`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd`. opencode publishes both an `npm`
+distribution and a `curl | bash` installer:
+
+```sh
+# Preferred when npm is already on the baseline (the Gemini/Claude CLIs need it):
+npm install -g opencode
+# OR
+curl -fsSL https://opencode.ai/install | bash
+```
+
+**Authentication.** opencode bundles access to multiple model providers
+(DeepSeek, Anthropic, OpenAI, …) under a single "opencode Go" subscription
+credential written by `opencode auth login`. CodeyBox supports two auth paths:
+
+* **Subscription (preferred):** point `CODEYBOX_OPENCODE_AUTH_FILE` at the
+  host file `opencode auth login` writes (default
+  `~/.local/share/opencode/auth.json`; verify with the CLI on the host).
+  CodeyBox watches the file, ships its raw bytes to the sandbox as
+  `OPENCODE_AUTH_JSON`, and the runner materialises them inside the VM
+  before invoking `opencode run`. Token rotations from the host CLI are
+  picked up without an orchestrator restart.
+
+  If `opencode auth login` writes its credential file somewhere other than
+  the XDG default, set `CODEYBOX_OPENCODE_AUTH_DEST` on the host to the
+  sandbox-side path opencode expects to find the file at. The default value
+  is the XDG path which appears to be opencode's current default but has
+  not been verified in this environment.
+
+* **API key fallback:** set `CODEYBOX_OPENCODE_API_KEY` on the host. The
+  orchestrator injects it as `OPENCODE_API_KEY` inside the sandbox. Do
+  NOT add provider-specific keys (`DEEPSEEK_API_KEY`, etc.) as side
+  channels — the opencode subscription IS the credential path.
+
+**Default model.** The runner ships with `DefaultModelId` pointed at a
+DeepSeek-coder variant. DeepSeek is the differentiated capability opencode
+adds over the other registered agents (Claude / Codex / Gemini already
+cover Opus-class); DeepSeek's MoE economics fit the bulk audit-rework
+workload that consumes Codex's weekly quota. **Confirm the exact model id**
+with `opencode models` on the host and override `DefaultModelId` (or pin a
+specific id per agent-class member via `ModelId`) to whichever DeepSeek
+coder variant the operator's subscription tier surfaces as the best
+option.
+
+**Multi-provider routing.** opencode can be slotted multiple times into
+the same agent class with different `ModelId` values — `deepseek/…` as
+the bulk-volume cheap-tokens member, `anthropic/claude-sonnet-4-6` as a
+top-shelf fallback for items the DeepSeek path can't carry, etc. This
+turns opencode into a redundant high-quality fallback path that survives
+single-provider outages.
+
+**Reasoning effort.** The CLI flag opencode uses for reasoning has not
+been verified in this environment. The runner reads
+`OPENCODE_REASONING_FLAG` from the host — set it to the flag name (e.g.
+`--reasoning-effort`) confirmed via `opencode run --help` and the
+runner will append the configured `ReasoningMode` after it. When the env
+var is unset the runner drops `ReasoningMode` rather than guessing.
+
+**Quota probe.** Ships as Unknown-only at integration time: opencode's
+subscription metering shape has not been verified. The router's
+`QuotaUnknownPolicy` (default `UseObservedFailures`) gates dispatch via
+observed failure history until a real probe endpoint is wired.
+
+**Smoke probe.** Credential-presence check only (no network call); see
+the per-agent probe table below.
+
+**Model-list probe.** Skipped (returns Failed): `AgentClassConfigValidator`
+logs a warning and accepts any operator-chosen `ModelId`. Confirm
+correctness by watching the first dispatched Done item.
 
 ### Google Gemini CLI (`@google/gemini-cli`)
 
@@ -342,6 +415,7 @@ credentials before they waste expensive compute.
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent` | `x-goog-api-key: <api-key>` |
 | `copilot` | *(no probe)* — always passes | — |
 | `cursor` | *(no HTTP probe — Cursor exposes no public usage endpoint)* — verifies the credential bundle carries `CODEYBOX_CURSOR_AUTH_JSON`; real auth check happens on first CLI call | — |
+| `opencode` | *(no network call)* — credential-presence check only | `OPENCODE_AUTH_JSON` or `OPENCODE_API_KEY` |
 
 Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
 means the credential is valid. 401/403 is classified as `"auth"` failure.

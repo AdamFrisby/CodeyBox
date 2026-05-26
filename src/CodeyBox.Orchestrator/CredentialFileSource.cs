@@ -416,3 +416,16 @@ public sealed class CursorCredentialFileSource : CredentialFileSource
     public CursorCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
         : base(filePath, log, watch) { }
 }
+
+/// <summary>
+/// Marker for the opencode subscription credentials file source. opencode
+/// hard-reads a credentials file written by <c>opencode auth login</c>;
+/// CodeyBox ships the raw bytes to the sandbox as <c>OPENCODE_AUTH_JSON</c>
+/// and the runner materialises them at <c>OPENCODE_AUTH_DEST_PATH</c> inside
+/// the VM.
+/// </summary>
+public sealed class OpencodeCredentialFileSource : CredentialFileSource
+{
+    public OpencodeCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
+}
