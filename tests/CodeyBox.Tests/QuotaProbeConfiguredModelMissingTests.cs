@@ -4,7 +4,6 @@ using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -32,58 +31,22 @@ public sealed class QuotaProbeConfiguredModelMissingTests
         """;
 
     // ── Gemini ────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task Gemini_ConfiguredModelMissingFromBuckets_ReportsUnknownWithDiagnosticNotes()
-    {
-        // Repros the bug: operator set ModelId = "gemini-3-flash-preview" (a typo
-        // for "gemini-3.1-flash-lite"). Buckets list the four real models. The
-        // pre-fix code reported global mostConstrained ≈ 100%.
-        var probe = BuildGeminiProbe(GeminiResponseFlashLitePro);
-
-        var member = new AgentMembership
-        {
-            Agent = AgentKind.Gemini,
-            Billing = AgentBilling.Subscription,
-            ModelId = "gemini-3-flash-preview",
-            QualityScore = 95,
-        };
-        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
-
-        Assert.Equal(-1, snapshot.AvailablePct);
-        Assert.Contains("not in quota response", snapshot.Notes ?? "");
-        Assert.Contains("gemini-3-flash-preview", snapshot.Notes ?? "");
-        Assert.Contains("gemini-2.5-flash", snapshot.Notes ?? "");
-    }
-
-    [Fact]
-    public async Task Gemini_ConfiguredModelPresentInBuckets_UsesParsedQuota()
-    {
-        var probe = BuildGeminiProbe(GeminiResponseFlashLitePro);
-
-        var member = new AgentMembership
-        {
-            Agent = AgentKind.Gemini,
-            Billing = AgentBilling.Subscription,
-            ModelId = "gemini-2.5-flash-lite",
-            QualityScore = 95,
-        };
-        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
-
-        // ParseResponse populates perModel; the gate finds gemini-2.5-flash-lite
-        // present and leaves the snapshot alone. AvailablePct stays at the
-        // mostConstrained value (42%, from gemini-2.5-flash-lite).
-        Assert.Equal(42, snapshot.AvailablePct);
-        Assert.True(snapshot.PerModel.ContainsKey("gemini-2.5-flash-lite"));
-        Assert.Null(snapshot.Notes);
-    }
+    //
+    // Gemini's primary signal is now the live :generateContent ping (a single
+    // call for a fixed ModelId, or a fan-out for the auto sentinel) — the
+    // bucket-gating ApplyMemberGate flow is no longer the source of "unknown"
+    // for a typoed model id. Coverage for the typo / 404 case lives with the
+    // live-call tests in GeminiQuotaProbeAutoFanOutTests; the only Gemini
+    // surface still exercised here is the no-ModelId legacy fallback that
+    // reaches retrieveUserQuota.
 
     [Fact]
     public async Task Gemini_NoConfiguredModelId_PreservesGlobalMostConstrained()
     {
         var probe = BuildGeminiProbe(GeminiResponseFlashLitePro);
 
-        // ModelId-less member: probe behaviour matches the pre-fix global cap.
+        // ModelId-less member: probe falls through to retrieveUserQuota and
+        // reports the overall mostConstrained pct.
         var member = new AgentMembership
         {
             Agent = AgentKind.Gemini,
@@ -94,50 +57,6 @@ public sealed class QuotaProbeConfiguredModelMissingTests
 
         Assert.Equal(42, snapshot.AvailablePct);
         Assert.Null(snapshot.Notes);
-    }
-
-    [Fact]
-    public async Task Gemini_EmptyBuckets_StillReportsUnknownWithOriginalNotes()
-    {
-        // When the response shape itself is unknown (e.g. empty buckets), don't
-        // override the existing notes with a "model not found" message.
-        var probe = BuildGeminiProbe("""{"buckets":[]}""");
-
-        var member = new AgentMembership
-        {
-            Agent = AgentKind.Gemini,
-            Billing = AgentBilling.Subscription,
-            ModelId = "anything",
-            QualityScore = 95,
-        };
-        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
-
-        Assert.Equal(-1, snapshot.AvailablePct);
-        Assert.Contains("no buckets", snapshot.Notes ?? "");
-        Assert.DoesNotContain("not in quota response", snapshot.Notes ?? "");
-    }
-
-    [Fact]
-    public async Task Gemini_MissingModelLog_FiresOncePerTokenAndModelCombo()
-    {
-        var sink = new CountingLoggerSink();
-        var probe = BuildGeminiProbe(GeminiResponseFlashLitePro, sink, cacheTtl: TimeSpan.FromMinutes(5));
-
-        var typoMember = new AgentMembership
-        {
-            Agent = AgentKind.Gemini,
-            Billing = AgentBilling.Subscription,
-            ModelId = "gemini-3-flash-preview",
-            QualityScore = 95,
-        };
-        var otherTypoMember = typoMember with { ModelId = "gemini-3-flash-preview-typo-2" };
-
-        await probe.GetAvailabilityAsync(typoMember, CancellationToken.None);
-        await probe.GetAvailabilityAsync(typoMember, CancellationToken.None);
-        await probe.GetAvailabilityAsync(otherTypoMember, CancellationToken.None);
-
-        // One log per distinct ModelId; the repeat call for the first typo is suppressed.
-        Assert.Equal(2, sink.MissingModelLogCount);
     }
 
     // ── Claude ────────────────────────────────────────────────────────────────
@@ -266,18 +185,15 @@ public sealed class QuotaProbeConfiguredModelMissingTests
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private static GeminiQuotaProbe BuildGeminiProbe(string body, CountingLoggerSink? sink = null, TimeSpan? cacheTtl = null)
+    private static GeminiQuotaProbe BuildGeminiProbe(string body, TimeSpan? cacheTtl = null)
     {
         var handler = new QuotaCapturingHandler(HttpStatusCode.OK, body, _ => { });
         var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
-        ILogger<GeminiQuotaProbe> log = sink is null
-            ? NullLogger<GeminiQuotaProbe>.Instance
-            : new SinkLogger<GeminiQuotaProbe>(sink);
         return new GeminiQuotaProbe(
             factory,
             () => new AgentQuotaCredentials("test-token"),
             cacheTtl ?? TimeSpan.FromMinutes(1),
-            log);
+            NullLogger<GeminiQuotaProbe>.Instance);
     }
 
     private static ClaudeQuotaProbe BuildClaudeProbe(string body)
@@ -302,37 +218,4 @@ public sealed class QuotaProbeConfiguredModelMissingTests
             NullLogger<CodexQuotaProbe>.Instance);
     }
 
-    private sealed class CountingLoggerSink
-    {
-        public int MissingModelLogCount { get; private set; }
-
-        public void Record(LogLevel level, string message)
-        {
-            if (level == LogLevel.Information && message.Contains("not in response buckets", StringComparison.Ordinal))
-                MissingModelLogCount++;
-        }
-    }
-
-    private sealed class SinkLogger<T> : ILogger<T>
-    {
-        private readonly CountingLoggerSink _sink;
-        public SinkLogger(CountingLoggerSink sink) { _sink = sink; }
-        public IDisposable BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
-        public bool IsEnabled(LogLevel logLevel) => true;
-        public void Log<TState>(
-            LogLevel logLevel,
-            EventId eventId,
-            TState state,
-            Exception? exception,
-            Func<TState, Exception?, string> formatter)
-        {
-            _sink.Record(logLevel, formatter(state, exception));
-        }
-
-        private sealed class NullScope : IDisposable
-        {
-            public static readonly NullScope Instance = new();
-            public void Dispose() { }
-        }
-    }
 }

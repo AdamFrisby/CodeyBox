@@ -11,28 +11,42 @@ namespace CodeyBox.Agents.Gemini;
 /// Probes the Google Code Assist private API to estimate available Gemini
 /// subscription quota for users on the OAuth (Sign-in-with-Google) path.
 ///
-/// Endpoint: <c>POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota</c>.
-/// Returns <c>{"buckets": [{ "modelId", "remainingFraction" 0-1, "resetTime", "tokenType" }]}</c>.
-///
-/// Each bucket represents one model's remaining quota. Overall availability
-/// is the most-restrictive bucket (min of remainingFraction × 100). Per-model
-/// availability is the bucket for that model id, capped by overall.
-///
-/// Only valid for OAuth subscription users (Code Assist Individual / AI Pro
-/// / AI Ultra). API-key (PayPerApi) and Vertex paths have no analogous
-/// endpoint — leave them as PayPerApi members in the agent class config.
-///
-/// Any network error, expired token, or unrecognised shape returns
-/// <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1.
+/// <para>
+/// Primary signal: live <c>:generateContent</c> calls. For a fixed
+/// <see cref="AgentMembership.ModelId"/> we issue a single minimal-cost ping at
+/// that model; <c>200</c> ⇒ 100% available, <c>429</c> ⇒ 0% with Retry-After
+/// reset, everything else ⇒ Unknown. When the membership uses the
+/// <c>auto</c> sentinel (<see cref="GeminiKnownModels.AutoSentinel"/>) we fan
+/// the ping across <see cref="GeminiKnownModels.All"/> at bounded concurrency
+/// and aggregate. The per-model rate-limit fragmentation Code Assist exhibits
+/// (e.g. <c>gemini-2.5-pro</c> 200 while <c>gemini-2.5-flash</c> 429) is
+/// invisible to the aggregated <c>:retrieveUserQuota</c> fraction; the live
+/// ping is the only signal that distinguishes them.
+/// </para>
 ///
 /// <para>
-/// When the membership's ModelId is the <c>auto</c> sentinel
-/// (<see cref="GeminiKnownModels.AutoSentinel"/>), the probe additionally
-/// fans out <c>:generateContent</c> calls across the known bucket list to
-/// ground-truth per-model availability — the per-model rate-limit
-/// fragmentation Code Assist exhibits (e.g. <c>gemini-2.5-pro</c> 200, but
-/// <c>gemini-2.5-flash</c> 429) is invisible to the aggregated
-/// retrieveUserQuota fraction.
+/// Legacy fallback: when no ModelId is configured we have no specific model
+/// to ping, so we fall through to <c>:retrieveUserQuota</c> for an overall
+/// snapshot. Callers that want per-model live data must pass a ModelId (or
+/// the <c>auto</c> sentinel).
+/// </para>
+///
+/// <para>
+/// <c>:retrieveUserQuota</c> is still parsed by <see cref="ParseResponse"/>
+/// for the no-ModelId legacy path and for future TierSignal use; it is no
+/// longer the primary AvailablePct signal because operator testing confirmed
+/// it can report 100% while a live <c>:generateContent</c> returns 429.
+/// </para>
+///
+/// <para>
+/// Only valid for OAuth subscription users (Code Assist Individual / AI Pro /
+/// AI Ultra). API-key (PayPerApi) and Vertex paths have no analogous endpoint
+/// — leave them as PayPerApi members in the agent class config.
+/// </para>
+///
+/// <para>
+/// Any network error, expired token, or unrecognised shape returns
+/// <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1.
 /// </para>
 /// </summary>
 public sealed class GeminiQuotaProbe : IAgentQuotaProbe
@@ -48,16 +62,12 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<GeminiQuotaProbe> _log;
 
-    // Cache keyed by (token, modelKey). modelKey = "" for default, "auto" for
-    // the auto-sentinel fan-out result. Two members on the same account using
-    // different sentinels don't clobber each other.
+    // Cache keyed by (token, modelKey). modelKey = the configured model id, or
+    // GeminiKnownModels.AutoSentinel for the auto fan-out result, or "" for the
+    // no-ModelId legacy fallback that hits retrieveUserQuota. Two members on
+    // the same account using different models don't clobber each other.
     private readonly Dictionary<(string Token, string ModelKey), CacheEntry> _cache = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
-
-    // Dedupes the Information log line that fires when a configured model is
-    // absent from the probe response. Keyed by (token, modelId).
-    private readonly HashSet<(string Token, string ModelId)> _loggedMissingModels = new();
-    private readonly object _loggedMissingModelsLock = new();
 
     public AgentKind Kind => AgentKind.Gemini;
 
@@ -80,7 +90,11 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
 
-        var modelKey = GeminiKnownModels.IsAuto(member.ModelId) ? GeminiKnownModels.AutoSentinel : "";
+        bool isAuto = GeminiKnownModels.IsAuto(member.ModelId);
+        bool hasFixedModel = !isAuto && !string.IsNullOrWhiteSpace(member.ModelId);
+        string modelKey = isAuto ? GeminiKnownModels.AutoSentinel
+            : hasFixedModel ? member.ModelId!
+            : "";
 
         AgentQuotaSnapshot snapshot;
         await _lock.WaitAsync(ct);
@@ -93,9 +107,11 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             }
             else
             {
-                snapshot = modelKey == GeminiKnownModels.AutoSentinel
+                snapshot = isAuto
                     ? await FetchAutoAsync(token, ct)
-                    : await FetchAsync(token, ct);
+                    : hasFixedModel
+                        ? await FetchSingleAsync(token, member.ModelId!, ct)
+                        : await FetchTierSignalAsync(token, ct);
                 _cache[(token, modelKey)] = new CacheEntry(snapshot, DateTimeOffset.UtcNow + _cacheTtl);
             }
         }
@@ -104,56 +120,13 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             _lock.Release();
         }
 
-        return ApplyMemberGate(snapshot, member, token);
-    }
-
-    /// <summary>
-    /// When the configured <see cref="AgentMembership.ModelId"/> is not present
-    /// in the parsed response's per-model buckets, we have no signal for the
-    /// model we'd actually invoke. Return <c>AvailablePct = -1</c> so the
-    /// router falls through to its <c>QuotaUnknownPolicy</c> instead of
-    /// fail-opening on a global mostConstrained that ignores our target.
-    /// Logs once per (token, modelId) so operators can spot typos like
-    /// <c>gemini-3-flash-preview</c> → <c>gemini-3.1-flash-lite</c>.
-    /// </summary>
-    private AgentQuotaSnapshot ApplyMemberGate(AgentQuotaSnapshot snapshot, AgentMembership member, string token)
-    {
-        // Don't override an already-unknown snapshot — the existing notes are more useful.
-        if (snapshot.AvailablePct < 0) return snapshot;
-        if (string.IsNullOrWhiteSpace(member.ModelId)) return snapshot;
-        // The "auto" sentinel routes via FetchAutoAsync — there is no single model
-        // to check against PerModel; the fan-out result IS the answer.
-        if (GeminiKnownModels.IsAuto(member.ModelId)) return snapshot;
-        if (snapshot.PerModel.ContainsKey(member.ModelId)) return snapshot;
-
-        var modelList = snapshot.PerModel.Count == 0
-            ? "(none)"
-            : string.Join(", ", snapshot.PerModel.Keys.OrderBy(k => k, StringComparer.Ordinal));
-        var notes = $"configured model '{member.ModelId}' not in quota response (have: {modelList})";
-
-        bool firstTime;
-        lock (_loggedMissingModelsLock)
-            firstTime = _loggedMissingModels.Add((token, member.ModelId));
-        if (firstTime)
-        {
-            _log.LogInformation(
-                "Gemini quota probe: configured model {ModelId} not in response buckets ({BucketList}); reporting unknown so the router can apply its unknown policy",
-                member.ModelId, modelList);
-        }
-
-        return new AgentQuotaSnapshot
-        {
-            AvailablePct = -1,
-            ResetAt = snapshot.ResetAt,
-            Notes = notes,
-            PerModel = snapshot.PerModel,
-        };
+        return snapshot;
     }
 
     /// <summary>
     /// Drops the in-process snapshot so the next
-    /// <see cref="GetAvailabilityAsync"/> call refetches against the Code
-    /// Assist quota endpoint. Wire to <see cref="CodeyBox.Orchestrator.CredentialFileSource.TokenUpdated"/>
+    /// <see cref="GetAvailabilityAsync"/> call refetches against Code Assist.
+    /// Wire to <see cref="CodeyBox.Orchestrator.CredentialFileSource.TokenUpdated"/>
     /// so an out-of-band host token rotation (operator running the CLI, child
     /// sandbox writeback, scripted refresh) doesn't leave a stale 401 pinned
     /// for the full cache TTL.
@@ -167,15 +140,64 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
 
     private const int MaxResponseChars = 64 * 1024;
 
-    private async Task<AgentQuotaSnapshot> FetchAsync(string token, CancellationToken ct)
+    /// <summary>
+    /// Single-model live probe via <c>:generateContent</c>. 200 ⇒ available,
+    /// 429 ⇒ rate-limited (Retry-After-derived reset when present), any other
+    /// status (including 404 for a non-existent model id) ⇒ Unknown.
+    /// </summary>
+    internal async Task<AgentQuotaSnapshot> FetchSingleAsync(string token, string modelId, CancellationToken ct)
+    {
+        var result = await ProbeOneAsync(token, modelId, ct);
+        if (result.Status is null)
+            return Unknown($"live probe of {modelId}: transient error");
+
+        if (result.Status == HttpStatusCode.OK)
+        {
+            var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+            {
+                [modelId] = new ModelQuota { AvailablePct = 100.0, ResetAt = null, Window = "REQUESTS" },
+            };
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = 100.0,
+                ResetAt = null,
+                Notes = $"live probe via {modelId}",
+                PerModel = perModel,
+            };
+        }
+
+        if (result.Status == HttpStatusCode.TooManyRequests)
+        {
+            var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+            {
+                [modelId] = new ModelQuota { AvailablePct = 0.0, ResetAt = result.ResetAt, Window = "REQUESTS" },
+            };
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = 0.0,
+                ResetAt = result.ResetAt,
+                Notes = $"live probe via {modelId}: rate-limited",
+                PerModel = perModel,
+            };
+        }
+
+        return Unknown($"live probe of {modelId}: HTTP {(int)result.Status.Value}");
+    }
+
+    /// <summary>
+    /// Legacy fallback for callers that don't configure a ModelId: hits
+    /// <c>:retrieveUserQuota</c> and reports the most-constrained bucket as
+    /// overall availability. The response is still parsed by
+    /// <see cref="ParseResponse"/> so the per-model breakdown surfaces in
+    /// diagnostics.
+    /// </summary>
+    internal async Task<AgentQuotaSnapshot> FetchTierSignalAsync(string token, CancellationToken ct)
     {
         try
         {
             var client = _httpClientFactory.CreateClient("agent-quota");
             using var request = new HttpRequestMessage(HttpMethod.Post, UsageEndpoint);
-            // Do NOT log the Authorization header — it contains the OAuth token.
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            // Empty JSON body is required (the endpoint rejects unknown fields).
             request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
 
             using var response = await client.SendAsync(request, ct);
@@ -186,7 +208,6 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
                 return Unknown($"HTTP {(int)response.StatusCode}");
             }
 
-            // Do NOT log the response body — it may contain account identifiers.
             var body = await ReadCappedAsync(response.Content, ct);
             if (body is null) return Unknown("response too large");
             return ParseResponse(body);
@@ -232,7 +253,6 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
 
         string? routedVia = null;
         DateTimeOffset? earliestReset = null;
-        int knownCount = 0;
         bool anyOk = false;
 
         foreach (var (modelId, result) in results)
@@ -244,25 +264,22 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             }
             if (result.Status == HttpStatusCode.OK)
             {
-                knownCount++;
                 anyOk = true;
                 routedVia ??= modelId;
                 perModel[modelId] = new ModelQuota { AvailablePct = 100.0, ResetAt = null, Window = "REQUESTS" };
             }
             else if (result.Status == HttpStatusCode.TooManyRequests)
             {
-                knownCount++;
                 perModel[modelId] = new ModelQuota { AvailablePct = 0.0, ResetAt = result.ResetAt, Window = "REQUESTS" };
                 if (result.ResetAt is { } r && (earliestReset is null || r < earliestReset))
                     earliestReset = r;
             }
             // else: 4xx/5xx other than 429 — treat as unknown for that model
-            // (not counted toward knownCount, omitted from perModel).
+            // (omitted from perModel).
         }
 
-        // Treat the run as Unknown if no model returned a definitive 200/429.
-        // Guarding on perModel.Count is equivalent (only 200/429 populate it) and
-        // protects against future regressions of the knownCount++ placement.
+        // Treat the run as Unknown if no model returned a definitive 200/429
+        // (only those statuses populate perModel).
         if (perModel.Count == 0)
             return Unknown("auto fan-out: no definitive responses");
 
@@ -307,7 +324,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "Gemini auto-fan-out probe of {ModelId} failed; treating as unknown", modelId);
+            _log.LogDebug(ex, "Gemini live-probe of {ModelId} failed; treating as unknown", modelId);
             return new ProbeOneResult(null, null);
         }
     }
