@@ -181,6 +181,29 @@ public sealed class GeminiQuotaProbeAutoFanOutTests
     }
 
     [Fact]
+    public async Task FixedMember_LiveProbeTransientThrows_ReportsUnknown()
+    {
+        // ProbeOneAsync catches transport exceptions and returns Status=null;
+        // FetchSingleAsync's transient branch must surface that as Unknown with
+        // a Notes string that pins both the model id and the transient nature
+        // (so /quota and audit logs can distinguish a network blip from a 404
+        // typo or 429 rate-limit).
+        var handler = new GeminiAutoFanOutHandler(
+            modelStatus: _ => HttpStatusCode.OK,
+            throwFor: _ => true);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(FixedMember, CancellationToken.None);
+
+        Assert.Equal(-1, snapshot.AvailablePct);
+        Assert.NotNull(snapshot.Notes);
+        Assert.Contains("gemini-2.5-pro", snapshot.Notes!);
+        Assert.Contains("transient error", snapshot.Notes!);
+        var req = Assert.Single(handler.Requests);
+        Assert.Equal(new Uri(GeminiQuotaProbe.GenerateContentEndpoint), req.Uri);
+    }
+
+    [Fact]
     public async Task FixedMember_LiveProbe404_ReportsUnknown()
     {
         // Typo / unknown model id: :generateContent returns 404. The probe
