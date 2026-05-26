@@ -125,12 +125,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Null(history[1].ToAgent);
     }
 
-    // Temporarily skipped (regression introduced when merging cb-provider-loose-coupling
-    // with cb-park-recovery / cb-classify-claude-overage). Codex's first quota failure
-    // does NOT dispatch claude in this synthetic 3-member fixture, even though the
-    // 2-member Codex_HitsQuota_FallsBackToClaude_SameIteration variant works. Tracked
-    // as a follow-up CodeyBox task.
-    [Fact(Skip = "Regression after multi-merge; see follow-up CodeyBox task.")]
+    [Fact]
     public async Task ThreeMemberClass_SecondMemberExhausted_FallsBackToThird()
     {
         // The task spec calls out '3-member class with top member injected to
@@ -138,6 +133,14 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         // to member #2'. With only two members the loop body that scans
         // candidates for an unused one only runs once on each side; a regression
         // in the 'continue if already tried' branch is undetectable at N=2.
+        //
+        // Originally skipped after the cb-provider-loose-coupling merge dropped
+        // the "rate_limit_exceeded" pattern from CodexQuotaFailureDetector — with
+        // the pattern missing, codex's quota stderr was never classified as a
+        // quota failure, so MoveToNextMemberOrThrowAsync never fired and claude
+        // stayed at CallCount=0. Commit 3d6777a re-added the pattern; this test
+        // re-enables the assertion so a future loose-coupling refactor can't
+        // silently drop it again.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipelineThreeMembers(seed);
 
@@ -169,6 +172,72 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(AgentKind.Claude, history[0].ToAgent);
         Assert.Equal(AgentKind.Claude, history[1].FromAgent);
         Assert.Equal(AgentKind.Gemini, history[1].ToAgent);
+    }
+
+    [Fact]
+    public async Task ThreeMemberClass_DispatchSequence_TracesEveryStep()
+    {
+        // Focused regression guard. The parent test above only asserts the *end*
+        // state of a 3-member fallback chain; this one nails down each individual
+        // step so a regression that breaks the dispatch ordering can be diagnosed
+        // from one failing assertion rather than a vague "Claude.CallCount = 0".
+        //
+        // What we pin down:
+        //   1. Codex's first quota failure DOES classify as a quota failure
+        //      (Codex.CallCount=2: work + merge short-circuit).
+        //   2. The work-phase fallback dispatch reaches Claude exactly once.
+        //   3. After Claude also fails on quota, fallback reaches Gemini.
+        //   4. MarkExhausted is called on codex+claude only — gemini ran to
+        //      success and must not have been marked.
+        //   5. Both fallback-history records belong to the WORK phase (no
+        //      spurious cross-phase entries from the merge short-circuit).
+        //   6. Neither record carries a null ToAgent — the class did NOT
+        //      report "all members exhausted" since gemini succeeded.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipelineThreeMembers(seed);
+
+        var quotaErr = new AgentResult(false, "exit 1", null, "API Error: rate_limit_exceeded");
+        fix.Codex.ScriptedFailures.Enqueue(quotaErr);
+        fix.Claude.ScriptedFailures.Enqueue(quotaErr);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("c.txt", "v1"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // (1) Codex was invoked twice: once for work (which returned quota), and
+        // once for the merge short-circuit. Item.Agent is never rewritten when
+        // a work-phase fallback swaps agents, so merge still picks codex.
+        Assert.Equal(2, fix.Codex.CallCount);
+
+        // (2) Claude was reached via fallback exactly once.
+        Assert.Equal(1, fix.Claude.CallCount);
+
+        // (3) Gemini ran the work-phase write that finally succeeded.
+        Assert.Equal(1, fix.Gemini.CallCount);
+
+        // (4) Exhaustion was marked on codex+claude only; gemini's success path
+        // must not leak a MarkExhausted call.
+        Assert.Equal([AgentKind.Codex], fix.CodexProbe.MarkedExhausted);
+        Assert.Equal([AgentKind.Claude], fix.ClaudeProbe.MarkedExhausted);
+        Assert.Empty(fix.GeminiProbe.MarkedExhausted);
+
+        // (5) + (6) Fallback history captures the work-phase chain only, in
+        // order, with no all-exhausted park event.
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Equal(2, history.Count);
+        Assert.All(history, h => Assert.Equal("work", h.Phase));
+        Assert.Equal(AgentKind.Codex, history[0].FromAgent);
+        Assert.Equal(AgentKind.Claude, history[0].ToAgent);
+        Assert.Equal(AgentKind.Claude, history[1].FromAgent);
+        Assert.Equal(AgentKind.Gemini, history[1].ToAgent);
+        Assert.All(history, h => Assert.NotNull(h.ToAgent));
+
+        // Final state must be a success terminal — no Failed / no parked.
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.NotEqual(WorkItemState.Failed, finalItem!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, finalItem.State);
     }
 
     [Fact]
