@@ -771,6 +771,21 @@ public static class AuditLog
         Audit("plugin.initialization_failed")
             .Error(exception, "Plugin {PluginId} initialization failed; plugin not available", pluginId);
 
+    // ── Hot-reload config ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Emitted by <c>AgentConfigHotReload</c> when an OnChange-driven swap of a
+    /// hot-reloadable config block (AgentConcurrency, AgentClasses,
+    /// AgentBurnEstimator) actually mutated the in-memory view. Fires at most
+    /// once per block per reload; if a reload edits unrelated fields the block
+    /// stays silent. Operators trace per-block config drift by filtering on
+    /// EventName="config_reloaded".
+    /// </summary>
+    public static void ConfigReloaded(string block, string oldValue, string newValue) =>
+        Audit("config_reloaded")
+            .Information("Configuration reloaded: block={Block} oldValue={OldValue} newValue={NewValue}",
+                block, oldValue, newValue);
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>

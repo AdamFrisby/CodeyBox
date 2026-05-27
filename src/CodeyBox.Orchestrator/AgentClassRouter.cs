@@ -28,7 +28,12 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class AgentClassRouter
 {
-    private readonly IReadOnlyDictionary<string, AgentClass> _catalog;
+    // The class catalog and pre-parsed TOD modifiers are bundled into a single
+    // record so the hot-reload coordinator can publish a coherent (catalog,
+    // modifiers) pair via one atomic Volatile.Write. Every public entry point
+    // takes one Volatile.Read into a local at method start to keep a
+    // dispatch's view consistent if a reload races mid-call.
+    private RoutingConfig _routingConfig;
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe> _probesByKind;
     private readonly IAgentQuotaProbe _payPerApiProbe;
     private readonly IAgentQuotaProbe _nullProbe;
@@ -43,8 +48,6 @@ public sealed class AgentClassRouter
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
     public const double DefaultColdStartFitInWindow = 2.0;
-    // Pre-parsed TOD modifiers: evaluated on every pickup, zero-alloc.
-    private readonly IReadOnlyList<ParsedTodModifier> _todModifiers;
     // In-process short-lived exhaustion cache populated by mid-iteration fallback.
     // Keyed by (agent kind, model id ?? ""); value is the UTC instant at which
     // the suppression expires. Survives only the current process lifetime —
@@ -64,7 +67,9 @@ public sealed class AgentClassRouter
         IAgentRunningCounters? runningCounters = null,
         AgentAvailabilityRegistry? availability = null)
     {
-        _catalog = catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
+        _routingConfig = new RoutingConfig(
+            catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
+            todModifiers ?? []);
         var probeList = probes.ToList();
         // PayPerApiQuotaProbe and NullQuotaProbe are selected by billing type, not kind;
         // exclude them from the kind-based lookup to avoid polluting the dictionary.
@@ -76,12 +81,35 @@ public sealed class AgentClassRouter
         _opts = opts;
         _log = log;
         _time = timeProvider ?? TimeProvider.System;
-        _todModifiers = todModifiers ?? [];
         _quotaFailures = quotaFailures;
         _burnEstimator = burnEstimator;
         _runningCounters = runningCounters;
         _availability = availability;
     }
+
+    /// <summary>
+    /// Atomically replaces the in-memory class catalog and TOD modifier list
+    /// with the supplied values. Called by the hot-reload coordinator after
+    /// rebuilding from the latest <c>CodeyBox:AgentClasses</c> /
+    /// <c>CodeyBox:AgentScoreModifiers</c> sections. Dispatches already past
+    /// the entry-point Volatile.Read keep their consistent old-snapshot view
+    /// for the rest of the call; new dispatches see the new config.
+    /// </summary>
+    public void ApplyConfigReload(
+        IReadOnlyList<AgentClass> catalog,
+        IReadOnlyList<ParsedTodModifier> todModifiers)
+    {
+        ArgumentNullException.ThrowIfNull(catalog);
+        ArgumentNullException.ThrowIfNull(todModifiers);
+        var next = new RoutingConfig(
+            catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
+            todModifiers);
+        Volatile.Write(ref _routingConfig, next);
+    }
+
+    private sealed record RoutingConfig(
+        IReadOnlyDictionary<string, AgentClass> Catalog,
+        IReadOnlyList<ParsedTodModifier> TodModifiers);
 
     /// <summary>
     /// Resolves the agent to use for <paramref name="item"/>.
@@ -93,11 +121,12 @@ public sealed class AgentClassRouter
     public async Task<AgentRoutingDecision> ResolveAsync(
         WorkItem item, Project? project, CancellationToken ct)
     {
+        var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null)
             return new AgentRoutingDecision { Reason = "no agent class configured" };
 
-        if (!_catalog.TryGetValue(classId, out var agentClass))
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
         {
             _log.LogWarning(
                 "Work item {Id}: unknown agent class '{ClassId}'; falling through to direct agent pick",
@@ -125,7 +154,7 @@ public sealed class AgentClassRouter
                 .Select(m => (
                     Agent: m.Agent,
                     ModelId: m.ModelId,
-                    EffectiveScore: m.QualityScore + ComputeTodModifier(m.Agent, nowUtcFloor),
+                    EffectiveScore: m.QualityScore + ComputeTodModifier(cfg.TodModifiers, m.Agent, nowUtcFloor),
                     RejectReason: $"below floor ({m.QualityScore} < {item.MinModelScore})"))
                 .ToList();
             AuditLog.QuotaRouterNoEligible(item.Id, classId, item.MinModelScore, belowFloor);
@@ -137,7 +166,7 @@ public sealed class AgentClassRouter
         var scored = eligible.Select(x => new ScoredMember(
             Member: x.Member,
             BaseScore: x.Member.QualityScore,
-            EffectiveScore: x.Member.QualityScore + ComputeTodModifier(x.Member.Agent, nowUtc),
+            EffectiveScore: x.Member.QualityScore + ComputeTodModifier(cfg.TodModifiers, x.Member.Agent, nowUtc),
             ConfigIndex: x.ConfigIndex
         )).ToList();
 
@@ -156,7 +185,7 @@ public sealed class AgentClassRouter
         {
             if (m.QualityScore < item.MinModelScore)
             {
-                var eff = m.QualityScore + ComputeTodModifier(m.Agent, nowUtc);
+                var eff = m.QualityScore + ComputeTodModifier(cfg.TodModifiers, m.Agent, nowUtc);
                 rejected.Add((m.Agent, m.ModelId, eff, $"below floor ({m.QualityScore} < {item.MinModelScore})"));
             }
         }
@@ -214,7 +243,7 @@ public sealed class AgentClassRouter
                 foreach (var other in sorted.Where(x => x != entry))
                     rejected.Add((other.Member.Agent, other.Member.ModelId, other.EffectiveScore, "ranked lower"));
 
-                var modDesc = DescribeModifiers(member.Agent, nowUtc);
+                var modDesc = DescribeModifiers(cfg.TodModifiers, member.Agent, nowUtc);
                 AuditLog.QuotaRouterScored(
                     item.Id, classId,
                     member.Agent, member.ModelId,
@@ -277,7 +306,8 @@ public sealed class AgentClassRouter
     /// </summary>
     public AgentMembership? FindMember(string classId, AgentKind agent, string? modelId)
     {
-        if (!_catalog.TryGetValue(classId, out var agentClass)) return null;
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass)) return null;
         var normalisedModel = modelId ?? string.Empty;
         foreach (var m in agentClass.Members)
         {
@@ -309,8 +339,9 @@ public sealed class AgentClassRouter
     /// </summary>
     public IReadOnlyList<AgentMembership> OrderedFallbackCandidates(WorkItem item, Project? project)
     {
+        var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
-        if (classId is null || !_catalog.TryGetValue(classId, out var agentClass))
+        if (classId is null || !cfg.Catalog.TryGetValue(classId, out var agentClass))
             return [];
 
         var nowUtc = _time.GetUtcNow();
@@ -333,7 +364,7 @@ public sealed class AgentClassRouter
             {
                 x.Member,
                 x.ConfigIndex,
-                EffectiveScore = x.Member.QualityScore + ComputeTodModifier(x.Member.Agent, nowUtc),
+                EffectiveScore = x.Member.QualityScore + ComputeTodModifier(cfg.TodModifiers, x.Member.Agent, nowUtc),
             })
             .OrderByDescending(x => x.EffectiveScore)
             .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
@@ -397,9 +428,10 @@ public sealed class AgentClassRouter
     public async Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
         WorkItem item, Project? project, CancellationToken ct)
     {
+        var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null) return null;
-        if (!_catalog.TryGetValue(classId, out var agentClass)) return null;
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass)) return null;
 
         DateTimeOffset? earliest = null;
         foreach (var member in agentClass.Members)
@@ -512,7 +544,8 @@ public sealed class AgentClassRouter
     public async Task<IReadOnlyList<MemberFitView>> SummariseFitsAsync(string classId, CancellationToken ct = default)
     {
         var results = new List<MemberFitView>();
-        if (!_catalog.TryGetValue(classId, out var agentClass)) return results;
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass)) return results;
         if (_burnEstimator is null) return results;
 
         foreach (var member in agentClass.Members)
@@ -547,7 +580,7 @@ public sealed class AgentClassRouter
     }
 
     /// <summary>Returns every class id known to the router. Used by /concurrency to enumerate fits.</summary>
-    public IReadOnlyCollection<string> ClassIds => _catalog.Keys.ToList();
+    public IReadOnlyCollection<string> ClassIds => Volatile.Read(ref _routingConfig).Catalog.Keys.ToList();
 
     private async Task<QuotaGateDecision> EvaluateObservedFailuresAsync(AgentMembership member, CancellationToken ct)
     {
@@ -630,10 +663,10 @@ public sealed class AgentClassRouter
         return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null);
     }
 
-    private int ComputeTodModifier(AgentKind agent, DateTimeOffset nowUtc)
+    private static int ComputeTodModifier(IReadOnlyList<ParsedTodModifier> modifiers, AgentKind agent, DateTimeOffset nowUtc)
     {
         var total = 0;
-        foreach (var mod in _todModifiers)
+        foreach (var mod in modifiers)
         {
             if (mod.Agent != agent) continue;
             foreach (var window in mod.Windows)
@@ -645,10 +678,10 @@ public sealed class AgentClassRouter
         return total;
     }
 
-    private string DescribeModifiers(AgentKind agent, DateTimeOffset nowUtc)
+    private static string DescribeModifiers(IReadOnlyList<ParsedTodModifier> modifiers, AgentKind agent, DateTimeOffset nowUtc)
     {
         var parts = new List<string>();
-        foreach (var mod in _todModifiers)
+        foreach (var mod in modifiers)
         {
             if (mod.Agent != agent) continue;
             foreach (var window in mod.Windows)

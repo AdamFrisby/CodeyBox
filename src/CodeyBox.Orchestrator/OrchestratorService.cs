@@ -29,7 +29,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
-    private readonly AgentConcurrencyOptions _agentConcurrency;
+    // Mutable + Volatile-swapped so the hot-reload coordinator can publish a
+    // new per-agent cap dictionary mid-flight. Cap reads in TryReserveAgentSlot
+    // / GetAgentCap / GetConcurrencyState take a single Volatile.Read into a
+    // local so a concurrent swap can't tear the read. In-flight items are not
+    // retroactively gated — caps are only consulted at dispatch time.
+    private AgentConcurrencyOptions _agentConcurrency;
 
     // Live in-flight count keyed by routed agent kind. Incremented after the
     // router pins an item to a member, decremented when the worker exits.
@@ -129,10 +134,26 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// Returns the per-agent cap configured for <paramref name="agent"/>, or 0
     /// when no cap is configured (treated as "unlimited within global pool").
     /// </summary>
-    internal int GetAgentCap(AgentKind agent) =>
-        _agentConcurrency.Members.TryGetValue(agent.Value, out var entry) && entry.MaxConcurrent > 0
+    internal int GetAgentCap(AgentKind agent)
+    {
+        var opts = Volatile.Read(ref _agentConcurrency);
+        return opts.Members.TryGetValue(agent.Value, out var entry) && entry.MaxConcurrent > 0
             ? entry.MaxConcurrent
             : 0;
+    }
+
+    /// <summary>
+    /// Replaces the per-agent concurrency cap dictionary with <paramref name="next"/>.
+    /// Called by the hot-reload coordinator when <c>CodeyBox:AgentConcurrency</c>
+    /// changes on disk. The swap is atomic against in-progress reservation
+    /// reads; in-flight items already past the gate are unaffected (caps are
+    /// only consulted at dispatch time).
+    /// </summary>
+    public void ApplyAgentConcurrencyReload(AgentConcurrencyOptions next)
+    {
+        ArgumentNullException.ThrowIfNull(next);
+        Volatile.Write(ref _agentConcurrency, next);
+    }
 
     /// <summary>
     /// Snapshot of concurrency state for the <c>/concurrency</c> endpoint:
@@ -140,8 +161,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     public ConcurrencyStateSnapshot GetConcurrencyState()
     {
+        var opts = Volatile.Read(ref _agentConcurrency);
         var caps = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var kv in _agentConcurrency.Members)
+        foreach (var kv in opts.Members)
         {
             if (kv.Value.MaxConcurrent > 0)
                 caps[kv.Key] = kv.Value.MaxConcurrent;

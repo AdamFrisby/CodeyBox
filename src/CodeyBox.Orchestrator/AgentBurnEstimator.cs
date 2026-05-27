@@ -61,7 +61,11 @@ public sealed class AgentBurnEstimatorOptions
 public sealed class AgentBurnEstimator : IAgentBurnEstimator
 {
     private readonly Func<IWorkItemCostStore> _resolveCosts;
-    private readonly AgentBurnEstimatorOptions _opts;
+    // Mutable + Volatile-swapped so the hot-reload coordinator can publish new
+    // burn defaults / token budgets / cache TTL without a restart. Reads in
+    // ComputeAsync take a single Volatile.Read into a local so a concurrent
+    // swap can't tear the per-agent lookup.
+    private AgentBurnEstimatorOptions _opts;
     private readonly TimeProvider _time;
     private readonly ILogger<AgentBurnEstimator> _log;
     private readonly ConcurrentDictionary<string, CacheEntry> _cache =
@@ -102,12 +106,30 @@ public sealed class AgentBurnEstimator : IAgentBurnEstimator
         if (_cache.TryGetValue(key, out var entry) && entry.ExpiresAt > now)
             return entry.Estimate;
 
-        var estimate = await ComputeAsync(agent, ct);
-        _cache[key] = new CacheEntry(estimate, now + _opts.CacheTtl);
+        var opts = Volatile.Read(ref _opts);
+        var estimate = await ComputeAsync(opts, agent, ct);
+        _cache[key] = new CacheEntry(estimate, now + opts.CacheTtl);
         return estimate;
     }
 
-    private async Task<AgentBurnEstimate> ComputeAsync(AgentKind agent, CancellationToken ct)
+    /// <summary>
+    /// Replaces the burn-estimator options with <paramref name="next"/> and
+    /// drops the per-agent cache so the next read uses the new
+    /// <see cref="AgentBurnEstimatorOptions.RollingSampleSize"/> /
+    /// <see cref="AgentBurnEstimatorOptions.WindowTokenBudget"/>. Called by the
+    /// hot-reload coordinator on a <c>CodeyBox:AgentBurnEstimator</c> change.
+    /// </summary>
+    public void ApplyConfigReload(AgentBurnEstimatorOptions next)
+    {
+        ArgumentNullException.ThrowIfNull(next);
+        Volatile.Write(ref _opts, next);
+        // Cached entries were computed against the prior RollingSampleSize /
+        // WindowTokenBudget; drop them so the next read recomputes under the
+        // new policy rather than serving a stale average for up to CacheTtl.
+        _cache.Clear();
+    }
+
+    private async Task<AgentBurnEstimate> ComputeAsync(AgentBurnEstimatorOptions opts, AgentKind agent, CancellationToken ct)
     {
         long avgTokens = 0;
         int samples = 0;
@@ -121,7 +143,7 @@ public sealed class AgentBurnEstimator : IAgentBurnEstimator
                 agent.Value);
             return new AgentBurnEstimate
             {
-                AvgBurnPctPerItem = _opts.DefaultBurnPercentPerItem.TryGetValue(agent.Value, out var fallback) ? fallback : -1,
+                AvgBurnPctPerItem = opts.DefaultBurnPercentPerItem.TryGetValue(agent.Value, out var fallback) ? fallback : -1,
                 SampleCount = 0,
             };
         }
@@ -132,7 +154,7 @@ public sealed class AgentBurnEstimator : IAgentBurnEstimator
             try
             {
                 (avgTokens, samples) = await q.GetAvgTokensPerItemAsync(
-                    agent.Value, _opts.RollingSampleSize, ct);
+                    agent.Value, opts.RollingSampleSize, ct);
             }
             catch (Exception ex)
             {
@@ -145,7 +167,7 @@ public sealed class AgentBurnEstimator : IAgentBurnEstimator
 
         double avgBurnPct;
         int reportedSamples;
-        if (samples > 0 && _opts.WindowTokenBudget.TryGetValue(agent.Value, out var budget) && budget > 0)
+        if (samples > 0 && opts.WindowTokenBudget.TryGetValue(agent.Value, out var budget) && budget > 0)
         {
             avgBurnPct = Math.Min(100.0, (avgTokens / (double)budget) * 100.0);
             reportedSamples = samples;
@@ -157,7 +179,7 @@ public sealed class AgentBurnEstimator : IAgentBurnEstimator
             // AvgBurnPctPerItem. A default value is not empirical, so SampleCount must
             // be 0 so the router takes its cold-start fit fallback rather than treating
             // the default as a measured average.
-            avgBurnPct = _opts.DefaultBurnPercentPerItem.TryGetValue(agent.Value, out var d) ? d : -1;
+            avgBurnPct = opts.DefaultBurnPercentPerItem.TryGetValue(agent.Value, out var d) ? d : -1;
             reportedSamples = 0;
         }
 
