@@ -62,6 +62,46 @@ public interface IUpstreamRemote
     /// </summary>
     Task<string?> FetchBaseBranchAsync(string repositoryId, string baseBranch, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Lists open pull requests whose head branch starts with <paramref name="branchPrefix"/>
+    /// and whose mergeability is known. Used by the stale-base PR sweeper to
+    /// detect CodeyBox-authored PRs whose base branch has moved and produced a
+    /// conflict the auto-merger can no longer resolve.
+    ///
+    /// <para>Implementations only need to return PRs whose mergeability has
+    /// been computed by the forge (i.e. <c>mergeable</c> is not null on
+    /// GitHub). PRs whose state is still being calculated are skipped so the
+    /// sweeper reconsiders them on the next tick.</para>
+    ///
+    /// <para>Default returns an empty list for upstream kinds that don't
+    /// model PRs (noop, git-generic).</para>
+    /// </summary>
+    Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(
+        string branchPrefix, CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<UpstreamPullRequest>>([]);
+}
+
+/// <summary>
+/// Snapshot of an open pull request as seen by an <see cref="IUpstreamRemote"/>
+/// at a point in time. Fields mirror the subset of the forge PR object the
+/// stale-base sweeper needs: identity (number + URL), branch endpoints, head
+/// sha, and a textual mergeability classification.
+/// </summary>
+public sealed record UpstreamPullRequest
+{
+    public required int Number { get; init; }
+    public required string Url { get; init; }
+    public required string HeadBranch { get; init; }
+    public required string HeadSha { get; init; }
+    public required string BaseBranch { get; init; }
+    /// <summary>
+    /// True when the forge reports the PR has conflicts that need a
+    /// manual rebase (GitHub: <c>mergeable=false</c> or
+    /// <c>mergeable_state=dirty</c>). False when the PR is mergeable or
+    /// blocked for an unrelated reason (branch protection, awaiting review).
+    /// </summary>
+    public required bool HasMergeConflict { get; init; }
 }
 
 public sealed record UpstreamPushResult(bool Success, string? Error);

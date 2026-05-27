@@ -1511,6 +1511,23 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
 
+// --- Stale-base PR sweeper ---------------------------------------------------
+// Periodically polls open PRs across every github-upstream project, detects
+// the ones whose base branch has moved and produced a conflict the auto-merger
+// can no longer resolve, and fires the upstream.pr_stale_base webhook event so
+// operators see the orphan PR within minutes (5-minute SLA per the bug spec).
+// See StalePullRequestSweeper.
+builder.Services.AddHostedService(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new StalePullRequestSweeper(
+        sp.GetRequiredService<IProjectRepository>(),
+        sp.GetRequiredService<IUpstreamRemoteFactory>(),
+        sp.GetRequiredService<IWebhookDispatcher>(),
+        () => monitor.CurrentValue.StalePullRequestSweep,
+        sp.GetRequiredService<ILogger<StalePullRequestSweeper>>());
+});
+
 // --- Plugin foundation -------------------------------------------------------
 // Discovers assemblies from CodeyBox:Plugins, registers plugin types under
 // their Core interfaces before the container is frozen, then runs
@@ -2073,6 +2090,15 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+
+        /// <summary>
+        /// Stale-base PR sweeper configuration. Detects open CodeyBox-authored
+        /// PRs whose base branch has moved and produced a merge conflict the
+        /// orchestrator can no longer resolve in-pipeline, and fires the
+        /// <c>upstream.pr_stale_base</c> webhook event so operators see the
+        /// orphan PR within minutes. See <see cref="StalePullRequestSweeper"/>.
+        /// </summary>
+        public StalePullRequestSweeperOptions StalePullRequestSweep { get; set; } = new();
 
         /// <summary>
         /// Startup config-validation knobs. Controls whether AgentClass ModelId

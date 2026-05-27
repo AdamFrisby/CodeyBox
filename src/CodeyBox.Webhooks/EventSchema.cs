@@ -116,6 +116,8 @@ public static class EventSchema
         "release.published",
         "release.failed",
         "release.sync_conflict",
+        // Upstream/forge state surfaced by background sweeps (not state transitions)
+        "upstream.pr_stale_base",
     ];
 
     /// <summary>

@@ -138,6 +138,7 @@ subscribe to.
 | `release.published` | 1.0 | Release merged to main. |
 | `release.failed` | 1.0 | Deep audit exceeded max iterations. |
 | `release.sync_conflict` | 1.0 | Conflict merging `main` into a release branch. |
+| `upstream.pr_stale_base` | 1.1 | A CodeyBox-authored PR has been left unmergeable by motion on the base branch; needs operator rebase. |
 
 See [`webhooks.md`](webhooks.md) for the per-event `details` payload shapes.
 Schema 1.1 adds the sandbox leak `reason` details field.
