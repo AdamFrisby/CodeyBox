@@ -234,6 +234,9 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             throw new InvalidOperationException($"Project '{pc.Id}' missing 'RepositoryUrl'");
         Validation.ValidateRepositoryUrl(pc.RepositoryUrl, $"projects[{pc.Id}].RepositoryUrl");
 
+        var upstream = ResolveUpstream(pc.Upstream);
+        ValidateUpstreamSeedCombination(pc.Id, pc.RepositoryUrl, upstream);
+
         return new Project
         {
             Id = new ProjectId(pc.Id),
@@ -242,7 +245,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             DefaultBaseBranch = pc.BaseBranch ?? defaults.BaseBranch,
             DefaultAgent = ParseAgent(pc.Agent ?? defaults.Agent),
             DefaultAgentClass = pc.DefaultAgentClass,
-            Upstream = ResolveUpstream(pc.Upstream),
+            Upstream = upstream,
             Audit = ResolveAudit(pc.Id, pc.Audit, defaults.Audit),
             NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),
             Budget = ResolveBudget(pc.Budget),
@@ -251,6 +254,59 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             MaxPriority = pc.MaxPriority,
             GraphicalSandbox = pc.GraphicalSandbox ?? defaults.GraphicalSandbox ?? false,
         };
+    }
+
+    /// <summary>
+    /// Refuses the <c>Upstream.Kind=noop</c> + local-path <c>RepositoryUrl</c>
+    /// combination unless the operator explicitly acknowledges it. Without an
+    /// upstream to merge back into, every work item against a shared local seed
+    /// forks from the same starting point and produces an independent rewrite
+    /// — the operator has no way to compose results across work items. See
+    /// <c>docs/projects.md</c> for the full failure mode write-up.
+    ///
+    /// Bypass: set <c>Upstream.AcknowledgeSandboxIsolation=true</c> for genuine
+    /// sandbox/experiment projects, or configure a real upstream
+    /// (<c>Kind=github</c> or <c>Kind=git-generic</c>) for compose-able work.
+    /// </summary>
+    internal static void ValidateUpstreamSeedCombination(string projectId, string repositoryUrl, ProjectUpstream upstream)
+    {
+        if (!upstream.Kind.Equals("noop", StringComparison.OrdinalIgnoreCase))
+            return;
+        if (upstream.AcknowledgeSandboxIsolation)
+            return;
+        if (!IsLocalRepositoryUrl(repositoryUrl))
+            return;
+
+        throw new InvalidOperationException(
+            $"Project '{projectId}' combines Upstream.Kind='noop' with a local " +
+            $"RepositoryUrl ('{repositoryUrl}'). This produces work items that all " +
+            "fork from the same seed with no upstream to merge back into, so every " +
+            "Done item is an independent rewrite rather than iterative progress " +
+            "(see docs/projects.md). Fix this by either: " +
+            "(1) configuring a real upstream (Upstream.Kind='github' or " +
+            "'git-generic') so the orchestrator can push merged work back to a " +
+            "shared remote, or " +
+            "(2) explicitly setting Upstream.AcknowledgeSandboxIsolation=true to " +
+            "confirm this project is an intentionally-isolated sandbox where each " +
+            "work item is expected to start from scratch.");
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="repositoryUrl"/> resolves to a local
+    /// filesystem path. Used by <see cref="ValidateUpstreamSeedCombination"/>;
+    /// recognises the subset of forms accepted by
+    /// <see cref="Validation.ValidateRepositoryUrl(string,string)"/> that point
+    /// at a path on the host (<c>file://</c> URIs and absolute Unix paths).
+    /// </summary>
+    internal static bool IsLocalRepositoryUrl(string repositoryUrl)
+    {
+        if (string.IsNullOrWhiteSpace(repositoryUrl))
+            return false;
+        if (repositoryUrl.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (repositoryUrl.StartsWith('/'))
+            return true;
+        return false;
     }
 
     private static ProjectNetworkProfiles ResolveNetworkProfiles(ProjectNetworkProfilesConfig? project, ProjectNetworkProfilesConfig? defaults) => new()
@@ -290,6 +346,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             AutoMerge = c.AutoMerge ?? false,
             PullRequestTitleTemplate = c.PullRequestTitleTemplate,
             PreMergeVerifyArgv = c.PreMergeVerifyArgv is null ? [] : c.PreMergeVerifyArgv.ToArray(),
+            AcknowledgeSandboxIsolation = c.AcknowledgeSandboxIsolation ?? false,
         };
     }
 

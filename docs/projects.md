@@ -453,6 +453,43 @@ For `git-generic`, set `GenericUrl` and rely on the host git config
 (askpass, SSH agent) for auth. For `noop`, no upstream push happens and
 the host bare repo is the source of truth.
 
+#### `Kind=noop` + local `RepositoryUrl`: rejected by default
+
+`Upstream.Kind=noop` combined with a `RepositoryUrl` that points at a
+local filesystem path (`file://...` or an absolute path like
+`/home/me/.codeybox/seeds/foo.git`) is **refused at startup**. Without a
+real upstream, every work item forks from the same seed and has nowhere
+to merge back to — operators see a parade of independent rewrites
+instead of iterative progress, because no Done item ever feeds the next
+one's base. In practice this has consumed tens of agent-hours per
+misconfigured project before the operator noticed.
+
+If you actually want sandbox-style isolation (each work item starts
+from scratch, results aren't intended to compose), opt in explicitly:
+
+```json
+"Upstream": {
+  "Kind": "noop",
+  "AcknowledgeSandboxIsolation": true
+}
+```
+
+Otherwise, configure a real upstream so merged work flows back to a
+shared remote:
+
+```json
+"Upstream": {
+  "Kind": "github",
+  "GitHubOwner": "me",
+  "GitHubRepository": "my-app",
+  "TokenEnvVar": "MY_APP_GITHUB_TOKEN"
+}
+```
+
+The validator runs on first load and on every `appsettings.json` reload;
+a reload that introduces the dangerous combination is rejected and the
+prior snapshot is retained (the rejection is logged at ERROR).
+
 ### Plugin upstreams and PluginConfig
 
 When `Kind` is not a built-in (`noop`, `github`, `git-generic`), the orchestrator

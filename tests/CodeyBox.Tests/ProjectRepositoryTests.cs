@@ -442,4 +442,258 @@ public sealed class ProjectRepositoryTests
         var p = await repo.GetAsync(new ProjectId("alpha"));
         Assert.Equal(750, p!.MaxPriority);
     }
+
+    // --- noop + local-seed validator ------------------------------------------
+    //
+    // The validator refuses Upstream.Kind=noop + local RepositoryUrl unless the
+    // operator explicitly acknowledges the isolated-sandbox semantics. These
+    // tests cover the canonical failure modes that produced the original bug
+    // (absolute local path, file:// URI) plus the two recovery paths
+    // (acknowledge the isolation or configure a real upstream).
+
+    [Theory]
+    [InlineData("/home/operator/.codeybox/seeds/foo.git")]
+    [InlineData("file:///srv/codeybox/seeds/foo.git")]
+    public void Rejects_NoopUpstream_With_LocalRepositoryUrl(string localUrl)
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "isolated",
+                    RepositoryUrl = localUrl,
+                    // Explicit noop kind — the dangerous default combination.
+                    Upstream = new ProjectUpstreamConfig { Kind = "noop" },
+                },
+            ],
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            new ProjectRepository(Options.Create(opts)));
+        Assert.Contains("noop", ex.Message);
+        Assert.Contains("AcknowledgeSandboxIsolation", ex.Message);
+    }
+
+    [Fact]
+    public void Rejects_NoopUpstream_With_LocalRepositoryUrl_WhenUpstreamOmitted()
+    {
+        // ProjectUpstream defaults to Kind=noop when the Upstream section is
+        // omitted entirely. The validator still fires — the failure mode is
+        // identical whether the operator wrote "noop" explicitly or simply
+        // left the section out.
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "isolated",
+                    RepositoryUrl = "/home/operator/.codeybox/seeds/foo.git",
+                },
+            ],
+        };
+        Assert.Throws<InvalidOperationException>(() =>
+            new ProjectRepository(Options.Create(opts)));
+    }
+
+    [Fact]
+    public async Task Allows_NoopUpstream_With_LocalRepositoryUrl_WhenAcknowledged()
+    {
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "isolated",
+                    RepositoryUrl = "/home/operator/.codeybox/seeds/foo.git",
+                    Upstream = new ProjectUpstreamConfig
+                    {
+                        Kind = "noop",
+                        AcknowledgeSandboxIsolation = true,
+                    },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("isolated"));
+        Assert.NotNull(p);
+        Assert.True(p!.Upstream.AcknowledgeSandboxIsolation);
+    }
+
+    [Fact]
+    public async Task Allows_NoopUpstream_With_RemoteRepositoryUrl()
+    {
+        // A remote RepositoryUrl with Kind=noop is unusual but not the
+        // shared-seed failure mode — pushes are skipped, but each work item
+        // still clones a real remote. No acknowledgement required.
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "remote-noop",
+                    RepositoryUrl = "https://example.com/foo.git",
+                    Upstream = new ProjectUpstreamConfig { Kind = "noop" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("remote-noop"));
+        Assert.NotNull(p);
+        Assert.Equal("noop", p!.Upstream.Kind);
+    }
+
+    [Fact]
+    public async Task Allows_GitHubUpstream_With_LocalRepositoryUrl()
+    {
+        // The validator only fires for Kind=noop. A real upstream means
+        // merged work flows back to a shared remote even when the seed
+        // happens to live on the local filesystem.
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "local-with-github",
+                    RepositoryUrl = "/home/operator/.codeybox/seeds/foo.git",
+                    Upstream = new ProjectUpstreamConfig
+                    {
+                        Kind = "github",
+                        GitHubOwner = "me",
+                        GitHubRepository = "foo",
+                        TokenEnvVar = "GH_TOKEN",
+                    },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("local-with-github"));
+        Assert.NotNull(p);
+        Assert.Equal("github", p!.Upstream.Kind);
+    }
+
+    [Fact]
+    public async Task Reload_Rejects_NoopUpstream_With_LocalRepositoryUrl()
+    {
+        // Hot-reload regression guard: an appsettings.json edit that flips an
+        // existing project into the dangerous combination must not silently
+        // swap the snapshot. The reload exception is caught inside the
+        // repository's OnChange callback, so the prior snapshot stays live;
+        // the rejection is logged at ERROR for the operator to spot.
+        var initial = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/alpha.git",
+                },
+            ],
+        };
+        var monitor = new TestProjectsOptionsMonitor(initial);
+        var logger = new CapturingLogger<ProjectRepository>();
+        using var repo = new ProjectRepository(monitor, logger);
+
+        // Flip the project into noop + local-seed. The reload candidate must
+        // be rejected; the original snapshot remains.
+        var bad = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "/home/operator/.codeybox/seeds/alpha.git",
+                    Upstream = new ProjectUpstreamConfig { Kind = "noop" },
+                },
+            ],
+        };
+        monitor.Push(bad);
+
+        Assert.Contains(logger.Entries, e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Error &&
+            e.Exception is InvalidOperationException);
+        // The prior snapshot stayed live: alpha still resolves with its
+        // original https RepositoryUrl, not the rejected local-seed candidate.
+        var preserved = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(preserved);
+        Assert.Equal("https://example.com/alpha.git", preserved!.RepositoryUrl);
+    }
+
+    [Theory]
+    [InlineData("https://example.com/foo.git")]
+    [InlineData("http://example.com/foo.git")]
+    [InlineData("git://example.com/foo.git")]
+    [InlineData("ssh://git@example.com/foo.git")]
+    [InlineData("git@github.com:me/foo.git")]
+    public async Task Allows_NoopUpstream_With_NetworkOrScpRepositoryUrl(string url)
+    {
+        // Every form that ValidateRepositoryUrl recognises as a network /
+        // scp-style endpoint must be accepted with Kind=noop — the dangerous
+        // combination is specifically noop + local-filesystem seed.
+        var opts = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "remote",
+                    RepositoryUrl = url,
+                    Upstream = new ProjectUpstreamConfig { Kind = "noop" },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("remote"));
+        Assert.NotNull(p);
+        Assert.Equal("noop", p!.Upstream.Kind);
+    }
 }
+
+/// <summary>
+/// Minimal in-memory <see cref="IOptionsMonitor{T}"/> for ProjectsOptions hot
+/// reload tests. Exercises the OnChange callback path inside
+/// <see cref="ProjectRepository"/> without spinning up a real configuration
+/// provider — the production guarantee being tested is "the reload validator
+/// keeps the prior snapshot when the candidate is invalid", which depends on
+/// OnChange being invoked, not on the source of the change.
+/// </summary>
+internal sealed class TestProjectsOptionsMonitor : IOptionsMonitor<ProjectsOptions>
+{
+    private ProjectsOptions _current;
+    private readonly List<Action<ProjectsOptions, string?>> _listeners = new();
+
+    public TestProjectsOptionsMonitor(ProjectsOptions initial)
+    {
+        _current = initial;
+    }
+
+    public ProjectsOptions CurrentValue => _current;
+    public ProjectsOptions Get(string? name) => _current;
+
+    public IDisposable OnChange(Action<ProjectsOptions, string?> listener)
+    {
+        _listeners.Add(listener);
+        return new Subscription(() => _listeners.Remove(listener));
+    }
+
+    public void Push(ProjectsOptions next)
+    {
+        _current = next;
+        foreach (var listener in _listeners.ToArray())
+            listener(next, null);
+    }
+
+    private sealed class Subscription : IDisposable
+    {
+        private readonly Action _onDispose;
+        public Subscription(Action onDispose) { _onDispose = onDispose; }
+        public void Dispose() => _onDispose();
+    }
+}
+

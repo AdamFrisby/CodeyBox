@@ -113,6 +113,14 @@ public sealed class ProjectUpstreamConfig
     /// <see cref="ProjectUpstream"/>.
     /// </summary>
     public List<string>? PreMergeVerifyArgv { get; set; }
+
+    /// <summary>
+    /// Opt-in acknowledgement that a <c>Kind=noop</c> + local
+    /// <c>RepositoryUrl</c> combination is intentional (see
+    /// <see cref="ProjectUpstream.AcknowledgeSandboxIsolation"/>). The startup
+    /// validator refuses that combination unless this flag is <c>true</c>.
+    /// </summary>
+    public bool? AcknowledgeSandboxIsolation { get; set; }
 }
 
 public sealed class ProjectAuditConfig
