@@ -78,8 +78,9 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         // CompleteAsync was called twice — once for the initial attempt that
         // raced, and once after the race-recovery re-merge.
         Assert.Equal(2, remote.CompleteCalls);
-        // The race-recovery path called FetchBaseBranchAsync exactly once.
-        Assert.Equal(1, remote.FetchCalls);
+        // Two FetchBaseBranchAsync calls: one is the pre-merge canonical-base
+        // refresh (stale-base guard), the other is the race-recovery refetch.
+        Assert.Equal(2, remote.FetchCalls);
         // The second CompleteAsync carried the PR number from the first to
         // skip re-creating the PR (which would 422).
         Assert.Null(remote.Requests[0].ExistingPullRequestNumber);
@@ -137,7 +138,9 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         Assert.Contains("base didn't move", final.LastError);
         // Only one CompleteAsync call — orchestrator parked instead of looping.
         Assert.Equal(1, remote.CompleteCalls);
-        Assert.Equal(1, remote.FetchCalls);
+        // Two FetchBaseBranchAsync calls: pre-merge canonical-base refresh +
+        // race-recovery refetch (which is what detects "base didn't move").
+        Assert.Equal(2, remote.FetchCalls);
     }
 
     [Fact]
@@ -194,7 +197,9 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         // the orchestrator kept attempting recovery on every iteration rather
         // than silently falling through. A regression that skipped recovery
         // on iterations 2..N would still trip CompleteCalls but not this.
-        Assert.Equal(maxAttempts, remote.FetchCalls);
+        // +1 for the pre-merge canonical-base refresh that runs once at the
+        // start of the merge phase (before any race-recovery iteration).
+        Assert.Equal(maxAttempts + 1, remote.FetchCalls);
         // UpstreamPushAttempts must reflect the cap so the operator surface
         // matches what actually happened — a stuck counter would hide the
         // pathological retry loop.
@@ -242,9 +247,10 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
         Assert.Contains("no PR number returned", final.LastError);
-        // No fetch should have run — the park happened before we'd reach the
-        // refetch step (which is keyed on having a PR number to retry).
-        Assert.Equal(0, remote.FetchCalls);
+        // Exactly one fetch: the pre-merge canonical-base refresh. The
+        // race-recovery refetch never runs because the park branch fires
+        // before reaching it (no PR number to retry against).
+        Assert.Equal(1, remote.FetchCalls);
     }
 
     [Fact]
@@ -285,7 +291,11 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
         Assert.Contains("could not refetch upstream base", final.LastError);
-        Assert.Equal(1, remote.FetchCalls);
+        // Two fetches: the pre-merge canonical-base refresh (which throws,
+        // is caught + logged as best-effort), then the race-recovery refetch
+        // (which throws and is the one the test specifically targets — it's
+        // the strict path that parks with the asserted lastError).
+        Assert.Equal(2, remote.FetchCalls);
     }
 
     [Fact]
@@ -327,7 +337,11 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
         Assert.Contains("does not advertise base branch", final.LastError);
-        Assert.Equal(1, remote.FetchCalls);
+        // Two fetches: the pre-merge canonical-base refresh (which returns
+        // null and is logged as best-effort), then the race-recovery refetch
+        // (also returns null and triggers the strict park with the asserted
+        // lastError).
+        Assert.Equal(2, remote.FetchCalls);
     }
 
     [Fact]
