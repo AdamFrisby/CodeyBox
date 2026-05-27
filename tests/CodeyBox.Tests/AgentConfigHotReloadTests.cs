@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -8,10 +9,11 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies hot-reload of <c>CodeyBox:AgentConcurrency</c>,
-/// <c>CodeyBox:AgentClasses</c>, and <c>CodeyBox:AgentBurnEstimator</c>: edits
-/// to these blocks of the layered config land in the running router /
-/// orchestrator / burn estimator without a restart, and in-flight items
-/// already past the dispatch gate keep the snapshot they started on.
+/// <c>CodeyBox:AgentClasses</c>, <c>CodeyBox:AgentBurnEstimator</c>, and
+/// <c>CodeyBox:AgentPricing</c>: edits to these blocks of the layered config
+/// land in the running router / orchestrator / burn estimator / cost
+/// calculator without a restart, and in-flight items already past the
+/// dispatch gate keep the snapshot they started on.
 /// </summary>
 public sealed class AgentConfigHotReloadTests
 {
@@ -377,6 +379,173 @@ public sealed class AgentConfigHotReloadTests
 
         Assert.DoesNotContain("frontier", router.ClassIds);
         Assert.Contains("bulk", router.ClassIds);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_PushesPricingUpdateIntoCostCalculator()
+    {
+        // End-to-end: edits to CodeyBox:AgentPricing flow through OnChange ->
+        // ApplyPricingIfChanged -> AgentCostCalculator.ApplyConfigReload and
+        // subsequent Calculate() calls reflect the new rates. Catches:
+        //   - costCalculator parameter not wired in DI / ctor (silently no-ops)
+        //   - SerializePricing returning a constant (changes never detected)
+        //   - ApplyPricingIfChanged passing the wrong section to the calculator
+        var initialPricing = new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["claude"] = new()
+                {
+                    ["claude-opus-4-7"] = new ModelRateConfig
+                    {
+                        InputPerMillion = 15.0,
+                        CachedInputPerMillion = 1.50,
+                        OutputPerMillion = 75.0,
+                    },
+                },
+            },
+        };
+        var initial = new CodeyBoxOptions { AgentPricing = initialPricing };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var calculator = new AgentCostCalculator(initialPricing);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-opus-4-7");
+        Assert.Equal(0.090000m, calculator.Calculate(snapshot, Claude));
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            costCalculator: calculator);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Fire OnChange with doubled pricing.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentPricing = new AgentPricingOptions
+            {
+                Rates = new()
+                {
+                    ["claude"] = new()
+                    {
+                        ["claude-opus-4-7"] = new ModelRateConfig
+                        {
+                            InputPerMillion = 30.0,
+                            CachedInputPerMillion = 3.00,
+                            OutputPerMillion = 150.0,
+                        },
+                    },
+                },
+            },
+        });
+
+        // Calculator must see the doubled rate via the live calculator instance.
+        Assert.Equal(0.180000m, calculator.Calculate(snapshot, Claude));
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_InvalidAgentPricingPayload_KeepsPriorSnapshot_AndAllowsFollowupValidEdit()
+    {
+        // Mirror of the AgentClasses follow-up-valid-edit regression test: if
+        // _lastPricing were advanced inside the catch, the operator's
+        // follow-up fix would be detected as no-change against the rejected
+        // payload and silently skipped.
+        var initialPricing = new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["claude"] = new()
+                {
+                    ["claude-opus-4-7"] = new ModelRateConfig
+                    {
+                        InputPerMillion = 15.0,
+                        CachedInputPerMillion = 1.50,
+                        OutputPerMillion = 75.0,
+                    },
+                },
+            },
+        };
+        var initial = new CodeyBoxOptions { AgentPricing = initialPricing };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var calculator = new AgentCostCalculator(initialPricing);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-opus-4-7");
+        var priorCost = calculator.Calculate(snapshot, Claude);
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            costCalculator: calculator);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Invalid: negative rate is rejected by AgentCostCalculator.ApplyConfigReload.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentPricing = new AgentPricingOptions
+            {
+                Rates = new()
+                {
+                    ["claude"] = new()
+                    {
+                        ["claude-opus-4-7"] = new ModelRateConfig
+                        {
+                            InputPerMillion = -1.0,
+                            CachedInputPerMillion = 0,
+                            OutputPerMillion = 75.0,
+                        },
+                    },
+                },
+            },
+        });
+
+        // Prior pricing snapshot still in effect after the rejected reload.
+        Assert.Equal(priorCost, calculator.Calculate(snapshot, Claude));
+
+        // Follow-up valid edit (doubled rate) must still be detected as a
+        // change against the original baseline, not the rejected payload.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentPricing = new AgentPricingOptions
+            {
+                Rates = new()
+                {
+                    ["claude"] = new()
+                    {
+                        ["claude-opus-4-7"] = new ModelRateConfig
+                        {
+                            InputPerMillion = 30.0,
+                            CachedInputPerMillion = 3.00,
+                            OutputPerMillion = 150.0,
+                        },
+                    },
+                },
+            },
+        });
+
+        Assert.Equal(0.180000m, calculator.Calculate(snapshot, Claude));
 
         await coordinator.StopAsync(CancellationToken.None);
     }

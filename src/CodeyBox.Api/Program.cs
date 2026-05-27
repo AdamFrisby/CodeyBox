@@ -1433,7 +1433,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp => new AgentConfigHotRelo
     sp.GetRequiredService<OrchestratorService>(),
     sp.GetRequiredService<AgentClassRouter>(),
     sp.GetRequiredService<AgentBurnEstimator>(),
-    sp.GetRequiredService<ILogger<AgentConfigHotReload>>()));
+    sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
+    sp.GetRequiredService<AgentCostCalculator>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
@@ -1455,9 +1456,13 @@ builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetRequiredService<ILogger<AuditAgentStartupValidationService>>()));
+// Live accessor: operator edits to CodeyBox:AuditLog:RetainedDays take effect
+// on the next daily retention sweep without restart. The Serilog rolling-file
+// writer pinned RetainedDays at startup though, so its sink retention does
+// require a restart — documented on AuditLogOptions.RetainedDays.
 builder.Services.AddHostedService(sp => new AuditReportRetentionService(
     sp.GetRequiredService<IAuditReportStore>(),
-    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AuditLog.RetainedDays,
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AuditLog.RetainedDays,
     sp.GetRequiredService<ILogger<AuditReportRetentionService>>()));
 builder.Services.AddHostedService(sp => new IdempotencyKeyRetentionService(
     sp.GetRequiredService<IIdempotencyStore>(),
@@ -1477,11 +1482,16 @@ builder.Services.AddHostedService(sp => new BudgetAlertService(
 
 builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 {
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.SandboxLeak;
+    // Live accessor: thresholds and policy fields (LeakAgeThreshold, AutoDispose,
+    // MaxConcurrentAutoDispose, PreemptRetention) are re-read on every sweep so
+    // operator edits take effect without restart. CheckInterval and Enabled are
+    // sampled once at PeriodicTimer construction — limitation documented on the
+    // fields themselves.
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     return new SandboxLeakReaper(
         sp.GetRequiredService<ISandboxProvider>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
-        opts,
+        () => monitor.CurrentValue.SandboxLeak,
         sp.GetRequiredService<ILogger<SandboxLeakReaper>>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
@@ -1819,6 +1829,37 @@ namespace CodeyBox.Api
             MultipassSandboxOptions.DefaultCloudInitReadyRetryAttempts;
     }
 
+    /// <summary>
+    /// Top-level options bag bound from the <c>CodeyBox</c> configuration
+    /// section. See <c>docs/configuration.md</c> for the full hot-reload
+    /// contract per field. Summary of the rule of thumb consumers should
+    /// follow when adding new fields:
+    /// <list type="bullet">
+    /// <item><b>Hot-reloadable</b> fields are read fresh from
+    ///   <see cref="IOptionsMonitor{T}"/> on each consumer access (or
+    ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
+    ///   <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
+    ///   <c>AgentBurnEstimator</c>, <c>AgentPricing</c>, <c>DeadWorker</c>
+    ///   (per-sweep), <c>SandboxLeak</c> (thresholds, per-sweep),
+    ///   <c>AuditLog.RetainedDays</c> (DB retention, per-sweep), and the
+    ///   sandbox launch fields (<c>Multipass*</c>, <c>SandboxNetworkProfiles</c>,
+    ///   per-launch).</item>
+    /// <item><b>Startup-only and rejected</b> on reload by
+    ///   <see cref="ImmutableCodeyBoxOptionsValidator"/>:
+    ///   <c>SandboxProvider</c>, <c>StateDatabasePath</c>,
+    ///   <c>GitRootDirectory</c>, <c>AgentStreams.Path</c>. The retaining
+    ///   options-monitor cache keeps the startup value visible to consumers
+    ///   after a rejected reload.</item>
+    /// <item><b>Startup-only by capture</b> — bound into a downstream
+    ///   singleton (PipelineOptions, OrchestratorOptions, QuotaRouterOptions,
+    ///   SmokeOptions, AvailabilityOptions, WebhookEventBroadcaster,
+    ///   HttpWebhookDispatcher, ClaudeChangelogGenerator, Serilog sinks,
+    ///   etc.) at startup. Edits land in <see cref="IOptionsMonitor{T}.CurrentValue"/>
+    ///   but the captured singleton continues to use the prior value until
+    ///   restart. Add a hot-reload bridge if/when an operator-facing knob
+    ///   should not require restart.</item>
+    /// </list>
+    /// </summary>
     public sealed class CodeyBoxOptions
     {
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
