@@ -47,6 +47,24 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void CloudInit_InstallsTcpKeepaliveSysctlForSuspendResumeRecovery()
+    {
+        // R8-core: after a multipass suspend/start cycle the in-VM agent's
+        // long-lived TCP connections may be hanging in the kernel waiting for
+        // a peer that doesn't know the suspend happened. The keepalive
+        // sysctl makes that detection fast (~45s worst-case) instead of the
+        // OS default of ~2h.
+        var cloudInit = MultipassSandboxProvider.BuildCloudInit(extraRuncmd: [], extraCloudInit: null);
+
+        Assert.Contains("path: /etc/sysctl.d/99-codeybox-keepalive.conf", cloudInit);
+        Assert.Contains("net.ipv4.tcp_keepalive_time = 30", cloudInit);
+        Assert.Contains("net.ipv4.tcp_keepalive_intvl = 5", cloudInit);
+        Assert.Contains("net.ipv4.tcp_keepalive_probes = 3", cloudInit);
+        // Applied immediately on first boot so the first agent run benefits.
+        Assert.Contains("sysctl --system", cloudInit);
+    }
+
+    [Fact]
     public void CloudInit_GraphicalFlavor_InstallsDesktopVncAndInputTools()
     {
         var cloudInit = MultipassSandboxProvider.BuildCloudInit(

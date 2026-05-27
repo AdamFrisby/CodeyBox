@@ -222,6 +222,16 @@ public static class AuditLog
             .Warning("Failed to dispose leaked sandbox {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB reason={Reason}: {Error}",
                 name, ageMinutes, diskMb, reason, error);
 
+    public static void SandboxSuspendedOnShutdown(WorkItemId workItemId, string vmName) =>
+        Audit("sandbox.suspended_on_shutdown")
+            .Information("Suspended sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
+                vmName, workItemId.ToString());
+
+    public static void SandboxResumedOnStartup(WorkItemId workItemId, string vmName, bool success, string? error = null) =>
+        Audit(success ? "sandbox.resumed_on_startup" : "sandbox.resume_failed_on_startup")
+            .Information("Resume of suspended sandbox {VmName} for work item {WorkItemId}: success={Success} error={Error}",
+                vmName, workItemId.ToString(), success, error);
+
     // ── Upstream remote ──────────────────────────────────────────────────────
 
     public static void UpstreamPrOpened(int prNumber, string? prUrl, string workBranch, string baseBranch) =>

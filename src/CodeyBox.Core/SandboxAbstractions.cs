@@ -114,6 +114,57 @@ public interface IPreemptibleSandbox : ISandbox
 }
 
 /// <summary>
+/// Optional sandbox capability for providers that can freeze a running sandbox
+/// (including its RAM state) and resume it later via
+/// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/>. Currently
+/// implemented by the multipass provider (via <c>multipass suspend</c>); the
+/// process and bubblewrap providers do not implement it.
+///
+/// <para>Distinct from <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/>:
+/// preempt does an orderly stop after capturing a git checkpoint (process
+/// state inside the sandbox is lost; recovery replays from the ref). Suspend
+/// freezes the in-VM process state so the agent CLI can resume exactly where
+/// it was on the next orchestrator start.</para>
+/// </summary>
+public interface ISuspendableSandbox : ISandbox
+{
+    /// <summary>
+    /// Freeze the sandbox's RAM to disk so it can be resumed later. Marks the
+    /// sandbox as preserved so the subsequent <see cref="IAsyncDisposable.DisposeAsync"/>
+    /// call is a no-op rather than destroying the suspended VM.
+    /// </summary>
+    Task SuspendAsync(CancellationToken ct = default);
+}
+
+/// <summary>
+/// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
+/// The orchestrator's suspend-on-shutdown hosted service uses
+/// <see cref="SnapshotSuspendableActive"/> to enumerate sandboxes that should
+/// be frozen on <c>ApplicationStopping</c>, and the startup resume handler
+/// uses <see cref="ResumeSandboxAsync"/> to start each persisted VM by name.
+/// </summary>
+public interface ISuspendingSandboxProvider
+{
+    /// <summary>
+    /// Snapshot of currently-active sandboxes that can be suspended, keyed by
+    /// the work item that owns them. Snapshot is taken under a lock so a
+    /// disposal racing the shutdown handler cannot produce a stale entry.
+    /// Implementations that cannot determine the owner (e.g. an in-process
+    /// CreateAsync that did not pass <see cref="SandboxSpec.TimingWorkItemId"/>)
+    /// omit those entries.
+    /// </summary>
+    IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive();
+
+    /// <summary>
+    /// Best-effort resume of a previously-suspended sandbox by name. Implementations
+    /// should treat "VM not found" / "already running" as non-fatal so the
+    /// startup handler can clear the persisted bookkeeping for items whose
+    /// suspended VM no longer exists.
+    /// </summary>
+    Task ResumeSandboxAsync(string name, CancellationToken ct);
+}
+
+/// <summary>
 /// Description of a sandbox to provision. Mounts and environment are the only
 /// channels by which the host injects state into the sandbox.
 /// </summary>

@@ -1418,9 +1418,18 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<DeadWorkerReaper>(),
     sp.GetService<ReleaseService>(),
     sp.GetRequiredService<AgentConcurrencyOptions>(),
-    sp.GetRequiredService<AgentConcurrencySnapshot>()));
+    sp.GetRequiredService<AgentConcurrencySnapshot>(),
+    sp.GetRequiredService<ISandboxProvider>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
+// R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
+// can resume them. Hosted-service registration only matters for StartAsync; the
+// suspend itself happens on the ApplicationStopping callback.
+builder.Services.AddHostedService(sp => new SandboxSuspendOnShutdownService(
+    sp.GetRequiredService<ISandboxProvider>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<IHostApplicationLifetime>(),
+    sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the
@@ -1492,7 +1501,8 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
         sp.GetRequiredService<ISandboxProvider>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
         () => monitor.CurrentValue.SandboxLeak,
-        sp.GetRequiredService<ILogger<SandboxLeakReaper>>());
+        sp.GetRequiredService<ILogger<SandboxLeakReaper>>(),
+        sp.GetRequiredService<IWorkItemStore>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
 

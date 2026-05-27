@@ -29,6 +29,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
+    private readonly ISandboxProvider? _sandboxProvider;
     // Shared swappable holder. Both this service AND PipelineRunner (the
     // pickup-time rebase-resolver's cap-aware router) read through the same
     // AgentConcurrencySnapshot, so ApplyAgentConcurrencyReload's swap is
@@ -99,7 +100,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         DeadWorkerReaper? reaper = null,
         ReleaseService? releaseService = null,
         AgentConcurrencyOptions? agentConcurrency = null,
-        AgentConcurrencySnapshot? agentConcurrencySnapshot = null)
+        AgentConcurrencySnapshot? agentConcurrencySnapshot = null,
+        ISandboxProvider? sandboxProvider = null)
     {
         _queue = queue;
         _store = store;
@@ -115,6 +117,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _deadWorkerOpts = deadWorkerOpts;
         _reaper = reaper;
         _releaseService = releaseService;
+        _sandboxProvider = sandboxProvider;
         // Prefer the shared snapshot when DI provides one (production path —
         // PipelineRunner reads from the same instance, so hot-reload swaps
         // here are visible there). Test fixtures that pass only the legacy
@@ -287,6 +290,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // R8-core: resume any sandboxes the previous process suspended on
+        // shutdown BEFORE the reaper / replay paths run. This way the leak
+        // reaper (which only sees Suspended VMs as host-side state) and the
+        // stranded-item recovery (which considers items in worker-owned
+        // states) both see a consistent picture: the VM is being brought back
+        // up, and the work item still carries SuspendedVmName until the
+        // resume completes successfully.
+        await ResumeSuspendedSandboxesAsync(stoppingToken);
+
         // Run the reaper once at startup before replaying pending items.
         // This transitions any items that were mid-flight when the previous
         // process crashed back to a recoverable state, so ReplayPendingAsync
@@ -508,7 +520,96 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // Exposed as internal so tests can invoke recovery in isolation without
     // starting the full worker loop.
     internal Task ReplayPendingForTestAsync(CancellationToken ct) => ReplayPendingAsync(ct);
+    internal Task ResumeSuspendedSandboxesForTestAsync(CancellationToken ct) => ResumeSuspendedSandboxesAsync(ct);
     internal WorkItem? TryBuildRecoveredStateForTest(WorkItem item) => TryBuildRecoveredState(item);
+
+    /// <summary>
+    /// R8-core startup phase: for every work item the previous process
+    /// suspended (SuspendedVmName is non-null), invoke
+    /// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/> in parallel
+    /// and clear the suspended bookkeeping. The work item's pipeline state is
+    /// untouched: the standard stranded-item recovery path
+    /// (<see cref="DeadWorkerReaper.SweepStrandedItemsAsync"/>, then
+    /// <see cref="ReplayPendingAsync"/>) picks the item up afterwards.
+    ///
+    /// <para>Best-effort: if a resume fails (multipassd down, VM was operator-
+    /// deleted, etc.), the SuspendedVmName row is cleared so the item flows
+    /// through the recovery path without being held up forever. The VM, if it
+    /// exists, will be reaped by SandboxLeakReaper when its preempt-retention
+    /// window expires.</para>
+    /// </summary>
+    private async Task ResumeSuspendedSandboxesAsync(CancellationToken ct)
+    {
+        if (_sandboxProvider is not ISuspendingSandboxProvider suspending)
+            return;
+
+        var suspended = new List<WorkItem>();
+        await foreach (var item in _store.ListAsync(ct))
+        {
+            if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
+                suspended.Add(item);
+        }
+
+        if (suspended.Count == 0)
+            return;
+
+        _log.LogInformation("Startup resume: {Count} suspended sandbox(es) to start", suspended.Count);
+
+        // Bound parallelism so multipassd isn't flooded on a host that had many
+        // in-flight items at shutdown. Matches the suspend handler's cap.
+        const int MaxParallel = 8;
+        using var gate = new SemaphoreSlim(MaxParallel, MaxParallel);
+        var tasks = new List<Task>(suspended.Count);
+        foreach (var item in suspended)
+        {
+            await gate.WaitAsync(ct);
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    await ResumeOneSuspendedAsync(suspending, item, ct);
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            }, ct));
+        }
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task ResumeOneSuspendedAsync(ISuspendingSandboxProvider suspending, WorkItem item, CancellationToken ct)
+    {
+        var vmName = item.SuspendedVmName!;
+        var success = true;
+        string? error = null;
+        try
+        {
+            await suspending.ResumeSandboxAsync(vmName, ct);
+        }
+        catch (Exception ex)
+        {
+            success = false;
+            error = ex.Message;
+            _log.LogWarning(ex,
+                "Startup resume failed for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, item.Id);
+        }
+
+        // Always clear the suspended fields, even on failure: leaving them set
+        // would re-trigger the resume attempt on every restart and would
+        // prevent the leak reaper from cleaning up the orphaned VM after the
+        // preempt-retention window expires.
+        var fresh = await _store.GetAsync(item.Id, ct);
+        if (fresh is null) return;
+        await _store.UpdateAsync(fresh with
+        {
+            SuspendedVmName = null,
+            SuspendedAt = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        }, ct);
+        AuditLog.SandboxResumedOnStartup(item.Id, vmName, success, error);
+    }
 
     // Exposed as internal so tests can verify the deferred-pickup contract
     // without spinning the BackgroundService: PickNextEligibleAsync must skip

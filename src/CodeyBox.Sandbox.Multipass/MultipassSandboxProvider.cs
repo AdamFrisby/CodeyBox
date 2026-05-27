@@ -45,7 +45,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider
+public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -70,6 +70,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
     // Tracks sandboxes still owned by a currently-running phase in this process.
     // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
     private readonly ConcurrentDictionary<string, bool> _activeSandboxNames = new(StringComparer.Ordinal);
+
+    // Parallel registry keyed by sandbox name with the owning work item and a
+    // back-reference to the live MultipassSandbox object. Populated only when
+    // CreateAsync receives a SandboxSpec carrying TimingWorkItemId — that field
+    // is set for every real pipeline phase, so the registry covers everything
+    // the orchestrator might want to suspend on shutdown. Tests that call
+    // CreateAsync without a work item are intentionally absent.
+    private readonly ConcurrentDictionary<string, SuspendableOwnerEntry> _suspendableOwners = new(StringComparer.Ordinal);
+
+    private sealed record SuspendableOwnerEntry(WorkItemId WorkItemId, MultipassSandbox Sandbox);
 
     // Cache for ListAllManagedAsync results to avoid hammering multipassd.
     private IReadOnlyList<ManagedSandboxInfo>? _listCache;
@@ -259,6 +269,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         void MarkNoLongerActive(string n)
         {
             _activeSandboxNames.TryRemove(n, out _);
+            _suspendableOwners.TryRemove(n, out _);
             _listCacheExpiry = DateTimeOffset.MinValue;
         }
 
@@ -329,11 +340,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
             // already baked into the source VM's filesystem, so the clone
             // inherits it. The codeybox-route systemd service runs on every
             // boot in both paths.
-            return new MultipassSandbox(name, sandboxRoot, spec, opts, _log, timingStore, timingItemId, timingPhase,
+            var sandbox = new MultipassSandbox(name, sandboxRoot, spec, opts, _log, timingStore, timingItemId, timingPhase,
                 onDisposed: MarkNoLongerActive,
                 onNoLongerTrackedActive: MarkNoLongerActive,
                 runner: _runner,
                 daemonRetryPolicy: _daemonRetryPolicy);
+            // Register in the owner index ONLY when a work-item ID is present.
+            // Sandboxes created without one (some tests) have no orchestrator-side
+            // owner to suspend back into, so skip them.
+            if (workItemId is { } owner)
+                _suspendableOwners[name] = new SuspendableOwnerEntry(owner, sandbox);
+            return sandbox;
         }
         catch
         {
@@ -365,6 +382,34 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         {
             _listLock.Release();
         }
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive()
+    {
+        // ConcurrentDictionary enumeration is snapshot-safe; we materialise
+        // immediately so the caller's parallel suspend loop sees a stable list
+        // even if a sandbox disposes concurrently.
+        var entries = _suspendableOwners.Values.ToList();
+        var result = new List<(WorkItemId, ISuspendableSandbox)>(entries.Count);
+        foreach (var entry in entries)
+            result.Add((entry.WorkItemId, entry.Sandbox));
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public async Task ResumeSandboxAsync(string name, CancellationToken ct)
+    {
+        var opts = ReadOptions();
+        if (!IsValidSandboxName(name))
+            throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
+
+        var run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
+        if (run.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"multipass start {name} failed (exit {run.ExitCode}): {run.Stderr}");
+        _listCacheExpiry = DateTimeOffset.MinValue;
+        _log.LogInformation("Resumed suspended multipass VM {Name}", name);
     }
 
     /// <inheritdoc/>
@@ -1315,6 +1360,18 @@ test "$work" = present && test "$exec_wrapper" = present
         var sb = new StringBuilder();
         sb.AppendLine("#cloud-config");
         sb.AppendLine("write_files:");
+        // Aggressive TCP keepalive defaults so the in-VM agent's connections to
+        // api.anthropic.com / github.com / etc. discover dead peers quickly
+        // after a multipass suspend/start cycle. The peer doesn't know the
+        // suspend happened; without these, the agent's read/write can hang
+        // until the OS default (~2h) before retrying. 30s/5s/3 probes detects
+        // a dead conn within ~45s of resume in the worst case.
+        sb.AppendLine("  - path: /etc/sysctl.d/99-codeybox-keepalive.conf");
+        sb.AppendLine("    permissions: '0644'");
+        sb.AppendLine("    content: |");
+        sb.AppendLine("      net.ipv4.tcp_keepalive_time = 30");
+        sb.AppendLine("      net.ipv4.tcp_keepalive_intvl = 5");
+        sb.AppendLine("      net.ipv4.tcp_keepalive_probes = 3");
         sb.AppendLine("  - path: /usr/local/bin/codeybox-exec");
         sb.AppendLine("    permissions: '0755'");
         sb.AppendLine("    content: |");
@@ -1361,6 +1418,10 @@ test "$work" = present && test "$exec_wrapper" = present
         // installation or caller extraRuncmd runs.
         sb.AppendLine("  - systemctl daemon-reload");
         sb.AppendLine("  - mkdir -p /work");
+        // Apply the keepalive sysctl now so first-boot agent runs benefit,
+        // not just post-reboot ones. sysctl --system re-reads every conf
+        // under /etc/sysctl.d including the one we just wrote.
+        sb.AppendLine("  - sysctl --system");
         sb.AppendLine(startRouteService
             ? "  - systemctl enable --now codeybox-route.service"
             : "  - systemctl enable codeybox-route.service");
@@ -2101,7 +2162,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -2587,5 +2648,41 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox
         {
             _log.LogWarning(ex, "Failed to stop multipass VM {Name} for preemption", _name);
         }
+    }
+
+    /// <summary>
+    /// Freezes the VM's RAM to disk via <c>multipass suspend</c>. Sets
+    /// <c>_preserveOnDispose</c> so the host-side handle's DisposeAsync becomes
+    /// a no-op — the orchestrator owns destruction via the startup resume
+    /// handler (which will <c>multipass start</c> the same VM) or the leak
+    /// reaper (if the persisted bookkeeping has expired).
+    ///
+    /// <para>Writes the same <c>.codeybox-preempt</c> marker as
+    /// <see cref="StopAndPreserveAsync"/> so the SandboxLeakReaper applies the
+    /// PreemptRetention grace window to suspended VMs even if the SuspendedVmName
+    /// row gets cleared (e.g. operator manually edits the DB).</para>
+    /// </summary>
+    public async Task SuspendAsync(CancellationToken ct = default)
+    {
+        if (_disposed) return;
+        _preserveOnDispose = true;
+        var markerPath = Path.Combine(_sandboxRoot, ".codeybox-preempt");
+        try
+        {
+            await File.WriteAllTextAsync(markerPath, DateTimeOffset.UtcNow.ToString("O"), ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to write preempt marker for suspended multipass VM {Name}", _name);
+        }
+
+        var result = await RunMultipassAsync(
+            [_opts.MultipassBinary, "suspend", _name],
+            stdin: null,
+            ct: ct);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"multipass suspend {_name} failed (exit {result.ExitCode}): {result.Stderr}");
+        _log.LogInformation("Suspended multipass VM {Name} for orchestrator restart", _name);
     }
 }
