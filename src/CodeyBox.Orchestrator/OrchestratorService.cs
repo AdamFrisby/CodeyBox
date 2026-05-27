@@ -29,12 +29,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
-    // Mutable + Volatile-swapped so the hot-reload coordinator can publish a
-    // new per-agent cap dictionary mid-flight. Cap reads in TryReserveAgentSlot
-    // / GetAgentCap / GetConcurrencyState take a single Volatile.Read into a
-    // local so a concurrent swap can't tear the read. In-flight items are not
-    // retroactively gated — caps are only consulted at dispatch time.
-    private AgentConcurrencyOptions _agentConcurrency;
+    // Shared swappable holder. Both this service AND PipelineRunner (the
+    // pickup-time rebase-resolver's cap-aware router) read through the same
+    // AgentConcurrencySnapshot, so ApplyAgentConcurrencyReload's swap is
+    // visible to both consumers — without the shared holder, the resolver
+    // would keep gating against the pre-reload caps until process restart.
+    // In-flight items are not retroactively gated; caps are only consulted at
+    // dispatch time.
+    private readonly AgentConcurrencySnapshot _concurrencySnapshot;
 
     // Live in-flight count keyed by routed agent kind. Incremented after the
     // router pins an item to a member, decremented when the worker exits.
@@ -96,7 +98,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         DeadWorkerOptions? deadWorkerOpts = null,
         DeadWorkerReaper? reaper = null,
         ReleaseService? releaseService = null,
-        AgentConcurrencyOptions? agentConcurrency = null)
+        AgentConcurrencyOptions? agentConcurrency = null,
+        AgentConcurrencySnapshot? agentConcurrencySnapshot = null)
     {
         _queue = queue;
         _store = store;
@@ -112,7 +115,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _deadWorkerOpts = deadWorkerOpts;
         _reaper = reaper;
         _releaseService = releaseService;
-        _agentConcurrency = agentConcurrency ?? new AgentConcurrencyOptions();
+        // Prefer the shared snapshot when DI provides one (production path —
+        // PipelineRunner reads from the same instance, so hot-reload swaps
+        // here are visible there). Test fixtures that pass only the legacy
+        // options-shaped parameter get a fresh, unshared snapshot.
+        _concurrencySnapshot = agentConcurrencySnapshot
+            ?? new AgentConcurrencySnapshot(agentConcurrency ?? new AgentConcurrencyOptions());
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
     }
 
@@ -136,7 +144,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     internal int GetAgentCap(AgentKind agent)
     {
-        var opts = Volatile.Read(ref _agentConcurrency);
+        var opts = _concurrencySnapshot.Current;
         return opts.Members.TryGetValue(agent.Value, out var entry) && entry.MaxConcurrent > 0
             ? entry.MaxConcurrent
             : 0;
@@ -152,7 +160,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     public void ApplyAgentConcurrencyReload(AgentConcurrencyOptions next)
     {
         ArgumentNullException.ThrowIfNull(next);
-        Volatile.Write(ref _agentConcurrency, next);
+        _concurrencySnapshot.Replace(next);
     }
 
     /// <summary>
@@ -161,7 +169,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     public ConcurrencyStateSnapshot GetConcurrencyState()
     {
-        var opts = Volatile.Read(ref _agentConcurrency);
+        var opts = _concurrencySnapshot.Current;
         var caps = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var kv in opts.Members)
         {

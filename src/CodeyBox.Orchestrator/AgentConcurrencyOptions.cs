@@ -41,3 +41,43 @@ public sealed class AgentConcurrencyEntry
     /// </summary>
     public int MaxConcurrent { get; set; } = 0;
 }
+
+/// <summary>
+/// Shared, swappable holder for the current <see cref="AgentConcurrencyOptions"/>.
+/// Registered as a DI singleton so every consumer (<see cref="OrchestratorService"/>'s
+/// dispatch gate AND <see cref="PipelineRunner"/>'s pickup-time rebase-resolver
+/// cap-aware routing) reads through the same reference. The hot-reload
+/// coordinator updates this one holder via <see cref="Replace"/>, and both
+/// consumers' next read picks up the new caps — without it,
+/// <see cref="OrchestratorService.ApplyAgentConcurrencyReload"/> would only
+/// swap its own field and the resolver in <see cref="PipelineRunner"/> would
+/// keep gating against the pre-reload caps until process restart.
+/// </summary>
+public sealed class AgentConcurrencySnapshot
+{
+    private AgentConcurrencyOptions _current;
+
+    public AgentConcurrencySnapshot(AgentConcurrencyOptions initial)
+    {
+        ArgumentNullException.ThrowIfNull(initial);
+        _current = initial;
+    }
+
+    /// <summary>
+    /// Current snapshot. Volatile read so a concurrent <see cref="Replace"/>
+    /// cannot tear the reference. Callers should bind once into a local for
+    /// any compound read (e.g. iterating <see cref="AgentConcurrencyOptions.Members"/>).
+    /// </summary>
+    public AgentConcurrencyOptions Current => Volatile.Read(ref _current);
+
+    /// <summary>
+    /// Atomically publishes <paramref name="next"/> as the new snapshot.
+    /// In-flight reads observe either the old or the new reference, never a
+    /// partial state.
+    /// </summary>
+    public void Replace(AgentConcurrencyOptions next)
+    {
+        ArgumentNullException.ThrowIfNull(next);
+        Volatile.Write(ref _current, next);
+    }
+}

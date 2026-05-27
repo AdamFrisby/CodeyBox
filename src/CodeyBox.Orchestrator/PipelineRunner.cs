@@ -72,7 +72,11 @@ public sealed class PipelineRunner : IPipelineRunner
     // that don't wire concurrency can keep their previous "always-route-to-
     // primary" semantics.
     private readonly IAgentRunningCounters? _agentRunningCounters;
-    private readonly AgentConcurrencyOptions? _agentConcurrency;
+    // Shared swappable holder for per-agent caps. Same instance is held by
+    // OrchestratorService, so the hot-reload coordinator's call to
+    // OrchestratorService.ApplyAgentConcurrencyReload (which writes through
+    // the shared snapshot) is observable here on the next GetCapSafe read.
+    private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
     // Last-resort pause for quota-shaped terminal failures when neither the
     // agent output nor quota probes expose a reset window.
     internal static readonly TimeSpan DefaultQuotaFailurePause = TimeSpan.FromMinutes(5);
@@ -162,7 +166,8 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentAvailabilityRegistry? availability = null,
         IAgentRunningCounters? agentRunningCounters = null,
         AgentConcurrencyOptions? agentConcurrency = null,
-        IPreMergeVerifier? preMergeVerifier = null)
+        IPreMergeVerifier? preMergeVerifier = null,
+        AgentConcurrencySnapshot? agentConcurrencySnapshot = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -218,7 +223,13 @@ public sealed class PipelineRunner : IPipelineRunner
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _availability = availability;
         _agentRunningCounters = agentRunningCounters;
-        _agentConcurrency = agentConcurrency;
+        // Prefer the shared snapshot when DI supplies it (production path —
+        // OrchestratorService holds the same instance, so hot-reload swaps
+        // are observed here). Test fixtures that only pass the legacy
+        // options-shaped parameter get a private snapshot. Null means
+        // "no per-agent cap state wired" — GetCapSafe returns 0 (= unlimited).
+        _concurrencySnapshot = agentConcurrencySnapshot
+            ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
@@ -1341,12 +1352,17 @@ public sealed class PipelineRunner : IPipelineRunner
         return _agentRunningCounters.GetRunning(agent) >= cap;
     }
 
-    private int GetCapSafe(AgentKind agent) =>
-        _agentConcurrency is not null
-            && _agentConcurrency.Members.TryGetValue(agent.Value, out var entry)
+    private int GetCapSafe(AgentKind agent)
+    {
+        // Bind the snapshot reference once so a concurrent ApplyConcurrencyReload
+        // can't tear the read between the existence check and the lookup.
+        var opts = _concurrencySnapshot?.Current;
+        return opts is not null
+            && opts.Members.TryGetValue(agent.Value, out var entry)
             && entry.MaxConcurrent > 0
             ? entry.MaxConcurrent
             : 0;
+    }
 
     private int GetRunningSafe(AgentKind agent) =>
         _agentRunningCounters?.GetRunning(agent) ?? 0;

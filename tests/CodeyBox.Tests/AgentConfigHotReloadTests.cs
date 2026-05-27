@@ -285,6 +285,161 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task Coordinator_OnChange_InvalidAgentClassesPayload_KeepsPriorSnapshot_AndAllowsFollowupValidEdit()
+    {
+        // Acceptance criterion: "a bad edit can't break a running orchestrator"
+        // (AgentClassesConfigBuilder.Build summary). When AgentClasses fails
+        // validation mid-reload, the coordinator must keep the prior router
+        // catalog AND keep its _lastRouter baseline at the pre-edit value so a
+        // later valid edit is still detected as a change. Otherwise an
+        // operator who fixes the bad edit would see the second OnChange
+        // silently skipped because _lastRouter had been advanced to the
+        // rejected serialised form.
+        var validInitial = new List<AgentClassOptions>
+        {
+            new()
+            {
+                Id = "frontier",
+                Members =
+                [
+                    new() { Agent = "claude", Billing = "Subscription", QualityScore = 100 },
+                ],
+            },
+        };
+        var initial = new CodeyBoxOptions { AgentClasses = validInitial };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            AgentClassesConfigBuilder.Build(validInitial, NullLogger<AgentClassRouter>.Instance),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Fire OnChange with an invalid payload: Gemini at QualityScore=95
+        // without ReasoningMode="high" is explicitly rejected by the builder.
+        var invalid = new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                new()
+                {
+                    Id = "frontier",
+                    Members =
+                    [
+                        new() { Agent = "gemini", Billing = "Subscription", QualityScore = 95 },
+                    ],
+                },
+            ],
+        };
+        monitor.Fire(invalid);
+
+        // Router catalog must NOT have been touched.
+        Assert.Contains("frontier", router.ClassIds);
+        Assert.Single(router.ClassIds);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "t",
+            Prompt = "p",
+            AgentClassId = "frontier",
+        };
+        var decision = await router.ResolveAsync(item, project: null, CancellationToken.None);
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+
+        // Now fire a follow-up valid edit. If _lastRouter had been advanced to
+        // the rejected serialised form, this would be detected as no-change
+        // against the rejected payload and the new "bulk" class would never
+        // make it into the router.
+        var validFollowup = new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                new()
+                {
+                    Id = "bulk",
+                    Members =
+                    [
+                        new() { Agent = "codex", Billing = "Subscription", QualityScore = 100 },
+                    ],
+                },
+            ],
+        };
+        monitor.Fire(validFollowup);
+
+        Assert.DoesNotContain("frontier", router.ClassIds);
+        Assert.Contains("bulk", router.ClassIds);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_HotReloadConcurrency_IsObservableByPipelineRunner()
+    {
+        // Regression: PipelineRunner.GetCapSafe (used by the pickup-time
+        // rebase-resolver's cap-aware routing) used to capture the
+        // AgentConcurrencyOptions instance at construction. Hot-reload then
+        // only swapped OrchestratorService's reference and PipelineRunner kept
+        // gating against the pre-reload caps until process restart. After
+        // wiring both consumers through the shared AgentConcurrencySnapshot,
+        // a reload here must be visible to PipelineRunner.IsAtAgentCap.
+        var initialCaps = new AgentConcurrencyOptions
+        {
+            Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 5 } },
+        };
+        var sharedSnapshot = new AgentConcurrencySnapshot(initialCaps);
+
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(new CodeyBoxOptions
+        {
+            AgentConcurrency = initialCaps,
+        });
+        using var orchFixture = OrchestratorFixture.BuildWithSnapshot(sharedSnapshot);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Sanity: the shared snapshot starts at the original caps.
+        Assert.Equal(5, sharedSnapshot.Current.Members["claude"].MaxConcurrent);
+
+        // Fire a reload that lowers the claude cap to 1.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentConcurrency = new AgentConcurrencyOptions
+            {
+                Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } },
+            },
+        });
+
+        // The shared snapshot — observed by both OrchestratorService.GetAgentCap
+        // and PipelineRunner.GetCapSafe — now reflects the new cap. Before the
+        // fix, sharedSnapshot.Current would still hold the pre-reload reference
+        // because OrchestratorService.ApplyAgentConcurrencyReload would have
+        // swapped only its own field.
+        Assert.Equal(1, sharedSnapshot.Current.Members["claude"].MaxConcurrent);
+        Assert.Equal(1, orchFixture.Orchestrator.GetConcurrencyState().PerAgentCaps["claude"]);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_OnlyMutatedBlocksAreReapplied()
     {
         // Confirms that an edit which touches only one block does not also
@@ -384,6 +539,21 @@ public sealed class AgentConfigHotReloadTests
                 new OrchestratorOptions { MaxConcurrentWorkers = 4 },
                 NullLogger<OrchestratorService>.Instance,
                 agentConcurrency: concurrency);
+            return new OrchestratorFixture { Orchestrator = orch, _store = store, _dbPath = dbPath };
+        }
+
+        public static OrchestratorFixture BuildWithSnapshot(AgentConcurrencySnapshot snapshot)
+        {
+            var dbPath = Path.Combine(Path.GetTempPath(), $"cb-hotreload-{Guid.NewGuid():N}.db");
+            var store = new SqliteWorkItemStore(dbPath);
+            var orch = new OrchestratorService(
+                new InMemoryTaskQueue(),
+                store,
+                new NoopPipelineRunner(),
+                new CancellationRegistry(CancellationToken.None),
+                new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+                NullLogger<OrchestratorService>.Instance,
+                agentConcurrencySnapshot: snapshot);
             return new OrchestratorFixture { Orchestrator = orch, _store = store, _dbPath = dbPath };
         }
 

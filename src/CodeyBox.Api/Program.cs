@@ -764,6 +764,14 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
 builder.Services.AddSingleton<AgentConcurrencyOptions>(sp =>
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentConcurrency);
+// AgentConcurrencySnapshot is the shared swappable holder: OrchestratorService
+// (dispatch gate) and PipelineRunner (pickup-time rebase-resolver cap-aware
+// routing) both read through this single instance. The hot-reload coordinator
+// updates it via OrchestratorService.ApplyAgentConcurrencyReload, and both
+// consumers' next read picks up the new caps — without the shared holder,
+// PipelineRunner would keep gating against the pre-reload caps until restart.
+builder.Services.AddSingleton<AgentConcurrencySnapshot>(sp =>
+    new AgentConcurrencySnapshot(sp.GetRequiredService<AgentConcurrencyOptions>()));
 builder.Services.AddSingleton<AgentBurnEstimatorOptions>(sp =>
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentBurnEstimator);
 builder.Services.AddSingleton<AgentBurnEstimator>(sp => new AgentBurnEstimator(
@@ -1286,7 +1294,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<AgentAvailabilityRegistry>(),
     sp.GetService<IAgentRunningCounters>(),
     sp.GetService<AgentConcurrencyOptions>(),
-    sp.GetRequiredService<IPreMergeVerifier>()));
+    sp.GetRequiredService<IPreMergeVerifier>(),
+    sp.GetRequiredService<AgentConcurrencySnapshot>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1356,7 +1365,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<DeadWorkerOptions>(),
     sp.GetRequiredService<DeadWorkerReaper>(),
     sp.GetService<ReleaseService>(),
-    sp.GetRequiredService<AgentConcurrencyOptions>()));
+    sp.GetRequiredService<AgentConcurrencyOptions>(),
+    sp.GetRequiredService<AgentConcurrencySnapshot>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 
