@@ -98,6 +98,40 @@ public sealed class CompositeQuotaFailureClassifierTests
         Assert.Empty(claude.Calls);
     }
 
+    // ── IsAgentExited1Summary ───────────────────────────────────────────────
+    //
+    // The composite classifier's persistent-store gate requires an "agent
+    // exited 1" summary so non-quota infrastructure failures (e.g.
+    // "failed to materialise gemini auth: exit 1") don't pollute the
+    // observed-failure store. The GeminiAgentRunner now appends a diagnostic
+    // tail to that summary; the gate must still recognise the enriched form,
+    // otherwise persistent recording silently stops and the next pickup
+    // routes back to an agent we already know is exhausted.
+
+    [Theory]
+    [InlineData("agent exited 1")]
+    [InlineData("  agent exited 1  ")]
+    [InlineData("AGENT EXITED 1")]
+    [InlineData("agent exited 1: RESOURCE_EXHAUSTED quota exceeded")]
+    [InlineData("agent exited 1: API Error: 401 Unauthorized")]
+    [InlineData("agent exited 1: …<truncated tail>")]
+    public void IsAgentExited1Summary_AcceptsBaseAndEnrichedForms(string summary)
+    {
+        Assert.True(CompositeQuotaFailureClassifier.IsAgentExited1Summary(summary));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("ok")]
+    [InlineData("agent exited 2")]
+    [InlineData("agent exited 1foo")]
+    [InlineData("failed to materialise gemini auth: exit 1")]
+    public void IsAgentExited1Summary_RejectsOtherShapes(string? summary)
+    {
+        Assert.False(CompositeQuotaFailureClassifier.IsAgentExited1Summary(summary));
+    }
+
     private sealed record AdvisoryCall(string? Stderr, string? Stdout, string Phase, string? SandboxName);
 
     private sealed class RecordingDetector : IAgentQuotaFailureDetector
