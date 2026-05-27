@@ -217,6 +217,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
                             AvailablePct = capPct,
                             ResetAt = overall.ResetAt ?? v.ResetAt,
                             Window = $"{v.Window} (capped by overall)",
+                            Windows = v.Windows,
                         };
                     }
                 }
@@ -229,6 +230,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
                     ResetAt = overall?.ResetAt,
                     Notes = overall is null ? "overall quota unknown; parsed per-model rollups" : null,
                     PerModel = perModel,
+                    Windows = overall?.Windows ?? Array.Empty<WindowQuota>(),
                 };
 
             return Unknown("unexpected response shape");
@@ -273,15 +275,19 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
 
     private static ModelQuota? TryParseRateLimit(JsonElement el)
     {
-        var windows = new[]
+        var windowSources = new[]
         {
             ("5h-rolling", TryGetProperty(el, "primary_window")),
             ("weekly", TryGetProperty(el, "secondary_window")),
             ("overall", (JsonElement?)el),
         };
 
+        // Two passes: first collect every named window, then pick the min.
+        // The collected list is preserved on the returned ModelQuota so
+        // operators can see (via /quota) which window is the actual gate.
+        var windows = new List<WindowQuota>(windowSources.Length);
         ModelQuota? mostConstrained = null;
-        foreach (var (windowName, window) in windows)
+        foreach (var (windowName, window) in windowSources)
         {
             if (window is null)
                 continue;
@@ -290,11 +296,24 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
             if (quota is null)
                 continue;
 
+            // Skip the synthetic "overall" entry from the window list when it
+            // duplicates the named windows — it carries no extra signal and
+            // would only confuse the per-window breakdown.
+            if (windowName != "overall")
+                windows.Add(new WindowQuota
+                {
+                    Name = windowName,
+                    AvailablePct = quota.AvailablePct,
+                    ResetAt = quota.ResetAt,
+                });
+
             if (mostConstrained is null || quota.AvailablePct < mostConstrained.AvailablePct)
                 mostConstrained = quota;
         }
 
-        return mostConstrained;
+        return mostConstrained is null
+            ? null
+            : mostConstrained with { Windows = windows };
     }
 
     private static ModelQuota? TryParseWindow(JsonElement el, string window)
