@@ -1,11 +1,14 @@
 # Restart tolerance
 
-CodeyBox runs as a single ASP.NET process owning one port (default `5036`).
-Binary swaps (kill old → start new) and operator-triggered restarts produce a
-short window — typically 5–30 seconds — during which TCP connections to the API
-are refused. We have **explicitly chosen not to implement blue/green port
-handover**; the design accepts the brief refused-connection window and relies on
-callers to retry.
+CodeyBox runs as a single ASP.NET process owning one port. In production the
+default bind URL is `http://127.0.0.1:5000` (see `src/CodeyBox.Api/Program.cs`,
+the `UseUrls` fallback when `ASPNETCORE_URLS`/`urls`/`Kestrel:Endpoints:Default`
+are unset); the `Properties/launchSettings.json` profile uses `5036` for local
+`dotnet run` only. Binary swaps (kill old → start new) and operator-triggered
+restarts produce a short window — typically 5–30 seconds — during which TCP
+connections to the API are refused. We have **explicitly chosen not to
+implement blue/green port handover**; the design accepts the brief
+refused-connection window and relies on callers to retry.
 
 This document records that decision and lists every external HTTP caller of the
 CodeyBox API together with the retry behaviour it must exhibit for the
@@ -17,7 +20,7 @@ complementary half of the restart story.
 
 | Phase | Duration (typical) | Caller-visible symptom |
 |---|---|---|
-| Old process draining (`HostOptions.ShutdownTimeout`, default **60 s**) | up to `CodeyBox:Shutdown:GraceSeconds` | Process still bound; new requests accepted until the listener stops, then `connection refused` |
+| Old process draining (`HostOptions.ShutdownTimeout`, **set by CodeyBox to `Shutdown:GraceSeconds`, default 60 s** — the ASP.NET Core framework default is 30 s) | up to `CodeyBox:Shutdown:GraceSeconds` | Process still bound; new requests accepted until the listener stops, then `connection refused` |
 | Port unbound → new process listening | 5–30 s | TCP `connection refused` |
 | Warm-up before first request served | < 1 s | First request may take longer (cold path) |
 
@@ -54,20 +57,26 @@ delivery delay during a restart.
   mutating calls send `Idempotency-Key`. Live verification belongs in the
   JobTrack repo; this repo cannot inspect it directly.
 
-### 2. JobTrack → CodeyBox (webhook receiver target)
+### 2. CodeyBox → JobTrack (outbound webhook delivery)
 
-* **Direction.** This caller is *inverted* — CodeyBox dispatches webhooks to
-  JobTrack, not the other way around. Restarting CodeyBox does not break
-  JobTrack's webhook receiver; restarting JobTrack would, but CodeyBox's
-  outbound dispatcher handles that:
+* **Direction.** This caller is *outbound from CodeyBox* — CodeyBox dispatches
+  webhooks to JobTrack, not the other way around. Restarting CodeyBox does
+  not break JobTrack's webhook receiver; restarting JobTrack would, but
+  CodeyBox's outbound dispatcher handles that:
   * `src/CodeyBox.Webhooks/HttpWebhookDispatcher.cs` retries each delivery
-    `MaxAttempts` times with exponential back-off
-    (`InitialBackoffSeconds`, doubling each attempt).
+    up to `MaxAttempts` times. The wait between consecutive attempts starts
+    at `InitialBackoffSeconds` and **doubles each attempt** (see the
+    `backoff *= 2` step at the end of the retry loop in
+    `HttpWebhookDispatcher.cs`).
   * Default config: `MaxAttempts=3`, `InitialBackoffSeconds=1` → attempt
-    schedule of `t+0`, `t+1`, `t+3` seconds. Operators dispatching to a
-    JobTrack instance that may itself take 30 s to restart should raise
-    `MaxAttempts` to ≥ 5 in `appsettings.json` so the last attempt falls
-    well outside the restart window.
+    schedule of `t+0`, `t+1`, `t+3` seconds (i.e. waits of 1 s then 2 s).
+    Because the backoff doubles, raising `MaxAttempts` lengthens the tail
+    geometrically: `4` → last attempt at `t+7`, `5` → `t+15`, `6` → `t+31`,
+    `7` → `t+63`. To guarantee the *final* attempt lands strictly outside
+    the worst-case 30 s restart window, operators dispatching to a JobTrack
+    instance that may itself take 30 s to restart should raise
+    `MaxAttempts` to **≥ 6** in `appsettings.json` (or raise
+    `InitialBackoffSeconds`).
   * The dispatcher runs on a background channel that survives webhook
     receiver failures; the work-item pipeline is never blocked on delivery.
   * On graceful shutdown the dispatcher drains for up to 30 s — see
@@ -101,8 +110,9 @@ delivery delay during a restart.
   *before* the 202 response reaches GitHub) would create a duplicate
   changelog work item on the next retry. This is **outside the scope of the
   brief-restart window** (where the request never reaches the handler at
-  all) but operators should be aware. Tracked as a suggestion in
-  `.codeybox/suggestions.json` for follow-up.
+  all) but operators should be aware. This should be tracked as a follow-up
+  hardening task (e.g. opened as an issue against the changelog endpoint) —
+  it is not blocked on this verification work.
 * **Verdict.** Tolerant of the 30-s downtime window. A future hardening
   pass should add delivery-ID deduplication to close the broader retry
   idempotency hole.
@@ -117,7 +127,7 @@ refused` or a 503 page during a restart will simply retry.
 **None.** The orchestrator, audit, merge and upstream-push paths use
 in-process services (`IWorkItemStore`, `IGitHost`, `ISandboxProvider`, etc.)
 rather than the HTTP API. No background service or hosted job calls the API
-on `127.0.0.1:5036`.
+on `127.0.0.1:5000` (or `:5000` under the dev profile).
 
 Verification: `grep -r 'HttpClient' src/` returns only callers to GitHub,
 Anthropic, OpenAI, Google, OpenCode and the outbound webhook dispatcher;
@@ -146,7 +156,10 @@ assumptions above hold in a live deployment.
 
 ### Prerequisites
 
-* A running CodeyBox instance bound to a known port (default `5036`).
+* A running CodeyBox instance bound to a known port. The examples below use
+  `5000` (the production default from `Program.cs`); substitute `5036` if
+  you are exercising the local `dotnet run` profile from
+  `Properties/launchSettings.json`.
 * JobTrack (or any HTTP poller) configured against that instance.
 * `curl`, `ss` (or `lsof`), and a working clock.
 
@@ -154,8 +167,8 @@ assumptions above hold in a live deployment.
 
 1. **Record the steady state.**
    ```bash
-   curl -s http://localhost:5036/healthz
-   curl -s http://localhost:5036/workitems | jq 'length'
+   curl -s http://localhost:5000/healthz
+   curl -s http://localhost:5000/workitems | jq 'length'
    ```
    Note the count.
 
@@ -164,14 +177,14 @@ assumptions above hold in a live deployment.
    PID=$(pgrep -f 'CodeyBox.Api')
    kill -SIGTERM "$PID"
    # wait for the port to free
-   while ss -ltn 'sport = :5036' | grep -q :5036; do sleep 1; done
+   while ss -ltn 'sport = :5000' | grep -q :5000; do sleep 1; done
    sleep 30
    # restart
    dotnet run --project src/CodeyBox.Api &
    ```
 
 3. **Observe caller behaviour during the window.**
-   * `curl http://localhost:5036/healthz` should fail with
+   * `curl http://localhost:5000/healthz` should fail with
      `Connection refused`. The JobTrack Quartz job logs should show a
      transient failure and re-schedule.
    * GitHub deliveries queued during the window should appear in the
@@ -180,11 +193,11 @@ assumptions above hold in a live deployment.
 
 4. **Wait for recovery.** Once the port is bound again:
    ```bash
-   until curl -sf http://localhost:5036/healthz > /dev/null; do sleep 1; done
+   until curl -sf http://localhost:5000/healthz > /dev/null; do sleep 1; done
    ```
 
 5. **Verify no data loss.**
-   * Re-run `curl http://localhost:5036/workitems | jq 'length'` — count
+   * Re-run `curl http://localhost:5000/workitems | jq 'length'` — count
      should be unchanged (no items created or lost by the outage).
    * Confirm JobTrack's next poll succeeds (check JobTrack logs for the
      successful 200 after the failure burst).
