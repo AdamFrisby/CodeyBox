@@ -71,6 +71,16 @@ public sealed class UnknownLanguageStringTests
                     {
                         Id = "alpha",
                         RepositoryUrl = new Uri(temp.Path).AbsoluteUri,
+                        // Local-filesystem repository URLs are blocked by the
+                        // noop+local-seed validator unless the operator opts
+                        // in. This test is exercising preset loading from a
+                        // local directory — exactly the sandbox-isolation
+                        // use case the flag is designed for.
+                        Upstream = new ProjectUpstreamConfig
+                        {
+                            Kind = "noop",
+                            AcknowledgeSandboxIsolation = true,
+                        },
                         Audit = new ProjectAuditConfig { Languages = ["elixir"] },
                     },
                 ],

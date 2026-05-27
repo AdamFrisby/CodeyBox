@@ -284,6 +284,18 @@ public sealed record ProjectUpstream
     /// </summary>
     public IReadOnlyList<string> PreMergeVerifyArgv { get; init; } = [];
 
+    /// <summary>
+    /// Operator-supplied acknowledgement that the project is intentionally
+    /// running as an isolated sandbox: <c>Kind=noop</c> combined with a local
+    /// <c>RepositoryUrl</c>. The startup validator refuses that combination by
+    /// default because it makes every work item fork from the same seed with no
+    /// way to compose results, producing throwaway rewrites instead of
+    /// iterative progress. Setting this flag to <c>true</c> bypasses the
+    /// validator for projects that genuinely want that behaviour (short-lived
+    /// experiments, snapshot replay, etc.). See <c>docs/projects.md</c>.
+    /// </summary>
+    public bool AcknowledgeSandboxIsolation { get; init; }
+
     public static ProjectUpstream Noop { get; } = new();
 }
 
