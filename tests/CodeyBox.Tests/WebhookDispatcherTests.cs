@@ -275,7 +275,7 @@ public sealed class WebhookDispatcherTests
 
         Assert.True(doc.RootElement.TryGetProperty("eventSchemaVersion", out var version),
             "every webhook payload must carry the eventSchemaVersion envelope field");
-        Assert.Equal(HttpWebhookDispatcher.EventSchemaVersion, version.GetString());
+        Assert.Equal(WebhookEvent.CurrentSchemaVersion, version.GetString());
     }
 
     // ── EventFilter respects new intermediate event names ────────────────────

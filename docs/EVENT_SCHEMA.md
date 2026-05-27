@@ -22,6 +22,12 @@ The `eventSchemaVersion` string is semver (`major.minor`). Trackers should
 inspect this string — or the `X-CodeyBox-Schema-Version` HTTP header on
 webhook deliveries — to decide whether to accept the payload.
 
+The single canonical source in code is `WebhookEvent.CurrentSchemaVersion`
+(in `src/CodeyBox.Core/WebhookEvent.cs`). Anywhere else that needs the
+compile-time value — payload defaults, tests, validators — should reference
+that const rather than declare its own. The dispatcher does not own the
+schema version; the event type does.
+
 ---
 
 ## Envelope
