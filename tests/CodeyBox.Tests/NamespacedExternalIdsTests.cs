@@ -316,6 +316,165 @@ public sealed class NamespacedExternalIdsTests : IDisposable
         Assert.Contains("disagree", err!.Error);
     }
 
+    // ── Route resolver: composite forms ───────────────────────────────────
+
+    [Fact]
+    public async Task RouteResolver_ProjectIdNamespaceValue_ResolvesItem()
+    {
+        // GET /workitems/{projectId}:{namespace}:{value} must hit the
+        // namespaced lookup branch in ResolveWorkItemAsync.
+        var created = await CreateAsync(new() { ["github"] = "gh-issue:1234" });
+
+        var get = await _client.GetAsync("/workitems/test-project:github:gh-issue:1234");
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+        var fetched = await get.Content.ReadFromJsonAsync<CreateResp>();
+        Assert.Equal(created.Id, fetched!.Id);
+        Assert.Equal("gh-issue:1234", fetched.ExternalIds["github"]);
+    }
+
+    [Fact]
+    public async Task RouteResolver_ProjectIdBareValue_FallsBackToBareLookup()
+    {
+        // Without a recognised namespace prefix, the second segment is treated
+        // as a bare value and resolves via the bare lookup. Same value lives
+        // under a single namespace, so the lookup is unambiguous.
+        var created = await CreateAsync(new() { ["github"] = "BARE-ROUTE-1" });
+
+        var get = await _client.GetAsync("/workitems/test-project:BARE-ROUTE-1");
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+        var fetched = await get.Content.ReadFromJsonAsync<CreateResp>();
+        Assert.Equal(created.Id, fetched!.Id);
+    }
+
+    [Fact]
+    public async Task RouteResolver_BareLookup_AmbiguousAcrossItems_Returns400()
+    {
+        // Two distinct items share the same bare value via different namespaces;
+        // the resolver must translate AmbiguousExternalIdException into a 400
+        // with a disambiguation hint (not propagate as 500).
+        await CreateAsync(new() { ["github"] = "AMBIG-ROUTE-1" });
+        await CreateAsync(new() { ["linear"] = "AMBIG-ROUTE-1" });
+
+        var get = await _client.GetAsync("/workitems/test-project:AMBIG-ROUTE-1");
+        Assert.Equal(HttpStatusCode.BadRequest, get.StatusCode);
+        var err = await get.Content.ReadFromJsonAsync<ErrorResp>();
+        Assert.Contains("ambiguous", err!.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("github", err.Error);
+        Assert.Contains("linear", err.Error);
+    }
+
+    [Fact]
+    public async Task RouteResolver_NamespacedForm_NotFound_Returns404()
+    {
+        // Sanity: a well-formed namespaced lookup for an unknown value is 404,
+        // not 400 — the format is valid, the row just doesn't exist.
+        var get = await _client.GetAsync("/workitems/test-project:github:does-not-exist");
+        Assert.Equal(HttpStatusCode.NotFound, get.StatusCode);
+    }
+
+    // ── PATCH /external-ids: error branches ───────────────────────────────
+
+    [Fact]
+    public async Task Patch_NotFound_When_WorkItemDoesNotExist()
+    {
+        // Resolver returns 404 when the work item id does not exist.
+        var missing = Guid.NewGuid();
+        var patch = await _client.PatchAsJsonAsync($"/workitems/{missing}/external-ids", new
+        {
+            externalIds = new Dictionary<string, string?> { ["github"] = "gh-issue:99" },
+        });
+        Assert.Equal(HttpStatusCode.NotFound, patch.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_MissingExternalIdsField_Returns400()
+    {
+        // Body present but ExternalIds field absent → 400.
+        var created = await CreateAsync(new() { ["github"] = "PATCH-FIELD-1" });
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created.Id}/external-ids", new { });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var err = await resp.Content.ReadFromJsonAsync<ErrorResp>();
+        Assert.Contains("externalIds", err!.Error);
+    }
+
+    [Fact]
+    public async Task Patch_InvalidValue_ControlChar_Returns400()
+    {
+        var created = await CreateAsync(new() { ["github"] = "PATCH-VAL-1" });
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created.Id}/external-ids", new
+        {
+            externalIds = new Dictionary<string, string?> { ["github"] = "hasctrl" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_InvalidValue_WhitespaceOrSlash_Returns400()
+    {
+        var created = await CreateAsync(new() { ["github"] = "PATCH-VAL-2" });
+        var withSpace = await _client.PatchAsJsonAsync($"/workitems/{created.Id}/external-ids", new
+        {
+            externalIds = new Dictionary<string, string?> { ["github"] = "has space" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, withSpace.StatusCode);
+
+        var withSlash = await _client.PatchAsJsonAsync($"/workitems/{created.Id}/external-ids", new
+        {
+            externalIds = new Dictionary<string, string?> { ["github"] = "has/slash" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, withSlash.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_InvalidValue_TooLong_Returns400()
+    {
+        var created = await CreateAsync(new() { ["github"] = "PATCH-VAL-3" });
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created.Id}/external-ids", new
+        {
+            externalIds = new Dictionary<string, string?> { ["github"] = new string('a', 257) },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_InvalidNamespaceKey_Returns400()
+    {
+        var created = await CreateAsync(new() { ["github"] = "PATCH-NS-1" });
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created.Id}/external-ids", new
+        {
+            externalIds = new Dictionary<string, string?> { ["UpperCase"] = "ok-value" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task Post_InvalidValueInDict_Returns400()
+    {
+        // POST must run ValidateExternalId on every value in the externalIds
+        // dict, not just the singular legacy field.
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "t",
+            prompt = "p",
+            externalIds = new Dictionary<string, string> { ["github"] = "has space" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task Post_InvalidNamespaceKey_Returns400()
+    {
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "t",
+            prompt = "p",
+            externalIds = new Dictionary<string, string> { ["UpperCase"] = "ok" },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
 
     private async Task<CreateResp> CreateAsync(Dictionary<string, string> externalIds)

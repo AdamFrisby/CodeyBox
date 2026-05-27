@@ -153,7 +153,12 @@ internal static class SuggestionEndpoints
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
             externalId = body.ExternalId;
 
-            var conflict = await workItemStore.GetByExternalIdAsync(pid, externalId, ct);
+            // The suggestion-promotion path always stores the operator-supplied
+            // externalId under the 'legacy' namespace, so the unambiguous
+            // namespaced lookup is sufficient — and avoids the
+            // AmbiguousExternalIdException the bare lookup can now throw when
+            // the same value appears across multiple namespaces in the project.
+            var conflict = await workItemStore.GetByNamespacedExternalIdAsync(pid, "legacy", externalId, ct);
             if (conflict is not null)
                 return Results.BadRequest(new
                 {
