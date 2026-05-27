@@ -151,14 +151,33 @@ internal static class AgentStreamEndpoints
             var projectPart = idSegment[..colonIdx];
             var externalPart = idSegment[(colonIdx + 1)..];
             if (string.IsNullOrEmpty(projectPart) || string.IsNullOrEmpty(externalPart))
-                return (null, Results.BadRequest(new { error = "composite id format requires non-empty projectId and externalId: '<projectId>:<externalId>'" }));
+                return (null, Results.BadRequest(new { error = "composite id format requires non-empty projectId and externalId: '<projectId>:<externalId>' or '<projectId>:<namespace>:<value>'" }));
             ProjectId pid;
             try { pid = new ProjectId(projectPart); }
             catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
+
+            if (Validation.TryParseNamespacedExternalId(externalPart, out var ns, out var nsValue) && ns is not null)
+            {
+                try { Validation.ValidateExternalId(nsValue, "externalId"); }
+                catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
+                var byNs = await store.GetByNamespacedExternalIdAsync(pid, ns, nsValue, ct);
+                return byNs is null ? (null, Results.NotFound()) : (byNs, null);
+            }
+
             try { Validation.ValidateExternalId(externalPart, "externalId"); }
             catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
-            var byExtId = await store.GetByExternalIdAsync(pid, externalPart, ct);
-            return byExtId is null ? (null, Results.NotFound()) : (byExtId, null);
+            try
+            {
+                var byExtId = await store.GetByExternalIdAsync(pid, externalPart, ct);
+                return byExtId is null ? (null, Results.NotFound()) : (byExtId, null);
+            }
+            catch (AmbiguousExternalIdException ex)
+            {
+                return (null, Results.BadRequest(new
+                {
+                    error = $"externalId '{externalPart}' is ambiguous in project '{pid}': matches namespaces {string.Join(", ", ex.Namespaces)}. Use '<projectId>:<namespace>:<value>' to disambiguate."
+                }));
+            }
         }
 
         if (!Guid.TryParse(idSegment, out var g))

@@ -228,11 +228,36 @@ public sealed record WorkItem
     public string? PreemptCheckpoint { get; init; }
 
     /// <summary>
-    /// Caller-supplied identifier unique within the project (e.g. "JIRA-1234", "GH-#456").
-    /// Null when not provided. Allows API callers to reference work items by a familiar
-    /// external ID and to batch-queue dependent work items without a round-trip for UUIDs.
+    /// Caller-supplied identifiers keyed by namespace. The same item can carry
+    /// IDs in multiple external systems (e.g. <c>jobtrack</c>, <c>github</c>,
+    /// <c>linear</c>). Keys are short, lowercase, dash-separated identifiers
+    /// (see <see cref="Validation.ValidateExternalIdNamespace"/>); values follow
+    /// the same character rules as the legacy single-value field (see
+    /// <see cref="Validation.ValidateExternalId"/>). The pair
+    /// <c>(projectId, namespace, value)</c> is unique within a project; the
+    /// same string can appear in two different namespaces on the same item.
+    ///
+    /// The legacy single-value <c>externalId</c> field is preserved as a
+    /// projection — see <see cref="ExternalId"/> — under the reserved namespace
+    /// <c>legacy</c>.
     /// </summary>
-    public string? ExternalId { get; init; }
+    public IReadOnlyDictionary<string, string> ExternalIds { get; init; }
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Legacy single-value form, preserved for the deprecation window. Returns
+    /// the value at namespace <c>legacy</c> if present; otherwise the first
+    /// value in <see cref="ExternalIds"/> ordered ordinal-ignore-case by key
+    /// (deterministic across reads). Null when the dictionary is empty. New
+    /// code should read <see cref="ExternalIds"/> directly.
+    /// </summary>
+    public string? ExternalId =>
+        ExternalIds.TryGetValue("legacy", out var legacy)
+            ? legacy
+            : ExternalIds
+                .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(kv => (string?)kv.Value)
+                .FirstOrDefault();
 
     /// <summary>
     /// When set, identifies the source work item this item was created as a replay of.

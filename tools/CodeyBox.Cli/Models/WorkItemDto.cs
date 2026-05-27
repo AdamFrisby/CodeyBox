@@ -8,6 +8,7 @@ internal sealed class WorkItemDto
 {
     public string Id { get; set; } = "";
     public string? ExternalId { get; set; }
+    public Dictionary<string, string> ExternalIds { get; set; } = [];
     public string ProjectId { get; set; } = "";
     public string Title { get; set; } = "";
     public string Prompt { get; set; } = "";

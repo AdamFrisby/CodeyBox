@@ -180,6 +180,44 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 """;
             iterCmd.ExecuteNonQuery();
         }
+
+        // Namespaced external-ID side table. Each work item may carry an ID per
+        // namespace (jobtrack, github, linear, …). The legacy single-value
+        // external_id column on work_items is preserved as a denormalised
+        // projection of the 'legacy' namespace for the deprecation window;
+        // back-fill happens once on the migration below. Cascade-delete with
+        // the parent work item so cancelled/deleted items don't leak rows.
+        using (var extCmd = _conn.CreateCommand())
+        {
+            extCmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS work_item_external_ids (
+                    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                    project_id   TEXT NOT NULL,
+                    namespace    TEXT NOT NULL,
+                    external_id  TEXT NOT NULL,
+                    PRIMARY KEY (work_item_id, namespace)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_external_ids_per_project
+                    ON work_item_external_ids(project_id, namespace, external_id);
+                CREATE INDEX IF NOT EXISTS idx_work_item_external_ids_lookup
+                    ON work_item_external_ids(project_id, external_id);
+                """;
+            extCmd.ExecuteNonQuery();
+        }
+
+        // One-shot back-fill: copy any non-null work_items.external_id into the
+        // side table under namespace 'legacy'. INSERT OR IGNORE so re-running
+        // the migration is a no-op (rows already populated take precedence).
+        using (var backfill = _conn.CreateCommand())
+        {
+            backfill.CommandText = """
+                INSERT OR IGNORE INTO work_item_external_ids (work_item_id, project_id, namespace, external_id)
+                SELECT id, project_id, 'legacy', external_id
+                FROM work_items
+                WHERE external_id IS NOT NULL;
+                """;
+            backfill.ExecuteNonQuery();
+        }
     }
 
     private void RunMigration(string sql)
@@ -207,28 +245,35 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         await _writeLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
-                    work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
-                    last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
-                    stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
-                    min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
-                    failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
-                    cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts)
-                VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
-                    $sretries, $started_at, $external_id, $replay_of, $merge_sha,
-                    $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
-                    $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
-                    $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts);
-                """;
-            Bind(cmd, item);
-            await cmd.ExecuteNonQueryAsync(ct);
+            using var tx = _conn.BeginTransaction();
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = """
+                    INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
+                        work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
+                        last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
+                        stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
+                        min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
+                        failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
+                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts)
+                    VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
+                        $sretries, $started_at, $external_id, $replay_of, $merge_sha,
+                        $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
+                        $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
+                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts);
+                    """;
+                Bind(cmd, item);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            await WriteExternalIdsAsync(tx, item.Id, item.ProjectId, item.ExternalIds, ct);
+            tx.Commit();
         }
         catch (SqliteException sqlex) when (sqlex.SqliteExtendedErrorCode == 2067) // SQLITE_CONSTRAINT_UNIQUE
         {
             // A concurrent request snuck past the application-level pre-check and
-            // hit the UNIQUE index on (project_id, external_id).
+            // hit either the legacy work_items.external_id UNIQUE index or the
+            // new work_item_external_ids UNIQUE index on (project_id, namespace, external_id).
             throw new WorkItemExternalIdConflictException();
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
@@ -241,19 +286,53 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    /// <summary>
+    /// Inserts the side-table rows for an item's namespaced external IDs.
+    /// Caller owns the transaction; <see cref="WriteExternalIdsAsync"/> only
+    /// issues the INSERTs. No-op when the dict is empty.
+    /// </summary>
+    private async Task WriteExternalIdsAsync(
+        SqliteTransaction tx,
+        WorkItemId workItemId,
+        ProjectId projectId,
+        IReadOnlyDictionary<string, string> externalIds,
+        CancellationToken ct)
+    {
+        if (externalIds.Count == 0) return;
+        using var cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO work_item_external_ids (work_item_id, project_id, namespace, external_id)
+            VALUES ($wid, $pid, $ns, $eid);
+            """;
+        var widParam = cmd.Parameters.Add("$wid", Microsoft.Data.Sqlite.SqliteType.Text);
+        var pidParam = cmd.Parameters.Add("$pid", Microsoft.Data.Sqlite.SqliteType.Text);
+        var nsParam = cmd.Parameters.Add("$ns", Microsoft.Data.Sqlite.SqliteType.Text);
+        var eidParam = cmd.Parameters.Add("$eid", Microsoft.Data.Sqlite.SqliteType.Text);
+        foreach (var (ns, value) in externalIds)
+        {
+            widParam.Value = workItemId.ToString();
+            pidParam.Value = projectId.Value;
+            nsParam.Value = ns;
+            eidParam.Value = value;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+    }
+
     public async Task UpdateAsync(WorkItem item, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
-            // prompt / prompt_revision / priority are excluded from this UPDATE.
-            // Callers commonly pass a STALE in-memory WorkItem snapshot taken at
-            // pickup time; writing those columns from the snapshot would clobber
-            // a concurrent PUT /workitems/{id}/prompt or POST /workitems/{id}/priority
+            // prompt / prompt_revision / priority / external_id(s) are excluded
+            // from this UPDATE. Callers commonly pass a STALE in-memory WorkItem
+            // snapshot taken at pickup time; writing those columns from the
+            // snapshot would clobber a concurrent PUT /workitems/{id}/prompt,
+            // POST /workitems/{id}/priority, or PATCH /workitems/{id}/external-ids
             // that landed mid-pipeline. Use TryReplacePromptAsync /
-            // UpdatePriorityAsync to mutate them safely; routine state transitions
-            // leave them alone.
+            // UpdatePriorityAsync / ReplaceExternalIdsAsync to mutate them safely;
+            // routine state transitions leave them alone.
             cmd.CommandText = """
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
@@ -262,7 +341,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
-                    stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
+                    stuck_retries = $sretries, started_at = $started_at,
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
@@ -300,8 +379,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         try
         {
             using var cmd = _conn.CreateCommand();
-            // See UpdateAsync — prompt / prompt_revision / priority are excluded
-            // from the full-row UPDATE to avoid stale-snapshot clobber.
+            // See UpdateAsync — prompt / prompt_revision / priority / external_id(s)
+            // are excluded from the full-row UPDATE to avoid stale-snapshot clobber.
             cmd.CommandText = """
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
@@ -310,7 +389,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
-                    stuck_retries = $sretries, started_at = $started_at, external_id = $external_id,
+                    stuck_retries = $sretries, started_at = $started_at,
                     replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
@@ -372,11 +451,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
-        cmd.Parameters.AddWithValue("$id", id.ToString());
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? Read(reader) : null;
+        WorkItem? row;
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            row = await reader.ReadAsync(ct) ? Read(reader) : null;
+        }
+        return await EnrichOneAsync(row, ct);
     }
 
     public async Task<PriorityUpdateResult> UpdatePriorityAsync(
@@ -401,6 +484,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
             if (current is null)
                 return new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null);
+
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
 
             if (WorkItemDependencies.TerminalStates.Contains(current.State))
                 return new PriorityUpdateResult(PriorityUpdateOutcome.TerminalState, current, current.Priority);
@@ -429,37 +514,47 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
     public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM work_items ORDER BY created_at DESC;";
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-            yield return Read(reader);
+        var rows = new List<WorkItem>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT * FROM work_items ORDER BY created_at DESC;";
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
     public async IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
-        // queue_position = 0 (pre-migration or newly created without explicit pos) sort
-        // last via the CASE sentinel, then by creation time for stable tie-breaking.
-        // Other states: simple creation-time ordering.
-        if (state == WorkItemState.Queued)
+        var rows = new List<WorkItem>();
+        using (var cmd = _conn.CreateCommand())
         {
-            cmd.CommandText = """
-                SELECT * FROM work_items WHERE state = $state
-                ORDER BY
-                    CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
-                    created_at ASC;
-                """;
+            // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
+            // queue_position = 0 (pre-migration or newly created without explicit pos) sort
+            // last via the CASE sentinel, then by creation time for stable tie-breaking.
+            // Other states: simple creation-time ordering.
+            if (state == WorkItemState.Queued)
+            {
+                cmd.CommandText = """
+                    SELECT * FROM work_items WHERE state = $state
+                    ORDER BY
+                        CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
+                        created_at ASC;
+                    """;
+            }
+            else
+            {
+                cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
+            }
+            cmd.Parameters.AddWithValue("$state", (int)state);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
         }
-        else
-        {
-            cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
-        }
-        cmd.Parameters.AddWithValue("$state", (int)state);
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-            yield return Read(reader);
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
     public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)
@@ -475,31 +570,37 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         IReadOnlySet<WorkItemId> skipIds,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        // Exclude terminal states and parked NeedsOperatorInput. The remaining set
-        // mirrors what the FIFO dispatcher used to process via the channel:
-        // Queued plus the mid-pipeline resumable states (Working, WorkComplete,
-        // Auditing, Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
-        cmd.CommandText = $"""
-            SELECT * FROM work_items
-            WHERE state NOT IN (
-                {(int)WorkItemState.Done},
-                {(int)WorkItemState.Failed},
-                {(int)WorkItemState.Cancelled},
-                {(int)WorkItemState.AuditFailed},
-                {(int)WorkItemState.MergeConflictResolutionFailed},
-                {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
-                {(int)WorkItemState.NeedsOperatorInput}
-            )
-            ORDER BY priority DESC, created_at ASC;
-            """;
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        var rows = new List<WorkItem>();
+        using (var cmd = _conn.CreateCommand())
         {
-            var item = Read(reader);
-            if (skipIds.Contains(item.Id)) continue;
-            yield return item;
+            // Exclude terminal states and parked NeedsOperatorInput. The remaining set
+            // mirrors what the FIFO dispatcher used to process via the channel:
+            // Queued plus the mid-pipeline resumable states (Working, WorkComplete,
+            // Auditing, Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
+            cmd.CommandText = $"""
+                SELECT * FROM work_items
+                WHERE state NOT IN (
+                    {(int)WorkItemState.Done},
+                    {(int)WorkItemState.Failed},
+                    {(int)WorkItemState.Cancelled},
+                    {(int)WorkItemState.AuditFailed},
+                    {(int)WorkItemState.MergeConflictResolutionFailed},
+                    {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
+                    {(int)WorkItemState.NeedsOperatorInput}
+                )
+                ORDER BY priority DESC, created_at ASC;
+                """;
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                var item = Read(reader);
+                if (skipIds.Contains(item.Id)) continue;
+                rows.Add(item);
+            }
         }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
     public async Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default)
@@ -572,12 +673,144 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
     public async Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM work_items WHERE project_id = $pid AND external_id = $eid;";
-        cmd.Parameters.AddWithValue("$pid", projectId.Value);
-        cmd.Parameters.AddWithValue("$eid", externalId);
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? Read(reader) : null;
+        // Bare lookup: match against every namespace in the project. The
+        // namespace dimension was added when work items got an external-IDs
+        // dict; this entry point used to scan only work_items.external_id, but
+        // a namespaced PATCH can produce an item discoverable only via the
+        // side table. Disambiguation matters because two namespaces in the
+        // same project may legitimately share a value (e.g.
+        // github:PROJ-42 + linear:PROJ-42 on the same item is allowed; a
+        // collision *across distinct items* shows up here too).
+        var matches = new List<(WorkItemId Id, string Namespace)>();
+        using (var lookup = _conn.CreateCommand())
+        {
+            lookup.CommandText = """
+                SELECT work_item_id, namespace
+                FROM work_item_external_ids
+                WHERE project_id = $pid AND external_id = $eid;
+                """;
+            lookup.Parameters.AddWithValue("$pid", projectId.Value);
+            lookup.Parameters.AddWithValue("$eid", externalId);
+            using var reader = await lookup.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                if (Guid.TryParse(reader.GetString(0), out var g))
+                    matches.Add((new WorkItemId(g), reader.GetString(1)));
+            }
+        }
+
+        if (matches.Count == 0) return null;
+        var distinctItems = matches.Select(m => m.Id).Distinct().ToList();
+        if (distinctItems.Count > 1)
+        {
+            // Same value resolved to multiple WORK ITEMS via different namespaces.
+            // Refuse the bare lookup; the caller must disambiguate.
+            throw new AmbiguousExternalIdException(externalId, matches.Select(m => m.Namespace).Distinct().ToList());
+        }
+        return await GetAsync(distinctItems[0], ct);
+    }
+
+    public async Task<WorkItem?> GetByNamespacedExternalIdAsync(
+        ProjectId projectId,
+        string @namespace,
+        string externalId,
+        CancellationToken ct = default)
+    {
+        WorkItemId? matched = null;
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT work_item_id
+                FROM work_item_external_ids
+                WHERE project_id = $pid AND namespace = $ns AND external_id = $eid
+                LIMIT 1;
+                """;
+            cmd.Parameters.AddWithValue("$pid", projectId.Value);
+            cmd.Parameters.AddWithValue("$ns", @namespace);
+            cmd.Parameters.AddWithValue("$eid", externalId);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (await reader.ReadAsync(ct) && Guid.TryParse(reader.GetString(0), out var g))
+                matched = new WorkItemId(g);
+        }
+        return matched is null ? null : await GetAsync(matched.Value, ct);
+    }
+
+    public async Task<WorkItem?> ReplaceExternalIdsAsync(
+        WorkItemId id,
+        IReadOnlyDictionary<string, string> externalIds,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            // Re-read inside the lock so we can detect "row vanished" cleanly and
+            // so the caller's snapshot can't race a concurrent cancel-delete.
+            WorkItem? current;
+            using (var read = _conn.CreateCommand())
+            {
+                read.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                read.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await read.ExecuteReaderAsync(ct);
+                current = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+            if (current is null) return null;
+
+            using var tx = _conn.BeginTransaction();
+            using (var del = _conn.CreateCommand())
+            {
+                del.Transaction = tx;
+                del.CommandText = "DELETE FROM work_item_external_ids WHERE work_item_id = $id;";
+                del.Parameters.AddWithValue("$id", id.ToString());
+                await del.ExecuteNonQueryAsync(ct);
+            }
+            try
+            {
+                await WriteExternalIdsAsync(tx, id, current.ProjectId, externalIds, ct);
+            }
+            catch (SqliteException sqlex) when (sqlex.SqliteExtendedErrorCode == 2067)
+            {
+                // Side-table UNIQUE collision: another item in the project already
+                // holds one of the namespaced values being assigned.
+                tx.Rollback();
+                throw new WorkItemExternalIdConflictException();
+            }
+
+            // Mirror the legacy projection so the deprecated work_items.external_id
+            // column still reflects the 'legacy' namespace value (or NULL when
+            // absent). Keeps the legacy UNIQUE index honest.
+            using (var legacyUpdate = _conn.CreateCommand())
+            {
+                legacyUpdate.Transaction = tx;
+                legacyUpdate.CommandText = "UPDATE work_items SET external_id = $eid, updated_at = $ua WHERE id = $id;";
+                var legacy = externalIds.TryGetValue("legacy", out var v) ? v : null;
+                legacyUpdate.Parameters.AddWithValue("$eid", (object?)legacy ?? DBNull.Value);
+                legacyUpdate.Parameters.AddWithValue("$ua", updatedAt.ToString("O"));
+                legacyUpdate.Parameters.AddWithValue("$id", id.ToString());
+                try
+                {
+                    await legacyUpdate.ExecuteNonQueryAsync(ct);
+                }
+                catch (SqliteException sqlex) when (sqlex.SqliteExtendedErrorCode == 2067)
+                {
+                    // Legacy work_items.external_id UNIQUE-per-project index collision.
+                    tx.Rollback();
+                    throw new WorkItemExternalIdConflictException();
+                }
+            }
+
+            tx.Commit();
+
+            return current with
+            {
+                ExternalIds = externalIds.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase),
+                UpdatedAt = updatedAt,
+            };
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default)
@@ -637,16 +870,21 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
     public async IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(
         WorkItemId sourceId, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT * FROM work_items
-            WHERE replay_of_work_item_id = $source_id
-            ORDER BY created_at ASC;
-            """;
-        cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-            yield return Read(reader);
+        var rows = new List<WorkItem>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT * FROM work_items
+                WHERE replay_of_work_item_id = $source_id
+                ORDER BY created_at ASC;
+                """;
+            cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
     public async Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default)
@@ -675,12 +913,17 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         CodeyBox.Core.ReleaseId releaseId,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM work_items WHERE release_id = $rid ORDER BY created_at;";
-        cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-            yield return Read(reader);
+        var rows = new List<WorkItem>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT * FROM work_items WHERE release_id = $rid ORDER BY created_at;";
+            cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
 
@@ -819,7 +1062,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$qpos", item.QueuePosition);
         cmd.Parameters.AddWithValue("$sretries", item.StuckRetries);
         cmd.Parameters.AddWithValue("$started_at", (object?)item.StartedAt?.ToString("O") ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$external_id", (object?)item.ExternalId ?? DBNull.Value);
+        // external_id (singular column) is the denormalised projection of namespace 'legacy'.
+        // It exists for the deprecation window so the legacy unique index and any read
+        // paths that still query the column keep working without code-flow changes.
+        // After the deprecation window the column is dropped and lookups go entirely
+        // through the work_item_external_ids side table.
+        var legacyValue = item.ExternalIds.TryGetValue("legacy", out var legacy) ? legacy : null;
+        cmd.Parameters.AddWithValue("$external_id", (object?)legacyValue ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$replay_of", (object?)item.ReplayOfWorkItemId?.ToString() ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$merge_sha", (object?)item.MergeSha ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$min_model_score", item.MinModelScore);
@@ -864,7 +1113,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         QueuePosition = r.GetInt64(r.GetOrdinal("queue_position")),
         StuckRetries = r.GetInt32(r.GetOrdinal("stuck_retries")),
         StartedAt = ReadNullableDateTimeOffset(r, "started_at"),
-        ExternalId = r.IsDBNull(r.GetOrdinal("external_id")) ? null : r.GetString(r.GetOrdinal("external_id")),
+        // ExternalIds is populated by a follow-up batch / per-id load from
+        // work_item_external_ids; rows that fall straight out of Read() carry
+        // an empty dict and rely on the wrapping method to enrich them. The
+        // legacy work_items.external_id column is no longer parsed here — the
+        // side table is the canonical source.
         ReplayOfWorkItemId = ReadNullableWorkItemId(r, "replay_of_work_item_id"),
         MergeSha = r.IsDBNull(r.GetOrdinal("merge_sha")) ? null : r.GetString(r.GetOrdinal("merge_sha")),
         MinModelScore = ReadInt32OrDefault(r, "min_model_score", defaultValue: 95),
@@ -945,5 +1198,89 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                 result.Add(new WorkItemId(g));
         }
         return result;
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyExternalIds
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Loads the namespaced external IDs for a single work item. Returns an
+    /// empty dictionary when the item has none. Caller-supplied
+    /// <paramref name="tx"/> is reused so reads see writes from the same
+    /// transaction; pass null for a no-transaction read.
+    /// </summary>
+    private async Task<IReadOnlyDictionary<string, string>> LoadExternalIdsForAsync(
+        WorkItemId id,
+        SqliteTransaction? tx,
+        CancellationToken ct)
+    {
+        using var cmd = _conn.CreateCommand();
+        if (tx is not null) cmd.Transaction = tx;
+        cmd.CommandText = "SELECT namespace, external_id FROM work_item_external_ids WHERE work_item_id = $id;";
+        cmd.Parameters.AddWithValue("$id", id.ToString());
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        while (await reader.ReadAsync(ct))
+            dict[reader.GetString(0)] = reader.GetString(1);
+        return dict;
+    }
+
+    /// <summary>
+    /// Batch-loads external IDs for a set of work items in a single round-trip.
+    /// For batches larger than a small threshold falls back to a full-table
+    /// scan filtered in memory to avoid blowing past SQLite's parameter cap.
+    /// </summary>
+    private async Task<Dictionary<WorkItemId, IReadOnlyDictionary<string, string>>> LoadExternalIdsBatchAsync(
+        IReadOnlyCollection<WorkItemId> ids,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<WorkItemId, IReadOnlyDictionary<string, string>>();
+        if (ids.Count == 0) return result;
+
+        var idSet = ids as HashSet<WorkItemId> ?? new HashSet<WorkItemId>(ids);
+        using var cmd = _conn.CreateCommand();
+        if (ids.Count > 256)
+        {
+            cmd.CommandText = "SELECT work_item_id, namespace, external_id FROM work_item_external_ids;";
+        }
+        else
+        {
+            var paramNames = new List<string>(ids.Count);
+            var i = 0;
+            foreach (var id in ids)
+            {
+                var p = $"$id{i++}";
+                paramNames.Add(p);
+                cmd.Parameters.AddWithValue(p, id.ToString());
+            }
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- paramNames is composed of literal '$idN' tokens generated from a counter; no user input reaches the SQL string
+            cmd.CommandText = $"SELECT work_item_id, namespace, external_id FROM work_item_external_ids WHERE work_item_id IN ({string.Join(",", paramNames)});";
+        }
+
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        var accum = new Dictionary<WorkItemId, Dictionary<string, string>>();
+        while (await reader.ReadAsync(ct))
+        {
+            if (!Guid.TryParse(reader.GetString(0), out var g)) continue;
+            var wid = new WorkItemId(g);
+            if (!idSet.Contains(wid)) continue;
+            if (!accum.TryGetValue(wid, out var inner))
+                accum[wid] = inner = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            inner[reader.GetString(1)] = reader.GetString(2);
+        }
+        foreach (var kv in accum)
+            result[kv.Key] = kv.Value;
+        return result;
+    }
+
+    /// <summary>
+    /// Enriches a single in-memory item with its external IDs loaded from the
+    /// side table. No-op when the item is null.
+    /// </summary>
+    private async Task<WorkItem?> EnrichOneAsync(WorkItem? item, CancellationToken ct)
+    {
+        if (item is null) return null;
+        var extIds = await LoadExternalIdsForAsync(item.Id, tx: null, ct);
+        return item with { ExternalIds = extIds };
     }
 }

@@ -126,6 +126,91 @@ public sealed class PromoteCreatesLinkedWorkItemTests : IDisposable
         Assert.Equal(System.Net.HttpStatusCode.BadRequest, resp.StatusCode);
     }
 
+    [Fact]
+    public async Task Promote_WithExternalId_StoresUnderLegacyNamespace()
+    {
+        // Operator-supplied externalId on promotion lands in the new work
+        // item's ExternalIds dict under the reserved 'legacy' namespace —
+        // both the singular projection and the dict round-trip.
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        var resp = await _client.PostAsJsonAsync($"/suggestions/{s.Id}/promote",
+            new { externalId = "PROMOTE-EXT-1" });
+        resp.EnsureSuccessStatusCode();
+        var body = await resp.Content.ReadFromJsonAsync<PromoteBody>();
+
+        var wi = await _factory.WorkItemStore.GetAsync(WorkItemId.Parse(body!.WorkItemId));
+        Assert.NotNull(wi);
+        Assert.Equal("PROMOTE-EXT-1", wi!.ExternalId);
+        Assert.True(wi.ExternalIds.TryGetValue("legacy", out var v));
+        Assert.Equal("PROMOTE-EXT-1", v);
+    }
+
+    [Fact]
+    public async Task Promote_WithDuplicateExternalId_InLegacyNamespace_ReturnsBadRequest()
+    {
+        // Pre-existing item in the same project already owns the legacy
+        // value 'DUP-EXT-1'. Promoting a suggestion with the same externalId
+        // must hit the GetByNamespacedExternalIdAsync(pid, 'legacy', value)
+        // duplicate check and 400 — not silently let the create proceed.
+        await _factory.WorkItemStore.CreateAsync(new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId(SuggestionsApiFactory.ProjectId),
+            Title = "occupies the legacy namespace",
+            Prompt = "p",
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["legacy"] = "DUP-EXT-1",
+            },
+        });
+
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        var resp = await _client.PostAsJsonAsync($"/suggestions/{s.Id}/promote",
+            new { externalId = "DUP-EXT-1" });
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, resp.StatusCode);
+
+        // The suggestion must remain promotable (TryAcceptAsync was never called).
+        var afterAttempt = await _factory.SuggestionStore.GetAsync(s.Id);
+        Assert.Equal("open", afterAttempt!.State);
+        Assert.Null(afterAttempt.PromotedToWorkItemId);
+    }
+
+    [Fact]
+    public async Task Promote_WithExternalId_DoesNotConflictWith_NonLegacyNamespace()
+    {
+        // The legacy-namespace duplicate check must scope to 'legacy' only —
+        // an item already carrying the same value under a DIFFERENT namespace
+        // (e.g. 'github') must not block a suggestion promote with the same
+        // externalId. This pins the namespace constant: a regression that
+        // dropped or replaced 'legacy' with bare/cross-namespace matching
+        // would 400 here.
+        await _factory.WorkItemStore.CreateAsync(new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId(SuggestionsApiFactory.ProjectId),
+            Title = "uses github namespace, not legacy",
+            Prompt = "p",
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["github"] = "PROMOTE-EXT-NS-1",
+            },
+        });
+
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        var resp = await _client.PostAsJsonAsync($"/suggestions/{s.Id}/promote",
+            new { externalId = "PROMOTE-EXT-NS-1" });
+        resp.EnsureSuccessStatusCode();
+        var body = await resp.Content.ReadFromJsonAsync<PromoteBody>();
+        var wi = await _factory.WorkItemStore.GetAsync(WorkItemId.Parse(body!.WorkItemId));
+        Assert.Equal("PROMOTE-EXT-NS-1", wi!.ExternalIds["legacy"]);
+    }
+
     private sealed record SuggestionShape(string State, string? PromotedToWorkItemId);
     private sealed record PromoteBody(string WorkItemId, SuggestionShape Suggestion);
 }

@@ -20,6 +20,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/dependents", GetDependentsAsync);
         group.MapGet("/{id}/replays", GetReplaysAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
+        group.MapPatch("/{id}/external-ids", PatchExternalIdsAsync);
         group.MapPut("/{id}/prompt", PutPromptAsync);
         group.MapPatch("/{id}/priority", PatchPriorityAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
@@ -104,22 +105,55 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = ex.Message });
         }
 
-        // ── ExternalId validation ─────────────────────────────────────────────
+        // ── External-IDs validation ───────────────────────────────────────────
 
-        string? externalId = null;
+        // Build the canonical namespaced map by merging the legacy singular
+        // field (POSTed as `externalId`) with the new dict (`externalIds`).
+        // The singular form is stored under the reserved namespace 'legacy'.
+        // The two MAY NOT conflict (i.e. POSTing both `externalId: "X"` and
+        // `externalIds: { legacy: "Y" }` is a 400 — we don't silently pick a
+        // winner). Within `externalIds` the namespace 'legacy' is allowed but
+        // collides with the singular form when both are sent.
+        var canonicalExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (req.ExternalIds is { Count: > 0 })
+        {
+            if (req.ExternalIds.Count > 16)
+                return Results.BadRequest(new { error = "externalIds may contain at most 16 entries per work item" });
+            foreach (var (ns, value) in req.ExternalIds)
+            {
+                if (value is null)
+                    return Results.BadRequest(new { error = $"externalIds['{ns}'] must not be null on create — use PATCH /external-ids to delete" });
+                try
+                {
+                    Validation.ValidateExternalIdNamespace(ns, $"externalIds key '{ns}'");
+                    Validation.ValidateExternalId(value, $"externalIds['{ns}']");
+                }
+                catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+                canonicalExternalIds[ns] = value;
+            }
+        }
         if (!string.IsNullOrEmpty(req.ExternalId))
         {
             try { Validation.ValidateExternalId(req.ExternalId, nameof(req.ExternalId)); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
-            externalId = req.ExternalId;
+            if (canonicalExternalIds.TryGetValue("legacy", out var dictLegacy) && dictLegacy != req.ExternalId)
+                return Results.BadRequest(new { error = "externalId and externalIds['legacy'] disagree; send one or matching values" });
+            canonicalExternalIds["legacy"] = req.ExternalId;
+        }
 
-            var conflict = await store.GetByExternalIdAsync(pid, externalId, ct);
+        foreach (var (ns, value) in canonicalExternalIds)
+        {
+            var conflict = await store.GetByNamespacedExternalIdAsync(pid, ns, value, ct);
             if (conflict is not null)
                 return Results.BadRequest(new
                 {
-                    error = $"externalId '{externalId}' already exists in project '{pid}' for work item {conflict.Id} (state: {conflict.State})"
+                    error = $"externalId '{value}' in namespace '{ns}' already exists in project '{pid}' for work item {conflict.Id} (state: {conflict.State})"
                 });
         }
+
+        // Legacy single-value shortcut, computed once so error messages and the
+        // catch-block conflict re-query don't have to recompute from the dict.
+        string? externalId = canonicalExternalIds.TryGetValue("legacy", out var legacyValue) ? legacyValue : null;
 
         AgentKind? agentOverride = null;
         if (!string.IsNullOrWhiteSpace(req.Agent))
@@ -153,16 +187,26 @@ internal static class WorkItemEndpoints
         // Load all existing items — used for existence/cycle checks and externalId resolution.
         // Skip the scan entirely when dependsOn is empty to avoid an O(N) read for the common case.
         var allItems = new List<WorkItem>();
-        var allItemsByExternalId = new Dictionary<string, WorkItem>(StringComparer.Ordinal);
+        // Lookup table keyed by (namespace, value). For bare-ID deps (no ':') we
+        // scan every namespace and 400 on ambiguity; for namespaced deps
+        // ("ns:value") we hit the exact (ns, value) key. ExternalId (legacy
+        // single-value) round-trips because each legacy item also has a
+        // ("legacy", value) entry.
+        var byNamespacedExternalId = new Dictionary<(string Namespace, string Value), WorkItem>();
+        var byBareExternalId = new Dictionary<string, List<(string Namespace, WorkItem Item)>>(StringComparer.Ordinal);
         if (req.DependsOn?.Length > 0)
         {
             await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
-            // GroupBy guards against data-inconsistency duplicates (index corruption, missed migration):
-            // last-wins ensures a deterministic result rather than an unhandled InvalidOperationException.
-            allItemsByExternalId = allItems
-                .Where(i => i.ExternalId != null && i.ProjectId == pid)
-                .GroupBy(i => i.ExternalId!)
-                .ToDictionary(g => g.Key, g => g.Last());
+            foreach (var existing in allItems.Where(i => i.ProjectId == pid))
+            {
+                foreach (var (ns, value) in existing.ExternalIds)
+                {
+                    byNamespacedExternalId[(ns, value)] = existing;
+                    if (!byBareExternalId.TryGetValue(value, out var list))
+                        byBareExternalId[value] = list = new List<(string, WorkItem)>();
+                    list.Add((ns, existing));
+                }
+            }
         }
 
         var newId = WorkItemId.New();
@@ -174,14 +218,25 @@ internal static class WorkItemEndpoints
             if (Guid.TryParse(rawId, out var g))
             {
                 dependsOnIds.Add(new WorkItemId(g));
+                continue;
             }
-            else
+            if (Validation.TryParseNamespacedExternalId(rawId, out var depNs, out var depValue) && depNs is not null)
             {
-                // Treat as externalId within the same project.
-                if (!allItemsByExternalId.TryGetValue(rawId, out var depByExtId))
-                    return Results.BadRequest(new { error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{rawId}' in project '{pid}'" });
-                dependsOnIds.Add(depByExtId.Id);
+                if (!byNamespacedExternalId.TryGetValue((depNs, depValue), out var depByNs))
+                    return Results.BadRequest(new { error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{depValue}' in namespace '{depNs}' in project '{pid}'" });
+                dependsOnIds.Add(depByNs.Id);
+                continue;
             }
+            // Bare externalId: must be unambiguous across namespaces.
+            if (!byBareExternalId.TryGetValue(rawId, out var matches) || matches.Count == 0)
+                return Results.BadRequest(new { error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{rawId}' in project '{pid}'" });
+            var distinctItems = matches.Select(m => m.Item.Id).Distinct().ToList();
+            if (distinctItems.Count > 1)
+                return Results.BadRequest(new
+                {
+                    error = $"dependency '{rawId}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} — qualify as 'namespace:value'"
+                });
+            dependsOnIds.Add(distinctItems[0]);
         }
 
         // Self-dependency check: explicit guard per spec.
@@ -262,7 +317,7 @@ internal static class WorkItemEndpoints
             DependsOn = dependsOnIds,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
             Priority = priority,
-            ExternalId = externalId,
+            ExternalIds = canonicalExternalIds,
             ReleaseId = releaseId,
         };
         if (req.WorkTimeoutMinutes is { } w)
@@ -275,13 +330,20 @@ internal static class WorkItemEndpoints
         try { await store.CreateAsync(item, ct); }
         catch (WorkItemExternalIdConflictException)
         {
-            var concurrentConflict = await store.GetByExternalIdAsync(pid, externalId!, ct);
-            var conflictDetail = concurrentConflict is not null
-                ? $"for work item {concurrentConflict.Id} (state: {concurrentConflict.State})"
-                : "(concurrent duplicate)";
+            // Re-probe each namespaced ID to identify the colliding row(s). The
+            // race winner could be in any namespace we tried to set.
+            foreach (var (ns, value) in canonicalExternalIds)
+            {
+                var conflict = await store.GetByNamespacedExternalIdAsync(pid, ns, value, ct);
+                if (conflict is not null)
+                    return Results.BadRequest(new
+                    {
+                        error = $"externalId '{value}' in namespace '{ns}' already exists in project '{pid}' for work item {conflict.Id} (state: {conflict.State})"
+                    });
+            }
             return Results.BadRequest(new
             {
-                error = $"externalId '{externalId}' already exists in project '{pid}' {conflictDetail}"
+                error = "an external id already exists in this project (concurrent duplicate)"
             });
         }
         AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
@@ -320,11 +382,36 @@ internal static class WorkItemEndpoints
         IProjectRepository projects,
         IWorkItemCostStore? costs,
         ILoggerFactory loggerFactory,
+        string? externalId,
+        string? projectId,
         CancellationToken ct)
     {
         var allProjects = (await projects.ListAsync(ct)).ToDictionary(p => p.Id.Value);
         var allItems = new List<WorkItem>();
         await foreach (var item in store.ListAsync(ct)) allItems.Add(item);
+
+        // ?externalId=ns:val filter (matches the namespaced PATCH/POST surface).
+        // Also accepts a bare value: returns every item that carries the value
+        // in any namespace, leaving the caller to disambiguate by namespace.
+        // Optional ?projectId=… narrows further when set.
+        if (!string.IsNullOrEmpty(externalId))
+        {
+            if (Validation.TryParseNamespacedExternalId(externalId, out var filterNs, out var filterValue) && filterNs is not null)
+            {
+                allItems = allItems
+                    .Where(i => i.ExternalIds.TryGetValue(filterNs, out var v) && v == filterValue)
+                    .ToList();
+            }
+            else
+            {
+                allItems = allItems
+                    .Where(i => i.ExternalIds.Values.Any(v => v == externalId))
+                    .ToList();
+            }
+        }
+        if (!string.IsNullOrEmpty(projectId))
+            allItems = allItems.Where(i => i.ProjectId.Value == projectId).ToList();
+
         var statesById = WorkItemDependencies.BuildStateMap(allItems);
         var externalIdsById = allItems.ToDictionary(i => i.Id, i => i.ExternalId);
 
@@ -903,6 +990,7 @@ internal static class WorkItemEndpoints
                 {
                     id = resumed.Id.ToString(),
                     externalId = resumed.ExternalId,
+                    externalIds = resumed.ExternalIds,
                     from = requestedFrom,
                     reason = reason,
                 },
@@ -1026,6 +1114,112 @@ internal static class WorkItemEndpoints
 
         var project = await projects.GetAsync(updated.ProjectId, ct);
         return Results.Ok(ToDto(updated, project, statesById, depExternalIds));
+    }
+
+    /// <summary>
+    /// Patches the work item's namespaced external IDs.
+    ///
+    /// Default semantics: MERGE. The request body's entries are overlaid on the
+    /// existing map; a value of <c>null</c> deletes the key. Set
+    /// <c>replaceExternalIds: true</c> to overwrite the whole map instead.
+    ///
+    /// Conflict resolution: each resulting <c>(namespace, value)</c> pair must
+    /// be unique within the project — colliding writes return 409. The legacy
+    /// singular <c>external_id</c> column on the underlying row is kept in
+    /// sync with the <c>legacy</c> namespace for the deprecation window.
+    ///
+    /// Allowed in any non-deleted state — namespaced external IDs are
+    /// caller-facing identifiers and may be added at any point in the item's
+    /// lifecycle (e.g. after a PR has been opened the GitHub ID is appended).
+    /// </summary>
+    private static async Task<IResult> PatchExternalIdsAsync(
+        string id,
+        PatchExternalIdsRequest body,
+        IWorkItemStore store,
+        IProjectRepository projects,
+        CancellationToken ct)
+    {
+        if (body is null)
+            return Results.BadRequest(new { error = "request body is required" });
+        if (body.ExternalIds is null)
+            return Results.BadRequest(new { error = "externalIds field is required" });
+
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        // Build the resulting map. Start from current (merge) or empty (replace),
+        // then apply the patch — string values set/overwrite, null values delete.
+        var resulting = body.ReplaceExternalIds == true
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(item!.ExternalIds, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (ns, value) in body.ExternalIds)
+        {
+            try { Validation.ValidateExternalIdNamespace(ns, $"externalIds key '{ns}'"); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            if (value is null)
+            {
+                resulting.Remove(ns);
+                continue;
+            }
+            try { Validation.ValidateExternalId(value, $"externalIds['{ns}']"); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            resulting[ns] = value;
+        }
+
+        if (resulting.Count > 16)
+            return Results.BadRequest(new { error = "externalIds may contain at most 16 entries per work item" });
+
+        // Pre-check for conflicts on namespaced IDs newly assigned to this item
+        // (additions and changed values). We don't pre-check unchanged entries —
+        // they already belong to this item.
+        foreach (var (ns, value) in resulting)
+        {
+            if (item!.ExternalIds.TryGetValue(ns, out var existing) && existing == value)
+                continue;
+            var other = await store.GetByNamespacedExternalIdAsync(item.ProjectId, ns, value, ct);
+            if (other is not null && other.Id != item.Id)
+                return Results.Conflict(new
+                {
+                    error = $"externalId '{value}' in namespace '{ns}' already exists in project '{item.ProjectId}' for work item {other.Id} (state: {other.State})"
+                });
+        }
+
+        WorkItem? updated;
+        try
+        {
+            updated = await store.ReplaceExternalIdsAsync(item!.Id, resulting, DateTimeOffset.UtcNow, ct);
+        }
+        catch (WorkItemExternalIdConflictException)
+        {
+            // Re-probe to surface the colliding namespaced ID after a race.
+            foreach (var (ns, value) in resulting)
+            {
+                var other = await store.GetByNamespacedExternalIdAsync(item!.ProjectId, ns, value, ct);
+                if (other is not null && other.Id != item.Id)
+                    return Results.Conflict(new
+                    {
+                        error = $"externalId '{value}' in namespace '{ns}' already exists in project '{item.ProjectId}' for work item {other.Id} (state: {other.State})"
+                    });
+            }
+            return Results.Conflict(new { error = "external id conflict (concurrent duplicate)" });
+        }
+        if (updated is null)
+            return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+
+        var project = await projects.GetAsync(updated.ProjectId, ct);
+        var depStates = new Dictionary<WorkItemId, WorkItemState>();
+        var depExtIds = new Dictionary<WorkItemId, string?>();
+        foreach (var depId in updated.DependsOn)
+        {
+            var dep = await store.GetAsync(depId, ct);
+            if (dep is not null)
+            {
+                depStates[depId] = dep.State;
+                depExtIds[depId] = dep.ExternalId;
+            }
+        }
+        return Results.Ok(ToDto(updated, project, depStates, depExtIds));
     }
 
     /// <summary>
@@ -1458,9 +1652,14 @@ internal static class WorkItemEndpoints
     // ── Work item resolver ────────────────────────────────────────────────────
 
     /// <summary>
-    /// Resolves a route path segment to a <see cref="WorkItem"/>. Accepts either
-    /// a UUID or a composite <c>projectId:externalId</c> form. Returns the item
-    /// and a null error result on success, or a null item with an error result on failure.
+    /// Resolves a route path segment to a <see cref="WorkItem"/>. Accepts:
+    ///   * a UUID
+    ///   * a composite <c>projectId:externalId</c> where externalId is a bare
+    ///     value (matches across every namespace; 400 if ambiguous)
+    ///   * a composite <c>projectId:namespace:value</c> where the second
+    ///     segment is a recognised external-id namespace key (unambiguous).
+    /// Returns the item and a null error result on success, or a null item
+    /// with an error result on failure.
     /// </summary>
     private static async Task<(WorkItem? item, IResult? error)> ResolveWorkItemAsync(
         string idSegment,
@@ -1473,14 +1672,37 @@ internal static class WorkItemEndpoints
             var projectPart = idSegment[..colonIdx];
             var externalPart = idSegment[(colonIdx + 1)..];
             if (string.IsNullOrEmpty(projectPart) || string.IsNullOrEmpty(externalPart))
-                return (null, Results.BadRequest(new { error = "composite id format requires non-empty projectId and externalId: '<projectId>:<externalId>'" }));
+                return (null, Results.BadRequest(new { error = "composite id format requires non-empty projectId and externalId: '<projectId>:<externalId>' or '<projectId>:<namespace>:<value>'" }));
             ProjectId pid;
             try { pid = new ProjectId(projectPart); }
             catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
+
+            // Detect the optional namespace qualifier inside externalPart. If
+            // the leading token is a valid namespace key followed by a value,
+            // route to the namespaced lookup; otherwise treat the whole thing
+            // as a bare value (which scans every namespace).
+            if (Validation.TryParseNamespacedExternalId(externalPart, out var ns, out var nsValue) && ns is not null)
+            {
+                try { Validation.ValidateExternalId(nsValue, "externalId"); }
+                catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
+                var byNs = await store.GetByNamespacedExternalIdAsync(pid, ns, nsValue, ct);
+                return byNs is null ? (null, Results.NotFound()) : (byNs, null);
+            }
+
             try { Validation.ValidateExternalId(externalPart, "externalId"); }
             catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
-            var byExtId = await store.GetByExternalIdAsync(pid, externalPart, ct);
-            return byExtId is null ? (null, Results.NotFound()) : (byExtId, null);
+            try
+            {
+                var byExtId = await store.GetByExternalIdAsync(pid, externalPart, ct);
+                return byExtId is null ? (null, Results.NotFound()) : (byExtId, null);
+            }
+            catch (AmbiguousExternalIdException ex)
+            {
+                return (null, Results.BadRequest(new
+                {
+                    error = $"externalId '{externalPart}' is ambiguous in project '{pid}': matches namespaces {string.Join(", ", ex.Namespaces)}. Use '<projectId>:<namespace>:<value>' to disambiguate."
+                }));
+            }
         }
 
         if (!Guid.TryParse(idSegment, out var g))
@@ -1516,6 +1738,9 @@ internal static class WorkItemEndpoints
         return new WorkItemDto(
             item.Id.ToString(),
             item.ExternalId,
+            item.ExternalIds.Count == 0
+                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                : item.ExternalIds.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase),
             item.ProjectId.Value,
             item.Title,
             item.Prompt,
@@ -1703,7 +1928,11 @@ public sealed record CreateWorkItemRequest(
     string[]? DependsOn = null,
     int? MinModelScore = null,
     string? ReleaseId = null,
-    int? Priority = null);
+    int? Priority = null,
+    // Namespaced external IDs. The legacy singular `ExternalId` field is
+    // accepted as a write-shortcut stored under namespace 'legacy'. Sending
+    // both is allowed only when they agree; conflicting values 400.
+    IReadOnlyDictionary<string, string>? ExternalIds = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -1719,6 +1948,18 @@ public sealed record PatchWorkItemRequest(
 
 public sealed record PatchPriorityRequest(int Priority);
 
+/// <summary>
+/// Body for PATCH /workitems/{id}/external-ids.
+///
+/// <see cref="ExternalIds"/> entries with a non-null string are added or
+/// updated; entries with a null value delete that namespace. By default the
+/// patch is MERGED with the existing map; set
+/// <see cref="ReplaceExternalIds"/> to <c>true</c> to overwrite the whole map.
+/// </summary>
+public sealed record PatchExternalIdsRequest(
+    IReadOnlyDictionary<string, string?>? ExternalIds = null,
+    bool? ReplaceExternalIds = null);
+
 public sealed record PutPromptRequest(string Prompt);
 
 public sealed record WorkItemIterationDto(int Iteration, int PromptRevision, DateTimeOffset DispatchedAt);
@@ -1732,6 +1973,7 @@ public sealed record WorkItemTimelineResponse(string WorkItemId, IReadOnlyList<T
 public sealed record WorkItemDto(
     string Id,
     string? ExternalId,
+    IReadOnlyDictionary<string, string> ExternalIds,
     string ProjectId,
     string Title,
     string Prompt,

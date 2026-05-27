@@ -213,6 +213,9 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
     private static WebhookWorkItemPayload MapWorkItem(WorkItem item, string? repositoryUrl, AgentKind projectDefaultAgent) => new(
         Id: item.Id.ToString(),
         ExternalId: item.ExternalId,
+        ExternalIds: item.ExternalIds.Count == 0
+            ? null
+            : item.ExternalIds.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase),
         ProjectId: item.ProjectId.Value,
         Title: item.Title,
         Agent: (item.Agent ?? projectDefaultAgent).Value,
@@ -281,6 +284,9 @@ internal sealed record WebhookPayload(
 internal sealed record WebhookWorkItemPayload(
     string Id,
     string? ExternalId,
+    // Namespaced external IDs. Emitted alongside ExternalId for the deprecation
+    // window so consumers can migrate incrementally; null/omitted when empty.
+    IReadOnlyDictionary<string, string>? ExternalIds,
     string ProjectId,
     string Title,
     string Agent,

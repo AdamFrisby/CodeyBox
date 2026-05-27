@@ -16,7 +16,9 @@ public sealed class WebhookPayloadIncludesExternalIdTests
         ProjectId = new ProjectId("proj"),
         Title = "test",
         Prompt = "do the thing",
-        ExternalId = externalId,
+        ExternalIds = externalId is null
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["legacy"] = externalId },
     };
 
     private static Project MakeProject() => new()

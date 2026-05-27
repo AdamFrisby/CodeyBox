@@ -123,7 +123,7 @@ public sealed class OutboundWebhooksUatTests
             ProjectId = new ProjectId("uat-project"),
             Title = "Webhook UAT item",
             Prompt = "run webhook uat",
-            ExternalId = "UAT-WEBHOOK-1",
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["legacy"] = "UAT-WEBHOOK-1" },
             Agent = AgentKind.Codex,
             BaseBranch = "main",
             WorkBranch = "feature/webhook-uat",

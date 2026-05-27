@@ -54,7 +54,9 @@ public sealed class ResumeEndpointTests : IDisposable
             Title = "t",
             Prompt = "p",
             WorkBranch = workBranch,
-            ExternalId = externalId,
+            ExternalIds = externalId is null
+                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["legacy"] = externalId },
             State = WorkItemState.Cancelled,
             CancellationReason = reason,
             CancellationSource = CancellationSources.Operator,

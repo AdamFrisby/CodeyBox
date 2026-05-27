@@ -167,7 +167,7 @@ public sealed class SseEndpointsTests : IDisposable
         {
             Id = WorkItemId.New(),
             ProjectId = new ProjectId("proj"),
-            ExternalId = externalId,
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["legacy"] = externalId },
             Title = "Composite",
             Prompt = "p",
             State = WorkItemState.Queued,
