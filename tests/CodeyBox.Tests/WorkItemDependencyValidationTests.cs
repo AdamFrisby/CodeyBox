@@ -29,20 +29,20 @@ public sealed class WorkItemDependencyValidationTests
     }
 
     [Fact]
-    public void AreSatisfied_AllDepsTerminal_ReturnsTrue()
+    public void AreSatisfied_AllDepsDone_ReturnsTrue()
     {
         var dep1 = WorkItemId.New();
         var dep2 = WorkItemId.New();
         var states = new Dictionary<WorkItemId, WorkItemState>
         {
             [dep1] = WorkItemState.Done,
-            [dep2] = WorkItemState.Failed,
+            [dep2] = WorkItemState.Done,
         };
         Assert.True(WorkItemDependencies.AreSatisfied([dep1, dep2], states));
     }
 
     [Fact]
-    public void AreSatisfied_OneDepsNonTerminal_ReturnsFalse()
+    public void AreSatisfied_OneDepInProgress_ReturnsFalse()
     {
         var dep1 = WorkItemId.New();
         var dep2 = WorkItemId.New();
@@ -55,6 +55,20 @@ public sealed class WorkItemDependencyValidationTests
     }
 
     [Fact]
+    public void AreSatisfied_OneDepFailed_ReturnsFalse()
+    {
+        // Failed deps block the gate — see SatisfyingStates.
+        var dep1 = WorkItemId.New();
+        var dep2 = WorkItemId.New();
+        var states = new Dictionary<WorkItemId, WorkItemState>
+        {
+            [dep1] = WorkItemState.Done,
+            [dep2] = WorkItemState.Failed,
+        };
+        Assert.False(WorkItemDependencies.AreSatisfied([dep1, dep2], states));
+    }
+
+    [Fact]
     public void AreSatisfied_DepNotInMap_ReturnsFalse()
     {
         var dep = WorkItemId.New();
@@ -62,16 +76,27 @@ public sealed class WorkItemDependencyValidationTests
         Assert.False(WorkItemDependencies.AreSatisfied([dep], states));
     }
 
+    [Fact]
+    public void AreSatisfied_DoneDep_ReturnsTrue()
+    {
+        var dep = WorkItemId.New();
+        var states = new Dictionary<WorkItemId, WorkItemState> { [dep] = WorkItemState.Done };
+        Assert.True(WorkItemDependencies.AreSatisfied([dep], states));
+    }
+
     [Theory]
-    [InlineData(WorkItemState.Done)]
     [InlineData(WorkItemState.Failed)]
     [InlineData(WorkItemState.AuditFailed)]
     [InlineData(WorkItemState.Cancelled)]
-    public void AreSatisfied_EachTerminalState_ReturnsTrue(WorkItemState terminal)
+    [InlineData(WorkItemState.MergeConflictResolutionFailed)]
+    [InlineData(WorkItemState.AbandonedAfterRecoveryAttempts)]
+    public void AreSatisfied_NonSuccessTerminalState_ReturnsFalse(WorkItemState terminal)
     {
+        // Terminal but not Done — dependent must wait for an operator-driven
+        // retry-and-resolve of the parent.
         var dep = WorkItemId.New();
         var states = new Dictionary<WorkItemId, WorkItemState> { [dep] = terminal };
-        Assert.True(WorkItemDependencies.AreSatisfied([dep], states));
+        Assert.False(WorkItemDependencies.AreSatisfied([dep], states));
     }
 
     [Theory]

@@ -113,11 +113,15 @@ public sealed class OrchestratorServiceDepGateTests : IDisposable
         Assert.Contains(dependent.Id, pipeline.Executed);
     }
 
-    // ── Failed dep still satisfies gate ──────────────────────────────────────
+    // ── Failed dep BLOCKS the gate (conservative posture) ─────────────────────
 
     [Fact]
-    public async Task DepInFailedState_DependentIsPickedUp()
+    public async Task DepInFailedState_DependentIsBlocked()
     {
+        // A Failed dep does NOT satisfy the gate. The dependent stays Queued
+        // until an operator retries the parent and it reaches Done. Running
+        // the dependent against a failed prerequisite would burn agent quota
+        // on work that cannot be validated end-to-end.
         var dep = Sample(WorkItemState.Failed);
         var dependent = Sample(WorkItemState.Queued, dep.Id);
         await _store.CreateAsync(dep);
@@ -128,11 +132,174 @@ public sealed class OrchestratorServiceDepGateTests : IDisposable
         await queue.EnqueueAsync(dependent.Id);
 
         await svc.StartAsync(CancellationToken.None);
-        var done = await WaitForStateAsync(dependent.Id, WorkItemState.Done, TimeSpan.FromSeconds(30));
+        await Task.Delay(300);
         await svc.StopAsync(CancellationToken.None);
 
-        Assert.True(done, "Dependent should be picked up when dep is in Failed state");
-        Assert.Contains(dependent.Id, pipeline.Executed);
+        Assert.DoesNotContain(dependent.Id, pipeline.Executed);
+        var still = await _store.GetAsync(dependent.Id);
+        Assert.Equal(WorkItemState.Queued, still!.State);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.AuditFailed)]
+    [InlineData(WorkItemState.Cancelled)]
+    [InlineData(WorkItemState.MergeConflictResolutionFailed)]
+    [InlineData(WorkItemState.AbandonedAfterRecoveryAttempts)]
+    public async Task DepInNonDoneTerminalState_DependentIsBlocked(WorkItemState terminalState)
+    {
+        var dep = Sample(terminalState);
+        var dependent = Sample(WorkItemState.Queued, dep.Id);
+        await _store.CreateAsync(dep);
+        await _store.CreateAsync(dependent);
+
+        var (svc, queue, pipeline, registry) = BuildOrchestrator();
+        using var _ = registry;
+        await queue.EnqueueAsync(dependent.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        await Task.Delay(300);
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(dependent.Id, pipeline.Executed);
+        var still = await _store.GetAsync(dependent.Id);
+        Assert.Equal(WorkItemState.Queued, still!.State);
+    }
+
+    // ── Live-incident reproduction: Queued dep must block dispatch ────────────
+
+    [Fact]
+    public async Task DepInQueuedState_DispatcherRefusesToPickUpDependent()
+    {
+        // Live incident 2026-05-18: a Queued dep let the dependent's worker
+        // proceed into Auditing. The dispatch query MUST honour the dep gate
+        // even when a kick exists for the dependent and a worker slot is
+        // free. We exercise PickNextEligibleAsync directly here so the test
+        // pins the gate decision rather than racing it against the loop.
+        var dep = Sample(WorkItemState.Queued);
+        var dependent = Sample(WorkItemState.Queued, dep.Id);
+        await _store.CreateAsync(dep);
+        await _store.CreateAsync(dependent);
+
+        var (svc, _, _, registry) = BuildOrchestrator(concurrency: 2);
+        using var _r = registry;
+
+        // Pre-claim the dep slot so the priority pickup must consider the
+        // dependent next — mirrors the production race where dep is in
+        // flight on another worker while the dispatcher decides whether
+        // the dependent is eligible. The Queued state in store means the
+        // gate's AreSatisfied check sees a non-satisfying state.
+        svc.MarkDeferredForTest(dep.Id);
+
+        var pick = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+        Assert.Null(pick);
+    }
+
+    // ── Acceptance #1: concurrency=2, only A runs first; B follows after Done ─
+
+    [Fact]
+    public async Task TwoItemsAB_OnlyARunsFirst_ThenBAfterADone()
+    {
+        var a = Sample(WorkItemState.Queued);
+        var b = Sample(WorkItemState.Queued, a.Id);
+        await _store.CreateAsync(a);
+        await _store.CreateAsync(b);
+
+        // Pausable pipeline: A blocks until we release it, so we can observe
+        // that B remains Queued while A is in-flight — i.e. the dep gate
+        // actually held even with a second worker slot free.
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var release = new TaskCompletionSource();
+        var pipeline = new PausablePipelineRunner(_store, release.Task, a.Id);
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, registry, opts,
+            NullLogger<OrchestratorService>.Instance);
+        using var _ = registry;
+
+        await queue.EnqueueAsync(a.Id);
+        await queue.EnqueueAsync(b.Id);
+        await svc.StartAsync(CancellationToken.None);
+
+        // Wait for A to actually enter RunAsync (so its state is at least
+        // Working) before checking B.
+        var aStarted = await pipeline.WaitForEnteredAsync(a.Id, TimeSpan.FromSeconds(5));
+        Assert.True(aStarted, "A should have entered the pipeline");
+
+        // While A is held, the dispatcher's second worker slot is free —
+        // but B's gate must hold because A has not yet reached Done.
+        await Task.Delay(200);
+        var bMid = await _store.GetAsync(b.Id);
+        Assert.Equal(WorkItemState.Queued, bMid!.State);
+        Assert.DoesNotContain(b.Id, pipeline.Executed);
+
+        // Release A → it transitions to Done → B's gate is satisfied →
+        // B is enqueued and runs.
+        release.SetResult();
+        var bDone = await WaitForStateAsync(b.Id, WorkItemState.Done, TimeSpan.FromSeconds(30));
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.True(bDone, "B should complete after A reaches Done");
+        Assert.Contains(a.Id, pipeline.Executed);
+        Assert.Contains(b.Id, pipeline.Executed);
+    }
+
+    // ── Acceptance #2: items without deps continue to dispatch normally ───────
+
+    [Fact]
+    public async Task ItemsWithoutDeps_DispatchNormally()
+    {
+        var a = Sample();
+        var b = Sample();
+        var c = Sample();
+        await _store.CreateAsync(a);
+        await _store.CreateAsync(b);
+        await _store.CreateAsync(c);
+
+        var (svc, queue, pipeline, registry) = BuildOrchestrator(concurrency: 2);
+        using var _ = registry;
+        await queue.EnqueueAsync(a.Id);
+        await queue.EnqueueAsync(b.Id);
+        await queue.EnqueueAsync(c.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        var allDone = await WaitForStateAsync(c.Id, WorkItemState.Done, TimeSpan.FromSeconds(30))
+            && await WaitForStateAsync(b.Id, WorkItemState.Done, TimeSpan.FromSeconds(5))
+            && await WaitForStateAsync(a.Id, WorkItemState.Done, TimeSpan.FromSeconds(5));
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.True(allDone);
+        Assert.Contains(a.Id, pipeline.Executed);
+        Assert.Contains(b.Id, pipeline.Executed);
+        Assert.Contains(c.Id, pipeline.Executed);
+    }
+
+    // ── Acceptance #4: PickNextEligibleAsync recomputes on each pickup ────────
+
+    [Fact]
+    public async Task PickNextEligible_RecomputesAfterDepStateChanges()
+    {
+        // Start with dep=Queued and dependent=Queued. PickNextEligibleAsync
+        // must return null (gate not satisfied). Flip dep to Done, call
+        // again — must now return the dependent. Confirms the gate is
+        // recomputed from a fresh store snapshot per pickup, not from a
+        // cached boolean.
+        var dep = Sample(WorkItemState.Queued);
+        var dependent = Sample(WorkItemState.Queued, dep.Id);
+        await _store.CreateAsync(dep);
+        await _store.CreateAsync(dependent);
+
+        var (svc, _, _, registry) = BuildOrchestrator();
+        using var _r = registry;
+
+        var first = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+        Assert.Equal(dep.Id, first);
+
+        // Flip dep to Done and pretend it's no longer in flight.
+        await _store.UpdateAsync(dep.With(WorkItemState.Done));
+
+        var second = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+        Assert.Equal(dependent.Id, second);
     }
 
     // ── Double-enqueue: same item not processed twice concurrently ────────────
@@ -195,6 +362,44 @@ internal sealed class FakePipelineRunner : IPipelineRunner
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         _executed.Add(item.Id);
+        await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+    }
+}
+
+/// <summary>
+/// Pipeline runner that pauses RunAsync for a specified work item until an
+/// external <c>release</c> signal fires. Lets tests observe the dispatcher's
+/// behaviour mid-flight — specifically that a dep-gated dependent stays
+/// Queued while its parent is still in flight.
+/// </summary>
+internal sealed class PausablePipelineRunner : IPipelineRunner
+{
+    private readonly IWorkItemStore _store;
+    private readonly Task _release;
+    private readonly WorkItemId _pauseFor;
+    private readonly ConcurrentBag<WorkItemId> _executed = new();
+    private readonly ConcurrentDictionary<WorkItemId, TaskCompletionSource> _enteredSignals = new();
+
+    public IReadOnlyCollection<WorkItemId> Executed => _executed;
+
+    public PausablePipelineRunner(IWorkItemStore store, Task release, WorkItemId pauseFor)
+    {
+        _store = store;
+        _release = release;
+        _pauseFor = pauseFor;
+    }
+
+    public async Task<bool> WaitForEnteredAsync(WorkItemId id, TimeSpan timeout)
+    {
+        var tcs = _enteredSignals.GetOrAdd(id, _ => new TaskCompletionSource());
+        return await Task.WhenAny(tcs.Task, Task.Delay(timeout)) == tcs.Task;
+    }
+
+    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+    {
+        _executed.Add(item.Id);
+        _enteredSignals.GetOrAdd(item.Id, _ => new TaskCompletionSource()).TrySetResult();
+        if (item.Id == _pauseFor) await _release;
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
     }
 }

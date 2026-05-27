@@ -9,11 +9,17 @@ namespace CodeyBox.Orchestrator;
 public static class WorkItemDependencies
 {
     /// <summary>
-    /// States that count as "satisfied" for dependency gating. A dependent
-    /// item may be picked up once ALL of its DependsOn items are in one of
-    /// these states, regardless of which terminal state they reached — if a
-    /// dependency fails, its dependents still become eligible so an operator
-    /// can retry the parent and the dependents will run automatically.
+    /// States from which a work item cannot exit without explicit operator
+    /// action (retry / uncancel / resume). Used by callers that need to know
+    /// "is this item terminal?" — e.g. PATCH /priority refusing to mutate a
+    /// terminal row, the SSE stream closing its connection on terminal arrival.
+    ///
+    /// <para>
+    /// Distinct from <see cref="SatisfyingStates"/>: terminal does NOT imply
+    /// satisfying. A Failed dependency is terminal (the item is parked until
+    /// an operator retries it) but does NOT satisfy a dependent's gate — the
+    /// dependent waits until the parent reaches Done.
+    /// </para>
     /// </summary>
     public static readonly IReadOnlySet<WorkItemState> TerminalStates =
         new HashSet<WorkItemState>
@@ -27,8 +33,30 @@ public static class WorkItemDependencies
         };
 
     /// <summary>
+    /// States that count as "satisfied" for the dependsOn gate. A dependent
+    /// item may be picked up once every ID in its DependsOn maps to one of
+    /// these states.
+    ///
+    /// <para>
+    /// Only successful completion (<see cref="WorkItemState.Done"/>) satisfies
+    /// the gate by default — Failed / AuditFailed / Cancelled /
+    /// MergeConflictResolutionFailed / AbandonedAfterRecoveryAttempts all
+    /// block. This is the conservative posture: a dependent built on a
+    /// failed prerequisite cannot be validated end-to-end, so running it
+    /// burns agent quota on speculative work. Operators must retry-and-
+    /// resolve the failed parent (or uncancel a cascade-cancelled one)
+    /// before the dependent becomes eligible.
+    /// </para>
+    /// </summary>
+    public static readonly IReadOnlySet<WorkItemState> SatisfyingStates =
+        new HashSet<WorkItemState>
+        {
+            WorkItemState.Done,
+        };
+
+    /// <summary>
     /// Returns true iff every ID in <paramref name="dependsOn"/> maps to a
-    /// terminal state in <paramref name="statesById"/>.
+    /// <see cref="SatisfyingStates"/> entry in <paramref name="statesById"/>.
     /// </summary>
     public static bool AreSatisfied(
         IReadOnlyList<WorkItemId> dependsOn,
@@ -36,7 +64,7 @@ public static class WorkItemDependencies
     {
         foreach (var id in dependsOn)
         {
-            if (!statesById.TryGetValue(id, out var state) || !TerminalStates.Contains(state))
+            if (!statesById.TryGetValue(id, out var state) || !SatisfyingStates.Contains(state))
                 return false;
         }
         return true;
@@ -135,8 +163,9 @@ public static class WorkItemDependencies
     /// <summary>
     /// Returns all Queued items from <paramref name="allItems"/> whose
     /// DependsOn includes <paramref name="completedId"/> and whose every
-    /// dependency is now in a terminal state per <paramref name="statesById"/>.
-    /// These items are ready to be enqueued for processing.
+    /// dependency now satisfies the gate per <paramref name="statesById"/>
+    /// (see <see cref="SatisfyingStates"/>). These items are ready to be
+    /// enqueued for processing.
     /// </summary>
     public static IEnumerable<WorkItem> FindSatisfiedDependents(
         WorkItemId completedId,
