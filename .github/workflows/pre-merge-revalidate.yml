@@ -1,0 +1,191 @@
+# Pre-merge re-validation gate (CI layer).
+#
+# Background: GitHub's textual `mergeable` check only flags conflicts. A PR
+# whose CI was green when it was opened can still break the post-merge tree
+# when `main` moves underneath — a helper renamed on `main` that the PR
+# still calls, a drifted constant the PR's tests didn't reference, etc.
+# PR-time CI never reruns when `main` advances, so the green checkmark goes
+# stale and the auto-merger has no signal that something has gone wrong.
+#
+# This workflow plugs that gap on the CI side, complementing the in-process
+# IPreMergeVerifier gate in the orchestrator. After every push to `main`,
+# we enumerate open PRs and for each one: rebase its head onto the new
+# `main` in a throwaway worktree, build, and run the fast test target.
+# The outcome is reported as a commit status (`codeybox/pre-merge-revalidate`)
+# on the PR head so the auto-merger / branch-protection rules can refuse
+# merge until the rebased build is green again.
+#
+# Acceptance-criteria mapping (matches the in-CodeyBox tests):
+#   1. compile-fail after rebase → status FAILURE with "rebased build failed"
+#   2. previously-green test now red after rebase → same FAILURE status
+#   3. textual rebase conflict → status FAILURE with "rebase failed"
+#   4. all of the above produce an operator-visible signal on the PR
+
+name: pre-merge re-validate
+
+on:
+  push:
+    branches: [main]
+  # Manual trigger so an operator can re-run after a half-failed deployment
+  # without waiting for another commit on main.
+  workflow_dispatch:
+
+permissions:
+  # Required to POST a commit status on PR heads we don't own (forks).
+  statuses: write
+  pull-requests: read
+  contents: read
+
+concurrency:
+  # Two pushes to main in quick succession would otherwise double-spend the
+  # PR fan-out budget. Keep only the most recent run; cancel older ones.
+  group: pre-merge-revalidate
+  cancel-in-progress: true
+
+jobs:
+  enumerate:
+    name: list open PRs
+    runs-on: ubuntu-latest
+    outputs:
+      prs: ${{ steps.list.outputs.prs }}
+    steps:
+      - id: list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Open PRs targeting the default branch, draft PRs included
+          # (operators sometimes auto-merge approved drafts).
+          prs=$(gh api -X GET \
+            "repos/${REPO}/pulls" \
+            -F state=open \
+            -F per_page=100 \
+            --jq '[.[] | select(.base.ref == "main") | {number, head_sha: .head.sha, head_ref: .head.ref, head_repo: .head.repo.full_name}]')
+          echo "Found PRs to re-validate:"
+          echo "${prs}" | jq -r '.[] | "  #\(.number) @ \(.head_sha[0:8]) (\(.head_ref))"'
+          # The matrix-strategy input is a JSON array.
+          {
+            printf 'prs<<EOF\n%s\nEOF\n' "${prs}"
+          } >> "$GITHUB_OUTPUT"
+
+  revalidate:
+    name: rebase + build + test
+    needs: enumerate
+    if: ${{ needs.enumerate.outputs.prs != '[]' && needs.enumerate.outputs.prs != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Each PR is independent; isolate failures so one red PR doesn't mask
+      # the rest.
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        pr: ${{ fromJSON(needs.enumerate.outputs.prs) }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      STATUS_CONTEXT: codeybox/pre-merge-revalidate
+    steps:
+      - name: check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # Need full history so the rebase has the merge-base available.
+          fetch-depth: 0
+
+      - name: post pending status
+        run: |
+          gh api -X POST \
+            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
+            -f state=pending \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="rebasing onto current main" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: fetch PR head
+        id: fetch
+        run: |
+          set -euo pipefail
+          # `pull/<num>/head` is the merged-from ref GitHub maintains for
+          # every open PR, including forks. We fetch into a local
+          # ref so the subsequent rebase has something to operate on.
+          git fetch origin "pull/${{ matrix.pr.number }}/head:codeybox/pr-${{ matrix.pr.number }}"
+          git checkout "codeybox/pr-${{ matrix.pr.number }}"
+
+      - name: rebase onto current main
+        id: rebase
+        run: |
+          set -euo pipefail
+          git -c user.name=codeybox-ci \
+              -c user.email=codeybox-ci@invalid \
+              rebase origin/main
+        continue-on-error: true
+
+      - name: report textual rebase failure
+        if: steps.rebase.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          gh api -X POST \
+            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
+            -f state=failure \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="rebase failed — needs operator rebase" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Exit non-zero so the workflow surfaces the failure on the Actions
+          # tab too, not only as a commit status.
+          exit 1
+
+      - name: setup .NET
+        if: steps.rebase.outcome == 'success'
+        uses: actions/setup-dotnet@v4
+        with:
+          # Tracks Directory.Build.props's net10.0 target.
+          dotnet-version: '10.0.x'
+
+      - name: build
+        id: build
+        if: steps.rebase.outcome == 'success'
+        run: dotnet build CodeyBox.slnx --configuration Release
+        continue-on-error: true
+
+      - name: test
+        id: test
+        if: steps.rebase.outcome == 'success' && steps.build.outcome == 'success'
+        # Tests are intentionally the *fast* target. The orchestrator's
+        # IPreMergeVerifier runs the same kind of fast suite — this stays
+        # consistent so a CI green here means the in-process gate would also
+        # see green on the same tree.
+        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build
+        continue-on-error: true
+
+      - name: report rebased build failure
+        if: steps.rebase.outcome == 'success' && steps.build.outcome != 'success'
+        run: |
+          gh api -X POST \
+            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
+            -f state=failure \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="rebased build failed — main moved, PR breaks compile" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          exit 1
+
+      - name: report rebased test failure
+        if: steps.rebase.outcome == 'success' && steps.build.outcome == 'success' && steps.test.outcome != 'success'
+        run: |
+          gh api -X POST \
+            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
+            -f state=failure \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="rebased tests failed — main moved, PR breaks tests" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          exit 1
+
+      - name: report success
+        if: steps.rebase.outcome == 'success' && steps.build.outcome == 'success' && steps.test.outcome == 'success'
+        run: |
+          gh api -X POST \
+            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
+            -f state=success \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="rebased build + tests green against current main" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

@@ -38,17 +38,32 @@ public interface IPreMergeVerifier
     Task<PreMergeVerifyResult> VerifyAsync(PreMergeVerifyRequest request, CancellationToken ct);
 }
 
-/// <summary>Inputs to <see cref="IPreMergeVerifier.VerifyAsync"/>.</summary>
+/// <summary>
+/// Inputs to <see cref="IPreMergeVerifier.VerifyAsync"/>. Only the fields the
+/// verifier needs to do its job: which repo + which sha to verify, and the
+/// argv to run. The full <see cref="Project"/> is intentionally not exposed —
+/// the gate's contract is "verify this tree" not "do anything else with this
+/// project."
+/// </summary>
 public sealed record PreMergeVerifyRequest
 {
     public required WorkItemId WorkItemId { get; init; }
-    public required Project Project { get; init; }
+    /// <summary>The project id the work item belongs to. Available for logging only.</summary>
+    public required ProjectId ProjectId { get; init; }
     /// <summary>Opaque repository identifier resolved by the host's git module.</summary>
     public required string RepositoryId { get; init; }
     public required string BaseBranch { get; init; }
     public required string WorkBranch { get; init; }
     /// <summary>SHA of the local merge commit on <see cref="BaseBranch"/> at the time of verification.</summary>
     public required string MergeSha { get; init; }
+    /// <summary>
+    /// Operator-configured argv to run as the build/test command. Equals
+    /// <see cref="ProjectUpstream.PreMergeVerifyArgv"/> at the time the
+    /// orchestrator invokes the gate. Empty argv means "no verification";
+    /// the orchestrator skips the gate entirely in that case so verifiers
+    /// can assume <c>Argv.Count &gt; 0</c>.
+    /// </summary>
+    public required IReadOnlyList<string> Argv { get; init; }
 }
 
 /// <summary>Outcome of <see cref="IPreMergeVerifier.VerifyAsync"/>.</summary>

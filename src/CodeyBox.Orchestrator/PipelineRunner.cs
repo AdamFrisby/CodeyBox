@@ -4667,10 +4667,12 @@ public sealed class PipelineRunner : IPipelineRunner
             // that the PR still calls under its old name). When a verifier is
             // registered AND the project has opted in via PreMergeVerifyArgv,
             // re-validate the post-local-merge tree before the auto-merge API
-            // call. A failure here parks the item at
-            // MergeConflictResolutionFailed with a `pre-merge verify: …`
-            // prefix so operators can distinguish this from race recovery and
-            // LLM-merger failure modes.
+            // call. A failure here is signalled by throwing
+            // MergeConflictResolutionFailedException — the centralized catch
+            // handler (see the catch at the top of RunAsync) parks the work
+            // item at MergeConflictResolutionFailed with the same bookkeeping
+            // every other merge-conflict-resolution failure goes through, so
+            // there is exactly one park-and-publish path to maintain.
             if (project.Upstream.AutoMerge &&
                 _preMergeVerifier is not null &&
                 project.Upstream.PreMergeVerifyArgv.Count > 0 &&
@@ -4682,11 +4684,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     verifyResult = await _preMergeVerifier.VerifyAsync(new PreMergeVerifyRequest
                     {
                         WorkItemId = item.Id,
-                        Project = project,
+                        ProjectId = project.Id,
                         RepositoryId = repoId,
                         BaseBranch = baseBranch,
                         WorkBranch = workBranch,
                         MergeSha = mergeSha!,
+                        Argv = project.Upstream.PreMergeVerifyArgv,
                     }, ct);
                 }
                 catch (OperationCanceledException)
@@ -4714,20 +4717,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     _log.LogWarning(
                         "Work item {Id} blocked from auto-merge by pre-merge verify ({Mode}): {Reason}",
                         item.Id, verifyResult.FailureMode, verifyResult.FailureReason);
-                    var current = await _store.GetAsync(item.Id, ct) ?? item;
-                    var failed = current.With(WorkItemState.MergeConflictResolutionFailed, parkReason);
-                    await _store.UpdateAsync(failed, ct);
-                    var revision = await BuildTerminalRevisionAsync(failed, ct);
-                    await _webhooks.PublishAsync(new WebhookEvent
-                    {
-                        Event = "work_item.merge_conflict_resolution_failed",
-                        WorkItem = failed,
-                        Project = project,
-                        PromptRevision = revision?.PromptRevision,
-                        RevisionAtCompletion = revision?.RevisionAtCompletion,
-                        RevisionMatches = revision?.RevisionMatches,
-                    }, ct);
-                    return;
+                    throw new MergeConflictResolutionFailedException(parkReason);
                 }
 
                 _log.LogInformation(

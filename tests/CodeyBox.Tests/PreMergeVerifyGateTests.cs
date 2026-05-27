@@ -267,6 +267,156 @@ public sealed class PreMergeVerifyGateTests : IDisposable
     }
 
     /// <summary>
+    /// The orchestrator MUST pass the right fields on PreMergeVerifyRequest so
+    /// the verifier can identify the repo/branches/sha and the operator-
+    /// configured argv to run. A bug that swaps base/work or forwards an
+    /// empty merge sha would leave the verifier looking at the wrong tree —
+    /// the gate's pass/fail outcome on stubs wouldn't notice. Lock the fields
+    /// in directly.
+    /// </summary>
+    [Fact]
+    public async Task RequestCarriesCorrectFieldsForVerifier()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var verifier = new StubPreMergeVerifier { Result = PreMergeVerifyResult.Ok() };
+        var remote = new RacingUpstreamRemote
+        {
+            SeedRepoPath = seed,
+            ResponsePlan = { new RacingResponse(AutoMergeRaced: false, AdvanceSeedBeforeReturning: false) },
+        };
+        var factory = new SingleRemoteFactory(remote);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "racing-upstream",
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PreMergeVerifyArgv = ["dotnet", "build", "--no-restore"],
+            },
+            upstreamFactory: factory,
+            mergeStrategy: [MergeStrategy.RealMerge],
+            preMergeVerifier: verifier);
+        remote.BareRepoRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("hello.txt", "hello\n"));
+
+        var item = NewItem("feature/premerge-fields");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var req = Assert.Single(verifier.Requests);
+        Assert.Equal(item.Id, req.WorkItemId);
+        Assert.Equal(new ProjectId("test-project"), req.ProjectId);
+        Assert.Equal("main", req.BaseBranch);
+        Assert.Equal("feature/premerge-fields", req.WorkBranch);
+        Assert.False(string.IsNullOrEmpty(req.RepositoryId));
+        Assert.False(string.IsNullOrEmpty(req.MergeSha));
+        // 40-char SHA-1 (LocalGitHost-produced); a regression that forwarded
+        // an empty/branch-name string instead would fail this check.
+        Assert.Matches("^[0-9a-f]{40}$", req.MergeSha);
+        Assert.Equal(new[] { "dotnet", "build", "--no-restore" }, req.Argv);
+    }
+
+    /// <summary>
+    /// Symmetric guard for <see cref="NoArgvConfigured_VerifierIsNotInvoked"/>:
+    /// when the project has populated PreMergeVerifyArgv but the host did NOT
+    /// register an IPreMergeVerifier (DI returns null), the orchestrator MUST
+    /// skip the gate rather than failing the merge or silently routing
+    /// through the missing verifier. This locks the behaviour in so that
+    /// flipping the AND to an OR — or making the missing verifier fatal —
+    /// gets caught by tests.
+    /// </summary>
+    [Fact]
+    public async Task ArgvConfiguredButVerifierMissing_GateIsSkipped()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var remote = new RacingUpstreamRemote
+        {
+            SeedRepoPath = seed,
+            ResponsePlan = { new RacingResponse(AutoMergeRaced: false, AdvanceSeedBeforeReturning: false) },
+        };
+        var factory = new SingleRemoteFactory(remote);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "racing-upstream",
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PreMergeVerifyArgv = ["dotnet", "build"],
+            },
+            upstreamFactory: factory,
+            mergeStrategy: [MergeStrategy.RealMerge],
+            preMergeVerifier: null);
+        remote.BareRepoRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("hello.txt", "hello\n"));
+
+        var item = NewItem("feature/premerge-no-verifier");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, remote.CompleteCalls);
+    }
+
+    /// <summary>
+    /// OperationCanceledException raised by the verifier (operator cancel,
+    /// host shutdown) MUST propagate — it is NOT a build/test failure.
+    /// Catching it as if it were one would park items at shutdown instead of
+    /// leaving them mid-flight for the recovery loop to pick up on restart.
+    /// </summary>
+    [Fact]
+    public async Task VerifierThrowsOperationCanceledException_DoesNotParkAsBuildFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        using var cts = new CancellationTokenSource();
+        var verifier = new StubPreMergeVerifier
+        {
+            ThrowOnVerify = new OperationCanceledException(cts.Token),
+        };
+        var remote = new RacingUpstreamRemote { SeedRepoPath = seed };
+        var factory = new SingleRemoteFactory(remote);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "racing-upstream",
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PreMergeVerifyArgv = ["dotnet", "build"],
+            },
+            upstreamFactory: factory,
+            mergeStrategy: [MergeStrategy.RealMerge],
+            preMergeVerifier: verifier);
+        remote.BareRepoRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("hello.txt", "hello\n"));
+
+        var item = NewItem("feature/premerge-oce");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        // The exact terminal state on cancellation depends on RunAsync's
+        // attributed catch handlers, but it MUST NOT be parked at
+        // MergeConflictResolutionFailed with a "rebased build failed" prefix
+        // — that would misrepresent shutdown/cancellation as a real test
+        // failure on the operator-facing surface.
+        if (final!.State == WorkItemState.MergeConflictResolutionFailed)
+        {
+            Assert.DoesNotContain(
+                "pre-merge verify: rebased build failed",
+                final.LastError ?? string.Empty);
+        }
+        Assert.Equal(0, remote.CompleteCalls);
+    }
+
+    /// <summary>
     /// If the verifier itself throws (a host I/O error, sandbox bring-up
     /// failure, etc.) we MUST park rather than silently auto-merge — the
     /// gate is a refuse-on-doubt safety net, not a best-effort hint.

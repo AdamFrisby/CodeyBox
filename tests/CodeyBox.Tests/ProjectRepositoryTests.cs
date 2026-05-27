@@ -373,6 +373,11 @@ public sealed class ProjectRepositoryTests
                         MergeMethod = "squash",
                         AutoMerge = true,
                         PullRequestTitleTemplate = "[bot] {title}",
+                        // The pre-merge CI gate reads this list — populate it
+                        // here so the binding is locked in. A regression that
+                        // dropped this field would leave operators with a
+                        // gate silently disabled despite their config setting it.
+                        PreMergeVerifyArgv = ["dotnet", "build", "--no-restore"],
                     },
                 },
             ],
@@ -384,6 +389,7 @@ public sealed class ProjectRepositoryTests
         Assert.Equal("squash", p.Upstream.MergeMethod);
         Assert.True(p.Upstream.AutoMerge);
         Assert.Equal("[bot] {title}", p.Upstream.PullRequestTitleTemplate);
+        Assert.Equal(new[] { "dotnet", "build", "--no-restore" }, p.Upstream.PreMergeVerifyArgv);
     }
 
     [Fact]
