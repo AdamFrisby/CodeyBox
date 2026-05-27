@@ -140,19 +140,19 @@ public sealed class AgentConfigHotReloadAuditLogTests : IDisposable
         int claudeCap,
         List<AgentMembershipOptions> classMembers,
         double burnDefault) => new()
-    {
-        AgentConcurrency = new AgentConcurrencyOptions
         {
-            Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = claudeCap } },
-        },
-        AgentBurnEstimator = new AgentBurnEstimatorOptions
-        {
-            DefaultBurnPercentPerItem = new(StringComparer.OrdinalIgnoreCase)
+            AgentConcurrency = new AgentConcurrencyOptions
             {
-                ["claude"] = burnDefault,
+                Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = claudeCap } },
             },
-        },
-        AgentClasses =
+            AgentBurnEstimator = new AgentBurnEstimatorOptions
+            {
+                DefaultBurnPercentPerItem = new(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["claude"] = burnDefault,
+                },
+            },
+            AgentClasses =
         [
             new AgentClassOptions
             {
@@ -160,7 +160,7 @@ public sealed class AgentConfigHotReloadAuditLogTests : IDisposable
                 Members = classMembers,
             },
         ],
-    };
+        };
 
     private static async Task<CoordinatorContext> StartCoordinatorAsync(CodeyBoxOptions initial)
     {
