@@ -4,7 +4,7 @@
 
 A *work item* is the unit of work CodeyBox submits to an agent. Each item belongs to a project, carries a natural-language prompt, and progresses through a defined [state machine](architecture.md).
 
-Work items can declare that they depend on other work items. The orchestrator will not start a dependent until every item it depends on has reached a **terminal state**.
+Work items can declare that they depend on other work items. The orchestrator will not start a dependent until every item it depends on has reached `Done` — successful completion. Failed / AuditFailed / Cancelled prerequisites block dependents until an operator retries-and-resolves them.
 
 ---
 
@@ -46,19 +46,23 @@ POST /workitems
 
 ---
 
-## Terminal states and the dependency gate
+## The dependency gate
 
-A dependency is **satisfied** when it has reached any of these terminal states:
+A dependency is **satisfied** when it has reached `Done` — successful end-to-end completion. The gate is recomputed from the live store on every dispatch tick, so a dep that lands after a kick is honored on the very next pickup; no cached `dependsOnSatisfied` flag is consulted.
 
-| State | Meaning |
-|-------|---------|
-| `Done` | Completed successfully |
-| `Failed` | Pipeline error (work, audit, or merge phase) |
-| `AuditFailed` | Audit did not converge within `MaxIterations` |
-| `Cancelled` | Operator-requested stop or parent-cascaded cancel (see below) |
-| `AbandonedAfterRecoveryAttempts` | Recovery loop exceeded `MaxRecoveryAttempts`; operator intervention needed |
+| Dep state | Gate satisfied? | Operator action |
+|-----------|-----------------|-----------------|
+| `Done` | ✅ Yes | None — dependent dispatches automatically |
+| `Failed` | ❌ No | `POST /workitems/{depId}/retry` and let it reach `Done` |
+| `AuditFailed` | ❌ No | `POST /workitems/{depId}/retry` (typically after raising `Audit.MaxIterations` or amending the prompt) |
+| `MergeConflictResolutionFailed` | ❌ No | Resolve the conflict manually, then `POST /workitems/{depId}/retry` |
+| `Cancelled` | ❌ No | `POST /workitems/{depId}/uncancel` (cascade) or `/resume` (operator-cancelled), then let it reach `Done` |
+| `AbandonedAfterRecoveryAttempts` | ❌ No | Investigate the stuck root cause, then `POST /workitems/{depId}/retry` |
+| Any non-terminal state | ❌ No | None — wait for completion |
 
-The gate is satisfied by *any* terminal state, not only `Done`. This is a deliberate design choice: if an upstream item fails, its dependents become eligible so the operator can inspect, manually retry the failed parent, and let the queue resume automatically — no manual re-enqueuing needed.
+Rationale: a dependent built on a failed prerequisite cannot be validated end-to-end. Running it anyway burns agent quota on speculative work the operator will likely discard once the parent is retried. The conservative posture matches the CB-12 quota-conservation policy.
+
+If the operator wants to keep a dependent alive after deciding the parent is no longer needed, they can edit the dependent's `dependsOn` (PATCH endpoint) to drop the entry — the gate then re-evaluates without the parent.
 
 ---
 
@@ -78,9 +82,10 @@ Cycle detection runs DFS over the full dependency graph (O(V + E) where V is the
 
 ## Enqueueing behaviour
 
-* **At create time**: if all dependencies are already terminal (or there are none), the item is enqueued immediately. Otherwise it is persisted in `Queued` state but not placed in the worker queue.
-* **When a dependency reaches a terminal state**: the orchestrator scans for `Queued` items whose full dependency set is now satisfied and enqueues them automatically.
-* **At startup (recovery)**: `Queued` items with unsatisfied dependencies are not re-enqueued; they will be picked up when their in-progress dependencies complete.
+* **At create time**: if all dependencies are already `Done` (or there are none), the item is enqueued immediately. Otherwise it is persisted in `Queued` state but not placed in the worker queue.
+* **When a dependency reaches `Done`**: the orchestrator scans for `Queued` items whose full dependency set is now satisfied and enqueues them automatically. Reaching a non-`Done` terminal state (`Failed`, `AuditFailed`, `Cancelled`, …) does NOT enqueue dependents — they wait until an operator retries-and-resolves the parent.
+* **At startup (recovery)**: `Queued` items with unsatisfied dependencies are not re-enqueued; they will be picked up when their in-progress dependencies reach `Done`.
+* **At every dispatch tick**: the dispatcher refuses to pick up a Queued item with unsatisfied `dependsOn`, even when a kick exists for the item and a worker slot is free. The gate is the single source of truth for ordering — no path bypasses it.
 
 ---
 
@@ -205,7 +210,7 @@ Returns the list of work items that have this item in their `dependsOn`. Useful 
 }
 ```
 
-`dependsOnSatisfied` is `true` when every item in `dependsOn` is in a terminal state. For items with no dependencies it is always `true`.
+`dependsOnSatisfied` is `true` when every item in `dependsOn` is in `Done`. For items with no dependencies it is always `true`. Failed / AuditFailed / Cancelled deps leave it `false` until an operator retries the parent to success.
 
 ### `GET /workitems/{id}/dependents`
 

@@ -1137,8 +1137,10 @@ Audit states only appear when the deployment has registered auditors (see
 [`audit.md`](audit.md)).
 
 `dependsOn` lists the IDs of work items this item depends on.
-`dependsOnSatisfied` is `true` when all dependencies are in a terminal
-state (or when there are no dependencies). See [`work-items.md`](work-items.md).
+`dependsOnSatisfied` is `true` when every dependency has reached `Done`
+(or when there are no dependencies). Failed / AuditFailed / Cancelled
+deps leave it `false` — the operator must retry-and-resolve the parent
+before the dependent can run. See [`work-items.md`](work-items.md).
 
 ## Configuration
 

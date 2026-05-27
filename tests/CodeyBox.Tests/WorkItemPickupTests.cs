@@ -81,10 +81,12 @@ public sealed class WorkItemPickupTests : IDisposable
     }
 
     [Fact]
-    public async Task ItemWithFailedDep_IsSatisfied()
+    public async Task ItemWithFailedDep_IsNotSatisfied()
     {
-        // A Failed dependency still satisfies the gate — operator can retry
-        // the parent and dependents become eligible automatically.
+        // A Failed dependency BLOCKS the gate — operator must retry-and-
+        // resolve the parent (so it reaches Done) before dependents become
+        // eligible. Running a dependent against a failed prerequisite would
+        // burn agent quota on work that cannot be validated end-to-end.
         var dep = Sample(WorkItemState.Failed);
         var dependent = Sample(WorkItemState.Queued, dep.Id);
         await _store.CreateAsync(dep);
@@ -94,11 +96,11 @@ public sealed class WorkItemPickupTests : IDisposable
         await foreach (var i in _store.ListAsync()) all.Add(i);
         var states = WorkItemDependencies.BuildStateMap(all);
 
-        Assert.True(WorkItemDependencies.AreSatisfied(dependent.DependsOn, states));
+        Assert.False(WorkItemDependencies.AreSatisfied(dependent.DependsOn, states));
     }
 
     [Fact]
-    public async Task ItemWithAuditFailedDep_IsSatisfied()
+    public async Task ItemWithAuditFailedDep_IsNotSatisfied()
     {
         var dep = Sample(WorkItemState.AuditFailed);
         var dependent = Sample(WorkItemState.Queued, dep.Id);
@@ -109,11 +111,11 @@ public sealed class WorkItemPickupTests : IDisposable
         await foreach (var i in _store.ListAsync()) all.Add(i);
         var states = WorkItemDependencies.BuildStateMap(all);
 
-        Assert.True(WorkItemDependencies.AreSatisfied(dependent.DependsOn, states));
+        Assert.False(WorkItemDependencies.AreSatisfied(dependent.DependsOn, states));
     }
 
     [Fact]
-    public async Task ItemWithCancelledDep_IsSatisfied()
+    public async Task ItemWithCancelledDep_IsNotSatisfied()
     {
         var dep = Sample(WorkItemState.Cancelled);
         var dependent = Sample(WorkItemState.Queued, dep.Id);
@@ -124,7 +126,7 @@ public sealed class WorkItemPickupTests : IDisposable
         await foreach (var i in _store.ListAsync()) all.Add(i);
         var states = WorkItemDependencies.BuildStateMap(all);
 
-        Assert.True(WorkItemDependencies.AreSatisfied(dependent.DependsOn, states));
+        Assert.False(WorkItemDependencies.AreSatisfied(dependent.DependsOn, states));
     }
 
     // ── FindSatisfiedDependents ───────────────────────────────────────────────
@@ -169,8 +171,10 @@ public sealed class WorkItemPickupTests : IDisposable
     }
 
     [Fact]
-    public async Task FindSatisfiedDependents_BothDepsTerminal_ReturnsDependentOnce()
+    public async Task FindSatisfiedDependents_OneDepFailed_ReturnsNone()
     {
+        // dep2 ended in Failed — the dependent stays blocked even though
+        // dep1 reached Done. Operator must retry-and-resolve dep2 first.
         var dep1 = Sample(WorkItemState.Done);
         var dep2 = Sample(WorkItemState.Failed);
         var dependent = Sample(WorkItemState.Queued, dep1.Id, dep2.Id);
@@ -182,7 +186,26 @@ public sealed class WorkItemPickupTests : IDisposable
         await foreach (var i in _store.ListAsync()) all.Add(i);
         var states = WorkItemDependencies.BuildStateMap(all);
 
-        // Trigger from dep2 becoming terminal.
+        // Trigger from dep2 reaching Failed: dependent must NOT be returned.
+        var ready = WorkItemDependencies.FindSatisfiedDependents(dep2.Id, all, states).ToList();
+        Assert.Empty(ready);
+    }
+
+    [Fact]
+    public async Task FindSatisfiedDependents_BothDepsDone_ReturnsDependentOnce()
+    {
+        var dep1 = Sample(WorkItemState.Done);
+        var dep2 = Sample(WorkItemState.Done);
+        var dependent = Sample(WorkItemState.Queued, dep1.Id, dep2.Id);
+        await _store.CreateAsync(dep1);
+        await _store.CreateAsync(dep2);
+        await _store.CreateAsync(dependent);
+
+        var all = new List<WorkItem>();
+        await foreach (var i in _store.ListAsync()) all.Add(i);
+        var states = WorkItemDependencies.BuildStateMap(all);
+
+        // Trigger from dep2 becoming Done — dependent is now eligible.
         var ready = WorkItemDependencies.FindSatisfiedDependents(dep2.Id, all, states).ToList();
         Assert.Single(ready);
         Assert.Equal(dependent.Id, ready[0].Id);

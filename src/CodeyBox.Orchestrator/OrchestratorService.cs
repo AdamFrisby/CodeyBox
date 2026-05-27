@@ -395,14 +395,27 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     /// <summary>
-    /// Streams dispatch-eligible non-terminal items by priority order and returns
-    /// the first one that is not already in <c>_activeItems</c> or
-    /// <c>_deferredItems</c> and whose dependencies are all in terminal states.
-    /// Returns null when no eligible item exists or every candidate is blocked.
+    /// Streams dispatch-eligible non-terminal items by priority order and
+    /// returns the first one that is not already in <c>_activeItems</c> or
+    /// <c>_deferredItems</c> and whose <see cref="WorkItem.DependsOn"/> gate
+    /// is satisfied per <see cref="WorkItemDependencies.SatisfyingStates"/>
+    /// (currently: every dep is in <see cref="WorkItemState.Done"/>). Returns
+    /// null when no eligible item exists or every candidate is blocked.
     ///
-    /// Dependency satisfaction is checked in C# (the deps_satisfied is a derived
-    /// property over a JSON column on each row) — for typical queue depths
-    /// the enumerator stops on the first match and never reads the whole table.
+    /// <para>
+    /// Dependency satisfaction is checked in C# against a freshly-built
+    /// state map (one ListAsync snapshot per pickup) — never a cached
+    /// <see cref="WorkItem.DependsOnSatisfied"/>-style boolean, so a dep
+    /// transition that landed after the channel kick is honored on the very
+    /// next tick. For typical queue depths the enumerator stops on the first
+    /// match and never reads the whole table.
+    /// </para>
+    ///
+    /// <para>
+    /// Items found blocked here are logged so an unsatisfied-deps backlog is
+    /// visible in operator dashboards — important when a dependency chain
+    /// is stuck on an upstream item that needs operator action.
+    /// </para>
     /// </summary>
     private async Task<WorkItemId?> PickNextEligibleAsync(CancellationToken stoppingToken)
     {
@@ -426,6 +439,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
             if (WorkItemDependencies.AreSatisfied(candidate.DependsOn, statesById))
                 return candidate.Id;
+
+            // Gate blocked this candidate. Log so a sustained unsatisfied-deps
+            // backlog (e.g. a parent stuck in Failed awaiting operator retry)
+            // is observable instead of silently absorbed by the dispatcher.
+            _log.LogDebug(
+                "Dispatch skip {Id}: dependsOn gate not satisfied (state={State}, deps={Deps})",
+                candidate.Id, candidate.State, candidate.DependsOn.Count);
         }
 
         return null;
@@ -760,7 +780,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
             item = current;
 
-            // Dependency gate: skip items whose deps aren't all terminal yet.
+            // Dependency gate: skip items whose deps aren't all satisfied yet
+            // (see WorkItemDependencies.SatisfyingStates — currently only Done
+            // satisfies; Failed / AuditFailed / Cancelled all block). Recomputed
+            // from a fresh ListAsync snapshot on every pickup so the gate is
+            // never served from a stale cache. This is the worker-side mirror
+            // of the dispatch-side check in PickNextEligibleAsync; running both
+            // closes the narrow TOCTOU window where a dep regresses out of a
+            // satisfying state between candidate enumeration and worker spawn.
             if (item.DependsOn.Count > 0)
             {
                 var allItems = new List<WorkItem>();
@@ -769,7 +796,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 if (!WorkItemDependencies.AreSatisfied(item.DependsOn, statesById))
                 {
                     _log.LogInformation(
-                        "Worker {WorkerId} skipping {Id}: dependencies not yet terminal", workerIndex, id);
+                        "Worker {WorkerId} skipping {Id}: dependsOn gate not satisfied", workerIndex, id);
                     return;
                 }
             }
