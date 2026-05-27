@@ -338,6 +338,269 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after.AgentLogPath);
     }
 
+    // ── Restart-resume checkpoint promotion (R8-core regression #1) ──────────
+
+    [Fact]
+    public async Task StartupResume_AdoptionExit0_PromotesVmHeadToPreemptCheckpoint()
+    {
+        // The audit's primary regression: a successful suspend+resume+adoption
+        // used to clear suspend bookkeeping with no PreemptCheckpoint, after
+        // which DeadWorkerReaper.SweepStrandedItemsAsync would mark the item
+        // Failed for "Working without a preempt checkpoint". The resume service
+        // must now push the adopted VM's HEAD to a real preempt-checkpoint ref
+        // (via the new provider hook) and persist that ref on the work item so
+        // the standard with-checkpoint recovery branch fires instead.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-promote",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/abc.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var pushed = Assert.Single(provider.CheckpointPushCalls);
+        Assert.Equal("vm-promote", pushed.VmName);
+        Assert.Equal("/work", pushed.WorkingDir);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", pushed.RefName);
+        Assert.Contains(item.Id.ToString(), pushed.CommitMessage);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Null(after.AgentLogPath);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", after.PreemptCheckpoint);
+        Assert.NotNull(after.PreemptedAt);
+    }
+
+    [Fact]
+    public async Task StartupResume_AdoptionNonZeroExit_DoesNotPromoteCheckpoint()
+    {
+        // A non-zero exit from the adopted agent means the in-VM work failed
+        // — promoting that state to a PreemptCheckpoint would cause the
+        // pipeline to resume from a known-bad ref. Leave the item without a
+        // checkpoint so stranded-item recovery (which re-runs the iteration)
+        // takes over.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-failed-exit",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/x.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 7 };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Empty(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_AdoptionDeadlineNull_DoesNotPromoteCheckpoint()
+    {
+        // WaitForAdoptedAgentCompletionAsync returns null when the deadline
+        // elapses before the .exit marker appears. The orchestrator does not
+        // know whether the agent finished or wedged, so we MUST NOT promote
+        // unknown in-VM state to a checkpoint ref. Bookkeeping clears so the
+        // stranded-item path can take over.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-deadline",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/d.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = null };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Empty(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+    }
+
+    [Fact]
+    public async Task StartupResume_AdoptionExit0_ButPushReturnsFalse_DoesNotSetCheckpoint()
+    {
+        // The in-VM git push can fail for reasons outside the orchestrator
+        // (no upstream, write-protected ref, network blip inside the VM). On
+        // any push failure the resume service must leave PreemptCheckpoint
+        // null so the pipeline doesn't try to resume from a ref that doesn't
+        // exist on origin.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-push-fails",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/p.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionExitCodeToReturn = 0,
+            CheckpointPushReturns = false,
+        };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Single(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_AdoptionExit0_ButPushThrows_DoesNotSetCheckpoint()
+    {
+        // Symmetric to the push-returns-false branch: an exception during the
+        // push must not propagate (it would block other items in the resume
+        // fan-out) and must NOT leave a stale PreemptCheckpoint pointing at a
+        // ref that was never created.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-push-throws",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/t.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionExitCodeToReturn = 0,
+            CheckpointPushThrows = true,
+        };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_ResumeFailure_SkipsCheckpointPromotion()
+    {
+        // If multipass start failed, the VM is not running and any git push
+        // would hit a dead VM. The promotion step must be skipped.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-resume-failed",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/r.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            ResumeThrows = true,
+            AdoptionExitCodeToReturn = 0,
+        };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Empty(provider.CheckpointPushCalls);
+        Assert.Empty(provider.AdoptionCalls);
+    }
+
+    [Fact]
+    public async Task StartupResume_AdoptionExit0_NoAgentLogPath_DoesNotPromote()
+    {
+        // Without an agent log path there was no adoption attempt (the resume
+        // service short-circuits adoption), so there is no exit code to act on.
+        // Promotion must NOT fire because adoption did not occur.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-no-log-path",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            // AgentLogPath intentionally null.
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Empty(provider.AdoptionCalls);
+        Assert.Empty(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+    }
+
+    [Fact]
+    public void SandboxResumeOnStartupService_PreemptCheckpointRefFor_MatchesPipelineRunnerFormat()
+    {
+        // The resume service's ref-name builder must produce exactly the same
+        // string PipelineRunner.PreemptRefFor produces — the resumable agent
+        // runner's ValidatePreemptCheckpoint rejects anything else, so a
+        // format drift would mean items get re-enqueued with a checkpoint the
+        // runner refuses to use. PipelineRunner.PreemptRefFor is private, so
+        // duplicate the canonical literal here as the contract under test.
+        var id = WorkItemId.New();
+        Assert.Equal(
+            $"refs/heads/codeybox/preempt/{id}",
+            SandboxResumeOnStartupService.PreemptCheckpointRefFor(id));
+    }
+
+    [Fact]
+    public async Task StartupResume_AdoptionExit0_WithCheckpoint_DoesNotMarkFailed()
+    {
+        // Integration assertion that the resume promotion is wired through
+        // end-to-end: after a successful resume + exit 0 + checkpoint push,
+        // simulate the very next pass of DeadWorkerReaper.SweepStrandedItemsAsync
+        // (which OrchestratorService.ExecuteAsync invokes immediately after
+        // StartingAsync returns) and verify the item is re-enqueued for clean
+        // resume instead of being marked Failed.
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-restart-flow",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/flow.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = MakeResumeService(provider);
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        // Verify the resume side set the checkpoint.
+        var afterResume = await _store.GetAsync(item.Id);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", afterResume!.PreemptCheckpoint);
+
+        // Now drive the dead-worker reaper across the same row. With the
+        // checkpoint promoted, the recovery path must re-enqueue, NOT mark
+        // Failed. A regression that dropped the promotion would surface as
+        // State == Failed here.
+        var queue = new InMemoryTaskQueue();
+        var registry = new SqliteWorkerRegistry(_dbPath);
+        var reaper = new DeadWorkerReaper(
+            registry, _store, queue,
+            new DeadWorkerOptions(),
+            NullLogger<DeadWorkerReaper>.Instance,
+            new NullWebhookDispatcher());
+        await reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var afterSweep = await _store.GetAsync(item.Id);
+        Assert.NotEqual(WorkItemState.Failed, afterSweep!.State);
+        // Re-enqueue clears StartedAt so the item is again pickup-eligible.
+        Assert.Null(afterSweep.StartedAt);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", afterSweep.PreemptCheckpoint);
+    }
+
     // ── Leak reaper integration ──────────────────────────────────────────────
 
     [Fact]
@@ -522,10 +785,21 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     private sealed class FakeSuspendingProvider : ISandboxProvider, ISuspendingSandboxProvider
     {
         private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
-        public List<string> ResumedNames { get; } = new();
-        public List<AdoptionCall> AdoptionCalls { get; } = new();
+        // Resume runs items in parallel (SandboxResumeOnStartupService fans out
+        // via Task.Run with a SemaphoreSlim gate), so the recording lists MUST
+        // be thread-safe — a plain List<T>.Add from two concurrent resumes
+        // intermittently loses one entry, which historically surfaced as a
+        // flaky "vm-1 not in ResumedNames" assertion.
+        private readonly ConcurrentQueue<string> _resumedNames = new();
+        private readonly ConcurrentQueue<AdoptionCall> _adoptionCalls = new();
+        private readonly ConcurrentQueue<CheckpointPushCall> _checkpointPushCalls = new();
+        public IReadOnlyList<string> ResumedNames => _resumedNames.ToArray();
+        public IReadOnlyList<AdoptionCall> AdoptionCalls => _adoptionCalls.ToArray();
+        public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
         public int? AdoptionExitCodeToReturn { get; set; }
+        public bool CheckpointPushReturns { get; set; } = true;
+        public bool CheckpointPushThrows { get; set; }
 
         public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
 
@@ -545,7 +819,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         public Task ResumeSandboxAsync(string name, CancellationToken ct)
         {
-            ResumedNames.Add(name);
+            _resumedNames.Enqueue(name);
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
             return Task.CompletedTask;
         }
@@ -557,12 +831,26 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             TimeSpan? deadline,
             CancellationToken ct)
         {
-            AdoptionCalls.Add(new AdoptionCall(vmName, agentLogPath, deadline));
+            _adoptionCalls.Enqueue(new AdoptionCall(vmName, agentLogPath, deadline));
             return Task.FromResult(AdoptionExitCodeToReturn);
+        }
+
+        public Task<bool> PushSuspendedVmCheckpointRefAsync(
+            string vmName,
+            string workingDir,
+            string refName,
+            string commitMessage,
+            CancellationToken ct)
+        {
+            _checkpointPushCalls.Enqueue(new CheckpointPushCall(vmName, workingDir, refName, commitMessage));
+            if (CheckpointPushThrows)
+                throw new InvalidOperationException("simulated in-VM git push failure");
+            return Task.FromResult(CheckpointPushReturns);
         }
     }
 
     private sealed record AdoptionCall(string VmName, string AgentLogPath, TimeSpan? Deadline);
+    private sealed record CheckpointPushCall(string VmName, string WorkingDir, string RefName, string CommitMessage);
 
     private sealed class NonSuspendingProvider : ISandboxProvider
     {

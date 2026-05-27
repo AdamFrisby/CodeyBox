@@ -134,6 +134,18 @@ public interface ISuspendableSandbox : ISandbox
     /// call is a no-op rather than destroying the suspended VM.
     /// </summary>
     Task SuspendAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// True once <see cref="SuspendAsync"/> has frozen the sandbox's RAM and
+    /// the provider has flipped the preserve-on-dispose flag. PipelineRunner
+    /// reads this in its host-shutdown OCE catch block so the legacy
+    /// preempt-checkpoint flow (git add/commit/push from inside the VM) does
+    /// NOT race a suspend that already preserved the agent's in-RAM state —
+    /// running a git push against a frozen VM hangs and would block the
+    /// orchestrator's exit. Defaults to false for providers that don't yet
+    /// model suspension state.
+    /// </summary>
+    bool IsSuspended => false;
 }
 
 /// <summary>
@@ -191,6 +203,46 @@ public interface ISuspendingSandboxProvider
         Action<string>? logSink,
         TimeSpan? deadline,
         CancellationToken ct) => Task.FromResult<int?>(null);
+
+    /// <summary>
+    /// R8-core: after the resumed in-VM agent has finished (
+    /// <see cref="WaitForAdoptedAgentCompletionAsync"/> returned an exit code),
+    /// promote whatever the agent committed inside the VM into a real
+    /// preempt-checkpoint git ref on origin so the orchestrator's standard
+    /// recovery flow (see <c>DeadWorkerReaper.RecoverWorkItemAsync</c>) can
+    /// re-enqueue the work item with a non-null
+    /// <see cref="WorkItem.PreemptCheckpoint"/> instead of marking it Failed
+    /// for "Working without a preempt checkpoint".
+    ///
+    /// <para>Operation, executed inside the resumed VM:</para>
+    /// <list type="number">
+    ///   <item>ensure <c>.codeybox/preempt-scratchpad.md</c> exists (so the
+    ///   resumable agent runner has something to restore);</item>
+    ///   <item><c>git add -A</c> in <paramref name="workingDir"/> to capture
+    ///   any uncommitted agent output;</item>
+    ///   <item><c>git commit --allow-empty</c> so the push is non-empty even
+    ///   when the agent had nothing dirty;</item>
+    ///   <item><c>git push origin HEAD:<paramref name="refName"/></c>.</item>
+    /// </list>
+    ///
+    /// <para>Returns true on a successful push; false on any in-VM failure
+    /// (the resume service falls back to clearing suspend bookkeeping with no
+    /// checkpoint, and the existing stranded-item path takes over).</para>
+    ///
+    /// <para>Implementations that cannot exec in the VM (non-VM providers)
+    /// return false — those providers do not participate in suspend/resume.</para>
+    /// </summary>
+    /// <param name="vmName">Resumed (running) VM to operate inside.</param>
+    /// <param name="workingDir">Absolute in-VM working directory containing the git repo (typically <c>/work</c>).</param>
+    /// <param name="refName">Fully-qualified remote ref to push HEAD to (e.g. <c>refs/heads/codeybox/preempt/&lt;id&gt;</c>).</param>
+    /// <param name="commitMessage">Commit message for the synthetic checkpoint commit. Must contain no shell metacharacters.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task<bool> PushSuspendedVmCheckpointRefAsync(
+        string vmName,
+        string workingDir,
+        string refName,
+        string commitMessage,
+        CancellationToken ct) => Task.FromResult(false);
 }
 
 /// <summary>

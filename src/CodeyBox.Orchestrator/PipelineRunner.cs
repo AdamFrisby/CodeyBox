@@ -1787,6 +1787,24 @@ public sealed class PipelineRunner : IPipelineRunner
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
 
+            // R8-core: if SandboxSuspendOnShutdownService already froze this
+            // VM during IHostedLifecycleService.StoppingAsync (which runs
+            // BEFORE BackgroundService cancellation flows down as
+            // hostShutdownToken), the agent process is paused mid-call and
+            // the VM cannot service `git add/commit/push`. The legacy
+            // preempt-checkpoint flow would block on the frozen VM until the
+            // host's shutdown grace expires. Skip both the checkpoint and
+            // the StopAndPreserveAsync — the suspend handler already
+            // persisted the SuspendedVmName bookkeeping and SandboxResumeOnStartupService
+            // takes over on the next boot.
+            if (sandbox is ISuspendableSandbox { IsSuspended: true })
+            {
+                _log.LogInformation(
+                    "Work item {Id}: sandbox {SandboxId} was suspended by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid hanging on the frozen VM",
+                    item.Id, sandbox.Id);
+                throw;
+            }
+
             Exception? checkpointFailure = null;
             try
             {

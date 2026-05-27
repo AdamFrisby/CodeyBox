@@ -443,6 +443,105 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Contains("partial-rework.txt", tree.stdout);
     }
 
+    // ── R8-core regression #2: suspend handler must not race the checkpoint flow ──
+
+    [Fact]
+    public async Task HostShutdown_WhenSandboxAlreadySuspended_SkipsCheckpointAndPreserve()
+    {
+        // Replays the race the SandboxSuspendOnShutdownService → PipelineRunner
+        // shutdown ordering creates: by the time the pipeline catches the
+        // host-shutdown OCE, the suspend handler has already frozen the VM
+        // (sandbox.IsSuspended == true). The legacy preempt-checkpoint flow
+        // would then try to run `git add/commit/push` against a frozen VM and
+        // hang until the host kills the process — so the pipeline must
+        // short-circuit: no checkpoint commit, no StopAndPreserveAsync call,
+        // just rethrow OCE and let the resume side own recovery.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+
+        var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var wrappingProvider = new SuspendableSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var agent = new BlockingAgentRunner();
+        var pipeline = new PipelineRunner(
+            wrappingProvider, gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
+            new InMemoryPullRequestService(),
+            new InMemoryProjectRepository(new Project
+            {
+                Id = new ProjectId("test-project"),
+                DisplayName = "Test Project",
+                RepositoryUrl = seed,
+                DefaultBaseBranch = "main",
+                DefaultAgent = AgentKind.Claude,
+                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+            }),
+            new TestUpstreamFactory(),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store, new NullWebhookDispatcher(),
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            logger);
+
+        var item = NewItem();
+        await store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+
+        // Simulate the suspend service freezing the active VM before the
+        // BackgroundService cancellation token propagates to the pipeline:
+        // every live sandbox the pipeline created flips to IsSuspended=true.
+        SuspendableSandboxWrapper? liveSandbox = null;
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            liveSandbox = wrappingProvider.Wrappers.LastOrDefault();
+            if (liveSandbox is not null) break;
+            await Task.Delay(25);
+        }
+        Assert.NotNull(liveSandbox);
+        liveSandbox.IsSuspended = true;
+
+        await hostShutdownCts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            pipelineTask.WaitAsync(TimeSpan.FromSeconds(15)));
+
+        // The pipeline must NOT have run the legacy checkpoint commit/push
+        // flow (it would hang against a real frozen VM and would here race
+        // the test). PreemptCheckpoint stays null because the suspend
+        // handler owns recovery via SuspendedVmName, not via a checkpoint
+        // ref. StopAndPreserveAsync must also be skipped: the suspend
+        // already preserved the VM and a redundant stop call would (in the
+        // real multipass case) re-issue lifecycle ops against a frozen VM.
+        var final = await store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Working, final.State);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.PreemptedAt);
+        Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
+
+        Assert.Contains(logger.Entries, e =>
+            e.Message.Contains("was suspended by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
+
+        // Sanity: no preempt-checkpoint ref ever made it to origin either.
+        var showRef = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
+            "show-ref");
+        Assert.DoesNotContain("codeybox/preempt", showRef.stdout);
+
+        store.Dispose();
+    }
+
     [Fact]
     public async Task ProcessSandbox_StopAndPreserve_SkipsDisposeDeletion()
     {
@@ -851,4 +950,68 @@ internal sealed class CapturingSandboxProvider : ISandboxProvider
 
     public Task DisposeLeakedAsync(string name, CancellationToken ct)
         => _inner.DisposeLeakedAsync(name, ct);
+}
+
+/// <summary>
+/// Test wrapper that gives a non-suspending sandbox provider an
+/// <see cref="ISuspendableSandbox"/> capability. Used by the R8-core test
+/// that proves <see cref="PipelineRunner"/> short-circuits its preempt-checkpoint
+/// flow when the suspend handler has already frozen the VM (i.e. the
+/// wrapper's <see cref="SuspendableSandboxWrapper.IsSuspended"/> is true at
+/// the moment the host-shutdown OCE catch runs).
+/// </summary>
+internal sealed class SuspendableSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+    private readonly List<SuspendableSandboxWrapper> _wrappers = new();
+    private readonly object _gate = new();
+
+    public SuspendableSandboxProvider(ISandboxProvider inner) { _inner = inner; }
+
+    public string Name => _inner.Name;
+    public IReadOnlyList<SuspendableSandboxWrapper> Wrappers
+    {
+        get { lock (_gate) return _wrappers.ToArray(); }
+    }
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+    {
+        var inner = await _inner.CreateAsync(spec, ct);
+        var wrapper = new SuspendableSandboxWrapper(inner);
+        lock (_gate) _wrappers.Add(wrapper);
+        return wrapper;
+    }
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+}
+
+internal sealed class SuspendableSandboxWrapper : IPreemptibleSandbox, ISuspendableSandbox
+{
+    private readonly ISandbox _inner;
+    public SuspendableSandboxWrapper(ISandbox inner) { _inner = inner; }
+
+    public string Id => _inner.Id;
+    public bool IsSuspended { get; set; }
+    public int StopAndPreserveCalls { get; private set; }
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        => _inner.ExecAsync(exec, ct);
+    public ValueTask DisposeAsync() => _inner.DisposeAsync();
+
+    public Task SuspendAsync(CancellationToken ct = default)
+    {
+        IsSuspended = true;
+        return Task.CompletedTask;
+    }
+
+    public Task StopAndPreserveAsync(CancellationToken ct = default)
+    {
+        StopAndPreserveCalls++;
+        if (_inner is IPreemptibleSandbox preemptible)
+            return preemptible.StopAndPreserveAsync(ct);
+        return Task.CompletedTask;
+    }
 }

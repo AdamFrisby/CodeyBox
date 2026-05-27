@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -186,31 +187,85 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             }
         }
 
-        // Clear the suspended-bookkeeping AFTER the adoption attempt completes
-        // (or after the resume itself failed). This way the leak reaper keeps
-        // the suspended VM exempt for the entire window we were waiting for it
-        // to come back — see SandboxLeakReaper.BuildSuspendedVmNameSetAsync.
-        //
-        // The work item's pipeline state is intentionally left untouched here:
-        // the stranded-item recovery path (DeadWorkerReaper.SweepStrandedItemsAsync
-        // + OrchestratorService.ReplayPendingAsync) takes the item forward
-        // from this point. When adoption succeeded, the resumed agent has
-        // already produced its commits inside the resumed VM and the
-        // PreemptCheckpoint mechanism captures them; when adoption failed,
-        // recovery falls back to re-running the iteration.
+        // Promote whatever the adopted agent committed inside the VM into a
+        // real PreemptCheckpoint git ref so DeadWorkerReaper.RecoverWorkItemAsync
+        // sees a non-null checkpoint and re-enqueues the item for clean resume
+        // instead of marking it Failed for "Working without a preempt checkpoint"
+        // (the happy-path failure mode of the suspend/resume cycle before R8-core
+        // wired the checkpoint promotion). Only attempt when the resumed VM is
+        // actually live and the agent has exited cleanly — a non-zero exit, a
+        // missing exit code (deadline elapsed) or a resume failure all leave
+        // the in-VM state untrustworthy, so we fall through to the standard
+        // stranded-item recovery path which re-runs the iteration.
+        string? promotedCheckpointRef = null;
+        if (resumeSucceeded && adopted && adoptionExitCode == 0)
+        {
+            var refName = PreemptCheckpointRefFor(item.Id);
+            try
+            {
+                var pushed = await suspending.PushSuspendedVmCheckpointRefAsync(
+                    vmName,
+                    SandboxConventions.WorkDir,
+                    refName,
+                    $"codeybox: suspend-resume checkpoint {item.Id}",
+                    ct);
+                if (pushed)
+                {
+                    promotedCheckpointRef = refName;
+                }
+                else
+                {
+                    _log.LogWarning(
+                        "Failed to promote adopted-VM HEAD to preempt-checkpoint {RefName} for work item {WorkItemId}; falling through to stranded-item recovery (item will be marked Failed unless it has an earlier checkpoint)",
+                        refName, item.Id);
+                }
+            }
+            catch (Exception promoteEx) when (promoteEx is not OperationCanceledException)
+            {
+                _log.LogWarning(promoteEx,
+                    "Promote of adopted-VM HEAD to preempt-checkpoint {RefName} threw for work item {WorkItemId}; falling through to stranded-item recovery",
+                    refName, item.Id);
+            }
+        }
+
+        // Clear the suspended-bookkeeping AFTER the adoption + promotion
+        // attempts complete (or after the resume itself failed). This way the
+        // leak reaper keeps the suspended VM exempt for the entire window we
+        // were waiting for it to come back — see
+        // SandboxLeakReaper.BuildSuspendedVmNameSetAsync. When promotion
+        // succeeded we ALSO persist PreemptCheckpoint so the next pass of
+        // DeadWorkerReaper.SweepStrandedItemsAsync re-enqueues the item via
+        // the with-checkpoint branch instead of marking it Failed.
         var fresh = await _store.GetAsync(item.Id, ct);
         if (fresh is null)
         {
             AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError);
             return;
         }
-        await _store.UpdateAsync(fresh with
+        var updatedItem = fresh with
         {
             SuspendedVmName = null,
             SuspendedAt = null,
             AgentLogPath = null,
             UpdatedAt = DateTimeOffset.UtcNow,
-        }, ct);
+        };
+        if (promotedCheckpointRef is not null)
+        {
+            updatedItem = updatedItem with
+            {
+                PreemptCheckpoint = promotedCheckpointRef,
+                PreemptedAt = DateTimeOffset.UtcNow,
+            };
+        }
+        await _store.UpdateAsync(updatedItem, ct);
         AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError, adopted, adoptionExitCode);
     }
+
+    /// <summary>
+    /// Must stay in lockstep with <c>PipelineRunner.PreemptRefFor</c>: the
+    /// resumable agent runner only accepts checkpoint refs that match the
+    /// expected per-work-item shape (see <c>PipelineRunner.ValidatePreemptCheckpoint</c>).
+    /// </summary>
+    internal static string PreemptCheckpointRefFor(WorkItemId id)
+        => $"refs/heads/codeybox/preempt/{id}";
 }

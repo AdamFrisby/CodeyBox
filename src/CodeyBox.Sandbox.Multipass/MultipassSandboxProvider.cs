@@ -553,6 +553,135 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         }
     }
 
+    /// <inheritdoc/>
+    public async Task<bool> PushSuspendedVmCheckpointRefAsync(
+        string vmName,
+        string workingDir,
+        string refName,
+        string commitMessage,
+        CancellationToken ct)
+    {
+        var opts = ReadOptions();
+        if (!IsValidSandboxName(vmName))
+            throw new ArgumentException($"Sandbox name '{vmName}' contains invalid characters (only [a-z0-9-] allowed).", nameof(vmName));
+        if (!IsValidAbsolutePath(workingDir))
+            throw new ArgumentException($"Working directory '{workingDir}' contains invalid characters.", nameof(workingDir));
+        if (!IsValidPreemptCheckpointRef(refName))
+            throw new ArgumentException($"Ref '{refName}' is not a permitted preempt-checkpoint ref shape.", nameof(refName));
+        if (!IsValidCheckpointCommitMessage(commitMessage))
+            throw new ArgumentException("Commit message contains invalid characters.", nameof(commitMessage));
+
+        // Single sh -c so a mid-script failure short-circuits via `set -e`
+        // instead of (e.g.) pushing a stale HEAD when the commit failed. The
+        // scratchpad touch mirrors CheckpointPreemptAsync so the resumable
+        // agent runner always finds a non-empty .codeybox/preempt-scratchpad.md
+        // to restore from. `--allow-empty` lets the push succeed even when
+        // the agent had no dirty changes left after its in-VM exit.
+        var script = $@"set -e
+cd {ShellSingleQuote(workingDir)}
+mkdir -p .codeybox
+test -f .codeybox/preempt-scratchpad.md || printf '%s\n' 'No CLI scratchpad was captured before suspend-resume.' > .codeybox/preempt-scratchpad.md
+git add -A
+git commit --allow-empty -m {ShellSingleQuote(commitMessage)}
+git push origin HEAD:{refName}";
+
+        try
+        {
+            var argv = new[]
+            {
+                opts.MultipassBinary, "exec", vmName, "--",
+                "sh", "-c", script,
+            };
+            var result = await _runner.RunAsync(argv, stdin: null, ct);
+            if (result.ExitCode != 0)
+            {
+                _log.LogWarning(
+                    "PushSuspendedVmCheckpointRefAsync({VmName}, {RefName}): in-VM git push failed (exit {ExitCode}): {Stderr}",
+                    vmName, refName, result.ExitCode, result.Stderr);
+                return false;
+            }
+            _log.LogInformation(
+                "Pushed adopted-VM HEAD to checkpoint {RefName} from {VmName}",
+                refName, vmName);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "PushSuspendedVmCheckpointRefAsync({VmName}, {RefName}) threw; treating as push failure",
+                vmName, refName);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Restricts the working-directory argument passed into the in-VM sh -c so a
+    /// DB-tamper attacker who flips a recorded path cannot smuggle shell
+    /// metacharacters or relative segments through the suspend-checkpoint flow.
+    /// Absolute path only; rejects metacharacters that survive single-quoting.
+    /// </summary>
+    internal static bool IsValidAbsolutePath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        if (path[0] != '/') return false;
+        if (path.Contains("..", StringComparison.Ordinal)) return false;
+        foreach (var ch in path)
+        {
+            if (ch < 0x20 || ch == 0x7f) return false;
+            if (ch is '\'' or '"' or '`' or '$' or '\\' or '\n' or '\r' or '\0') return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Enforces the fully-qualified <c>refs/heads/codeybox/preempt/&lt;guid&gt;</c>
+    /// shape that the orchestrator uses for preempt checkpoints. The ref is
+    /// inlined into <c>git push origin HEAD:&lt;ref&gt;</c> unquoted (because git
+    /// rejects single-quoted refs as ambiguous on push), so the validator must
+    /// guarantee the suffix contains no shell metacharacters or whitespace.
+    /// </summary>
+    internal static bool IsValidPreemptCheckpointRef(string refName)
+    {
+        const string prefix = "refs/heads/codeybox/preempt/";
+        if (string.IsNullOrEmpty(refName)) return false;
+        if (!refName.StartsWith(prefix, StringComparison.Ordinal)) return false;
+        var suffix = refName[prefix.Length..];
+        if (suffix.Length == 0) return false;
+        foreach (var ch in suffix)
+        {
+            // Restrict to [A-Za-z0-9-] which covers the Guid shape and is a
+            // strict subset of git's valid ref characters AND of shell-safe
+            // characters.
+            var ok = (ch >= 'a' && ch <= 'z')
+                  || (ch >= 'A' && ch <= 'Z')
+                  || (ch >= '0' && ch <= '9')
+                  || ch == '-';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Defence-in-depth: keep the commit message free of characters that could
+    /// break out of the single-quoted sh -c argument or smuggle control bytes
+    /// into the in-VM git invocation. The caller composes the message from
+    /// known-safe components (literal string + WorkItemId guid), so this
+    /// check is a guardrail against a future refactor that interpolates an
+    /// operator-supplied string.
+    /// </summary>
+    internal static bool IsValidCheckpointCommitMessage(string message)
+    {
+        if (string.IsNullOrEmpty(message)) return false;
+        if (message.Length > 1024) return false;
+        foreach (var ch in message)
+        {
+            if (ch == '\0' || ch == '\r') return false;
+            if (ch < 0x20 && ch != '\n' && ch != '\t') return false;
+            if (ch == 0x7f) return false;
+        }
+        return true;
+    }
+
     /// <summary>
     /// Allows <c>/work/.codeybox/agent-logs/&lt;name&gt;.log</c>-style absolute
     /// paths and rejects anything with shell metacharacters or relative
@@ -2406,6 +2535,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     private int _firstExecEmitted;
     private bool _disposed;
     private bool _preserveOnDispose;
+    private bool _isSuspended;
+
+    /// <summary>
+    /// True once <see cref="SuspendAsync"/> has frozen this VM's RAM via
+    /// <c>multipass suspend</c>. PipelineRunner reads this in its host-shutdown
+    /// OCE catch block to short-circuit the preempt-checkpoint flow (whose
+    /// in-VM <c>git add/commit/push</c> would hang against a frozen VM and
+    /// stall the orchestrator's exit).
+    /// </summary>
+    public bool IsSuspended => _isSuspended;
 
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
@@ -2910,8 +3049,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         }
         // Only flip the preserve flag once we know the VM is suspended on disk.
         // From here on, DisposeAsync MUST be a no-op so multipass start can
-        // resume the same VM on the next orchestrator startup.
+        // resume the same VM on the next orchestrator startup. _isSuspended
+        // is observed by PipelineRunner's host-shutdown OCE catch so it can
+        // skip its preempt-checkpoint flow (whose in-VM git push would hang
+        // against the now-frozen VM).
         _preserveOnDispose = true;
+        _isSuspended = true;
         _log.LogInformation("Suspended multipass VM {Name} for orchestrator restart", _name);
     }
 }
