@@ -52,6 +52,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `audit.completed` | Audit iteration finished with a `pass` or `fail` verdict |
 | `merge.started` | Merge phase started |
 | `merge.completed` | Merge phase succeeded; carries the merge commit SHA |
+| `upstream.pr_stale_base` | A CodeyBox-authored PR has been left unmergeable by motion on the base branch; needs operator rebase (see [Details](#upstream_pr_stale_base-details)) |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -659,6 +660,44 @@ trackers should rely on the terminal failure event to close the iteration.
 If the merge phase throws (agent failure, host shutdown), the matching
 `merge.started` will have no partner event; trackers should rely on the
 terminal failure event in the same way as for the iteration/audit phases.
+
+---
+
+### `upstream.pr_stale_base` details
+
+```json
+{
+  "details": {
+    "projectId": "my-project",
+    "pullRequestNumber": 112,
+    "pullRequestUrl": "https://github.com/example/repo/pull/112",
+    "headBranch": "codeybox/b6e61d94",
+    "headSha": "deadbeefcafe...",
+    "baseBranch": "main",
+    "firstDetectedAt": "2026-05-28T14:32:11.234+00:00"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `projectId` | string | The CodeyBox project that owns the PR |
+| `pullRequestNumber` | int | Forge-assigned PR number |
+| `pullRequestUrl` | string | HTML URL of the PR on the forge |
+| `headBranch` | string | PR head branch (always matches the configured prefix, e.g. `codeybox/*`) |
+| `headSha` | string | Tip of the head branch at the time staleness was first observed |
+| `baseBranch` | string | Branch the PR targets |
+| `firstDetectedAt` | string (ISO-8601) | First time this `(projectId, prNumber, headSha)` was observed as stale |
+
+Fired by the `StalePullRequestSweeper` background service when a
+CodeyBox-authored PR is observed in the forge's "dirty" (conflicting)
+state. **De-duplication**: the same `(projectId, prNumber, headSha)`
+tuple fires the event at most once per orchestrator process. A new push to
+the PR head (changing `headSha`) produces a fresh event if the PR remains
+stale; that is the intended signal that the operator's most recent rebase
+attempt did not resolve the conflict. On orchestrator restart the dedup
+state resets and a still-stale PR re-fires once, so trackers should be
+idempotent on `(projectId, prNumber, headSha)`.
 
 ---
 

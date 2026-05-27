@@ -236,6 +236,97 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     }
 
     /// <summary>
+    /// Enumerates open pull requests in this repo whose head branch starts
+    /// with <paramref name="branchPrefix"/> and whose mergeability has been
+    /// computed by GitHub. Used by the stale-base PR sweeper.
+    ///
+    /// <para>GitHub computes <c>mergeable</c> asynchronously after each push
+    /// or base-branch motion: the field is <c>null</c> while the calculation
+    /// is in flight. PRs in that "unknown" window are skipped so the sweeper
+    /// reconsiders them on the next tick — never report them as either
+    /// mergeable or conflicted from stale data.</para>
+    ///
+    /// <para>The forge call uses the same <c>github-upstream</c> HttpClient
+    /// and PAT as the rest of this class; failures throw so the caller can
+    /// log and back off.</para>
+    /// </summary>
+    public async Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(
+        string branchPrefix, CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(branchPrefix))
+            throw new ArgumentException("branchPrefix must be non-empty", nameof(branchPrefix));
+
+        var listed = new List<UpstreamPullRequest>();
+        // Page through /pulls?state=open until the first page returns fewer
+        // than per_page entries. Cap to a sane safety limit so a broken/very
+        // large repo cannot stall the sweep indefinitely.
+        const int perPage = 100;
+        const int maxPages = 10;
+        for (var page = 1; page <= maxPages; page++)
+        {
+            var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls" +
+                $"?state=open&per_page={perPage}&page={page}";
+            using var listReq = BuildRequest(HttpMethod.Get, url);
+            using var listResp = await SendAsync(listReq, ct);
+            if (!listResp.IsSuccessStatusCode)
+            {
+                AuditLog.UpstreamApiCallFailed("GET /pulls", (int)listResp.StatusCode, _opts.Owner, _opts.Repository);
+                listResp.EnsureSuccessStatusCode();
+            }
+            var summaries = await listResp.Content.ReadFromJsonAsync<GitHubPrSummary[]>(ct);
+            if (summaries is null || summaries.Length == 0) break;
+
+            foreach (var summary in summaries)
+            {
+                var headRef = summary.Head?.Ref;
+                if (string.IsNullOrEmpty(headRef)) continue;
+                if (!headRef.StartsWith(branchPrefix, StringComparison.Ordinal)) continue;
+
+                // /pulls (list) returns a thin object without `mergeable`;
+                // we have to fetch the full PR detail to read it. Restricting
+                // the fetch to PRs whose head matches the prefix keeps the
+                // per-sweep API-call count proportional to the
+                // CodeyBox-authored PR set rather than the full open-PR set.
+                var detail = await FetchPullRequestDetailAsync(summary.Number, ct);
+                if (detail is null) continue;
+
+                // `mergeable` null means GitHub is still computing — skip.
+                // The sweeper will reconsider on the next tick.
+                if (detail.Mergeable is null) continue;
+
+                var hasConflict = detail.Mergeable == false
+                    || string.Equals(detail.MergeableState, "dirty", StringComparison.Ordinal);
+
+                listed.Add(new UpstreamPullRequest
+                {
+                    Number = detail.Number,
+                    Url = detail.HtmlUrl ?? $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{detail.Number}",
+                    HeadBranch = headRef,
+                    HeadSha = summary.Head?.Sha ?? string.Empty,
+                    BaseBranch = summary.Base?.Ref ?? string.Empty,
+                    HasMergeConflict = hasConflict,
+                });
+            }
+
+            if (summaries.Length < perPage) break;
+        }
+        return listed;
+    }
+
+    private async Task<GitHubPrDetailMergeable?> FetchPullRequestDetailAsync(int number, CancellationToken ct)
+    {
+        var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{number}";
+        using var req = BuildRequest(HttpMethod.Get, url);
+        using var resp = await SendAsync(req, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            AuditLog.UpstreamApiCallFailed($"GET /pulls/{number}", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+            return null;
+        }
+        return await resp.Content.ReadFromJsonAsync<GitHubPrDetailMergeable>(ct);
+    }
+
+    /// <summary>
     /// Fetches the current head of <paramref name="baseBranch"/> from this
     /// upstream GitHub repo into the host bare repo, overwriting the local
     /// ref. Returns the new sha. The orchestrator calls this on auto-merge
@@ -556,3 +647,18 @@ internal sealed record GitHubCreateReleaseRequest(
 internal sealed record GitHubReleaseResponse(
     [property: JsonPropertyName("id")] long Id,
     [property: JsonPropertyName("html_url")] string? HtmlUrl);
+
+internal sealed record GitHubPrSummary(
+    [property: JsonPropertyName("number")] int Number,
+    [property: JsonPropertyName("head")] GitHubPrRef? Head,
+    [property: JsonPropertyName("base")] GitHubPrRef? Base);
+
+internal sealed record GitHubPrRef(
+    [property: JsonPropertyName("ref")] string? Ref,
+    [property: JsonPropertyName("sha")] string? Sha);
+
+internal sealed record GitHubPrDetailMergeable(
+    [property: JsonPropertyName("number")] int Number,
+    [property: JsonPropertyName("html_url")] string? HtmlUrl,
+    [property: JsonPropertyName("mergeable")] bool? Mergeable,
+    [property: JsonPropertyName("mergeable_state")] string? MergeableState);

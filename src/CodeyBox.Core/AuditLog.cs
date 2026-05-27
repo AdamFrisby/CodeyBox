@@ -271,6 +271,13 @@ public static class AuditLog
             .Warning("Upstream API call failed: {Operation} returned HTTP {StatusCode} for {Owner}/{Repo}",
                 operation, statusCode, owner, repo);
 
+    public static void UpstreamPrStaleBaseDetected(
+        ProjectId projectId, int prNumber, string headBranch, string baseBranch, string headSha) =>
+        Audit("upstream.pr_stale_base")
+            .Warning(
+                "Stale-base PR detected for project {ProjectId}: #{PrNumber} {HeadBranch} → {BaseBranch} (head sha {HeadSha}) is open with merge conflicts; needs operator rebase",
+                projectId.Value, prNumber, headBranch, baseBranch, headSha);
+
     // ── Authentication ───────────────────────────────────────────────────────
 
     /// <summary>
