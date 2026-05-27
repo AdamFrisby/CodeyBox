@@ -241,6 +241,69 @@ public sealed class NamespacedExternalIdsTests : IDisposable
     }
 
     [Fact]
+    public async Task ListFilter_ByBareExternalId_MatchesValueAcrossAnyNamespace()
+    {
+        // Two items carry the same bare value under different namespaces; a
+        // bare ?externalId= filter (no colon) must return BOTH. This pins the
+        // bare-value branch which scans i.ExternalIds.Values for exact match.
+        var first = await CreateAsync(new() { ["github"] = "BARE-FILTER-1" });
+        var second = await CreateAsync(new() { ["linear"] = "BARE-FILTER-1" });
+        await CreateAsync(new() { ["github"] = "OTHER-BARE-FILTER" });
+
+        var list = await _client.GetFromJsonAsync<List<CreateResp>>(
+            "/workitems?externalId=BARE-FILTER-1");
+        Assert.NotNull(list);
+        Assert.Equal(2, list!.Count);
+        var ids = list.Select(i => i.Id).ToHashSet();
+        Assert.Contains(first.Id, ids);
+        Assert.Contains(second.Id, ids);
+    }
+
+    [Fact]
+    public async Task ListFilter_ByBareExternalId_NoMatch_ReturnsEmpty()
+    {
+        // Confirms the bare-value branch checks Values (not Keys): looking up
+        // a string that only appears as a namespace key must not match.
+        await CreateAsync(new() { ["github"] = "VALUE-ONLY" });
+
+        var list = await _client.GetFromJsonAsync<List<CreateResp>>(
+            "/workitems?externalId=github");
+        Assert.NotNull(list);
+        Assert.Empty(list!);
+    }
+
+    [Fact]
+    public async Task ListFilter_ByProjectId_NarrowsToMatchingProject()
+    {
+        // The /workitems list endpoint accepts an optional ?projectId= filter.
+        // Items created in two projects must be filterable via this parameter.
+        var inFirst = await CreateAsync(new() { ["github"] = "PROJFILTER-1" });
+        var second = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "second-project",
+            title = "t",
+            prompt = "p",
+            externalIds = new Dictionary<string, string> { ["github"] = "PROJFILTER-2" },
+        });
+        Assert.Equal(HttpStatusCode.Created, second.StatusCode);
+        var inSecondDto = await second.Content.ReadFromJsonAsync<CreateResp>();
+
+        // Filter to the first project only.
+        var firstOnly = await _client.GetFromJsonAsync<List<CreateResp>>(
+            "/workitems?projectId=test-project");
+        Assert.NotNull(firstOnly);
+        Assert.Contains(firstOnly!, i => i.Id == inFirst.Id);
+        Assert.DoesNotContain(firstOnly, i => i.Id == inSecondDto!.Id);
+
+        // Filter to the second project only.
+        var secondOnly = await _client.GetFromJsonAsync<List<CreateResp>>(
+            "/workitems?projectId=second-project");
+        Assert.NotNull(secondOnly);
+        Assert.Contains(secondOnly!, i => i.Id == inSecondDto!.Id);
+        Assert.DoesNotContain(secondOnly, i => i.Id == inFirst.Id);
+    }
+
+    [Fact]
     public async Task Webhook_Payload_IncludesBothLegacyAndNamespaced()
     {
         // Build a work item carrying both a legacy ('legacy' namespace) value
