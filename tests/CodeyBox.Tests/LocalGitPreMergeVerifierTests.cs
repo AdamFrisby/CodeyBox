@@ -293,6 +293,85 @@ public sealed class LocalGitPreMergeVerifierTests : IDisposable
     }
 
     /// <summary>
+    /// The verifier must not inherit secret environment variables into the
+    /// agent-controlled build subprocess. The orchestrator host's environment
+    /// carries agent API keys (CODEYBOX_*/ANTHROPIC_*/OPENAI_*/GH_TOKEN/
+    /// GITHUB_TOKEN) read at startup; .NET's default ProcessStartInfo
+    /// behaviour would inherit them into the child, where a prompt-injected
+    /// agent's MSBuild target (or .csproj inline task) could exfiltrate them.
+    /// This test seeds those well-known names into the parent process and
+    /// asserts the child sees none of them. The argv prints the child's full
+    /// environment to stderr; FailureReason then surfaces what leaked.
+    /// </summary>
+    [Fact]
+    public async Task RealVerifier_SecretEnvVarsAreNotInheritedByVerifySubprocess()
+    {
+        // Concrete examples of every prefix family the host actually exports
+        // (see Program.cs:700, 827, 844-845, 865, 957-958). Distinctive
+        // sentinel values so an inheritance leak shows up unambiguously.
+        var secrets = new Dictionary<string, string>
+        {
+            ["CODEYBOX_CLAUDE_API_KEY"] = "leak-sentinel-CLAUDE",
+            ["ANTHROPIC_API_KEY"] = "leak-sentinel-ANTHROPIC",
+            ["CODEYBOX_COPILOT_TOKEN"] = "leak-sentinel-COPILOT",
+            ["CODEYBOX_CODEX_API_KEY"] = "leak-sentinel-CODEX",
+            ["CODEYBOX_CODEX_ACCOUNT_ID"] = "leak-sentinel-CODEX-ACCT",
+            ["CODEYBOX_GEMINI_OAUTH_TOKEN"] = "leak-sentinel-GEMINI",
+            ["OPENAI_API_KEY"] = "leak-sentinel-OPENAI",
+            ["GH_TOKEN"] = "leak-sentinel-GH",
+            ["GITHUB_TOKEN"] = "leak-sentinel-GITHUB",
+        };
+        var prior = new Dictionary<string, string?>();
+        foreach (var (k, v) in secrets)
+        {
+            prior[k] = System.Environment.GetEnvironmentVariable(k);
+            System.Environment.SetEnvironmentVariable(k, v);
+        }
+        try
+        {
+            var (gitHost, repoId, mergeSha) = await SetupBareRepoWithCommitAsync();
+            var verifier = new LocalGitPreMergeVerifier(
+                gitHost,
+                NullLogger<LocalGitPreMergeVerifier>.Instance);
+
+            // env(1) prints the child process's full env to stdout. The argv
+            // exits non-zero so the captured output flows into FailureReason
+            // — that's where we look for any leaked sentinel. A printf-only
+            // success run would still scrub stdout from FailureReason on the
+            // success branch, so we deliberately drive the red path.
+            var result = await verifier.VerifyAsync(new PreMergeVerifyRequest
+            {
+                WorkItemId = WorkItemId.New(),
+                ProjectId = new ProjectId("test"),
+                RepositoryId = repoId,
+                BaseBranch = "main",
+                WorkBranch = "feature/x",
+                MergeSha = mergeSha,
+                Argv = ["/bin/sh", "-c", "env >&2; exit 1"],
+            }, CancellationToken.None);
+
+            Assert.False(result.Success);
+            // The redactor would catch some token *shapes*, but the
+            // distinctive "leak-sentinel-*" string is structural-only and
+            // would pass redaction unchanged. So a match here proves
+            // inheritance, not just a redactor miss.
+            foreach (var (k, v) in secrets)
+            {
+                Assert.DoesNotContain(v, result.FailureReason);
+                // The variable NAME could appear in the redacted output if a
+                // future change accidentally allowlisted it — fail loud on
+                // that too.
+                Assert.DoesNotContain($"{k}=", result.FailureReason);
+            }
+        }
+        finally
+        {
+            foreach (var (k, v) in prior)
+                System.Environment.SetEnvironmentVariable(k, v);
+        }
+    }
+
+    /// <summary>
     /// Default <see cref="IGitHost"/> implementations throw
     /// <see cref="NotSupportedException"/> from <c>GetRepoPath</c> when the
     /// host does not expose a bare-repo filesystem path (in-memory test

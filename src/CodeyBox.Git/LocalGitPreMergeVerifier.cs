@@ -34,6 +34,48 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
 {
     private const int MaxCapturedStreamBytes = 4096;
 
+    /// <summary>
+    /// Explicit allowlist of environment variables passed to subprocesses
+    /// spawned by the verifier. .NET's default ProcessStartInfo behaviour is
+    /// to inherit the full parent environment; the orchestrator's
+    /// environment carries agent API keys
+    /// (<c>CODEYBOX_CLAUDE_API_KEY</c>, <c>ANTHROPIC_API_KEY</c>,
+    /// <c>CODEYBOX_COPILOT_TOKEN</c>, <c>CODEYBOX_CODEX_API_KEY</c>,
+    /// <c>CODEYBOX_CODEX_ACCOUNT_ID</c>, <c>CODEYBOX_GEMINI_OAUTH_TOKEN</c>,
+    /// etc.) read at startup in <c>Program.cs</c>. The verifier executes
+    /// agent-controlled build/test argv against an agent-controlled tree
+    /// (<c>.csproj</c>, <c>Directory.Build.props</c>, <c>.targets</c>,
+    /// <c>nuget.config</c> files can run inline MSBuild tasks during
+    /// <c>dotnet build</c>), so an inherited environment would let a
+    /// prompt-injected agent commit a build target that reads those keys and
+    /// exfiltrates them. Symmetric to the CI-layer scrub in
+    /// <c>.github/workflows/pre-merge-revalidate.yml</c>.
+    /// </summary>
+    private static readonly IReadOnlySet<string> EnvAllowList =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            // Required for the verify argv to find common toolchains.
+            "PATH",
+            // dotnet, nuget, msbuild all derive their per-user state from HOME.
+            "HOME",
+            // dotnet specifically; explicit so we don't depend on HOME alone.
+            "DOTNET_ROOT", "DOTNET_CLI_HOME",
+            // User identity used by some build tools' diagnostic output.
+            "USER", "LOGNAME",
+            // Some shells / make / cmake refuse to run under empty SHELL.
+            "SHELL",
+            // Locale: without these dotnet emits garbled error text.
+            "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_TIME",
+            "LC_NUMERIC", "LC_COLLATE", "LC_MONETARY",
+            // Time zone for any test that depends on local clocks.
+            "TZ",
+            // Some tools refuse to run without TERM set.
+            "TERM",
+            // Temporary directory; build tools default to /tmp if unset but
+            // operators sometimes pin a larger volume here.
+            "TMPDIR", "TMP", "TEMP",
+        };
+
     private readonly IGitHost _gitHost;
     private readonly ILogger<LocalGitPreMergeVerifier> _log;
     private readonly TimeSpan _commandTimeout;
@@ -87,7 +129,6 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
                 ["-c", $"core.hooksPath={DisabledHooksPath(bareRepoPath)}",
                  "worktree", "add", "--detach", worktreePath, request.MergeSha],
                 workdir: bareRepoPath,
-                extraEnv: null,
                 ct);
             if (add.ExitCode != 0)
             {
@@ -108,7 +149,6 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
                 request.Argv[0],
                 request.Argv.Skip(1).ToArray(),
                 workdir: worktreePath,
-                extraEnv: null,
                 ct,
                 timeout: _commandTimeout);
 
@@ -144,7 +184,6 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
                         "git",
                         ["worktree", "remove", "--force", worktreePath],
                         workdir: bareRepoPath,
-                        extraEnv: null,
                         CancellationToken.None);
                 }
                 catch (Exception ex) when (ex is IOException or InvalidOperationException)
@@ -204,7 +243,6 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
         string fileName,
         IReadOnlyList<string> args,
         string workdir,
-        IReadOnlyDictionary<string, string>? extraEnv,
         CancellationToken ct,
         TimeSpan? timeout = null)
     {
@@ -218,8 +256,21 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
             CreateNoWindow = true,
         };
         foreach (var a in args) psi.ArgumentList.Add(a);
-        if (extraEnv is not null)
-            foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;
+
+        // .NET pre-populates psi.Environment from the parent process. Clear
+        // that and re-add only the allowlist so an agent-controlled build
+        // (executed inline by MSBuild / NuGet hooks during dotnet build)
+        // cannot read CODEYBOX_*/ANTHROPIC_*/OPENAI_*/GH_TOKEN/GITHUB_TOKEN.
+        // Applied uniformly to every subprocess (git plumbing and verify
+        // argv alike) — the git invocations don't need those secrets and
+        // scrubbing symmetrically avoids a future code path silently
+        // regaining the inheritance.
+        psi.Environment.Clear();
+        foreach (var key in EnvAllowList)
+        {
+            var v = System.Environment.GetEnvironmentVariable(key);
+            if (v is not null) psi.Environment[key] = v;
+        }
 
         using var p = new Process { StartInfo = psi };
         p.Start();
