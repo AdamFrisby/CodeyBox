@@ -180,6 +180,15 @@ public interface IWorkItemStore
     IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default);
 
     /// <summary>
+    /// Returns work items whose <see cref="WorkItem.SuspendedVmName"/> is
+    /// non-null. Hits the partial index <c>idx_work_items_suspended_vm</c> so
+    /// the cost scales with the number of in-flight suspends rather than the
+    /// full work-items table. Consumed by the startup resume handler and the
+    /// leak reaper's protected-name set.
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// Clears <c>replay_of_work_item_id</c> for every work item that was a replay of
     /// <paramref name="sourceId"/>. Called when the source is cancelled so replays
     /// become orphaned but keep running.

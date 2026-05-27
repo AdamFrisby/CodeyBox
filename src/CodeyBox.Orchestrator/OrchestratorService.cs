@@ -287,6 +287,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // R8-core suspend/resume: SandboxResumeOnStartupService.StartingAsync
+        // (an IHostedLifecycleService) runs BEFORE BackgroundService.ExecuteAsync,
+        // so by the time we reach this method any suspended VMs have already
+        // been multipass-started and adopted (or fallen through to recovery).
+        // The orchestrator no longer needs to inline the resume itself.
+
         // Run the reaper once at startup before replaying pending items.
         // This transitions any items that were mid-flight when the previous
         // process crashed back to a recoverable state, so ReplayPendingAsync

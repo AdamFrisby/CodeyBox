@@ -114,6 +114,138 @@ public interface IPreemptibleSandbox : ISandbox
 }
 
 /// <summary>
+/// Optional sandbox capability for providers that can freeze a running sandbox
+/// (including its RAM state) and resume it later via
+/// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/>. Currently
+/// implemented by the multipass provider (via <c>multipass suspend</c>); the
+/// process and bubblewrap providers do not implement it.
+///
+/// <para>Distinct from <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/>:
+/// preempt does an orderly stop after capturing a git checkpoint (process
+/// state inside the sandbox is lost; recovery replays from the ref). Suspend
+/// freezes the in-VM process state so the agent CLI can resume exactly where
+/// it was on the next orchestrator start.</para>
+/// </summary>
+public interface ISuspendableSandbox : ISandbox
+{
+    /// <summary>
+    /// Freeze the sandbox's RAM to disk so it can be resumed later. Marks the
+    /// sandbox as preserved so the subsequent <see cref="IAsyncDisposable.DisposeAsync"/>
+    /// call is a no-op rather than destroying the suspended VM.
+    /// </summary>
+    Task SuspendAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// True once <see cref="SuspendAsync"/> has frozen the sandbox's RAM and
+    /// the provider has flipped the preserve-on-dispose flag. PipelineRunner
+    /// reads this in its host-shutdown OCE catch block so the legacy
+    /// preempt-checkpoint flow (git add/commit/push from inside the VM) does
+    /// NOT race a suspend that already preserved the agent's in-RAM state —
+    /// running a git push against a frozen VM hangs and would block the
+    /// orchestrator's exit. Defaults to false for providers that don't yet
+    /// model suspension state.
+    /// </summary>
+    bool IsSuspended => false;
+}
+
+/// <summary>
+/// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
+/// The orchestrator's suspend-on-shutdown hosted service uses
+/// <see cref="SnapshotSuspendableActive"/> to enumerate sandboxes that should
+/// be frozen on <c>ApplicationStopping</c>, and the startup resume handler
+/// uses <see cref="ResumeSandboxAsync"/> to start each persisted VM by name.
+/// </summary>
+public interface ISuspendingSandboxProvider
+{
+    /// <summary>
+    /// Snapshot of currently-active sandboxes that can be suspended, paired
+    /// with the work item that owns each entry. Implementations that
+    /// internally use a <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/>
+    /// or other snapshot-safe data structure return entries that are
+    /// consistent with concurrent disposals — a sandbox racing dispose may
+    /// still appear here, but its <see cref="ISuspendableSandbox.SuspendAsync"/>
+    /// is a no-op once the sandbox is disposed. Implementations that cannot
+    /// determine the owner (e.g. an in-process <c>CreateAsync</c> that did not
+    /// pass <see cref="SandboxSpec.TimingWorkItemId"/>) omit those entries.
+    /// </summary>
+    IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive();
+
+    /// <summary>
+    /// Best-effort resume of a previously-suspended sandbox by name. Implementations
+    /// should treat "VM not found" / "already running" as non-fatal so the
+    /// startup handler can clear the persisted bookkeeping for items whose
+    /// suspended VM no longer exists.
+    /// </summary>
+    Task ResumeSandboxAsync(string name, CancellationToken ct);
+
+    /// <summary>
+    /// R8-core: after <see cref="ResumeSandboxAsync"/> brings the VM back to
+    /// Running, the startup resume handler asks the provider to wait for the
+    /// in-VM agent process to finish, streaming what's left of
+    /// <paramref name="agentLogPath"/> to <paramref name="logSink"/> as it goes.
+    /// Completion is signalled by the <c>codeybox-exec</c> wrapper writing
+    /// <paramref name="agentLogPath"/><c>.exit</c> containing the agent's exit
+    /// code. Returns the parsed exit code on completion; returns null when
+    /// the deadline elapses before the marker appears (the orchestrator falls
+    /// back to the stranded-item recovery path in that case). Implementations
+    /// that cannot inspect the in-VM filesystem (process / bubblewrap) return
+    /// null immediately.
+    /// </summary>
+    /// <param name="vmName">VM whose log to tail. Must validate against the provider's name allow-list.</param>
+    /// <param name="agentLogPath">Absolute in-VM path to the tee'd log file the agent wrapper writes.</param>
+    /// <param name="logSink">Receives appended log bytes as the agent emits them post-resume.</param>
+    /// <param name="deadline">Best-effort cap on the wait window; null lets the caller's cancellation token drive timing.</param>
+    /// <param name="ct">Cancellation token. Cancelling returns immediately without throwing.</param>
+    /// <returns>Agent exit code, or null if the wait timed out, the file is absent, or the provider does not support adoption.</returns>
+    Task<int?> WaitForAdoptedAgentCompletionAsync(
+        string vmName,
+        string agentLogPath,
+        Action<string>? logSink,
+        TimeSpan? deadline,
+        CancellationToken ct) => Task.FromResult<int?>(null);
+
+    /// <summary>
+    /// R8-core: after the resumed in-VM agent has finished (
+    /// <see cref="WaitForAdoptedAgentCompletionAsync"/> returned an exit code),
+    /// promote whatever the agent committed inside the VM into a real
+    /// preempt-checkpoint git ref on origin so the orchestrator's standard
+    /// recovery flow (see <c>DeadWorkerReaper.RecoverWorkItemAsync</c>) can
+    /// re-enqueue the work item with a non-null
+    /// <see cref="WorkItem.PreemptCheckpoint"/> instead of marking it Failed
+    /// for "Working without a preempt checkpoint".
+    ///
+    /// <para>Operation, executed inside the resumed VM:</para>
+    /// <list type="number">
+    ///   <item>ensure <c>.codeybox/preempt-scratchpad.md</c> exists (so the
+    ///   resumable agent runner has something to restore);</item>
+    ///   <item><c>git add -A</c> in <paramref name="workingDir"/> to capture
+    ///   any uncommitted agent output;</item>
+    ///   <item><c>git commit --allow-empty</c> so the push is non-empty even
+    ///   when the agent had nothing dirty;</item>
+    ///   <item><c>git push origin HEAD:<paramref name="refName"/></c>.</item>
+    /// </list>
+    ///
+    /// <para>Returns true on a successful push; false on any in-VM failure
+    /// (the resume service falls back to clearing suspend bookkeeping with no
+    /// checkpoint, and the existing stranded-item path takes over).</para>
+    ///
+    /// <para>Implementations that cannot exec in the VM (non-VM providers)
+    /// return false — those providers do not participate in suspend/resume.</para>
+    /// </summary>
+    /// <param name="vmName">Resumed (running) VM to operate inside.</param>
+    /// <param name="workingDir">Absolute in-VM working directory containing the git repo (typically <c>/work</c>).</param>
+    /// <param name="refName">Fully-qualified remote ref to push HEAD to (e.g. <c>refs/heads/codeybox/preempt/&lt;id&gt;</c>).</param>
+    /// <param name="commitMessage">Commit message for the synthetic checkpoint commit. Must contain no shell metacharacters.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task<bool> PushSuspendedVmCheckpointRefAsync(
+        string vmName,
+        string workingDir,
+        string refName,
+        string commitMessage,
+        CancellationToken ct) => Task.FromResult(false);
+}
+
+/// <summary>
 /// Description of a sandbox to provision. Mounts and environment are the only
 /// channels by which the host injects state into the sandbox.
 /// </summary>

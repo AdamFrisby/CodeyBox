@@ -639,6 +639,14 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             ? new Dictionary<string, string>(StringComparer.Ordinal)
             : new Dictionary<string, string>(environment, StringComparer.Ordinal);
         merged[AgentRunIdEnvironmentVariable] = runId;
+        // R8-core: the orchestrator-controlled invocation context optionally
+        // requests tee'd capture of the agent CLI's stdout/stderr into an in-VM
+        // log file. The codeybox-exec wrapper honours this env var; without it
+        // (test/non-pipeline callers) the wrapper preserves its
+        // existing behaviour of streaming output to the host only.
+        var logPath = AgentInvocationLogContext.CurrentLogPath;
+        if (!string.IsNullOrEmpty(logPath))
+            merged[SandboxConventions.AgentLogFileEnv] = logPath;
         return merged;
     }
 

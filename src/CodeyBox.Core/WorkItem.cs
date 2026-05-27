@@ -228,6 +228,33 @@ public sealed record WorkItem
     public string? PreemptCheckpoint { get; init; }
 
     /// <summary>
+    /// Name of the sandbox (e.g. multipass VM) suspended during graceful host
+    /// shutdown so the orchestrator can <c>multipass start &lt;name&gt;</c> the
+    /// same VM on the next process startup. Set by the suspend-on-shutdown
+    /// handler; cleared by the startup resume handler once the VM is back to
+    /// Running. Null for items that were not suspended (the steady-state and
+    /// post-resume state).
+    /// </summary>
+    public string? SuspendedVmName { get; init; }
+
+    /// <summary>
+    /// UTC timestamp captured when the suspend-on-shutdown handler froze this
+    /// item's sandbox. Paired with <see cref="SuspendedVmName"/>; null when
+    /// the item is not suspended.
+    /// </summary>
+    public DateTimeOffset? SuspendedAt { get; init; }
+
+    /// <summary>
+    /// Absolute path INSIDE the sandbox VM to the file capturing the active
+    /// agent CLI's stdout/stderr. Set by <see cref="PipelineRunner"/> at agent
+    /// invocation time and preserved across a multipass suspend/start cycle so
+    /// the startup resume handler can <c>tail</c> the file to recover output
+    /// the host-side stream lost on shutdown. Null when no agent is running or
+    /// the active CLI has not opted into tee'd capture.
+    /// </summary>
+    public string? AgentLogPath { get; init; }
+
+    /// <summary>
     /// Caller-supplied identifiers keyed by namespace. The same item can carry
     /// IDs in multiple external systems (e.g. <c>jobtrack</c>, <c>github</c>,
     /// <c>linear</c>). Keys are short, lowercase, dash-separated identifiers

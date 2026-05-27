@@ -1787,6 +1787,24 @@ public sealed class PipelineRunner : IPipelineRunner
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
 
+            // R8-core: if SandboxSuspendOnShutdownService already froze this
+            // VM during IHostedLifecycleService.StoppingAsync (which runs
+            // BEFORE BackgroundService cancellation flows down as
+            // hostShutdownToken), the agent process is paused mid-call and
+            // the VM cannot service `git add/commit/push`. The legacy
+            // preempt-checkpoint flow would block on the frozen VM until the
+            // host's shutdown grace expires. Skip both the checkpoint and
+            // the StopAndPreserveAsync — the suspend handler already
+            // persisted the SuspendedVmName bookkeeping and SandboxResumeOnStartupService
+            // takes over on the next boot.
+            if (sandbox is ISuspendableSandbox { IsSuspended: true })
+            {
+                _log.LogInformation(
+                    "Work item {Id}: sandbox {SandboxId} was suspended by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid hanging on the frozen VM",
+                    item.Id, sandbox.Id);
+                throw;
+            }
+
             Exception? checkpointFailure = null;
             try
             {
@@ -3156,6 +3174,17 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentRunner? initialRunnerOverride = null,
         AgentMembership? initialMemberOverride = null)
     {
+        // R8-core: every agent invocation gets a deterministic in-VM log path,
+        // persisted on the work item BEFORE the runner starts. If SIGTERM fires
+        // mid-invocation the suspend-on-shutdown handler reads AgentLogPath out
+        // of the store and the startup resume handler re-tails the same file on
+        // the resumed VM. Path is keyed by (workItemId, phase, iteration) so
+        // a single work item can have its work / audit-rework / merge / conflict-
+        // rework runs all tagged unambiguously.
+        var agentLogPath = BuildAgentLogPath(item.Id, phase, iteration);
+        await PersistAgentLogPathAsync(item.Id, agentLogPath, ct);
+        using var logScope = AgentInvocationLogContext.BeginScope(agentLogPath);
+
         async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, WorkItem trialItem)
         {
             using var attempt = phaseCancellation is not null && attemptTimeout is { } perAttempt
@@ -3507,6 +3536,69 @@ public sealed class PipelineRunner : IPipelineRunner
         var now = DateTimeOffset.UtcNow;
         var ceiling = now + MaxParsedQuotaResetWindow;
         return parsed > ceiling ? ceiling : parsed;
+    }
+
+    /// <summary>
+    /// R8-core: deterministic in-VM path to the tee'd agent log file for a
+    /// single agent invocation. Persisted on the work item so the suspend-on-
+    /// shutdown handler can read it back without coordinating with this
+    /// process, and the startup resume handler can re-tail the same file on
+    /// the resumed VM. <paramref name="phase"/> / <paramref name="iteration"/>
+    /// keep adjacent runs from clobbering each other; iteration is null for
+    /// merge / conflict-rework invocations that have no audit-loop counter.
+    /// </summary>
+    internal static string BuildAgentLogPath(WorkItemId workItemId, string phase, int? iteration)
+    {
+        var safePhase = string.IsNullOrEmpty(phase) ? "agent" : phase;
+        var iterSuffix = iteration.HasValue ? $"-i{iteration.Value}" : string.Empty;
+        return $"{SandboxConventions.AgentLogDir}/{workItemId.ToString()}-{safePhase}{iterSuffix}.log";
+    }
+
+    /// <summary>
+    /// Persists <paramref name="agentLogPath"/> on <paramref name="id"/> BEFORE
+    /// the agent runs so a SIGTERM mid-invocation lets the suspend-on-shutdown
+    /// handler read the path out of the store. Re-reads the latest row so we
+    /// do not regress a concurrent update from another worker thread on the
+    /// same item (priority bump, prompt edit, etc).
+    /// </summary>
+    private Task PersistAgentLogPathAsync(WorkItemId id, string agentLogPath, CancellationToken ct) =>
+        PersistAgentLogPathAsync(_store, _log, id, agentLogPath, ct);
+
+    /// <summary>
+    /// Static testable core of <see cref="PersistAgentLogPathAsync(WorkItemId,string,CancellationToken)"/>.
+    /// Returns true when a write was issued, false when short-circuited (item
+    /// missing, path already matches) or swallowed (store exception). Cancellation
+    /// is propagated; every other exception is logged at warning and absorbed.
+    /// </summary>
+    internal static async Task<bool> PersistAgentLogPathAsync(
+        IWorkItemStore store,
+        Microsoft.Extensions.Logging.ILogger log,
+        WorkItemId id,
+        string agentLogPath,
+        CancellationToken ct)
+    {
+        try
+        {
+            var fresh = await store.GetAsync(id, ct);
+            if (fresh is null) return false;
+            if (string.Equals(fresh.AgentLogPath, agentLogPath, StringComparison.Ordinal))
+                return false;
+            await store.UpdateAsync(fresh with
+            {
+                AgentLogPath = agentLogPath,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            }, ct);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Best-effort: a store hiccup here must not block the agent
+            // invocation. Worst-case, the suspend-on-shutdown handler does not
+            // see AgentLogPath and the startup resume handler falls back to
+            // the standard stranded-item recovery path.
+            log.LogWarning(ex, "Failed to persist agent log path for {WorkItemId}", id);
+            return false;
+        }
     }
 
     /// <summary>

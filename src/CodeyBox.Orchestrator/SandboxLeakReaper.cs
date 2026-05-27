@@ -36,6 +36,7 @@ public sealed class SandboxLeakReaper : BackgroundService
     private readonly IWebhookDispatcher _webhooks;
     private readonly Func<SandboxLeakOptions> _optsAccessor;
     private readonly ILogger<SandboxLeakReaper> _log;
+    private readonly IWorkItemStore? _store;
 
     // Latest detected leaks, snapshotted after each sweep. Thread-safe via
     // Interlocked-style replace; the API endpoint reads this without locking.
@@ -54,18 +55,27 @@ public sealed class SandboxLeakReaper : BackgroundService
         IWebhookDispatcher webhooks,
         SandboxLeakOptions opts,
         ILogger<SandboxLeakReaper> log)
-        : this(provider, webhooks, () => opts, log) { }
+        : this(provider, webhooks, () => opts, log, store: null) { }
 
     public SandboxLeakReaper(
         ISandboxProvider provider,
         IWebhookDispatcher webhooks,
         Func<SandboxLeakOptions> optionsAccessor,
         ILogger<SandboxLeakReaper> log)
+        : this(provider, webhooks, optionsAccessor, log, store: null) { }
+
+    public SandboxLeakReaper(
+        ISandboxProvider provider,
+        IWebhookDispatcher webhooks,
+        Func<SandboxLeakOptions> optionsAccessor,
+        ILogger<SandboxLeakReaper> log,
+        IWorkItemStore? store)
     {
         _provider = provider;
         _webhooks = webhooks;
         _optsAccessor = optionsAccessor;
         _log = log;
+        _store = store;
     }
 
     /// <summary>
@@ -124,10 +134,21 @@ public sealed class SandboxLeakReaper : BackgroundService
             var allManaged = await _provider.ListAllManagedAsync(ct);
             var now = DateTimeOffset.UtcNow;
 
+            // R8-core: any VM named in a work item's SuspendedVmName is being
+            // held across an orchestrator restart and MUST NOT be reaped — the
+            // startup resume handler will multipass-start it back to Running
+            // (or clear the bookkeeping if the resume fails). Built fresh per
+            // sweep so a resume that completes between sweeps takes effect on
+            // the next pass without an explicit invalidation hook.
+            var suspendedNames = await BuildSuspendedVmNameSetAsync(ct);
+
             var leaks = new List<LeakedSandboxInfo>();
             foreach (var info in allManaged)
             {
                 if (info.IsTrackedActive)
+                    continue;
+
+                if (suspendedNames.Contains(info.Name))
                     continue;
 
                 var missingCreationMetadata = !info.CreatedAt.HasValue;
@@ -200,6 +221,31 @@ public sealed class SandboxLeakReaper : BackgroundService
         {
             _log.LogWarning(ex, "SandboxLeakReaper: sweep failed");
         }
+    }
+
+    private async Task<HashSet<string>> BuildSuspendedVmNameSetAsync(CancellationToken ct)
+    {
+        if (_store is null) return new HashSet<string>(StringComparer.Ordinal);
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        // ListSuspendedAsync hits the partial index idx_work_items_suspended_vm
+        // (suspended_vm_name WHERE NOT NULL), so this loop's cost scales with
+        // the in-flight suspend count rather than the full work_items table.
+        await foreach (var item in _store.ListSuspendedAsync(ct))
+        {
+            // Only honour SuspendedVmName for items still in mid-flight states.
+            // A terminal item with a stale SuspendedVmName (e.g. cancelled by
+            // the operator between suspend and the next sweep) should not
+            // keep its VM exempt from reaping forever.
+            if (string.IsNullOrWhiteSpace(item.SuspendedVmName)) continue;
+            if (item.State is WorkItemState.Working
+                or WorkItemState.Auditing
+                or WorkItemState.Reworking
+                or WorkItemState.Merging)
+            {
+                set.Add(item.SuspendedVmName!);
+            }
+        }
+        return set;
     }
 
     private async Task<string?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)

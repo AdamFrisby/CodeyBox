@@ -222,6 +222,35 @@ public static class AuditLog
             .Warning("Failed to dispose leaked sandbox {SandboxName} age={AgeMinutes:F1}min disk={DiskMb}MB reason={Reason}: {Error}",
                 name, ageMinutes, diskMb, reason, error);
 
+    public static void SandboxSuspendedOnShutdown(WorkItemId workItemId, string vmName) =>
+        Audit("sandbox.suspended_on_shutdown")
+            .Information("Suspended sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
+                vmName, workItemId.ToString());
+
+    public static void SandboxResumedOnStartup(
+        WorkItemId workItemId,
+        string vmName,
+        bool success,
+        string? error = null,
+        bool adopted = false,
+        int? adoptionExitCode = null)
+    {
+        // Failure (multipass start non-zero, missing VM, etc.) surfaces at
+        // Warning so it lights up operator dashboards alongside other resume
+        // problems instead of disappearing into the Information stream.
+        var log = Audit(success ? "sandbox.resumed_on_startup" : "sandbox.resume_failed_on_startup");
+        if (!success)
+        {
+            log.Warning(
+                "Resume of suspended sandbox {VmName} for work item {WorkItemId} failed: error={Error}",
+                vmName, workItemId.ToString(), error);
+            return;
+        }
+        log.Information(
+            "Resume of suspended sandbox {VmName} for work item {WorkItemId}: success={Success} adopted={Adopted} adoptionExitCode={AdoptionExitCode}",
+            vmName, workItemId.ToString(), success, adopted, adoptionExitCode);
+    }
+
     // ── Upstream remote ──────────────────────────────────────────────────────
 
     public static void UpstreamPrOpened(int prNumber, string? prUrl, string workBranch, string baseBranch) =>
