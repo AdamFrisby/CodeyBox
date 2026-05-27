@@ -119,6 +119,49 @@ public sealed class ClaudeQuotaProbeTests
         Assert.Equal(0.0, snap.AvailablePct);
     }
 
+    [Fact]
+    public void ParseResponse_LegacyShape_FreshPrimary_ExhaustedSecondary_AggregatesToZero()
+    {
+        // Bug "multi-window quota: primary 0% obscures secondary 100%": the
+        // legacy rate_limit shape (still emitted by Anthropic for some plan
+        // types) must report 0% when EITHER window is exhausted, regardless of
+        // which window is fresh.
+        var snap = ClaudeQuotaProbe.ParseResponse("""
+        {
+          "rate_limit": {
+            "primary_window":   { "used_percent": 0,   "reset_at": 1778091218 },
+            "secondary_window": { "used_percent": 100, "reset_at": 1778605571 }
+          }
+        }
+        """);
+
+        Assert.Equal(0, snap.AvailablePct);
+        Assert.Equal(2, snap.Windows.Count);
+        Assert.Equal(0, Assert.Single(snap.Windows, w => w.Name == "weekly").AvailablePct);
+        Assert.Equal(100, Assert.Single(snap.Windows, w => w.Name == "5h-rolling").AvailablePct);
+    }
+
+    [Fact]
+    public void ParseResponse_FlatShape_FreshFiveHour_ExhaustedSevenDay_AggregatesToZero()
+    {
+        // Same multi-window bug as above but for the flat-bucket shape the live
+        // Anthropic OAuth endpoint returns. five_hour at 0% used (100% avail)
+        // alongside seven_day at 100% used (0% avail) must aggregate to 0,
+        // not 100 — otherwise the router routes to claude during the weekly
+        // exhaustion period whenever the 5h bucket cycles.
+        var snap = ClaudeQuotaProbe.ParseResponse("""
+        {
+          "five_hour": { "utilization": 0,   "resets_at": "2026-05-27T07:00:00Z" },
+          "seven_day": { "utilization": 100, "resets_at": "2026-06-01T07:00:00Z" }
+        }
+        """);
+
+        Assert.Equal(0, snap.AvailablePct);
+        Assert.Equal(2, snap.Windows.Count);
+        Assert.Equal(0, Assert.Single(snap.Windows, w => w.Name == "seven_day").AvailablePct);
+        Assert.Equal(100, Assert.Single(snap.Windows, w => w.Name == "five_hour").AvailablePct);
+    }
+
     // ── HTTP error handling ───────────────────────────────────────────────────
 
     [Fact]

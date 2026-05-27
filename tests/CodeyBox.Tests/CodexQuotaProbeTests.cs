@@ -119,6 +119,31 @@ public sealed class CodexQuotaProbeTests
     }
 
     [Fact]
+    public void ParseResponse_FreshPrimary_ExhaustedSecondary_AggregatesToZero()
+    {
+        // Bug "multi-window quota: primary 0% obscures secondary 100%": after
+        // the codex 5h-rolling bucket reset to 0% used, the weekly bucket was
+        // still at 100% used (118h to reset). The router must see the weekly
+        // bucket's 0% available, not the 5h bucket's 100% — otherwise it
+        // dispatches into an exhausted weekly cap.
+        var snap = CodexQuotaProbe.ParseResponse("""
+        {
+          "rate_limit": {
+            "primary_window":   { "used_percent": 0,   "reset_at": 1778091218 },
+            "secondary_window": { "used_percent": 100, "reset_at": 1778605571 }
+          }
+        }
+        """);
+
+        Assert.Equal(0, snap.AvailablePct);
+        Assert.Equal(2, snap.Windows.Count);
+        var weekly = Assert.Single(snap.Windows, w => w.Name == "weekly");
+        Assert.Equal(0, weekly.AvailablePct);
+        var fiveH = Assert.Single(snap.Windows, w => w.Name == "5h-rolling");
+        Assert.Equal(100, fiveH.AvailablePct);
+    }
+
+    [Fact]
     public void ParseResponse_AddsDefaultRoutedAliasForWhamCodexBucket()
     {
         var snap = CodexQuotaProbe.ParseResponse("""

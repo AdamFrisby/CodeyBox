@@ -234,7 +234,13 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
                 {
                     var v = perModel[key];
                     if (v.AvailablePct > capPct)
-                        perModel[key] = new ModelQuota { AvailablePct = capPct, ResetAt = overall.ResetAt ?? v.ResetAt, Window = $"{v.Window} (capped by overall)" };
+                        perModel[key] = new ModelQuota
+                        {
+                            AvailablePct = capPct,
+                            ResetAt = overall.ResetAt ?? v.ResetAt,
+                            Window = $"{v.Window} (capped by overall)",
+                            Windows = v.Windows,
+                        };
                 }
             }
 
@@ -245,6 +251,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
                     ResetAt = overall?.ResetAt,
                     Notes = overall is null ? "overall quota unknown; parsed per-model rollups" : null,
                     PerModel = perModel,
+                    Windows = overall?.Windows ?? Array.Empty<WindowQuota>(),
                 };
 
             return Unknown("unexpected response shape");
@@ -260,19 +267,28 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         if (root.ValueKind != JsonValueKind.Object) return null;
 
         // Detect flat shape: at least one global bucket present with `utilization`.
+        // Collect every global window's raw reading so /quota can expose the
+        // breakdown — without this, an operator sees only the aggregated min
+        // and can't tell whether the gate was the 5h or the 7d cap.
         ModelQuota? overall = null;
-        var allBuckets = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
+        var globalWindows = new List<WindowQuota>(GlobalBuckets.Length);
         foreach (var bucket in GlobalBuckets)
         {
             if (!root.TryGetProperty(bucket, out var el) || el.ValueKind != JsonValueKind.Object) continue;
             var quota = ParseFlatBucket(el, bucket);
             if (quota is null) continue;
-            allBuckets[bucket] = quota;
+            globalWindows.Add(new WindowQuota
+            {
+                Name = bucket,
+                AvailablePct = quota.AvailablePct,
+                ResetAt = quota.ResetAt,
+            });
             if (overall is null || quota.AvailablePct < overall.AvailablePct)
                 overall = quota with { Window = bucket };
         }
 
         if (overall is null) return null; // not the flat shape
+        overall = overall with { Windows = globalWindows };
 
         // Collect model-specific buckets.
         var modelBuckets = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
@@ -286,14 +302,23 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
 
         // Build per-model dict: every model_id matched by a suffix gets
         // min(overall, model-specific). Keep the suffix as a synthetic key
-        // too so callers that route by suffix still work.
+        // too so callers that route by suffix still work. Each per-model
+        // ModelQuota carries the global windows plus its own model-specific
+        // window so the breakdown stays complete in /quota.
         var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
         foreach (var (suffix, _) in ModelSuffixes)
         {
             if (!modelBuckets.TryGetValue(suffix, out var bucket)) continue;
+            var windowsForModel = BuildPerModelWindows(globalWindows, suffix, bucket);
             var capped = bucket.AvailablePct < overall.AvailablePct
-                ? bucket with { Window = suffix }
-                : new ModelQuota { AvailablePct = overall.AvailablePct, ResetAt = overall.ResetAt ?? bucket.ResetAt, Window = $"{suffix} (capped by overall)" };
+                ? bucket with { Window = suffix, Windows = windowsForModel }
+                : new ModelQuota
+                {
+                    AvailablePct = overall.AvailablePct,
+                    ResetAt = overall.ResetAt ?? bucket.ResetAt,
+                    Window = $"{suffix} (capped by overall)",
+                    Windows = windowsForModel,
+                };
             perModel[suffix] = capped;
         }
 
@@ -302,10 +327,12 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         foreach (var modelId in configuredModels)
         {
             ModelQuota? best = overall; // default to global cap
+            List<WindowQuota> windowsForModel = globalWindows;
             foreach (var (suffix, modelMatch) in ModelSuffixes)
             {
                 if (!modelId.Contains(modelMatch, StringComparison.OrdinalIgnoreCase)) continue;
                 if (!modelBuckets.TryGetValue(suffix, out var modelBucket)) continue;
+                windowsForModel = BuildPerModelWindows(globalWindows, suffix, modelBucket);
                 var effective = modelBucket.AvailablePct < overall.AvailablePct
                     ? modelBucket
                     : overall;
@@ -313,7 +340,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
                     best = effective with { Window = suffix };
             }
             if (best is not null)
-                perModel[modelId] = best;
+                perModel[modelId] = best with { Windows = windowsForModel };
         }
 
         return new AgentQuotaSnapshot
@@ -322,7 +349,24 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
             ResetAt = overall.ResetAt,
             Notes = null,
             PerModel = perModel,
+            Windows = globalWindows,
         };
+    }
+
+    private static List<WindowQuota> BuildPerModelWindows(
+        List<WindowQuota> globalWindows,
+        string modelSuffix,
+        ModelQuota modelBucket)
+    {
+        var result = new List<WindowQuota>(globalWindows.Count + 1);
+        result.AddRange(globalWindows);
+        result.Add(new WindowQuota
+        {
+            Name = modelSuffix,
+            AvailablePct = modelBucket.AvailablePct,
+            ResetAt = modelBucket.ResetAt,
+        });
+        return result;
     }
 
     private static ModelQuota? ParseFlatBucket(JsonElement el, string window)
@@ -384,15 +428,18 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
 
     private static ModelQuota? TryParseRateLimit(JsonElement el)
     {
-        var windows = new[]
+        var windowSources = new[]
         {
             ("5h-rolling", TryGetProperty(el, "primary_window")),
             ("weekly", TryGetProperty(el, "secondary_window")),
             ("overall", (JsonElement?)el),
         };
 
+        // Two passes: collect every named window for /quota exposure, then
+        // pick the min (most-constrained) for the aggregated AvailablePct.
+        var windows = new List<WindowQuota>(windowSources.Length);
         ModelQuota? mostConstrained = null;
-        foreach (var (windowName, window) in windows)
+        foreach (var (windowName, window) in windowSources)
         {
             if (window is null)
                 continue;
@@ -401,11 +448,23 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
             if (quota is null)
                 continue;
 
+            // Skip the synthetic "overall" entry when it duplicates the named
+            // windows — it carries no extra signal in the breakdown.
+            if (windowName != "overall")
+                windows.Add(new WindowQuota
+                {
+                    Name = windowName,
+                    AvailablePct = quota.AvailablePct,
+                    ResetAt = quota.ResetAt,
+                });
+
             if (mostConstrained is null || quota.AvailablePct < mostConstrained.AvailablePct)
                 mostConstrained = quota;
         }
 
-        return mostConstrained;
+        return mostConstrained is null
+            ? null
+            : mostConstrained with { Windows = windows };
     }
 
     private static ModelQuota? TryParseWindow(JsonElement el, string window)
