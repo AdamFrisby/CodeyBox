@@ -257,6 +257,51 @@ public sealed class CodeyBoxOptionsHotReloadTests
     }
 
     [Fact]
+    public void AgentCostCalculator_ApplyConfigReload_RejectsNegativeDefaultRate_KeepsPrior()
+    {
+        // Exercises the second validation loop in ApplyConfigReload — the one
+        // that scans next.DefaultRates rather than next.Rates. A regression
+        // that inverted the comparison, dropped the loop, or copy-pasted the
+        // wrong field would let a negative default rate swap in silently.
+        var initial = new AgentPricingOptions
+        {
+            DefaultRates = new()
+            {
+                ["claude"] = new ModelRateConfig
+                {
+                    InputPerMillion = 3.0,
+                    CachedInputPerMillion = 0.30,
+                    OutputPerMillion = 15.0,
+                },
+            },
+        };
+        var calculator = new AgentCostCalculator(initial);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "model-not-in-rates");
+        // Falls through to DefaultRates: 1000*3/1e6 + 1000*15/1e6 = 0.018
+        var priorCost = calculator.Calculate(snapshot, AgentKind.Claude);
+        Assert.Equal(0.018000m, priorCost);
+
+        var bad = new AgentPricingOptions
+        {
+            DefaultRates = new()
+            {
+                ["claude"] = new ModelRateConfig
+                {
+                    InputPerMillion = 3.0,
+                    CachedInputPerMillion = 0.30,
+                    OutputPerMillion = -1.0,
+                },
+            },
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => calculator.ApplyConfigReload(bad));
+        Assert.Contains("default rate", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // Prior default rate must still be in effect after the rejected reload.
+        Assert.Equal(priorCost, calculator.Calculate(snapshot, AgentKind.Claude));
+    }
+
+    [Fact]
     public void AgentCostCalculator_ApplyConfigReload_AddsRateForPreviouslyUnknownAgent()
     {
         // Initial config has no rate for codex; calculator returns 0 for codex calls.
