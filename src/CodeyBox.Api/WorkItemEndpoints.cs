@@ -381,9 +381,16 @@ internal static class WorkItemEndpoints
             iterations: iterations.Count > 0 ? iterations : null);
         if (fallbackHistory is not null)
         {
+            // Always emit a list (possibly empty) when the store is wired, so
+            // consumers can distinguish "no fallback happened" ([]) from "data
+            // never fetched / store unavailable" (null on listing endpoints).
             var history = await fallbackHistory.ListByWorkItemAsync(item.Id, ct);
-            if (history.Count > 0)
-                dto = dto with { FallbackHistory = history.Select(MapFallback).ToList() };
+            dto = dto with
+            {
+                FallbackHistory = history.Count > 0
+                    ? history.Select(MapFallback).ToList()
+                    : Array.Empty<AgentFallbackDto>(),
+            };
         }
         return Results.Ok(dto);
     }

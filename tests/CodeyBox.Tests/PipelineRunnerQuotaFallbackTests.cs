@@ -76,6 +76,45 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task Codex_HitsQuota_FallsBackToClaude_PersistsFallbackHistoryAfterDone()
+    {
+        // Regression guard for the symptom "fallbackHistory: null on 25/30 Done
+        // items" reported by operators: in-process logs showed Codex→Claude
+        // fallback events but the persisted FallbackHistory was empty on most
+        // Done items. This test pins the contract that, after a work item
+        // completes in Done following a quota-triggered swap, at least one
+        // fallback record is durably present in the store. A regression that
+        // bypasses RecordAsync (e.g. wiring the swap webhook without the store
+        // write) or that clears the per-item rows on Done-finalization will
+        // trip Count == 0 here.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.True(history.Count >= 1,
+            $"expected at least one persisted fallback record after Done; got {history.Count}");
+        var swap = history.Single(h => h.Phase == "work" && h.ToAgent == AgentKind.Claude);
+        Assert.Equal(AgentKind.Codex, swap.FromAgent);
+        Assert.Equal(AgentKind.Claude, swap.ToAgent);
+        Assert.Contains("quota", swap.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task BothMembers_Exhausted_ParksInWaitingForQuotaReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
