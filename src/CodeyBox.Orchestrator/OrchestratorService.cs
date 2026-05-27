@@ -292,8 +292,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // process crashed back to a recoverable state, so ReplayPendingAsync
         // finds them in their correct target states (Queued, WorkComplete, …)
         // rather than the stale worker-owned states.
+        //
+        // Order matters: RunOnceAsync claims and DELETEs every stale worker
+        // row, so the subsequent SweepStrandedItemsAsync can treat any
+        // remaining registry rows as authoritatively "live" and safely leave
+        // their owned items alone. Without this ordering an HA peer mid-flight
+        // could be misclassified as stranded.
         if (_reaper is not null)
+        {
             await _reaper.RunOnceAsync(stoppingToken);
+            await _reaper.SweepStrandedItemsAsync(stoppingToken);
+        }
 
         await ReplayPendingAsync(stoppingToken);
 
@@ -626,9 +635,33 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// <summary>
     /// Builds the recovered state for a mid-flight work item, or returns null
     /// if the item does not need recovery (terminal or Queued).
+    ///
+    /// <para>
+    /// When a <see cref="DeadWorkerReaper"/> is wired, items in
+    /// <see cref="WorkItemState.Working"/>, <see cref="WorkItemState.Reworking"/>,
+    /// <see cref="WorkItemState.Auditing"/>, and <see cref="WorkItemState.Merging"/>
+    /// are handled earlier by <see cref="DeadWorkerReaper.SweepStrandedItemsAsync"/>
+    /// — that path consults the worker registry to skip items owned by a live
+    /// worker, which this unconditional replay cannot do. Returning null here
+    /// for those states prevents double-recovery (duplicate <c>RecoveryAttempts</c>
+    /// increments, duplicate webhook fires, double queue kicks). Test fixtures
+    /// without a reaper fall through to the legacy inline handling so the
+    /// recovery contract for those states remains exercised end-to-end.
+    /// </para>
     /// </summary>
     private WorkItem? TryBuildRecoveredState(WorkItem item)
     {
+        // Worker-owned mid-flight states are handled by the registry-aware
+        // startup sweep when a reaper is wired. Skip them here to avoid
+        // clobbering items held by a live peer and to avoid double-recovery.
+        if (_reaper is not null && item.State is WorkItemState.Working
+            or WorkItemState.Reworking
+            or WorkItemState.Auditing
+            or WorkItemState.Merging)
+        {
+            return null;
+        }
+
         if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
