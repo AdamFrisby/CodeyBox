@@ -220,6 +220,8 @@ public sealed class DiskFullApiBoundaryTests
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => Task.FromResult(0);
         public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => Task.FromResult(0);
         public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);
+        public Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);
+        public Task<WorkItem?> ReplaceExternalIdsAsync(WorkItemId id, IReadOnlyDictionary<string, string> externalIds, DateTimeOffset updatedAt, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);
         public Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<(string, int, int, string)>>([]);
         public Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default)
@@ -264,6 +266,8 @@ public sealed class DiskFullApiBoundaryTests
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => Task.FromResult(0);
         public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => Task.FromResult(0);
         public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);
+        public Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);
+        public Task<WorkItem?> ReplaceExternalIdsAsync(WorkItemId id, IReadOnlyDictionary<string, string> externalIds, DateTimeOffset updatedAt, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);
         public Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<(string, int, int, string)>>([]);
         public Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default)

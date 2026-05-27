@@ -88,12 +88,14 @@ public sealed class SqlitePersistenceUatTests : IDisposable
         using var store = new SqliteWorkItemStore(_workspace.NewDatabasePath());
         var projectItem = PersistenceAndRecoveryHelpers.Item();
         var secondNullExternalId = PersistenceAndRecoveryHelpers.Item();
-        var withExternalId = PersistenceAndRecoveryHelpers.Item() with { ExternalId = "UAT-123" };
-        var duplicateExternalId = PersistenceAndRecoveryHelpers.Item() with { ExternalId = "UAT-123" };
+        static Dictionary<string, string> Legacy(string value) =>
+            new(StringComparer.OrdinalIgnoreCase) { ["legacy"] = value };
+        var withExternalId = PersistenceAndRecoveryHelpers.Item() with { ExternalIds = Legacy("UAT-123") };
+        var duplicateExternalId = PersistenceAndRecoveryHelpers.Item() with { ExternalIds = Legacy("UAT-123") };
         var otherProjectSameExternalId = PersistenceAndRecoveryHelpers.Item() with
         {
             ProjectId = new ProjectId("uat-persistence-other"),
-            ExternalId = "UAT-123",
+            ExternalIds = Legacy("UAT-123"),
         };
 
         await store.CreateAsync(projectItem);

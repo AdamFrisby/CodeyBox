@@ -213,6 +213,52 @@ public static partial class Validation
     }
 
     /// <summary>
+    /// External-ID namespace: lowercase ASCII letters, digits, and dashes;
+    /// 1–32 chars; must start with a letter or digit. The empty string is
+    /// rejected. Used as a key in <see cref="WorkItem.ExternalIds"/> and as the
+    /// namespace component in composite query/dep-resolution strings
+    /// (<c>namespace:value</c>).
+    /// </summary>
+    [GeneratedRegex(@"^[a-z0-9][a-z0-9\-]{0,31}$", RegexOptions.CultureInvariant)]
+    private static partial Regex ExternalIdNamespaceRegex();
+
+    /// <summary>
+    /// Validates an external-ID namespace key. Lowercase alphanumeric + dashes,
+    /// must start with a letter or digit, length 1–32.
+    /// </summary>
+    public static void ValidateExternalIdNamespace(string value, string fieldName)
+    {
+        if (string.IsNullOrEmpty(value))
+            throw new ArgumentException($"{fieldName} must not be empty", fieldName);
+        if (!ExternalIdNamespaceRegex().IsMatch(value))
+            throw new ArgumentException(
+                $"{fieldName} '{value}' must be 1–32 lowercase alphanumeric characters or dashes, starting with a letter or digit",
+                fieldName);
+    }
+
+    /// <summary>
+    /// Parses a namespaced external-ID reference of the form <c>namespace:value</c>.
+    /// On a successful split with a non-empty namespace and value, sets
+    /// <paramref name="ns"/> and <paramref name="value"/> and returns true. When
+    /// the input contains no colon (a bare value) returns false with the input
+    /// echoed into <paramref name="value"/> and <paramref name="ns"/> set to null
+    /// so callers can route to an "any-namespace" lookup.
+    /// </summary>
+    public static bool TryParseNamespacedExternalId(string input, out string? ns, out string value)
+    {
+        ns = null;
+        value = input;
+        if (string.IsNullOrEmpty(input)) return false;
+        var colonIdx = input.IndexOf(':');
+        if (colonIdx <= 0 || colonIdx == input.Length - 1) return false;
+        var nsPart = input[..colonIdx];
+        if (!ExternalIdNamespaceRegex().IsMatch(nsPart)) return false;
+        ns = nsPart;
+        value = input[(colonIdx + 1)..];
+        return true;
+    }
+
+    /// <summary>
     /// Validates a string used as a positional argument for a tool that may
     /// otherwise interpret leading '-' as an option, and forbids control
     /// characters that could affect log/audit fidelity.

@@ -121,10 +121,35 @@ public interface IWorkItemStore
     Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default);
 
     /// <summary>
-    /// Look up a work item by its caller-supplied external ID within a project.
-    /// Returns null when no matching item exists.
+    /// Look up a work item by a bare external-ID value within a project. Matches
+    /// across every namespace in <see cref="WorkItem.ExternalIds"/>. Returns
+    /// null when no matching item exists. Throws
+    /// <see cref="AmbiguousExternalIdException"/> when the value matches in
+    /// more than one namespace within the project — callers must disambiguate
+    /// using <see cref="GetByNamespacedExternalIdAsync"/>.
     /// </summary>
     Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Look up a work item by an explicit (namespace, value) pair within a
+    /// project. Returns null when no matching item exists. Unlike the bare
+    /// lookup this is always unambiguous because <c>(projectId, namespace,
+    /// value)</c> is uniquely indexed.
+    /// </summary>
+    Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Replaces the full <see cref="WorkItem.ExternalIds"/> map for the item.
+    /// Implementations enforce per-project uniqueness on each
+    /// <c>(namespace, value)</c> pair and throw
+    /// <see cref="WorkItemExternalIdConflictException"/> on collision. The
+    /// store snapshot returned by subsequent reads reflects the new map.
+    /// </summary>
+    Task<WorkItem?> ReplaceExternalIdsAsync(
+        WorkItemId id,
+        IReadOnlyDictionary<string, string> externalIds,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Fleet aggregation: returns (project_id, state, count, max_updated_at) rows produced by

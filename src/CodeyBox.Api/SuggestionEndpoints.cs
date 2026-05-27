@@ -195,7 +195,9 @@ internal static class SuggestionEndpoints
             PushUpstream = body?.PushUpstream ?? true,
             AgentClassId = body?.AgentClassId,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
-            ExternalId = externalId,
+            ExternalIds = externalId is null
+                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["legacy"] = externalId },
         };
 
         // Atomically claim the suggestion BEFORE creating the work item.
