@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -371,6 +372,261 @@ public sealed class MergeConflictReworkTests : IDisposable
         var reworkRow = rows.First(r => r.Phase == "conflict_rework");
         Assert.Equal(1234, reworkRow.InputTokens);
         Assert.Equal(567, reworkRow.OutputTokens);
+    }
+
+    /// <summary>
+    /// One-iteration cap. Spec acceptance criterion #1 caps the agent at one
+    /// rework engagement per merge attempt. We simulate "the rework already
+    /// happened" by seeding <see cref="WorkItem.ConflictReworkAttempts"/> = 1
+    /// before the pipeline runs; when the merge phase then surfaces a
+    /// conflict, the cap check at the top of the catch block must trip and
+    /// the agent's <see cref="ScriptedAgent.ConflictReworkPlan"/> must NOT be
+    /// dequeued (or the counter bumped a second time).
+    /// </summary>
+    [Fact]
+    public async Task ConflictRework_OneIterationCap_SecondAttemptSkipsAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        // Deliberately leave ConflictReworkPlan EMPTY: if the cap check
+        // misfires and the agent is invoked, ScriptedAgent returns a failure
+        // ("ran out of conflict-rework plan entries") — but the assertions
+        // below also defend by checking ConflictReworkPrompts.Count.
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]) with
+        {
+            ConflictReworkAttempts = 1,
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        // Counter must NOT be bumped: the cap blocked re-engagement.
+        Assert.Equal(1, final.ConflictReworkAttempts);
+        // The agent's rework plan was never consulted.
+        Assert.Empty(tp.Agent.ConflictReworkPrompts);
+    }
+
+    /// <summary>
+    /// State-transition observation: while the rework agent is running, the
+    /// work item's persisted state must be
+    /// <see cref="WorkItemState.ReworkingForConflict"/>. We snapshot the
+    /// state from inside the agent callback (which runs after the
+    /// Transition() call but before the agent finishes) and assert it on
+    /// completion. Without this test, a bug that emitted the wrong
+    /// intermediate state (or skipped the transition entirely) would be
+    /// invisible — the only post-condition the success test reads is the
+    /// terminal Done state.
+    /// </summary>
+    [Fact]
+    public async Task ConflictRework_PipelineTransitionsThroughReworkingForConflictState()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        WorkItemState? observedStateAtAgentInvocation = null;
+        int? observedAttemptsAtAgentInvocation = null;
+        var capturedItemId = WorkItemId.New();
+        var store = tp.Store;
+
+        tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
+        {
+            var snapshot = await store.GetAsync(capturedItemId, ct);
+            observedStateAtAgentInvocation = snapshot?.State;
+            observedAttemptsAtAgentInvocation = snapshot?.ConflictReworkAttempts;
+
+            await WriteFileAsync(sandbox, workDir, "README.md", "main side\nwork side\n", ct);
+            await Run(sandbox, "git", "-C", workDir, "add", "README.md");
+            await Run(sandbox, "git", "-C", workDir,
+                "-c", "core.editor=true",
+                "-c", "sequence.editor=true",
+                "rebase", "--continue");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]) with
+        {
+            Id = capturedItemId,
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.Equal(WorkItemState.ReworkingForConflict, observedStateAtAgentInvocation);
+        // The bump must be visible while the agent runs so the cap check works
+        // correctly on any concurrent observer.
+        Assert.Equal(1, observedAttemptsAtAgentInvocation);
+    }
+
+    /// <summary>
+    /// Webhook events: the rework iteration must emit
+    /// <c>work_item.conflict_rework_started</c> with the conflict-file list,
+    /// base/work branches, and tip SHAs; and
+    /// <c>work_item.conflict_rework_finished</c> with the success outcome
+    /// and the diff stats (NewWorkBranchTip / FilesChanged). Spec
+    /// acceptance criterion #3.
+    /// </summary>
+    [Fact]
+    public async Task ConflictRework_EmitsStartedAndFinishedWebhookEvents_WithPayloadFields()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed,
+            auditors: [auditor], webhookDispatcher: webhooks);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
+        {
+            await WriteFileAsync(sandbox, workDir, "README.md", "main side\nwork side\n", ct);
+            await Run(sandbox, "git", "-C", workDir, "add", "README.md");
+            await Run(sandbox, "git", "-C", workDir,
+                "-c", "core.editor=true",
+                "-c", "sequence.editor=true",
+                "rebase", "--continue");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var workBranch = "codeybox/" + WorkItemId.New().ToString()[..8];
+        var item = NewItem(workBranch);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var startedEvt = Assert.Single(webhooks.Events, e => e.Event == "work_item.conflict_rework_started");
+        var startedDetails = Assert.IsType<ConflictReworkStartedDetails>(startedEvt.Details);
+        Assert.Equal(item.Id.ToString(), startedDetails.WorkItemId);
+        Assert.Equal("main", startedDetails.BaseBranch);
+        Assert.Equal(workBranch, startedDetails.WorkBranch);
+        Assert.False(string.IsNullOrWhiteSpace(startedDetails.WorkBranchTip));
+        Assert.False(string.IsNullOrWhiteSpace(startedDetails.BaseTip));
+        // Started before finished — temporal contract for trackers.
+        Assert.NotEqual(startedDetails.WorkBranchTip, startedDetails.BaseTip);
+
+        var finishedEvt = Assert.Single(webhooks.Events, e => e.Event == "work_item.conflict_rework_finished");
+        var finishedDetails = Assert.IsType<ConflictReworkFinishedDetails>(finishedEvt.Details);
+        Assert.Equal(item.Id.ToString(), finishedDetails.WorkItemId);
+        Assert.Equal("main", finishedDetails.BaseBranch);
+        Assert.Equal(workBranch, finishedDetails.WorkBranch);
+        Assert.True(finishedDetails.Success);
+        Assert.False(string.IsNullOrWhiteSpace(finishedDetails.NewWorkBranchTip));
+        Assert.Null(finishedDetails.SemanticIncompatibleReason);
+        Assert.Null(finishedDetails.ParkReason);
+
+        // Order: started before finished.
+        var startedIdx = webhooks.Events.ToList().FindIndex(e => e.Event == "work_item.conflict_rework_started");
+        var finishedIdx = webhooks.Events.ToList().FindIndex(e => e.Event == "work_item.conflict_rework_finished");
+        Assert.True(startedIdx >= 0 && finishedIdx > startedIdx,
+            $"finished must follow started (started={startedIdx}, finished={finishedIdx})");
+    }
+
+    /// <summary>
+    /// Webhook event payload carries the SEMANTIC_INCOMPATIBLE reason on the
+    /// finished event so operators can wire a tracker comment / Slack notice
+    /// off the parked state.
+    /// </summary>
+    [Fact]
+    public async Task ConflictRework_SemanticIncompatible_FinishedEventCarriesReason()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed,
+            auditors: [auditor], webhookDispatcher: webhooks);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+        {
+            _ = sandbox; _ = workDir; _ = ct;
+            return Task.FromResult(new AgentResult(
+                Success: false,
+                Summary: "incompatible",
+                Stdout: "SEMANTIC_INCOMPATIBLE: events have diverged",
+                Stderr: null));
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finishedEvt = Assert.Single(webhooks.Events, e => e.Event == "work_item.conflict_rework_finished");
+        var finishedDetails = Assert.IsType<ConflictReworkFinishedDetails>(finishedEvt.Details);
+        Assert.False(finishedDetails.Success);
+        Assert.Equal("events have diverged", finishedDetails.SemanticIncompatibleReason);
+        Assert.NotNull(finishedDetails.ParkReason);
+        Assert.Contains("SEMANTIC_INCOMPATIBLE", finishedDetails.ParkReason);
+    }
+
+    /// <summary>
+    /// Restart-recovery: a worker dying mid-<see cref="WorkItemState.ReworkingForConflict"/>
+    /// must surface back at <see cref="WorkItemState.AuditPassed"/> via the
+    /// reaper, with <see cref="WorkItem.ConflictReworkAttempts"/> preserved
+    /// across the restart so the one-iteration cap survives. The mapping
+    /// itself is exercised here (DeadWorkerReaper.MapToRecoveryState +
+    /// OrchestratorService.TryBuildRecoveredStateForTest); the cap test
+    /// above complements it by proving a preserved=1 counter blocks
+    /// re-engagement.
+    /// </summary>
+    [Fact]
+    public void ConflictRework_DeadWorkerReaperMaps_ReworkingForConflict_To_AuditPassed()
+    {
+        var mapped = DeadWorkerReaper.MapToRecoveryState(WorkItemState.ReworkingForConflict);
+        Assert.Equal(WorkItemState.AuditPassed, mapped);
+    }
+
+    [Fact]
+    public async Task ConflictRework_StartupRecovery_PreservesConflictReworkAttempts_AcrossRestart()
+    {
+        var dbPath = Path.Combine(_workspace, $"startup-recovery-{Guid.NewGuid():N}.db");
+        using var store = new SqliteWorkItemStore(dbPath);
+
+        // Simulate: worker died while the rework iteration was running.
+        // ConflictReworkAttempts has already been bumped to 1.
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "rework-restart",
+            Prompt = "p",
+            State = WorkItemState.ReworkingForConflict,
+            ConflictReworkAttempts = 1,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        await store.CreateAsync(item);
+
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new FakePipelineRunner(store);
+        var svc = new OrchestratorService(
+            queue, store, pipeline,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1, MaxRecoveryAttempts = 3 },
+            NullLogger<OrchestratorService>.Instance);
+
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await store.GetAsync(item.Id);
+        Assert.NotNull(recovered);
+        // State maps back to AuditPassed so the merge phase re-runs on resume.
+        Assert.Equal(WorkItemState.AuditPassed, recovered.State);
+        // CRITICAL: counter is preserved. If a regression reset it to 0, the
+        // one-iteration cap would silently re-enable a second agent engagement
+        // on the very next merge attempt.
+        Assert.Equal(1, recovered.ConflictReworkAttempts);
+        // Recovery counts as an interrupted-in-flight transition.
+        Assert.Equal(1, recovered.RecoveryAttempts);
+        Assert.Equal(1, queue.Count);
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
