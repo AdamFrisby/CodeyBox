@@ -40,6 +40,29 @@ Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
 }
 ```
 
+### Slotting opencode
+
+opencode fronts multiple model providers (DeepSeek, Anthropic, OpenAI, …)
+under one subscription credential. It pairs naturally with the existing
+frontier members as a cheap-tokens bulk-volume option (DeepSeek default)
+plus an optional redundant high-quality fallback (Anthropic-via-opencode
+or OpenAI-via-opencode). Suggested starting scores:
+
+```json
+{
+  "Agent": "opencode",
+  "Billing": "Subscription",
+  "ModelId": "deepseek/deepseek-coder",
+  "QualityScore": 90
+}
+```
+
+The default 88–92 range is intentionally below Claude / Codex / Cursor
+(all ~98–100) because DeepSeek is strong but not Opus-class on the
+heaviest refactors. opencode slotted with `ModelId: "anthropic/…"` or
+`ModelId: "openai/…"` should be scored alongside the underlying
+provider's own member; it is a redundancy path, not a quality upgrade.
+
 The JSON order no longer determines preference (effective score does); it is
 only a tiebreaker when scores are equal. Keep the obvious order for readability
 — operators read the config.

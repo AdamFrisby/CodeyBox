@@ -9,6 +9,7 @@ using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
+using CodeyBox.Agents.Opencode;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
 using CodeyBox.Audit;
@@ -350,6 +351,7 @@ builder.Services.AddSingleton<IAgentRunner, CopilotAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 
 // Plugin discovery result captured before builder.Build() so the credential
@@ -461,6 +463,26 @@ if (cursorAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         cursorAuthFilePath[2..]);
 
+var opencodeAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_OPENCODE_AUTH_FILE")
+    ?? builder.Configuration["CodeyBox:OpencodeAuthFile"]
+    ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".local", "share", "opencode", "auth.json");
+if (opencodeAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
+    opencodeAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        opencodeAuthFilePath[2..]);
+
+// Optional override for where the sandbox-side credential file gets written.
+// Operators who confirm a different `opencode auth login` destination set
+// CODEYBOX_OPENCODE_AUTH_DEST on the host; the runner uses this value as the
+// destination path inside the VM. Defaults to the XDG path opencode appears
+// to use at the time of writing; verify with `opencode auth login` output.
+var opencodeAuthDestPath =
+    Environment.GetEnvironmentVariable("CODEYBOX_OPENCODE_AUTH_DEST")
+    ?? builder.Configuration["CodeyBox:OpencodeAuthDestPath"];
+
 builder.Services.AddSingleton(sp => new ClaudeCredentialFileSource(
     claudeOAuthFilePath,
     sp.GetService<ILogger<CredentialFileSource>>(),
@@ -479,6 +501,10 @@ builder.Services.AddSingleton(sp => new GeminiSettingsCredentialFileSource(
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new CursorCredentialFileSource(
     cursorAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
+builder.Services.AddSingleton(sp => new OpencodeCredentialFileSource(
+    opencodeAuthFilePath,
     sp.GetService<ILogger<CredentialFileSource>>(),
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 
@@ -535,6 +561,16 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         sp.GetRequiredService<CursorCredentialFileSource>(),
         sp.GetService<ILogger<CursorOAuthFileCredentialProvider>>()));
 
+    // opencode (sst/opencode "Go" subscription) auth file. The opencode CLI
+    // hard-reads its credential file in the target user's home; this
+    // provider ships the raw bytes to the sandbox via OPENCODE_AUTH_JSON
+    // and OpencodeAgentRunner writes them back inside the VM before
+    // invoking `opencode run`.
+    builtInFirst.Add(new OpencodeOAuthFileCredentialProvider(
+        sp.GetRequiredService<OpencodeCredentialFileSource>(),
+        destinationPath: opencodeAuthDestPath,
+        sp.GetService<ILogger<OpencodeOAuthFileCredentialProvider>>()));
+
     // Enumerate plugin-registered ICredentialProvider types using the list captured
     // from AddCodeyBoxPlugins (called before builder.Build()). Each plugin type is
     // registered in DI under its concrete type by PluginLoader.RegisterPlugins;
@@ -565,6 +601,10 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // when an operator wants to inject the JSON directly via env var
         // without an on-host credential file.
         new AgentCredentialMapping(AgentKind.Cursor, "CODEYBOX_CURSOR_AUTH_JSON", "CODEYBOX_CURSOR_AUTH_JSON"),
+        // Note: no OPENCODE_API_KEY mapping. The opencode subscription IS the
+        // credential path; auth flows exclusively through the auth.json file
+        // materialised by OpencodeOAuthFileCredentialProvider. See the brief
+        // for the relevant 'Don't do' rule and docs/agents.md for setup.
     }));
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
@@ -733,6 +773,12 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 // is preferred over speculative coverage.
 builder.Services.AddSingleton<IAgentQuotaProbe, CursorQuotaProbe>();
 
+// opencode: no verified usage endpoint at integration time. The probe ships
+// as Unknown-only so the router falls onto its QuotaUnknownPolicy
+// (UseObservedFailures) for opencode members. Replace with a real
+// HTTP-backed probe once an endpoint is confirmed.
+builder.Services.AddSingleton<IAgentQuotaProbe>(_ => new OpencodeQuotaProbe());
+
 // --- Agent class router ------------------------------------------------------
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
 {
@@ -812,6 +858,9 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new CursorSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CursorSmokeProbe>()));
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new OpencodeSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<OpencodeSmokeProbe>()));
 
 // --- Model-list probes (used by AgentClassConfigValidator at startup) --------
 // Registered as IEnumerable<IAgentModelListProbe>; the validator resolves by Kind.
@@ -846,6 +895,7 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
         },
         loggerFactory.CreateLogger<CodexModelListProbe>());
 });
+builder.Services.AddSingleton<IAgentModelListProbe>(_ => new OpencodeModelListProbe());
 builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
@@ -1158,6 +1208,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Codex] = new CodexCostExtractor(),
         [AgentKind.Gemini] = new GeminiCostExtractor(),
         [AgentKind.Cursor] = new CursorCostExtractor(),
+        [AgentKind.Opencode] = new OpencodeCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -1228,6 +1279,7 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector, ClaudeQuotaFailureDete
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CodexQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, GeminiQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CursorQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
 
