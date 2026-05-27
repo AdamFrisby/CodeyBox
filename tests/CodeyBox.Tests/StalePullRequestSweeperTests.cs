@@ -237,13 +237,21 @@ public sealed class StalePullRequestSweeperTests
         var p2 = BuildGitHubProject("project-b");
         var dirty1 = new UpstreamPullRequest
         {
-            Number = 1, Url = "u1", HeadBranch = "codeybox/a", HeadSha = "a-1",
-            BaseBranch = "main", HasMergeConflict = true,
+            Number = 1,
+            Url = "u1",
+            HeadBranch = "codeybox/a",
+            HeadSha = "a-1",
+            BaseBranch = "main",
+            HasMergeConflict = true,
         };
         var dirty2 = new UpstreamPullRequest
         {
-            Number = 2, Url = "u2", HeadBranch = "codeybox/b", HeadSha = "b-1",
-            BaseBranch = "main", HasMergeConflict = true,
+            Number = 2,
+            Url = "u2",
+            HeadBranch = "codeybox/b",
+            HeadSha = "b-1",
+            BaseBranch = "main",
+            HasMergeConflict = true,
         };
         var factory = new PerProjectScriptedUpstreamFactory(new Dictionary<string, ScriptedUpstreamRemote>
         {
@@ -277,8 +285,12 @@ public sealed class StalePullRequestSweeperTests
         var healthy = BuildGitHubProject("healthy");
         var dirty = new UpstreamPullRequest
         {
-            Number = 7, Url = "u", HeadBranch = "codeybox/h", HeadSha = "tip",
-            BaseBranch = "main", HasMergeConflict = true,
+            Number = 7,
+            Url = "u",
+            HeadBranch = "codeybox/h",
+            HeadSha = "tip",
+            BaseBranch = "main",
+            HasMergeConflict = true,
         };
         var factory = new PerProjectScriptedUpstreamFactory(new Dictionary<string, ScriptedUpstreamRemote>
         {
@@ -301,6 +313,41 @@ public sealed class StalePullRequestSweeperTests
     }
 
     [Fact]
+    public async Task Sweep_EnabledFalse_ExecuteAsyncReturnsImmediatelyWithoutTouchingUpstream()
+    {
+        // Enabled=false is the operator's kill switch — ExecuteAsync must
+        // return before scheduling any work. Without a test on this branch a
+        // regression that swapped the negation (or moved the gate to a point
+        // after factory.Create) would silently keep hammering GitHub even
+        // when an operator explicitly disabled the sweep.
+        var project = BuildGitHubProject();
+        var factory = new ThrowingUpstreamFactory();
+        var webhooks = new CapturingWebhookDispatcher();
+        var disabled = new StalePullRequestSweeperOptions
+        {
+            Enabled = false,
+            CheckInterval = TimeSpan.FromSeconds(30),
+            BranchPrefix = "codeybox/",
+        };
+        var sweeper = new StalePullRequestSweeper(
+            new InMemoryProjectRepository(project),
+            factory,
+            webhooks,
+            disabled,
+            NullLogger<StalePullRequestSweeper>.Instance);
+
+        // StartAsync drives ExecuteAsync. With Enabled=false the body returns
+        // immediately (no 5-s stagger delay, no PeriodicTimer). StopAsync
+        // would otherwise wait for that initial Task.Delay if the gate were
+        // broken — so a hang here is itself a regression signal.
+        await sweeper.StartAsync(CancellationToken.None);
+        await sweeper.StopAsync(CancellationToken.None);
+
+        Assert.False(factory.CreateCalled);
+        Assert.Empty(webhooks.Events);
+    }
+
+    [Fact]
     public async Task Sweep_DetectionLatencyWithinSlaAtDefaultInterval()
     {
         // SLA acceptance criterion #1: detection within 5 minutes when main
@@ -312,8 +359,12 @@ public sealed class StalePullRequestSweeperTests
         var project = BuildGitHubProject();
         var dirty = new UpstreamPullRequest
         {
-            Number = 42, Url = "u", HeadBranch = "codeybox/x", HeadSha = "tip",
-            BaseBranch = "main", HasMergeConflict = true,
+            Number = 42,
+            Url = "u",
+            HeadBranch = "codeybox/x",
+            HeadSha = "tip",
+            BaseBranch = "main",
+            HasMergeConflict = true,
         };
         var remote = new ScriptedUpstreamRemote(
             firstResponse: Array.Empty<UpstreamPullRequest>(),

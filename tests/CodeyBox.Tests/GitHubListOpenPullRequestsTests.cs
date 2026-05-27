@@ -182,4 +182,57 @@ public sealed class GitHubListOpenPullRequestsTests
         await Assert.ThrowsAsync<ArgumentException>(
             () => remote.ListOpenPullRequestsAsync(string.Empty, CancellationToken.None));
     }
+
+    [Fact]
+    public async Task ListOpenPullRequestsAsync_PullsListReturnsServerError_Throws()
+    {
+        // A non-2xx response on the list endpoint (e.g. 503 from GitHub, or a
+        // 403 rate-limit) must NOT be silently swallowed: the sweeper relies on
+        // this exception path to log + back off until the next tick. If the
+        // throw regressed to a silent return the sweep would appear healthy
+        // while reporting zero open PRs and stale-base events would stop firing.
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(JsonResponse(HttpStatusCode.ServiceUnavailable, "{\"message\":\"upstream busy\"}"));
+
+        var remote = BuildRemote(handler);
+
+        await Assert.ThrowsAsync<HttpRequestException>(
+            () => remote.ListOpenPullRequestsAsync("codeybox/", CancellationToken.None));
+        // No detail call should have been issued because the list call failed first.
+        Assert.Single(handler.Requests);
+    }
+
+    [Fact]
+    public async Task ListOpenPullRequestsAsync_PullsDetailReturnsNotFound_SkipsPr()
+    {
+        // Per-PR detail fetch may fail (404 on a just-closed PR, transient 5xx,
+        // PAT scope drift). The list endpoint succeeded, so the sweep itself is
+        // still healthy — the failing PR is skipped via `return null` and the
+        // loop continues to the next prefix-matching summary. Removing the
+        // graceful-skip would break the sweep for the entire project on a
+        // single bad PR.
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
+        [
+          { "number": 50, "head": {"ref": "codeybox/missing", "sha": "x"}, "base": {"ref": "main"} },
+          { "number": 51, "head": {"ref": "codeybox/ok", "sha": "y"}, "base": {"ref": "main"} }
+        ]
+        """));
+        // First detail fetch: 404 — that PR is skipped.
+        handler.Enqueue(JsonResponse(HttpStatusCode.NotFound, "{\"message\":\"Not Found\"}"));
+        // Second detail fetch: 200, dirty — included.
+        handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
+        {"number": 51, "html_url": "https://github.com/myorg/myrepo/pull/51",
+         "mergeable": false, "mergeable_state": "dirty"}
+        """));
+
+        var remote = BuildRemote(handler);
+        var prs = await remote.ListOpenPullRequestsAsync("codeybox/", CancellationToken.None);
+
+        var pr = Assert.Single(prs);
+        Assert.Equal(51, pr.Number);
+        Assert.True(pr.HasMergeConflict);
+        // Three HTTP calls: list + two details.
+        Assert.Equal(3, handler.Requests.Count);
+    }
 }
