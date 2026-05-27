@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
@@ -74,6 +75,306 @@ public sealed class MultipassAdoptionTests
         // a state where every legitimate persisted path is rejected.
         Assert.True(MultipassSandboxProvider.IsValidAgentLogPath(
             SandboxConventions.AgentLogDir + "/sample.log"));
+    }
+
+    // ── IsValidAbsolutePath ─────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData("/work", true)]
+    [InlineData("/work/", true)]
+    [InlineData("/work/subdir", true)]
+    [InlineData("/work/a/b/c", true)]
+    [InlineData("/", true)]
+    [InlineData("", false)]                  // empty
+    [InlineData(" ", false)]                 // not absolute (no leading slash)
+    [InlineData("work", false)]              // relative
+    [InlineData("./work", false)]            // relative-dot
+    [InlineData("../work", false)]           // contains ..
+    [InlineData("/work/..", false)]          // contains ..
+    [InlineData("/work/../etc", false)]      // contains ..
+    [InlineData("/work/a..b", false)]        // even an inert ".." substring is rejected
+    [InlineData("/work/a$b", false)]         // $
+    [InlineData("/work/a`b", false)]         // backtick
+    [InlineData("/work/a\"b", false)]        // double quote
+    [InlineData("/work/a'b", false)]         // single quote
+    [InlineData("/work/a\\b", false)]        // backslash
+    [InlineData("/work/a\nb", false)]        // newline
+    [InlineData("/work/a\rb", false)]        // carriage return
+    [InlineData("/work/a\0b", false)]        // NUL
+    public void IsValidAbsolutePath_AcceptsLegitimate_RejectsShellAndPathInjection(
+        string path, bool expected)
+    {
+        Assert.Equal(expected, MultipassSandboxProvider.IsValidAbsolutePath(path));
+    }
+
+    [Fact]
+    public void IsValidAbsolutePath_RejectsAllControlBytes()
+    {
+        // Each control byte (0x00-0x1f, 0x7f) could be used to inject newlines,
+        // bell, escape sequences, etc. into the in-VM sh -c. Reject the whole
+        // class — defence-in-depth even though we single-quote the value.
+        for (var ch = 0; ch < 0x20; ch++)
+        {
+            var path = "/work/x" + (char)ch + "y";
+            Assert.False(MultipassSandboxProvider.IsValidAbsolutePath(path),
+                $"control char 0x{ch:x2} must be rejected");
+        }
+        Assert.False(MultipassSandboxProvider.IsValidAbsolutePath("/work/xy"),
+            "0x7f (DEL) must be rejected");
+    }
+
+    // ── IsValidPreemptCheckpointRef ──────────────────────────────────────────
+
+    [Theory]
+    [InlineData("refs/heads/codeybox/preempt/abc", true)]
+    [InlineData("refs/heads/codeybox/preempt/01234567-89ab-cdef-0123-456789abcdef", true)]
+    [InlineData("refs/heads/codeybox/preempt/A", true)]
+    [InlineData("refs/heads/codeybox/preempt/-", true)]
+    [InlineData("", false)]                                              // empty
+    [InlineData("refs/heads/codeybox/preempt/", false)]                  // empty suffix
+    [InlineData("refs/heads/codeybox/preempts/abc", false)]              // wrong prefix
+    [InlineData("refs/heads/codeybox/preempt", false)]                   // missing trailing slash → no suffix
+    [InlineData("refs/heads/codebox/preempt/abc", false)]                // misspelled prefix
+    [InlineData("efs/heads/codeybox/preempt/abc", false)]                // off-by-one prefix
+    [InlineData("refs/tags/codeybox/preempt/abc", false)]                // wrong namespace
+    [InlineData("codeybox/preempt/abc", false)]                          // not fully-qualified
+    [InlineData("refs/heads/codeybox/preempt/abc def", false)]           // whitespace in suffix
+    [InlineData("refs/heads/codeybox/preempt/abc/def", false)]           // slash in suffix
+    [InlineData("refs/heads/codeybox/preempt/abc.def", false)]           // dot in suffix
+    [InlineData("refs/heads/codeybox/preempt/abc_def", false)]           // underscore in suffix
+    [InlineData("refs/heads/codeybox/preempt/abc$def", false)]           // shell metachar in suffix
+    [InlineData("refs/heads/codeybox/preempt/abc;rm -rf /", false)]      // injection attempt
+    [InlineData("refs/heads/codeybox/preempt/abc`whoami`", false)]       // backtick injection
+    [InlineData("refs/heads/codeybox/preempt/abc\ndef", false)]          // newline
+    public void IsValidPreemptCheckpointRef_AcceptsCodeyboxShape_RejectsEverythingElse(
+        string refName, bool expected)
+    {
+        Assert.Equal(expected, MultipassSandboxProvider.IsValidPreemptCheckpointRef(refName));
+    }
+
+    [Fact]
+    public void IsValidPreemptCheckpointRef_AcceptsGuidShape()
+    {
+        // The orchestrator builds refs of the form
+        // refs/heads/codeybox/preempt/<guid>. Sanity that a real Guid (the
+        // typical case) is accepted.
+        var refName = "refs/heads/codeybox/preempt/" + Guid.NewGuid().ToString("D");
+        Assert.True(MultipassSandboxProvider.IsValidPreemptCheckpointRef(refName));
+    }
+
+    // ── IsValidCheckpointCommitMessage ───────────────────────────────────────
+
+    [Theory]
+    [InlineData("CodeyBox preempt checkpoint", true)]
+    [InlineData("multi\nline\nmessage", true)]                // LF allowed
+    [InlineData("col1\tcol2", true)]                          // TAB allowed
+    [InlineData("", false)]                                   // empty
+    [InlineData("contains\rCR", false)]                       // CR rejected
+    [InlineData("contains\0NUL", false)]                      // NUL rejected
+    [InlineData("containsBELL", false)]                 // BEL (0x07) rejected
+    [InlineData("containsESC", false)]                  // ESC (0x1b) rejected
+    [InlineData("containsDEL", false)]                  // DEL (0x7f) rejected
+    public void IsValidCheckpointCommitMessage_AcceptsTextLfTab_RejectsControlAndCr(
+        string message, bool expected)
+    {
+        Assert.Equal(expected, MultipassSandboxProvider.IsValidCheckpointCommitMessage(message));
+    }
+
+    [Fact]
+    public void IsValidCheckpointCommitMessage_RejectsAllControlBytesExceptLfAndTab()
+    {
+        // Defence-in-depth: every control byte (0x00-0x1f and 0x7f) is rejected
+        // except 0x09 (TAB) and 0x0a (LF), which are common in real commit
+        // messages. CR (0x0d) is rejected because it can collide with the
+        // single-quoting on macOS/BSD shells.
+        for (var ch = 0; ch < 0x20; ch++)
+        {
+            var msg = "msg" + (char)ch + "trailing";
+            var expected = ch == '\n' || ch == '\t';
+            Assert.Equal(expected, MultipassSandboxProvider.IsValidCheckpointCommitMessage(msg));
+        }
+        Assert.False(MultipassSandboxProvider.IsValidCheckpointCommitMessage("msgtrailing"));
+    }
+
+    [Fact]
+    public void IsValidCheckpointCommitMessage_CapsAt1024Chars()
+    {
+        // The cap protects the in-VM `git commit -m '...'` argv length against
+        // a pathological persisted value. 1024 is generous for a synthesised
+        // preempt-checkpoint commit message ("CodeyBox preempt checkpoint for
+        // <guid>"). The boundary should be inclusive at 1024 and exclusive at
+        // 1025 — verify both sides.
+        var exactlyAtCap = new string('a', 1024);
+        var oneOver = new string('a', 1025);
+
+        Assert.True(MultipassSandboxProvider.IsValidCheckpointCommitMessage(exactlyAtCap),
+            "1024-char message must be accepted (boundary)");
+        Assert.False(MultipassSandboxProvider.IsValidCheckpointCommitMessage(oneOver),
+            "1025-char message must be rejected (over cap)");
+    }
+
+    // ── PushSuspendedVmCheckpointRefAsync ────────────────────────────────────
+
+    [Fact]
+    public async Task PushCheckpoint_HappyPath_RunsExpectedShScriptAndReturnsTrue()
+    {
+        // Verifies the real provider composes the exact `sh -c` script that
+        // the in-VM git push relies on: set -e for short-circuit, scratchpad
+        // creation, git add -A / commit --allow-empty / push origin HEAD:<ref>.
+        // The fake provider used in SandboxSuspendResumeTests exercises the
+        // surface but not this script — a regression that dropped `set -e` or
+        // changed the push target would slip past those tests.
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var provider = NewProviderWithRunner(runner);
+
+        var ok = await provider.PushSuspendedVmCheckpointRefAsync(
+            vmName: "codeybox-test",
+            workingDir: "/work",
+            refName: "refs/heads/codeybox/preempt/abc-123",
+            commitMessage: "CodeyBox preempt checkpoint for wi42",
+            ct: CancellationToken.None);
+
+        Assert.True(ok);
+        Assert.Single(runner.Calls);
+
+        var call = runner.Calls.ToArray()[0];
+        Assert.Equal("exec", call.Argv[1]);
+        Assert.Equal("codeybox-test", call.Argv[2]);
+        Assert.Equal("--", call.Argv[3]);
+        Assert.Equal("sh", call.Argv[4]);
+        Assert.Equal("-c", call.Argv[5]);
+
+        var script = call.Argv[6];
+        // set -e is load-bearing: a mid-script failure (e.g. commit refusing
+        // an empty author) must short-circuit before `git push` runs and
+        // promotes a stale HEAD.
+        Assert.StartsWith("set -e", script, StringComparison.Ordinal);
+        Assert.Contains("cd '/work'", script);
+        Assert.Contains("mkdir -p .codeybox", script);
+        Assert.Contains(".codeybox/preempt-scratchpad.md", script);
+        Assert.Contains("git add -A", script);
+        Assert.Contains("git commit --allow-empty -m 'CodeyBox preempt checkpoint for wi42'", script);
+        // Ref is inlined unquoted (git rejects single-quoted refs on push as
+        // ambiguous) — the validator is what makes this safe.
+        Assert.Contains("git push origin HEAD:refs/heads/codeybox/preempt/abc-123", script);
+    }
+
+    [Fact]
+    public async Task PushCheckpoint_RunnerNonZeroExit_ReturnsFalse()
+    {
+        // A non-zero exit from the in-VM script (e.g. push rejected by remote,
+        // commit refused) must surface as `false` so the orchestrator records
+        // the promotion failure rather than silently advancing the work item
+        // as if the checkpoint succeeded.
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(1, "", "push rejected")));
+        var provider = NewProviderWithRunner(runner);
+
+        var ok = await provider.PushSuspendedVmCheckpointRefAsync(
+            "codeybox-test", "/work",
+            "refs/heads/codeybox/preempt/abc",
+            "msg",
+            CancellationToken.None);
+
+        Assert.False(ok);
+    }
+
+    [Fact]
+    public async Task PushCheckpoint_RunnerThrows_ReturnsFalse()
+    {
+        // An exception out of the runner (e.g. multipassd hiccup, transient
+        // network error) is logged and converted to `false` — never lets a
+        // throw propagate up into the orchestrator's resume promotion path.
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            throw new InvalidOperationException("multipassd unreachable"));
+        var provider = NewProviderWithRunner(runner);
+
+        var ok = await provider.PushSuspendedVmCheckpointRefAsync(
+            "codeybox-test", "/work",
+            "refs/heads/codeybox/preempt/abc",
+            "msg",
+            CancellationToken.None);
+
+        Assert.False(ok);
+    }
+
+    [Fact]
+    public async Task PushCheckpoint_RunnerCancellation_Propagates()
+    {
+        // Cancellation must propagate (host shutdown during the resume sweep)
+        // rather than being swallowed into a false return. The orchestrator
+        // distinguishes "push failed" from "host shutting down" via the
+        // OperationCanceledException.
+        var runner = new RecordingMultipassRunner((_, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+            return Task.FromResult(new RunResult(0, "", ""));
+        });
+        var provider = NewProviderWithRunner(runner);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            provider.PushSuspendedVmCheckpointRefAsync(
+                "codeybox-test", "/work",
+                "refs/heads/codeybox/preempt/abc",
+                "msg",
+                cts.Token));
+    }
+
+    [Theory]
+    [InlineData("../escape", "/work", "refs/heads/codeybox/preempt/abc", "msg", "vmName")]
+    [InlineData("codeybox-test", "relative/path", "refs/heads/codeybox/preempt/abc", "msg", "workingDir")]
+    [InlineData("codeybox-test", "/work/../etc", "refs/heads/codeybox/preempt/abc", "msg", "workingDir")]
+    [InlineData("codeybox-test", "/work", "refs/heads/wrong/shape", "msg", "refName")]
+    [InlineData("codeybox-test", "/work", "refs/heads/codeybox/preempt/abc;rm", "msg", "refName")]
+    [InlineData("codeybox-test", "/work", "refs/heads/codeybox/preempt/abc", "", "commitMessage")]
+    [InlineData("codeybox-test", "/work", "refs/heads/codeybox/preempt/abc", "bad\rmsg", "commitMessage")]
+    public async Task PushCheckpoint_RejectsInvalidArguments(
+        string vmName, string workingDir, string refName, string commitMessage, string expectedParam)
+    {
+        // The four validators (IsValidSandboxName, IsValidAbsolutePath,
+        // IsValidPreemptCheckpointRef, IsValidCheckpointCommitMessage) gate
+        // the in-VM sh -c construction. An ArgumentException here means an
+        // attacker who flipped the DB-stored value can't reach the runner.
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var provider = NewProviderWithRunner(runner);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            provider.PushSuspendedVmCheckpointRefAsync(
+                vmName, workingDir, refName, commitMessage, CancellationToken.None));
+        Assert.Equal(expectedParam, ex.ParamName);
+        // Critical: the runner is never invoked when validation fails — the
+        // in-VM sh -c construction is unreachable for tampered inputs.
+        Assert.Empty(runner.Calls);
+    }
+
+    [Fact]
+    public async Task PushCheckpoint_SingleQuotesEscapeApostropheInCommitMessage()
+    {
+        // ShellSingleQuote uses the classic '"'"' trick to embed apostrophes.
+        // A regression that dropped that escape would split the -m argument
+        // and either fail noisily or (worse) interpret the trailing text as
+        // a subsequent shell command. Verify the script encodes the
+        // apostrophe correctly.
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new RunResult(0, "", "")));
+        var provider = NewProviderWithRunner(runner);
+
+        var ok = await provider.PushSuspendedVmCheckpointRefAsync(
+            "codeybox-test", "/work",
+            "refs/heads/codeybox/preempt/abc",
+            "agent's checkpoint",
+            CancellationToken.None);
+
+        Assert.True(ok);
+        var script = runner.Calls.ToArray()[0].Argv[6];
+        // '"'"' is the canonical shell-safe way to embed a single quote
+        // inside a single-quoted string.
+        Assert.Contains("'agent'\"'\"'s checkpoint'", script);
     }
 
     // ── WaitForAdoptedAgentCompletionAsync ───────────────────────────────────
