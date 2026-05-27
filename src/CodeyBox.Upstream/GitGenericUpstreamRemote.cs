@@ -61,6 +61,17 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
     }
 
     /// <summary>
+    /// Fetches the current head of <paramref name="baseBranch"/> from the
+    /// configured generic upstream into the host bare repo, overwriting the
+    /// local ref. Returns the new sha (or null when the upstream does not
+    /// advertise the branch). Used by the pre-merge base refresh and by the
+    /// auto-merge race recovery path; both rely on the upstream-configured
+    /// auth (<c>ExtraEnvironment</c>) being honoured.
+    /// </summary>
+    public Task<string?> FetchBaseBranchAsync(string repositoryId, string baseBranch, CancellationToken ct = default)
+        => _gitHost.FetchUpstreamBranchAsync(repositoryId, _opts.UpstreamUrl, baseBranch, _opts.ExtraEnvironment, ct);
+
+    /// <summary>
     /// Clones <paramref name="targetBranch"/> to a temp directory, fetches
     /// <paramref name="sourceBranch"/> from origin, and attempts <c>git merge</c>.
     /// On conflict returns false; on success pushes back to origin and returns true.

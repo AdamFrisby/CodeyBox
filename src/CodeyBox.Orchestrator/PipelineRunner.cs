@@ -504,6 +504,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     Description: $"Work item {item.Id} via {agentKind.Value} (project {project.Id})"), ct);
             }
 
+            // The upstream remote is constructed before the merge phase rather
+            // than at upstream-push time so the pre-merge canonical-base refresh
+            // (below) can reuse its auth path. CompleteAsync is still called
+            // later, on the same instance.
+            var upstream = _upstreamFactory.Create(project);
+
             // -------- Phase 2: Merge (agent-driven) --------
             // The merge phase is wrapped in a reusable async helper so the
             // upstream-push phase can re-invoke it on a 405 auto-merge race
@@ -541,6 +547,24 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 await PublishMergeStartedAsync(item, project, baseBranch, workBranch, ct);
                 await Transition(item, WorkItemState.Merging, ct, project);
+
+                // Stale-base guard. The per-work-item bare repo's local base
+                // was snapshotted at item dispatch; sibling work items merged
+                // since then have moved the canonical upstream tip. Without
+                // this refresh, the merge phase agent would compose the merge
+                // against the stale fork-point, producing a mergeSha whose
+                // first-parent ancestry omits everything sibling work landed,
+                // which then silently reverts that work when GitHub's merge
+                // commit is published. Best-effort: a failure here logs a
+                // warning rather than parking — the existing 405 auto-merge
+                // race recovery + non-fast-forward push reconcile still catch
+                // motion that races our refresh, and a transient fetch failure
+                // shouldn't strand an item that's done all its agent work.
+                if (project.Upstream.Kind != "noop")
+                {
+                    await TryRefreshCanonicalBaseBeforeMergeAsync(item, project, upstream, repoId, baseBranch, ct);
+                }
+
                 try
                 {
                     (mergeSha, agentStdout) = await RunMergePhase(ct);
@@ -585,7 +609,6 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             // -------- Phase 3: Upstream push (separate atomic unit) --------
-            var upstream = _upstreamFactory.Create(project);
             if (item.PushUpstream && project.Upstream.Kind != "noop")
             {
                 await RunUpstreamPushPhaseAsync(
@@ -857,6 +880,74 @@ public sealed class PipelineRunner : IPipelineRunner
         if (ticks >= MaxCancellationTimer.Ticks)
             return MaxCancellationTimer;
         return TimeSpan.FromTicks((long)ticks);
+    }
+
+    /// <summary>
+    /// Pre-merge canonical-base refresh. Asks the upstream remote to update the
+    /// host bare repo's local base ref to the upstream tip, so the merge phase
+    /// agent composes the merge against canonical main rather than the snapshot
+    /// taken when the bare repo was first created. Best-effort: a fetch that
+    /// throws or returns null is logged at Warning but does not park the work
+    /// item — the residual race window (between this refresh and the upstream
+    /// merge call) is already covered by the 405 auto-merge race recovery and
+    /// the non-fast-forward push reconcile.
+    /// </summary>
+    private async Task TryRefreshCanonicalBaseBeforeMergeAsync(
+        WorkItem item,
+        Project project,
+        IUpstreamRemote upstream,
+        string repoId,
+        string baseBranch,
+        CancellationToken ct)
+    {
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+
+        string? preRefreshSha = null;
+        try
+        {
+            preRefreshSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Couldn't read pre-refresh tip — log and proceed. The refresh
+            // itself may still succeed and overwrite whatever the local ref
+            // points at; we just lose the "did it actually move?" diagnostic.
+            _log.LogDebug(ex,
+                "Pre-merge base refresh: could not read local '{Branch}' tip before fetch",
+                baseBranch);
+        }
+
+        string? postRefreshSha;
+        try
+        {
+            postRefreshSha = await upstream.FetchBaseBranchAsync(repoId, baseBranch, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Pre-merge base refresh: fetch of canonical '{Branch}' for work item {WorkItemId} failed via '{UpstreamKind}'; merge phase will proceed against the bare repo's existing base (possibly stale)",
+                baseBranch, item.Id, project.Upstream.Kind);
+            return;
+        }
+
+        if (postRefreshSha is null)
+        {
+            _log.LogWarning(
+                "Pre-merge base refresh: upstream '{UpstreamKind}' did not advertise '{Branch}' for work item {WorkItemId}; merge phase will proceed against the bare repo's existing base (possibly stale)",
+                project.Upstream.Kind, baseBranch, item.Id);
+            return;
+        }
+
+        if (preRefreshSha is not null && !string.Equals(preRefreshSha, postRefreshSha, StringComparison.Ordinal))
+        {
+            _log.LogInformation(
+                "Pre-merge base refresh: '{Branch}' advanced {Old} → {New} for work item {WorkItemId}",
+                baseBranch, preRefreshSha, postRefreshSha, item.Id);
+        }
     }
 
     private async Task RebaseExistingWorkBranchOntoFreshBaseAsync(
