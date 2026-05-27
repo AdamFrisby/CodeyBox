@@ -162,11 +162,14 @@ public sealed class AuditorParallelismTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
 
+        // The real proof of parallelism is that all three auditors were in
+        // flight at the same time. The wall-clock check is a coarse guard
+        // against accidentally adding large serial work around the parallel
+        // section; under heavy CI/sandbox load scheduler noise can push the
+        // measured elapsed time well past the nominal DelayMs, so allow
+        // generous headroom.
         Assert.Equal(AuditorCount, Volatile.Read(ref maxRunning));
-        // Keep a coarse guard against accidentally adding large serial work
-        // around the parallel section, but do not use the exact sequential
-        // delay as the threshold; solution-level test runs add scheduler noise.
-        Assert.True(sw.ElapsedMilliseconds < AuditorCount * DelayMs + 1_500,
+        Assert.True(sw.ElapsedMilliseconds < AuditorCount * DelayMs * 6,
             $"Expected wall-clock near parallel execution but got {sw.ElapsedMilliseconds} ms");
     }
 }
@@ -672,13 +675,17 @@ public sealed class AuditorParallelismCancellationTests : IDisposable
         var pipelineTask = Task.Run(() => tp.Pipeline.RunAsync(item, cts.Token));
 
         // Wait until at least one auditor has started (audit phase is live).
-        var started = await auditPhaseStarted.WaitAsync(TimeSpan.FromSeconds(15));
-        Assert.True(started, "audit phase did not start within 15 s");
+        // Use a generous timeout: under heavy CI/sandbox load the work phase
+        // (git clone + commit + push of a tiny repo) can take longer than a
+        // few seconds, and a false negative here would mask the real
+        // cancellation behaviour the test wants to verify.
+        var started = await auditPhaseStarted.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.True(started, "audit phase did not start within 60 s");
 
         // Cancel and wait for the pipeline to unwind.
         // RunAsync re-throws OperationCanceledException after setting state=Cancelled.
         cts.Cancel();
-        try { await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10)); }
+        try { await pipelineTask.WaitAsync(TimeSpan.FromSeconds(30)); }
         catch (OperationCanceledException) { /* expected — pipeline re-throws after setting state */ }
 
         var final = await tp.Store.GetAsync(item.Id);

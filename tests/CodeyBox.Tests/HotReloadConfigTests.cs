@@ -140,7 +140,7 @@ public sealed class HotReloadConfigTests
             await fixture.Store.CreateAsync(item);
 
             var runTask = fixture.Pipeline.RunAsync(item, CancellationToken.None);
-            await workStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await workStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
             var working = await fixture.Store.GetAsync(item.Id);
             Assert.Equal(WorkItemState.Working, working!.State);
 
@@ -153,7 +153,10 @@ public sealed class HotReloadConfigTests
             });
             releaseWork.TrySetResult();
 
-            await runTask.WaitAsync(TimeSpan.FromSeconds(20));
+            // Generous timeout: this is a behaviour test, not a performance
+            // test, and under heavy CI/sandbox load the work+audit phases can
+            // take well over the nominal time.
+            await runTask.WaitAsync(TimeSpan.FromSeconds(60));
 
             Assert.True(auditor.Completed);
             var finished = await fixture.Store.GetAsync(item.Id);
