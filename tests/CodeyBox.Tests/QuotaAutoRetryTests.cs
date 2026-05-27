@@ -278,7 +278,23 @@ public sealed class QuotaAutoRetryTests : IDisposable
         Assert.NotNull(retried);
         Assert.Equal(WorkItemState.Queued, retried!.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
+
+        // The webhook publish happens AFTER the state transition in PerformRetryAsync,
+        // so the state change can be visible before the webhook event lands in the
+        // capturing dispatcher. Poll briefly for the event.
+        await WaitForWebhookAsync(webhooks, "work_item.auto_retry", TimeSpan.FromSeconds(5));
         Assert.Contains(webhooks.Events, e => e.Event == "work_item.auto_retry");
+    }
+
+    private static async Task WaitForWebhookAsync(
+        CapturingWebhookDispatcher webhooks, string eventName, TimeSpan timeout)
+    {
+        var start = DateTimeOffset.UtcNow;
+        while (DateTimeOffset.UtcNow - start < timeout)
+        {
+            if (webhooks.Events.Any(e => e.Event == eventName)) return;
+            await Task.Delay(50);
+        }
     }
 
     private static async Task<WorkItem?> WaitForStateAsync(

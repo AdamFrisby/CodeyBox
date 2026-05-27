@@ -189,3 +189,49 @@ public sealed record MergeCompletedDetails
     public required string WorkBranch { get; init; }
     public string? MergeSha { get; init; }
 }
+
+/// <summary>
+/// Details payload for <c>work_item.conflict_rework_started</c>. Emitted when
+/// the orchestrator engages the original work agent as the third-line fallback
+/// to resolve a merge-phase conflict that the preventive auto-rebase and the
+/// merge-phase LLM rerun could not handle.
+/// </summary>
+public sealed record ConflictReworkStartedDetails
+{
+    public required string WorkItemId { get; init; }
+    public required string BaseBranch { get; init; }
+    public required string WorkBranch { get; init; }
+    /// <summary>SHA of the work branch tip at the moment the rework iteration began.</summary>
+    public required string WorkBranchTip { get; init; }
+    /// <summary>SHA of the upstream base the rework will reconcile against.</summary>
+    public required string BaseTip { get; init; }
+    /// <summary>Paths the merge phase reported conflicts on.</summary>
+    public required IReadOnlyList<string> ConflictFiles { get; init; }
+}
+
+/// <summary>
+/// Details payload for <c>work_item.conflict_rework_finished</c>. Emitted when
+/// the rework iteration completes — successfully (new branch tip ready for a
+/// fresh merge attempt) or as a parked failure (semantic-incompatible exit,
+/// destructive-action guard, or the post-rework merge still failed).
+/// </summary>
+public sealed record ConflictReworkFinishedDetails
+{
+    public required string WorkItemId { get; init; }
+    public required string BaseBranch { get; init; }
+    public required string WorkBranch { get; init; }
+    /// <summary>True iff the rework iteration produced a clean work branch ready for re-merge.</summary>
+    public required bool Success { get; init; }
+    /// <summary>SHA of the work branch tip after the rework iteration (null on failure paths that never advanced).</summary>
+    public string? NewWorkBranchTip { get; init; }
+    /// <summary>Files added/modified by the rework iteration.</summary>
+    public IReadOnlyList<string>? FilesChanged { get; init; }
+    /// <summary>Inserted-line count over the rework's diff (best effort).</summary>
+    public int? Insertions { get; init; }
+    /// <summary>Deleted-line count over the rework's diff (best effort).</summary>
+    public int? Deletions { get; init; }
+    /// <summary>Verbatim <c>SEMANTIC_INCOMPATIBLE:</c> reason when the agent declared the two intents incompatible; null otherwise.</summary>
+    public string? SemanticIncompatibleReason { get; init; }
+    /// <summary>Free-form park reason when <see cref="Success"/> is false. Mirrors <c>LastError</c>.</summary>
+    public string? ParkReason { get; init; }
+}

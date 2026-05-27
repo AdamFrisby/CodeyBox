@@ -144,6 +144,16 @@ public sealed record WorkItem
     public int StuckRetries { get; init; }
 
     /// <summary>
+    /// Number of focused conflict-rework iterations the pipeline has executed
+    /// for this work item. Capped at <c>1</c> per merge attempt; the original
+    /// work agent gets exactly one re-engagement to resolve merge-phase
+    /// conflicts that the preventive auto-rebase and the merge-phase LLM
+    /// rerun could not handle. Past the cap the item parks at
+    /// <see cref="WorkItemState.MergeConflictResolutionFailed"/>.
+    /// </summary>
+    public int ConflictReworkAttempts { get; init; }
+
+    /// <summary>
     /// IDs of work items this item depends on. The orchestrator will not pick
     /// this item up until every dependency has reached a terminal state
     /// (Done, Failed, AuditFailed, MergeConflictResolutionFailed, or Cancelled). Immutable after creation.

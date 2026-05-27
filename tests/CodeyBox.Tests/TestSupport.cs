@@ -94,10 +94,15 @@ internal static class TestSupport
         ICredentialProvider? credentials = null,
         IProjectRepository? projectRepository = null,
         AgentClassRouter? classRouter = null,
-        Func<IGitHost, IGitHost>? gitHostDecorator = null)
+        Func<IGitHost, IGitHost>? gitHostDecorator = null,
+        IWebhookDispatcher? webhookDispatcher = null,
+        IWorkItemCostStore? costStore = null,
+        IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? costExtractors = null,
+        AgentCostCalculator? costCalculator = null,
+        string? stateDbPathOverride = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
-        var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
         var queue = new InMemoryTaskQueue();
@@ -152,13 +157,16 @@ internal static class TestSupport
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, resolvedUpstreamFactory, composer,
             store,
-            new NullWebhookDispatcher(),
+            webhookDispatcher ?? new NullWebhookDispatcher(),
             resolvedOptions,
             NullLogger<PipelineRunner>.Instance,
             timingStore: timingStore,
             auditReports: auditReportStore,
             agentStreams: agentStreams,
             classRouter: classRouter,
+            costStore: costStore,
+            costExtractors: costExtractors,
+            costCalculator: costCalculator,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[]
             {
                 new ClaudeQuotaFailureDetector(),
@@ -252,6 +260,21 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
     public Queue<Func<IReadOnlyList<ConflictResolverFile>, IReadOnlyDictionary<string, string>>> ConflictResolutionPlan { get; } = new();
+    /// <summary>
+    /// Handlers invoked when the scripted agent recognises the conflict-rework
+    /// prompt (third-line merge fallback). The handler receives the sandbox +
+    /// working directory and returns the <see cref="AgentResult"/> the
+    /// orchestrator will see. Use this to script destructive actions
+    /// (git reset --hard), semantic-incompatible declarations, or
+    /// fully-resolved rebases for the conflict-rework tests.
+    /// </summary>
+    public Queue<Func<ISandbox, string, CancellationToken, Task<AgentResult>>> ConflictReworkPlan { get; } = new();
+    /// <summary>
+    /// Captured prompts the conflict-rework path sent to the agent. One entry
+    /// per <see cref="ConflictReworkPlan"/> invocation. Tests use this to
+    /// assert the prompt scaffolding (forbidden actions, file list, etc.).
+    /// </summary>
+    public List<string> ConflictReworkPrompts { get; } = new();
     public Queue<string> StdoutChunks { get; } = new();
     public Queue<IReadOnlyList<string>> StdoutChunkBatches { get; } = new();
     public List<bool> CaptureStructuredStreamCalls { get; } = new();
@@ -347,6 +370,14 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
         {
             return await HandleMergeAsync(sandbox, workingDirectory, prompt, ct);
+        }
+        if (prompt.Contains("# Conflict-resolution mode (third-line fallback)", StringComparison.Ordinal))
+        {
+            ConflictReworkPrompts.Add(prompt);
+            if (ConflictReworkPlan.Count == 0)
+                return new AgentResult(false, "ScriptedAgent: ran out of conflict-rework plan entries", null, null);
+            var handler = ConflictReworkPlan.Dequeue();
+            return await handler(sandbox, workingDirectory, ct);
         }
         return await HandleWorkAsync(sandbox, workingDirectory, ct);
     }

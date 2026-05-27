@@ -215,6 +215,10 @@ public sealed class DeadWorkerReaper : BackgroundService
         WorkItemState.Reworking => WorkItemState.Queued,
         WorkItemState.Auditing => WorkItemState.WorkComplete,
         WorkItemState.Merging => WorkItemState.AuditPassed,
+        // A dead worker mid-ReworkingForConflict resumes from AuditPassed so
+        // the merge phase re-runs. The ConflictReworkAttempts counter is
+        // preserved so the third-line fallback cannot fire a second time.
+        WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
         WorkItemState.UpstreamPushing => WorkItemState.Merged,
         _ => null,
     };

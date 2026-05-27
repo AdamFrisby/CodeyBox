@@ -614,6 +614,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             WorkItemState.Auditing => WorkItemState.WorkComplete,
             WorkItemState.Reworking => WorkItemState.WorkComplete,
+            // ReworkingForConflict resumes from AuditPassed so the merge phase
+            // re-runs. The ConflictReworkAttempts counter is preserved across
+            // the restart so the third-line fallback cannot fire a second
+            // time: if the re-run merge fails again the item parks at
+            // MergeConflictResolutionFailed instead of looping the agent.
+            WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
             WorkItemState.Merging => WorkItemState.AuditPassed,
             // WorkComplete / AuditPassed / Merged: pipeline resumes at the correct
             // phase; no state change needed, just re-enqueue.
