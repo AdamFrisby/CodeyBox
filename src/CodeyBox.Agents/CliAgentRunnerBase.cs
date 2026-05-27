@@ -3,8 +3,6 @@ using CodeyBox.Sandbox;
 
 namespace CodeyBox.Agents;
 
-
-
 /// <summary>
 /// Shared scaffolding for agent runners that drive a one-shot CLI binary
 /// inside the sandbox. Subclasses describe how to invoke their CLI; this base

@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -91,9 +90,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         provider.Register(item1.Id, sandbox1);
         provider.Register(item2.Id, sandbox2);
 
-        var lifetime = new FakeLifetime();
         var svc = new SandboxSuspendOnShutdownService(
-            provider, _store, lifetime,
+            provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance);
 
         await svc.StartAsync(CancellationToken.None);
@@ -120,7 +118,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         provider.Register(item.Id, sandbox);
 
         var svc = new SandboxSuspendOnShutdownService(
-            provider, _store, new FakeLifetime(),
+            provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance);
         await svc.SuspendAllAsync();
 
@@ -148,7 +146,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         provider.Register(item.Id, sandbox);
 
         var svc = new SandboxSuspendOnShutdownService(
-            provider, _store, new FakeLifetime(),
+            provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
             perSuspendTimeout: TimeSpan.FromMilliseconds(50));
         await svc.SuspendAllAsync();
@@ -172,7 +170,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // continues to be the recovery mechanism.
         var nonSuspending = new NonSuspendingProvider();
         var svc = new SandboxSuspendOnShutdownService(
-            nonSuspending, _store, new FakeLifetime(),
+            nonSuspending, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance);
         await svc.SuspendAllAsync();
 
@@ -596,11 +594,4 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         }
     }
 
-    private sealed class FakeLifetime : IHostApplicationLifetime
-    {
-        public CancellationToken ApplicationStarted => CancellationToken.None;
-        public CancellationToken ApplicationStopping => CancellationToken.None;
-        public CancellationToken ApplicationStopped => CancellationToken.None;
-        public void StopApplication() { }
-    }
 }

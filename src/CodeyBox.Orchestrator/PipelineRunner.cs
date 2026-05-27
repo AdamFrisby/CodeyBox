@@ -3543,19 +3543,34 @@ public sealed class PipelineRunner : IPipelineRunner
     /// do not regress a concurrent update from another worker thread on the
     /// same item (priority bump, prompt edit, etc).
     /// </summary>
-    private async Task PersistAgentLogPathAsync(WorkItemId id, string agentLogPath, CancellationToken ct)
+    private Task PersistAgentLogPathAsync(WorkItemId id, string agentLogPath, CancellationToken ct) =>
+        PersistAgentLogPathAsync(_store, _log, id, agentLogPath, ct);
+
+    /// <summary>
+    /// Static testable core of <see cref="PersistAgentLogPathAsync(WorkItemId,string,CancellationToken)"/>.
+    /// Returns true when a write was issued, false when short-circuited (item
+    /// missing, path already matches) or swallowed (store exception). Cancellation
+    /// is propagated; every other exception is logged at warning and absorbed.
+    /// </summary>
+    internal static async Task<bool> PersistAgentLogPathAsync(
+        IWorkItemStore store,
+        Microsoft.Extensions.Logging.ILogger log,
+        WorkItemId id,
+        string agentLogPath,
+        CancellationToken ct)
     {
         try
         {
-            var fresh = await _store.GetAsync(id, ct);
-            if (fresh is null) return;
+            var fresh = await store.GetAsync(id, ct);
+            if (fresh is null) return false;
             if (string.Equals(fresh.AgentLogPath, agentLogPath, StringComparison.Ordinal))
-                return;
-            await _store.UpdateAsync(fresh with
+                return false;
+            await store.UpdateAsync(fresh with
             {
                 AgentLogPath = agentLogPath,
                 UpdatedAt = DateTimeOffset.UtcNow,
             }, ct);
+            return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -3563,7 +3578,8 @@ public sealed class PipelineRunner : IPipelineRunner
             // invocation. Worst-case, the suspend-on-shutdown handler does not
             // see AgentLogPath and the startup resume handler falls back to
             // the standard stranded-item recovery path.
-            _log.LogWarning(ex, "Failed to persist agent log path for {WorkItemId}", id);
+            log.LogWarning(ex, "Failed to persist agent log path for {WorkItemId}", id);
+            return false;
         }
     }
 

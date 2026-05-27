@@ -556,11 +556,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
     /// <summary>
     /// Allows <c>/work/.codeybox/agent-logs/&lt;name&gt;.log</c>-style absolute
     /// paths and rejects anything with shell metacharacters or relative
-    /// segments. The orchestrator chooses the path via
-    /// <c>SandboxConventions.AgentLogDir</c>, so this is defence-in-depth
-    /// against persistence-layer corruption.
+    /// segments. Path must be anchored under
+    /// <see cref="SandboxConventions.AgentLogDir"/>: defence-in-depth against
+    /// a write-only DB-tamper attacker who flips <c>work_items.agent_log_path</c>
+    /// to (say) <c>/etc/passwd</c> or <c>/home/ubuntu/.ssh/id_ed25519</c> to
+    /// coerce the resume handler into streaming the contents back through the
+    /// adopted-agent log forwarder.
     /// </summary>
-    private static bool IsValidAgentLogPath(string path)
+    internal static bool IsValidAgentLogPath(string path)
     {
         if (string.IsNullOrEmpty(path)) return false;
         if (path[0] != '/') return false;
@@ -573,6 +576,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
             // `$(...)` substrings if they survived quoting.
             if (ch is '\'' or '"' or '`' or '$' or '\\' or '\n' or '\r' or '\0') return false;
         }
+        // Anchor under AgentLogDir/. Trailing '/' ensures '/work/.codeybox/agent-logs-other'
+        // is not accepted by accident.
+        const string anchor = SandboxConventions.AgentLogDir + "/";
+        if (!path.StartsWith(anchor, StringComparison.Ordinal)) return false;
         return true;
     }
 
@@ -1321,7 +1328,13 @@ test "$work" = present && test "$exec_wrapper" = present
     /// </para>
     /// </summary>
     internal const string ExecWrapperScript = """
-        #!/bin/sh
+        #!/bin/bash
+        # bash, not sh: the tee branch below needs `set -o pipefail` so the
+        # pipeline's exit code reflects the agent's exit code rather than tee's
+        # (always 0). Ubuntu's /bin/sh is dash, which has neither pipefail nor
+        # PIPESTATUS, so an sh shebang would silently report success for every
+        # failed agent invocation when CODEYBOX_AGENT_LOG_FILE is set.
+        set -o pipefail
         # Non-interactive defaults. Set BEFORE sourcing user env so user env
         # can override if needed. CI=true is respected by many CLIs to skip
         # prompts; DEBIAN_FRONTEND=noninteractive disables apt's tty prompts;
@@ -1389,12 +1402,17 @@ test "$work" = present && test "$exec_wrapper" = present
             # Drop any stale exit marker from a previous run so a resumed
             # poller cannot mistake the previous outcome for the current one.
             rm -f "$codeybox_exit_file" 2>/dev/null || true
+            # With `set -o pipefail` above, the pipeline's exit code is the
+            # rightmost non-zero status — i.e. the agent's exit code, not tee's.
+            # ${PIPESTATUS[0]} is the agent process specifically, which is what
+            # we want regardless of whether tee itself failed (it never does in
+            # practice but we still prefer the agent's true exit code).
             if [ "$keep_stdin" = "1" ]; then
                 "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
-                codeybox_user_rc=${PIPESTATUS:-$?}
+                codeybox_user_rc=${PIPESTATUS[0]}
             else
                 "$@" </dev/null 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
-                codeybox_user_rc=${PIPESTATUS:-$?}
+                codeybox_user_rc=${PIPESTATUS[0]}
             fi
             # Best-effort sidecar; the orchestrator treats missing file as
             # "not yet finished" so we never silently swallow a write error.

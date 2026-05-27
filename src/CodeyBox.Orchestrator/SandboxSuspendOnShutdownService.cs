@@ -46,7 +46,6 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 
     private readonly ISandboxProvider _provider;
     private readonly IWorkItemStore _store;
-    private readonly IHostApplicationLifetime _lifetime;
     private readonly ILogger<SandboxSuspendOnShutdownService> _log;
     private readonly int _maxParallel;
     private readonly TimeSpan _perSuspendTimeout;
@@ -54,14 +53,12 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     public SandboxSuspendOnShutdownService(
         ISandboxProvider provider,
         IWorkItemStore store,
-        IHostApplicationLifetime lifetime,
         ILogger<SandboxSuspendOnShutdownService> log,
         int? maxParallel = null,
         TimeSpan? perSuspendTimeout = null)
     {
         _provider = provider;
         _store = store;
-        _lifetime = lifetime;
         _log = log;
         _maxParallel = maxParallel is > 0 ? maxParallel.Value : DefaultMaxParallelSuspends;
         _perSuspendTimeout = perSuspendTimeout is { } t && t > TimeSpan.Zero ? t : DefaultPerSuspendTimeout;

@@ -29,7 +29,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
-    private readonly ISandboxProvider? _sandboxProvider;
     // Shared swappable holder. Both this service AND PipelineRunner (the
     // pickup-time rebase-resolver's cap-aware router) read through the same
     // AgentConcurrencySnapshot, so ApplyAgentConcurrencyReload's swap is
@@ -100,12 +99,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         DeadWorkerReaper? reaper = null,
         ReleaseService? releaseService = null,
         AgentConcurrencyOptions? agentConcurrency = null,
-        AgentConcurrencySnapshot? agentConcurrencySnapshot = null,
-        // sandboxProvider remains optional because some legacy test fixtures
-        // continue to pass it. Production now drives suspend/resume via the
-        // standalone SandboxSuspendOnShutdownService / SandboxResumeOnStartupService
-        // hosted services — the orchestrator no longer embeds the resume half.
-        ISandboxProvider? sandboxProvider = null)
+        AgentConcurrencySnapshot? agentConcurrencySnapshot = null)
     {
         _queue = queue;
         _store = store;
@@ -121,7 +115,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _deadWorkerOpts = deadWorkerOpts;
         _reaper = reaper;
         _releaseService = releaseService;
-        _sandboxProvider = sandboxProvider;
         // Prefer the shared snapshot when DI provides one (production path —
         // PipelineRunner reads from the same instance, so hot-reload swaps
         // here are visible there). Test fixtures that pass only the legacy

@@ -1418,8 +1418,7 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<DeadWorkerReaper>(),
     sp.GetService<ReleaseService>(),
     sp.GetRequiredService<AgentConcurrencyOptions>(),
-    sp.GetRequiredService<AgentConcurrencySnapshot>(),
-    sp.GetRequiredService<ISandboxProvider>()));
+    sp.GetRequiredService<AgentConcurrencySnapshot>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 // R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
@@ -1431,7 +1430,6 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>(
 builder.Services.AddHostedService(sp => new SandboxSuspendOnShutdownService(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
-    sp.GetRequiredService<IHostApplicationLifetime>(),
     sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>()));
 builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
     sp.GetService<ISandboxProvider>(),
