@@ -135,6 +135,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         RunMigration("ALTER TABLE work_items ADD COLUMN suspended_at TEXT;");
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_suspended_vm ON work_items(suspended_vm_name) WHERE suspended_vm_name IS NOT NULL;");
 
+        // R8-core: in-VM path to the tee'd agent-CLI log file. Persisted at
+        // agent invocation time so the startup resume handler can re-tail the
+        // file inside the resumed VM. Nullable: only set while an agent CLI
+        // that opted into tee'd capture is active for the work item.
+        RunMigration("ALTER TABLE work_items ADD COLUMN agent_log_path TEXT;");
+
         // Additive migration: optional per-work-item audit profile override.
         // NULL means use the project's default audit profile.
         RunMigration("ALTER TABLE work_items ADD COLUMN auditor_profile TEXT;");
@@ -265,13 +271,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                         min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
-                        suspended_vm_name, suspended_at,
+                        suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
-                        $suspended_vm_name, $suspended_at,
+                        $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts);
                     """;
@@ -363,6 +369,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     preempt_checkpoint = $preempt_checkpoint,
                     suspended_vm_name = $suspended_vm_name,
                     suspended_at = $suspended_at,
+                    agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
@@ -413,6 +420,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     preempt_checkpoint = $preempt_checkpoint,
                     suspended_vm_name = $suspended_vm_name,
                     suspended_at = $suspended_at,
+                    agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
@@ -463,6 +471,30 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- 'pages' is an int64 from a test caller; PRAGMA does not accept parameters so inlining is required and safe
         cmd.CommandText = $"PRAGMA max_page_count = {pages};";
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Test hook: deletes a single work item row. Used by tests that need to
+    /// race a deletion against another writer (e.g. the suspend-resume race
+    /// where an operator-cancel-and-delete arrives mid-resume). The
+    /// orchestrator never exposes a public delete API on
+    /// <see cref="IWorkItemStore"/> because work items are immutable end-to-
+    /// end; tests need it only for race coverage.
+    /// </summary>
+    internal async Task DeleteRowForTestAsync(WorkItemId id, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM work_items WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)
@@ -883,6 +915,27 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    public async IAsyncEnumerable<WorkItem> ListSuspendedAsync(
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        // Hits the partial index idx_work_items_suspended_vm (defined on
+        // suspended_vm_name WHERE suspended_vm_name IS NOT NULL) so the query
+        // scales with the in-flight suspend count, not the full table.
+        var rows = new List<WorkItem>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT * FROM work_items
+                WHERE suspended_vm_name IS NOT NULL;
+                """;
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
     public async IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(
         WorkItemId sourceId, [EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -1096,6 +1149,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$preempt_checkpoint", (object?)item.PreemptCheckpoint ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$suspended_vm_name", (object?)item.SuspendedVmName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$suspended_at", (object?)item.SuspendedAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$agent_log_path", (object?)item.AgentLogPath ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$failure_kind", (object?)item.FailureKind ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_reset_at", (object?)item.QuotaResetAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$next_quota_retry_at", (object?)item.NextQuotaRetryAt?.ToString("O") ?? DBNull.Value);
@@ -1146,6 +1200,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         PreemptCheckpoint = r.IsDBNull(r.GetOrdinal("preempt_checkpoint")) ? null : r.GetString(r.GetOrdinal("preempt_checkpoint")),
         SuspendedVmName = ReadNullableString(r, "suspended_vm_name"),
         SuspendedAt = ReadNullableDateTimeOffset(r, "suspended_at"),
+        AgentLogPath = ReadNullableString(r, "agent_log_path"),
         FailureKind = r.IsDBNull(r.GetOrdinal("failure_kind")) ? null : r.GetString(r.GetOrdinal("failure_kind")),
         QuotaResetAt = ReadNullableDateTimeOffset(r, "quota_reset_at"),
         NextQuotaRetryAt = ReadNullableDateTimeOffset(r, "next_quota_retry_at"),

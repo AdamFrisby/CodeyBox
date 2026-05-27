@@ -146,12 +146,15 @@ public interface ISuspendableSandbox : ISandbox
 public interface ISuspendingSandboxProvider
 {
     /// <summary>
-    /// Snapshot of currently-active sandboxes that can be suspended, keyed by
-    /// the work item that owns them. Snapshot is taken under a lock so a
-    /// disposal racing the shutdown handler cannot produce a stale entry.
-    /// Implementations that cannot determine the owner (e.g. an in-process
-    /// CreateAsync that did not pass <see cref="SandboxSpec.TimingWorkItemId"/>)
-    /// omit those entries.
+    /// Snapshot of currently-active sandboxes that can be suspended, paired
+    /// with the work item that owns each entry. Implementations that
+    /// internally use a <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/>
+    /// or other snapshot-safe data structure return entries that are
+    /// consistent with concurrent disposals — a sandbox racing dispose may
+    /// still appear here, but its <see cref="ISuspendableSandbox.SuspendAsync"/>
+    /// is a no-op once the sandbox is disposed. Implementations that cannot
+    /// determine the owner (e.g. an in-process <c>CreateAsync</c> that did not
+    /// pass <see cref="SandboxSpec.TimingWorkItemId"/>) omit those entries.
     /// </summary>
     IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive();
 
@@ -162,6 +165,32 @@ public interface ISuspendingSandboxProvider
     /// suspended VM no longer exists.
     /// </summary>
     Task ResumeSandboxAsync(string name, CancellationToken ct);
+
+    /// <summary>
+    /// R8-core: after <see cref="ResumeSandboxAsync"/> brings the VM back to
+    /// Running, the startup resume handler asks the provider to wait for the
+    /// in-VM agent process to finish, streaming what's left of
+    /// <paramref name="agentLogPath"/> to <paramref name="logSink"/> as it goes.
+    /// Completion is signalled by the <c>codeybox-exec</c> wrapper writing
+    /// <paramref name="agentLogPath"/><c>.exit</c> containing the agent's exit
+    /// code. Returns the parsed exit code on completion; returns null when
+    /// the deadline elapses before the marker appears (the orchestrator falls
+    /// back to the stranded-item recovery path in that case). Implementations
+    /// that cannot inspect the in-VM filesystem (process / bubblewrap) return
+    /// null immediately.
+    /// </summary>
+    /// <param name="vmName">VM whose log to tail. Must validate against the provider's name allow-list.</param>
+    /// <param name="agentLogPath">Absolute in-VM path to the tee'd log file the agent wrapper writes.</param>
+    /// <param name="logSink">Receives appended log bytes as the agent emits them post-resume.</param>
+    /// <param name="deadline">Best-effort cap on the wait window; null lets the caller's cancellation token drive timing.</param>
+    /// <param name="ct">Cancellation token. Cancelling returns immediately without throwing.</param>
+    /// <returns>Agent exit code, or null if the wait timed out, the file is absent, or the provider does not support adoption.</returns>
+    Task<int?> WaitForAdoptedAgentCompletionAsync(
+        string vmName,
+        string agentLogPath,
+        Action<string>? logSink,
+        TimeSpan? deadline,
+        CancellationToken ct) => Task.FromResult<int?>(null);
 }
 
 /// <summary>

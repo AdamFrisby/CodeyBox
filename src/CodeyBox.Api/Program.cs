@@ -1423,13 +1423,20 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 // R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
-// can resume them. Hosted-service registration only matters for StartAsync; the
-// suspend itself happens on the ApplicationStopping callback.
+// can resume them. Both halves of the cycle are IHostedLifecycleService so the
+// host awaits StoppingAsync (suspend) and StartingAsync (resume) natively
+// rather than blocking a thread-pool callback. The resume runs BEFORE
+// OrchestratorService.ExecuteAsync (and before the dead-worker reaper) so
+// adopted in-VM agents are observed before the standard recovery sweep fires.
 builder.Services.AddHostedService(sp => new SandboxSuspendOnShutdownService(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<IHostApplicationLifetime>(),
     sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>()));
+builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
+    sp.GetService<ISandboxProvider>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ILogger<SandboxResumeOnStartupService>>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the

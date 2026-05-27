@@ -15,6 +15,24 @@ public static class SandboxConventions
     /// <summary>Default tmpfs size for credentials.</summary>
     public const long CredentialsTmpfsBytes = 4L * 1024 * 1024;
 
+    /// <summary>
+    /// R8-core: directory inside the sandbox where the exec wrapper writes the
+    /// active agent CLI's tee'd stdout/stderr (one file per agent invocation,
+    /// named with the agent run id). Persisted to the work item as
+    /// <c>WorkItem.AgentLogPath</c> so the startup resume handler can re-tail
+    /// it after a multipass suspend/start cycle. Lives under <see cref="WorkDir"/>
+    /// because that mount is preserved across a suspend (the host bind-mount
+    /// stays intact when the VM is frozen and re-attached on start).
+    /// </summary>
+    public const string AgentLogDir = "/work/.codeybox/agent-logs";
+
+    /// <summary>
+    /// Environment variable name the exec wrapper looks for to enable tee'd
+    /// capture of stdout/stderr into <see cref="AgentLogDir"/>. Set by the
+    /// orchestrator on every agent CLI invocation.
+    /// </summary>
+    public const string AgentLogFileEnv = "CODEYBOX_AGENT_LOG_FILE";
+
     /// <summary>Logical network profile used by opt-in graphical sandboxes.</summary>
     public const string GraphicalNetworkProfile = "graphical";
 

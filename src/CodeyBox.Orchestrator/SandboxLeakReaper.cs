@@ -227,7 +227,10 @@ public sealed class SandboxLeakReaper : BackgroundService
     {
         if (_store is null) return new HashSet<string>(StringComparer.Ordinal);
         var set = new HashSet<string>(StringComparer.Ordinal);
-        await foreach (var item in _store.ListAsync(ct))
+        // ListSuspendedAsync hits the partial index idx_work_items_suspended_vm
+        // (suspended_vm_name WHERE NOT NULL), so this loop's cost scales with
+        // the in-flight suspend count rather than the full work_items table.
+        await foreach (var item in _store.ListSuspendedAsync(ct))
         {
             // Only honour SuspendedVmName for items still in mid-flight states.
             // A terminal item with a stale SuspendedVmName (e.g. cancelled by

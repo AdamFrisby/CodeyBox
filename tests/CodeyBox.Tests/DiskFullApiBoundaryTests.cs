@@ -229,6 +229,7 @@ public sealed class DiskFullApiBoundaryTests
         public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyDictionary<string, bool>>(new Dictionary<string, bool>());
         public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) => Empty();
+        public IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) => Empty();
         public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => Task.CompletedTask;
         public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => Empty();
         public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default)
@@ -275,6 +276,7 @@ public sealed class DiskFullApiBoundaryTests
         public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyDictionary<string, bool>>(new Dictionary<string, bool>());
         public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) => Empty();
+        public IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) => Empty();
         public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => Task.CompletedTask;
         public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => Empty();
         public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default)

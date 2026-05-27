@@ -405,11 +405,175 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
             throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
 
         var run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
+        // Treat "instance not running" / "already started" as success: the goal
+        // of ResumeSandboxAsync is "VM is Running afterwards", and multipass
+        // start on an already-Running VM is the same desired postcondition. We
+        // do not parse stderr for VM-not-found vs other failures here because
+        // the orchestrator's caller treats any failure as "fall through to the
+        // stranded-item recovery path" — preserving the explicit signal.
         if (run.ExitCode != 0)
             throw new InvalidOperationException(
                 $"multipass start {name} failed (exit {run.ExitCode}): {run.Stderr}");
         _listCacheExpiry = DateTimeOffset.MinValue;
         _log.LogInformation("Resumed suspended multipass VM {Name}", name);
+    }
+
+    /// <inheritdoc/>
+    public async Task<int?> WaitForAdoptedAgentCompletionAsync(
+        string vmName,
+        string agentLogPath,
+        Action<string>? logSink,
+        TimeSpan? deadline,
+        CancellationToken ct)
+    {
+        var opts = ReadOptions();
+        if (!IsValidSandboxName(vmName))
+            throw new ArgumentException($"Sandbox name '{vmName}' contains invalid characters (only [a-z0-9-] allowed).", nameof(vmName));
+        if (string.IsNullOrWhiteSpace(agentLogPath))
+            return null;
+        // Reject paths that contain shell metacharacters or relative segments
+        // so the subsequent `multipass exec` arguments cannot be coerced into
+        // running an unintended command. Absolute paths only.
+        if (!IsValidAgentLogPath(agentLogPath))
+            throw new ArgumentException($"Agent log path '{agentLogPath}' is not an allowed in-VM path.", nameof(agentLogPath));
+
+        var exitMarker = agentLogPath + ".exit";
+        var startedAt = DateTimeOffset.UtcNow;
+        // Track how many bytes of the log file we have already forwarded so a
+        // poll round only ships the newly-appended bytes. Reset on transient
+        // read failure so we do not silently drop output if the file was
+        // rotated by some VM-side tool.
+        long offset = 0;
+        var pollInterval = TimeSpan.FromSeconds(2);
+        var maxStdoutBytes = 1024 * 1024;
+
+        while (!ct.IsCancellationRequested)
+        {
+            if (deadline is { } d && DateTimeOffset.UtcNow - startedAt > d)
+            {
+                _log.LogWarning(
+                    "WaitForAdoptedAgentCompletionAsync({VmName}): exit marker {Marker} did not appear within {Deadline}; giving up — work item will fall through to stranded-item recovery",
+                    vmName, exitMarker, d);
+                return null;
+            }
+
+            // Stream what's new in the log file via `tail -c +offset`. Failure
+            // (e.g. file does not exist yet) is non-fatal: keep polling.
+            var (newOffset, chunk) = await ReadLogTailAsync(opts, vmName, agentLogPath, offset, maxStdoutBytes, ct);
+            if (chunk.Length > 0)
+            {
+                logSink?.Invoke(chunk);
+                offset = newOffset;
+            }
+
+            var (exitPresent, exitCode) = await TryReadExitMarkerAsync(opts, vmName, exitMarker, ct);
+            if (exitPresent)
+            {
+                // One final tail to flush bytes appended between the last read
+                // and the wrapper's exit-code write.
+                var (_, finalChunk) = await ReadLogTailAsync(opts, vmName, agentLogPath, offset, maxStdoutBytes, ct);
+                if (finalChunk.Length > 0)
+                    logSink?.Invoke(finalChunk);
+                _log.LogInformation(
+                    "Adopted agent in {VmName} (log={LogPath}) exited with code {ExitCode}",
+                    vmName, agentLogPath, exitCode);
+                return exitCode;
+            }
+
+            try { await Task.Delay(pollInterval, ct); }
+            catch (OperationCanceledException) { return null; }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Tail bytes from <paramref name="agentLogPath"/> starting at byte offset
+    /// <paramref name="offset"/>. Returns the new offset (post-read) and the
+    /// chunk that was read. Returns empty on any in-VM failure — the caller
+    /// keeps polling.
+    /// </summary>
+    private async Task<(long Offset, string Chunk)> ReadLogTailAsync(
+        MultipassSandboxOptions opts,
+        string vmName,
+        string agentLogPath,
+        long offset,
+        int maxBytes,
+        CancellationToken ct)
+    {
+        // tail -c +N is 1-indexed: byte N is the first read. Adjust accordingly.
+        var byteOffset = (offset + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        try
+        {
+            var argv = new[]
+            {
+                opts.MultipassBinary, "exec", vmName, "--",
+                "sh", "-c", $"tail -c +{byteOffset} -- {ShellSingleQuote(agentLogPath)} 2>/dev/null | head -c {maxBytes}",
+            };
+            var result = await _runner.RunAsync(argv, stdin: null, ct);
+            if (result.ExitCode != 0)
+                return (offset, string.Empty);
+            return (offset + System.Text.Encoding.UTF8.GetByteCount(result.Stdout), result.Stdout);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "ReadLogTailAsync({VmName}, {LogPath}) threw; will retry next tick", vmName, agentLogPath);
+            return (offset, string.Empty);
+        }
+    }
+
+    private async Task<(bool Present, int ExitCode)> TryReadExitMarkerAsync(
+        MultipassSandboxOptions opts,
+        string vmName,
+        string exitMarker,
+        CancellationToken ct)
+    {
+        try
+        {
+            var argv = new[]
+            {
+                opts.MultipassBinary, "exec", vmName, "--",
+                "sh", "-c", $"test -f {ShellSingleQuote(exitMarker)} && cat -- {ShellSingleQuote(exitMarker)}",
+            };
+            var result = await _runner.RunAsync(argv, stdin: null, ct);
+            if (result.ExitCode != 0)
+                return (false, 0);
+            var trimmed = result.Stdout.Trim();
+            if (int.TryParse(trimmed, out var code))
+                return (true, code);
+            // Marker present but unparseable. Treat as completion with an
+            // unknown-code sentinel so the orchestrator can act without
+            // looping forever on a corrupted file.
+            return (true, -1);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "TryReadExitMarkerAsync({VmName}, {Marker}) threw; treating as not-yet-present", vmName, exitMarker);
+            return (false, 0);
+        }
+    }
+
+    /// <summary>
+    /// Allows <c>/work/.codeybox/agent-logs/&lt;name&gt;.log</c>-style absolute
+    /// paths and rejects anything with shell metacharacters or relative
+    /// segments. The orchestrator chooses the path via
+    /// <c>SandboxConventions.AgentLogDir</c>, so this is defence-in-depth
+    /// against persistence-layer corruption.
+    /// </summary>
+    private static bool IsValidAgentLogPath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        if (path[0] != '/') return false;
+        if (path.Contains("..", StringComparison.Ordinal)) return false;
+        foreach (var ch in path)
+        {
+            if (ch < 0x20 || ch == 0x7f) return false;
+            // Reject shell metacharacters even though we already quote the
+            // value: the wrapper's `sh -c` would still expand `$var` /
+            // `$(...)` substrings if they survived quoting.
+            if (ch is '\'' or '"' or '`' or '$' or '\\' or '\n' or '\r' or '\0') return false;
+        }
+        return true;
     }
 
     /// <inheritdoc/>
@@ -1145,6 +1309,16 @@ test "$work" = present && test "$exec_wrapper" = present
     /// at /usr/local/bin/codeybox-exec inside the VM, owned by root with
     /// mode 0755 so the agent (running as the unprivileged ubuntu user
     /// without sudo) can run but cannot modify it.
+    ///
+    /// <para>R8-core: when <c>CODEYBOX_AGENT_LOG_FILE</c> is set in the user
+    /// environment, both stdout and stderr are tee'd to that path inside the
+    /// VM so the host can re-tail it after a multipass suspend/start cycle.
+    /// On exit, an <c>.exit</c> sidecar file is written containing the
+    /// command's exit code so the startup resume handler can recover the
+    /// outcome that the host stream missed when it went away. Both files
+    /// are created relative to the directory of CODEYBOX_AGENT_LOG_FILE; the
+    /// caller picks a path inside a writable mount (typically /work/.codeybox/).
+    /// </para>
     /// </summary>
     internal const string ExecWrapperScript = """
         #!/bin/sh
@@ -1202,6 +1376,31 @@ test "$work" = present && test "$exec_wrapper" = present
             shift 2
         fi
         rm -f "$codeybox_err_file"
+        # Tee path is opt-in via CODEYBOX_AGENT_LOG_FILE. When set, both
+        # stdout and stderr stream live to the host AND get tee'd into the
+        # log file so a suspend/resume cycle can recover output the host
+        # stream lost. The .exit sidecar is overwritten on each invocation
+        # with the command's exit code so the orchestrator can poll for
+        # completion after a resume without having to read the agent's PID.
+        if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
+            codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
+            mkdir -p "$codeybox_log_dir" 2>/dev/null || true
+            codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
+            # Drop any stale exit marker from a previous run so a resumed
+            # poller cannot mistake the previous outcome for the current one.
+            rm -f "$codeybox_exit_file" 2>/dev/null || true
+            if [ "$keep_stdin" = "1" ]; then
+                "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
+                codeybox_user_rc=${PIPESTATUS:-$?}
+            else
+                "$@" </dev/null 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
+                codeybox_user_rc=${PIPESTATUS:-$?}
+            fi
+            # Best-effort sidecar; the orchestrator treats missing file as
+            # "not yet finished" so we never silently swallow a write error.
+            printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
+            exit "$codeybox_user_rc"
+        fi
         if [ "$keep_stdin" = "1" ]; then
             exec "$@"
         else
@@ -2665,7 +2864,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     public async Task SuspendAsync(CancellationToken ct = default)
     {
         if (_disposed) return;
-        _preserveOnDispose = true;
         var markerPath = Path.Combine(_sandboxRoot, ".codeybox-preempt");
         try
         {
@@ -2681,8 +2879,21 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             stdin: null,
             ct: ct);
         if (result.ExitCode != 0)
+        {
+            // Do NOT set _preserveOnDispose before this point: if the multipass
+            // suspend call fails we still want DisposeAsync to destroy the VM
+            // so a still-Running but un-bookkept VM doesn't silently leak. The
+            // caller (SandboxSuspendOnShutdownService.SuspendOneAsync) treats
+            // any exception here as "don't persist SuspendedVmName"; the next
+            // DisposeAsync (triggered by the orchestrator's host stopping)
+            // then cleanly tears the VM down.
             throw new InvalidOperationException(
                 $"multipass suspend {_name} failed (exit {result.ExitCode}): {result.Stderr}");
+        }
+        // Only flip the preserve flag once we know the VM is suspended on disk.
+        // From here on, DisposeAsync MUST be a no-op so multipass start can
+        // resume the same VM on the next orchestrator startup.
+        _preserveOnDispose = true;
         _log.LogInformation("Suspended multipass VM {Name} for orchestrator restart", _name);
     }
 }

@@ -7,9 +7,10 @@ namespace CodeyBox.Orchestrator;
 /// <summary>
 /// R8-core: on graceful host shutdown, freeze every in-flight sandbox via
 /// <see cref="ISuspendableSandbox.SuspendAsync"/> and persist the
-/// <c>(workItemId → vmName, suspendedAt)</c> mapping so the next orchestrator
-/// process can <c>multipass start</c> the same VM (see the startup resume
-/// handler wired in <see cref="OrchestratorService.ExecuteAsync"/>).
+/// <c>(workItemId → vmName, suspendedAt, agentLogPath)</c> mapping so the next
+/// orchestrator process can <c>multipass start</c> the same VM and re-tail the
+/// in-VM agent log (see <see cref="SandboxResumeOnStartupService"/> for the
+/// resume half).
 ///
 /// <para>This sits alongside — not on top of — the existing per-phase
 /// preempt-checkpoint flow in <see cref="PipelineRunner"/>: that path commits a
@@ -17,12 +18,15 @@ namespace CodeyBox.Orchestrator;
 /// sandbox provider does not support suspend (process, bubblewrap). The
 /// suspend path is strictly an improvement when both are available.</para>
 ///
-/// <para>Registered as a hosted service. It does almost nothing during normal
-/// runtime — the work happens entirely on the
-/// <see cref="IHostApplicationLifetime.ApplicationStopping"/> token, which the
-/// host fires before tearing down the worker pool.</para>
+/// <para>Implements <see cref="IHostedLifecycleService.StoppingAsync"/> rather
+/// than registering a synchronous callback on
+/// <see cref="IHostApplicationLifetime.ApplicationStopping"/>. StoppingAsync
+/// is awaited by the host before the BackgroundService cancellation token
+/// fires, so the in-VM agent process is still running when multipass takes
+/// its snapshot, AND the host honours the async signature instead of being
+/// blocked on a sync-over-async fan-out.</para>
 /// </summary>
-public sealed class SandboxSuspendOnShutdownService : IHostedService
+public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 {
     /// <summary>
     /// Cap on parallel <c>multipass suspend</c> calls. Suspend writes the VM's
@@ -63,31 +67,33 @@ public sealed class SandboxSuspendOnShutdownService : IHostedService
         _perSuspendTimeout = perSuspendTimeout is { } t && t > TimeSpan.Zero ? t : DefaultPerSuspendTimeout;
     }
 
-    public Task StartAsync(CancellationToken ct)
-    {
-        // Run the handler on ApplicationStopping, not StopAsync. ApplicationStopping
-        // fires before the host enters its drain window, which is what the design
-        // spec requires (we want to suspend before BackgroundService.ExecuteAsync's
-        // cancellation token fires inside the pipeline runner, so the in-VM agent
-        // process is still running when multipass suspend takes its snapshot).
-        _lifetime.ApplicationStopping.Register(() =>
-        {
-            try
-            {
-                // Block the lifetime callback long enough to finish; this is
-                // intentional. The host will only proceed to its drain once
-                // every ApplicationStopping registration has returned.
-                SuspendAllAsync().GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Sandbox suspend-on-shutdown failed; in-flight items will follow the existing recovery path");
-            }
-        });
-        return Task.CompletedTask;
-    }
-
+    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+
+    // IHostedLifecycleService hooks. StoppingAsync fires before any
+    // BackgroundService cancellation token, which is what the design spec
+    // requires: the in-VM agent process must still be running when multipass
+    // suspend takes its snapshot. The async signature lets us await the
+    // suspend fan-out natively instead of sync-over-async-ing it onto a
+    // thread-pool callback.
+    public Task StartingAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task StoppedAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public async Task StoppingAsync(CancellationToken ct)
+    {
+        try
+        {
+            // Suspend always uses CancellationToken.None for the multipass call
+            // so the host's shutdown grace period doesn't truncate it mid-flight.
+            // ct is honoured for the loop's early exit before we fan out.
+            await SuspendAllAsync();
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Sandbox suspend-on-shutdown failed; in-flight items will follow the existing recovery path");
+        }
+    }
 
     internal async Task SuspendAllAsync()
     {

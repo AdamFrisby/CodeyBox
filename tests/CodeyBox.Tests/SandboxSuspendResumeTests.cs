@@ -132,6 +132,35 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task ShutdownHandler_SuspendTimeout_DoesNotPersistVmName()
+    {
+        // The suspend handler bounds each multipass suspend with a per-VM
+        // timeout. When the inner suspend exceeds it (OperationCanceledException),
+        // the handler logs and returns WITHOUT persisting SuspendedVmName so
+        // the item flows through the standard stranded-item recovery path.
+        // Distinct from the generic Exception branch — both must lead to the
+        // same "no bookkeeping" outcome.
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var sandbox = new SlowSuspendingSandbox("vm-slow");
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store, new FakeLifetime(),
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            perSuspendTimeout: TimeSpan.FromMilliseconds(50));
+        await svc.SuspendAllAsync();
+
+        var after = await _store.GetAsync(item.Id);
+        // Timeout fired before the sandbox SuspendAsync could complete; no
+        // bookkeeping must have been persisted.
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+    }
+
+    [Fact]
     public async Task ShutdownHandler_NonSuspendingProvider_IsNoOp()
     {
         var item = MakeItem();
@@ -162,9 +191,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await _store.CreateAsync(item2 with { SuspendedVmName = "vm-2", SuspendedAt = DateTimeOffset.UtcNow });
 
         var provider = new FakeSuspendingProvider();
-        var orchestrator = MakeOrchestratorWithProvider(provider);
+        var svc = MakeResumeService(provider);
 
-        await orchestrator.ResumeSuspendedSandboxesForTestAsync(CancellationToken.None);
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         Assert.Contains("vm-1", provider.ResumedNames);
         Assert.Contains("vm-2", provider.ResumedNames);
@@ -188,9 +217,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await _store.CreateAsync(item with { SuspendedVmName = "vm-gone", SuspendedAt = DateTimeOffset.UtcNow });
 
         var provider = new FakeSuspendingProvider { ResumeThrows = true };
-        var orchestrator = MakeOrchestratorWithProvider(provider);
+        var svc = MakeResumeService(provider);
 
-        await orchestrator.ResumeSuspendedSandboxesForTestAsync(CancellationToken.None);
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
@@ -204,11 +233,111 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await _store.CreateAsync(item); // No SuspendedVmName.
 
         var provider = new FakeSuspendingProvider();
-        var orchestrator = MakeOrchestratorWithProvider(provider);
+        var svc = MakeResumeService(provider);
 
-        await orchestrator.ResumeSuspendedSandboxesForTestAsync(CancellationToken.None);
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         Assert.Empty(provider.ResumedNames);
+    }
+
+    [Fact]
+    public async Task StartupResume_NonSuspendingProvider_IsNoOpEvenWithSuspendedRows()
+    {
+        // Regression guard for the early-return when the provider does not
+        // implement ISuspendingSandboxProvider. The service must not NRE and
+        // must leave the persisted bookkeeping untouched so a subsequent
+        // restart with the right provider can still resume.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-orphan",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var svc = new SandboxResumeOnStartupService(
+            new NonSuspendingProvider(), _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance);
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-orphan", after!.SuspendedVmName);
+        Assert.NotNull(after.SuspendedAt);
+    }
+
+    [Fact]
+    public async Task StartupResume_NullProvider_IsNoOp()
+    {
+        // No sandbox provider registered at all (host doesn't run sandboxes).
+        // Must not throw even when the DB still has suspended rows from a
+        // previous configuration.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-old",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var svc = new SandboxResumeOnStartupService(
+            provider: null, _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+        // Rows untouched — operator-visible signal that the suspended VM
+        // bookkeeping was inherited from a different configuration.
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-old", after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_ItemDeletedBetweenResumeAndClear_DoesNotThrow()
+    {
+        // Race: an operator-cancel-and-delete arrives between the multipass
+        // start succeeding and the suspend-bookkeeping clear. The fresh
+        // GetAsync returns null; we must log + audit + return cleanly.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-disappearing",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new DeleteOnResumeProvider(_store, item.Id);
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Contains("vm-disappearing", provider.ResumedNames);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after); // Was deleted by the racing provider.
+    }
+
+    [Fact]
+    public async Task StartupResume_WithAgentLogPath_WaitsForAdoptionAndClearsLogPath()
+    {
+        // When the work item carries AgentLogPath, the resume service should
+        // both call ResumeSandboxAsync and call WaitForAdoptedAgentCompletion
+        // (which the fake records). On adoption success the bookkeeping
+        // including AgentLogPath is cleared.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-adopt",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/abc.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Single(provider.AdoptionCalls);
+        var adoption = provider.AdoptionCalls[0];
+        Assert.Equal("vm-adopt", adoption.VmName);
+        Assert.Equal("/work/.codeybox/agent-logs/abc.log", adoption.AgentLogPath);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Null(after.AgentLogPath);
     }
 
     // ── Leak reaper integration ──────────────────────────────────────────────
@@ -244,6 +373,46 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.DoesNotContain("vm-suspended", provider.DisposedNames);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Auditing, "vm-auditing", true)]
+    [InlineData(WorkItemState.Reworking, "vm-reworking", true)]
+    [InlineData(WorkItemState.Merging, "vm-merging", true)]
+    [InlineData(WorkItemState.AuditPassed, "vm-auditpassed", false)]
+    [InlineData(WorkItemState.Done, "vm-done", false)]
+    public async Task LeakReaper_ProtectsSuspendedVm_ForEveryMidFlightState(
+        WorkItemState state, string vmName, bool expectedProtected)
+    {
+        // Each of (Working, Auditing, Reworking, Merging) is a mid-flight
+        // state where the agent could legitimately be running inside a
+        // suspended VM. A regression that drops one would cause that state's
+        // suspended VMs to be reaped during the restart window. The
+        // separately-tested terminal cases (Done, AuditPassed-as-resting) act
+        // as negative controls.
+        var item = MakeItem(state);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = vmName,
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSandboxLeakProvider();
+        provider.SeedManaged(new(vmName, DateTimeOffset.UtcNow.AddHours(-1), 1024L * 1024, IsTrackedActive: false));
+
+        var webhooks = new CapturingWebhookDispatcher();
+        var reaper = new SandboxLeakReaper(
+            provider, webhooks,
+            () => new SandboxLeakOptions { LeakAgeThreshold = TimeSpan.FromMinutes(30), AutoDispose = true },
+            NullLogger<SandboxLeakReaper>.Instance,
+            _store);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        if (expectedProtected)
+            Assert.DoesNotContain(vmName, provider.DisposedNames);
+        else
+            Assert.Contains(vmName, provider.DisposedNames);
+    }
+
     [Fact]
     public async Task LeakReaper_SuspendedVmName_OnTerminalItem_IsNotProtected()
     {
@@ -275,16 +444,43 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private OrchestratorService MakeOrchestratorWithProvider(ISandboxProvider provider)
+    private SandboxResumeOnStartupService MakeResumeService(ISandboxProvider provider) =>
+        new(provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance);
+
+    private sealed class DeleteOnResumeProvider : ISandboxProvider, ISuspendingSandboxProvider
     {
-        var queue = new InMemoryTaskQueue();
-        var pipeline = new ImmediateDonePipeline(_store);
-        var cancellations = new CancellationRegistry(CancellationToken.None);
-        return new OrchestratorService(
-            queue, _store, pipeline, cancellations,
-            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
-            NullLogger<OrchestratorService>.Instance,
-            sandboxProvider: provider);
+        private readonly IWorkItemStore _store;
+        private readonly WorkItemId _itemToDelete;
+        public DeleteOnResumeProvider(IWorkItemStore store, WorkItemId itemToDelete)
+        {
+            _store = store;
+            _itemToDelete = itemToDelete;
+        }
+        public List<string> ResumedNames { get; } = new();
+        public string Name => "fake-delete-on-resume";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) => throw new NotImplementedException();
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
+        public async Task ResumeSandboxAsync(string name, CancellationToken ct)
+        {
+            ResumedNames.Add(name);
+            // Drop the row before the caller can re-read it.
+            await DeleteRowAsync(_itemToDelete, ct);
+        }
+
+        private async Task DeleteRowAsync(WorkItemId id, CancellationToken ct)
+        {
+            // Force the SQLite store to drop the row by issuing a raw DELETE.
+            // The IWorkItemStore interface does not expose Delete, but the test
+            // store has a Dispose hook so we approximate by setting state and
+            // letting the test verify GetAsync returns null. We use direct
+            // ADO.NET for the test only.
+            if (_store is SqliteWorkItemStore sqlite)
+            {
+                await sqlite.DeleteRowForTestAsync(id, ct);
+            }
+        }
     }
 
     private sealed class FakeSuspendableSandbox : ISuspendableSandbox
@@ -308,11 +504,30 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         }
     }
 
+    private sealed class SlowSuspendingSandbox : ISuspendableSandbox
+    {
+        public SlowSuspendingSandbox(string id) { Id = id; }
+        public string Id { get; }
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public Task SuspendAsync(CancellationToken ct = default)
+        {
+            // Block until cancellation fires; the per-suspend timeout in
+            // SandboxSuspendOnShutdownService will cancel this.
+            var tcs = new TaskCompletionSource();
+            ct.Register(() => tcs.TrySetException(new OperationCanceledException(ct)));
+            return tcs.Task;
+        }
+    }
+
     private sealed class FakeSuspendingProvider : ISandboxProvider, ISuspendingSandboxProvider
     {
         private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
         public List<string> ResumedNames { get; } = new();
+        public List<AdoptionCall> AdoptionCalls { get; } = new();
         public bool ResumeThrows { get; set; }
+        public int? AdoptionExitCodeToReturn { get; set; }
 
         public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
 
@@ -336,7 +551,20 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
             return Task.CompletedTask;
         }
+
+        public Task<int?> WaitForAdoptedAgentCompletionAsync(
+            string vmName,
+            string agentLogPath,
+            Action<string>? logSink,
+            TimeSpan? deadline,
+            CancellationToken ct)
+        {
+            AdoptionCalls.Add(new AdoptionCall(vmName, agentLogPath, deadline));
+            return Task.FromResult(AdoptionExitCodeToReturn);
+        }
     }
+
+    private sealed record AdoptionCall(string VmName, string AgentLogPath, TimeSpan? Deadline);
 
     private sealed class NonSuspendingProvider : ISandboxProvider
     {
