@@ -490,13 +490,14 @@ and opens a pull request (workBranch → baseBranch) rather than pushing
 the merged base branch directly. This leaves a PR and code-review trail
 on GitHub even for fully-automated merges.
 
-Three additional options control the behaviour:
+Four additional options control the behaviour:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `MergeMethod` | `"merge"` \| `"squash"` \| `"rebase"` | `"merge"` | Merge strategy used when `AutoMerge=true`. |
 | `AutoMerge` | bool | `false` | When `true`, merges the PR via the GitHub API immediately after opening it. When `false`, the PR is left open for human review. Either way the work item transitions to `Done`. |
 | `PullRequestTitleTemplate` | string? | — | Template for the PR title. Supports `{title}` (work item title) and `{branch}` (work branch name) placeholders. Defaults to the work item title. |
+| `PreMergeVerifyArgv` | string[]? | `[]` | Pre-merge CI gate. When non-empty AND `AutoMerge=true` AND an `IPreMergeVerifier` is registered, the post-local-merge tree is re-validated against current `baseBranch` before the auto-merge API call. A failed verify parks the work item at `MergeConflictResolutionFailed` with a `pre-merge verify: …` prefix on `LastError`. Empty (the default) skips the gate. |
 
 **Example — auto-merge with squash:**
 
@@ -518,6 +519,19 @@ instead. The local merge produced by phase 3 is still in the host bare
 repo; the upstream push is additive. If your branch protection rules
 prevent the PAT from merging, leave `AutoMerge=false` and approve the PR
 manually.
+
+**Pre-merge CI gate.** GitHub's `mergeable == true` flag only checks for
+textual conflicts; it does not catch the case where a clean merge against
+a freshly-moved `baseBranch` still breaks the build (a renamed helper,
+a drifted constant) or fails previously-green tests. When a project sets
+`PreMergeVerifyArgv` and the host has registered an `IPreMergeVerifier`,
+the orchestrator runs the verifier *after* the local merge phase and
+*before* the auto-merge API call. A red verify parks the work item with
+`LastError` prefixed by `pre-merge verify: rebase failed:` (textual
+conflict) or `pre-merge verify: rebased build failed:` (clean rebase but
+broken build/tests) so operators can tell the two cases apart. The gate
+is opt-in: leaving `PreMergeVerifyArgv` empty preserves the previous
+behaviour.
 
 ## Budget caps
 

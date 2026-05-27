@@ -62,6 +62,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly AgentAvailabilityRegistry? _availability;
+    private readonly IPreMergeVerifier? _preMergeVerifier;
     // Per-agent concurrency view used by ResolveTextOnlyRebaseResolverAsync to
     // route the pickup-time rebase resolver away from agents whose
     // operator-configured cap is at ceiling. The cap is shorthand for "this
@@ -160,7 +161,8 @@ public sealed class PipelineRunner : IPipelineRunner
         OrchestratorOptions? orchestratorOptions = null,
         AgentAvailabilityRegistry? availability = null,
         IAgentRunningCounters? agentRunningCounters = null,
-        AgentConcurrencyOptions? agentConcurrency = null)
+        AgentConcurrencyOptions? agentConcurrency = null,
+        IPreMergeVerifier? preMergeVerifier = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -217,6 +219,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _availability = availability;
         _agentRunningCounters = agentRunningCounters;
         _agentConcurrency = agentConcurrency;
+        _preMergeVerifier = preMergeVerifier;
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
     }
@@ -4657,6 +4660,80 @@ public sealed class PipelineRunner : IPipelineRunner
                 AutoMerge = project.Upstream.AutoMerge,
                 MergeMethod = project.Upstream.MergeMethod,
             };
+
+            // Pre-merge CI gate. The forge's textual `mergeable` flag does not
+            // catch the case where a clean merge against newly-moved `main`
+            // still breaks the build or tests (e.g. a helper renamed on `main`
+            // that the PR still calls under its old name). When a verifier is
+            // registered AND the project has opted in via PreMergeVerifyArgv,
+            // re-validate the post-local-merge tree before the auto-merge API
+            // call. A failure here parks the item at
+            // MergeConflictResolutionFailed with a `pre-merge verify: …`
+            // prefix so operators can distinguish this from race recovery and
+            // LLM-merger failure modes.
+            if (project.Upstream.AutoMerge &&
+                _preMergeVerifier is not null &&
+                project.Upstream.PreMergeVerifyArgv.Count > 0 &&
+                !string.IsNullOrEmpty(mergeSha))
+            {
+                PreMergeVerifyResult verifyResult;
+                try
+                {
+                    verifyResult = await _preMergeVerifier.VerifyAsync(new PreMergeVerifyRequest
+                    {
+                        WorkItemId = item.Id,
+                        Project = project,
+                        RepositoryId = repoId,
+                        BaseBranch = baseBranch,
+                        WorkBranch = workBranch,
+                        MergeSha = mergeSha!,
+                    }, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // Verifier blew up. Park rather than silently proceed —
+                    // the gate exists precisely to refuse-merge-on-doubt.
+                    _log.LogWarning(ex, "Pre-merge verifier threw; parking work item rather than auto-merging");
+                    verifyResult = PreMergeVerifyResult.BuildOrTestFailed(
+                        $"verifier threw: {ex.Message}");
+                }
+
+                if (!verifyResult.Success)
+                {
+                    var prefix = verifyResult.FailureMode switch
+                    {
+                        PreMergeVerifyFailureMode.RebaseFailed => "pre-merge verify: rebase failed",
+                        PreMergeVerifyFailureMode.BuildOrTestFailed => "pre-merge verify: rebased build failed",
+                        _ => "pre-merge verify: failed",
+                    };
+                    var parkReason = $"{prefix}: {verifyResult.FailureReason ?? "(no detail provided)"}";
+                    _log.LogWarning(
+                        "Work item {Id} blocked from auto-merge by pre-merge verify ({Mode}): {Reason}",
+                        item.Id, verifyResult.FailureMode, verifyResult.FailureReason);
+                    var current = await _store.GetAsync(item.Id, ct) ?? item;
+                    var failed = current.With(WorkItemState.MergeConflictResolutionFailed, parkReason);
+                    await _store.UpdateAsync(failed, ct);
+                    var revision = await BuildTerminalRevisionAsync(failed, ct);
+                    await _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.merge_conflict_resolution_failed",
+                        WorkItem = failed,
+                        Project = project,
+                        PromptRevision = revision?.PromptRevision,
+                        RevisionAtCompletion = revision?.RevisionAtCompletion,
+                        RevisionMatches = revision?.RevisionMatches,
+                    }, ct);
+                    return;
+                }
+
+                _log.LogInformation(
+                    "Pre-merge verify passed for work item {Id} ({Argv})",
+                    item.Id, string.Join(' ', project.Upstream.PreMergeVerifyArgv));
+            }
 
             // Capture the outcome from a successful CompleteAsync so the local
             // bookkeeping (state transition + webhook events) runs once, outside

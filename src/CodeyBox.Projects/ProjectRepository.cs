@@ -289,6 +289,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             MergeMethod = mergeMethod,
             AutoMerge = c.AutoMerge ?? false,
             PullRequestTitleTemplate = c.PullRequestTitleTemplate,
+            PreMergeVerifyArgv = c.PreMergeVerifyArgv is null ? [] : c.PreMergeVerifyArgv.ToArray(),
         };
     }
 

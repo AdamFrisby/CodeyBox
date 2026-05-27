@@ -1411,7 +1411,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<OrchestratorOptions>(),
     sp.GetService<AgentAvailabilityRegistry>(),
     sp.GetService<IAgentRunningCounters>(),
-    sp.GetService<AgentConcurrencyOptions>()));
+    sp.GetService<AgentConcurrencyOptions>(),
+    sp.GetService<IPreMergeVerifier>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

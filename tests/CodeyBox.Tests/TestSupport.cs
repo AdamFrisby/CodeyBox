@@ -99,7 +99,8 @@ internal static class TestSupport
         IWorkItemCostStore? costStore = null,
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? costExtractors = null,
         AgentCostCalculator? costCalculator = null,
-        string? stateDbPathOverride = null)
+        string? stateDbPathOverride = null,
+        IPreMergeVerifier? preMergeVerifier = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -172,7 +173,8 @@ internal static class TestSupport
                 new ClaudeQuotaFailureDetector(),
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
-            }));
+            }),
+            preMergeVerifier: preMergeVerifier);
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot);
     }
