@@ -1,0 +1,307 @@
+# Pre-merge re-validation gate (CI layer).
+#
+# Background: GitHub's textual `mergeable` check only flags conflicts. A PR
+# whose CI was green when it was opened can still break the post-merge tree
+# when `main` moves underneath — a helper renamed on `main` that the PR
+# still calls, a drifted constant the PR's tests didn't reference, etc.
+# PR-time CI never reruns when `main` advances, so the green checkmark goes
+# stale and the auto-merger has no signal that something has gone wrong.
+#
+# This workflow plugs that gap on the CI side, complementing the in-process
+# IPreMergeVerifier gate in the orchestrator. After every push to `main`,
+# we enumerate open PRs and for each one: rebase its head onto the new
+# `main` in a throwaway worktree, build, and run the fast test target.
+# The outcome is reported as a commit status (`codeybox/pre-merge-revalidate`)
+# on the PR head so the auto-merger / branch-protection rules can refuse
+# merge until the rebased build is green again.
+#
+# Security model — pwn-request defence.
+# `push: branches: [main]` means GITHUB_TOKEN is writer-scoped (not the
+# fork-PR read-only scope), and the build step necessarily executes
+# attacker-controlled MSBuild targets / NuGet pre/post-build hooks /
+# .gitattributes filter drivers. The workflow is therefore split:
+#
+#   * `revalidate-build` runs the PR code and holds ONLY `contents: read` —
+#     a malicious target cannot POST to /repos/.../statuses/<sha> or any
+#     other write endpoint with this job's token. GITHUB_TOKEN/GH_TOKEN
+#     are additionally scrubbed from the env of the dotnet steps as
+#     defence-in-depth.
+#   * `post-status` holds `statuses: write` but runs NO PR code. It
+#     consumes only an artifact's outcome string and the trusted
+#     `matrix.pr.head_sha` value sourced from the no-PR-code `enumerate`
+#     job — never from artifact content.
+#
+# A PR can still fake its own outcome (write `success` into the artifact
+# even if its build failed). That only affects its OWN gate; the in-process
+# IPreMergeVerifier still independently re-checks the merge tree before
+# auto-merge, so a fake-green CI status alone cannot bypass the gate.
+# What the malicious PR CANNOT do is post status on other PR heads,
+# comment on other PRs, push to main, or otherwise affect anything outside
+# its own row of the matrix.
+#
+# Acceptance-criteria mapping (matches the in-CodeyBox tests):
+#   1. compile-fail after rebase → status FAILURE with "rebased build failed"
+#   2. previously-green test now red after rebase → same FAILURE status
+#   3. textual rebase conflict → status FAILURE with "rebase failed"
+#   4. all of the above produce an operator-visible signal on the PR
+
+name: pre-merge re-validate
+
+on:
+  push:
+    branches: [main]
+  # Manual trigger so an operator can re-run after a half-failed deployment
+  # without waiting for another commit on main.
+  workflow_dispatch:
+
+# Workflow-default is empty; each job opts in to the minimum scopes it needs.
+permissions: {}
+
+concurrency:
+  # Two pushes to main in quick succession would otherwise double-spend the
+  # PR fan-out budget. Keep only the most recent run; cancel older ones.
+  group: pre-merge-revalidate
+  cancel-in-progress: true
+
+jobs:
+  enumerate:
+    name: list open PRs
+    runs-on: ubuntu-latest
+    # Read-only: this job runs no PR-controlled code, it just reads the
+    # PR list via gh api. The head_sha values it captures are the trusted
+    # input the post-status job will use.
+    permissions:
+      pull-requests: read
+      contents: read
+    outputs:
+      prs: ${{ steps.list.outputs.prs }}
+    steps:
+      - id: list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Open PRs targeting the default branch, draft PRs included
+          # (operators sometimes auto-merge approved drafts).
+          prs=$(gh api -X GET \
+            "repos/${REPO}/pulls" \
+            -F state=open \
+            -F per_page=100 \
+            --jq '[.[] | select(.base.ref == "main") | {number, head_sha: .head.sha, head_ref: .head.ref, head_repo: .head.repo.full_name}]')
+          echo "Found PRs to re-validate:"
+          echo "${prs}" | jq -r '.[] | "  #\(.number) @ \(.head_sha[0:8]) (\(.head_ref))"'
+          # The matrix-strategy input is a JSON array.
+          {
+            printf 'prs<<EOF\n%s\nEOF\n' "${prs}"
+          } >> "$GITHUB_OUTPUT"
+
+  revalidate-build:
+    name: rebase + build + test (untrusted)
+    needs: enumerate
+    if: ${{ needs.enumerate.outputs.prs != '[]' && needs.enumerate.outputs.prs != '' }}
+    runs-on: ubuntu-latest
+    # SECURITY: this job intentionally runs attacker-controllable code
+    # (PR-side MSBuild targets, NuGet pre/post-build hooks, .gitattributes
+    # filter drivers can all execute during rebase/build/test). It MUST
+    # NOT hold write scopes — the post-status job below is where status
+    # reporting happens.
+    permissions:
+      contents: read
+    strategy:
+      # Each PR is independent; isolate failures so one red PR doesn't mask
+      # the rest.
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        pr: ${{ fromJSON(needs.enumerate.outputs.prs) }}
+    steps:
+      - name: check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # Need full history so the rebase has the merge-base available.
+          fetch-depth: 0
+
+      - name: fetch PR head
+        id: fetch
+        env:
+          # The fetch itself runs git plumbing, not PR code. Token is only
+          # needed for private repos; we keep it scoped to this step so it
+          # is NOT in scope for the subsequent rebase/build/test steps.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # `pull/<num>/head` is the merged-from ref GitHub maintains for
+          # every open PR, including forks. We fetch into a local
+          # ref so the subsequent rebase has something to operate on.
+          git fetch origin "pull/${{ matrix.pr.number }}/head:codeybox/pr-${{ matrix.pr.number }}"
+          git checkout "codeybox/pr-${{ matrix.pr.number }}"
+
+      - name: rebase onto current main
+        id: rebase
+        # `git rebase` can invoke PR-controlled filter drivers and merge
+        # drivers via .gitattributes — treat everything from here on as
+        # running untrusted code. The job-level permissions block above
+        # ensures the runner's GITHUB_TOKEN has no write scopes.
+        run: |
+          set -euo pipefail
+          git -c user.name=codeybox-ci \
+              -c user.email=codeybox-ci@invalid \
+              rebase origin/main
+        continue-on-error: true
+
+      - name: build
+        id: build
+        if: steps.rebase.outcome == 'success'
+        # Strip GitHub-issued tokens from the env that MSBuild sees, so a
+        # malicious build target cannot reach for them even if a runner
+        # default exposes them under a different name.
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+          ACTIONS_RUNTIME_TOKEN: ''
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+        run: |
+          # setup-dotnet is invoked in this same step (not as a separate
+          # action) so all of dotnet's lifecycle runs under the scrubbed
+          # env block above — the action's own env injection cannot bring
+          # GH_TOKEN back into scope after this point.
+          set -euo pipefail
+          if ! command -v dotnet >/dev/null; then
+            echo "dotnet not pre-installed on runner; this job assumes the ubuntu-latest image ships it" >&2
+            exit 1
+          fi
+          dotnet build CodeyBox.slnx --configuration Release
+        continue-on-error: true
+
+      - name: test
+        id: test
+        if: steps.rebase.outcome == 'success' && steps.build.outcome == 'success'
+        # Tests are intentionally the *fast* target. The orchestrator's
+        # IPreMergeVerifier runs the same kind of fast suite — this stays
+        # consistent so a CI green here means the in-process gate would also
+        # see green on the same tree. Same token-scrubbing as `build`.
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+          ACTIONS_RUNTIME_TOKEN: ''
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build
+        continue-on-error: true
+
+      - name: classify outcome
+        id: classify
+        if: always()
+        # Outcome is derived from step-level outcomes (recorded by GitHub
+        # Actions on the runner side, not by anything the PR code wrote).
+        # The file written here is then surfaced as an artifact for the
+        # trusted post-status job to consume — its INTEGRITY anchor is the
+        # PR number baked into the artifact NAME, not the file's contents
+        # (which a malicious build could overwrite via a custom MSBuild
+        # target; that only affects the PR's own gate).
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.rebase.outcome }}" = "failure" ]; then
+            outcome="rebase_failed"
+            description="rebase failed — needs operator rebase"
+          elif [ "${{ steps.build.outcome }}" != "success" ]; then
+            outcome="build_failed"
+            description="rebased build failed — main moved, PR breaks compile"
+          elif [ "${{ steps.test.outcome }}" != "success" ]; then
+            outcome="test_failed"
+            description="rebased tests failed — main moved, PR breaks tests"
+          else
+            outcome="success"
+            description="rebased build + tests green against current main"
+          fi
+          mkdir -p outcome
+          printf '%s\n' "${outcome}" > outcome/outcome.txt
+          printf '%s\n' "${description}" > outcome/description.txt
+
+      - name: upload outcome artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # PR number is the integrity anchor: post-status finds THIS PR's
+          # outcome by THIS name; it never re-uses an artifact across PRs.
+          name: outcome-pr-${{ matrix.pr.number }}
+          path: outcome/
+          retention-days: 1
+
+  post-status:
+    name: post commit status (trusted)
+    # `always()` so we still post a status when revalidate-build's matrix
+    # row failed (we want operators to SEE the failure as a status, not
+    # just an actions-tab red X).
+    needs: [enumerate, revalidate-build]
+    if: ${{ always() && needs.enumerate.outputs.prs != '[]' && needs.enumerate.outputs.prs != '' }}
+    runs-on: ubuntu-latest
+    # This is the only job in the workflow that holds a write scope, and
+    # it never runs PR code — it consumes the artifact's outcome string
+    # and posts a single status call. A malicious PR cannot reach this
+    # job's GITHUB_TOKEN.
+    permissions:
+      statuses: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        pr: ${{ fromJSON(needs.enumerate.outputs.prs) }}
+    env:
+      STATUS_CONTEXT: codeybox/pre-merge-revalidate
+    steps:
+      - name: download outcome artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: outcome-pr-${{ matrix.pr.number }}
+          path: outcome/
+        continue-on-error: true
+
+      - name: post status
+        # Trusted inputs (matrix.pr.head_sha from the enumerate job that
+        # ran no PR code) are passed via env; artifact-derived strings are
+        # treated as untrusted and length-capped before being forwarded.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ matrix.pr.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -f outcome/outcome.txt ]; then
+            outcome="missing"
+            description="pre-merge revalidate produced no outcome (job error or cancelled)"
+          else
+            # Length-cap the PR-influenced fields. outcome.txt is checked
+            # against an explicit allowlist below; description.txt is
+            # surfaced to the operator but truncated so a PR can't stuff
+            # the status payload with megabytes of noise.
+            outcome=$(head -c 64 outcome/outcome.txt | tr -d '[:space:]')
+            if [ -f outcome/description.txt ]; then
+              description=$(head -c 256 outcome/description.txt | tr -d '\n\r')
+            fi
+            [ -z "${description:-}" ] && description="(no description)"
+          fi
+
+          case "${outcome}" in
+            success)
+              state="success"
+              ;;
+            rebase_failed|build_failed|test_failed)
+              state="failure"
+              ;;
+            *)
+              # Anything outside the allowlist (including PR-faked values)
+              # surfaces as an error so the operator can investigate.
+              state="error"
+              description="unexpected outcome '${outcome}' from revalidate-build"
+              ;;
+          esac
+
+          gh api -X POST \
+            "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state="${state}" \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="${description}" \
+            -f target_url="${RUN_URL}"

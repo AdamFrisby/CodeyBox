@@ -268,6 +268,22 @@ public sealed record ProjectUpstream
     public IReadOnlyDictionary<string, string> PluginConfig { get; init; }
         = new Dictionary<string, string>();
 
+    /// <summary>
+    /// Optional argv invoked by an <see cref="IPreMergeVerifier"/> implementation
+    /// to validate the post-local-merge tree against the current upstream
+    /// <c>baseBranch</c> before the auto-merge API call. Empty (the default)
+    /// means the verifier — if registered — is given no commands to run and
+    /// the orchestrator skips the gate, preserving backwards-compatible
+    /// behaviour for projects that have not opted in.
+    ///
+    /// <para>Operators populate this with the smallest set of commands that
+    /// catches the failure modes the forge's textual <c>mergeable</c> flag
+    /// misses: typically a build invocation and the project's fastest test
+    /// target. Long full-suite runs belong in PR-time CI; this gate runs on
+    /// every merge attempt.</para>
+    /// </summary>
+    public IReadOnlyList<string> PreMergeVerifyArgv { get; init; } = [];
+
     public static ProjectUpstream Noop { get; } = new();
 }
 

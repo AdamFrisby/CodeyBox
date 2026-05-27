@@ -472,6 +472,17 @@ builder.Services.AddSingleton<LocalGitHost>(sp =>
 });
 builder.Services.AddSingleton<IGitHost>(sp => sp.GetRequiredService<LocalGitHost>());
 
+// --- Pre-merge CI gate verifier -----------------------------------------------
+// LocalGitPreMergeVerifier materialises the orchestrator's merge result into
+// a worktree on the host bare repo and runs the operator-configured
+// PreMergeVerifyArgv against it before the forge auto-merge API call. The
+// gate stays opt-in: the orchestrator skips the verifier when the project's
+// PreMergeVerifyArgv is empty, so projects that have not configured the gate
+// see no behaviour change.
+builder.Services.AddSingleton<IPreMergeVerifier>(sp => new LocalGitPreMergeVerifier(
+    sp.GetRequiredService<IGitHost>(),
+    sp.GetRequiredService<ILogger<LocalGitPreMergeVerifier>>()));
+
 // --- Pull request service (in-memory by default) -----------------------------
 builder.Services.AddSingleton<IPullRequestService, InMemoryPullRequestService>();
 
@@ -1411,7 +1422,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<OrchestratorOptions>(),
     sp.GetService<AgentAvailabilityRegistry>(),
     sp.GetService<IAgentRunningCounters>(),
-    sp.GetService<AgentConcurrencyOptions>()));
+    sp.GetService<AgentConcurrencyOptions>(),
+    sp.GetRequiredService<IPreMergeVerifier>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

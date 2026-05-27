@@ -490,13 +490,14 @@ and opens a pull request (workBranch → baseBranch) rather than pushing
 the merged base branch directly. This leaves a PR and code-review trail
 on GitHub even for fully-automated merges.
 
-Three additional options control the behaviour:
+Four additional options control the behaviour:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `MergeMethod` | `"merge"` \| `"squash"` \| `"rebase"` | `"merge"` | Merge strategy used when `AutoMerge=true`. |
 | `AutoMerge` | bool | `false` | When `true`, merges the PR via the GitHub API immediately after opening it. When `false`, the PR is left open for human review. Either way the work item transitions to `Done`. |
 | `PullRequestTitleTemplate` | string? | — | Template for the PR title. Supports `{title}` (work item title) and `{branch}` (work branch name) placeholders. Defaults to the work item title. |
+| `PreMergeVerifyArgv` | string[]? | `[]` | Pre-merge CI gate. When non-empty AND `AutoMerge=true`, the post-local-merge tree is checked out into a worktree and this argv is run against it before the auto-merge API call. A non-zero exit parks the work item at `MergeConflictResolutionFailed` with `pre-merge verify: rebased build failed:` on `LastError`. Empty (the default) skips the gate. The default host registers `LocalGitPreMergeVerifier`; alternative implementations can be plugged in by re-registering `IPreMergeVerifier`. |
 
 **Example — auto-merge with squash:**
 
@@ -518,6 +519,30 @@ instead. The local merge produced by phase 3 is still in the host bare
 repo; the upstream push is additive. If your branch protection rules
 prevent the PAT from merging, leave `AutoMerge=false` and approve the PR
 manually.
+
+**Pre-merge CI gate.** GitHub's `mergeable == true` flag only checks for
+textual conflicts; it does not catch the case where a clean merge against
+a freshly-moved `baseBranch` still breaks the build (a renamed helper,
+a drifted constant) or fails previously-green tests. The default
+`LocalGitPreMergeVerifier` (registered automatically when the API host
+boots) reacts by materialising the merge commit into a temporary worktree
+on the host bare repo and running the project's configured
+`PreMergeVerifyArgv` against that tree. A non-zero exit parks the work
+item with `LastError` prefixed by `pre-merge verify: rebased build failed:`
+so operators can tell it apart from race recovery and LLM-merger failure
+modes. (Alternative `IPreMergeVerifier` implementations may also return
+the `rebase failed:` prefix when they re-fetch + rebase against current
+upstream and find a textual conflict that the local merge phase did not
+hit.) The gate is opt-in: leaving `PreMergeVerifyArgv` empty skips it
+entirely, even though a verifier is registered.
+
+The CI-layer counterpart of this gate lives at
+`.github/workflows/pre-merge-revalidate.yml`. After every push to `main`,
+it enumerates open PRs and re-runs build + tests against the rebased tree,
+posting `codeybox/pre-merge-revalidate` as a commit status on the PR head.
+Operators can require that status in branch protection rules so the
+auto-merger respects the rebased outcome even when the in-process gate is
+unavailable.
 
 ## Budget caps
 

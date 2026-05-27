@@ -107,6 +107,12 @@ public sealed class ProjectUpstreamConfig
     public string? MergeMethod { get; set; }
     public bool? AutoMerge { get; set; }
     public string? PullRequestTitleTemplate { get; set; }
+    /// <summary>
+    /// argv for the pre-merge CI gate (see <see cref="ProjectUpstream.PreMergeVerifyArgv"/>).
+    /// List-mutable for IConfiguration binding; the immutable copy lives on
+    /// <see cref="ProjectUpstream"/>.
+    /// </summary>
+    public List<string>? PreMergeVerifyArgv { get; set; }
 }
 
 public sealed class ProjectAuditConfig

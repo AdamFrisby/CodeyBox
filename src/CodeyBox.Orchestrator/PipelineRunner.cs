@@ -62,6 +62,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly AgentAvailabilityRegistry? _availability;
+    private readonly IPreMergeVerifier? _preMergeVerifier;
     // Per-agent concurrency view used by ResolveTextOnlyRebaseResolverAsync to
     // route the pickup-time rebase resolver away from agents whose
     // operator-configured cap is at ceiling. The cap is shorthand for "this
@@ -160,7 +161,8 @@ public sealed class PipelineRunner : IPipelineRunner
         OrchestratorOptions? orchestratorOptions = null,
         AgentAvailabilityRegistry? availability = null,
         IAgentRunningCounters? agentRunningCounters = null,
-        AgentConcurrencyOptions? agentConcurrency = null)
+        AgentConcurrencyOptions? agentConcurrency = null,
+        IPreMergeVerifier? preMergeVerifier = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -217,6 +219,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _availability = availability;
         _agentRunningCounters = agentRunningCounters;
         _agentConcurrency = agentConcurrency;
+        _preMergeVerifier = preMergeVerifier;
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
     }
@@ -4657,6 +4660,78 @@ public sealed class PipelineRunner : IPipelineRunner
                 AutoMerge = project.Upstream.AutoMerge,
                 MergeMethod = project.Upstream.MergeMethod,
             };
+
+            // Pre-merge CI gate. The forge's textual `mergeable` flag does not
+            // catch the case where a clean merge against newly-moved `main`
+            // still breaks the build or tests (e.g. a helper renamed on `main`
+            // that the PR still calls under its old name). When a verifier is
+            // registered AND the project has opted in via PreMergeVerifyArgv,
+            // re-validate the post-local-merge tree before the auto-merge API
+            // call. A failure here is signalled by throwing
+            // MergeConflictResolutionFailedException — the centralized catch
+            // handler (see the catch at the top of RunAsync) parks the work
+            // item at MergeConflictResolutionFailed with the same bookkeeping
+            // every other merge-conflict-resolution failure goes through, so
+            // there is exactly one park-and-publish path to maintain.
+            if (project.Upstream.AutoMerge &&
+                _preMergeVerifier is not null &&
+                project.Upstream.PreMergeVerifyArgv.Count > 0 &&
+                !string.IsNullOrEmpty(mergeSha))
+            {
+                PreMergeVerifyResult verifyResult;
+                try
+                {
+                    verifyResult = await _preMergeVerifier.VerifyAsync(new PreMergeVerifyRequest
+                    {
+                        WorkItemId = item.Id,
+                        ProjectId = project.Id,
+                        RepositoryId = repoId,
+                        BaseBranch = baseBranch,
+                        WorkBranch = workBranch,
+                        MergeSha = mergeSha!,
+                        Argv = project.Upstream.PreMergeVerifyArgv,
+                    }, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // Verifier blew up. Park rather than silently proceed —
+                    // the gate exists precisely to refuse-merge-on-doubt.
+                    // ex.Message is routed through RawOutputRedactor here for
+                    // the same reason SummariseOutput does it in-band: this
+                    // string flows into LastError and the
+                    // work_item.merge_conflict_resolution_failed webhook
+                    // payload, both operator-visible surfaces. A native
+                    // subprocess / IGitHost / I/O exception can in principle
+                    // quote command lines or env values that contain tokens,
+                    // so we redact defensively before forwarding.
+                    _log.LogWarning(ex, "Pre-merge verifier threw; parking work item rather than auto-merging");
+                    verifyResult = PreMergeVerifyResult.BuildOrTestFailed(
+                        $"verifier threw: {RawOutputRedactor.Redact(ex.Message ?? string.Empty)}");
+                }
+
+                if (!verifyResult.Success)
+                {
+                    var prefix = verifyResult.FailureMode switch
+                    {
+                        PreMergeVerifyFailureMode.RebaseFailed => "pre-merge verify: rebase failed",
+                        PreMergeVerifyFailureMode.BuildOrTestFailed => "pre-merge verify: rebased build failed",
+                        _ => "pre-merge verify: failed",
+                    };
+                    var parkReason = $"{prefix}: {verifyResult.FailureReason ?? "(no detail provided)"}";
+                    _log.LogWarning(
+                        "Work item {Id} blocked from auto-merge by pre-merge verify ({Mode}): {Reason}",
+                        item.Id, verifyResult.FailureMode, verifyResult.FailureReason);
+                    throw new MergeConflictResolutionFailedException(parkReason);
+                }
+
+                _log.LogInformation(
+                    "Pre-merge verify passed for work item {Id} ({Argv})",
+                    item.Id, string.Join(' ', project.Upstream.PreMergeVerifyArgv));
+            }
 
             // Capture the outcome from a successful CompleteAsync so the local
             // bookkeeping (state transition + webhook events) runs once, outside
