@@ -23,6 +23,15 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         @"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    private static readonly Regex WhitespaceRun = new(
+        @"\s+", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    // Cap embedded in the failure summary so the orchestrator's TerminalQuotaError /
+    // InvalidOperationException messages don't balloon past what audit log sinks
+    // and webhooks accept. The full stderr is still on AgentResult.Stderr for
+    // any caller that needs it.
+    internal const int FailureSummaryTailMaxChars = 240;
+
     public override AgentKind Kind => AgentKind.Gemini;
 
     /// <summary>
@@ -235,9 +244,11 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             stderr = string.IsNullOrEmpty(stderr) ? warning : $"{warning}\n{stderr}";
         }
 
+        var stdout = Strip(result.Stdout);
         return result with
         {
-            Stdout = Strip(result.Stdout),
+            Summary = EnrichFailureSummary(result.Success, result.Summary, stderr, stdout),
+            Stdout = stdout,
             Stderr = stderr,
         };
     }
@@ -257,15 +268,53 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             ? null
             : chunk => stdoutChunkCallback(Strip(chunk) ?? string.Empty);
         var result = await base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, strippingCallback);
+        var stdout = Strip(result.Stdout);
+        var stderr = Strip(result.Stderr);
         return result with
         {
-            Stdout = Strip(result.Stdout),
-            Stderr = Strip(result.Stderr),
+            Summary = EnrichFailureSummary(result.Success, result.Summary, stderr, stdout),
+            Stdout = stdout,
+            Stderr = stderr,
         };
     }
 
     private static string? Strip(string? s) =>
         s is null ? null : AnsiEscape.Replace(s, string.Empty);
+
+    /// <summary>
+    /// On failure, appends a single-line tail of stderr (or stdout, when stderr
+    /// is empty) to the base "agent exited N" summary so downstream
+    /// <c>TerminalQuotaError</c> messages and <c>WorkItem.LastError</c> carry
+    /// the diagnostic text instead of just the exit code. Gemini exits 1 for
+    /// every authentication, network, quota, and CLI-internal failure shape,
+    /// so the exit code alone is uninformative — without this enrichment
+    /// operators cannot tell quota from auth from transport from a stale
+    /// model id. Returns the unchanged summary when the run succeeded or when
+    /// neither stream produced usable text.
+    /// </summary>
+    internal static string EnrichFailureSummary(bool success, string baseSummary, string? stderr, string? stdout)
+    {
+        if (success) return baseSummary;
+        var tail = ExtractDiagnosticTail(stderr) ?? ExtractDiagnosticTail(stdout);
+        return tail is null ? baseSummary : $"{baseSummary}: {tail}";
+    }
+
+    /// <summary>
+    /// Collapses internal whitespace and control characters in <paramref name="text"/>
+    /// to a single-line tail of at most <see cref="FailureSummaryTailMaxChars"/>
+    /// characters, preserving the most recent (right-hand) bytes — provider
+    /// errors typically arrive on the final lines of CLI output. Returns null
+    /// when the input has no printable content.
+    /// </summary>
+    internal static string? ExtractDiagnosticTail(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var collapsed = WhitespaceRun.Replace(text.Trim(), " ").Trim();
+        if (collapsed.Length == 0) return null;
+        return collapsed.Length <= FailureSummaryTailMaxChars
+            ? collapsed
+            : "…" + collapsed[^(FailureSummaryTailMaxChars - 1)..];
+    }
 
     private static string ExtractResponseText(string responseText)
     {

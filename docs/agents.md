@@ -189,6 +189,59 @@ This requires a custom `ICredentialProvider` that materialises the JSON into
 the sandbox via `AgentCredential.Files` — the `Files` map on `AgentCredential`
 is designed for exactly this use case.
 
+**Intermittent unavailability — why every Gemini call may exit 1:**
+the Gemini CLI uses exit code `1` for every failure shape — quota, expired
+OAuth refresh token, network/TLS errors, an unknown `--model` id, an
+invalid argv, even an unrecognised sandbox flag. Reading the exit code
+alone is uninformative, so `GeminiAgentRunner` now appends a single-line
+stderr (or stdout, when stderr is empty) tail to the failure summary —
+operators see e.g.
+`agent exited 1: RESOURCE_EXHAUSTED quota exceeded for gemini-3-flash-preview`
+on the work item's `lastError` instead of a bare `agent exited 1`. The
+full stderr is still preserved on `AgentResult.Stderr` and in the audit
+log; only the surfaced summary is capped (~240 chars).
+
+Common failure shapes and what to check:
+
+- `RESOURCE_EXHAUSTED` / `quota exceeded` / `exhausted your capacity` —
+  genuine quota. `GeminiQuotaFailureDetector` classifies these as
+  rate-limit / limit-reached, and the orchestrator marks the member
+  exhausted for an hour so subsequent pickups skip it. To shorten that
+  window, wait for the reset hint embedded in the stderr (e.g.
+  `reset after 13m`) or rotate to a different model id.
+- `API Error: 401` / `invalid_grant` / `Token has been expired or revoked` —
+  the OAuth refresh token in `~/.gemini/oauth_creds.json` is no longer
+  valid (Google rotates these aggressively; an idle account can lose its
+  token in days). **Re-auth out of band on the orchestrator host:** run
+  `gemini` once interactively (or `gemini auth login` for non-interactive
+  flows), complete the Sign-in-with-Google flow in your browser, and
+  confirm the file has been rewritten:
+  ```sh
+  ls -l ~/.gemini/oauth_creds.json
+  ```
+  If you've pointed CodeyBox at a non-default path via
+  `CODEYBOX_GEMINI_OAUTH_FILE`, refresh that file instead. The
+  orchestrator re-reads the file on every pickup, so re-auth propagates
+  without a restart.
+- Unknown / typo'd `ModelId` (e.g. `gemini-3.1-flash-lite` when the
+  catalog only ships `gemini-3-flash-preview`) — the CLI exits 1
+  without a clear marker. Check the model against
+  `GeminiKnownModels.All`; the agent-class validator warns at startup
+  but does not reject unknown ids.
+- Bare `agent exited 1` with no appended tail — both stderr and stdout
+  were empty. Investigate the sandbox image: a missing or non-executable
+  `gemini` binary on `$PATH` produces this shape, as does a corrupt
+  `~/.gemini/settings.json` that the CLI rejects before emitting
+  diagnostics.
+
+If quota or auth is recurrent and Gemini contributes no Done items, the
+quickest mitigation is to move Gemini to a higher index in the
+agent-class members list (or drop it entirely) until the underlying
+cause is resolved; the persistent observed-failure store will
+automatically gate the agent for `ObservedFailureWindow` after the first
+classified exit-1, but a configuration change is the only durable fix
+when re-auth is required.
+
 ### Cursor CLI (`agent`)
 
 > **HARD CONSTRAINT — never invoke in fast mode.**

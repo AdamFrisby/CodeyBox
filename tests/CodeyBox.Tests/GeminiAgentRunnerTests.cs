@@ -202,6 +202,160 @@ public sealed class GeminiAgentRunnerTests
         Assert.False(result.Success);
     }
 
+    // ── Failure summary enrichment ────────────────────────────────────────────
+    //
+    // Without these, every Gemini exit-1 surfaces as "agent exited 1" in
+    // TerminalQuotaError / WorkItem.LastError, so operators cannot tell quota
+    // from auth from transport from a stale model id by inspecting the work
+    // item alone. The full stderr is preserved on AgentResult.Stderr; only the
+    // Summary is enriched (capped at FailureSummaryTailMaxChars).
+
+    [Fact]
+    public async Task RunAsync_Failure_AppendsStderrTailToSummary()
+    {
+        var sandbox = new CapturingSandbox(
+            exitCode: 1,
+            stderr: "RESOURCE_EXHAUSTED quota exceeded for gemini-3-flash-preview",
+            stdout: "");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.False(result.Success);
+        Assert.StartsWith("agent exited 1", result.Summary);
+        Assert.Contains("RESOURCE_EXHAUSTED quota exceeded for gemini-3-flash-preview", result.Summary);
+    }
+
+    [Fact]
+    public async Task RunAsync_Failure_StripsAnsiBeforeAppendingTail()
+    {
+        var sandbox = new CapturingSandbox(
+            exitCode: 1,
+            stderr: "\x1b[31merror: invalid_grant: refresh token expired\x1b[0m",
+            stdout: "");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.Contains("invalid_grant: refresh token expired", result.Summary);
+        Assert.False(result.Summary.Contains('\x1B'), $"summary contains ESC: {string.Join(",", result.Summary.Select(c => ((int)c).ToString("X2")))}");
+    }
+
+    [Fact]
+    public async Task RunAsync_Failure_EmptyStderr_FallsBackToStdout()
+    {
+        // gemini-cli sometimes funnels structured errors only via stdout
+        // (stream-json) — the summary should still carry context.
+        var sandbox = new CapturingSandbox(
+            exitCode: 1,
+            stderr: "",
+            stdout: """{"type":"result","status":"error","error":{"message":"API Error: 401 Unauthorized"}}""");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.Contains("API Error: 401", result.Summary);
+    }
+
+    [Fact]
+    public async Task RunAsync_Failure_NoOutput_LeavesBaseSummary()
+    {
+        // Neither stream produced text — keep the unchanged "agent exited N"
+        // so the orchestrator can still distinguish ok from failure without
+        // crashing on a null tail.
+        var sandbox = new CapturingSandbox(exitCode: 1, stderr: "", stdout: "");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.Equal("agent exited 1", result.Summary);
+    }
+
+    [Fact]
+    public async Task RunAsync_Failure_CollapsesNewlinesInSummary()
+    {
+        // The summary is consumed by single-line audit log sinks and webhook
+        // payloads; embedded newlines would break grep/CSV parsing.
+        var sandbox = new CapturingSandbox(
+            exitCode: 1,
+            stderr: "line one\nline two\r\nline three",
+            stdout: "");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        var summary = result.Summary;
+        Assert.DoesNotContain('\n', summary);
+        Assert.DoesNotContain('\r', summary);
+        Assert.Contains("line one line two line three", summary);
+    }
+
+    [Fact]
+    public async Task RunAsync_Failure_TailIsCapped()
+    {
+        var longStderr = "head " + new string('x', GeminiAgentRunner.FailureSummaryTailMaxChars * 2) + " tail-marker";
+        var sandbox = new CapturingSandbox(exitCode: 1, stderr: longStderr, stdout: "");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        // The cap applies to the appended tail only; verify the tail-marker
+        // (which sits at the end of stderr) survived while the leading "head"
+        // was dropped.
+        Assert.Contains("tail-marker", result.Summary);
+        Assert.DoesNotContain("head ", result.Summary);
+        Assert.StartsWith("agent exited 1: …", result.Summary);
+    }
+
+    [Fact]
+    public async Task RunAsync_Success_LeavesSummaryAsOk()
+    {
+        var sandbox = new CapturingSandbox(exitCode: 0, stderr: "warning: deprecated flag", stdout: "result");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.True(result.Success);
+        Assert.Equal("ok", result.Summary);
+    }
+
+    [Fact]
+    public async Task RunAsync_Failure_FullStderrStillOnAgentResult()
+    {
+        // The Summary is capped, but the orchestrator's quota classifier and
+        // detail builder still need the full stderr — assert it survives.
+        var stderr = "RESOURCE_EXHAUSTED " + new string('y', GeminiAgentRunner.FailureSummaryTailMaxChars * 3);
+        var sandbox = new CapturingSandbox(exitCode: 1, stderr: stderr, stdout: "");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", null);
+
+        Assert.Equal(stderr.Length, result.Stderr!.Length);
+        Assert.StartsWith("RESOURCE_EXHAUSTED", result.Stderr);
+    }
+
+    [Fact]
+    public async Task RunResumedAsync_Failure_AppendsStderrTailToSummary()
+    {
+        // Differentiate bash setup calls (scratchpad restore, auth materialise)
+        // from the agent invocation itself: the former must succeed (exit 0) or
+        // base.RunResumedAsync throws before the agent runs; only the gemini
+        // binary call should surface as exit 1.
+        var sandbox = new ResumeFailingSandbox(
+            agentStderr: "RESOURCE_EXHAUSTED gemini-3-pro-preview");
+        var runner = new GeminiAgentRunner();
+
+        var result = await runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "p",
+            null,
+            new AgentResumeContext("refs/heads/codeybox/preempt/wi"));
+
+        Assert.False(result.Success);
+        Assert.Contains("RESOURCE_EXHAUSTED gemini-3-pro-preview", result.Summary);
+    }
+
     // ── ANSI stripping ────────────────────────────────────────────────────────
 
     [Fact]
@@ -435,6 +589,32 @@ internal sealed class CapturingSandbox : ISandbox
         if (_stdoutChunk is not null)
             exec.StdoutChunkCallback?.Invoke(_stdoutChunk);
         return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+/// <summary>
+/// Sandbox that succeeds for the orchestrator-internal bash setup phases
+/// (scratchpad restore, credential materialisation) but fails for the agent
+/// binary invocation itself. Used to assert the runner's failure-summary
+/// enrichment on the resume path without short-circuiting at scratchpad
+/// restore.
+/// </summary>
+internal sealed class ResumeFailingSandbox : ISandbox
+{
+    private readonly string _agentStderr;
+    public ResumeFailingSandbox(string agentStderr) { _agentStderr = agentStderr; }
+
+    public string Id => "fake-resume";
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+    {
+        // bash-driven prep (restore + auth materialisation) must succeed so
+        // base.RunResumedAsync reaches the actual agent invocation.
+        if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
+            return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+        return Task.FromResult(new SandboxExecResult(1, string.Empty, _agentStderr));
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
