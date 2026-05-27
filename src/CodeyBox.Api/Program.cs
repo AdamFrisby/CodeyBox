@@ -1409,7 +1409,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>(),
     sp.GetService<ITaskQueue>(),
     sp.GetService<OrchestratorOptions>(),
-    sp.GetService<AgentAvailabilityRegistry>()));
+    sp.GetService<AgentAvailabilityRegistry>(),
+    sp.GetService<IAgentRunningCounters>(),
+    sp.GetService<AgentConcurrencyOptions>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

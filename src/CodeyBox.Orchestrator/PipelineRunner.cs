@@ -62,6 +62,16 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly AgentAvailabilityRegistry? _availability;
+    // Per-agent concurrency view used by ResolveTextOnlyRebaseResolverAsync to
+    // route the pickup-time rebase resolver away from agents whose
+    // operator-configured cap is at ceiling. The cap is shorthand for "this
+    // agent's API account budget is currently saturated"; a second concurrent
+    // call from the resolver against the same account is what produces the
+    // HTTP 429 reported in c9fd5b75. Both are optional so tests/embeddings
+    // that don't wire concurrency can keep their previous "always-route-to-
+    // primary" semantics.
+    private readonly IAgentRunningCounters? _agentRunningCounters;
+    private readonly AgentConcurrencyOptions? _agentConcurrency;
     // Last-resort pause for quota-shaped terminal failures when neither the
     // agent output nor quota probes expose a reset window.
     internal static readonly TimeSpan DefaultQuotaFailurePause = TimeSpan.FromMinutes(5);
@@ -148,7 +158,9 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         ITaskQueue? taskQueue = null,
         OrchestratorOptions? orchestratorOptions = null,
-        AgentAvailabilityRegistry? availability = null)
+        AgentAvailabilityRegistry? availability = null,
+        IAgentRunningCounters? agentRunningCounters = null,
+        AgentConcurrencyOptions? agentConcurrency = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -203,6 +215,8 @@ public sealed class PipelineRunner : IPipelineRunner
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _availability = availability;
+        _agentRunningCounters = agentRunningCounters;
+        _agentConcurrency = agentConcurrency;
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
     }
@@ -1163,27 +1177,43 @@ public sealed class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Picks the runner + credential the pickup-time rebase resolver should
-    /// use. Tries <paramref name="primaryRunner"/> (the work item's currently-
-    /// selected agent) first; if it lacks a viable text-only credential, walks
-    /// the work item's agent class chain and returns the first registered
-    /// member whose <see cref="ITextOnlyAgentRunner.GetTextOnlyUnavailabilityReason"/>
-    /// is null.
+    /// use. Two layered preferences:
+    /// <list type="number">
+    ///   <item>
+    ///     <b>Creds</b>: the candidate must have a viable text-only credential
+    ///     (<see cref="ITextOnlyAgentRunner.GetTextOnlyUnavailabilityReason"/>
+    ///     returns null). The original bug this resolver was introduced for —
+    ///     OAuth-only Gemini failing every pickup-time rebase with a misleading
+    ///     <see cref="WorkItemState.MergeConflictResolutionFailed"/> — is
+    ///     covered by this filter alone.
+    ///   </item>
+    ///   <item>
+    ///     <b>Cap</b>: prefer candidates whose per-agent concurrency cap is
+    ///     <i>not</i> at ceiling. The operator-configured cap is shorthand
+    ///     for "this agent's API account budget is currently saturated";
+    ///     issuing a second concurrent call against the same account from
+    ///     the resolver is what produced the recurring HTTP 429 on
+    ///     <c>c9fd5b75</c>. Skipping at-cap agents routes the resolver to a
+    ///     class member whose budget is still free instead of stacking
+    ///     another call onto the saturated one.
+    ///   </item>
+    /// </list>
     ///
     /// <para>
-    /// Fixes the long-tail bug where a work item routed to an agent with no
-    /// text-only credential (typically Gemini with OAuth-only, no
-    /// <c>GEMINI_API_KEY</c>) failed the pickup-time rebase with a misleading
-    /// <see cref="WorkItemState.MergeConflictResolutionFailed"/> even when
-    /// every other class member had working credentials. Caller-supplied
-    /// runner is preferred so a single registered/credentialed agent (no
-    /// class) still works.
+    /// Resolution order:
     /// </para>
+    /// <list type="number">
+    ///   <item>Primary runner if creds viable AND not at cap → return primary.</item>
+    ///   <item>Walk the class chain; first member with viable creds AND not at cap → reroute (cap-rerouted audit when primary was at cap).</item>
+    ///   <item>No non-at-cap viable candidate found — fall back to primary if its creds are viable (all-at-cap audit), else to the first at-cap class member with viable creds.</item>
+    ///   <item>No viable candidate anywhere → throw <see cref="AgentUnavailableException"/>.</item>
+    /// </list>
     ///
     /// <para>
-    /// Throws <see cref="AgentUnavailableException"/> when no class member
-    /// has viable text-only credentials. The caller surfaces this as
-    /// <c>failureKind=agent_unavailable</c> rather than merging it into the
-    /// merge-conflict failure bucket.
+    /// The cap check is skipped when neither the cap config nor the running
+    /// counters are wired (covers tests / embedding setups that don't
+    /// register per-agent concurrency), preserving the prior credential-only
+    /// behaviour.
     /// </para>
     /// </summary>
     private async Task<(IAgentRunner Runner, AgentCredential? Credential)>
@@ -1194,8 +1224,15 @@ public sealed class PipelineRunner : IPipelineRunner
         var seenKinds = new HashSet<AgentKind>();
 
         var primary = await TryCandidateAsync(primaryRunner, ct);
-        if (primary is { } primaryPair)
+        var primaryAtCap = primary is not null && IsAtAgentCap(primaryRunner.Kind);
+        if (primary is { } primaryPair && !primaryAtCap)
             return primaryPair;
+
+        // Walk the class chain. Track both the first non-at-cap viable
+        // candidate (strict preference) and the first at-cap viable candidate
+        // (permissive fallback for when nothing else is free).
+        (AgentKind Kind, IAgentRunner Runner, AgentCredential? Credential)? strictFallback = null;
+        (AgentKind Kind, IAgentRunner Runner, AgentCredential? Credential)? atCapFallback = null;
 
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
         if (_classRouter is not null && classId is not null)
@@ -1210,13 +1247,52 @@ public sealed class PipelineRunner : IPipelineRunner
                     continue;
                 }
                 var memberPair = await TryCandidateAsync(memberRunner, ct);
-                if (memberPair is { } chosen)
+                if (memberPair is not { } chosen)
+                    continue;
+                if (IsAtAgentCap(member.Agent))
                 {
-                    AuditLog.RebaseResolverAgentRerouted(primaryRunner.Kind, member.Agent,
-                        $"{primaryRunner.Kind.Value} text-only credential missing; using class member");
-                    return chosen;
+                    atCapFallback ??= (member.Agent, chosen.Runner, chosen.Credential);
+                }
+                else
+                {
+                    strictFallback = (member.Agent, chosen.Runner, chosen.Credential);
+                    break;
                 }
             }
+        }
+
+        if (strictFallback is { } strict)
+        {
+            if (primaryAtCap)
+            {
+                AuditLog.RebaseResolverAgentCapReroute(
+                    primaryRunner.Kind, strict.Kind,
+                    GetRunningSafe(primaryRunner.Kind), GetCapSafe(primaryRunner.Kind));
+            }
+            else
+            {
+                AuditLog.RebaseResolverAgentRerouted(primaryRunner.Kind, strict.Kind,
+                    $"{primaryRunner.Kind.Value} text-only credential missing; using class member");
+            }
+            return (strict.Runner, strict.Credential);
+        }
+
+        // No non-at-cap candidate. Prefer primary if its creds are viable
+        // (avoid swapping agents just because every option is saturated);
+        // otherwise an at-cap class member with viable creds.
+        if (primary is { } primaryViable)
+        {
+            AuditLog.RebaseResolverAllAtCap(
+                primaryRunner.Kind,
+                GetRunningSafe(primaryRunner.Kind),
+                GetCapSafe(primaryRunner.Kind));
+            return primaryViable;
+        }
+        if (atCapFallback is { } atCap)
+        {
+            AuditLog.RebaseResolverAllAtCap(
+                atCap.Kind, GetRunningSafe(atCap.Kind), GetCapSafe(atCap.Kind));
+            return (atCap.Runner, atCap.Credential);
         }
 
         var reasons = candidateReasons.Count == 0 ? "no text-only-capable agent registered" : string.Join("; ", candidateReasons);
@@ -1246,6 +1322,31 @@ public sealed class PipelineRunner : IPipelineRunner
             return (candidate, credential);
         }
     }
+
+    /// <summary>
+    /// Returns true when <paramref name="agent"/> has an operator-configured
+    /// per-agent cap and the live in-flight count is at or above that cap.
+    /// Always false when either the cap config or the running counters are
+    /// not wired — keeping the resolver's behaviour stable for tests /
+    /// embeddings that don't register concurrency.
+    /// </summary>
+    private bool IsAtAgentCap(AgentKind agent)
+    {
+        var cap = GetCapSafe(agent);
+        if (cap <= 0) return false;
+        if (_agentRunningCounters is null) return false;
+        return _agentRunningCounters.GetRunning(agent) >= cap;
+    }
+
+    private int GetCapSafe(AgentKind agent) =>
+        _agentConcurrency is not null
+            && _agentConcurrency.Members.TryGetValue(agent.Value, out var entry)
+            && entry.MaxConcurrent > 0
+            ? entry.MaxConcurrent
+            : 0;
+
+    private int GetRunningSafe(AgentKind agent) =>
+        _agentRunningCounters?.GetRunning(agent) ?? 0;
 
     private static async Task<IReadOnlyList<ConflictHunk>> ExtractSandboxConflictHunksAsync(ISandbox sandbox, CancellationToken ct)
     {

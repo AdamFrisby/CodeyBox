@@ -200,9 +200,204 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         Assert.Empty(codex.TextOnlyInvocations);
     }
 
+    [Fact]
+    public async Task PrimaryAtAgentCap_WithViableFallback_ResolverRoutesToFallback()
+    {
+        // Operator config: claude.MaxConcurrent=1 (intentional, to leave Anthropic
+        // account budget for an external assistant session). When the work item
+        // is on Claude and Claude's per-agent cap is at ceiling, issuing the
+        // rebase resolver's text-only call against Claude would compete with
+        // the in-flight work-phase budget and 429. The resolver should route
+        // to the next class member (Codex here) which is below its own cap.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Claude,
+        };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+        };
+
+        // Conflict plan goes on Codex — the class member we expect the router
+        // to reach after stepping past at-cap Claude.
+        codex.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        // Claude at cap (running=1, cap=1). Codex has no configured cap.
+        var counters = new StubAgentRunningCounters
+        {
+            { AgentKind.Claude, 1 },
+        };
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members =
+            {
+                [AgentKind.Claude.Value] = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+            },
+        };
+
+        using var fix = BuildFixture(seed, [claude, codex],
+            runningCounters: counters, agentConcurrency: concurrency);
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Resolver did NOT invoke Claude — its cap was at ceiling.
+        Assert.Empty(claude.TextOnlyInvocations);
+        // Resolver invoked Codex (the next class member below cap) for the
+        // conflict-resolution prompt.
+        Assert.Single(codex.TextOnlyInvocations);
+        Assert.StartsWith("# Merge conflict resolver", codex.TextOnlyInvocations[0]);
+        Assert.Empty(codex.ConflictResolutionPlan);
+    }
+
+    [Fact]
+    public async Task AllAgentsAtCap_FallsBackToPrimaryViableCreds()
+    {
+        // Permissive escape hatch: when every viable class member is at cap,
+        // the resolver runs on the primary anyway. Better to attempt the call
+        // (and accept a possible 429 surfaced as MergeConflictResolutionFailed)
+        // than to fail every work item with agent_unavailable simply because
+        // the operator's caps are tight. The all-at-cap audit event marks
+        // this code path so operators can distinguish it from the clean
+        // cap-rerouted case.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Claude,
+        };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+        };
+
+        // Conflict plan goes on Claude — the primary, which we expect to be
+        // reused under the all-at-cap fallback.
+        claude.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        // Both Claude and Codex pinned to cap.
+        var counters = new StubAgentRunningCounters
+        {
+            { AgentKind.Claude, 1 },
+            { AgentKind.Codex, 1 },
+        };
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members =
+            {
+                [AgentKind.Claude.Value] = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+                [AgentKind.Codex.Value] = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+            },
+        };
+
+        using var fix = BuildFixture(seed, [claude, codex],
+            runningCounters: counters, agentConcurrency: concurrency);
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Both were at cap; primary (Claude) was used despite being at cap.
+        Assert.Single(claude.TextOnlyInvocations);
+        Assert.StartsWith("# Merge conflict resolver", claude.TextOnlyInvocations[0]);
+        Assert.Empty(claude.ConflictResolutionPlan);
+        Assert.Empty(codex.TextOnlyInvocations);
+    }
+
+    [Fact]
+    public async Task NoCapConfigured_ResolverIgnoresRunningCount_UsesPrimary()
+    {
+        // Sanity check: when MaxConcurrent=0 (unset / "no per-agent cap"),
+        // the resolver MUST still pick the primary even when running > 0.
+        // Otherwise wiring IAgentRunningCounters would change behaviour in
+        // any configuration that doesn't set an explicit cap.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Claude,
+        };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+        };
+
+        claude.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        // Running counters say "5 claude items in flight" — should be ignored
+        // because no cap is configured.
+        var counters = new StubAgentRunningCounters
+        {
+            { AgentKind.Claude, 5 },
+        };
+        var concurrency = new AgentConcurrencyOptions(); // empty Members — no caps.
+
+        using var fix = BuildFixture(seed, [claude, codex],
+            runningCounters: counters, agentConcurrency: concurrency);
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Single(claude.TextOnlyInvocations);
+        Assert.Empty(codex.TextOnlyInvocations);
+    }
+
     // ── Harness ─────────────────────────────────────────────────────────────
 
-    private RoutingFixture BuildFixture(string seedRepoUrl, IReadOnlyList<ScriptedAgent> agents)
+    private RoutingFixture BuildFixture(
+        string seedRepoUrl,
+        IReadOnlyList<ScriptedAgent> agents,
+        IAgentRunningCounters? runningCounters = null,
+        AgentConcurrencyOptions? agentConcurrency = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -262,7 +457,9 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            classRouter: router);
+            classRouter: router,
+            agentRunningCounters: runningCounters,
+            agentConcurrency: agentConcurrency);
 
         return new RoutingFixture(pipeline, store, gitHost);
     }
@@ -331,5 +528,19 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         LocalGitHost GitHost) : IDisposable
     {
         public void Dispose() => Store.Dispose();
+    }
+
+    /// <summary>
+    /// Implements <see cref="IAgentRunningCounters"/> for these tests with a
+    /// fixed dictionary. Initializer-list friendly so each test can express
+    /// the pinned in-flight count in one line.
+    /// </summary>
+    private sealed class StubAgentRunningCounters
+        : Dictionary<AgentKind, int>, IAgentRunningCounters
+    {
+        public int GetRunning(AgentKind agent) => TryGetValue(agent, out var n) ? n : 0;
+
+        public IReadOnlyDictionary<AgentKind, int> Snapshot()
+            => new Dictionary<AgentKind, int>(this);
     }
 }
