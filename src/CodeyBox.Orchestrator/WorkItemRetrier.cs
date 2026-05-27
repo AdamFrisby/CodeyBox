@@ -315,9 +315,11 @@ public sealed class WorkItemRetrier
         // Build the resumed item by hand rather than via WorkItem.With() —
         // With(Queued) intentionally clears WorkBranch for the failed-retry
         // path. Resume's whole purpose is to preserve it. AuditIterations,
-        // FallbackHistory, UsageTotal, QuotaResetAt, Priority, ExternalId and
-        // ReleaseId are preserved by virtue of not appearing in this
-        // initializer.
+        // UsageTotal, QuotaResetAt, Priority, ExternalId and ReleaseId are
+        // preserved by virtue of not appearing in this initializer. Agent
+        // fallback history lives in a separate append-only store
+        // (IAgentFallbackHistoryStore), not on WorkItem, so it is unaffected
+        // by this rebuild.
         var resumed = item with
         {
             State = resumeState.Value,

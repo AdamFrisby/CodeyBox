@@ -37,13 +37,14 @@ public sealed class WorkItemFallbackHistoryEndpointTests : IDisposable
     }
 
     [Fact]
-    public async Task Get_WhenHistoryEmpty_OmitsFallbackHistoryField()
+    public async Task Get_WhenHistoryEmpty_ReturnsEmptyArray()
     {
-        // Per WorkItemEndpoints.GetAsync the field is only added when
-        // history.Count > 0. JSON serialisation must therefore not include
-        // FallbackHistory for a new work item with no fallback events. A
-        // regression that emits `"fallbackHistory": []` would also be valid
-        // here — what we guard against is regressing to a non-empty default.
+        // Contract: when the fallback-history store is wired and a work item
+        // has no recorded events, GET /workitems/{id} must emit
+        // `"fallbackHistory": []`, not `null` and not "omitted". Consumers rely
+        // on this to distinguish "no fallback happened" (empty array) from
+        // "data was lost / store unavailable" (null on bulk-list endpoints
+        // that don't query the store).
         var item = NewItem();
         await _factory.Store.CreateAsync(item);
 
@@ -52,11 +53,10 @@ public sealed class WorkItemFallbackHistoryEndpointTests : IDisposable
 
         var json = await resp.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
-        var hasFh = doc.RootElement.TryGetProperty("fallbackHistory", out var fh);
-        // Either omitted or null/empty — never populated.
-        if (hasFh)
-            Assert.True(fh.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
-                || (fh.ValueKind is JsonValueKind.Array && fh.GetArrayLength() == 0));
+        Assert.True(doc.RootElement.TryGetProperty("fallbackHistory", out var fh),
+            "fallbackHistory must be present on the GET response when the store is wired");
+        Assert.Equal(JsonValueKind.Array, fh.ValueKind);
+        Assert.Equal(0, fh.GetArrayLength());
     }
 
     [Fact]
@@ -141,9 +141,10 @@ public sealed class WorkItemFallbackHistoryEndpointTests : IDisposable
 
         var dto = await _client.GetFromJsonAsync<WorkItemDtoForTest>($"/workitems/{requested.Id}");
         Assert.NotNull(dto);
-        // Either FallbackHistory is null/omitted, or it's empty — never
-        // populated with the other item's record.
-        Assert.True(dto!.FallbackHistory is null || dto.FallbackHistory.Count == 0);
+        // FallbackHistory must be an empty array, never populated with the
+        // other item's record.
+        Assert.NotNull(dto!.FallbackHistory);
+        Assert.Empty(dto.FallbackHistory!);
     }
 
     private static WorkItem NewItem() => new()
