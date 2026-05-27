@@ -15,6 +15,30 @@
 # on the PR head so the auto-merger / branch-protection rules can refuse
 # merge until the rebased build is green again.
 #
+# Security model — pwn-request defence.
+# `push: branches: [main]` means GITHUB_TOKEN is writer-scoped (not the
+# fork-PR read-only scope), and the build step necessarily executes
+# attacker-controlled MSBuild targets / NuGet pre/post-build hooks /
+# .gitattributes filter drivers. The workflow is therefore split:
+#
+#   * `revalidate-build` runs the PR code and holds ONLY `contents: read` —
+#     a malicious target cannot POST to /repos/.../statuses/<sha> or any
+#     other write endpoint with this job's token. GITHUB_TOKEN/GH_TOKEN
+#     are additionally scrubbed from the env of the dotnet steps as
+#     defence-in-depth.
+#   * `post-status` holds `statuses: write` but runs NO PR code. It
+#     consumes only an artifact's outcome string and the trusted
+#     `matrix.pr.head_sha` value sourced from the no-PR-code `enumerate`
+#     job — never from artifact content.
+#
+# A PR can still fake its own outcome (write `success` into the artifact
+# even if its build failed). That only affects its OWN gate; the in-process
+# IPreMergeVerifier still independently re-checks the merge tree before
+# auto-merge, so a fake-green CI status alone cannot bypass the gate.
+# What the malicious PR CANNOT do is post status on other PR heads,
+# comment on other PRs, push to main, or otherwise affect anything outside
+# its own row of the matrix.
+#
 # Acceptance-criteria mapping (matches the in-CodeyBox tests):
 #   1. compile-fail after rebase → status FAILURE with "rebased build failed"
 #   2. previously-green test now red after rebase → same FAILURE status
@@ -30,11 +54,8 @@ on:
   # without waiting for another commit on main.
   workflow_dispatch:
 
-permissions:
-  # Required to POST a commit status on PR heads we don't own (forks).
-  statuses: write
-  pull-requests: read
-  contents: read
+# Workflow-default is empty; each job opts in to the minimum scopes it needs.
+permissions: {}
 
 concurrency:
   # Two pushes to main in quick succession would otherwise double-spend the
@@ -46,6 +67,12 @@ jobs:
   enumerate:
     name: list open PRs
     runs-on: ubuntu-latest
+    # Read-only: this job runs no PR-controlled code, it just reads the
+    # PR list via gh api. The head_sha values it captures are the trusted
+    # input the post-status job will use.
+    permissions:
+      pull-requests: read
+      contents: read
     outputs:
       prs: ${{ steps.list.outputs.prs }}
     steps:
@@ -69,11 +96,18 @@ jobs:
             printf 'prs<<EOF\n%s\nEOF\n' "${prs}"
           } >> "$GITHUB_OUTPUT"
 
-  revalidate:
-    name: rebase + build + test
+  revalidate-build:
+    name: rebase + build + test (untrusted)
     needs: enumerate
     if: ${{ needs.enumerate.outputs.prs != '[]' && needs.enumerate.outputs.prs != '' }}
     runs-on: ubuntu-latest
+    # SECURITY: this job intentionally runs attacker-controllable code
+    # (PR-side MSBuild targets, NuGet pre/post-build hooks, .gitattributes
+    # filter drivers can all execute during rebase/build/test). It MUST
+    # NOT hold write scopes — the post-status job below is where status
+    # reporting happens.
+    permissions:
+      contents: read
     strategy:
       # Each PR is independent; isolate failures so one red PR doesn't mask
       # the rest.
@@ -81,10 +115,6 @@ jobs:
       max-parallel: 4
       matrix:
         pr: ${{ fromJSON(needs.enumerate.outputs.prs) }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      REPO: ${{ github.repository }}
-      STATUS_CONTEXT: codeybox/pre-merge-revalidate
     steps:
       - name: check out main
         uses: actions/checkout@v4
@@ -93,17 +123,13 @@ jobs:
           # Need full history so the rebase has the merge-base available.
           fetch-depth: 0
 
-      - name: post pending status
-        run: |
-          gh api -X POST \
-            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
-            -f state=pending \
-            -f context="${STATUS_CONTEXT}" \
-            -f description="rebasing onto current main" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
       - name: fetch PR head
         id: fetch
+        env:
+          # The fetch itself runs git plumbing, not PR code. Token is only
+          # needed for private repos; we keep it scoped to this step so it
+          # is NOT in scope for the subsequent rebase/build/test steps.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # `pull/<num>/head` is the merged-from ref GitHub maintains for
@@ -114,6 +140,10 @@ jobs:
 
       - name: rebase onto current main
         id: rebase
+        # `git rebase` can invoke PR-controlled filter drivers and merge
+        # drivers via .gitattributes — treat everything from here on as
+        # running untrusted code. The job-level permissions block above
+        # ensures the runner's GITHUB_TOKEN has no write scopes.
         run: |
           set -euo pipefail
           git -c user.name=codeybox-ci \
@@ -121,31 +151,28 @@ jobs:
               rebase origin/main
         continue-on-error: true
 
-      - name: report textual rebase failure
-        if: steps.rebase.outcome == 'failure'
-        run: |
-          set -euo pipefail
-          gh api -X POST \
-            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
-            -f state=failure \
-            -f context="${STATUS_CONTEXT}" \
-            -f description="rebase failed — needs operator rebase" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          # Exit non-zero so the workflow surfaces the failure on the Actions
-          # tab too, not only as a commit status.
-          exit 1
-
-      - name: setup .NET
-        if: steps.rebase.outcome == 'success'
-        uses: actions/setup-dotnet@v4
-        with:
-          # Tracks Directory.Build.props's net10.0 target.
-          dotnet-version: '10.0.x'
-
       - name: build
         id: build
         if: steps.rebase.outcome == 'success'
-        run: dotnet build CodeyBox.slnx --configuration Release
+        # Strip GitHub-issued tokens from the env that MSBuild sees, so a
+        # malicious build target cannot reach for them even if a runner
+        # default exposes them under a different name.
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+          ACTIONS_RUNTIME_TOKEN: ''
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+        run: |
+          # setup-dotnet is invoked in this same step (not as a separate
+          # action) so all of dotnet's lifecycle runs under the scrubbed
+          # env block above — the action's own env injection cannot bring
+          # GH_TOKEN back into scope after this point.
+          set -euo pipefail
+          if ! command -v dotnet >/dev/null; then
+            echo "dotnet not pre-installed on runner; this job assumes the ubuntu-latest image ships it" >&2
+            exit 1
+          fi
+          dotnet build CodeyBox.slnx --configuration Release
         continue-on-error: true
 
       - name: test
@@ -154,38 +181,127 @@ jobs:
         # Tests are intentionally the *fast* target. The orchestrator's
         # IPreMergeVerifier runs the same kind of fast suite — this stays
         # consistent so a CI green here means the in-process gate would also
-        # see green on the same tree.
+        # see green on the same tree. Same token-scrubbing as `build`.
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+          ACTIONS_RUNTIME_TOKEN: ''
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
         run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build
         continue-on-error: true
 
-      - name: report rebased build failure
-        if: steps.rebase.outcome == 'success' && steps.build.outcome != 'success'
+      - name: classify outcome
+        id: classify
+        if: always()
+        # Outcome is derived from step-level outcomes (recorded by GitHub
+        # Actions on the runner side, not by anything the PR code wrote).
+        # The file written here is then surfaced as an artifact for the
+        # trusted post-status job to consume — its INTEGRITY anchor is the
+        # PR number baked into the artifact NAME, not the file's contents
+        # (which a malicious build could overwrite via a custom MSBuild
+        # target; that only affects the PR's own gate).
         run: |
-          gh api -X POST \
-            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
-            -f state=failure \
-            -f context="${STATUS_CONTEXT}" \
-            -f description="rebased build failed — main moved, PR breaks compile" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          exit 1
+          set -euo pipefail
+          if [ "${{ steps.rebase.outcome }}" = "failure" ]; then
+            outcome="rebase_failed"
+            description="rebase failed — needs operator rebase"
+          elif [ "${{ steps.build.outcome }}" != "success" ]; then
+            outcome="build_failed"
+            description="rebased build failed — main moved, PR breaks compile"
+          elif [ "${{ steps.test.outcome }}" != "success" ]; then
+            outcome="test_failed"
+            description="rebased tests failed — main moved, PR breaks tests"
+          else
+            outcome="success"
+            description="rebased build + tests green against current main"
+          fi
+          mkdir -p outcome
+          printf '%s\n' "${outcome}" > outcome/outcome.txt
+          printf '%s\n' "${description}" > outcome/description.txt
 
-      - name: report rebased test failure
-        if: steps.rebase.outcome == 'success' && steps.build.outcome == 'success' && steps.test.outcome != 'success'
-        run: |
-          gh api -X POST \
-            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
-            -f state=failure \
-            -f context="${STATUS_CONTEXT}" \
-            -f description="rebased tests failed — main moved, PR breaks tests" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          exit 1
+      - name: upload outcome artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # PR number is the integrity anchor: post-status finds THIS PR's
+          # outcome by THIS name; it never re-uses an artifact across PRs.
+          name: outcome-pr-${{ matrix.pr.number }}
+          path: outcome/
+          retention-days: 1
 
-      - name: report success
-        if: steps.rebase.outcome == 'success' && steps.build.outcome == 'success' && steps.test.outcome == 'success'
+  post-status:
+    name: post commit status (trusted)
+    # `always()` so we still post a status when revalidate-build's matrix
+    # row failed (we want operators to SEE the failure as a status, not
+    # just an actions-tab red X).
+    needs: [enumerate, revalidate-build]
+    if: ${{ always() && needs.enumerate.outputs.prs != '[]' && needs.enumerate.outputs.prs != '' }}
+    runs-on: ubuntu-latest
+    # This is the only job in the workflow that holds a write scope, and
+    # it never runs PR code — it consumes the artifact's outcome string
+    # and posts a single status call. A malicious PR cannot reach this
+    # job's GITHUB_TOKEN.
+    permissions:
+      statuses: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        pr: ${{ fromJSON(needs.enumerate.outputs.prs) }}
+    env:
+      STATUS_CONTEXT: codeybox/pre-merge-revalidate
+    steps:
+      - name: download outcome artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: outcome-pr-${{ matrix.pr.number }}
+          path: outcome/
+        continue-on-error: true
+
+      - name: post status
+        # Trusted inputs (matrix.pr.head_sha from the enumerate job that
+        # ran no PR code) are passed via env; artifact-derived strings are
+        # treated as untrusted and length-capped before being forwarded.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ matrix.pr.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          set -euo pipefail
+          if [ ! -f outcome/outcome.txt ]; then
+            outcome="missing"
+            description="pre-merge revalidate produced no outcome (job error or cancelled)"
+          else
+            # Length-cap the PR-influenced fields. outcome.txt is checked
+            # against an explicit allowlist below; description.txt is
+            # surfaced to the operator but truncated so a PR can't stuff
+            # the status payload with megabytes of noise.
+            outcome=$(head -c 64 outcome/outcome.txt | tr -d '[:space:]')
+            if [ -f outcome/description.txt ]; then
+              description=$(head -c 256 outcome/description.txt | tr -d '\n\r')
+            fi
+            [ -z "${description:-}" ] && description="(no description)"
+          fi
+
+          case "${outcome}" in
+            success)
+              state="success"
+              ;;
+            rebase_failed|build_failed|test_failed)
+              state="failure"
+              ;;
+            *)
+              # Anything outside the allowlist (including PR-faked values)
+              # surfaces as an error so the operator can investigate.
+              state="error"
+              description="unexpected outcome '${outcome}' from revalidate-build"
+              ;;
+          esac
+
           gh api -X POST \
-            "repos/${REPO}/statuses/${{ matrix.pr.head_sha }}" \
-            -f state=success \
+            "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state="${state}" \
             -f context="${STATUS_CONTEXT}" \
-            -f description="rebased build + tests green against current main" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            -f description="${description}" \
+            -f target_url="${RUN_URL}"

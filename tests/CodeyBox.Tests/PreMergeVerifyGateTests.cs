@@ -458,6 +458,84 @@ public sealed class PreMergeVerifyGateTests : IDisposable
         Assert.Contains("out of disk", final.LastError);
         Assert.Equal(0, remote.CompleteCalls);
     }
+
+    /// <summary>
+    /// Resume-from-Merged is the canonical path where mergeSha stays null
+    /// (the merge phase was skipped, so the orchestrator never resolved a
+    /// post-merge sha). The gate's fourth conjunct, <c>!string.IsNullOrEmpty(mergeSha)</c>,
+    /// must hold against this case: forwarding an empty mergeSha into the
+    /// verifier would either crash on <c>Validation.ValidateCommitSha</c> or
+    /// have <c>git worktree add</c> check out nothing. A regression that
+    /// dropped this guard (or replaced the AND with an OR) would silently
+    /// park every resume-from-Merged item as a build failure.
+    /// </summary>
+    [Fact]
+    public async Task EmptyMergeSha_OnMergedResume_GateIsSkipped()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var verifier = new StubPreMergeVerifier
+        {
+            // If the verifier is ever called on this path, we want a loud
+            // failure rather than a silent green — pre-program a failure
+            // result so a regression that calls VerifyAsync here would
+            // park the work item with the rebased-build prefix.
+            Result = PreMergeVerifyResult.BuildOrTestFailed("should not be called on merged-resume"),
+        };
+        var remote = new RacingUpstreamRemote
+        {
+            SeedRepoPath = seed,
+            ResponsePlan = { new RacingResponse(AutoMergeRaced: false, AdvanceSeedBeforeReturning: false) },
+        };
+        var factory = new SingleRemoteFactory(remote);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "racing-upstream",
+                AutoMerge = true,
+                MergeMethod = "squash",
+                PreMergeVerifyArgv = ["dotnet", "build"],
+            },
+            upstreamFactory: factory,
+            mergeStrategy: [MergeStrategy.RealMerge],
+            preMergeVerifier: verifier);
+        remote.BareRepoRoot = tp.GitRoot;
+
+        // Set up a State=Merged item with a real work branch in the host
+        // bare repo, so the orchestrator can resume past the merge phase
+        // without re-running it. This is the exact configuration that
+        // leaves the local `mergeSha` variable null at the gate.
+        var item = NewItem("feature/premerge-empty-sha") with { State = WorkItemState.Merged };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareWorkBranchAsync(tp.GitHost.GetRepoPath(repoId), item.WorkBranch!, "file.txt", "content\n");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // The crucial assertions: gate did NOT invoke the verifier, but the
+        // upstream auto-merge DID proceed. A regression that ran the gate
+        // anyway would have invoked VerifyAsync once and parked at
+        // MergeConflictResolutionFailed.
+        Assert.Equal(0, verifier.Calls);
+        Assert.Equal(1, remote.CompleteCalls);
+    }
+
+    private async Task CommitToBareWorkBranchAsync(string barePath, string branch, string fileName, string content)
+    {
+        var clone = Path.Combine(_workspace, "clone-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "t@l");
+        await TestSupport.RunGit(clone, "config", "user.name", "T");
+        await TestSupport.RunGit(clone, "checkout", "-B", branch, "origin/main");
+        await File.WriteAllTextAsync(Path.Combine(clone, fileName), content);
+        await TestSupport.RunGit(clone, "add", fileName);
+        await TestSupport.RunGit(clone, "commit", "-m", "work");
+        await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
+    }
 }
 
 internal sealed class StubPreMergeVerifier : IPreMergeVerifier

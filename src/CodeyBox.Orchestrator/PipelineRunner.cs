@@ -4700,9 +4700,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     // Verifier blew up. Park rather than silently proceed —
                     // the gate exists precisely to refuse-merge-on-doubt.
+                    // ex.Message is routed through RawOutputRedactor here for
+                    // the same reason SummariseOutput does it in-band: this
+                    // string flows into LastError and the
+                    // work_item.merge_conflict_resolution_failed webhook
+                    // payload, both operator-visible surfaces. A native
+                    // subprocess / IGitHost / I/O exception can in principle
+                    // quote command lines or env values that contain tokens,
+                    // so we redact defensively before forwarding.
                     _log.LogWarning(ex, "Pre-merge verifier threw; parking work item rather than auto-merging");
                     verifyResult = PreMergeVerifyResult.BuildOrTestFailed(
-                        $"verifier threw: {ex.Message}");
+                        $"verifier threw: {RawOutputRedactor.Redact(ex.Message ?? string.Empty)}");
                 }
 
                 if (!verifyResult.Success)

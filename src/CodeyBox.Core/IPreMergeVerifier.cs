@@ -16,11 +16,16 @@ namespace CodeyBox.Core;
 /// original base; this gate re-validates against current
 /// <c>baseBranch</c>.</para>
 ///
-/// <para>Implementations should:</para>
+/// <para>Implementations:</para>
 /// <list type="number">
-/// <item>Ensure <c>baseBranch</c> reflects the current upstream tip
-/// (the orchestrator's <see cref="IUpstreamRemote.FetchBaseBranchAsync"/>
-/// is the canonical refresh path).</item>
+/// <item>Trust the orchestrator to have refreshed <c>baseBranch</c> to
+/// the current upstream tip BEFORE the gate runs — the merge phase that
+/// produced <see cref="PreMergeVerifyRequest.MergeSha"/> already executed
+/// the canonical refresh path (<see cref="IUpstreamRemote.FetchBaseBranchAsync"/>),
+/// so verifiers should validate the supplied merge sha as-is rather than
+/// re-fetching. (A future verifier that runs in a sandbox with its own
+/// upstream access could choose to refresh; for in-process verifiers the
+/// refresh is the orchestrator's responsibility.)</item>
 /// <item>Run the configured build/test commands against the post-merge
 /// working tree.</item>
 /// <item>Return <see cref="PreMergeVerifyResult.Success"/> = true on

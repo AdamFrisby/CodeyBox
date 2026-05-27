@@ -166,8 +166,15 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
     /// <summary>
     /// Reuse LocalGitHost's disabled-hooks directory so worktree creation
     /// doesn't trip user-installed bare-repo hooks. The directory is created
-    /// by LocalGitHost on construction; if it does not exist we fall back to
-    /// the empty string (git treats that as "no override").
+    /// by LocalGitHost on construction at <c>{rootDirectory}/.codeybox-disabled-hooks</c>;
+    /// when present, pointing <c>core.hooksPath</c> at that empty directory
+    /// makes git see no hooks for the duration of this command. If it is
+    /// not present, we fall back to <c>/dev/null</c> — on Linux (the only
+    /// supported host OS) git treats that as a non-directory hooks path
+    /// and the lookup for any hook name fails, which is the behaviour we
+    /// want here. POSIX-only; if this verifier ever needs to run on
+    /// Windows the fallback should become a verifier-managed empty
+    /// directory instead.
     /// </summary>
     private static string DisabledHooksPath(string bareRepoPath)
     {
@@ -217,7 +224,7 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
         using var p = new Process { StartInfo = psi };
         p.Start();
 
-        using var timeoutCts = timeout is { } t
+        using var timeoutCts = timeout is not null
             ? CancellationTokenSource.CreateLinkedTokenSource(ct)
             : null;
         if (timeout is { } tspan && timeoutCts is not null)
@@ -232,19 +239,38 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
         }
         catch (OperationCanceledException) when (timeoutCts is not null && timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            // Process may have already exited between CancelAfter and Kill;
+            // it may also have been a child of a stale shell that's gone.
+            // Either way the kill is informational — the timeout outcome
+            // below is the real signal. Exit code 124 mirrors GNU
+            // timeout(1) so operators / downstream tooling see a familiar
+            // sentinel for "command timed out".
+            try { p.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { /* process already exited */ }
+            catch (System.ComponentModel.Win32Exception) { /* kill denied / process gone */ }
             return (124, await ReadOrEmpty(stdoutTask), $"verify command exceeded {timeout!.Value.TotalMinutes:0} min timeout");
         }
         catch (OperationCanceledException)
         {
-            try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            // Same kill-race as the timeout branch above; the re-thrown
+            // OCE is what propagates the cancel to the orchestrator.
+            try { p.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { /* process already exited */ }
+            catch (System.ComponentModel.Win32Exception) { /* kill denied / process gone */ }
             throw;
         }
         return (p.ExitCode, await stdoutTask, await stderrTask);
 
         static async Task<string> ReadOrEmpty(Task<string> t)
         {
-            try { return await t; } catch { return string.Empty; }
+            // The read tasks are cancelled along with the timeout CTS, so
+            // an OCE here is expected. IOException can also surface when
+            // the process's stdio handles are closed by the kill above.
+            // Returning empty preserves the timeout-message tuple shape
+            // while suppressing the secondary noise.
+            try { return await t; }
+            catch (OperationCanceledException) { return string.Empty; }
+            catch (IOException) { return string.Empty; }
         }
     }
 }
