@@ -391,6 +391,40 @@ public static class AuditLog
                 "Pickup-time rebase resolver could not run for {WorkItemId}: no text-only-capable agent had viable credentials ({CandidateReasons})",
                 workItemId.ToString(), candidateReasons);
 
+    /// <summary>
+    /// Emitted when the pickup-time rebase resolver routed past an agent
+    /// whose creds are viable but whose per-agent concurrency cap is at
+    /// ceiling, picking a class member that is below its own cap instead.
+    /// Distinct from <c>rebase_resolver.rerouted</c> (which fires only when
+    /// the primary's creds are missing): here the primary could have run,
+    /// but the operator-configured cap signals that adding a second
+    /// in-flight call against this agent's account would compete with
+    /// already-running work and risk a 429.
+    /// </summary>
+    public static void RebaseResolverAgentCapReroute(
+        AgentKind rejectedAgent, AgentKind chosenAgent, int rejectedRunning, int rejectedCap) =>
+        Audit("rebase_resolver.cap_rerouted")
+            .Information(
+                "Pickup-time rebase resolver rerouted from '{RejectedAgent}' (running={Running} cap={Cap}) to class member '{ChosenAgent}' — primary at per-agent cap",
+                rejectedAgent.Value, rejectedRunning, rejectedCap, chosenAgent.Value);
+
+    /// <summary>
+    /// Emitted when every candidate the pickup-time rebase resolver
+    /// considered was at its per-agent concurrency cap, so the resolver
+    /// fell back to the highest-ranked viable candidate (typically the
+    /// primary itself) and ran the call despite the cap. This is the
+    /// "reserve pool" escape hatch: better to attempt the call and possibly
+    /// 429 than to fail the work item outright when every alternative is
+    /// equally saturated. Distinct from <c>rebase_resolver.cap_rerouted</c>
+    /// (which fires when a non-saturated alternative exists).
+    /// </summary>
+    public static void RebaseResolverAllAtCap(
+        AgentKind chosenAgent, int chosenRunning, int chosenCap) =>
+        Audit("rebase_resolver.all_at_cap")
+            .Warning(
+                "Pickup-time rebase resolver: every viable agent at per-agent cap; running on '{ChosenAgent}' (running={Running} cap={Cap}) anyway",
+                chosenAgent.Value, chosenRunning, chosenCap);
+
     public static void AuditIterationComplete(int iteration, int maxIterations, int blockingCount, int nonBlockingCount) =>
         Audit("audit.iteration_complete")
             .Information("Audit iteration {Iteration}/{MaxIterations}: blocking={BlockingCount} non-blocking={NonBlockingCount}",
