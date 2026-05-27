@@ -32,6 +32,8 @@ public sealed class DeadWorkerReaper : BackgroundService
     // limitation is documented on CheckInterval itself.
     private DeadWorkerOptions _opts => _optsAccessor();
 
+    private const string StartupSweepWorkerId = "<orchestrator-startup>";
+
     public DeadWorkerReaper(
         IWorkerRegistry registry,
         IWorkItemStore store,
@@ -77,6 +79,77 @@ public sealed class DeadWorkerReaper : BackgroundService
         }
     }
 
+    /// <summary>
+    /// One-shot startup sweep that finds work items left in worker-owned
+    /// states (<see cref="WorkItemState.Working"/>, <see cref="WorkItemState.Reworking"/>,
+    /// <see cref="WorkItemState.Auditing"/>, <see cref="WorkItemState.Merging"/>)
+    /// with no live worker row holding them, and routes each through the
+    /// same recovery helper the periodic reaper uses.
+    ///
+    /// <para>
+    /// Closes the crash-before-heartbeat edge case: the periodic
+    /// <see cref="RunOnceAsync"/> only catches items whose worker row exists
+    /// but has gone stale. If the orchestrator crashed between writing the
+    /// <c>Working</c> state and the worker-registry row (or the registry
+    /// table is otherwise empty), the item is orphaned until the next
+    /// periodic sweep — that's minutes of wasted dispatch capacity per
+    /// affected item.
+    /// </para>
+    ///
+    /// <para>
+    /// Callers should invoke <see cref="RunOnceAsync"/> first so any stale
+    /// registry rows are claimed and deleted; the remaining rows are then
+    /// trusted as live and any items they own are left alone here.
+    /// </para>
+    /// </summary>
+    public async Task SweepStrandedItemsAsync(CancellationToken ct)
+    {
+        try
+        {
+            // Snapshot the live worker set after the periodic reaper has
+            // claimed and deleted any stale rows. Anything still in the
+            // registry is therefore treated as a live worker; we must not
+            // touch its in-flight item.
+            var liveWorkers = await _registry.ListAsync(ct);
+            var liveOwnedIds = new HashSet<WorkItemId>();
+            foreach (var w in liveWorkers)
+            {
+                if (string.IsNullOrEmpty(w.CurrentWorkItemId)) continue;
+                if (!Guid.TryParse(w.CurrentWorkItemId, out var guid)) continue;
+                liveOwnedIds.Add(new WorkItemId(guid));
+            }
+
+            // Plain array — ReadOnlySpan cannot cross await boundaries.
+            var strandedStates = new[]
+            {
+                WorkItemState.Working,
+                WorkItemState.Reworking,
+                WorkItemState.Auditing,
+                WorkItemState.Merging,
+            };
+
+            foreach (var state in strandedStates)
+            {
+                await foreach (var item in _store.ListByStateAsync(state, ct))
+                {
+                    if (liveOwnedIds.Contains(item.Id))
+                        continue;
+                    await RecoverWorkItemAsync(
+                        item,
+                        StartupSweepWorkerId,
+                        noPreemptFailedReason: "orchestrator restarted while work was in progress without a preempt checkpoint",
+                        webhookReason: "orchestrator restart with stranded item",
+                        ct);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Startup stranded-item sweep failed");
+        }
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var timer = new PeriodicTimer(_opts.CheckInterval);
@@ -106,6 +179,32 @@ public sealed class DeadWorkerReaper : BackgroundService
             return;
         }
 
+        await RecoverWorkItemAsync(
+            item,
+            worker.WorkerId,
+            noPreemptFailedReason: "worker died while work phase was running without a preempt checkpoint",
+            webhookReason: "dead worker detected",
+            ct);
+    }
+
+    /// <summary>
+    /// Per-item recovery logic shared by the periodic reaper (called for each
+    /// worker whose heartbeat row has been claimed) and the orchestrator's
+    /// startup stranded-item sweep (called for each mid-flight item with no
+    /// live worker row). State transitions, recovery-attempt accounting, audit
+    /// logging, webhook dispatch, and re-enqueue are identical across both
+    /// callers — only the worker-identity log token, the no-preempt-checkpoint
+    /// <c>LastError</c> phrasing, and the webhook reason vary.
+    /// </summary>
+    private async Task RecoverWorkItemAsync(
+        WorkItem item,
+        string workerIdContext,
+        string noPreemptFailedReason,
+        string webhookReason,
+        CancellationToken ct)
+    {
+        var itemId = item.Id;
+
         if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
@@ -113,8 +212,8 @@ public sealed class DeadWorkerReaper : BackgroundService
             await _store.UpdateAsync(preempted, ct);
             await _queue.EnqueueAsync(itemId, ct);
             _log.LogInformation(
-                "Dead worker {WorkerId}: work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume",
-                worker.WorkerId, itemId, item.PreemptCheckpoint);
+                "Recovery ({WorkerId}): work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume",
+                workerIdContext, itemId, item.PreemptCheckpoint);
             return;
         }
 
@@ -123,7 +222,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             var failed = item with
             {
                 State = WorkItemState.Failed,
-                LastError = "worker died while work phase was running without a preempt checkpoint",
+                LastError = noPreemptFailedReason,
                 RecoveryAttempts = item.RecoveryAttempts + 1,
                 StartedAt = null,
                 PreemptedAt = null,
@@ -132,8 +231,8 @@ public sealed class DeadWorkerReaper : BackgroundService
             };
             await _store.UpdateAsync(failed, ct);
             _log.LogWarning(
-                "Dead worker {WorkerId}: work item {ItemId} was Working without a preempt checkpoint; marked Failed",
-                worker.WorkerId, itemId);
+                "Recovery ({WorkerId}): work item {ItemId} was Working without a preempt checkpoint; marked Failed",
+                workerIdContext, itemId);
             return;
         }
 
@@ -141,8 +240,8 @@ public sealed class DeadWorkerReaper : BackgroundService
         if (recoveryTarget is null)
         {
             _log.LogInformation(
-                "Dead worker {WorkerId}: item {ItemId} in non-recoverable state {State} (already terminal or not worker-owned); no action",
-                worker.WorkerId, itemId, item.State);
+                "Recovery ({WorkerId}): item {ItemId} in non-recoverable state {State} (already terminal or not worker-owned); no action",
+                workerIdContext, itemId, item.State);
             return;
         }
 
@@ -160,9 +259,9 @@ public sealed class DeadWorkerReaper : BackgroundService
                 UpdatedAt = DateTimeOffset.UtcNow,
             };
             _log.LogWarning(
-                "Dead worker {WorkerId}: work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); failing permanently",
-                worker.WorkerId, itemId, _opts.MaxRecoveryAttempts);
-            AuditLog.DeadWorkerFailedTerminal(itemId, worker.WorkerId, attempt);
+                "Recovery ({WorkerId}): work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+            AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, attempt);
         }
         else
         {
@@ -176,9 +275,9 @@ public sealed class DeadWorkerReaper : BackgroundService
                 StartedAt = recoveryTarget == WorkItemState.Queued ? null : item.StartedAt,
             };
             _log.LogInformation(
-                "Dead worker {WorkerId}: recovering work item {ItemId} from {From} → {To} (attempt {Attempt}/{Max})",
-                worker.WorkerId, itemId, fromState, recoveryTarget, attempt, _opts.MaxRecoveryAttempts);
-            AuditLog.DeadWorkerRecovered(itemId, worker.WorkerId, fromState, recoveryTarget.Value, attempt);
+                "Recovery ({WorkerId}): recovering work item {ItemId} from {From} → {To} (attempt {Attempt}/{Max})",
+                workerIdContext, itemId, fromState, recoveryTarget, attempt, _opts.MaxRecoveryAttempts);
+            AuditLog.DeadWorkerRecovered(itemId, workerIdContext, fromState, recoveryTarget.Value, attempt);
         }
 
         await _store.UpdateAsync(updated, ct);
@@ -195,7 +294,7 @@ public sealed class DeadWorkerReaper : BackgroundService
                     projectId = item.ProjectId.Value,
                     fromState = fromState.ToString(),
                     toState = updated.State.ToString(),
-                    reason = "dead worker detected",
+                    reason = webhookReason,
                     recoveryAttempt = attempt,
                     maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
                 },
