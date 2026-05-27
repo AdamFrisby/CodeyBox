@@ -49,7 +49,11 @@ public sealed class AgentPricingOptions
 /// </summary>
 public sealed class AgentCostCalculator
 {
-    private readonly AgentPricingOptions _opts;
+    // Volatile reference swap: replaced atomically by ApplyConfigReload so an
+    // in-flight Calculate() sees either the old or new pricing snapshot but
+    // never a torn intermediate. Per-Calculate() reads use a local copy so the
+    // ResolveRate lookup is consistent for that single call.
+    private volatile AgentPricingOptions _opts;
     private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor> _extractors;
 
     public AgentCostCalculator(
@@ -61,6 +65,32 @@ public sealed class AgentCostCalculator
     }
 
     /// <summary>
+    /// Swaps the held pricing snapshot. Called by <c>AgentConfigHotReload</c>
+    /// when <c>CodeyBox:AgentPricing</c> changes so operators can update rates
+    /// without restarting CodeyBox. The new snapshot is validated by the same
+    /// rules as the startup snapshot before the swap.
+    /// </summary>
+    public void ApplyConfigReload(AgentPricingOptions next)
+    {
+        foreach (var (agentKey, modelMap) in next.Rates)
+        {
+            foreach (var (modelKey, rate) in modelMap)
+            {
+                if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
+                    throw new InvalidOperationException(
+                        $"AgentPricing: negative rate for agent '{agentKey}' model '{modelKey}'");
+            }
+        }
+        foreach (var (agentKey, rate) in next.DefaultRates)
+        {
+            if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
+                throw new InvalidOperationException(
+                    $"AgentPricing: negative default rate for agent '{agentKey}'");
+        }
+        _opts = next;
+    }
+
+    /// <summary>
     /// Calculates estimated USD cost. Returns 0 when token counts are zero.
     /// </summary>
     public decimal Calculate(AgentCostSnapshot snapshot, AgentKind kind)
@@ -68,7 +98,8 @@ public sealed class AgentCostCalculator
         if (snapshot.InputTokens == 0 && snapshot.OutputTokens == 0)
             return 0m;
 
-        var rate = ResolveRate(kind, snapshot.ModelId);
+        var opts = _opts;
+        var rate = ResolveRate(opts, kind, snapshot.ModelId);
         if (rate is null) return 0m;
 
         var billableInput = Math.Max(0, snapshot.InputTokens - snapshot.CachedInputTokens);
@@ -80,20 +111,20 @@ public sealed class AgentCostCalculator
         return decimal.Round(cost, 6);
     }
 
-    private ModelRateConfig? ResolveRate(AgentKind kind, string? modelId)
+    private ModelRateConfig? ResolveRate(AgentPricingOptions opts, AgentKind kind, string? modelId)
     {
         var agentKey = kind.Value;
 
         // 1. Model-specific rate from config.
         if (!string.IsNullOrEmpty(modelId)
-            && _opts.Rates.TryGetValue(agentKey, out var modelMap)
+            && opts.Rates.TryGetValue(agentKey, out var modelMap)
             && modelMap.TryGetValue(modelId, out var modelRate))
         {
             return modelRate;
         }
 
         // 2. Agent-level default from config.
-        if (_opts.DefaultRates.TryGetValue(agentKey, out var defaultRate))
+        if (opts.DefaultRates.TryGetValue(agentKey, out var defaultRate))
             return defaultRate;
 
         // 3. Per-provider built-in fallback (owned by the provider's cost extractor).

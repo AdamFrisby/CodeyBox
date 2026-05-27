@@ -10,10 +10,11 @@ namespace CodeyBox.Api;
 /// <summary>
 /// Hosted service that subscribes to <see cref="IOptionsMonitor{TOptions}"/>
 /// for <see cref="CodeyBoxOptions"/> and pushes per-block reloads into the
-/// router, orchestrator, and burn estimator without a process restart.
+/// router, orchestrator, burn estimator, and cost calculator without a process
+/// restart.
 ///
 /// <para>
-/// Three blocks are hot-reloadable here:
+/// Four blocks are hot-reloadable here:
 /// <list type="bullet">
 /// <item><c>CodeyBox:AgentConcurrency</c> → <see cref="OrchestratorService.ApplyAgentConcurrencyReload"/>.</item>
 /// <item><c>CodeyBox:AgentClasses</c> + <c>CodeyBox:AgentScoreModifiers</c> →
@@ -21,6 +22,7 @@ namespace CodeyBox.Api;
 ///   the router stores them as a single coherent snapshot, and TOD modifiers
 ///   only have meaning relative to the class catalog they tag.</item>
 /// <item><c>CodeyBox:AgentBurnEstimator</c> → <see cref="AgentBurnEstimator.ApplyConfigReload"/>.</item>
+/// <item><c>CodeyBox:AgentPricing</c> → <see cref="AgentCostCalculator.ApplyConfigReload"/>.</item>
 /// </list>
 /// </para>
 ///
@@ -45,6 +47,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly OrchestratorService _orchestrator;
     private readonly AgentClassRouter _router;
     private readonly AgentBurnEstimator _burnEstimator;
+    private readonly AgentCostCalculator? _costCalculator;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -54,6 +57,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastConcurrency = "";
     private string _lastBurn = "";
     private string _lastRouter = "";
+    private string _lastPricing = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -62,12 +66,14 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         OrchestratorService orchestrator,
         AgentClassRouter router,
         AgentBurnEstimator burnEstimator,
-        ILogger<AgentConfigHotReload> log)
+        ILogger<AgentConfigHotReload> log,
+        AgentCostCalculator? costCalculator = null)
     {
         _monitor = monitor;
         _orchestrator = orchestrator;
         _router = router;
         _burnEstimator = burnEstimator;
+        _costCalculator = costCalculator;
         _log = log;
     }
 
@@ -80,11 +86,12 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastConcurrency = SerializeConcurrency(initial.AgentConcurrency);
         _lastBurn = SerializeBurn(initial.AgentBurnEstimator);
         _lastRouter = SerializeRouterInputs(initial.AgentClasses, initial.AgentScoreModifiers);
+        _lastPricing = SerializePricing(initial.AgentPricing);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
-            "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen}",
-            _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length);
+            "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen}",
+            _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length);
         return Task.CompletedTask;
     }
 
@@ -107,6 +114,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyConcurrencyIfChanged(opts);
             ApplyRouterIfChanged(opts);
             ApplyBurnIfChanged(opts);
+            ApplyPricingIfChanged(opts);
         }
     }
 
@@ -181,6 +189,31 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         }
     }
 
+    private void ApplyPricingIfChanged(CodeyBoxOptions opts)
+    {
+        if (_costCalculator is null) return;
+
+        var next = SerializePricing(opts.AgentPricing);
+        if (string.Equals(_lastPricing, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastPricing;
+        try
+        {
+            _costCalculator.ApplyConfigReload(opts.AgentPricing);
+            _lastPricing = next;
+            AuditLog.ConfigReloaded("AgentPricing", prev, next);
+            _log.LogInformation("Hot-reloaded AgentPricing: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of AgentPricing rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
     private static string SerializeConcurrency(AgentConcurrencyOptions opts) =>
         JsonSerializer.Serialize(
             new
@@ -203,6 +236,23 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                     .ToDictionary(kv => kv.Key, kv => kv.Value),
                 opts.RollingSampleSize,
                 CacheTtlSeconds = opts.CacheTtl.TotalSeconds,
+            },
+            JsonOpts);
+
+    private static string SerializePricing(AgentPricingOptions opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                Rates = opts.Rates
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(
+                        kv => kv.Key,
+                        kv => kv.Value
+                            .OrderBy(m => m.Key, StringComparer.OrdinalIgnoreCase)
+                            .ToDictionary(m => m.Key, m => m.Value)),
+                DefaultRates = opts.DefaultRates
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => kv.Value),
             },
             JsonOpts);
 

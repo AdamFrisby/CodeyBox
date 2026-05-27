@@ -13,16 +13,27 @@ namespace CodeyBox.Orchestrator;
 public sealed class AuditReportRetentionService : BackgroundService
 {
     private readonly IAuditReportStore _store;
-    private readonly int _retainedDays;
+    private readonly Func<int> _retainedDaysAccessor;
     private readonly ILogger<AuditReportRetentionService> _log;
 
     public AuditReportRetentionService(
         IAuditReportStore store,
         int retainedDays,
         ILogger<AuditReportRetentionService> log)
+        : this(store, () => retainedDays, log) { }
+
+    /// <summary>
+    /// Accessor-based constructor. The accessor is invoked on every sweep so
+    /// an operator edit to <c>CodeyBox:AuditLog:RetainedDays</c> takes effect
+    /// on the next daily tick without restarting CodeyBox.
+    /// </summary>
+    public AuditReportRetentionService(
+        IAuditReportStore store,
+        Func<int> retainedDaysAccessor,
+        ILogger<AuditReportRetentionService> log)
     {
         _store = store;
-        _retainedDays = retainedDays;
+        _retainedDaysAccessor = retainedDaysAccessor;
         _log = log;
     }
 
@@ -41,7 +52,8 @@ public sealed class AuditReportRetentionService : BackgroundService
     {
         try
         {
-            var cutoff = DateTimeOffset.UtcNow.AddDays(-_retainedDays);
+            var retainedDays = _retainedDaysAccessor();
+            var cutoff = DateTimeOffset.UtcNow.AddDays(-retainedDays);
             var deleted = await _store.DeleteOlderThanAsync(cutoff, ct);
             if (deleted > 0)
                 _log.LogInformation("AuditReportRetention: deleted {Count} rows older than {Cutoff:O}", deleted, cutoff);

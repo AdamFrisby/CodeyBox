@@ -34,22 +34,37 @@ public sealed class SandboxLeakReaper : BackgroundService
 {
     private readonly ISandboxProvider _provider;
     private readonly IWebhookDispatcher _webhooks;
-    private readonly SandboxLeakOptions _opts;
+    private readonly Func<SandboxLeakOptions> _optsAccessor;
     private readonly ILogger<SandboxLeakReaper> _log;
 
     // Latest detected leaks, snapshotted after each sweep. Thread-safe via
     // Interlocked-style replace; the API endpoint reads this without locking.
     private volatile IReadOnlyList<LeakedSandboxInfo> _latestLeaks = [];
 
+    // Resolves the current SandboxLeakOptions on every read so threshold/policy
+    // edits applied via IOptionsMonitor (LeakAgeThreshold, PreemptRetention,
+    // AutoDispose, MaxConcurrentAutoDispose) take effect on the next sweep
+    // without restarting CodeyBox. CheckInterval and Enabled are sampled at
+    // PeriodicTimer construction so changes to those fields require a restart —
+    // limitation documented on the fields themselves.
+    private SandboxLeakOptions _opts => _optsAccessor();
+
     public SandboxLeakReaper(
         ISandboxProvider provider,
         IWebhookDispatcher webhooks,
         SandboxLeakOptions opts,
         ILogger<SandboxLeakReaper> log)
+        : this(provider, webhooks, () => opts, log) { }
+
+    public SandboxLeakReaper(
+        ISandboxProvider provider,
+        IWebhookDispatcher webhooks,
+        Func<SandboxLeakOptions> optionsAccessor,
+        ILogger<SandboxLeakReaper> log)
     {
         _provider = provider;
         _webhooks = webhooks;
-        _opts = opts;
+        _optsAccessor = optionsAccessor;
         _log = log;
     }
 
@@ -270,16 +285,25 @@ public sealed class SandboxLeakReaper : BackgroundService
 /// </summary>
 public sealed class SandboxLeakOptions
 {
-    /// <summary>Enable or disable the leak reaper. Default true.</summary>
+    /// <summary>
+    /// Enable or disable the leak reaper. Default true.
+    /// <para><b>Startup-only:</b> sampled at PeriodicTimer construction.
+    /// Toggling at runtime requires a CodeyBox restart.</para>
+    /// </summary>
     public bool Enabled { get; set; } = true;
 
-    /// <summary>How often to run the leak scan. Default 15 minutes.</summary>
+    /// <summary>
+    /// How often to run the leak scan. Default 15 minutes.
+    /// <para><b>Startup-only:</b> sampled at PeriodicTimer construction so
+    /// edits applied at runtime do not change the sweep cadence until restart.</para>
+    /// </summary>
     public TimeSpan CheckInterval { get; set; } = TimeSpan.FromMinutes(15);
 
     /// <summary>
     /// Minimum age before a non-active sandbox is declared leaked.
     /// Default 30 minutes — conservative enough to not mistake a sandbox
     /// that is mid-way through work-phase clone.
+    /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public TimeSpan LeakAgeThreshold { get; set; } = TimeSpan.FromMinutes(30);
 
@@ -287,6 +311,7 @@ public sealed class SandboxLeakOptions
     /// Maximum time to exempt gracefully preempted sandboxes from leak reporting
     /// and auto-disposal. After this bound they are treated like ordinary leaks.
     /// Default 24 hours.
+    /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public TimeSpan PreemptRetention { get; set; } = TimeSpan.FromHours(24);
 
@@ -294,12 +319,14 @@ public sealed class SandboxLeakOptions
     /// When true, automatically dispose each detected leak after logging it.
     /// Default true because sandbox VMs are phase-scoped and old untracked
     /// instances consume host memory until purged.
+    /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public bool AutoDispose { get; set; } = true;
 
     /// <summary>
     /// Maximum number of leaked sandboxes to dispose concurrently in one sweep.
     /// Default 4 to limit pressure on multipassd during restart cleanup.
+    /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public int MaxConcurrentAutoDispose { get; set; } = 4;
 }

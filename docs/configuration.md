@@ -23,12 +23,30 @@ Hot-reloadable today:
 - `Projects[].Audit.PerIterationTimeoutMinutes` — the resolved `Project`
   record is captured once at work-item pickup, so a change mid-iteration
   does not move the goalposts for an item already running.
+- `AgentConcurrency` — re-applied via `AgentConfigHotReload`. Reload propagates
+  to `OrchestratorService` (dispatch gate) and `PipelineRunner` (rebase-resolver
+  cap-aware routing) through a shared snapshot.
+- `AgentClasses` + `AgentScoreModifiers` — re-applied via `AgentConfigHotReload`
+  to the live `AgentClassRouter` catalog. In-flight routing calls finish against
+  the snapshot they started with.
+- `AgentBurnEstimator` — re-applied via `AgentConfigHotReload` to the live
+  burn-estimator (per-window token budgets, default burn percentages).
+- `AgentPricing` — re-applied via `AgentConfigHotReload` to the live
+  `AgentCostCalculator`. Negative-rate validation runs on the reload candidate
+  before the swap; rejected reloads keep the prior pricing.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
 - `MultipassExtraRuncmd` / `MultipassExtraCloudInit` / `SandboxNetworkProfiles` /
   `MultipassUseBaselineImages` / `MultipassSandbox.CloudInitReadyRetryAttempts`
   — re-read on every sandbox launch. VMs already running keep the snapshot they
   booted with.
+- `SandboxLeak.LeakAgeThreshold` / `PreemptRetention` / `AutoDispose` /
+  `MaxConcurrentAutoDispose` — re-read on every reaper sweep. `Enabled` and
+  `CheckInterval` are sampled once at startup (PeriodicTimer cadence is fixed).
+- `AuditLog.RetainedDays` (database retention) — re-read on every daily
+  `AuditReportRetentionService` sweep. The Serilog rolling-file sink pins
+  retention at startup though, so log-file retention continues to require a
+  restart.
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
 
@@ -36,6 +54,35 @@ Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
   would orphan running sandboxes.
 - `StateDatabasePath`, `GitRootDirectory`, `AgentStreams.Path` — captured by
   open file/SQLite handles at startup.
+
+Not hot-reloadable (consumer captures the value at construction; restart required):
+
+- `WebhookEventBus.RingBufferCapacity` — sized into the in-memory ring buffer.
+- `Webhooks[*]` — `HttpWebhookDispatcher` builds its endpoint set at startup;
+  rebuilding the dispatcher mid-flight would drop pending retries.
+- `Changelog.*` — `ClaudeChangelogGenerator` snapshots its config at construction.
+- `AuditLog.Path` / `AuditLog.AuditPath` / `AuditLog.MaxFileSizeBytes` — bound
+  into Serilog rolling-file sinks at startup.
+- `AgentStreams.*` (besides `Path` which is also rejected) — bound into the
+  `AgentStreamStore` singleton at startup.
+- `AgentStreamAnalysis.*` — bound into the `AgentStreamParserOptions` singleton
+  at startup.
+- `SandboxImageReference`, `AgentAllowedHosts`, `AuditToolAllowedHosts`,
+  `UpstreamPushMaxAttempts`, `UpstreamPushBackoffSeconds`, `Shutdown.GraceSeconds`,
+  `PhaseAbsoluteTimeoutMultiplier` — bound into `PipelineOptions` and consumed
+  by `PipelineRunner` / `ReleaseService` constructors.
+- `WorkerPool.*`, `Concurrency`, `AutoRetryOnQuotaFailure.*` — sized into
+  `OrchestratorOptions` and the worker-pool plumbing at startup.
+- `QuotaRouter.*` — `QuotaRouterOptions` and the per-probe `QuotaCacheTtl` are
+  captured by the router and the per-provider quota probes at construction.
+- `Smoke.*` / `Smoke.Availability.*` — bound into `SmokeOptions` /
+  `AvailabilityOptions` singletons at startup.
+- `BudgetAlerts.CheckInterval` — sized into the `BudgetAlertService`'s
+  `PeriodicTimer` at startup.
+- `SandboxLeak.Enabled` / `SandboxLeak.CheckInterval` — see above.
+- `Otel.*` — OpenTelemetry pipelines are wired at startup.
+- `Presets.*` — `PresetCatalog` is bound from configuration at startup.
+- `ConfigValidation.*` — only used by the startup `AgentClassConfigValidator`.
 
 For `CodeyBoxOptions`, CodeyBox installs a last-known-good options cache around
 `IOptionsMonitor<CodeyBoxOptions>`. This is CodeyBox policy, not default
