@@ -114,7 +114,7 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
             throw new InvalidOperationException("CODEYBOX_CLAUDE_API_KEY is not set");
         }
 
-        var model = _opts.GeneratorModelId ?? "claude-opus-4-7";
+        var model = _opts.GeneratorModelId ?? "claude-opus-4-8";
         var requestBody = new
         {
             model,

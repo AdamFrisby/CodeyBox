@@ -33,6 +33,7 @@
       "opencode-go/deepseek-v4-flash": { "inputPerMillion": 0.0055, "cachedInputPerMillion": 0.0055, "outputPerMillion": 0.0055 }
     },
     "claude": {
+      "claude-opus-4-8":   { "inputPerMillion": 5.00, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.00 },
       "claude-opus-4-7":   { "inputPerMillion": 5.00, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.00 },
       "claude-opus-4-6":   { "inputPerMillion": 5.00, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.00 },
       "claude-opus-4-5":   { "inputPerMillion": 5.00, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.00 },

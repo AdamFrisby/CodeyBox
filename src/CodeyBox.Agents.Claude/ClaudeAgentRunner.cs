@@ -46,7 +46,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// Default model passed to <c>--model</c> when no per-item override is provided.
     /// Pinned to Opus to avoid the CLI defaulting to a lighter model.
     /// </summary>
-    public string? DefaultModelId { get; init; } = "claude-opus-4-7";
+    public string? DefaultModelId { get; init; } = "claude-opus-4-8";
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".claude/projects", ".claude/todos"];
 

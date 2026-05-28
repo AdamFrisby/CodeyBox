@@ -79,7 +79,7 @@ Rates live in `appsettings.json` under `CodeyBox.AgentPricing`:
 "AgentPricing": {
   "Rates": {
     "claude": {
-      "claude-opus-4-7":  { "inputPerMillion": 15.0, "cachedInputPerMillion": 1.50, "outputPerMillion": 75.0 },
+      "claude-opus-4-8":  { "inputPerMillion": 15.0, "cachedInputPerMillion": 1.50, "outputPerMillion": 75.0 },
       "claude-sonnet-4-6": { "inputPerMillion": 3.0,  "cachedInputPerMillion": 0.30, "outputPerMillion": 15.0 }
     },
     "codex": {
