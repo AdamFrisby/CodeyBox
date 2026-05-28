@@ -35,7 +35,31 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
     public override AgentKind Kind => AgentKind.Opencode;
 
     /// <summary>Path to the opencode binary inside the sandbox.</summary>
-    public string Binary { get; init; } = "opencode";
+    /// <summary>
+    /// Default opencode CLI binary name inside the sandbox. Shared with
+    /// <c>OpencodeInVmSmokeProbe</c> so the smoke check and the real runner
+    /// always invoke the same binary.
+    /// </summary>
+    public const string DefaultBinary = "opencode";
+
+    /// <summary>
+    /// Bash that materialises opencode's credentials file from
+    /// <c>OPENCODE_AUTH_JSON</c> into the XDG-default location (overridable via
+    /// <c>OPENCODE_AUTH_DEST_PATH</c>). Shared verbatim with
+    /// <c>OpencodeInVmSmokeProbe</c> so the smoke probe writes to the exact
+    /// same path as a real dispatch.
+    /// </summary>
+    public const string AuthMaterialiseScript =
+        "set -eu\n" +
+        "dest=\"${OPENCODE_AUTH_DEST_PATH:-$HOME/.local/share/opencode/auth.json}\"\n" +
+        "umask 077\n" +
+        "mkdir -p \"$(dirname \"$dest\")\"\n" +
+        "if [ -n \"${OPENCODE_AUTH_JSON:-}\" ]; then\n" +
+        "  printf '%s' \"$OPENCODE_AUTH_JSON\" > \"$dest\"\n" +
+        "  chmod 600 \"$dest\"\n" +
+        "fi\n";
+
+    public string Binary { get; init; } = DefaultBinary;
 
     /// <summary>
     /// Default model passed to <c>--model</c> when the agent-class member
@@ -83,18 +107,9 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         //      already exists with looser modes (e.g. 0644 from a prior
         //      `opencode auth login`), the truncate does not change the
         //      mode. chmod pins 0600 regardless of pre-existing state.
-        var script =
-            "set -eu\n" +
-            "dest=\"${OPENCODE_AUTH_DEST_PATH:-$HOME/.local/share/opencode/auth.json}\"\n" +
-            "umask 077\n" +
-            "mkdir -p \"$(dirname \"$dest\")\"\n" +
-            "if [ -n \"${OPENCODE_AUTH_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$OPENCODE_AUTH_JSON\" > \"$dest\"\n" +
-            "  chmod 600 \"$dest\"\n" +
-            "fi\n";
         var write = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["bash", "-c", script],
+            Argv = ["bash", "-c", AuthMaterialiseScript],
         }, ct);
         if (!write.Success)
         {

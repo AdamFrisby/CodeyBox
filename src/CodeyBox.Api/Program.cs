@@ -1009,6 +1009,17 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new OpencodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<OpencodeSmokeProbe>()));
 
+// --- In-VM smoke probes ------------------------------------------------------
+// Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
+// These exec the agent CLI inside a sandbox cloned from the active baseline,
+// catching exit-127 / auth-path failures the host-only probes above cannot see.
+// Copilot has no in-VM probe (no first-party CLI driven by this pipeline).
+builder.Services.AddSingleton<IInVmSmokeProbe, ClaudeInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
+
 // --- Model-list probes (used by AgentClassConfigValidator at startup) --------
 // Registered as IEnumerable<IAgentModelListProbe>; the validator resolves by Kind.
 // Copilot has no probe — its CLI does not accept a --model flag, so AgentClass
@@ -1104,6 +1115,39 @@ builder.Services.AddSingleton<CredentialSmokeGate>(sp =>
         sp.GetRequiredService<IAgentSmokeCache>(),
         sp.GetRequiredService<SmokeOptions>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CredentialSmokeGate>()));
+
+// --- In-VM smoke prober ------------------------------------------------------
+builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var v = cbOpts.Smoke.InVm;
+    return new InVmSmokeOptions
+    {
+        Enabled = v.Enabled,
+        ImageReference = cbOpts.SandboxImageReference,
+        AllowedHosts = cbOpts.AgentAllowedHosts,
+        NetworkProfile = v.NetworkProfile,
+        StepTimeoutSeconds = v.StepTimeoutSeconds,
+        CacheTtlMinutes = v.CacheTtlMinutes,
+        SweepIntervalSeconds = v.SweepIntervalSeconds,
+    };
+});
+builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
+    new InVmSmokeCache(TimeSpan.FromMinutes(sp.GetRequiredService<InVmSmokeOptions>().CacheTtlMinutes)));
+builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
+    sp.GetRequiredService<ISandboxProvider>(),
+    sp.GetRequiredService<IBaselineImageResolver>(),
+    sp.GetRequiredService<ICredentialProvider>(),
+    sp.GetServices<IInVmSmokeProbe>(),
+    sp.GetRequiredService<AgentAvailabilityRegistry>(),
+    sp.GetRequiredService<IInVmSmokeCache>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<InVmSmokeOptions>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProber>()));
+builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
+    sp.GetRequiredService<InVmSmokeProber>(),
+    sp.GetRequiredService<InVmSmokeOptions>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProbeService>()));
 
 // --- Projects + per-project upstream + audit composer ------------------------
 // ProjectRepository observes IOptionsMonitor<ProjectsOptions>, so an
@@ -2773,6 +2817,36 @@ namespace CodeyBox.Api
         /// periodic smoke probe sweep). Bound from <c>CodeyBox:Smoke:Availability</c>.
         /// </summary>
         public AvailabilityConfig Availability { get; set; } = new();
+
+        /// <summary>
+        /// Tuning for the in-VM smoke prober (binary-presence + auth checks run
+        /// inside a sandbox cloned from the active baseline). Bound from
+        /// <c>CodeyBox:Smoke:InVm</c>.
+        /// </summary>
+        public InVmSmokeConfig InVm { get; set; } = new();
+    }
+
+    /// <summary>Config binding for the in-VM smoke prober.</summary>
+    public sealed class InVmSmokeConfig
+    {
+        /// <summary>Enable or disable the in-VM smoke prober. Default true.</summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>Per-step exec timeout inside the sandbox, in seconds. Default 30.</summary>
+        public int StepTimeoutSeconds { get; set; } = 30;
+
+        /// <summary>Result cache TTL per baseline ref, in minutes. Default 60.</summary>
+        public int CacheTtlMinutes { get; set; } = 60;
+
+        /// <summary>Background sweep interval in seconds. Default 300 (5 min); set 0 to disable.</summary>
+        public int SweepIntervalSeconds { get; set; } = 300;
+
+        /// <summary>
+        /// Host network profile for the probe sandbox; also selects which
+        /// baseline ref to probe (baselines are keyed by profile+flavor). Null
+        /// resolves against the provider's default.
+        /// </summary>
+        public string? NetworkProfile { get; set; }
     }
 
     /// <summary>Config binding for the availability registry.</summary>

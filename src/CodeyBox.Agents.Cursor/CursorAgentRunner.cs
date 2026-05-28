@@ -42,11 +42,30 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     public override AgentKind Kind => AgentKind.Cursor;
 
     /// <summary>
+    /// Default Cursor CLI binary name inside the sandbox. The binary is
+    /// <c>agent</c>, NOT <c>cursor-agent</c>. Shared with
+    /// <c>CursorInVmSmokeProbe</c> so the smoke check and the real runner
+    /// always invoke the same binary.
+    /// </summary>
+    public const string DefaultBinary = "agent";
+
+    /// <summary>
+    /// Bash that materialises Cursor's subscription credentials into the
+    /// sandbox at <c>~/.config/cursor/auth.json</c> from
+    /// <c>CODEYBOX_CURSOR_AUTH_JSON</c>. Shared verbatim with
+    /// <c>CursorInVmSmokeProbe</c> so the smoke probe exercises the exact same
+    /// destination path as a real dispatch — path drift here is the PR #138
+    /// failure this probe is meant to catch.
+    /// </summary>
+    public const string AuthMaterialiseScript =
+        "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; fi";
+
+    /// <summary>
     /// Path to the Cursor CLI inside the sandbox. The binary is <c>agent</c>,
     /// not <c>cursor-agent</c>. Override only if the sandbox image installs
     /// it elsewhere.
     /// </summary>
-    public string Binary { get; init; } = "agent";
+    public string Binary { get; init; } = DefaultBinary;
 
     /// <summary>
     /// Default model passed to <c>--model</c> when no per-item override is
@@ -76,7 +95,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     {
         var write = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["bash", "-c", "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; fi"],
+            Argv = ["bash", "-c", AuthMaterialiseScript],
         }, ct);
         if (!write.Success)
         {

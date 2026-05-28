@@ -9,10 +9,11 @@ namespace CodeyBox.Orchestrator;
 /// feed it:
 /// <list type="number">
 ///   <item>
-///     <b>Credential smoke probe</b> results — fed in by
-///     <see cref="StartupSmokeProbeService"/> and the periodic
-///     <see cref="PeriodicSmokeProbeService"/>. A failed probe excludes the
-///     agent until a subsequent probe passes or an operator resets it.
+///     <b>Smoke probe</b> results — fed in by the credential probes
+///     (<see cref="StartupSmokeProbeService"/> / <see cref="PeriodicSmokeProbeService"/>,
+///     host-side API checks) and by <see cref="InVmSmokeProber"/> (in-sandbox
+///     CLI checks: binary present, auth materialised). A failed probe excludes
+///     the agent until a subsequent probe passes or an operator resets it.
 ///   </item>
 ///   <item>
 ///     <b>Fast-fail circuit breaker</b> — runs that exit non-zero in less than
