@@ -2083,6 +2083,56 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("\"$@\" </dev/null 2>&1 | tee -a", MultipassSandboxProvider.ExecWrapperScript);
     }
 
+    /// <summary>
+    /// <c>ExecAsync</c> must retry when the underlying multipass exec fails with
+    /// a transient SSH-not-ready error ("Connection refused"). The retry wrapper
+    /// around <c>RunMultipassAsync</c> gives sshd one more opportunity to accept
+    /// the connection before the work item sees a failure.
+    /// </summary>
+    [Fact]
+    public async Task ExecAsync_RetriesOnSshNotReady_ReturnsSuccessOnRetry()
+    {
+        var attempts = 0;
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+        {
+            attempts++;
+            if (attempts == 1)
+                return Task.FromResult(new ProcessRunResult(1, "",
+                    "ssh connection failed: 'Connection refused'"));
+            return Task.FromResult(new ProcessRunResult(0, "ok", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["git", "add", "-A"] });
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal("ok", result.Stdout);
+        Assert.Equal(2, attempts);
+    }
+
+    /// <summary>
+    /// Non-SSH errors (e.g. "git: command not found") must NOT trigger a retry.
+    /// The retry wrapper must fail fast so callers see the real diagnostic
+    /// instead of burning the retry budget on what was never a transient failure.
+    /// </summary>
+    [Fact]
+    public async Task ExecAsync_DoesNotRetryNonSshError()
+    {
+        var attempts = 0;
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+        {
+            attempts++;
+            return Task.FromResult(new ProcessRunResult(127, "", "git: command not found"));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["git", "status"] });
+
+        Assert.Equal(127, result.ExitCode);
+        Assert.Contains("git: command not found", result.Stderr);
+        Assert.Equal(1, attempts);
+    }
+
     private static MultipassDaemonRetryPolicy InstantDaemonRetryPolicy() => new()
     {
         Delay = (_, _) => Task.CompletedTask,
