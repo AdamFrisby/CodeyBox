@@ -464,6 +464,132 @@ public sealed class AgentBudgetCalculatorTests
         Assert.Equal(100.0, second!.AvailablePct);
     }
 
+    [Fact]
+    public async Task StoreResolutionFailure_FailsClosed_AvailableZero()
+    {
+        // A configured budget whose usage store cannot be resolved must NOT
+        // silently disable the gate; it fails closed (0% remaining) so the cap
+        // still gates dispatch while accounting is unavailable.
+        var calc = new AgentBudgetCalculator(
+            () => throw new InvalidOperationException("store unavailable"),
+            Opts(Rolling(5, 200)),
+            NullLogger<AgentBudgetCalculator>.Instance);
+
+        var snapshot = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+
+        Assert.NotNull(snapshot);
+        Assert.Equal(0.0, snapshot!.AvailablePct);
+        var w = Assert.Single(snapshot.Windows);
+        Assert.Equal(0.0, w.AvailablePct);
+    }
+
+    [Fact]
+    public async Task PartialWindowFailure_FailedWindowCountsAsExhausted()
+    {
+        // Rolling (span < 1 day) query throws; Monthly succeeds at 10% used
+        // (90% remaining). The failed rolling window must still participate in
+        // MIN as exhausted (0%), so the snapshot fails closed rather than
+        // reporting the healthier surviving window.
+        var store = new FakeUsageStore
+        {
+            Responder = (_, _, from, to) =>
+                (to - from) < TimeSpan.FromDays(1)
+                    ? throw new InvalidOperationException("rolling query failed")
+                    : new AgentUsageWindowAggregate(200_000, null, 1),
+        };
+        var opts = Opts(Rolling(5, 200), new AgentBudgetWindowOptions { Kind = BudgetWindowKind.Monthly, LimitCents = 200 });
+        var calc = Build(store, opts);
+
+        var snapshot = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+
+        Assert.NotNull(snapshot);
+        Assert.Equal(0.0, snapshot!.AvailablePct);
+        Assert.Equal(2, snapshot.Windows.Count);
+    }
+
+    [Fact]
+    public async Task AllWindowsFail_FailsClosed_NotNull()
+    {
+        var store = new FakeUsageStore
+        {
+            Responder = (_, _, _, _) => throw new InvalidOperationException("every query fails"),
+        };
+        var calc = Build(store, Opts(Rolling(5, 200)));
+
+        var snapshot = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+
+        Assert.NotNull(snapshot);
+        Assert.Equal(0.0, snapshot!.AvailablePct);
+    }
+
+    [Fact]
+    public async Task ZeroLimit_FailsClosed()
+    {
+        // A misconfigured LimitCents <= 0 means a zero budget; nothing is
+        // available, so the window fails closed instead of disabling the gate.
+        var store = new FakeUsageStore();
+        var calc = Build(store, Opts(Rolling(5, 0)));
+
+        var snapshot = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+
+        Assert.NotNull(snapshot);
+        Assert.Equal(0.0, snapshot!.AvailablePct);
+    }
+
+    [Fact]
+    public async Task RollingWindow_QueriesFromNowMinusHours()
+    {
+        var now = new DateTimeOffset(2026, 5, 29, 12, 0, 0, TimeSpan.Zero);
+        var store = new FakeUsageStore();
+        var calc = Build(store, Opts(Rolling(5, 200)), new FixedTime(now));
+
+        await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+
+        var q = Assert.Single(store.Queries);
+        Assert.Equal(now.AddHours(-5), q.From);
+        Assert.Equal(now, q.To);
+    }
+
+    [Fact]
+    public async Task SecondCallWithinTtl_ReusesCachedResult()
+    {
+        var store = new FakeUsageStore { DefaultSum = 1_000_000 };
+        var opts = Opts(Rolling(5, 200));
+        opts.CacheTtl = TimeSpan.FromMinutes(10); // caching on
+        var calc = Build(store, opts);
+
+        await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+        await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+
+        // One window queried once; the second call must hit the cache.
+        Assert.Single(store.Queries);
+    }
+
+    [Fact]
+    public async Task DegradedComputation_IsNotCached_RecoversOnNextCall()
+    {
+        // First call: every query throws → fails closed and is NOT cached.
+        // Second call: queries succeed → the gate recovers immediately rather
+        // than serving a stale exhausted snapshot for CacheTtl.
+        var fail = true;
+        var store = new FakeUsageStore
+        {
+            Responder = (_, _, _, _) => fail
+                ? throw new InvalidOperationException("transient")
+                : new AgentUsageWindowAggregate(0, null, 0),
+        };
+        var opts = Opts(Rolling(5, 200));
+        opts.CacheTtl = TimeSpan.FromMinutes(10);
+        var calc = Build(store, opts);
+
+        var first = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+        Assert.Equal(0.0, first!.AvailablePct);
+
+        fail = false;
+        var second = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+        Assert.Equal(100.0, second!.AvailablePct);
+    }
+
     private sealed class FixedTime : TimeProvider
     {
         private readonly DateTimeOffset _now;
