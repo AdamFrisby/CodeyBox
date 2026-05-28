@@ -48,6 +48,18 @@ internal static class AgentPricingDefaults
                 $"AgentPricing: bundled defaults file at '{path}' is malformed: {ex.Message}", ex);
         }
 
+        if (parsed.Meta is null)
+        {
+            throw new InvalidOperationException(
+                $"AgentPricing: bundled defaults file at '{path}' has null _meta");
+        }
+
+        if (parsed.Rates is null)
+        {
+            throw new InvalidOperationException(
+                $"AgentPricing: bundled defaults file at '{path}' has null Rates");
+        }
+
         var baseline = new AgentPricingOptions();
         foreach (var (agentKey, modelMap) in parsed.Rates)
         {

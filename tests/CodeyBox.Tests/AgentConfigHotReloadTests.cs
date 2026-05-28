@@ -20,6 +20,32 @@ public sealed class AgentConfigHotReloadTests
     private static readonly AgentKind Claude = AgentKind.Claude;
     private static readonly AgentKind Codex = AgentKind.Codex;
 
+    [Fact]
+    public void Constructor_WithCalculatorButWithoutPricingState_Throws()
+    {
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(new CodeyBoxOptions());
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var calculator = new AgentCostCalculator(new AgentPricingOptions());
+
+        var ex = Assert.Throws<ArgumentException>(() =>
+            new AgentConfigHotReload(
+                monitor, orchFixture.Orchestrator, router, burnEstimator,
+                NullLogger<AgentConfigHotReload>.Instance,
+                costCalculator: calculator,
+                pricingState: null));
+
+        Assert.Contains("AgentPricingState", ex.Message);
+        Assert.Equal("pricingState", ex.ParamName);
+    }
+
     // ── AgentClassRouter.ApplyConfigReload ──────────────────────────────────
 
     [Fact]

@@ -90,6 +90,28 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     }
 
     [Fact]
+    public void Load_NullRates_Throws()
+    {
+        Write("""{ "_meta": { "lastUpdated": "2026-05-28" }, "Rates": null }""");
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentPricingDefaults.Load(_tempDir));
+
+        Assert.Contains("null Rates", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Load_NullMeta_Throws()
+    {
+        Write("""{ "_meta": null, "Rates": {} }""");
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentPricingDefaults.Load(_tempDir));
+
+        Assert.Contains("null _meta", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Load_NullRateEntry_Throws()
     {
         Write("""

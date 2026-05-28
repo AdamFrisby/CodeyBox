@@ -59,10 +59,11 @@ in its structured-stream usage events.
 | `cursor`  | No (notes)        | Cursor is a flat-rate subscription. No per-token rate is published. |
 | `copilot` | No (notes)        | Copilot is a flat-rate subscription. No per-token rate is published. |
 
-Subscription-only agents are deliberately excluded from the bundled table
-— any value would be a guess. Operators who want USD-equivalent
-attribution for those agents can override per (agent, modelId) (see
-below).
+Cursor and Copilot are deliberately excluded from the bundled table — no
+per-token list prices are published. OpenCode Go (`opencode`) ships
+subscription-equivalent per-token estimates (see the table above and
+`_meta.notes`). Operators who want different USD attribution for any agent
+can override per (agent, modelId) (see below).
 
 The bundled `_meta.notes` block captures these caveats in machine-readable
 form; the `/agent-pricing` endpoint echoes them so operators see the same
@@ -168,7 +169,6 @@ static between deploys).
 ## Out of scope
 
 - Auto-refresh from provider docs (HTML pages; no feed).
-- Cursor / Copilot / opencode-go per-call pricing (subscription-only;
-  intentionally absent).
+- Cursor / Copilot per-call pricing (subscription-only; not applicable).
 - Historical pricing for back-attributing past invocations against
   rates-at-the-time. The cost calculator always uses *current* rates.

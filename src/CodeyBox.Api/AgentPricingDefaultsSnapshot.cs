@@ -49,14 +49,24 @@ internal sealed class AgentPricingDefaultsFileDto
 /// </summary>
 internal sealed class AgentPricingState
 {
+    private readonly Lock _sync = new();
+    private MergedAgentPricing _lastMerge;
+
     public AgentPricingDefaultsSnapshot Defaults { get; }
 
-    public MergedAgentPricing LastMerge { get; private set; }
+    /// <summary>
+    /// Last applied merge snapshot; use under <see cref="_sync"/> via this
+    /// property or <see cref="ApplySuccessfulMerge"/>.
+    /// </summary>
+    public MergedAgentPricing LastMerge
+    {
+        get { lock (_sync) return _lastMerge; }
+    }
 
     public AgentPricingState(AgentPricingDefaultsSnapshot defaults, MergedAgentPricing initial)
     {
         Defaults = defaults;
-        LastMerge = initial;
+        _lastMerge = initial;
     }
 
     /// <summary>
@@ -66,7 +76,10 @@ internal sealed class AgentPricingState
     public void ApplySuccessfulMerge(MergedAgentPricing merge, AgentCostCalculator calculator)
     {
         ArgumentNullException.ThrowIfNull(calculator);
-        calculator.ApplyConfigReload(merge.Options);
-        LastMerge = merge;
+        lock (_sync)
+        {
+            calculator.ApplyConfigReload(merge.Options);
+            _lastMerge = merge;
+        }
     }
 }
