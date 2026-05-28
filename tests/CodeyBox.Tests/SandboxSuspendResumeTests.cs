@@ -855,20 +855,26 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Theory]
+    [InlineData(WorkItemState.Working, "vm-working", true)]
     [InlineData(WorkItemState.Auditing, "vm-auditing", true)]
     [InlineData(WorkItemState.Reworking, "vm-reworking", true)]
     [InlineData(WorkItemState.Merging, "vm-merging", true)]
-    [InlineData(WorkItemState.AuditPassed, "vm-auditpassed", false)]
+    [InlineData(WorkItemState.AuditPassed, "vm-auditpassed", true)]
+    [InlineData(WorkItemState.ReworkingForConflict, "vm-reworkingconflict", true)]
     [InlineData(WorkItemState.Done, "vm-done", false)]
+    [InlineData(WorkItemState.Cancelled, "vm-cancelled", false)]
     public async Task LeakReaper_ProtectsSuspendedVm_ForEveryMidFlightState(
         WorkItemState state, string vmName, bool expectedProtected)
     {
-        // Each of (Working, Auditing, Reworking, Merging) is a mid-flight
-        // state where the agent could legitimately be running inside a
-        // suspended VM. A regression that drops one would cause that state's
-        // suspended VMs to be reaped during the restart window. The
-        // separately-tested terminal cases (Done, AuditPassed-as-resting) act
-        // as negative controls.
+        // Any non-terminal state can hold a live suspended VM: the suspend-on-
+        // shutdown handler persists a (work item → VM) mapping for every entry
+        // SnapshotSuspendableActive returns, regardless of which in-flight phase
+        // it is in (Working, Auditing, Reworking, Merging, AuditPassed,
+        // ReworkingForConflict, ...). The reaper must therefore protect by
+        // "not terminal" rather than an allow-list that silently drops a state
+        // and reaps a VM the startup resume handler is about to reattach. The
+        // terminal cases (Done, Cancelled) are negative controls: a stale
+        // mapping on a terminal item must NOT shield its VM from reaping.
         var item = MakeItem(state);
         await _store.CreateAsync(item with
         {

@@ -2154,6 +2154,49 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ResumeSandboxAsync_StillSuspendingPastBudget_StartsAnyway()
+    {
+        // A VM that never leaves Suspending must not strand the resume: once the
+        // RAM-scaled settle budget elapses, WaitWhileSuspendingAsync logs a
+        // warning and proceeds to `multipass start` regardless, letting start
+        // surface any real error into the standard recovery path. The budget is
+        // floored at 10 min in production, so the test injects a tiny override to
+        // drive the deadline-expiry branch without waiting out real time.
+        var infoCalls = 0;
+        var startCalls = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=json"])
+            {
+                infoCalls++;
+                // Permanently Suspending — the snapshot never completes.
+                var info = new Dictionary<string, object>
+                {
+                    [infoName] = new Dictionary<string, object?>
+                    {
+                        ["state"] = "Suspending",
+                        ["memory"] = new Dictionary<string, object> { ["total"] = 4L * 1024 * 1024 * 1024 },
+                    },
+                };
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), ""));
+            }
+            if (argv is [_, "start", var name])
+            {
+                startCalls.Add(name);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
+        });
+        var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
+        provider.SuspendSettleBudgetOverride = TimeSpan.FromMilliseconds(50);
+
+        await ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-stillstuck", CancellationToken.None);
+
+        Assert.True(infoCalls >= 1, $"expected at least the initial Suspending probe; saw {infoCalls} call(s)");
+        Assert.Equal(["codeybox-stillstuck"], startCalls);
+    }
+
+    [Fact]
     public async Task ResumeSandboxAsync_RunsMultipassStartWithValidatedName()
     {
         var startCalls = new List<string>();

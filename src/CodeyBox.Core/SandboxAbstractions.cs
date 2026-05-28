@@ -186,6 +186,16 @@ public static class SuspendTimeoutPolicy
     public static readonly TimeSpan DefaultFloor = TimeSpan.FromMinutes(10);
 
     /// <summary>
+    /// Default cap on parallel <c>multipass suspend</c> calls during a shutdown
+    /// drain. Suspend writes the VM's RAM to disk; running too many in parallel
+    /// just contends on disk IO. Kept here (rather than only on the orchestrator
+    /// suspend handler) so the host-shutdown ceiling math in
+    /// <see cref="HostShutdownReserve"/> / <see cref="ResolveHostShutdownTimeout"/>
+    /// and the handler's semaphore share one source of truth.
+    /// </summary>
+    public const int DefaultMaxParallelSuspends = 8;
+
+    /// <summary>
     /// Extra budget per GiB of VM RAM. The effective budget is
     /// <c>max(floor, RAM_GiB × perGiB)</c>. 150s/GiB matches the observed
     /// ~6-minute suspend of a 4 GiB VM under load with headroom, and gives the
@@ -237,6 +247,44 @@ public static class SuspendTimeoutPolicy
         var batch = Math.Max(1, maxParallelSuspends);
         var waves = (sandboxes + batch - 1) / batch;
         return perVm * waves;
+    }
+
+    /// <summary>
+    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Only the
+    /// multipass provider suspends on shutdown, and a healthy RAM snapshot must
+    /// not be truncated by a SIGKILL, so for multipass the ceiling is raised to
+    /// the worst-case suspend drain (<see cref="HostShutdownReserve"/>:
+    /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
+    /// per-VM budget) or the requested <paramref name="grace"/>, whichever is
+    /// larger. Other providers keep the tighter <paramref name="grace"/>.
+    ///
+    /// <para>Lives on the Core policy (rather than on the orchestrator suspend
+    /// handler) so the API composition root can size the ceiling without
+    /// depending on a concrete hosted-service type, and so the provider guard
+    /// and the max() logic stay co-located with the suspend/resume budget
+    /// formula they must agree with.</para>
+    /// </summary>
+    /// <param name="sandboxProvider">Configured provider name; only "multipass" raises the ceiling.</param>
+    /// <param name="grace">Baseline shutdown grace (request-drain / preempt-checkpoint window).</param>
+    /// <param name="maxConcurrentSandboxes">Upper bound on concurrently in-flight (hence suspendable) VMs.</param>
+    /// <param name="maxParallelSuspends">Parallel-suspend batch size; defaults to <see cref="DefaultMaxParallelSuspends"/>.</param>
+    /// <param name="maxVmMemoryBytes">Largest per-VM RAM the deployment provisions; null uses <see cref="SandboxResourceLimits.Default"/>.</param>
+    public static TimeSpan ResolveHostShutdownTimeout(
+        string? sandboxProvider,
+        TimeSpan grace,
+        int maxConcurrentSandboxes,
+        int maxParallelSuspends = DefaultMaxParallelSuspends,
+        long? maxVmMemoryBytes = null)
+    {
+        var isMultipass = string.Equals(
+            (sandboxProvider ?? "").Trim(), "multipass", StringComparison.OrdinalIgnoreCase);
+        if (!isMultipass)
+            return grace;
+        var reserve = HostShutdownReserve(
+            maxConcurrentSandboxes,
+            maxParallelSuspends,
+            maxVmMemoryBytes ?? SandboxResourceLimits.Default.MemoryBytes);
+        return grace > reserve ? grace : reserve;
     }
 }
 

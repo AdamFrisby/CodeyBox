@@ -31,9 +31,11 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// <summary>
     /// Cap on parallel <c>multipass suspend</c> calls. Suspend writes the VM's
     /// RAM to disk; running too many in parallel just contends on disk IO and
-    /// stretches the SIGTERM-to-exit window. 8 matches the design spec.
+    /// stretches the SIGTERM-to-exit window. 8 matches the design spec. Shared
+    /// with the host-shutdown ceiling math via <see cref="SuspendTimeoutPolicy"/>
+    /// so the semaphore batch size and the wave count cannot diverge.
     /// </summary>
-    public const int DefaultMaxParallelSuspends = 8;
+    public const int DefaultMaxParallelSuspends = SuspendTimeoutPolicy.DefaultMaxParallelSuspends;
 
     /// <summary>
     /// Floor for the per-VM suspend timeout, and the value used when a sandbox
@@ -72,24 +74,17 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Only the
     /// multipass provider suspends on shutdown, and a healthy RAM snapshot must
     /// not be truncated by a SIGKILL, so for multipass the ceiling is raised to
-    /// the worst-case suspend drain (<see cref="SuspendTimeoutPolicy.HostShutdownReserve"/>:
-    /// <c>ceil(maxConcurrent / DefaultMaxParallelSuspends)</c> waves of the
-    /// largest per-VM budget) or the grace window, whichever is larger. Other
-    /// providers keep the tighter <paramref name="grace"/>. Centralised here (and
-    /// called from <c>Program.cs</c>) so the provider guard and the max() logic
-    /// are unit-testable rather than buried in host wiring.
+    /// the worst-case suspend drain or the grace window, whichever is larger.
+    /// Thin delegate to <see cref="SuspendTimeoutPolicy.ResolveHostShutdownTimeout"/>
+    /// — the provider guard and max() logic live on the Core policy so the API
+    /// composition root can size the ceiling without depending on this concrete
+    /// hosted-service type. Retained here for callers/tests that already
+    /// reference the suspend handler.
     /// </summary>
     public static TimeSpan ResolveHostShutdownTimeout(
-        string? sandboxProvider, TimeSpan grace, int maxConcurrentWorkers)
-    {
-        var isMultipass = string.Equals(
-            (sandboxProvider ?? "").Trim(), "multipass", StringComparison.OrdinalIgnoreCase);
-        if (!isMultipass)
-            return grace;
-        var reserve = SuspendTimeoutPolicy.HostShutdownReserve(
-            maxConcurrentWorkers, DefaultMaxParallelSuspends, SandboxResourceLimits.Default.MemoryBytes);
-        return grace > reserve ? grace : reserve;
-    }
+        string? sandboxProvider, TimeSpan grace, int maxConcurrentWorkers) =>
+        SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
+            sandboxProvider, grace, maxConcurrentWorkers, DefaultMaxParallelSuspends);
 
     private readonly ISandboxProvider _provider;
     private readonly IWorkItemStore _store;

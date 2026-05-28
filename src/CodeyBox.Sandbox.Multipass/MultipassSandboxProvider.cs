@@ -82,6 +82,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
 
     private sealed record SuspendableOwnerEntry(WorkItemId WorkItemId, MultipassSandbox Sandbox);
 
+    // Test seam: override the RAM-scaled Suspending-settle budget used by
+    // WaitWhileSuspendingAsync. Production leaves this null and derives the
+    // budget from SuspendTimeoutPolicy (floored at 10 min), which is far too
+    // long for a unit test to wait out; tests set a tiny value to exercise the
+    // deadline-expiry branch (proceed to `multipass start` while still
+    // Suspending) without controlling wall-clock time.
+    internal TimeSpan? SuspendSettleBudgetOverride { get; set; }
+
     // Cache for ListAllManagedAsync results to avoid hammering multipassd.
     private IReadOnlyList<ManagedSandboxInfo>? _listCache;
     private DateTimeOffset _listCacheExpiry = DateTimeOffset.MinValue;
@@ -1491,7 +1499,8 @@ test "$work" = present && test "$exec_wrapper" = present
         // Unknown RAM → assume the default VM profile so the cap still covers the
         // documented worst case (30 min for the 12 GiB default) rather than
         // collapsing to the bare floor.
-        var budget = SuspendTimeoutPolicy.For(memoryBytes ?? SandboxResourceLimits.Default.MemoryBytes);
+        var budget = SuspendSettleBudgetOverride
+            ?? SuspendTimeoutPolicy.For(memoryBytes ?? SandboxResourceLimits.Default.MemoryBytes);
         var deadline = DateTime.UtcNow + budget;
         while (DateTime.UtcNow < deadline)
         {

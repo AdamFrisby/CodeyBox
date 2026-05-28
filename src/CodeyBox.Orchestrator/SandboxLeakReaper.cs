@@ -248,15 +248,18 @@ public sealed class SandboxLeakReaper : BackgroundService
         // the in-flight suspend count rather than the full work_items table.
         await foreach (var item in _store.ListSuspendedAsync(ct))
         {
-            // Only honour SuspendedVmName for items still in mid-flight states.
-            // A terminal item with a stale SuspendedVmName (e.g. cancelled by
-            // the operator between suspend and the next sweep) should not
-            // keep its VM exempt from reaping forever.
+            // Honour SuspendedVmName for any non-terminal item. The suspend-on-
+            // shutdown handler persists a mapping for every entry from
+            // SnapshotSuspendableActive — Working/Auditing/Reworking/Merging but
+            // also ReworkingForConflict and any other mid-flight phase that can
+            // hold a live sandbox — so the exemption must track "not terminal"
+            // rather than an explicit allow-list that silently drops a state and
+            // lets the reaper purge a VM the startup resume handler is about to
+            // reattach. A terminal item with a stale SuspendedVmName (e.g.
+            // cancelled by the operator between suspend and the next sweep) is
+            // intentionally NOT exempt, so its VM does not leak forever.
             if (string.IsNullOrWhiteSpace(item.SuspendedVmName)) continue;
-            if (item.State is WorkItemState.Working
-                or WorkItemState.Auditing
-                or WorkItemState.Reworking
-                or WorkItemState.Merging)
+            if (!WorkItemDependencies.TerminalStates.Contains(item.State))
             {
                 set.Add(item.SuspendedVmName!);
             }

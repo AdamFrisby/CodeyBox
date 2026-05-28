@@ -205,7 +205,7 @@ builder.Services.Configure<HostOptions>(o =>
     // SandboxSpec today), so the default profile RAM is the largest per-VM suspend
     // budget the host needs to cover.
     var maxConcurrent = cbOpts.WorkerPool.MaxConcurrentWorkers ?? cbOpts.Concurrency ?? 1;
-    o.ShutdownTimeout = SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout(
+    o.ShutdownTimeout = SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
         cbOpts.SandboxProvider, grace, maxConcurrent);
 });
 
