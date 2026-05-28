@@ -216,18 +216,23 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     }
 
     [Fact]
-    public void Merge_OperatorMutationDoesNotAffectBundledSnapshot()
+    public void Merge_ReplacingDictionarySlot_DoesNotAffectMergedSnapshot()
     {
-        // The merged map should not share mutable state with the input
-        // bundle — a later edit to the operator-side AgentPricingOptions
-        // must not appear in a previously-computed merge result.
+        // Merge copies the per-agent dictionaries, so replacing a dictionary
+        // slot on either input (e.g. assigning a new ModelRateConfig to a
+        // key) is not visible to the previously-computed merge result.
+        // NOTE: Merge does *not* deep-clone ModelRateConfig — mutating the
+        // properties of an existing instance shared across inputs IS visible
+        // to the merged map. Callers are expected to treat ModelRateConfig
+        // as an immutable snapshot once produced.
         var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var operatorOpts = new AgentPricingOptions();
 
         var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
 
-        // Mutate the bundled source after merging — merged.Options should
-        // be isolated.
+        // Replace the dictionary slot on the bundled source. Because Merge
+        // copies the outer dictionaries, the replacement is invisible to the
+        // merged result.
         bundled.Rates["claude"]["claude-opus-4-7"] = new ModelRateConfig
         {
             InputPerMillion = 999,
@@ -236,6 +241,27 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         };
 
         Assert.Equal(5.0, merged.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
+    }
+
+    [Fact]
+    public void Merge_InstanceMutation_IsVisibleAcrossInputs_DocumentedBehaviour()
+    {
+        // Documents the deliberate shallow-copy behaviour: Merge does not
+        // clone ModelRateConfig, so mutating the properties of a shared
+        // instance leaks across bundled / operator / merged. Callers must
+        // treat the inputs as immutable after they hand them to Merge.
+        // If a future change clones ModelRateConfig (defense-in-depth), this
+        // test should be flipped to assert the merged side is isolated.
+        var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
+        var operatorOpts = new AgentPricingOptions();
+
+        var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
+
+        // Mutate the bundled ModelRateConfig instance in place.
+        bundled.Rates["claude"]["claude-opus-4-7"].InputPerMillion = 999.0;
+
+        // The shared instance is reachable from the merged map.
+        Assert.Equal(999.0, merged.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
     }
 
     [Fact]

@@ -99,8 +99,10 @@ public static class AgentPricingDefaults
     /// For each (agentKind, modelId), operator config wins over the bundled
     /// default. Operator <c>DefaultRates</c> are carried through unchanged
     /// (no bundled defaults at the agent-level fallback layer).
-    /// Returns the merged options and the override count (operator entries
-    /// that shadowed a bundled entry for the same key) for diagnostics.
+    /// The returned <see cref="MergedAgentPricing"/> carries the merged
+    /// options plus diagnostic counts: total bundled entries, total operator
+    /// entries (whether or not they overlapped), and the overlap count
+    /// (operator entries that shadowed a bundled entry for the same key).
     /// </summary>
     public static MergedAgentPricing Merge(BundledAgentPricing bundled, AgentPricingOptions operatorOpts)
     {
@@ -113,7 +115,6 @@ public static class AgentPricingDefaults
         int operatorCount = 0;
         int overlapCount = 0;
 
-        // Start with bundled rates.
         foreach (var (agentKey, modelMap) in bundled.Rates)
         {
             var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);

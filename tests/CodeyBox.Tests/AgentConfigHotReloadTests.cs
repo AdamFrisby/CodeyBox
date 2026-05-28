@@ -457,6 +457,123 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task Coordinator_OnChange_PricingHotReload_RemergesAgainstBundledDefaults()
+    {
+        // Regression for the bundledPricing branch of ApplyPricingIfChanged:
+        // a hot edit to operator AgentPricing must be merged with the bundled
+        // defaults (operator wins per (agent, model); bundled rates for keys
+        // the operator didn't touch are preserved). Without the merge, the
+        // calculator would lose the bundled rate for any non-overridden pair
+        // the moment the operator edited any other entry. Plausible bugs not
+        // caught without this test:
+        //   - operator overwrites bundled instead of merging (bundled rate
+        //     for an un-overridden model vanishes after a hot-reload)
+        //   - merge order reversed so bundled silently wins over operator
+        //   - bundledPricing parameter never plumbed; merge branch never runs
+        var bundled = new BundledAgentPricing
+        {
+            Rates = new(StringComparer.Ordinal)
+            {
+                ["claude"] = new(StringComparer.Ordinal)
+                {
+                    // Bundled rate for haiku — not in the initial or updated
+                    // operator config; must survive the operator hot-reload.
+                    ["claude-haiku-4-5"] = new ModelRateConfig
+                    {
+                        InputPerMillion = 1.0,
+                        CachedInputPerMillion = 0.10,
+                        OutputPerMillion = 5.0,
+                    },
+                    // Bundled rate for opus — overlaps initial operator entry
+                    // and the hot-reload candidate, so operator wins both times.
+                    ["claude-opus-4-7"] = new ModelRateConfig
+                    {
+                        InputPerMillion = 5.0,
+                        CachedInputPerMillion = 0.50,
+                        OutputPerMillion = 25.0,
+                    },
+                },
+            },
+        };
+        var initialOperator = new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["claude"] = new()
+                {
+                    ["claude-opus-4-7"] = new ModelRateConfig
+                    {
+                        InputPerMillion = 15.0,
+                        CachedInputPerMillion = 1.50,
+                        OutputPerMillion = 75.0,
+                    },
+                },
+            },
+        };
+        var initialMerged = AgentPricingDefaults.Merge(bundled, initialOperator).Options;
+        var initial = new CodeyBoxOptions { AgentPricing = initialOperator };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var calculator = new AgentCostCalculator(initialMerged);
+
+        var opusSnapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-opus-4-7");
+        var haikuSnapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-haiku-4-5");
+
+        // Baseline: operator wins on opus (15+75 per million * 1000 tokens
+        // each = 0.090000), bundled supplies haiku (1+5 per million = 0.006).
+        Assert.Equal(0.090000m, calculator.Calculate(opusSnapshot, Claude));
+        Assert.Equal(0.006000m, calculator.Calculate(haikuSnapshot, Claude));
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            costCalculator: calculator,
+            bundledPricing: bundled);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Hot-reload: operator doubles its own opus override. The bundled
+        // haiku rate must NOT disappear — Merge has to re-apply bundled rates
+        // for keys the operator didn't override.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentPricing = new AgentPricingOptions
+            {
+                Rates = new()
+                {
+                    ["claude"] = new()
+                    {
+                        ["claude-opus-4-7"] = new ModelRateConfig
+                        {
+                            InputPerMillion = 30.0,
+                            CachedInputPerMillion = 3.00,
+                            OutputPerMillion = 150.0,
+                        },
+                    },
+                },
+            },
+        });
+
+        // Opus reflects the doubled operator rate.
+        Assert.Equal(0.180000m, calculator.Calculate(opusSnapshot, Claude));
+        // Haiku still gets the bundled rate — the merge branch ran instead of
+        // overwriting the calculator with operator-only config.
+        Assert.Equal(0.006000m, calculator.Calculate(haikuSnapshot, Claude));
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_InvalidAgentPricingPayload_KeepsPriorSnapshot_AndAllowsFollowupValidEdit()
     {
         // Mirror of the AgentClasses follow-up-valid-edit regression test: if

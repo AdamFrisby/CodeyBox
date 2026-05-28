@@ -2,7 +2,7 @@
   "_meta": {
     "lastUpdated": "2026-05-28",
     "sources": {
-      "claude": "https://platform.claude.com/docs/en/docs/about-claude/pricing",
+      "claude": "https://docs.anthropic.com/en/docs/about-claude/pricing",
       "codex":  "https://openai.com/api/pricing/",
       "gemini": "https://ai.google.dev/gemini-api/docs/pricing"
     },
