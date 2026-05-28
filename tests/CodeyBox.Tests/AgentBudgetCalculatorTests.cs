@@ -222,6 +222,9 @@ public sealed class AgentBudgetCalculatorTests
     [Fact]
     public async Task ConfigReload_AppliesNewLimits()
     {
+        // SummariseAllAsync is the cached (visibility) path. A healthy result is
+        // cached; ApplyConfigReload must drop that cache so the next summary
+        // reflects the new limit rather than serving the stale snapshot.
         var store = new FakeUsageStore { DefaultSum = 1_000_000 };
         var calc = Build(store, Opts(Rolling(5, 200)));
 
@@ -551,18 +554,62 @@ public sealed class AgentBudgetCalculatorTests
     }
 
     [Fact]
-    public async Task SecondCallWithinTtl_ReusesCachedResult()
+    public async Task SummariseAllAsync_SecondCallWithinTtl_ReusesCachedResult()
     {
         var store = new FakeUsageStore { DefaultSum = 1_000_000 };
         var opts = Opts(Rolling(5, 200));
         opts.CacheTtl = TimeSpan.FromMinutes(10); // caching on
         var calc = Build(store, opts);
 
+        // Visibility path caches: the second summary within TTL hits the cache.
+        await calc.SummariseAllAsync();
+        await calc.SummariseAllAsync();
+
+        Assert.Single(store.Queries);
+    }
+
+    [Fact]
+    public async Task GetBudgetSnapshotAsync_NeverServesCache_RecomputesEveryCall()
+    {
+        // The dispatch gate must NOT serve a cached snapshot: a cached "healthy"
+        // value would mask an accounting outage for up to CacheTtl, bypassing the
+        // documented fail-closed behaviour. Every gate call recomputes.
+        var store = new FakeUsageStore { DefaultSum = 1_000_000 };
+        var opts = Opts(Rolling(5, 200));
+        opts.CacheTtl = TimeSpan.FromMinutes(10); // caching on, but gate ignores it
+        var calc = Build(store, opts);
+
         await calc.GetBudgetSnapshotAsync(Opencode, "m1");
         await calc.GetBudgetSnapshotAsync(Opencode, "m1");
 
-        // One window queried once; the second call must hit the cache.
-        Assert.Single(store.Queries);
+        Assert.Equal(2, store.Queries.Count);
+    }
+
+    [Fact]
+    public async Task GateFailsClosed_EvenWhenVisibilityCacheHasHealthySnapshot()
+    {
+        // A healthy SummariseAllAsync populates the visibility cache. When the
+        // store then fails, the dispatch gate must STILL fail closed immediately
+        // rather than serving the cached healthy snapshot for CacheTtl.
+        var fail = false;
+        var store = new FakeUsageStore
+        {
+            Responder = (_, _, _, _) => fail
+                ? throw new InvalidOperationException("outage")
+                : new AgentUsageWindowAggregate(0, null, 0),
+        };
+        var opts = Opts(Rolling(5, 200));
+        opts.CacheTtl = TimeSpan.FromMinutes(10);
+        var calc = Build(store, opts);
+
+        // Healthy: caches 100% remaining in the visibility cache.
+        var summary = await calc.SummariseAllAsync();
+        Assert.Equal(100.0, summary.Single().Windows.Single().PercentRemaining);
+
+        // Outage begins.
+        fail = true;
+        var gate = await calc.GetBudgetSnapshotAsync(Opencode, "m1");
+        Assert.Equal(0.0, gate!.AvailablePct);
     }
 
     [Fact]
