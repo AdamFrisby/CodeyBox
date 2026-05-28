@@ -257,6 +257,78 @@ public sealed class CodeyBoxOptionsHotReloadTests
     }
 
     [Fact]
+    public void AgentCostCalculator_ApplyConfigReload_RejectsNullRate_KeepsPrior()
+    {
+        var initial = new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["claude"] = new()
+                {
+                    ["claude-opus-4-7"] = new ModelRateConfig
+                    {
+                        InputPerMillion = 15.0,
+                        CachedInputPerMillion = 1.50,
+                        OutputPerMillion = 75.0,
+                    },
+                },
+            },
+        };
+        var calculator = new AgentCostCalculator(initial);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-opus-4-7");
+        var priorCost = calculator.Calculate(snapshot, AgentKind.Claude);
+
+        var bad = new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["claude"] = new Dictionary<string, ModelRateConfig>
+                {
+                    ["claude-opus-4-7"] = null!,
+                },
+            },
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => calculator.ApplyConfigReload(bad));
+        Assert.Contains("reload", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        Assert.Equal(priorCost, calculator.Calculate(snapshot, AgentKind.Claude));
+    }
+
+    [Fact]
+    public void AgentCostCalculator_ApplyConfigReload_RejectsNullDefaultRate_KeepsPrior()
+    {
+        var initial = new AgentPricingOptions
+        {
+            DefaultRates = new()
+            {
+                ["claude"] = new ModelRateConfig
+                {
+                    InputPerMillion = 3.0,
+                    CachedInputPerMillion = 0.30,
+                    OutputPerMillion = 15.0,
+                },
+            },
+        };
+        var calculator = new AgentCostCalculator(initial);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "model-not-in-rates");
+        var priorCost = calculator.Calculate(snapshot, AgentKind.Claude);
+
+        var bad = new AgentPricingOptions
+        {
+            DefaultRates = new Dictionary<string, ModelRateConfig>
+            {
+                ["claude"] = null!,
+            },
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => calculator.ApplyConfigReload(bad));
+        Assert.Contains("default", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        Assert.Equal(priorCost, calculator.Calculate(snapshot, AgentKind.Claude));
+    }
+
+    [Fact]
     public void AgentCostCalculator_ApplyConfigReload_RejectsNegativeDefaultRate_KeepsPrior()
     {
         // Exercises the second validation loop in ApplyConfigReload — the one
