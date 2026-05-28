@@ -457,17 +457,20 @@ if (geminiSettingsFilePath.StartsWith("~/", StringComparison.Ordinal))
         geminiSettingsFilePath[2..]);
 
 // Cursor subscription credentials. Path is operator-configurable; default
-// matches what `agent login` typically writes. The orchestrator never bind-
-// mounts this path into the sandbox — only the file contents are shipped via
-// CODEYBOX_CURSOR_AUTH_JSON and CursorAgentRunner re-materialises them inside
-// the VM.
+// matches what `agent login` writes in current Cursor CLI versions
+// (~/.config/cursor/auth.json — XDG-style; the legacy
+// ~/.cursor/credentials.json path is no longer read by the binary). The
+// orchestrator never bind-mounts this path into the sandbox — only the file
+// contents are shipped via CODEYBOX_CURSOR_AUTH_JSON and CursorAgentRunner
+// re-materialises them inside the VM at the matching XDG path.
 var cursorAuthFilePath =
     Environment.GetEnvironmentVariable("CODEYBOX_CURSOR_AUTH_FILE")
     ?? builder.Configuration["CodeyBox:CursorAuthFile"]
     ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".cursor",
-        "credentials.json");
+        ".config",
+        "cursor",
+        "auth.json");
 if (cursorAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
     cursorAuthFilePath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),

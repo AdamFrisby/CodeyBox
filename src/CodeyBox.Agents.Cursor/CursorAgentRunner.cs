@@ -53,7 +53,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
 
     /// <summary>
     /// Materialises Cursor's subscription credentials into the sandbox at
-    /// <c>~/.cursor/credentials.json</c> when <c>CODEYBOX_CURSOR_AUTH_JSON</c>
+    /// <c>~/.config/cursor/auth.json</c> when <c>CODEYBOX_CURSOR_AUTH_JSON</c>
     /// is present in the credential bundle. Mirrors
     /// <c>CodexAgentRunner.PrepareSandboxAsync</c>: preserves any pre-existing
     /// non-empty file (e.g. restored from a checkpoint scratchpad), short-
@@ -69,7 +69,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     {
         var write = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["bash", "-c", "set -eu; if [ -s \"$HOME/.cursor/credentials.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.cursor/credentials.json\"; fi"],
+            Argv = ["bash", "-c", "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; fi"],
         }, ct);
         if (!write.Success)
         {
@@ -95,7 +95,14 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         // The CursorAgentRunner_FastModeRegressionTests fixture pins this; if
         // a future Cursor release changes its default to fast-by-default the
         // invocation must explicitly opt out, NOT be made operator-toggleable.
-        var argv = new List<string> { Binary, "--print" };
+        //
+        // --trust auto-accepts the workspace-trust prompt that Cursor would
+        // otherwise raise on /work; the multipass VM boundary is our
+        // security perimeter so per-workspace consent inside the sandbox is
+        // noise. --force is the same idea for per-command tool prompts (see
+        // Claude's --dangerously-skip-permissions for the equivalent
+        // rationale on that runner).
+        var argv = new List<string> { Binary, "--print", "--trust", "--force" };
 
         var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))
