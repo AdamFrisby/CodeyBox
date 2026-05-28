@@ -1,0 +1,3 @@
+5 hour usage limit reached. It will reset in 5 hours 23 minutes.
+To continue using this model now, enable usage from your available balance -
+https://opencode.ai/workspace/wrk_REDACTEDXXXXXXXXXXXXXXXXXXXXXX/go

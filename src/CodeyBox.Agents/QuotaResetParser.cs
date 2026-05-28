@@ -15,8 +15,10 @@ public static class QuotaResetParser
     //   "reset in 30m", "retry after 1h", "try again after 2h30m".
     // The duration pieces are individually optional but at least one must
     // match; the surrounding code rejects the all-zero case.
+    // Duration pieces accept compact (5h23m) and word forms (5 hours 23 minutes)
+    // surfaced by OpenCode subscription limits and other provider CLIs.
     private static readonly Regex ResetAfterRegex = new(
-        @"(?:reset(?:s|ting)?(?:\s+will\s+reset)?\s+after|reset\s+in|retry\s+after|try\s+again\s+after|available\s+(?:in|after))\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?",
+        @"(?:reset(?:s|ting)?(?:\s+will\s+reset)?\s+after|reset\s+in|retry\s+after|try\s+again\s+after|available\s+(?:in|after))\s+(?:(\d+)\s*(?:h(?:ou)?rs?|h))?\s*(?:(\d+)\s*(?:m(?:in(?:ute)?s?|ins?)|m))?\s*(?:(\d+)\s*(?:s(?:ec(?:ond)?s?|ecs?)|s))?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>

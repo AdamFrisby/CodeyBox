@@ -5,6 +5,12 @@ namespace CodeyBox.Tests;
 
 public sealed class OpencodeQuotaFailureDetectorTests
 {
+    private static readonly string SubscriptionLimitFixturePath = Path.Combine(
+        AppContext.BaseDirectory,
+        "Fixtures",
+        "Opencode",
+        "opencode-subscription-limit.redacted.txt");
+
     private readonly OpencodeQuotaFailureDetector _detector = new();
 
     // --- LimitReached patterns ------------------------------------------------
@@ -129,5 +135,44 @@ public sealed class OpencodeQuotaFailureDetectorTests
     public void Kind_IsOpencode()
     {
         Assert.Equal(AgentKind.Opencode, _detector.Kind);
+    }
+
+    // --- OpenCode subscription rolling-window stderr (upstream fixture) -------
+
+    [Fact]
+    public void Detect_FiveHourUsageLimitFixture_ClassifiesAsLimitReachedWithResetAt()
+    {
+        var stderr = File.ReadAllText(SubscriptionLimitFixturePath);
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+
+        var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(diff.TotalHours, 5.35, 5.45);
+    }
+
+    [Fact]
+    public void Detect_WeeklyUsageLimitReached_ParsesResetAt()
+    {
+        const string stderr =
+            "weekly usage limit reached. It will reset in 2 hours 30 minutes.";
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+
+        var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(diff.TotalMinutes, 149, 151);
+    }
+
+    [Fact]
+    public void Detect_UnrelatedStderr_DoesNotClassifyAsQuota()
+    {
+        Assert.Null(_detector.Detect(stderr: "npm: command not found", stdout: null));
     }
 }
