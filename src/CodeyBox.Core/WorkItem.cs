@@ -39,7 +39,17 @@ public sealed record WorkItem
     /// <summary>Branch the agent pushes its work to. Generated if null.</summary>
     public string? WorkBranch { get; init; }
 
-    /// <summary>If set, overrides the project's default agent.</summary>
+    /// <summary>
+    /// Agent preference for this work item. When no <see cref="AgentClassId"/> is set,
+    /// overrides the project's default agent. When <see cref="AgentClassId"/> is set,
+    /// this field is <b>not consulted</b> during class routing: members are chosen purely
+    /// by <see cref="AgentMembership.QualityScore"/>, quota availability, smoke gates,
+    /// and related routing rules. At pickup the orchestrator <b>rewrites</b> this field
+    /// to whichever class member the router actually chose. Per-agent concurrency caps
+    /// apply after routing to the chosen member and may defer the work item without
+    /// picking another class member. There is no mechanism today to hard-pin a work
+    /// item to a specific agent inside a class.
+    /// </summary>
     public AgentKind? Agent { get; init; }
 
     /// <summary>
