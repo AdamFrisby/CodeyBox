@@ -103,7 +103,7 @@ public sealed class BaselineImageReaper : BackgroundService
             return;
         }
 
-        // Clamp to a 1-hour floor: more frequent than that would just hammer
+        // Clamp to a 15-minute floor: more frequent than that would just hammer
         // multipass list without giving the grace window time to apply.
         var interval = opts.CheckInterval < TimeSpan.FromMinutes(15)
             ? TimeSpan.FromMinutes(15)
