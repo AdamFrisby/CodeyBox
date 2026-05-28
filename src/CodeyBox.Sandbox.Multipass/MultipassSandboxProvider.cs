@@ -1492,12 +1492,22 @@ test "$work" = present && test "$exec_wrapper" = present
     /// <summary>
     /// Mounts one host directory into the VM with bounded retry and per-attempt
     /// host-state diagnostics. When <paramref name="restoreHostSourceAsync"/> is
-    /// supplied and a failed attempt reports the host source as missing, the
-    /// callback is invoked once to re-create the source before retrying — this
-    /// covers the case where racing cleanup or a failed clone removed the
-    /// staging directory between the orchestrator creating it and the mount
-    /// firing. Without the callback, a missing source is treated as terminal
-    /// (no number of retries can heal it) and reported immediately.
+    /// supplied and the post-failure orchestrator-side stat of the source path
+    /// returns <c>exists=no</c>, the callback is invoked once to re-create the
+    /// source before retrying — this covers the case where racing cleanup or a
+    /// failed clone removed the staging directory between the orchestrator
+    /// creating it and the mount firing. Without the callback, a missing
+    /// source is treated as terminal (no number of retries can heal it) and
+    /// reported immediately.
+    ///
+    /// <para><b>Out of scope for the callback.</b> Mount failures where the
+    /// orchestrator can stat the path fine but multipass cannot (e.g.
+    /// snap-confined daemon's AppArmor profile only allows reads under
+    /// <c>~/snap/multipass/common/</c>) yield <c>exists=dir</c> in
+    /// post-failure state and therefore never invoke <paramref name="restoreHostSourceAsync"/>.
+    /// Re-cloning the source would not change that visibility class.
+    /// The structural fix for that case lives in <see cref="IGitHost.GetMergeStagingRoot"/>:
+    /// route the bind source under a provider-readable root.</para>
     /// </summary>
     internal async Task MountSingleBindWithRetryAsync(
         MultipassSandboxOptions opts,
@@ -1570,9 +1580,12 @@ test "$work" = present && test "$exec_wrapper" = present
             await Task.Delay(backoff, ct);
         }
 
+        // lastFailureState is the post-failure orchestrator-side stat snapshot,
+        // not the pre-mount state; label it so a reader of the exception text
+        // doesn't misread it as "this is what we saw before issuing mount".
         throw new InvalidOperationException(
             $"multipass mount {host} -> {name}:{sandbox} failed after {attemptsRun} attempt(s): " +
-            $"{lastFailure?.Stderr.Trim()} (host source state at mount time: {lastFailureState})");
+            $"{lastFailure?.Stderr.Trim()} (post-failure host source state: {lastFailureState})");
     }
 
     /// <summary>

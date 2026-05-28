@@ -119,6 +119,119 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
     }
 
     [Fact]
+    public async Task ConcurrentReaperSweepsRunningDuringMergeStaging_LeaveAllStagingDirsIntact()
+    {
+        // Acceptance criterion #2: simulate SandboxLeakReaper running
+        // concurrently with merge-phase setup, assert the merge staging
+        // directories survive end-to-end. The test runs a tight reaper-sweep
+        // loop in the background while a parallel batch of
+        // CreateIsolatedMergeRepositoryAsync calls produces fresh staging
+        // clones. The contract being pinned: a real reaper instance, ticking
+        // at the same time merge staging is mid-flight, must not delete or
+        // otherwise mutate any of the freshly-created codeybox-merge-*.git
+        // directories before the orchestrator hands them off to the mount.
+        //
+        // The reaper's only contract is to call ISandboxProvider.ListAllManagedAsync
+        // — never the host filesystem — so the staging-host-path-vs-VM-name
+        // distinction is what protects merge staging. If a future change to
+        // the reaper started walking the host filesystem (e.g. "also clean
+        // stale directories under /tmp"), it would have to whitelist
+        // codeybox-merge-*.git paths or this test breaks loudly.
+        var gitRoot = Path.Combine(_workspace, "git-root-concurrent");
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+
+        var seed = await CreateSeedRepoAsync();
+        var workItemId = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(workItemId, seed);
+        var pipeline = CreatePipeline(gitHost);
+
+        // Empty-listing provider keeps the reaper from disposing anything real;
+        // we are only verifying the reaper does not touch merge staging.
+        var reaperProvider = new ListAllOnlySandboxProvider();
+        var reaperOpts = new SandboxLeakOptions
+        {
+            Enabled = true,
+            CheckInterval = TimeSpan.FromMinutes(1),
+            LeakAgeThreshold = TimeSpan.FromMinutes(30),
+            PreemptRetention = TimeSpan.FromHours(24),
+            AutoDispose = true,
+            MaxConcurrentAutoDispose = 4,
+        };
+        var reaper = new SandboxLeakReaper(
+            reaperProvider,
+            new NullWebhookDispatcher(),
+            reaperOpts,
+            NullLogger<SandboxLeakReaper>.Instance);
+
+        using var reaperLoopCts = new CancellationTokenSource();
+        // Background sweeps running while staging is in flight.
+        var reaperLoop = Task.Run(async () =>
+        {
+            while (!reaperLoopCts.IsCancellationRequested)
+            {
+                await reaper.RunSweepAsync(reaperLoopCts.Token);
+                // Yield without sleeping so the loop competes for CPU with
+                // the staging-creation tasks below.
+                await Task.Yield();
+            }
+        }, reaperLoopCts.Token);
+
+        // Concurrent staging creates. Use a small task fan-out so we hit
+        // overlap windows where a reaper sweep can complete between
+        // CreateIsolatedMergeRepositoryAsync's git clone and the test's
+        // post-clone assertion. Each task verifies its OWN clone is present
+        // immediately after CreateIsolatedMergeRepositoryAsync returns.
+        var inflightStagings = await Task.WhenAll(Enumerable.Range(0, 8)
+            .Select(_ => Task.Run(async () =>
+            {
+                var clone = await pipeline.CreateIsolatedMergeRepositoryAsync(
+                    repoId, workItemId, CancellationToken.None);
+                // Sleep a non-zero amount of "time the orchestrator would
+                // be spawning a sandbox" so the reaper has further chances
+                // to sweep before we re-stat the directory.
+                await Task.Delay(50);
+                return clone;
+            }))
+            .ToArray());
+
+        try
+        {
+            // Allow the reaper a final sweep window before stopping it so the
+            // last "is the staging dir still there" assertion runs against a
+            // state where the reaper had every opportunity to interfere.
+            await Task.Delay(100);
+            reaperLoopCts.Cancel();
+            try { await reaperLoop; } catch (OperationCanceledException) { /* expected */ }
+
+            // The acceptance invariant: every concurrently-created staging
+            // dir is still a valid bare git repo on disk after the reaper
+            // ran many sweeps overlapping with the create phase.
+            foreach (var path in inflightStagings)
+            {
+                Assert.True(Directory.Exists(path),
+                    $"merge staging dir reaped mid-flight: {path}");
+                Assert.True(File.Exists(Path.Combine(path, "HEAD")),
+                    $"merge staging dir corrupted mid-flight: {path}");
+            }
+
+            // The reaper enumerated its provider but never touched the host
+            // filesystem — the only safe contract for merge staging in the
+            // current architecture.
+            Assert.True(reaperProvider.ListCalls > 0,
+                "reaper sweep loop did not run any sweeps — concurrency window not exercised");
+        }
+        finally
+        {
+            foreach (var path in inflightStagings)
+            {
+                try { Directory.Delete(path, recursive: true); } catch { /* best-effort */ }
+            }
+        }
+    }
+
+    [Fact]
     public async Task SandboxLeakReaper_DoesNotEnumerateOrTouchHostFilesystem()
     {
         // Pins the contract behind the merge-staging fix: SandboxLeakReaper
@@ -373,50 +486,97 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
     }
 
     [Fact]
-    public void LocalGitHost_GetIsolatedRepoSandboxAccess_LayoutMatchesGetSandboxAccess()
+    public async Task LocalGitHost_GetIsolatedRepoSandboxAccess_LayoutMatchesGetSandboxAccess()
     {
         // The agent inside the sandbox must observe the same clone URL and
         // mount layout whether the orchestrator wires the durable bare repo
         // or an isolated bare clone — otherwise the merge prompt's `git
         // clone /repo` would target a path that only exists for one of the
-        // two flows. Pin the two access objects' mount layout matches.
+        // two flows. Pin parity by calling BOTH GetSandboxAccess (with a real
+        // repoId from EnsureRepositoryAsync) and GetIsolatedRepoSandboxAccess
+        // (pointed at a hypothetical sibling staging directory), then
+        // comparing the public mount-shape fields that the agent observes.
+        // A regression that changed mount count, sandbox path, ReadOnly,
+        // clone URL, or network policy on either side would fail this test.
         var gitRoot = Path.Combine(_workspace, "git-root-layout-parity");
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
         var asInterface = (IGitHost)gitHost;
 
-        // GetSandboxAccess uses GetRepoPath(repoId) for HostPath; we cannot
-        // call it without a real repoId in the registry, so derive the
-        // comparable layout via the public mount-path constant.
+        var seed = await CreateSeedRepoAsync();
+        var workItemId = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(workItemId, seed);
+
+        var durableAccess = asInterface.GetSandboxAccess(repoId);
         var isolatedAccess = asInterface.GetIsolatedRepoSandboxAccess(
             Path.Combine(gitRoot, "any-isolated.git"));
 
+        // Clone URL the agent sees must be identical so the same merge
+        // prompt (`git clone /repo`) works in both flows.
+        Assert.Equal(durableAccess.CloneUrlInsideSandbox, isolatedAccess.CloneUrlInsideSandbox);
         Assert.Equal(LocalGitHost.SandboxRepoMountPath, isolatedAccess.CloneUrlInsideSandbox);
+
+        // Network policy must match — both flows deny network so the
+        // sandbox cannot reach upstream during merge resolution.
+        Assert.Equal(durableAccess.Network, isolatedAccess.Network);
         Assert.Equal(SandboxNetworkPolicy.Denied, isolatedAccess.Network);
-        var mount = Assert.Single(isolatedAccess.Mounts);
-        Assert.Equal(LocalGitHost.SandboxRepoMountPath, mount.SandboxPath);
+
+        // Mount shape parity: same count, same sandbox path, same ReadOnly,
+        // same Tmpfs (none). HostPath legitimately differs (durable bare repo
+        // vs. isolated staging clone) — that is the whole point of the two
+        // flows existing.
+        Assert.Equal(durableAccess.Mounts.Count, isolatedAccess.Mounts.Count);
+        var durableMount = Assert.Single(durableAccess.Mounts);
+        var isolatedMount = Assert.Single(isolatedAccess.Mounts);
+        Assert.Equal(durableMount.SandboxPath, isolatedMount.SandboxPath);
+        Assert.Equal(durableMount.ReadOnly, isolatedMount.ReadOnly);
+        Assert.Equal(durableMount.Tmpfs, isolatedMount.Tmpfs);
+        Assert.False(isolatedMount.ReadOnly,
+            "merge sandbox must be able to push verification refs back to the isolated bare clone");
     }
 
     [Fact]
-    public void GetMergeStagingRoot_DefaultDerivesFromRepoParent()
+    public void GetMergeStagingRoot_DefaultReturnsRepoParentDirectory_FixedLayoutHost()
     {
-        // LocalGitHost takes the default IGitHost.GetMergeStagingRoot — which
-        // returns the directory containing the bare repo path. This pins the
-        // default's behaviour so a future override or interface change is
-        // intentional.
-        var gitRoot = Path.Combine(_workspace, "git-root-default-test");
+        // The default IGitHost.GetMergeStagingRoot implementation must return
+        // the parent directory of the bare repo path — that is the invariant
+        // PipelineRunner relies on so a single configured GitRoot covers both
+        // the durable bare repo and the merge staging clone. Pin the
+        // invariant with a fake host that returns a known fixed bare-repo
+        // path so the test does not depend on the default's own expression
+        // (a regression that shifted by one directory level would still pass
+        // a test that mirrored the body).
+        IGitHost fixedHost = new FixedRepoPathHost(
+            barePath: OperatingSystem.IsWindows()
+                ? @"C:\opt\codeybox\repos\b044f8bd.git"
+                : "/opt/codeybox/repos/b044f8bd.git");
+
+        var stagingRoot = fixedHost.GetMergeStagingRoot("anything");
+
+        Assert.Equal(
+            OperatingSystem.IsWindows() ? @"C:\opt\codeybox\repos" : "/opt/codeybox/repos",
+            stagingRoot);
+    }
+
+    [Fact]
+    public void GetMergeStagingRoot_LocalGitHostDelegatesToConfiguredRoot()
+    {
+        // Independent invariant for LocalGitHost: the staging root matches
+        // the operator-configured GitRoot directory (so a single
+        // CodeyBox.GitRootDirectory setting covers both the durable bare
+        // repo and the merge staging clone). Driven by LocalGitHost's
+        // GetRepoPath layout — not by the default impl body — so a future
+        // LocalGitHost override that produced the wrong directory would
+        // fail this test.
+        var gitRoot = Path.Combine(_workspace, "git-root-local-staging");
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
 
-        var repoId = "abc123";
-        IGitHost asInterface = gitHost;
-
-        var stagingRoot = asInterface.GetMergeStagingRoot(repoId);
+        var stagingRoot = ((IGitHost)gitHost).GetMergeStagingRoot("abc123");
 
         Assert.Equal(gitRoot, stagingRoot);
-        Assert.Equal(Path.GetDirectoryName(asInterface.GetRepoPath(repoId)), stagingRoot);
     }
 
     [Fact]
@@ -527,6 +687,37 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             Task.FromResult("rootless");
         public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default) =>
             Task.FromResult("rootless");
+        public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default) =>
+            Task.FromResult("main");
+        public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
+            IReadOnlyDictionary<string, string> upstreamEnv,
+            UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default) =>
+            Task.FromResult(true);
+        public Task<(string DiffStat, string FullDiff)> GetDiffAsync(string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default) =>
+            Task.FromResult((string.Empty, string.Empty));
+    }
+
+    /// <summary>
+    /// Host whose GetRepoPath returns a known fixed path so the default
+    /// GetMergeStagingRoot test can pin "parent directory" semantically
+    /// without mirroring the default implementation's expression.
+    /// </summary>
+    private sealed class FixedRepoPathHost : IGitHost
+    {
+        private readonly string _barePath;
+        public FixedRepoPathHost(string barePath) => _barePath = barePath;
+        public string GetRepoPath(string repositoryId) => _barePath;
+        public SandboxRepositoryAccess GetSandboxAccess(string repositoryId) =>
+            throw new NotSupportedException();
+        public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default) =>
+            Task.FromResult("fixed");
+        public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default) =>
+            Task.FromResult("fixed");
         public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default) =>
             Task.FromResult("main");
         public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,

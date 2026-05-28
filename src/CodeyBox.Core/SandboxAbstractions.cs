@@ -487,18 +487,31 @@ public sealed record SandboxMount
 
     /// <summary>
     /// Optional defensive heal hook invoked by a sandbox provider when a
-    /// bind-mount attempt reports the host source is missing. Used by the
-    /// merge / conflict-rework phase: if racing cleanup ever removes the
-    /// isolated bare clone between create and mount, the orchestrator's
-    /// callback re-clones it so the next mount attempt succeeds instead of
-    /// failing the whole work item.
+    /// bind-mount attempt fails AND the post-failure orchestrator-side stat
+    /// of <see cref="HostPath"/> shows the directory really is absent on the
+    /// host. Used by the merge / conflict-rework phase: if racing cleanup
+    /// removes the isolated bare clone between create and mount, the
+    /// orchestrator's callback re-clones it so the next mount attempt
+    /// succeeds instead of failing the whole work item.
     ///
-    /// <para>Null for the common case (the source is durable and the
-    /// orchestrator has no recreation logic to offer). Providers that do not
-    /// distinguish missing-source from other mount failures may ignore this
-    /// hook entirely; only providers whose mount-time visibility of the host
-    /// path can lag behind orchestrator creation (e.g. snap-confined
-    /// Multipass) benefit from invoking it.</para>
+    /// <para><b>Out of scope.</b> The hook is NOT a general-purpose
+    /// "mount failed for any reason" recovery. Cases where the host path
+    /// still exists from the orchestrator's view but is invisible to the
+    /// sandbox daemon (e.g. AppArmor confines snap-Multipass to a subset of
+    /// the host filesystem — the path the orchestrator can <c>stat</c>
+    /// returns Directory.Exists=true but multipass logs
+    /// "Source path does not exist") do NOT trigger the callback. That
+    /// failure class is structural — no number of re-clones can heal it —
+    /// and is addressed by <see cref="IGitHost.GetMergeStagingRoot"/>
+    /// placing the bind source under a provider-readable root, not by this
+    /// hook.</para>
+    ///
+    /// <para><b>Honoring providers.</b> Currently only
+    /// <c>MultipassSandboxProvider</c> consumes this callback. Process and
+    /// bubblewrap providers ignore it (their bind-mount paths share the
+    /// orchestrator's filesystem namespace, so the racing-cleanup window
+    /// the hook targets does not apply). The hook is null for the common
+    /// case (durable source, no recreation logic to offer).</para>
     /// </summary>
     public Func<CancellationToken, Task>? RestoreHostSourceAsync { get; init; }
 }
