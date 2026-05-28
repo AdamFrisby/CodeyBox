@@ -308,6 +308,118 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         Assert.Contains("after 1 attempt", ex.Message);
     }
 
+    // ── End-to-end CreateAsync wiring ──────────────────────────────────────
+
+    [Fact]
+    public async Task CreateAsync_SandboxMountWithSourceRestorer_RestorerReachesMountRetryLoop()
+    {
+        // Regression guard for the SandboxMount.SourceRestorer → bindMounts →
+        // ApplyMountsAsync → MountSingleBindWithRetryAsync wiring inside
+        // MultipassSandboxProvider.CreateAsync. All other restorer tests
+        // exercise MountSingleBindWithRetryAsync directly with an explicitly
+        // supplied restorer or invoke ISandboxMountSourceRestorer from a
+        // ProcessSandbox wrapper at CreateAsync time. If the tuple wiring at
+        // MultipassSandboxProvider.cs:257 regressed to drop the restorer
+        // (e.g. bindMounts.Add((m.HostPath, m.SandboxPath, null))), the
+        // existing 33-test restorer suite would still pass while the real
+        // merge-phase mount-heal path silently broke. This test drives a
+        // SandboxSpec carrying SourceRestorer through the full CreateAsync
+        // path and asserts the restorer was invoked when multipass mount
+        // reported a missing source.
+        var hostSource = Path.Combine(_workspace, "create-async-heal-source");
+        // Source initially absent so the first multipass mount call fails
+        // with "Source path does not exist" and the post-failure state is
+        // exists=no — the only path that reaches the restorer in
+        // MountSingleBindWithRetryAsync.
+        Assert.False(Directory.Exists(hostSource));
+
+        var states = new Dictionary<string, string>(StringComparer.Ordinal);
+        var mountAttempts = 0;
+        var runner = new SequencedRunner(call =>
+        {
+            var argv = call.Argv;
+
+            if (argv.Count >= 2 && argv[1] == "mount")
+            {
+                mountAttempts++;
+                return Directory.Exists(hostSource)
+                    ? new ProcessRunResult(0, "", "")
+                    : new ProcessRunResult(1, "", "Source path does not exist");
+            }
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                states[argv[3]] = "Running";
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv.Count >= 4 && argv[1] == "info" && argv[3] == "--format=csv")
+                return states.TryGetValue(argv[2], out var s)
+                    ? new ProcessRunResult(0, s, "")
+                    : new ProcessRunResult(1, "", "not found");
+            if (argv.Count >= 5 && argv[1] == "exec" && argv[3] == "--" && argv[4] == "cloud-init")
+                return new ProcessRunResult(0, "", "");
+            if (argv.Count >= 3 && argv[1] == "stop")
+            {
+                states[argv[2]] = "Stopped";
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv.Count >= 3 && argv[1] == "start")
+            {
+                states[argv[2]] = "Running";
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv.Count >= 4 && argv[1] == "transfer")
+                return new ProcessRunResult(0, "", "");
+            if (argv.Count >= 5 && argv[1] == "exec" && argv[3] == "--" && argv[4] == "chmod")
+                return new ProcessRunResult(0, "", "");
+            if (argv.Count >= 4 && argv[1] == "delete" && argv[2] == "--purge")
+            {
+                states.Remove(argv[3]);
+                return new ProcessRunResult(0, "", "");
+            }
+            // DescribeMountSourceState routes stat through IProcessRunner;
+            // return a plausible owner/mode trailer so the diagnostic
+            // helper does not fail.
+            if (argv.Count > 0 && argv[0] == "stat")
+                return new ProcessRunResult(0, "alice:devs(1000:1000) mode=755", "");
+            return new ProcessRunResult(99, "", "unexpected argv: " + string.Join(" ", argv));
+        });
+        var provider = NewProvider(runner);
+
+        var restorer = new RecordingRestorer(_ =>
+        {
+            Directory.CreateDirectory(hostSource);
+            return Task.CompletedTask;
+        });
+
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+            Mounts =
+            [
+                new SandboxMount
+                {
+                    SandboxPath = "/repo",
+                    HostPath = hostSource,
+                    ReadOnly = false,
+                    SourceRestorer = restorer,
+                },
+            ],
+        };
+
+        await using var sandbox = await provider.CreateAsync(spec, CancellationToken.None);
+
+        // The wiring assertion: bindMounts carried m.SourceRestorer into
+        // ApplyMountsAsync, which forwarded it to MountSingleBindWithRetryAsync,
+        // which invoked the restorer when the post-failure stat showed
+        // exists=no. A regression that dropped the restorer would leave
+        // Invocations==0 — the first mount would fail, no retry would heal
+        // it, and CreateAsync would throw before reaching this assertion.
+        Assert.Equal(1, restorer.Invocations);
+        Assert.Equal(2, mountAttempts);
+        Assert.True(Directory.Exists(hostSource));
+    }
+
     [Fact]
     public async Task MountSingleBindWithRetry_PersistentFailure_ThrowsWithSourceStateAndStderr()
     {
