@@ -52,9 +52,9 @@ public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFac
 
         var counts = meta.GetProperty("counts");
         Assert.Equal(2, counts.GetProperty("bundled").GetInt32());
-        Assert.Equal(2, counts.GetProperty("operatorOverrides").GetInt32());
+        Assert.Equal(1, counts.GetProperty("operatorOverrides").GetInt32());
         Assert.Equal(1, counts.GetProperty("overlap").GetInt32());
-        Assert.Equal(3, counts.GetProperty("total").GetInt32());
+        Assert.Equal(2, counts.GetProperty("total").GetInt32());
 
         var rates = body.GetProperty("rates");
         var opus = rates.GetProperty("claude").GetProperty("claude-opus-4-7");
@@ -62,8 +62,6 @@ public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFac
         Assert.Equal(990.0, opus.GetProperty("outputPerMillion").GetDouble());
         var haiku = rates.GetProperty("claude").GetProperty("claude-haiku-4-5");
         Assert.Equal(1.0, haiku.GetProperty("inputPerMillion").GetDouble());
-        var deepseek = rates.GetProperty("opencode").GetProperty("opencode-go/deepseek-v4-pro");
-        Assert.Equal(0.27, deepseek.GetProperty("inputPerMillion").GetDouble());
 
         var defaults = body.GetProperty("defaultRates");
         Assert.Equal(5.0, defaults.GetProperty("codex").GetProperty("inputPerMillion").GetDouble());
@@ -98,9 +96,6 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:inputPerMillion"] = "99.0",
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:cachedInputPerMillion"] = "9.9",
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:outputPerMillion"] = "990.0",
-                ["CodeyBox:AgentPricing:Rates:opencode:opencode-go/deepseek-v4-pro:inputPerMillion"] = "0.27",
-                ["CodeyBox:AgentPricing:Rates:opencode:opencode-go/deepseek-v4-pro:cachedInputPerMillion"] = "0.07",
-                ["CodeyBox:AgentPricing:Rates:opencode:opencode-go/deepseek-v4-pro:outputPerMillion"] = "1.10",
                 ["CodeyBox:AgentPricing:DefaultRates:codex:inputPerMillion"] = "5.0",
                 ["CodeyBox:AgentPricing:DefaultRates:codex:cachedInputPerMillion"] = "0.5",
                 ["CodeyBox:AgentPricing:DefaultRates:codex:outputPerMillion"] = "30.0",

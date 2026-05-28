@@ -63,6 +63,12 @@ internal static class AgentPricingDefaults
         var baseline = new AgentPricingOptions();
         foreach (var (agentKey, modelMap) in parsed.Rates)
         {
+            if (modelMap is null)
+            {
+                throw new InvalidOperationException(
+                    $"AgentPricing: bundled defaults file at '{path}' has null rate bucket for agent '{agentKey}'");
+            }
+
             var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
             foreach (var (modelKey, rate) in modelMap)
             {

@@ -112,6 +112,23 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     }
 
     [Fact]
+    public void Load_NullAgentBucket_Throws()
+    {
+        Write("""
+            {
+              "Rates": {
+                "claude": null
+              }
+            }
+            """);
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentPricingDefaults.Load(_tempDir));
+
+        Assert.Contains("null rate bucket", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Load_NullRateEntry_Throws()
     {
         Write("""

@@ -13,30 +13,38 @@ internal static class AgentPricingEndpoints
     public static void Map(WebApplication app)
     {
         app.MapGet("/agent-pricing", (AgentPricingState pricingState) =>
-        {
-            var defaults = pricingState.Defaults;
-            var merge = pricingState.LastMerge;
+            Results.Ok(BuildAgentPricingDto(pricingState)));
+    }
 
-            return Results.Ok(new
+    /// <summary>
+    /// Maps the last applied merge through a cloned pricing snapshot so the HTTP
+    /// response cannot mutate (or observe mutations of) live orchestrator state.
+    /// </summary>
+    private static object BuildAgentPricingDto(AgentPricingState pricingState)
+    {
+        var defaults = pricingState.Defaults;
+        var merge = pricingState.LastMerge;
+        var snapshot = AgentPricingOptions.CloneSnapshot(merge.Options);
+
+        return new
+        {
+            meta = new
             {
-                meta = new
+                lastUpdated = defaults.Meta.LastUpdated,
+                sources = defaults.Meta.Sources,
+                notes = defaults.Meta.Notes,
+                sourcePath = defaults.SourcePath,
+                bundledFile = AgentPricingDefaults.FileName,
+                counts = new
                 {
-                    lastUpdated = defaults.Meta.LastUpdated,
-                    sources = defaults.Meta.Sources,
-                    notes = defaults.Meta.Notes,
-                    sourcePath = defaults.SourcePath,
-                    bundledFile = AgentPricingDefaults.FileName,
-                    counts = new
-                    {
-                        bundled = merge.BundledRateCount,
-                        operatorOverrides = merge.OperatorRateCount,
-                        total = merge.TotalRateCount,
-                        overlap = merge.OverlapCount,
-                    },
+                    bundled = merge.BundledRateCount,
+                    operatorOverrides = merge.OperatorRateCount,
+                    total = merge.TotalRateCount,
+                    overlap = merge.OverlapCount,
                 },
-                rates = merge.Options.Rates,
-                defaultRates = merge.Options.DefaultRates,
-            });
-        });
+            },
+            rates = snapshot.Rates,
+            defaultRates = snapshot.DefaultRates,
+        };
     }
 }
