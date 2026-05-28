@@ -628,6 +628,39 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
     }
 
     [Fact]
+    public void GetIsolatedRepoSandboxAccess_DefaultThrowsNotSupportedException_ForHostsThatDoNotBindMount()
+    {
+        // The default IGitHost.GetIsolatedRepoSandboxAccess implementation
+        // throws NotSupportedException because not every host can bind-mount
+        // an arbitrary bare-repo path (e.g. a host that exposes git only over
+        // a network transport has nothing to mount). PipelineRunner's merge
+        // and conflict-rework flows go through this entry point; a regression
+        // that silently downgraded the default to "return null" or a default
+        // SandboxRepositoryAccess would cause the orchestrator to wire up an
+        // empty mount list and the agent inside the sandbox would fail at
+        // `git clone /repo` with a confusing error rather than the host
+        // surfacing a clear, operator-readable capability mismatch.
+        //
+        // Drive the default by invoking it on minimal IGitHost stubs that do
+        // not override the method — both FixedRepoPathHost and RootlessGitHost
+        // qualify. Pin the exact exception type AND that the message names
+        // the missing capability so operators can grep diagnostics for it.
+        IGitHost fixedHost = new FixedRepoPathHost(
+            barePath: OperatingSystem.IsWindows()
+                ? @"C:\opt\codeybox\repos\b044f8bd.git"
+                : "/opt/codeybox/repos/b044f8bd.git");
+        IGitHost rootlessHost = new RootlessGitHost();
+
+        var fixedEx = Assert.Throws<NotSupportedException>(
+            () => fixedHost.GetIsolatedRepoSandboxAccess("/anywhere/staging.git"));
+        Assert.Contains("isolated bare repo", fixedEx.Message);
+
+        var rootlessEx = Assert.Throws<NotSupportedException>(
+            () => rootlessHost.GetIsolatedRepoSandboxAccess("/anywhere/staging.git"));
+        Assert.Contains("isolated bare repo", rootlessEx.Message);
+    }
+
+    [Fact]
     public void GetMergeStagingRoot_DefaultReturnsRepoParentDirectory_FixedLayoutHost()
     {
         // The default IGitHost.GetMergeStagingRoot implementation must return
