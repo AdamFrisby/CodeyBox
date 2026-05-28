@@ -72,6 +72,30 @@ public sealed class AgentClassRouterScoreTests
                 TimeSpan.FromHours(14),
                 TimeSpan.FromHours(22))]);
 
+    // ── Stored Agent preference is ignored during class routing ───────────────
+
+    [Fact]
+    public async Task StoredAgentPreference_IsIgnored_HigherScoringMemberWins()
+    {
+        var cls = FrontierClass(Sub(Claude, 100), Sub(Codex, 90));
+        var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            Agent = Codex,
+            AgentClassId = "frontier",
+            MinModelScore = 80,
+        };
+
+        var decision = await router.ResolveAsync(item, null, CancellationToken.None);
+
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.Equal(Codex, item.Agent);
+    }
+
     // ── Floor filter ──────────────────────────────────────────────────────────
 
     [Fact]

@@ -27,6 +27,64 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task StoredAgentPreferenceOutscored_OrchestratorRewritesAgentToRouterChoice()
+    {
+        var frontierClass = new AgentClass
+        {
+            Id = "frontier-coding",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = AgentKind.Codex,  Billing = AgentBilling.Subscription, QualityScore = 90 },
+            ],
+        };
+
+        var router = new AgentClassRouter(
+            [frontierClass],
+            [new FakeProbe(AgentKind.Claude, 50.0), new FakeProbe(AgentKind.Codex, 50.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, QuotaRecheckInterval = TimeSpan.FromSeconds(5) },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var tracking = new AgentTrackingPipeline(_store);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            Agent = AgentKind.Codex,
+            AgentClassId = "frontier-coding",
+            MinModelScore = 80,
+        };
+        await _store.CreateAsync(item);
+
+        var queue = new InMemoryTaskQueue();
+        var registry = new CancellationRegistry(CancellationToken.None);
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 1 };
+        var svc = new OrchestratorService(
+            queue, _store, tracking, registry, opts,
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: null);
+
+        await queue.EnqueueAsync(item.Id);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline && tracking.LastAgent is null)
+            await Task.Delay(20);
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Equal(AgentKind.Claude, tracking.LastAgent);
+
+        var stored = await _store.GetAsync(item.Id);
+        Assert.Equal(AgentKind.Claude, stored?.Agent);
+    }
+
+    [Fact]
     public async Task ClaudeExhausted_CodexAvailable_RoutesToCodex()
     {
         // Arrange: frontier-coding class — Claude sub (exhausted), Codex sub (available).
