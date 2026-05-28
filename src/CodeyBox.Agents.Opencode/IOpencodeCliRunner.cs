@@ -10,6 +10,7 @@ internal interface IOpencodeCliRunner
     /// Runs <c>{binary} models</c> and returns exit code plus captured streams.
     /// </summary>
     /// <exception cref="FileNotFoundException">When <paramref name="binary"/> cannot be executed.</exception>
+    /// <exception cref="System.ComponentModel.Win32Exception">On Linux/macOS when the binary is absent from PATH (ENOENT).</exception>
     Task<OpencodeCliRunResult> RunModelsAsync(string binary, CancellationToken ct);
 }
 

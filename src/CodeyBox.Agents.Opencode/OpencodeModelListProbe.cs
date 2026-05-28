@@ -38,12 +38,17 @@ public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
         try
         {
             var run = await _runner.RunModelsAsync(_binary, ct).ConfigureAwait(false);
+            if (OpencodeCliErrors.IsCliNotFoundExitCode(run.ExitCode))
+                return AgentModelListResult.Failed("opencode CLI not found");
             if (run.ExitCode != 0)
             {
                 _log?.LogDebug(
                     "opencode models exited {ExitCode}; stderr length {StderrLen}",
                     run.ExitCode, run.Stderr.Length);
-                return AgentModelListResult.Failed($"opencode models exited {run.ExitCode}");
+                var reason = string.IsNullOrWhiteSpace(run.Stderr)
+                    ? $"opencode models exited {run.ExitCode}"
+                    : $"opencode models exited {run.ExitCode}: {run.Stderr.Trim()}";
+                return AgentModelListResult.Failed(reason);
             }
 
             var ids = ParseModelsOutput(run.Stdout);
@@ -56,18 +61,18 @@ public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
             _log?.LogDebug("opencode models listed {Count} model id(s)", ids.Count);
             return AgentModelListResult.Success(ids);
         }
-        catch (FileNotFoundException)
-        {
-            return AgentModelListResult.Failed("opencode CLI not found");
-        }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            throw;
+            return AgentModelListResult.Failed("timeout");
+        }
+        catch (Exception ex) when (OpencodeCliErrors.IsCliNotFound(ex))
+        {
+            return AgentModelListResult.Failed("opencode CLI not found");
         }
         catch (Exception ex)
         {
             _log?.LogDebug(ex, "opencode models probe failed");
-            return AgentModelListResult.Failed($"opencode models failed: {ex.Message}");
+            return AgentModelListResult.Failed("opencode models failed");
         }
     }
 

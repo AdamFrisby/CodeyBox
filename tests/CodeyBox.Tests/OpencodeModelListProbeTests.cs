@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 
@@ -43,6 +44,20 @@ public sealed class OpencodeModelListProbeTests
         var ids = OpencodeModelListProbe.ParseModelsOutput(stdout);
 
         Assert.Equal(ExpectedModelIds, ids);
+    }
+
+    [Fact]
+    public void ParseModelsOutput_TruncatesAtMaxModelIds()
+    {
+        var lines = Enumerable.Range(0, OpencodeModelListProbe.MaxModelIds + 10)
+            .Select(i => $"opencode/model{i}");
+        var stdout = string.Join('\n', lines);
+
+        var ids = OpencodeModelListProbe.ParseModelsOutput(stdout);
+
+        Assert.Equal(OpencodeModelListProbe.MaxModelIds, ids.Count);
+        Assert.Equal("opencode/model0", ids[0]);
+        Assert.Equal($"opencode/model{OpencodeModelListProbe.MaxModelIds - 1}", ids[^1]);
     }
 
     [Fact]
@@ -96,6 +111,52 @@ public sealed class OpencodeModelListProbeTests
     }
 
     [Fact]
+    public async Task GetModelListAsync_Win32Exception_ReturnsCliNotFound()
+    {
+        var probe = new OpencodeModelListProbe(
+            new ThrowingOpencodeCliRunner(new Win32Exception(2, "No such file or directory")));
+
+        var result = await probe.GetModelListAsync(CancellationToken.None);
+
+        Assert.Equal("opencode CLI not found", result.FailureReason);
+        Assert.Empty(result.ModelIds);
+    }
+
+    [Fact]
+    public async Task GetModelListAsync_Exit127_ReturnsCliNotFound()
+    {
+        var probe = new OpencodeModelListProbe(new StubOpencodeCliRunner(127, "", "opencode: not found"));
+
+        var result = await probe.GetModelListAsync(CancellationToken.None);
+
+        Assert.Equal("opencode CLI not found", result.FailureReason);
+        Assert.Empty(result.ModelIds);
+    }
+
+    [Fact]
+    public async Task GetModelListAsync_GenericException_ReturnsFailed()
+    {
+        var probe = new OpencodeModelListProbe(new ThrowingOpencodeCliRunner(new IOException("disk full")));
+
+        var result = await probe.GetModelListAsync(CancellationToken.None);
+
+        Assert.Equal("opencode models failed", result.FailureReason);
+        Assert.Empty(result.ModelIds);
+    }
+
+    [Fact]
+    public async Task GetModelListAsync_Cancellation_ReturnsTimeout()
+    {
+        var probe = new OpencodeModelListProbe(new DelayingOpencodeCliRunner());
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+
+        var result = await probe.GetModelListAsync(cts.Token);
+
+        Assert.Equal("timeout", result.FailureReason);
+        Assert.Empty(result.ModelIds);
+    }
+
+    [Fact]
     public async Task GetModelListAsync_Success_FromStubRunner()
     {
         var stdout = File.ReadAllText(FixturePath);
@@ -117,5 +178,14 @@ public sealed class OpencodeModelListProbeTests
     {
         public Task<OpencodeCliRunResult> RunModelsAsync(string binary, CancellationToken ct) =>
             throw ex;
+    }
+
+    private sealed class DelayingOpencodeCliRunner : IOpencodeCliRunner
+    {
+        public async Task<OpencodeCliRunResult> RunModelsAsync(string binary, CancellationToken ct)
+        {
+            await Task.Delay(60_000, ct).ConfigureAwait(false);
+            return new OpencodeCliRunResult(0, "", "");
+        }
     }
 }
