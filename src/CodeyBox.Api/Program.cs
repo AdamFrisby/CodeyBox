@@ -371,7 +371,11 @@ builder.Services.AddSingleton<IPreMergeVerifier>(sp => new LocalGitPreMergeVerif
 builder.Services.AddSingleton<IPullRequestService, InMemoryPullRequestService>();
 
 // --- Agents ------------------------------------------------------------------
-builder.Services.AddSingleton<IAgentRunner, ClaudeAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner>(sp =>
+    new ClaudeAgentRunner(
+        sp.GetRequiredService<CodeyBox.Core.AgentDefaultsSnapshot>(),
+        sp.GetService<IClaudeTokenRotationPusher>(),
+        sp.GetRequiredService<CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig>()));
 builder.Services.AddSingleton<IAgentRunner, CopilotAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();

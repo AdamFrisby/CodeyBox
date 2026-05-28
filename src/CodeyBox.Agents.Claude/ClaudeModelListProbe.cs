@@ -107,7 +107,7 @@ public sealed class ClaudeModelListProbe : IAgentModelListProbe
         }
     }
 
-    private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
+    internal static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
     {
         await using var stream = await content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream);
