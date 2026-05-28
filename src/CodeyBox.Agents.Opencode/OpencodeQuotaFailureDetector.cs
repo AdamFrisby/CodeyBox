@@ -37,7 +37,7 @@ public sealed class OpencodeQuotaFailureDetector : IAgentQuotaFailureDetector
     /// </summary>
     private static readonly Regex[] UsageLimitReachedRegexes =
     [
-        new(@"(\d+)\s+hour usage limit reached\.\s*It will reset in\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new(@"(?:\d+)\s+hour usage limit reached\.\s*It will reset in\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new(@"weekly usage limit reached\.\s*It will reset in\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new(@"monthly usage limit reached\.\s*It will reset in\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new(@"\busage limit reached\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),

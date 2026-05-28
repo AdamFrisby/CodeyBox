@@ -171,6 +171,47 @@ public sealed class OpencodeQuotaFailureDetectorTests
     }
 
     [Fact]
+    public void Detect_MonthlyUsageLimitReached_ParsesResetAt()
+    {
+        const string stderr =
+            "monthly usage limit reached. It will reset in 4 hours 15 minutes.";
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+
+        var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(diff.TotalHours, 4.2, 4.3);
+    }
+
+    [Fact]
+    public void Detect_UsageLimitReachedFallback_NoResetPhrase_ReturnsLimitReachedWithNullResetAt()
+    {
+        const string stderr = "Provider blocked request: usage limit reached.";
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.Null(detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_UsageLimitReached_OnStdout_ClassifiesAsLimitReached()
+    {
+        const string stdout =
+            "monthly usage limit reached. It will reset in 1 hour 5 minutes.";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+    }
+
+    [Fact]
     public void Detect_UnrelatedStderr_DoesNotClassifyAsQuota()
     {
         Assert.Null(_detector.Detect(stderr: "npm: command not found", stdout: null));
