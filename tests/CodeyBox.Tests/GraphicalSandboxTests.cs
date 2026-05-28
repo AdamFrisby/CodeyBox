@@ -256,34 +256,73 @@ public sealed class GraphicalSandboxTests
     public async Task ComputerUseBridge_AppliesInputRateBudgetExpiryAndToolTimeouts()
     {
         await using var rateSandbox = new RecordingGraphicalSandbox(NonUniformPng);
-        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var rateTime = new ManualTimeProvider();
         var rateLimited = new ComputerUseBridge(new ComputerUseBridgeOptions
         {
             MaxInputEventsPerWindow = 1,
             RateLimitWindow = TimeSpan.FromMinutes(1),
-        }, () => now);
+        }, timeProvider: rateTime);
 
         await rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" });
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" }));
-        now += TimeSpan.FromMinutes(1) + TimeSpan.FromTicks(1);
+        rateTime.Advance(TimeSpan.FromMinutes(1) + TimeSpan.FromTicks(1));
         await rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" });
         Assert.Equal(2, rateSandbox.Events.Count);
 
-        await using var slowSandbox = new HangingGraphicalSandbox();
+        await using var hangingSandbox = new HangingGraphicalSandbox();
         var time = new ManualTimeProvider();
+        var toolTimeout = TimeSpan.FromMilliseconds(10);
         var timeoutBridge = new ComputerUseBridge(new ComputerUseBridgeOptions
         {
-            ToolCallTimeout = TimeSpan.FromMilliseconds(10),
+            ToolCallTimeout = toolTimeout,
         }, timeProvider: time);
 
-        var screenshotTask = timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "screenshot" });
-        time.Advance(TimeSpan.FromMilliseconds(10));
+        var screenshotTask = timeoutBridge.ExecuteAsync(hangingSandbox, new ComputerUseRequest { Action = "screenshot" });
+        await hangingSandbox.WaitUntilOperationEnteredAsync();
+        time.Advance(toolTimeout);
         await Assert.ThrowsAsync<TimeoutException>(() => screenshotTask);
 
-        var clickTask = timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "click" });
-        time.Advance(TimeSpan.FromMilliseconds(10));
+        hangingSandbox.PrepareForNextOperation();
+        var clickTask = timeoutBridge.ExecuteAsync(hangingSandbox, new ComputerUseRequest { Action = "click" });
+        await hangingSandbox.WaitUntilOperationEnteredAsync();
+        time.Advance(toolTimeout);
         await Assert.ThrowsAsync<TimeoutException>(() => clickTask);
+    }
+
+    [Fact]
+    public async Task ComputerUseBridge_ToolCallTimeout_UsesSystemTimeProvider()
+    {
+        await using var hangingSandbox = new HangingGraphicalSandbox();
+        var bridge = new ComputerUseBridge(new ComputerUseBridgeOptions
+        {
+            ToolCallTimeout = TimeSpan.FromMilliseconds(200),
+        });
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            bridge.ExecuteAsync(hangingSandbox, new ComputerUseRequest { Action = "screenshot" }));
+    }
+
+    [Fact]
+    public async Task ComputerUseBridge_PropagatesCallerCancellationAsOperationCanceled()
+    {
+        await using var hangingSandbox = new HangingGraphicalSandbox();
+        using var cts = new CancellationTokenSource();
+        var bridge = new ComputerUseBridge(new ComputerUseBridgeOptions
+        {
+            ToolCallTimeout = TimeSpan.FromMinutes(1),
+        });
+
+        var task = bridge.ExecuteAsync(
+            hangingSandbox,
+            new ComputerUseRequest { Action = "screenshot" },
+            cts.Token);
+        await hangingSandbox.WaitUntilOperationEnteredAsync();
+        await cts.CancelAsync();
+
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => task);
+        Assert.IsAssignableFrom<OperationCanceledException>(ex);
+        Assert.IsNotType<TimeoutException>(ex);
     }
 
     [Fact]
@@ -872,21 +911,38 @@ public sealed class GraphicalSandboxTests
 
     private sealed class HangingGraphicalSandbox : ISandbox
     {
+        private TaskCompletionSource _operationEntered = CreateOperationEnteredSource();
+
         public string Id => "hanging-graphical-test";
+
+        public Task WaitUntilOperationEnteredAsync(CancellationToken ct = default) =>
+            _operationEntered.Task.WaitAsync(ct);
+
+        public void PrepareForNextOperation() =>
+            _operationEntered = CreateOperationEnteredSource();
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(new SandboxExecResult(0, "", ""));
 
         public async Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
         {
+            SignalOperationEntered();
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return NonUniformPng;
         }
 
         public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
-            => Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        {
+            SignalOperationEntered();
+            return Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private void SignalOperationEntered() => _operationEntered.TrySetResult();
+
+        private static TaskCompletionSource CreateOperationEnteredSource() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     private sealed class QueueAuditor : IAuditor
