@@ -465,6 +465,7 @@ public sealed class SandboxLeakReaperTests
         else
             Assert.Single(reaper.GetLatestLeaks());
     }
+
 }
 
 // ── Test double ─────────────────────────────────────────────────────────────

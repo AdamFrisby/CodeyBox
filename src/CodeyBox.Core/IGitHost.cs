@@ -37,6 +37,153 @@ public interface IGitHost
     string GetRepoPath(string repositoryId)
         => throw new NotSupportedException("This git host does not expose a host repository path.");
 
+    /// <summary>
+    /// Returns the host directory where the merge / conflict-rework phase
+    /// should stage an isolated bare clone. The contract is provider-agnostic:
+    /// the returned directory MUST be usable as a bind-mount source by
+    /// whichever <see cref="ISandboxProvider"/> the orchestrator is wired up
+    /// with. Operators are responsible for configuring the host's bare-repo
+    /// root to satisfy that constraint; the default below colocates merge
+    /// staging with the durable bare repo so a single configured root covers
+    /// both.
+    ///
+    /// <para>Default returns the bare-repo path's parent directory so the
+    /// staged clone is a sibling of the durable bare repo and inherits
+    /// whatever bind-mount property <see cref="GetRepoPath"/> already has.
+    /// Hosts whose <see cref="GetRepoPath"/> does not sit in a
+    /// sandbox-mountable directory must override this method.</para>
+    /// </summary>
+    string GetMergeStagingRoot(string repositoryId)
+    {
+        var repoPath = GetRepoPath(repositoryId);
+        var parent = Path.GetDirectoryName(repoPath);
+        // Guard null AND empty: on Unix, a bare-repo path with no directory
+        // component (e.g. "id.git" relative path, or a hostile GetRepoPath
+        // override) yields string.Empty rather than null from
+        // Path.GetDirectoryName. Without the empty guard, the staging clone
+        // would land in the orchestrator process CWD and bypass the
+        // sandbox-mountable-root contract this method exists to enforce.
+        return string.IsNullOrEmpty(parent)
+            ? throw new InvalidOperationException(
+                $"unable to derive merge staging root from bare repo path '{repoPath}'")
+            : parent;
+    }
+
+    /// <summary>
+    /// Describes how a sandbox should be wired up to reach an alternative
+    /// host-side bare repo path (e.g. the merge / conflict-rework phase's
+    /// isolated bare clone). The sandbox-side semantics match
+    /// <see cref="GetSandboxAccess"/> so the agent observes the same clone
+    /// URL/mount path it would under the normal flow.
+    ///
+    /// <para>Default throws — only hosts that bind-mount real bare repos
+    /// need to implement this.</para>
+    /// </summary>
+    SandboxRepositoryAccess GetIsolatedRepoSandboxAccess(string isolatedRepoHostPath)
+        => throw new NotSupportedException(
+            "This git host does not support sandbox access for an isolated bare repo path.");
+
+    /// <summary>
+    /// Name of the in-flight marker file the host writes inside a freshly
+    /// staged merge clone to flag the directory as actively in use by the
+    /// merge / conflict-rework pipeline. The marker exists for the lifetime
+    /// of the orchestrator's create-then-mount window; any host-side
+    /// cleanup (existing or future) MUST skip directories whose top level
+    /// contains this file. Documented on the interface so the convention
+    /// is visible to operators who write cron-driven cleanup scripts
+    /// alongside the orchestrator. Hosts MAY additionally drop a sibling
+    /// sentinel file alongside the directory; the sibling sentinel covers
+    /// the brief create-window before any in-directory marker is writable.
+    /// </summary>
+    public const string IsolatedMergeCloneInFlightMarkerFileName = ".codeybox-merge-in-flight";
+
+    /// <summary>
+    /// Suffix the host appends to the staging clone's directory name to
+    /// form a SIBLING marker file (next to the directory, in the staging
+    /// root). The sibling marker is written BEFORE the host runs
+    /// <c>git clone --bare</c> so external host-side cleanup honoring the
+    /// marker convention also covers the clone window — the in-directory
+    /// marker cannot be written before the clone because <c>git clone
+    /// --bare</c> refuses non-empty targets. Operators implementing
+    /// cleanup scripts must check for EITHER the in-directory marker OR
+    /// the sibling sentinel to be safe across the full lifetime.
+    /// </summary>
+    public const string IsolatedMergeCloneInFlightSiblingSuffix = ".inflight";
+
+    /// <summary>
+    /// Stages an isolated bare clone of the work item's host repo so the
+    /// merge / conflict-rework phase can mutate refs without touching the
+    /// durable host bare repo. The returned host path lives under
+    /// <see cref="GetMergeStagingRoot"/> and is suitable as a bind-mount
+    /// source for the configured <see cref="ISandboxProvider"/>. The host
+    /// is responsible for any on-disk verification the bare-repo layout
+    /// requires (HEAD file, objects/, etc.) — the orchestrator only sees
+    /// the returned path. The implementation MUST write the in-flight
+    /// marker (<see cref="IsolatedMergeCloneInFlightMarkerFileName"/>)
+    /// before returning so any concurrent host-side cleanup that honors
+    /// the marker convention will skip the directory.
+    ///
+    /// <para>Default throws — hosts that don't model a real bare repo
+    /// don't implement this method (and the merge / conflict-rework
+    /// flows do not run against them).</para>
+    /// </summary>
+    Task<string> CreateIsolatedMergeCloneAsync(
+        string repositoryId,
+        WorkItemId workItemId,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This git host does not support isolated merge clone staging.");
+
+    /// <summary>
+    /// Re-stages the isolated bare clone at <paramref name="targetPath"/>
+    /// after the host directory has gone missing between create-time and
+    /// mount-time (e.g. tmpwatch reaping, future host-side cleanup, or an
+    /// orchestrator retry from a stranded prior attempt). The implementation
+    /// MUST refuse paths outside its staging root before any filesystem
+    /// mutation — orchestrator code calls this with a path it received from
+    /// <see cref="CreateIsolatedMergeCloneAsync"/>, but a defensive
+    /// containment check here prevents a future wiring bug from turning the
+    /// restore into an arbitrary directory delete. The implementation MUST
+    /// re-write the in-flight marker after restoring so the directory's
+    /// in-flight state is observable again.
+    /// </summary>
+    Task RestoreIsolatedMergeCloneAsync(
+        string repositoryId,
+        string targetPath,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This git host does not support isolated merge clone restore.");
+
+    /// <summary>
+    /// Removes the host-side artifacts produced by
+    /// <see cref="CreateIsolatedMergeCloneAsync"/>: the staging bare-clone
+    /// directory itself AND any in-flight markers (in-directory or sibling)
+    /// the host wrote. Best-effort — implementations log failures rather
+    /// than throwing so a partial cleanup does not mask the original merge
+    /// outcome.
+    ///
+    /// <para>Default falls back to a plain recursive directory delete for
+    /// hosts that don't track auxiliary marker files. Operators wiring a
+    /// custom host that writes markers must override this to clean up the
+    /// marker alongside the directory.</para>
+    /// </summary>
+    Task DisposeIsolatedMergeCloneAsync(
+        string repositoryId,
+        string targetPath,
+        CancellationToken ct = default)
+    {
+        if (!string.IsNullOrWhiteSpace(targetPath) && Directory.Exists(targetPath))
+        {
+            try { Directory.Delete(targetPath, recursive: true); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // best-effort
+                _ = ex;
+            }
+        }
+        return Task.CompletedTask;
+    }
+
     /// <summary>Returns the resolved default branch name for the repo.</summary>
     Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default);
 

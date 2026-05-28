@@ -486,6 +486,32 @@ public sealed record SandboxMount
     public long? SizeBytes { get; init; }
 }
 
+/// <summary>
+/// Thrown by an <see cref="ISandboxProvider"/> when a bind mount fails because
+/// the host source path does not exist at mount time. Carries
+/// <see cref="HostPath"/> so the orchestrator can decide whether the path is
+/// one it knows how to recreate (e.g. the merge-phase isolated bare clone) and
+/// retry <see cref="ISandboxProvider.CreateAsync"/> after re-creating the
+/// source — keeping recovery in orchestration rather than threading a
+/// behavioral callback through the cross-provider mount DTO.
+/// </summary>
+public sealed class SandboxMountSourceMissingException : Exception
+{
+    public string HostPath { get; }
+
+    public SandboxMountSourceMissingException(string hostPath, string message)
+        : base(message)
+    {
+        HostPath = hostPath;
+    }
+
+    public SandboxMountSourceMissingException(string hostPath, string message, Exception inner)
+        : base(message, inner)
+    {
+        HostPath = hostPath;
+    }
+}
+
 public sealed record SandboxResourceLimits
 {
     public int? CpuCount { get; init; }
