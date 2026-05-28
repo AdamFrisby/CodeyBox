@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -429,7 +430,123 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
         AssertNoStagingDirsRemain(tp.GitRoot);
     }
 
+    /// <summary>
+    /// End-to-end exercise of the orchestrator-driven mount heal path at the
+    /// CONFLICT-REWORK call site (<c>PipelineRunner.RunConflictReworkAgentAsync</c>,
+    /// PipelineRunner.cs:5649). The companion test
+    /// <see cref="ConflictMergePhase_StagingReapedBeforeMergeSandboxCreate_OrchestratorRetriesAndPipelineCompletesDone"/>
+    /// pins the merge-phase call site (PipelineRunner.cs:3675); this test pins
+    /// the rework iteration's call site because a regression that bypassed
+    /// <c>CreateMergeSandboxWithStagingRestoreAsync</c> at line 5649 only —
+    /// e.g. a copy-paste mistake routing rework through a plain
+    /// <c>ISandboxProvider.CreateAsync</c> — would not be caught by the merge-
+    /// phase test or by the helper-direct unit tests in
+    /// <see cref="MergePhaseIsolatedRepoStagingTests"/>, which invoke the
+    /// helper directly rather than through the rework call site.
+    ///
+    /// <para>Flow:
+    /// <list type="number">
+    ///   <item>Merge phase produces its isolated staging clone; the hostile
+    ///   provider passes the merge-phase mount through (it is the first
+    ///   distinct staging path seen).</item>
+    ///   <item>The merge-phase text-only resolver has no plan queued, so it
+    ///   surfaces a <see cref="MergeConflictResolutionFailedException"/> and
+    ///   the rework iteration engages.</item>
+    ///   <item>The rework iteration creates a SECOND staging clone (a
+    ///   distinct codeybox-merge-*.git path). On the first CreateAsync that
+    ///   names this path, the hostile provider reaps the directory and
+    ///   throws <see cref="SandboxMountSourceMissingException"/> — matching
+    ///   the b044f8bd multipass exists=no failure mode.</item>
+    ///   <item><c>CreateMergeSandboxWithStagingRestoreAsync</c> at line 5649
+    ///   catches, calls <c>RestoreIsolatedMergeRepositoryAsync</c>, and
+    ///   retries CreateAsync.</item>
+    ///   <item>The retried CreateAsync passes through; the rework agent
+    ///   resolves the conflict and the pipeline reaches Done.</item>
+    /// </list></para>
+    /// </summary>
+    [Fact]
+    public async Task ConflictReworkPhase_StagingReapedBeforeReworkSandboxCreate_OrchestratorRetriesAndPipelineCompletesDone()
+    {
+        var seed = await CreateLargerSeedAsync();
+        var auditor = new MainAdvancingAuditor(_workspace, "shared.txt", "main side\n");
+
+        // Targets the rework-iteration staging mount only. The merge-phase
+        // mount happens first and is passed through; the next distinct
+        // staging path the provider sees (= the rework iteration's bare
+        // clone) is reaped exactly once, after which the orchestrator's
+        // heal path runs and the retry succeeds.
+        var healProvider = new ReworkIterationStagingReapingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed, auditors: [auditor], sandboxProvider: healProvider);
+        auditor.GitRoot = tp.GitRoot;
+
+        // Drive the conflict path. NO ConflictResolutionPlan is queued, so
+        // the merge-phase text-only resolver fails and the orchestrator
+        // enters the rework iteration — the path under test.
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("shared.txt", "work side\n"));
+        tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
+        {
+            // Resolve the conflict by keeping both intents, then continue.
+            await SandboxWriteFileAsync(sandbox, workDir, "shared.txt", "main side\nwork side\n", ct);
+            await SandboxRun(sandbox, ct, "git", "-C", workDir, "add", "shared.txt");
+            await SandboxRun(sandbox, ct, "git", "-C", workDir,
+                "-c", "core.editor=true",
+                "-c", "sequence.editor=true",
+                "rebase", "--continue");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotNull(final.MergeSha);
+        // The rework iteration must have actually engaged. Without this
+        // assertion the test could pass vacuously if the merge phase
+        // somehow recovered and skipped rework altogether.
+        Assert.Equal(1, final.ConflictReworkAttempts);
+
+        // The reap-and-throw branch must have fired AT THE REWORK CALL SITE
+        // (i.e. on the rework iteration's staging path). A regression that
+        // routed line 5649 through plain CreateAsync would still record a
+        // missing-source throw here, but the pipeline would NOT reach Done
+        // because the orchestrator would never re-clone the staging dir.
+        // The Done assertion above combined with this throw counter pin
+        // both halves: the failure was injected AND the heal path ran.
+        Assert.True(healProvider.ReworkStagingMissingSourceThrows > 0,
+            "rework-iteration SandboxMountSourceMissingException was never thrown — " +
+            "either the rework call site bypassed the heal helper, the merge phase " +
+            "never reached rework, or the test setup failed to produce a second staging path");
+
+        // Finally-block cleanup must still have removed both staging clones
+        // after the pipeline completed (recovery is orthogonal to cleanup).
+        AssertNoStagingDirsRemain(tp.GitRoot);
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
+
+    private static async Task SandboxRun(ISandbox sandbox, CancellationToken ct, params string[] argv)
+    {
+        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
+        if (!r.Success)
+            throw new InvalidOperationException(
+                $"sandbox command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}\n{r.Stdout}");
+    }
+
+    private static async Task SandboxWriteFileAsync(ISandbox sandbox, string workDir, string relPath, string content, CancellationToken ct)
+    {
+        var r = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$0\"", $"{workDir}/{relPath}"],
+            Stdin = content,
+        }, ct);
+        if (!r.Success)
+            throw new InvalidOperationException(
+                $"sandbox write failed (exit {r.ExitCode}) for {relPath}: {r.Stderr}");
+    }
 
     private static void AssertNoStagingDirsRemain(string gitRoot)
     {
@@ -665,6 +782,83 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
                 throw new SandboxMountSourceMissingException(
                     mount.HostPath,
                     $"simulated multipass mount source missing: {mount.HostPath}");
+            }
+
+            return _inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    /// <summary>
+    /// ISandboxProvider wrapper that targets the CONFLICT-REWORK call site
+    /// (<see cref="PipelineRunner.RunConflictReworkAgentAsync"/>,
+    /// PipelineRunner.cs:5649) — companion to
+    /// <see cref="ReapingThenRetryingSandboxProvider"/>, which targets the
+    /// merge-phase call site. The merge phase always runs first and produces
+    /// the first staging path the provider sees; that path is passed through
+    /// untouched. The rework iteration produces a SECOND, distinct staging
+    /// path (a new codeybox-merge-*.git bare clone). The first CreateAsync
+    /// naming that second path is reaped: the directory is deleted and
+    /// <see cref="SandboxMountSourceMissingException"/> is thrown to mimic
+    /// what <c>MultipassSandboxProvider.MountSingleBindWithRetryAsync</c>
+    /// does on <c>exists=no</c>. The orchestrator's
+    /// <c>CreateMergeSandboxWithStagingRestoreAsync</c> at line 5649 catches,
+    /// restores, and retries; the retried CreateAsync passes through to the
+    /// inner provider so the rework iteration can complete.
+    ///
+    /// <para>The two-staging-path design is load-bearing: passing the
+    /// merge-phase mount through ensures the failure injection is unique to
+    /// the rework call site, so the test's signal (pipeline reaches Done +
+    /// throws == 1) only fires when the rework call site really wired
+    /// through the heal helper.</para>
+    /// </summary>
+    private sealed class ReworkIterationStagingReapingSandboxProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+        private readonly HashSet<string> _stagingPathsSeen = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _alreadyReaped = new(StringComparer.Ordinal);
+        private string? _firstStagingPath;
+        public int ReworkStagingMissingSourceThrows { get; private set; }
+
+        public ReworkIterationStagingReapingSandboxProvider(ISandboxProvider inner) => _inner = inner;
+
+        public string Name => _inner.Name;
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            foreach (var mount in spec.Mounts)
+            {
+                if (mount.HostPath is null) continue;
+                var isStagingClone = Path.GetFileName(mount.HostPath)
+                    .StartsWith("codeybox-merge-", StringComparison.Ordinal)
+                    && mount.HostPath.EndsWith(".git", StringComparison.Ordinal);
+                if (!isStagingClone) continue;
+
+                _stagingPathsSeen.Add(mount.HostPath);
+                _firstStagingPath ??= mount.HostPath;
+
+                // First staging path (merge phase): pass through unchanged
+                // — this test only targets the rework call site.
+                if (string.Equals(mount.HostPath, _firstStagingPath, StringComparison.Ordinal))
+                    continue;
+
+                // Second+ staging path (rework iteration): reap exactly once.
+                // The orchestrator's heal retry then sees the path back on
+                // disk and the next CreateAsync for the same path passes
+                // through normally.
+                if (!_alreadyReaped.Add(mount.HostPath)) continue;
+
+                if (Directory.Exists(mount.HostPath))
+                    Directory.Delete(mount.HostPath, recursive: true);
+                ReworkStagingMissingSourceThrows++;
+                throw new SandboxMountSourceMissingException(
+                    mount.HostPath,
+                    $"simulated multipass mount source missing at rework call site: {mount.HostPath}");
             }
 
             return _inner.CreateAsync(spec, ct);
