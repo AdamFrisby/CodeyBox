@@ -231,6 +231,146 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
     }
 
     /// <summary>
+    /// AC#3 with an external, host-side deleter present: simulates the
+    /// scenario the b044f8bd post-mortem suspected (tmpwatch / cron /
+    /// future host-side reaper sweeping codeybox-merge-*.git under
+    /// GitRoot). The deleter respects the documented in-flight marker
+    /// convention — directories containing
+    /// <see cref="IGitHost.IsolatedMergeCloneInFlightMarkerFileName"/>
+    /// are skipped — so an in-flight merge survives even with the
+    /// deleter running tight loops alongside the merge phase. The
+    /// staging window is widened by a larger multi-file seed so the
+    /// deleter has many sweep iterations overlapping with the create →
+    /// mount window. Pins the marker contract end-to-end: if a future
+    /// regression dropped the marker write, the deleter would race
+    /// through and reap the in-flight directory mid-mount — the same
+    /// failure class b044f8bd tracked, with the same operator-visible
+    /// symptom ("Source path does not exist").
+    ///
+    /// <para>Test scope: the deleter is a stand-in for any cron-driven
+    /// or daemon-driven cleanup that walks the bare-repo root. The
+    /// marker convention is documented on
+    /// <see cref="IGitHost.IsolatedMergeCloneInFlightMarkerFileName"/>
+    /// so operator-authored cleanup scripts honor the same rule this
+    /// test pins.</para>
+    /// </summary>
+    [Fact]
+    public async Task ConflictMergePhase_HostSideDeleterRespectsInFlightMarker_PipelineCompletesDone()
+    {
+        var seed = await CreateLargerSeedAsync();
+        var auditor = new MainAdvancingAuditor(_workspace, "shared.txt", "main side\n");
+
+        var stagingObserver = new StagingMountObservingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed, auditors: [auditor], sandboxProvider: stagingObserver);
+        auditor.GitRoot = tp.GitRoot;
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("shared.txt", "work side\n"));
+        tp.Agent.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            Assert.Equal("shared.txt", file.Path);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["shared.txt"] = "main side\nwork side\n",
+            };
+        });
+
+        // External deleter: tmpwatch-style host-side cleanup that walks the
+        // bare-repo root every loop iteration and deletes
+        // codeybox-merge-*.git directories that do NOT contain the
+        // documented in-flight marker. The deleter is the stand-in for a
+        // real-world host-side reaper / cron script; the marker contract
+        // is the only thing keeping it off in-flight staging.
+        using var deleterCts = new CancellationTokenSource();
+        var deleterStats = new MarkerRespectingDeleterStats();
+        var deleterLoop = Task.Run(async () =>
+        {
+            while (!deleterCts.IsCancellationRequested)
+            {
+                if (Directory.Exists(tp.GitRoot))
+                {
+                    foreach (var candidate in Directory.EnumerateDirectories(
+                                 tp.GitRoot, "codeybox-merge-*", SearchOption.TopDirectoryOnly))
+                    {
+                        // The contract is OR: an in-flight directory is
+                        // ANY directory whose in-directory marker exists,
+                        // OR whose sibling sentinel exists. The sibling
+                        // sentinel is the load-bearing one during the
+                        // create window (before clone-finish the
+                        // in-directory marker cannot be written yet).
+                        var inDirMarker = Path.Combine(
+                            candidate, IGitHost.IsolatedMergeCloneInFlightMarkerFileName);
+                        var siblingMarker = candidate
+                            + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix;
+                        if (File.Exists(inDirMarker) || File.Exists(siblingMarker))
+                        {
+                            deleterStats.IncrementSkipped();
+                            continue;
+                        }
+
+                        try
+                        {
+                            Directory.Delete(candidate, recursive: true);
+                            deleterStats.IncrementDeleted();
+                        }
+                        catch (DirectoryNotFoundException)
+                        {
+                            // Race with the orchestrator's finally-block
+                            // cleanup — either side winning is fine.
+                        }
+                        catch (IOException)
+                        {
+                            // The orchestrator is mid-cleanup of the same
+                            // directory; the next sweep will see it gone.
+                        }
+                    }
+                }
+                await Task.Yield();
+            }
+        }, deleterCts.Token);
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        try
+        {
+            await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        }
+        finally
+        {
+            deleterCts.Cancel();
+            try { await deleterLoop; } catch (OperationCanceledException) { /* expected */ }
+        }
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotNull(final.MergeSha);
+
+        // The deleter must have observed the in-flight marker at least
+        // once — otherwise the test passed vacuously (e.g. if the
+        // deleter loop never ticked while staging was on disk). The
+        // existing observer also asserts the bind source was a valid
+        // bare repo at sandbox create time, so a regression that
+        // dropped the marker (letting the deleter reap mid-flight)
+        // would surface as either an observer failure or a non-Done
+        // pipeline state.
+        Assert.True(deleterStats.SkippedCount > 0,
+            "deleter never observed the in-flight marker on a staging directory — " +
+            "either the marker was dropped or the deleter loop did not overlap with staging");
+        Assert.True(stagingObserver.StagingMountObservations > 0,
+            "merge-phase staging mount was never observed mid-flight");
+
+        // After completion, no codeybox-merge-*.git directories remain
+        // under GitRoot — finally-block cleanup removed the marker and
+        // the directory together; the deleter (if still running) sees
+        // no in-flight marker and could have removed any residue, but
+        // the orchestrator's own cleanup is the load-bearing path.
+        AssertNoStagingDirsRemain(tp.GitRoot);
+    }
+
+    /// <summary>
     /// The finally-block in <see cref="PipelineRunner.RunAgentMergePhaseAsync"/>
     /// must clean up the isolated bare clone on every exit path, including
     /// when the body throws before sandbox creation finishes. This test
@@ -380,6 +520,21 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
             await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{context.BaseBranch}");
             return new AuditResult(true, []);
         }
+    }
+
+    /// <summary>
+    /// Thread-safe counters for the marker-respecting host-side deleter.
+    /// Lets the AC#3 test assert the deleter actually observed the
+    /// in-flight marker at least once during the merge phase.
+    /// </summary>
+    private sealed class MarkerRespectingDeleterStats
+    {
+        private int _skipped;
+        private int _deleted;
+        public int SkippedCount => Volatile.Read(ref _skipped);
+        public int DeletedCount => Volatile.Read(ref _deleted);
+        public void IncrementSkipped() => Interlocked.Increment(ref _skipped);
+        public void IncrementDeleted() => Interlocked.Increment(ref _deleted);
     }
 
     /// <summary>
@@ -575,6 +730,10 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
         public SandboxRepositoryAccess GetSandboxAccess(string repositoryId) => _inner.GetSandboxAccess(repositoryId);
         public string GetRepoPath(string repositoryId) => _inner.GetRepoPath(repositoryId);
         public string GetMergeStagingRoot(string repositoryId) => _inner.GetMergeStagingRoot(repositoryId);
+        public Task<string> CreateIsolatedMergeCloneAsync(string repositoryId, WorkItemId workItemId, CancellationToken ct = default)
+            => _inner.CreateIsolatedMergeCloneAsync(repositoryId, workItemId, ct);
+        public Task RestoreIsolatedMergeCloneAsync(string repositoryId, string targetPath, CancellationToken ct = default)
+            => _inner.RestoreIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
         public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
             => _inner.GetDefaultBranchAsync(repositoryId, ct);
         public Task PushToUpstreamAsync(

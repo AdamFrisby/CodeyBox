@@ -3950,13 +3950,14 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         finally
         {
-            // Clean up the isolated bare clone on every exit path (success or
-            // exception). Before this guard, a failed sandbox create, failed
+            // Clean up the isolated bare clone AND any in-flight markers on
+            // every exit path (success or exception) via the host-side
+            // contract. Before this guard, a failed sandbox create, failed
             // mount, or mid-phase throw left codeybox-merge-*.git directories
-            // accumulating as siblings of the durable bare repo under
-            // GitRootDirectory — both an operator-hygiene issue and a
-            // potential disk-pressure source over time.
-            DeleteDirectoryBestEffort(isolatedMergeRepoPath);
+            // (and the sibling in-flight sentinel) accumulating as siblings
+            // of the durable bare repo under GitRootDirectory.
+            if (isolatedMergeRepoPath is not null)
+                await _gitHost.DisposeIsolatedMergeCloneAsync(repoId, isolatedMergeRepoPath, CancellationToken.None);
         }
     }
 
@@ -4236,93 +4237,34 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Bare-clones the work item's repo so the merge / conflict-rework phase
-    /// can mutate refs without touching the durable host bare repo.
-    ///
-    /// <para>The staging directory comes from <see cref="IGitHost.GetMergeStagingRoot"/>
-    /// rather than <see cref="Path.GetTempPath"/>: the configured sandbox
-    /// provider may restrict bind-mount sources (e.g. snap-confined Multipass
-    /// only reads inside <c>~/snap/multipass/common/</c>), and routing through
-    /// the git host keeps that decision on the side that knows where its
-    /// durable bare repos already live so a single operator-configured root
-    /// satisfies both.</para>
+    /// Stages an isolated bare clone of the work item's repo for the merge /
+    /// conflict-rework phase by delegating to
+    /// <see cref="IGitHost.CreateIsolatedMergeCloneAsync"/>. The host owns
+    /// bare-repo layout and the on-disk verification — the orchestrator only
+    /// sees the returned host path. Bare-repo creation, HEAD verification,
+    /// and the in-flight marker write all live on the host side so a single
+    /// operator-configured root (the durable bare-repo directory) satisfies
+    /// both the durable repo and the merge staging clone constraints
+    /// (e.g. snap-confined Multipass's AppArmor profile only allows reads
+    /// inside <c>~/snap/multipass/common/</c>).
     /// </summary>
-    internal async Task<string> CreateIsolatedMergeRepositoryAsync(string repoId, WorkItemId itemId, CancellationToken ct)
-    {
-        var source = _gitHost.GetRepoPath(repoId);
-        var stagingRoot = _gitHost.GetMergeStagingRoot(repoId);
-        var target = Path.Combine(stagingRoot, $"codeybox-merge-{itemId}-{Guid.NewGuid():N}.git");
-        await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, target);
-        VerifyIsolatedMergeRepositoryOnDisk(target, "create");
-        _log.LogInformation(
-            "isolated merge clone landed for work item {WorkItem}: {Target}",
-            itemId, target);
-        return target;
-    }
+    internal Task<string> CreateIsolatedMergeRepositoryAsync(string repoId, WorkItemId itemId, CancellationToken ct)
+        => _gitHost.CreateIsolatedMergeCloneAsync(repoId, itemId, ct);
 
     /// <summary>
-    /// Asserts a freshly-run <c>git clone --bare</c> actually produced the
-    /// expected bare-repo layout on disk: the target directory exists AND
-    /// contains a HEAD file. Called immediately after RunHostGitAsync returns
-    /// from a clone so a silent/partial clone or an external process that
-    /// removed the directory between clone-exit and verification surfaces here
-    /// instead of as a confusing "Source path does not exist" mount failure
-    /// later — the exact failure class b044f8bd tracked. The HEAD file is
-    /// created by <c>git clone --bare</c> and is the cheapest single check
-    /// that distinguishes a successful bare clone from an empty directory.
-    ///
-    /// <para>Extracted as an <c>internal static</c> so the verification
-    /// failure path is unit-testable independently of running a real
-    /// <c>git clone</c>: a regression that inverted the condition or
-    /// removed the call site would still be caught by direct calls in tests
-    /// covering both the empty-directory and missing-HEAD failure modes.</para>
-    /// </summary>
-    internal static void VerifyIsolatedMergeRepositoryOnDisk(string targetPath, string operationContext)
-    {
-        var dirExists = Directory.Exists(targetPath);
-        var headExists = File.Exists(Path.Combine(targetPath, "HEAD"));
-        if (!dirExists || !headExists)
-        {
-            throw new InvalidOperationException(
-                $"isolated merge clone {operationContext} did not land on disk: target={targetPath} " +
-                $"exists={dirExists} head={headExists}");
-        }
-    }
-
-    /// <summary>
-    /// Re-clones the bare repo back into <paramref name="targetPath"/> after
-    /// the path has gone missing between create-time and mount-time. Called
-    /// from <see cref="CreateMergeSandboxWithStagingRestoreAsync"/> when the
+    /// Re-stages the isolated bare clone at <paramref name="targetPath"/>
+    /// after the path has gone missing between create-time and mount-time.
+    /// Delegates to <see cref="IGitHost.RestoreIsolatedMergeCloneAsync"/>
+    /// which owns containment, clone, on-disk verification, and the
+    /// in-flight marker re-write. Called from
+    /// <see cref="CreateMergeSandboxWithStagingRestoreAsync"/> when the
     /// sandbox provider surfaces a
     /// <see cref="SandboxMountSourceMissingException"/> naming the staging
-    /// path, so the merge mount step can self-heal a racing cleanup without
-    /// aborting the whole work item. Keeping recovery in orchestration
-    /// (rather than threading a behavioral callback through the cross-provider
-    /// mount DTO) lets every sandbox provider stay merge-staging-agnostic.
+    /// path, so the merge mount step can self-heal without aborting the
+    /// work item.
     /// </summary>
-    internal async Task RestoreIsolatedMergeRepositoryAsync(string repoId, string targetPath, CancellationToken ct)
-    {
-        var source = _gitHost.GetRepoPath(repoId);
-        var stagingRoot = _gitHost.GetMergeStagingRoot(repoId);
-        // Containment guard: the recursive delete below must only ever land
-        // inside the configured staging root. A future wiring bug or a
-        // hostile IGitHost override that returned a path outside the root
-        // would otherwise turn this into an arbitrary host-directory delete.
-        var canonicalRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(stagingRoot));
-        var canonicalTarget = Path.GetFullPath(targetPath);
-        if (!canonicalTarget.StartsWith(canonicalRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            && !string.Equals(canonicalTarget, canonicalRoot, StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                $"refusing to restore isolated merge clone outside staging root: target={canonicalTarget} root={canonicalRoot}");
-        }
-        // git clone refuses to overwrite an existing target — defensive remove
-        // in case a partial directory was left behind. DeleteDirectoryBestEffort
-        // is a no-op when the path is absent.
-        DeleteDirectoryBestEffort(targetPath);
-        await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, targetPath);
-        VerifyIsolatedMergeRepositoryOnDisk(targetPath, "restore");
-    }
+    internal Task RestoreIsolatedMergeRepositoryAsync(string repoId, string targetPath, CancellationToken ct)
+        => _gitHost.RestoreIsolatedMergeCloneAsync(repoId, targetPath, ct);
 
     /// <summary>
     /// Cap on how many times we attempt CreateAsync for a merge / conflict-rework
@@ -4341,7 +4283,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <see cref="ISandboxProvider.CreateAsync"/>. Returns the live sandbox or
     /// rethrows the original failure if recovery cannot land the staging clone.
     /// </summary>
-    private async Task<ISandbox> CreateMergeSandboxWithStagingRestoreAsync(
+    internal async Task<ISandbox> CreateMergeSandboxWithStagingRestoreAsync(
         SandboxSpec spec,
         string repoId,
         string stagingPath,
@@ -5842,7 +5784,7 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         finally
         {
-            DeleteDirectoryBestEffort(isolatedRepoPath);
+            await _gitHost.DisposeIsolatedMergeCloneAsync(repoId, isolatedRepoPath, CancellationToken.None);
         }
     }
 

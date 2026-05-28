@@ -127,6 +127,147 @@ public sealed class LocalGitHost : IGitHost
         return new SandboxRepositoryAccess(SandboxRepoMountPath, [mount], SandboxNetworkPolicy.Denied);
     }
 
+    public async Task<string> CreateIsolatedMergeCloneAsync(
+        string repositoryId,
+        WorkItemId workItemId,
+        CancellationToken ct = default)
+    {
+        var source = GetRepoPath(repositoryId);
+        var stagingRoot = ((IGitHost)this).GetMergeStagingRoot(repositoryId);
+        var target = Path.Combine(stagingRoot, $"codeybox-merge-{workItemId}-{Guid.NewGuid():N}.git");
+
+        // Write the SIBLING in-flight sentinel BEFORE the clone runs. The
+        // sentinel covers the entire create window — between clone-start
+        // and clone-end the target directory exists but has no
+        // in-directory marker yet, and a host-side cleanup honoring only
+        // the in-directory marker would race that gap. The sibling sentinel
+        // closes that race and is the load-bearing artifact a marker-respecting
+        // external cleaner should check.
+        WriteInFlightSibling(target, workItemId);
+
+        try
+        {
+            var rc = await RunGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, target);
+            if (rc.ExitCode != 0)
+                throw new InvalidOperationException(
+                    $"git clone --bare for merge staging failed (exit {rc.ExitCode}): {rc.Stderr}{rc.Stdout}");
+            VerifyIsolatedMergeCloneOnDisk(target, "create");
+            WriteInDirectoryMarker(target, workItemId);
+            _log.LogInformation(
+                "isolated merge clone landed for work item {WorkItem}: {Target}",
+                workItemId, target);
+            return target;
+        }
+        catch
+        {
+            // Best-effort sentinel cleanup if clone or verification failed.
+            TryDeleteFile(target + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix);
+            throw;
+        }
+    }
+
+    public async Task RestoreIsolatedMergeCloneAsync(
+        string repositoryId,
+        string targetPath,
+        CancellationToken ct = default)
+    {
+        var source = GetRepoPath(repositoryId);
+        var stagingRoot = ((IGitHost)this).GetMergeStagingRoot(repositoryId);
+        var canonicalRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(stagingRoot));
+        var canonicalTarget = Path.GetFullPath(targetPath);
+        if (!canonicalTarget.StartsWith(canonicalRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            && !string.Equals(canonicalTarget, canonicalRoot, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"refusing to restore isolated merge clone outside staging root: target={canonicalTarget} root={canonicalRoot}");
+        }
+        if (Directory.Exists(targetPath))
+        {
+            try { Directory.Delete(targetPath, recursive: true); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _log.LogWarning(ex, "Failed to clear partial merge staging residue at {Path}", targetPath);
+            }
+        }
+        // Re-write the sibling sentinel before re-cloning so the heal path
+        // matches the create path's in-flight protection.
+        WriteInFlightSibling(targetPath, workItemId: null);
+        var rc = await RunGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, targetPath);
+        if (rc.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git clone --bare for merge restore failed (exit {rc.ExitCode}): {rc.Stderr}{rc.Stdout}");
+        VerifyIsolatedMergeCloneOnDisk(targetPath, "restore");
+        WriteInDirectoryMarker(targetPath, workItemId: null);
+    }
+
+    public async Task DisposeIsolatedMergeCloneAsync(
+        string repositoryId,
+        string targetPath,
+        CancellationToken ct = default)
+    {
+        _ = repositoryId;
+        _ = ct;
+        if (string.IsNullOrWhiteSpace(targetPath))
+            return;
+        if (Directory.Exists(targetPath))
+        {
+            try { Directory.Delete(targetPath, recursive: true); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _log.LogWarning(ex, "Failed to delete isolated merge repository {Path}", targetPath);
+            }
+        }
+        TryDeleteFile(targetPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix);
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Asserts a freshly-run <c>git clone --bare</c> actually produced the
+    /// expected bare-repo layout on disk: the target directory exists AND
+    /// contains a HEAD file. Called immediately after the clone returns so
+    /// a silent/partial clone or an external process that removed the
+    /// directory between clone-exit and verification surfaces here instead
+    /// of as a confusing "Source path does not exist" mount failure later.
+    /// </summary>
+    internal static void VerifyIsolatedMergeCloneOnDisk(string targetPath, string operationContext)
+    {
+        var dirExists = Directory.Exists(targetPath);
+        var headExists = File.Exists(Path.Combine(targetPath, "HEAD"));
+        if (!dirExists || !headExists)
+        {
+            throw new InvalidOperationException(
+                $"isolated merge clone {operationContext} did not land on disk: target={targetPath} " +
+                $"exists={dirExists} head={headExists}");
+        }
+    }
+
+    private static void WriteInDirectoryMarker(string stagingPath, WorkItemId? workItemId)
+    {
+        var markerPath = Path.Combine(stagingPath, IGitHost.IsolatedMergeCloneInFlightMarkerFileName);
+        File.WriteAllText(markerPath, BuildMarkerBody(workItemId));
+    }
+
+    private static void WriteInFlightSibling(string stagingPath, WorkItemId? workItemId)
+    {
+        var siblingPath = stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix;
+        File.WriteAllText(siblingPath, BuildMarkerBody(workItemId));
+    }
+
+    private static string BuildMarkerBody(WorkItemId? workItemId)
+        => workItemId is { } id
+            ? $"work_item={id}\nhost=LocalGitHost\n"
+            : "host=LocalGitHost\n";
+
+    private static void TryDeleteFile(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // best-effort
+            _ = ex;
+        }
+    }
+
     public async Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);
