@@ -19,7 +19,7 @@ namespace CodeyBox.Tests.Uat.ProjectsAndConfiguration;
 public sealed class ApiConfigurationStartupValidationUatTests
 {
     [Fact]
-    public void WorkerPoolConfigBindsAndLegacyConcurrencyOverridesNewWorkerPool()
+    public void WorkerPoolConfigBindsAndMaxConcurrentWorkersOverridesLegacyConcurrency()
     {
         var logger = new UatLogCapture();
 
@@ -32,11 +32,12 @@ public sealed class ApiConfigurationStartupValidationUatTests
             },
             log: logger);
 
-        Assert.Equal(3, options.MaxConcurrentWorkers);
+        Assert.Equal(8, options.MaxConcurrentWorkers);
         Assert.Equal(TimeSpan.FromMilliseconds(250), options.MinSpawnInterval);
         var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
         Assert.Contains("CodeyBox:Concurrency", warning.Message);
-        Assert.Contains("Ignoring WorkerPool:MaxConcurrentWorkers=8", warning.Message);
+        Assert.Contains("overridden", warning.Message);
+        Assert.Contains("MaxConcurrentWorkers=8", warning.Message);
     }
 
     [Theory]

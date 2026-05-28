@@ -59,6 +59,24 @@ public sealed class WorkerPoolLegacyConcurrencyKeyTests : IDisposable
     }
 
     [Fact]
+    public void WorkerPoolMaxConcurrentWorkers_OverridesLegacyConcurrency_AndEmitsOverrideWarning()
+    {
+        var capturingLogger = new CapturingLogger();
+        var opts = OrchestratorOptionsFactory.Build(
+            legacyConcurrency: 2,
+            workerPool: new WorkerPoolOptions { MaxConcurrentWorkers = 8 },
+            capturingLogger);
+
+        Assert.Equal(8, opts.MaxConcurrentWorkers);
+
+        var warning = Assert.Single(capturingLogger.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Contains("CodeyBox:Concurrency", warning.Message);
+        Assert.Contains("deprecated", warning.Message);
+        Assert.Contains("overridden", warning.Message);
+        Assert.Contains("MaxConcurrentWorkers=8", warning.Message);
+    }
+
+    [Fact]
     public void LegacyConcurrencyKey_AbsentConcurrency_NoWarningEmitted()
     {
         // When CodeyBox:Concurrency is null (new-style config only), no warning.

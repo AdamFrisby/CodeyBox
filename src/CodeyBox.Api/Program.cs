@@ -1946,9 +1946,11 @@ namespace CodeyBox.Api
             "github.com",
         ];
         /// <summary>
-        /// Legacy concurrency knob. If set, treated as
+        /// Legacy concurrency knob (deprecated). Used as
         /// <see cref="WorkerPool"/>.<see cref="WorkerPoolOptions.MaxConcurrentWorkers"/>
-        /// and a deprecation warning is emitted. Prefer WorkerPool instead.
+        /// only when that key is not explicitly set; a deprecation warning is emitted.
+        /// When both are set, <see cref="WorkerPool"/>.<see cref="WorkerPoolOptions.MaxConcurrentWorkers"/>
+        /// wins. Prefer <c>WorkerPool:MaxConcurrentWorkers</c> for new configuration.
         /// </summary>
         public int? Concurrency { get; set; }
 
