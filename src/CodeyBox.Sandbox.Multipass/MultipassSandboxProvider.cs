@@ -1453,12 +1453,60 @@ test "$work" = present && test "$exec_wrapper" = present
         await WaitForStoppedAsync(opts, name, workItemId, ct);
         foreach (var (host, sandbox) in binds)
         {
+            // Stat the host source immediately before mount: a "Source path
+            // does not exist" failure from multipass can be the actual file
+            // being missing (orchestrator bug, racing cleanup) OR the snap's
+            // AppArmor profile denying access to a path outside
+            // ~/snap/multipass/common/. Logging the host-side state lets
+            // operators distinguish the two from the audit trail without
+            // needing to reproduce the failure.
+            var sourceState = DescribeMountSourceState(host);
+            _log.LogInformation(
+                "multipass mount source state: {Host} -> {Vm}:{Sandbox} state={State}",
+                host, name, sandbox, sourceState);
+
             var run = await RunAsync(
                 opts,
                 [opts.MultipassBinary, "mount", "--type=native", host, $"{name}:{sandbox}"],
                 stdin: null, ct: ct, workItemId: workItemId);
             if (run.ExitCode != 0)
-                throw new InvalidOperationException($"multipass mount {host} -> {name}:{sandbox} failed: {run.Stderr}");
+            {
+                // Re-stat after the failure so the exception message attributes
+                // a missing source to mount-time host state rather than
+                // pre-mount state — the two are sometimes different (e.g.
+                // SIGTERM during clone, externally racing cleanup).
+                var postFailureState = DescribeMountSourceState(host);
+                throw new InvalidOperationException(
+                    $"multipass mount {host} -> {name}:{sandbox} failed: {run.Stderr.Trim()} (host source state at mount time: {postFailureState})");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Best-effort description of the host path that a <c>multipass mount</c>
+    /// is about to read. Surface enough information to debug a
+    /// "Source path does not exist" failure (existence, type, mtime) without
+    /// hammering the path with expensive operations.
+    /// </summary>
+    private static string DescribeMountSourceState(string hostPath)
+    {
+        try
+        {
+            if (Directory.Exists(hostPath))
+            {
+                var info = new DirectoryInfo(hostPath);
+                return $"exists=dir mtime={info.LastWriteTimeUtc:O}";
+            }
+            if (File.Exists(hostPath))
+            {
+                var info = new FileInfo(hostPath);
+                return $"exists=file size={info.Length} mtime={info.LastWriteTimeUtc:O}";
+            }
+            return "exists=no";
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or System.Security.SecurityException)
+        {
+            return $"stat-failed={ex.GetType().Name}:{ex.Message}";
         }
     }
 

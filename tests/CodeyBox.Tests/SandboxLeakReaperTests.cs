@@ -465,6 +465,92 @@ public sealed class SandboxLeakReaperTests
         else
             Assert.Single(reaper.GetLatestLeaks());
     }
+
+    // ── Scope: host directories are out of bounds ────────────────────────────
+
+    [Fact]
+    public async Task Sweep_DoesNotTouchHostFilesystemDirectories_OnlyVms()
+    {
+        // The reaper only walks the provider's managed-VM list; host filesystem
+        // staging directories (codeybox-merge-*.git bare clones the merge phase
+        // creates) are outside its scope. This test documents that contract so
+        // a future "also clean stale directories" change can't quietly start
+        // reaping live merge-phase staging dirs.
+        var hostMergeDir = Directory.CreateTempSubdirectory("codeybox-merge-leak-reaper-test-").FullName;
+        try
+        {
+            var marker = Path.Combine(hostMergeDir, "HEAD");
+            await File.WriteAllTextAsync(marker, "ref: refs/heads/main\n");
+            // Pre-condition: the dir exists and has the marker file in it.
+            Assert.True(Directory.Exists(hostMergeDir));
+            Assert.True(File.Exists(marker));
+
+            var provider = new FakeSandboxProvider();
+            // No VMs at all — only the host dir.
+            var reaper = BuildReaper(provider, autoDispose: true);
+            await reaper.RunSweepAsync(CancellationToken.None);
+
+            // The reaper saw zero managed VMs, so it should have produced zero
+            // leaks. Critically, the host directory must remain intact —
+            // /tmp/codeybox-merge-* is the merge-phase isolated-clone area
+            // and a reap of it would break in-flight merges.
+            Assert.Empty(reaper.GetLatestLeaks());
+            Assert.Empty(provider.DisposedNames);
+            Assert.True(Directory.Exists(hostMergeDir), "host merge staging dir must survive a sweep");
+            Assert.True(File.Exists(marker), "host merge staging contents must survive a sweep");
+        }
+        finally
+        {
+            try { Directory.Delete(hostMergeDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task Sweep_RunningConcurrentlyWithMergeStaging_DoesNotDisturbStaging()
+    {
+        // Reproduces the "merge phase clone races leak reaper" hypothesis: run
+        // the reaper repeatedly while another task is busy populating a
+        // host-side merge staging directory. The staging dir and its contents
+        // must remain intact across every sweep — otherwise the merge phase
+        // would race against the reaper and `multipass mount` could see a
+        // partial / vanished source.
+        var hostMergeDir = Directory.CreateTempSubdirectory("codeybox-merge-staging-concurrent-").FullName;
+        var cts = new CancellationTokenSource();
+        try
+        {
+            var provider = new FakeSandboxProvider();
+            var reaper = BuildReaper(provider, autoDispose: true);
+
+            // Pre-seed one chunk so the directory contents the sweeps observe
+            // are non-empty even if the background writer never gets a turn.
+            var seed = Path.Combine(hostMergeDir, "chunk-seed.pack");
+            await File.WriteAllBytesAsync(seed, new byte[1024]);
+
+            var stagingTask = Task.Run(async () =>
+            {
+                for (var i = 0; !cts.IsCancellationRequested && i < 50; i++)
+                {
+                    var file = Path.Combine(hostMergeDir, $"chunk-{i:D4}.pack");
+                    try { await File.WriteAllBytesAsync(file, new byte[1024], cts.Token); }
+                    catch (OperationCanceledException) { return; }
+                }
+            });
+
+            for (var i = 0; i < 5; i++)
+                await reaper.RunSweepAsync(CancellationToken.None);
+
+            cts.Cancel();
+            try { await stagingTask; } catch (OperationCanceledException) { }
+
+            Assert.True(Directory.Exists(hostMergeDir));
+            Assert.True(File.Exists(seed), "pre-seeded chunk must survive every concurrent sweep");
+        }
+        finally
+        {
+            cts.Dispose();
+            try { Directory.Delete(hostMergeDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
 }
 
 // ── Test double ─────────────────────────────────────────────────────────────

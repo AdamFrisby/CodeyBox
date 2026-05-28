@@ -4224,11 +4224,28 @@ public sealed class PipelineRunner : IPipelineRunner
         return hunks;
     }
 
-    private async Task<string> CreateIsolatedMergeRepositoryAsync(string repoId, WorkItemId itemId, CancellationToken ct)
+    /// <summary>
+    /// Bare-clones the work item's repo so the merge / conflict-rework phase
+    /// can mutate refs without touching the durable host bare repo.
+    ///
+    /// <para>Why this is not under <c>Path.GetTempPath()</c>: snap-confined
+    /// Multipass cannot read paths outside <c>~/snap/multipass/common/</c>
+    /// (the AppArmor profile only allows that subtree). A host bind-mount
+    /// source under <c>/tmp</c> surfaces as <c>"Source path ... does not exist"</c>
+    /// from <c>multipass mount</c> even though the directory was just created
+    /// by <c>git clone --bare</c>. The durable bare repo already lives in
+    /// the multipass-allowed location per docs/sandbox-providers.md, so
+    /// staging the isolated clone as a sibling under the same root inherits
+    /// that property and works for every sandbox provider.</para>
+    /// </summary>
+    internal async Task<string> CreateIsolatedMergeRepositoryAsync(string repoId, WorkItemId itemId, CancellationToken ct)
     {
         var source = _gitHost.GetRepoPath(repoId);
-        var target = Path.Combine(Path.GetTempPath(), $"codeybox-merge-{itemId}-{Guid.NewGuid():N}.git");
-        await RunHostGitAsync(Path.GetTempPath(), ct, "clone", "--bare", "--", source, target);
+        var stagingRoot = Path.GetDirectoryName(source)
+            ?? throw new InvalidOperationException(
+                $"unable to derive merge staging root from bare repo path '{source}'");
+        var target = Path.Combine(stagingRoot, $"codeybox-merge-{itemId}-{Guid.NewGuid():N}.git");
+        await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, target);
         return target;
     }
 
