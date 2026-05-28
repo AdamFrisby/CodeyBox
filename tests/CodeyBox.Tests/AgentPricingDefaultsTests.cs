@@ -30,16 +30,12 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         File.WriteAllText(Path.Combine(_tempDir, AgentPricingDefaults.FileName), content);
 
     [Fact]
-    public void Load_MissingFile_ReturnsEmptyBundle_NoThrow()
+    public void Load_MissingFile_Throws()
     {
-        // Pointing at an empty directory simulates a deployment where the
-        // bundled file was somehow stripped — we degrade to "no bundled
-        // rates" rather than crashing the process.
-        var result = AgentPricingDefaults.Load(_tempDir, NullLogger.Instance);
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
 
-        Assert.Empty(result.Rates);
-        Assert.Equal("", result.Meta.LastUpdated);
-        Assert.EndsWith(AgentPricingDefaults.FileName, result.SourcePath);
+        Assert.Contains("not found", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -74,15 +70,42 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Load_MalformedJson_ThrowsLoudly()
     {
-        // Critical: a corrupted bundled file must NOT silently fall back
-        // to "no defaults" — that would mask the corruption and leave cost
-        // reports showing zero with no obvious signal in the logs.
         Write("{ this is not valid json");
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
             AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
 
         Assert.Contains("malformed", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Load_NullDocument_Throws()
+    {
+        Write("null");
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
+
+        Assert.Contains("deserialized to null", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Load_NullRateEntry_Throws()
+    {
+        Write("""
+            {
+              "Rates": {
+                "claude": {
+                  "claude-bad": null
+                }
+              }
+            }
+            """);
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
+
+        Assert.Contains("null", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -111,7 +134,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             ("claude", "claude-opus-4-7", 5.0, 0.5, 25.0),
             ("claude", "claude-haiku-4-5", 1.0, 0.1, 5.0));
 
-        var merged = AgentPricingDefaults.Merge(bundled, new AgentPricingOptions());
+        var merged = AgentPricingOptions.Merge(bundled, new AgentPricingOptions());
 
         Assert.Equal(2, merged.BundledRateCount);
         Assert.Equal(0, merged.OperatorRateCount);
@@ -136,7 +159,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             }
         };
 
-        var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
+        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
 
         Assert.Equal(0, merged.BundledRateCount);
         Assert.Equal(1, merged.OperatorRateCount);
@@ -156,20 +179,17 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             {
                 ["claude"] = new()
                 {
-                    // Operator believes the published rate doubled — bundled
-                    // entry must NOT override the operator's local value.
                     ["claude-opus-4-7"] = new() { InputPerMillion = 10.0, CachedInputPerMillion = 1.0, OutputPerMillion = 50.0 }
                 }
             }
         };
 
-        var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
+        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
 
         Assert.Equal(1, merged.BundledRateCount);
         Assert.Equal(1, merged.OperatorRateCount);
         Assert.Equal(1, merged.OverlapCount);
         Assert.Equal(1, merged.TotalRateCount);
-        // Operator wins on the overlapped key.
         Assert.Equal(10.0, merged.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
         Assert.Equal(50.0, merged.Options.Rates["claude"]["claude-opus-4-7"].OutputPerMillion);
     }
@@ -177,8 +197,6 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_NewAgentFromOperator_AddedAlongsideBundledAgents()
     {
-        // Operator adds an agent the bundled file didn't cover (e.g.,
-        // opencode). Bundled claude entries stay, opencode bucket is created.
         var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var operatorOpts = new AgentPricingOptions
         {
@@ -191,7 +209,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             }
         };
 
-        var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
+        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
 
         Assert.Equal(2, merged.TotalRateCount);
         Assert.True(merged.Options.Rates.ContainsKey("claude"));
@@ -210,7 +228,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             }
         };
 
-        var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
+        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
 
         Assert.Equal(5.0, merged.Options.DefaultRates["codex"].InputPerMillion);
     }
@@ -218,21 +236,11 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_ReplacingDictionarySlot_DoesNotAffectMergedSnapshot()
     {
-        // Merge copies the per-agent dictionaries, so replacing a dictionary
-        // slot on either input (e.g. assigning a new ModelRateConfig to a
-        // key) is not visible to the previously-computed merge result.
-        // NOTE: Merge does *not* deep-clone ModelRateConfig — mutating the
-        // properties of an existing instance shared across inputs IS visible
-        // to the merged map. Callers are expected to treat ModelRateConfig
-        // as an immutable snapshot once produced.
         var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var operatorOpts = new AgentPricingOptions();
 
-        var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
+        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
 
-        // Replace the dictionary slot on the bundled source. Because Merge
-        // copies the outer dictionaries, the replacement is invisible to the
-        // merged result.
         bundled.Rates["claude"]["claude-opus-4-7"] = new ModelRateConfig
         {
             InputPerMillion = 999,
@@ -244,34 +252,37 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     }
 
     [Fact]
-    public void Merge_InstanceMutation_IsVisibleAcrossInputs_DocumentedBehaviour()
+    public void Merge_InstanceMutation_DoesNotAffectMergedSnapshot()
     {
-        // Documents the deliberate shallow-copy behaviour: Merge does not
-        // clone ModelRateConfig, so mutating the properties of a shared
-        // instance leaks across bundled / operator / merged. Callers must
-        // treat the inputs as immutable after they hand them to Merge.
-        // If a future change clones ModelRateConfig (defense-in-depth), this
-        // test should be flipped to assert the merged side is isolated.
         var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
-        var operatorOpts = new AgentPricingOptions();
+        var merged = AgentPricingOptions.Merge(bundled, new AgentPricingOptions());
 
-        var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
-
-        // Mutate the bundled ModelRateConfig instance in place.
         bundled.Rates["claude"]["claude-opus-4-7"].InputPerMillion = 999.0;
 
-        // The shared instance is reachable from the merged map.
-        Assert.Equal(999.0, merged.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
+        Assert.Equal(5.0, merged.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
+    }
+
+    [Fact]
+    public void Merge_NullOperatorRate_Throws()
+    {
+        var bundled = new BundledAgentPricing();
+        var operatorOpts = new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["claude"] = new() { ["claude-opus-4-7"] = null! }
+            }
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentPricingOptions.Merge(bundled, operatorOpts));
+
+        Assert.Contains("null", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
     public void ShippedDefaultsFile_LoadsCleanly()
     {
-        // Smoke test: the actual file shipped in src/CodeyBox.Api parses,
-        // has a non-empty lastUpdated stamp, and includes at least claude
-        // (which is the primary supported agent for Codey workflows).
-        // Walking up from AppContext.BaseDirectory finds the source file
-        // regardless of where the test bin lives.
         var sourceFile = LocateShippedFile();
         Assert.True(File.Exists(sourceFile),
             $"agent-pricing-defaults.json not found at expected location: {sourceFile}");
@@ -281,10 +292,26 @@ public sealed class AgentPricingDefaultsTests : IDisposable
 
         Assert.False(string.IsNullOrWhiteSpace(bundle.Meta.LastUpdated),
             "_meta.lastUpdated must be set on the shipped file");
-        Assert.True(bundle.Rates.ContainsKey("claude"),
-            "shipped defaults must include claude pricing");
-        // No negative or NaN values made it through Load's validation.
+        Assert.True(bundle.Rates.ContainsKey("claude"), "shipped defaults must include claude pricing");
+        Assert.True(bundle.Rates.ContainsKey("codex"), "shipped defaults must include codex pricing");
+        Assert.True(bundle.Rates.ContainsKey("gemini"), "shipped defaults must include gemini pricing");
+        Assert.True(bundle.Rates["codex"].ContainsKey("codex-5.5"),
+            "shipped codex defaults must alias codex-5.5 for CLI attribution");
+        Assert.True(bundle.Rates["gemini"].ContainsKey("gemini-3-flash-preview"),
+            "shipped gemini defaults must include default AgentClasses model");
         Assert.NotEmpty(bundle.Rates["claude"]);
+    }
+
+    [Fact]
+    public void ShippedDefaults_IsPresentBesideApiAssembly()
+    {
+        var apiDir = Path.GetDirectoryName(typeof(Program).Assembly.Location)!;
+        var path = Path.Combine(apiDir, AgentPricingDefaults.FileName);
+        Assert.True(File.Exists(path),
+            $"CopyToOutputDirectory must place {AgentPricingDefaults.FileName} next to CodeyBox.Api at {path}");
+
+        var bundle = AgentPricingDefaults.Load(apiDir, NullLogger.Instance);
+        Assert.True(bundle.Rates["claude"].ContainsKey("claude-opus-4-7"));
     }
 
     private static string LocateShippedFile()

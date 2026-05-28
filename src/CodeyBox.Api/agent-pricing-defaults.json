@@ -8,8 +8,8 @@
     },
     "notes": {
       "claude": "Cache-hit (read) rate captured under cachedInputPerMillion. Cache-write rates (1.25x base for 5m, 2x for 1h) are not represented; cost framework treats CachedInputTokens as read-side discount.",
-      "codex":  "gpt-5.5 short-context rate ($5/$30). Long-context tier (above ~270k input tokens) is not represented; current pipeline workloads sit well below that threshold.",
-      "gemini": "gemini-3-pro-preview is the current default Pro model (gemini-3.0-pro is not on the live pricing page). Short-context rate (<= 200k tokens); long-context tier (>200k) is not represented.",
+      "codex":  "gpt-5.5 short-context rate ($5/$30). codex-5.5 aliases the same rate for CLI JSON attribution. Long-context tier (above ~270k input tokens) is not represented.",
+      "gemini": "gemini-3-flash-preview is the default AgentClasses model. Pro preview models use short-context rates (<= 200k tokens); long-context tier (>200k) is not represented.",
       "opencode": "opencode-go uses a flat subscription ($10/month) and does not publish per-token rates for its bundled models; intentionally omitted from defaults. Operators who want USD-equivalent cost attribution under opencode can override per (model, agent) in their own config — see docs/agent-pricing.md.",
       "cursor":   "Cursor uses a flat subscription and does not publish per-token rates; intentionally omitted from defaults.",
       "copilot":  "Copilot uses a flat subscription and does not publish per-token rates; intentionally omitted from defaults."
@@ -27,9 +27,11 @@
     },
     "codex": {
       "gpt-5.5":     { "inputPerMillion": 5.00,  "cachedInputPerMillion": 0.50, "outputPerMillion": 30.00 },
+      "codex-5.5":   { "inputPerMillion": 5.00,  "cachedInputPerMillion": 0.50, "outputPerMillion": 30.00 },
       "gpt-5.5-pro": { "inputPerMillion": 30.00, "cachedInputPerMillion": 3.00, "outputPerMillion": 180.00 }
     },
     "gemini": {
+      "gemini-3-flash-preview": { "inputPerMillion": 0.50, "cachedInputPerMillion": 0.05, "outputPerMillion": 3.00 },
       "gemini-3-pro-preview": { "inputPerMillion": 2.00, "cachedInputPerMillion": 0.20, "outputPerMillion": 12.00 },
       "gemini-3.1-pro-preview": { "inputPerMillion": 2.00, "cachedInputPerMillion": 0.20, "outputPerMillion": 12.00 }
     }

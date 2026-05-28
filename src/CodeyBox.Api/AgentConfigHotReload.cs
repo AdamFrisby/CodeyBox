@@ -210,7 +210,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             // need to reread from disk here.
             var effective = _bundledPricing is null
                 ? opts.AgentPricing
-                : AgentPricingDefaults.Merge(_bundledPricing, opts.AgentPricing).Options;
+                : AgentPricingOptions.Merge(_bundledPricing, opts.AgentPricing).Options;
             _costCalculator.ApplyConfigReload(effective);
             _lastPricing = next;
             AuditLog.ConfigReloaded("AgentPricing", prev, next);

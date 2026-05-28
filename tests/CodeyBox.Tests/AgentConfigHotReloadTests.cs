@@ -510,7 +510,7 @@ public sealed class AgentConfigHotReloadTests
                 },
             },
         };
-        var initialMerged = AgentPricingDefaults.Merge(bundled, initialOperator).Options;
+        var initialMerged = AgentPricingOptions.Merge(bundled, initialOperator).Options;
         var initial = new CodeyBoxOptions { AgentPricing = initialOperator };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
         var calculator = new AgentCostCalculator(initialMerged);
@@ -595,9 +595,25 @@ public sealed class AgentConfigHotReloadTests
                 },
             },
         };
+        var bundled = new BundledAgentPricing
+        {
+            Rates = new(StringComparer.Ordinal)
+            {
+                ["claude"] = new(StringComparer.Ordinal)
+                {
+                    ["claude-haiku-4-5"] = new ModelRateConfig
+                    {
+                        InputPerMillion = 1.0,
+                        CachedInputPerMillion = 0.10,
+                        OutputPerMillion = 5.0,
+                    },
+                },
+            },
+        };
+        var initialMerged = AgentPricingOptions.Merge(bundled, initialPricing).Options;
         var initial = new CodeyBoxOptions { AgentPricing = initialPricing };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
-        var calculator = new AgentCostCalculator(initialPricing);
+        var calculator = new AgentCostCalculator(initialMerged);
         var snapshot = new AgentCostSnapshot(
             InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-opus-4-7");
         var priorCost = calculator.Calculate(snapshot, Claude);
@@ -615,7 +631,8 @@ public sealed class AgentConfigHotReloadTests
         var coordinator = new AgentConfigHotReload(
             monitor, orchFixture.Orchestrator, router, burnEstimator,
             NullLogger<AgentConfigHotReload>.Instance,
-            costCalculator: calculator);
+            costCalculator: calculator,
+            bundledPricing: bundled);
         await coordinator.StartAsync(CancellationToken.None);
 
         // Invalid: negative rate is rejected by AgentCostCalculator.ApplyConfigReload.
@@ -640,6 +657,9 @@ public sealed class AgentConfigHotReloadTests
 
         // Prior pricing snapshot still in effect after the rejected reload.
         Assert.Equal(priorCost, calculator.Calculate(snapshot, Claude));
+        var haikuSnapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-haiku-4-5");
+        Assert.Equal(0.006000m, calculator.Calculate(haikuSnapshot, Claude));
 
         // Follow-up valid edit (doubled rate) must still be detected as a
         // change against the original baseline, not the rejected payload.

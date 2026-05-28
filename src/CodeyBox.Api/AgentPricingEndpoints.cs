@@ -24,7 +24,7 @@ internal static class AgentPricingEndpoints
             IOptionsMonitor<CodeyBoxOptions> monitor) =>
         {
             var operatorOpts = monitor.CurrentValue.AgentPricing;
-            var merged = AgentPricingDefaults.Merge(bundled, operatorOpts);
+            var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
 
             return Results.Ok(new
             {
@@ -33,7 +33,7 @@ internal static class AgentPricingEndpoints
                     lastUpdated = bundled.Meta.LastUpdated,
                     sources = bundled.Meta.Sources,
                     notes = bundled.Meta.Notes,
-                    sourcePath = bundled.SourcePath,
+                    bundledFile = AgentPricingDefaults.FileName,
                     counts = new
                     {
                         bundled = merged.BundledRateCount,

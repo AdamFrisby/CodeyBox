@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -29,6 +30,106 @@ public sealed class AgentPricingOptions
 
     /// <summary>Fallback rate per agent kind when the model is not in <see cref="Rates"/>.</summary>
     public Dictionary<string, ModelRateConfig> DefaultRates { get; set; } = [];
+
+    /// <summary>
+    /// Merges bundled defaults with operator config. Operator entries win per
+    /// (agentKind, modelId). Returns immutable rate snapshots (deep-cloned).
+    /// </summary>
+    public static MergedAgentPricing Merge(BundledAgentPricing bundled, AgentPricingOptions operatorOpts)
+    {
+        ArgumentNullException.ThrowIfNull(bundled);
+        ArgumentNullException.ThrowIfNull(operatorOpts);
+
+        var merged = new AgentPricingOptions
+        {
+            DefaultRates = operatorOpts.DefaultRates.ToDictionary(
+                kv => kv.Key,
+                kv => CloneRate(kv.Value),
+                StringComparer.Ordinal),
+        };
+
+        int bundledCount = 0;
+        int operatorCount = 0;
+        int overlapCount = 0;
+
+        foreach (var (agentKey, modelMap) in bundled.Rates)
+        {
+            var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
+            foreach (var (modelKey, rate) in modelMap)
+            {
+                ValidateRateNotNull(rate, agentKey, modelKey, "bundled");
+                copy[modelKey] = CloneRate(rate);
+                bundledCount++;
+            }
+            merged.Rates[agentKey] = copy;
+        }
+
+        foreach (var (agentKey, modelMap) in operatorOpts.Rates)
+        {
+            if (!merged.Rates.TryGetValue(agentKey, out var bucket))
+            {
+                bucket = new Dictionary<string, ModelRateConfig>(StringComparer.Ordinal);
+                merged.Rates[agentKey] = bucket;
+            }
+            foreach (var (modelKey, rate) in modelMap)
+            {
+                ValidateRateNotNull(rate, agentKey, modelKey, "operator");
+                if (bucket.ContainsKey(modelKey))
+                    overlapCount++;
+                bucket[modelKey] = CloneRate(rate);
+                operatorCount++;
+            }
+        }
+
+        return new MergedAgentPricing(merged, bundledCount, operatorCount, overlapCount);
+    }
+
+    public static void ValidateRateNotNull(ModelRateConfig? rate, string agentKey, string modelKey, string source)
+    {
+        if (rate is null)
+            throw new InvalidOperationException(
+                $"AgentPricing: {source} rate is null for agent '{agentKey}' model '{modelKey}'");
+    }
+
+    private static ModelRateConfig CloneRate(ModelRateConfig rate) => new()
+    {
+        InputPerMillion = rate.InputPerMillion,
+        CachedInputPerMillion = rate.CachedInputPerMillion,
+        OutputPerMillion = rate.OutputPerMillion,
+    };
+}
+
+/// <summary>Result of merging bundled defaults with operator pricing.</summary>
+public readonly record struct MergedAgentPricing(
+    AgentPricingOptions Options,
+    int BundledRateCount,
+    int OperatorRateCount,
+    int OverlapCount)
+{
+    /// <summary>Distinct (agent, model) rate entries after merging.</summary>
+    public int TotalRateCount => BundledRateCount + OperatorRateCount - OverlapCount;
+}
+
+/// <summary>
+/// Parsed shape of <c>agent-pricing-defaults.json</c>. Mirrors
+/// <see cref="AgentPricingOptions"/> except the bundled file does not carry
+/// agent-level <c>DefaultRates</c>; only per (agent, model) rates plus a
+/// <c>_meta</c> block.
+/// </summary>
+public sealed class BundledAgentPricing
+{
+    [JsonPropertyName("_meta")]
+    public BundledAgentPricingMeta Meta { get; set; } = new();
+
+    public Dictionary<string, Dictionary<string, ModelRateConfig>> Rates { get; set; } =
+        new(StringComparer.Ordinal);
+}
+
+public sealed class BundledAgentPricingMeta
+{
+    public string LastUpdated { get; set; } = "";
+    public Dictionary<string, string> Sources { get; set; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> Notes { get; set; } = new(StringComparer.Ordinal);
 }
 
 /// <summary>
@@ -76,6 +177,7 @@ public sealed class AgentCostCalculator
         {
             foreach (var (modelKey, rate) in modelMap)
             {
+                AgentPricingOptions.ValidateRateNotNull(rate, agentKey, modelKey, "operator");
                 if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                     throw new InvalidOperationException(
                         $"AgentPricing: negative rate for agent '{agentKey}' model '{modelKey}'");
@@ -83,6 +185,7 @@ public sealed class AgentCostCalculator
         }
         foreach (var (agentKey, rate) in next.DefaultRates)
         {
+            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "operator");
             if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                 throw new InvalidOperationException(
                     $"AgentPricing: negative default rate for agent '{agentKey}'");
@@ -168,6 +271,7 @@ public sealed class AgentCostCalculator
         {
             foreach (var (modelKey, rate) in modelMap)
             {
+                AgentPricingOptions.ValidateRateNotNull(rate, agentKey, modelKey, "configured");
                 if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                     throw new InvalidOperationException(
                         $"AgentPricing: negative rate for agent '{agentKey}' model '{modelKey}'");
@@ -175,6 +279,7 @@ public sealed class AgentCostCalculator
         }
         foreach (var (agentKey, rate) in opts.DefaultRates)
         {
+            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "configured");
             if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                 throw new InvalidOperationException(
                     $"AgentPricing: negative default rate for agent '{agentKey}'");

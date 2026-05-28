@@ -1254,10 +1254,10 @@ builder.Services.AddSingleton<AgentCostCalculator>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
     var bundled = sp.GetRequiredService<BundledAgentPricing>();
-    var merged = AgentPricingDefaults.Merge(bundled, opts.AgentPricing);
+    var merged = AgentPricingOptions.Merge(bundled, opts.AgentPricing);
     startupLog.LogInformation(
         "AgentPricing loaded: bundled={Bundled}, operator-overrides={Operator}, total={Total} (bundled lastUpdated={LastUpdated})",
-        merged.BundledRateCount, merged.OperatorRateCount, merged.TotalRateCount,
+        merged.BundledRateCount, merged.OverlapCount, merged.TotalRateCount,
         string.IsNullOrEmpty(bundled.Meta.LastUpdated) ? "(unknown)" : bundled.Meta.LastUpdated);
     var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
     AgentCostCalculator.ValidateAtStartup(merged.Options,

@@ -9,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using CodeyBox.Agents;
 using CodeyBox.Api;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
@@ -45,7 +46,7 @@ public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFac
         Assert.Equal(
             "fixture note for claude",
             meta.GetProperty("notes").GetProperty("claude").GetString());
-        Assert.EndsWith(AgentPricingDefaults.FileName, meta.GetProperty("sourcePath").GetString());
+        Assert.Equal(AgentPricingDefaults.FileName, meta.GetProperty("bundledFile").GetString());
 
         // counts: bundled=2, operator-overrides=2 (one overlap, one new agent), overlap=1, total=3.
         var counts = meta.GetProperty("counts");
@@ -156,10 +157,6 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
                         },
                     },
                 },
-                SourcePath = Path.Combine(
-                    Path.GetTempPath(),
-                    $"fixture-{Guid.NewGuid():N}",
-                    AgentPricingDefaults.FileName),
             });
         });
     }
