@@ -1,4 +1,3 @@
-using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -32,19 +31,24 @@ public sealed class AgentPricingOptions
     public Dictionary<string, ModelRateConfig> DefaultRates { get; set; } = [];
 
     /// <summary>
-    /// Merges bundled defaults with operator config. Operator entries win per
-    /// (agentKind, modelId). Returns immutable rate snapshots (deep-cloned).
+    /// Merges a baseline pricing snapshot with operator config. Operator entries
+    /// win per (agentKind, modelId). Returns immutable rate snapshots (deep-cloned).
+    /// Baseline rates are assumed validated at load time in the API host.
     /// </summary>
-    public static MergedAgentPricing Merge(BundledAgentPricing bundled, AgentPricingOptions operatorOpts)
+    public static MergedAgentPricing Merge(AgentPricingOptions baseline, AgentPricingOptions operatorOpts)
     {
-        ArgumentNullException.ThrowIfNull(bundled);
+        ArgumentNullException.ThrowIfNull(baseline);
         ArgumentNullException.ThrowIfNull(operatorOpts);
 
         var merged = new AgentPricingOptions
         {
             DefaultRates = operatorOpts.DefaultRates.ToDictionary(
                 kv => kv.Key,
-                kv => CloneRate(kv.Value),
+                kv =>
+                {
+                    ValidateRateNotNull(kv.Value, kv.Key, "(default)", "operator");
+                    return CloneRate(kv.Value);
+                },
                 StringComparer.Ordinal),
         };
 
@@ -52,12 +56,11 @@ public sealed class AgentPricingOptions
         int operatorCount = 0;
         int overlapCount = 0;
 
-        foreach (var (agentKey, modelMap) in bundled.Rates)
+        foreach (var (agentKey, modelMap) in baseline.Rates)
         {
             var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
             foreach (var (modelKey, rate) in modelMap)
             {
-                ValidateRateNotNull(rate, agentKey, modelKey, "bundled");
                 copy[modelKey] = CloneRate(rate);
                 bundledCount++;
             }
@@ -111,28 +114,6 @@ public readonly record struct MergedAgentPricing(
 }
 
 /// <summary>
-/// Parsed shape of <c>agent-pricing-defaults.json</c>. Mirrors
-/// <see cref="AgentPricingOptions"/> except the bundled file does not carry
-/// agent-level <c>DefaultRates</c>; only per (agent, model) rates plus a
-/// <c>_meta</c> block.
-/// </summary>
-public sealed class BundledAgentPricing
-{
-    [JsonPropertyName("_meta")]
-    public BundledAgentPricingMeta Meta { get; set; } = new();
-
-    public Dictionary<string, Dictionary<string, ModelRateConfig>> Rates { get; set; } =
-        new(StringComparer.Ordinal);
-}
-
-public sealed class BundledAgentPricingMeta
-{
-    public string LastUpdated { get; set; } = "";
-    public Dictionary<string, string> Sources { get; set; } = new(StringComparer.Ordinal);
-    public Dictionary<string, string> Notes { get; set; } = new(StringComparer.Ordinal);
-}
-
-/// <summary>
 /// Calculates estimated USD cost for a single agent invocation given a pricing configuration.
 ///
 /// Lookup order:
@@ -164,6 +145,12 @@ public sealed class AgentCostCalculator
         _opts = opts;
         _extractors = extractors ?? new Dictionary<AgentKind, IAgentCostExtractor>();
     }
+
+    /// <summary>
+    /// The pricing snapshot currently used by <see cref="Calculate"/>, including
+    /// after a successful hot-reload. Exposed for operator-facing endpoints.
+    /// </summary>
+    public AgentPricingOptions GetEffectivePricing() => _opts;
 
     /// <summary>
     /// Swaps the held pricing snapshot. Called by <c>AgentConfigHotReload</c>

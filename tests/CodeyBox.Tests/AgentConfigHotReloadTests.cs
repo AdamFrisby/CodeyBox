@@ -470,22 +470,18 @@ public sealed class AgentConfigHotReloadTests
         //     for an un-overridden model vanishes after a hot-reload)
         //   - merge order reversed so bundled silently wins over operator
         //   - bundledPricing parameter never plumbed; merge branch never runs
-        var bundled = new BundledAgentPricing
+        var bundledBaseline = new AgentPricingOptions
         {
             Rates = new(StringComparer.Ordinal)
             {
                 ["claude"] = new(StringComparer.Ordinal)
                 {
-                    // Bundled rate for haiku — not in the initial or updated
-                    // operator config; must survive the operator hot-reload.
                     ["claude-haiku-4-5"] = new ModelRateConfig
                     {
                         InputPerMillion = 1.0,
                         CachedInputPerMillion = 0.10,
                         OutputPerMillion = 5.0,
                     },
-                    // Bundled rate for opus — overlaps initial operator entry
-                    // and the hot-reload candidate, so operator wins both times.
                     ["claude-opus-4-7"] = new ModelRateConfig
                     {
                         InputPerMillion = 5.0,
@@ -510,18 +506,19 @@ public sealed class AgentConfigHotReloadTests
                 },
             },
         };
-        var initialMerged = AgentPricingOptions.Merge(bundled, initialOperator).Options;
+        var initialMerged = AgentPricingOptions.Merge(bundledBaseline, initialOperator);
+        var pricingState = new AgentPricingState(
+            new AgentPricingDefaultsSnapshot { Baseline = bundledBaseline },
+            initialMerged);
         var initial = new CodeyBoxOptions { AgentPricing = initialOperator };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
-        var calculator = new AgentCostCalculator(initialMerged);
+        var calculator = new AgentCostCalculator(initialMerged.Options);
 
         var opusSnapshot = new AgentCostSnapshot(
             InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-opus-4-7");
         var haikuSnapshot = new AgentCostSnapshot(
             InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-haiku-4-5");
 
-        // Baseline: operator wins on opus (15+75 per million * 1000 tokens
-        // each = 0.090000), bundled supplies haiku (1+5 per million = 0.006).
         Assert.Equal(0.090000m, calculator.Calculate(opusSnapshot, Claude));
         Assert.Equal(0.006000m, calculator.Calculate(haikuSnapshot, Claude));
 
@@ -539,7 +536,8 @@ public sealed class AgentConfigHotReloadTests
             monitor, orchFixture.Orchestrator, router, burnEstimator,
             NullLogger<AgentConfigHotReload>.Instance,
             costCalculator: calculator,
-            bundledPricing: bundled);
+            bundledBaseline: bundledBaseline,
+            pricingState: pricingState);
         await coordinator.StartAsync(CancellationToken.None);
 
         // Hot-reload: operator doubles its own opus override. The bundled
@@ -595,7 +593,7 @@ public sealed class AgentConfigHotReloadTests
                 },
             },
         };
-        var bundled = new BundledAgentPricing
+        var bundledBaseline = new AgentPricingOptions
         {
             Rates = new(StringComparer.Ordinal)
             {
@@ -610,10 +608,13 @@ public sealed class AgentConfigHotReloadTests
                 },
             },
         };
-        var initialMerged = AgentPricingOptions.Merge(bundled, initialPricing).Options;
+        var initialMerged = AgentPricingOptions.Merge(bundledBaseline, initialPricing);
+        var pricingState = new AgentPricingState(
+            new AgentPricingDefaultsSnapshot { Baseline = bundledBaseline },
+            initialMerged);
         var initial = new CodeyBoxOptions { AgentPricing = initialPricing };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
-        var calculator = new AgentCostCalculator(initialMerged);
+        var calculator = new AgentCostCalculator(initialMerged.Options);
         var snapshot = new AgentCostSnapshot(
             InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-opus-4-7");
         var priorCost = calculator.Calculate(snapshot, Claude);
@@ -632,7 +633,8 @@ public sealed class AgentConfigHotReloadTests
             monitor, orchFixture.Orchestrator, router, burnEstimator,
             NullLogger<AgentConfigHotReload>.Instance,
             costCalculator: calculator,
-            bundledPricing: bundled);
+            bundledBaseline: bundledBaseline,
+            pricingState: pricingState);
         await coordinator.StartAsync(CancellationToken.None);
 
         // Invalid: negative rate is rejected by AgentCostCalculator.ApplyConfigReload.

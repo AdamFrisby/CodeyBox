@@ -1,13 +1,13 @@
 using System.Text.Json;
+using CodeyBox.Agents;
 using CodeyBox.Orchestrator;
-using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Api;
 
 /// <summary>
 /// Loads the bundled <c>agent-pricing-defaults.json</c> file from the API
 /// content root. Merge logic lives on <see cref="AgentPricingOptions"/> in the
-/// orchestrator so hot-reload and cost calculation share the same domain rules.
+/// orchestrator; this type only parses the host defaults artifact.
 /// </summary>
 internal static class AgentPricingDefaults
 {
@@ -25,7 +25,7 @@ internal static class AgentPricingDefaults
     /// Throws <see cref="InvalidOperationException"/> when the file is missing,
     /// malformed, or contains invalid rates.
     /// </summary>
-    public static BundledAgentPricing Load(string contentRootPath, ILogger log)
+    public static AgentPricingDefaultsSnapshot Load(string contentRootPath)
     {
         var path = Path.Combine(contentRootPath, FileName);
         if (!File.Exists(path))
@@ -34,11 +34,11 @@ internal static class AgentPricingDefaults
                 $"AgentPricing: bundled defaults file not found at '{path}'");
         }
 
-        BundledAgentPricing parsed;
+        AgentPricingDefaultsFileDto parsed;
         try
         {
             using var stream = File.OpenRead(path);
-            parsed = JsonSerializer.Deserialize<BundledAgentPricing>(stream, JsonOpts)
+            parsed = JsonSerializer.Deserialize<AgentPricingDefaultsFileDto>(stream, JsonOpts)
                 ?? throw new InvalidOperationException(
                     $"AgentPricing: bundled defaults file at '{path}' deserialized to null");
         }
@@ -48,17 +48,31 @@ internal static class AgentPricingDefaults
                 $"AgentPricing: bundled defaults file at '{path}' is malformed: {ex.Message}", ex);
         }
 
+        var baseline = new AgentPricingOptions();
         foreach (var (agentKey, modelMap) in parsed.Rates)
         {
+            var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
             foreach (var (modelKey, rate) in modelMap)
             {
                 AgentPricingOptions.ValidateRateNotNull(rate, agentKey, modelKey, "bundled");
                 if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                     throw new InvalidOperationException(
                         $"AgentPricing: bundled rate has negative value for agent '{agentKey}' model '{modelKey}'");
+                copy[modelKey] = new ModelRateConfig
+                {
+                    InputPerMillion = rate.InputPerMillion,
+                    CachedInputPerMillion = rate.CachedInputPerMillion,
+                    OutputPerMillion = rate.OutputPerMillion,
+                };
             }
+            baseline.Rates[agentKey] = copy;
         }
 
-        return parsed;
+        return new AgentPricingDefaultsSnapshot
+        {
+            Meta = parsed.Meta,
+            SourcePath = path,
+            Baseline = baseline,
+        };
     }
 }

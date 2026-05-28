@@ -9,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using CodeyBox.Agents;
 using CodeyBox.Api;
+using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
@@ -19,8 +20,9 @@ namespace CodeyBox.Tests;
 /// <c>rates</c>, <c>defaultRates</c> — so a regression in the endpoint's JSON
 /// surface (e.g., counts nested in the wrong block, operator-only data
 /// returned without the bundled merge, sources/notes swapped) gets caught.
-/// The bundled <see cref="BundledAgentPricing"/> is replaced with a known
-/// fixture so assertions don't drift with the shipped <c>agent-pricing-defaults.json</c>.
+/// The bundled <see cref="AgentPricingDefaultsSnapshot"/> is replaced with a
+/// known fixture so assertions don't drift with the shipped
+/// <c>agent-pricing-defaults.json</c>.
 /// </summary>
 public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFactory>
 {
@@ -37,7 +39,6 @@ public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFac
 
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
 
-        // _meta block has the fixture's lastUpdated, sources, notes, sourcePath.
         var meta = body.GetProperty("meta");
         Assert.Equal("2099-01-01", meta.GetProperty("lastUpdated").GetString());
         Assert.Equal(
@@ -47,16 +48,14 @@ public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFac
             "fixture note for claude",
             meta.GetProperty("notes").GetProperty("claude").GetString());
         Assert.Equal(AgentPricingDefaults.FileName, meta.GetProperty("bundledFile").GetString());
+        Assert.Contains("agent-pricing-defaults.json", meta.GetProperty("sourcePath").GetString());
 
-        // counts: bundled=2, operator-overrides=2 (one overlap, one new agent), overlap=1, total=3.
         var counts = meta.GetProperty("counts");
         Assert.Equal(2, counts.GetProperty("bundled").GetInt32());
         Assert.Equal(2, counts.GetProperty("operatorOverrides").GetInt32());
         Assert.Equal(1, counts.GetProperty("overlap").GetInt32());
         Assert.Equal(3, counts.GetProperty("total").GetInt32());
 
-        // rates merged: claude-opus-4-7 operator-overridden, claude-haiku-4-5 from
-        // bundled, opencode bucket from operator.
         var rates = body.GetProperty("rates");
         var opus = rates.GetProperty("claude").GetProperty("claude-opus-4-7");
         Assert.Equal(99.0, opus.GetProperty("inputPerMillion").GetDouble());
@@ -66,7 +65,6 @@ public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFac
         var deepseek = rates.GetProperty("opencode").GetProperty("deepseek-v4-pro");
         Assert.Equal(0.27, deepseek.GetProperty("inputPerMillion").GetDouble());
 
-        // operator DefaultRates passes through unchanged.
         var defaults = body.GetProperty("defaultRates");
         Assert.Equal(5.0, defaults.GetProperty("codex").GetProperty("inputPerMillion").GetDouble());
     }
@@ -82,11 +80,6 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            // Drop the appsettings.json source so its operator-side
-            // AgentPricing block doesn't leak into the count assertions.
-            // RetainingOptionsMonitorCache pre-populates from the raw
-            // IConfiguration bind, bypassing Configure/PostConfigure, so this
-            // is the only reliable way to control the operator snapshot.
             var jsonSources = cfg.Sources
                 .OfType<Microsoft.Extensions.Configuration.Json.JsonConfigurationSource>()
                 .Where(s => (s.Path ?? string.Empty).Contains("appsettings", StringComparison.OrdinalIgnoreCase))
@@ -102,10 +95,6 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
 
-                // Operator-side AgentPricing: one entry overlaps the bundled
-                // fixture (claude-opus-4-7), one new agent bucket (opencode),
-                // plus a DefaultRates entry so the endpoint's full response
-                // shape is exercised.
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:inputPerMillion"] = "99.0",
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:cachedInputPerMillion"] = "9.9",
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:outputPerMillion"] = "990.0",
@@ -121,24 +110,8 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
         {
             services.RemoveAll<IHostedService>();
 
-            // Replace the bundled defaults with a deterministic fixture so the
-            // shipped agent-pricing-defaults.json isn't load-bearing for these
-            // assertions (the file's price values drift independently).
-            services.RemoveAll<BundledAgentPricing>();
-            services.AddSingleton(new BundledAgentPricing
+            var baseline = new AgentPricingOptions
             {
-                Meta = new BundledAgentPricingMeta
-                {
-                    LastUpdated = "2099-01-01",
-                    Sources = new Dictionary<string, string>(StringComparer.Ordinal)
-                    {
-                        ["claude"] = "https://example.invalid/claude-pricing",
-                    },
-                    Notes = new Dictionary<string, string>(StringComparer.Ordinal)
-                    {
-                        ["claude"] = "fixture note for claude",
-                    },
-                },
                 Rates = new Dictionary<string, Dictionary<string, ModelRateConfig>>(StringComparer.Ordinal)
                 {
                     ["claude"] = new(StringComparer.Ordinal)
@@ -157,6 +130,41 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
                         },
                     },
                 },
+            };
+            var defaultsSnapshot = new AgentPricingDefaultsSnapshot
+            {
+                Meta = new AgentPricingDefaultsMeta
+                {
+                    LastUpdated = "2099-01-01",
+                    Sources = new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["claude"] = "https://example.invalid/claude-pricing",
+                    },
+                    Notes = new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["claude"] = "fixture note for claude",
+                    },
+                },
+                SourcePath = Path.Combine(Path.GetTempPath(), AgentPricingDefaults.FileName),
+                Baseline = baseline,
+            };
+
+            services.RemoveAll<AgentPricingDefaultsSnapshot>();
+            services.RemoveAll<AgentPricingState>();
+            services.RemoveAll<AgentCostCalculator>();
+            services.AddSingleton(defaultsSnapshot);
+            services.AddSingleton(sp =>
+            {
+                var snapshot = sp.GetRequiredService<AgentPricingDefaultsSnapshot>();
+                var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<CodeyBoxOptions>>().Value;
+                var merged = AgentPricingOptions.Merge(snapshot.Baseline, opts.AgentPricing);
+                return new AgentPricingState(snapshot, merged);
+            });
+            services.AddSingleton(sp =>
+            {
+                var state = sp.GetRequiredService<AgentPricingState>();
+                var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
+                return new AgentCostCalculator(state.LastMerge.Options, extractors);
             });
         });
     }

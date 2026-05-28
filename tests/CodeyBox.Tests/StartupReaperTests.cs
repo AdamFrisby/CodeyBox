@@ -28,8 +28,8 @@ public sealed class StartupReaperTests : IDisposable
 
     public void Dispose()
     {
-        _store.Dispose();
-        _registry.Dispose();
+        try { _store.Dispose(); } catch { }
+        try { _registry.Dispose(); } catch { }
         try { File.Delete(_dbPath); } catch { }
     }
 

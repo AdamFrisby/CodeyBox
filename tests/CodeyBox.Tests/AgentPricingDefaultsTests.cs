@@ -1,4 +1,3 @@
-using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Api;
 using CodeyBox.Orchestrator;
@@ -33,7 +32,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     public void Load_MissingFile_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
+            AgentPricingDefaults.Load(_tempDir));
 
         Assert.Contains("not found", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -56,12 +55,13 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             }
             """);
 
-        var bundle = AgentPricingDefaults.Load(_tempDir, NullLogger.Instance);
+        var snapshot = AgentPricingDefaults.Load(_tempDir);
 
-        Assert.Equal("2026-05-28", bundle.Meta.LastUpdated);
-        Assert.Equal("https://example.invalid/pricing", bundle.Meta.Sources["claude"]);
-        Assert.Equal("test fixture", bundle.Meta.Notes["claude"]);
-        var rate = bundle.Rates["claude"]["claude-opus-4-7"];
+        Assert.Equal("2026-05-28", snapshot.Meta.LastUpdated);
+        Assert.Equal("https://example.invalid/pricing", snapshot.Meta.Sources["claude"]);
+        Assert.Equal("test fixture", snapshot.Meta.Notes["claude"]);
+        Assert.EndsWith(AgentPricingDefaults.FileName, snapshot.SourcePath);
+        var rate = snapshot.Baseline.Rates["claude"]["claude-opus-4-7"];
         Assert.Equal(5.0, rate.InputPerMillion);
         Assert.Equal(0.5, rate.CachedInputPerMillion);
         Assert.Equal(25.0, rate.OutputPerMillion);
@@ -73,7 +73,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         Write("{ this is not valid json");
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
+            AgentPricingDefaults.Load(_tempDir));
 
         Assert.Contains("malformed", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -84,7 +84,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         Write("null");
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
+            AgentPricingDefaults.Load(_tempDir));
 
         Assert.Contains("deserialized to null", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -103,7 +103,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             """);
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
+            AgentPricingDefaults.Load(_tempDir));
 
         Assert.Contains("null", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -122,7 +122,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             """);
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            AgentPricingDefaults.Load(_tempDir, NullLogger.Instance));
+            AgentPricingDefaults.Load(_tempDir));
 
         Assert.Contains("negative", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -130,7 +130,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_BundledOnly_AllBundledRatesPresent()
     {
-        var bundled = MakeBundle(
+        var bundled = MakeBaseline(
             ("claude", "claude-opus-4-7", 5.0, 0.5, 25.0),
             ("claude", "claude-haiku-4-5", 1.0, 0.1, 5.0));
 
@@ -147,7 +147,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_OperatorOnly_NoBundledNoOverlap()
     {
-        var bundled = new BundledAgentPricing();
+        var bundled = new AgentPricingOptions();
         var operatorOpts = new AgentPricingOptions
         {
             Rates = new()
@@ -171,7 +171,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_OperatorWinsOnOverlap()
     {
-        var bundled = MakeBundle(
+        var bundled = MakeBaseline(
             ("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var operatorOpts = new AgentPricingOptions
         {
@@ -197,7 +197,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_NewAgentFromOperator_AddedAlongsideBundledAgents()
     {
-        var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
+        var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var operatorOpts = new AgentPricingOptions
         {
             Rates = new()
@@ -219,7 +219,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_PreservesOperatorDefaultRates()
     {
-        var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
+        var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var operatorOpts = new AgentPricingOptions
         {
             DefaultRates = new()
@@ -236,17 +236,12 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_ReplacingDictionarySlot_DoesNotAffectMergedSnapshot()
     {
-        var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
+        var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var operatorOpts = new AgentPricingOptions();
 
         var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
 
-        bundled.Rates["claude"]["claude-opus-4-7"] = new ModelRateConfig
-        {
-            InputPerMillion = 999,
-            CachedInputPerMillion = 999,
-            OutputPerMillion = 999,
-        };
+        bundled.Rates["claude"]["claude-opus-4-7"].InputPerMillion = 999;
 
         Assert.Equal(5.0, merged.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
     }
@@ -254,10 +249,10 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_InstanceMutation_DoesNotAffectMergedSnapshot()
     {
-        var bundled = MakeBundle(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
+        var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var merged = AgentPricingOptions.Merge(bundled, new AgentPricingOptions());
 
-        bundled.Rates["claude"]["claude-opus-4-7"].InputPerMillion = 999.0;
+        bundled.Rates["claude"]["claude-opus-4-7"].InputPerMillion = 999;
 
         Assert.Equal(5.0, merged.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
     }
@@ -265,7 +260,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     [Fact]
     public void Merge_NullOperatorRate_Throws()
     {
-        var bundled = new BundledAgentPricing();
+        var bundled = new AgentPricingOptions();
         var operatorOpts = new AgentPricingOptions
         {
             Rates = new()
@@ -288,18 +283,22 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             $"agent-pricing-defaults.json not found at expected location: {sourceFile}");
 
         var dir = Path.GetDirectoryName(sourceFile)!;
-        var bundle = AgentPricingDefaults.Load(dir, NullLogger.Instance);
+        var snapshot = AgentPricingDefaults.Load(dir);
 
-        Assert.False(string.IsNullOrWhiteSpace(bundle.Meta.LastUpdated),
+        Assert.False(string.IsNullOrWhiteSpace(snapshot.Meta.LastUpdated),
             "_meta.lastUpdated must be set on the shipped file");
-        Assert.True(bundle.Rates.ContainsKey("claude"), "shipped defaults must include claude pricing");
-        Assert.True(bundle.Rates.ContainsKey("codex"), "shipped defaults must include codex pricing");
-        Assert.True(bundle.Rates.ContainsKey("gemini"), "shipped defaults must include gemini pricing");
-        Assert.True(bundle.Rates["codex"].ContainsKey("codex-5.5"),
+        Assert.True(snapshot.Baseline.Rates.ContainsKey("opencode"),
+            "shipped defaults must include opencode-go model pricing");
+        Assert.True(snapshot.Baseline.Rates.ContainsKey("claude"), "shipped defaults must include claude pricing");
+        Assert.True(snapshot.Baseline.Rates.ContainsKey("codex"), "shipped defaults must include codex pricing");
+        Assert.True(snapshot.Baseline.Rates.ContainsKey("gemini"), "shipped defaults must include gemini pricing");
+        Assert.True(snapshot.Baseline.Rates["opencode"].ContainsKey("deepseek-v4-pro"),
+            "shipped opencode defaults must include deepseek-v4-pro");
+        Assert.True(snapshot.Baseline.Rates["codex"].ContainsKey("codex-5.5"),
             "shipped codex defaults must alias codex-5.5 for CLI attribution");
-        Assert.True(bundle.Rates["gemini"].ContainsKey("gemini-3-flash-preview"),
+        Assert.True(snapshot.Baseline.Rates["gemini"].ContainsKey("gemini-3-flash-preview"),
             "shipped gemini defaults must include default AgentClasses model");
-        Assert.NotEmpty(bundle.Rates["claude"]);
+        Assert.NotEmpty(snapshot.Baseline.Rates["claude"]);
     }
 
     [Fact]
@@ -310,8 +309,8 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         Assert.True(File.Exists(path),
             $"CopyToOutputDirectory must place {AgentPricingDefaults.FileName} next to CodeyBox.Api at {path}");
 
-        var bundle = AgentPricingDefaults.Load(apiDir, NullLogger.Instance);
-        Assert.True(bundle.Rates["claude"].ContainsKey("claude-opus-4-7"));
+        var snapshot = AgentPricingDefaults.Load(apiDir);
+        Assert.True(snapshot.Baseline.Rates["claude"].ContainsKey("claude-opus-4-7"));
     }
 
     private static string LocateShippedFile()
@@ -327,15 +326,15 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             $"Could not locate src/CodeyBox.Api/{AgentPricingDefaults.FileName} walking up from {AppContext.BaseDirectory}");
     }
 
-    private static BundledAgentPricing MakeBundle(params (string Agent, string Model, double Input, double Cached, double Output)[] entries)
+    private static AgentPricingOptions MakeBaseline(params (string Agent, string Model, double Input, double Cached, double Output)[] entries)
     {
-        var bundle = new BundledAgentPricing();
+        var baseline = new AgentPricingOptions();
         foreach (var (agent, model, input, cached, output) in entries)
         {
-            if (!bundle.Rates.TryGetValue(agent, out var bucket))
+            if (!baseline.Rates.TryGetValue(agent, out var bucket))
             {
                 bucket = new Dictionary<string, ModelRateConfig>(StringComparer.Ordinal);
-                bundle.Rates[agent] = bucket;
+                baseline.Rates[agent] = bucket;
             }
             bucket[model] = new ModelRateConfig
             {
@@ -344,6 +343,6 @@ public sealed class AgentPricingDefaultsTests : IDisposable
                 OutputPerMillion = output,
             };
         }
-        return bundle;
+        return baseline;
     }
 }

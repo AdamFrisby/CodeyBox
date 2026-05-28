@@ -14,6 +14,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 {
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private int _disposed;
 
     public SqliteWorkItemStore(string path)
     {
@@ -1166,7 +1167,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
     public void Dispose()
     {
-        _conn.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        try { _conn.Dispose(); }
+        catch (NullReferenceException) { /* teardown race: connection already closed */ }
         _writeLock.Dispose();
     }
 

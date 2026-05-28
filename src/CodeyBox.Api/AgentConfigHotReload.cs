@@ -48,7 +48,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentClassRouter _router;
     private readonly AgentBurnEstimator _burnEstimator;
     private readonly AgentCostCalculator? _costCalculator;
-    private readonly BundledAgentPricing? _bundledPricing;
+    private readonly AgentPricingOptions? _bundledBaseline;
+    private readonly AgentPricingState? _pricingState;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -69,14 +70,16 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         AgentBurnEstimator burnEstimator,
         ILogger<AgentConfigHotReload> log,
         AgentCostCalculator? costCalculator = null,
-        BundledAgentPricing? bundledPricing = null)
+        AgentPricingOptions? bundledBaseline = null,
+        AgentPricingState? pricingState = null)
     {
         _monitor = monitor;
         _orchestrator = orchestrator;
         _router = router;
         _burnEstimator = burnEstimator;
         _costCalculator = costCalculator;
-        _bundledPricing = bundledPricing;
+        _bundledBaseline = bundledBaseline;
+        _pricingState = pricingState;
         _log = log;
     }
 
@@ -203,15 +206,18 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         var prev = _lastPricing;
         try
         {
-            // Re-merge bundled defaults with the new operator snapshot so a
-            // hot-reload of CodeyBox:AgentPricing keeps the bundled rates
-            // available for (agent, model) pairs the operator didn't override.
-            // The bundled file is static between deploys, so there is no
-            // need to reread from disk here.
-            var effective = _bundledPricing is null
-                ? opts.AgentPricing
-                : AgentPricingOptions.Merge(_bundledPricing, opts.AgentPricing).Options;
-            _costCalculator.ApplyConfigReload(effective);
+            // Re-merge bundled baseline with the new operator snapshot so a
+            // hot-reload of CodeyBox:AgentPricing keeps bundled rates for keys
+            // the operator didn't override. The bundled file is static between
+            // deploys, so there is no need to reread from disk here.
+            if (_bundledBaseline is null)
+            {
+                throw new InvalidOperationException(
+                    "AgentConfigHotReload: bundled pricing baseline is required for AgentPricing hot-reload");
+            }
+            var merged = AgentPricingOptions.Merge(_bundledBaseline, opts.AgentPricing);
+            _costCalculator.ApplyConfigReload(merged.Options);
+            _pricingState?.RecordSuccessfulMerge(merged);
             _lastPricing = next;
             AuditLog.ConfigReloaded("AgentPricing", prev, next);
             _log.LogInformation("Hot-reloaded AgentPricing: {OldValue} → {NewValue}", prev, next);
