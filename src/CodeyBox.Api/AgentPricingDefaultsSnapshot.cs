@@ -8,7 +8,7 @@ namespace CodeyBox.Api;
 /// Operator-visible metadata from the shipped
 /// <c>agent-pricing-defaults.json</c> <c>_meta</c> block.
 /// </summary>
-public sealed class AgentPricingDefaultsMeta
+internal sealed class AgentPricingDefaultsMeta
 {
     public string LastUpdated { get; set; } = "";
 
@@ -22,7 +22,7 @@ public sealed class AgentPricingDefaultsMeta
 /// The baseline <see cref="AgentPricingOptions"/> is merged with operator config
 /// in the API composition root; orchestration only sees merged snapshots.
 /// </summary>
-public sealed class AgentPricingDefaultsSnapshot
+internal sealed class AgentPricingDefaultsSnapshot
 {
     public AgentPricingDefaultsMeta Meta { get; init; } = new();
 
@@ -47,7 +47,7 @@ internal sealed class AgentPricingDefaultsFileDto
 /// Tracks the last successfully applied merge (startup or hot-reload) so
 /// <c>GET /agent-pricing</c> matches <see cref="AgentCostCalculator"/>.
 /// </summary>
-public sealed class AgentPricingState
+internal sealed class AgentPricingState
 {
     public AgentPricingDefaultsSnapshot Defaults { get; }
 

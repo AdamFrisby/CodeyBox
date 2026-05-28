@@ -62,7 +62,7 @@ public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFac
         Assert.Equal(990.0, opus.GetProperty("outputPerMillion").GetDouble());
         var haiku = rates.GetProperty("claude").GetProperty("claude-haiku-4-5");
         Assert.Equal(1.0, haiku.GetProperty("inputPerMillion").GetDouble());
-        var deepseek = rates.GetProperty("opencode").GetProperty("deepseek-v4-pro");
+        var deepseek = rates.GetProperty("opencode").GetProperty("opencode-go/deepseek-v4-pro");
         Assert.Equal(0.27, deepseek.GetProperty("inputPerMillion").GetDouble());
 
         var defaults = body.GetProperty("defaultRates");
@@ -98,9 +98,9 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:inputPerMillion"] = "99.0",
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:cachedInputPerMillion"] = "9.9",
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:outputPerMillion"] = "990.0",
-                ["CodeyBox:AgentPricing:Rates:opencode:deepseek-v4-pro:inputPerMillion"] = "0.27",
-                ["CodeyBox:AgentPricing:Rates:opencode:deepseek-v4-pro:cachedInputPerMillion"] = "0.07",
-                ["CodeyBox:AgentPricing:Rates:opencode:deepseek-v4-pro:outputPerMillion"] = "1.10",
+                ["CodeyBox:AgentPricing:Rates:opencode:opencode-go/deepseek-v4-pro:inputPerMillion"] = "0.27",
+                ["CodeyBox:AgentPricing:Rates:opencode:opencode-go/deepseek-v4-pro:cachedInputPerMillion"] = "0.07",
+                ["CodeyBox:AgentPricing:Rates:opencode:opencode-go/deepseek-v4-pro:outputPerMillion"] = "1.10",
                 ["CodeyBox:AgentPricing:DefaultRates:codex:inputPerMillion"] = "5.0",
                 ["CodeyBox:AgentPricing:DefaultRates:codex:cachedInputPerMillion"] = "0.5",
                 ["CodeyBox:AgentPricing:DefaultRates:codex:outputPerMillion"] = "30.0",
@@ -157,7 +157,7 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
             {
                 var snapshot = sp.GetRequiredService<AgentPricingDefaultsSnapshot>();
                 var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<CodeyBoxOptions>>().Value;
-                var merged = AgentPricingOptions.Merge(snapshot.Baseline, opts.AgentPricing);
+                var merged = AgentPricingMerge.Merge(snapshot.Baseline, opts.AgentPricing);
                 return new AgentPricingState(snapshot, merged);
             });
             services.AddSingleton(sp =>

@@ -12,7 +12,7 @@ namespace CodeyBox.Orchestrator;
 /// "AgentPricing": {
 ///   "Rates": {
 ///     "claude": {
-///       "claude-opus-4-7": { "inputPerMillion": 15.0, "cachedInputPerMillion": 1.50, "outputPerMillion": 75.0 },
+///       "claude-opus-4-7": { "inputPerMillion": 5.0, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.0 },
 ///       "claude-sonnet-4-6": { ... }
 ///     }
 ///   },
@@ -30,87 +30,12 @@ public sealed class AgentPricingOptions
     /// <summary>Fallback rate per agent kind when the model is not in <see cref="Rates"/>.</summary>
     public Dictionary<string, ModelRateConfig> DefaultRates { get; set; } = [];
 
-    /// <summary>
-    /// Merges a baseline pricing snapshot with operator config. Operator entries
-    /// win per (agentKind, modelId). Returns immutable rate snapshots (deep-cloned).
-    /// Baseline rates are assumed validated at load time in the API host.
-    /// </summary>
-    public static MergedAgentPricing Merge(AgentPricingOptions baseline, AgentPricingOptions operatorOpts)
-    {
-        ArgumentNullException.ThrowIfNull(baseline);
-        ArgumentNullException.ThrowIfNull(operatorOpts);
-
-        var merged = new AgentPricingOptions
-        {
-            DefaultRates = operatorOpts.DefaultRates.ToDictionary(
-                kv => kv.Key,
-                kv =>
-                {
-                    ValidateRateNotNull(kv.Value, kv.Key, "(default)", "operator");
-                    return CloneRate(kv.Value);
-                },
-                StringComparer.Ordinal),
-        };
-
-        int bundledCount = 0;
-        int operatorCount = 0;
-        int overlapCount = 0;
-
-        foreach (var (agentKey, modelMap) in baseline.Rates)
-        {
-            var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
-            foreach (var (modelKey, rate) in modelMap)
-            {
-                copy[modelKey] = CloneRate(rate);
-                bundledCount++;
-            }
-            merged.Rates[agentKey] = copy;
-        }
-
-        foreach (var (agentKey, modelMap) in operatorOpts.Rates)
-        {
-            if (!merged.Rates.TryGetValue(agentKey, out var bucket))
-            {
-                bucket = new Dictionary<string, ModelRateConfig>(StringComparer.Ordinal);
-                merged.Rates[agentKey] = bucket;
-            }
-            foreach (var (modelKey, rate) in modelMap)
-            {
-                ValidateRateNotNull(rate, agentKey, modelKey, "operator");
-                if (bucket.ContainsKey(modelKey))
-                    overlapCount++;
-                bucket[modelKey] = CloneRate(rate);
-                operatorCount++;
-            }
-        }
-
-        return new MergedAgentPricing(merged, bundledCount, operatorCount, overlapCount);
-    }
-
     public static void ValidateRateNotNull(ModelRateConfig? rate, string agentKey, string modelKey, string source)
     {
         if (rate is null)
             throw new InvalidOperationException(
                 $"AgentPricing: {source} rate is null for agent '{agentKey}' model '{modelKey}'");
     }
-
-    private static ModelRateConfig CloneRate(ModelRateConfig rate) => new()
-    {
-        InputPerMillion = rate.InputPerMillion,
-        CachedInputPerMillion = rate.CachedInputPerMillion,
-        OutputPerMillion = rate.OutputPerMillion,
-    };
-}
-
-/// <summary>Result of merging bundled defaults with operator pricing.</summary>
-public readonly record struct MergedAgentPricing(
-    AgentPricingOptions Options,
-    int BundledRateCount,
-    int OperatorRateCount,
-    int OverlapCount)
-{
-    /// <summary>Distinct (agent, model) rate entries after merging.</summary>
-    public int TotalRateCount => BundledRateCount + OperatorRateCount - OverlapCount;
 }
 
 /// <summary>
@@ -142,15 +67,16 @@ public sealed class AgentCostCalculator
         AgentPricingOptions opts,
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null)
     {
-        _opts = opts;
+        _opts = CloneSnapshot(opts);
         _extractors = extractors ?? new Dictionary<AgentKind, IAgentCostExtractor>();
     }
 
     /// <summary>
     /// The pricing snapshot currently used by <see cref="Calculate"/>, including
-    /// after a successful hot-reload. Exposed for operator-facing endpoints.
+    /// after a successful hot-reload. Returns a defensive copy so callers cannot
+    /// mutate the live calculator state.
     /// </summary>
-    public AgentPricingOptions GetEffectivePricing() => _opts;
+    public AgentPricingOptions GetEffectivePricing() => CloneSnapshot(_opts);
 
     /// <summary>
     /// Swaps the held pricing snapshot. Called by <c>AgentConfigHotReload</c>
@@ -164,7 +90,7 @@ public sealed class AgentCostCalculator
         {
             foreach (var (modelKey, rate) in modelMap)
             {
-                AgentPricingOptions.ValidateRateNotNull(rate, agentKey, modelKey, "operator");
+                AgentPricingOptions.ValidateRateNotNull(rate, agentKey, modelKey, "reload");
                 if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                     throw new InvalidOperationException(
                         $"AgentPricing: negative rate for agent '{agentKey}' model '{modelKey}'");
@@ -172,12 +98,43 @@ public sealed class AgentCostCalculator
         }
         foreach (var (agentKey, rate) in next.DefaultRates)
         {
-            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "operator");
+            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "reload");
             if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                 throw new InvalidOperationException(
                     $"AgentPricing: negative default rate for agent '{agentKey}'");
         }
-        _opts = next;
+        _opts = CloneSnapshot(next);
+    }
+
+    private static AgentPricingOptions CloneSnapshot(AgentPricingOptions source)
+    {
+        var clone = new AgentPricingOptions
+        {
+            DefaultRates = source.DefaultRates.ToDictionary(
+                kv => kv.Key,
+                kv => new ModelRateConfig
+                {
+                    InputPerMillion = kv.Value.InputPerMillion,
+                    CachedInputPerMillion = kv.Value.CachedInputPerMillion,
+                    OutputPerMillion = kv.Value.OutputPerMillion,
+                },
+                StringComparer.Ordinal),
+        };
+        foreach (var (agentKey, modelMap) in source.Rates)
+        {
+            var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
+            foreach (var (modelKey, rate) in modelMap)
+            {
+                copy[modelKey] = new ModelRateConfig
+                {
+                    InputPerMillion = rate.InputPerMillion,
+                    CachedInputPerMillion = rate.CachedInputPerMillion,
+                    OutputPerMillion = rate.OutputPerMillion,
+                };
+            }
+            clone.Rates[agentKey] = copy;
+        }
+        return clone;
     }
 
     /// <summary>

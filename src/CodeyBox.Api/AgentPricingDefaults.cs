@@ -6,8 +6,8 @@ namespace CodeyBox.Api;
 
 /// <summary>
 /// Loads the bundled <c>agent-pricing-defaults.json</c> file from the API
-/// content root. Merge logic lives on <see cref="AgentPricingOptions"/> in the
-/// orchestrator; this type only parses the host defaults artifact.
+/// content root. Merge logic lives in <see cref="AgentPricingMerge"/>; this
+/// type only parses the host defaults artifact.
 /// </summary>
 internal static class AgentPricingDefaults
 {

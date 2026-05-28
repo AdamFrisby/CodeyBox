@@ -120,6 +120,9 @@ When a provider changes prices, deprecates a model, or ships a new one:
 2. Bump `_meta.lastUpdated` to today's UTC date.
 3. If a source URL has moved, update `_meta.sources` to match.
 4. Open a PR; mention which provider's price page you cross-checked.
+5. File a [CodeyBox work item](https://github.com/codeybox/codeybox/issues/new/choose)
+   when you need tracking outside the PR (provider-wide refresh, new agent
+   kind, or operator-reported cost mismatch).
 
 The bundled file is **not** auto-refreshed from provider docs — they're
 HTML pages with no machine-readable feed, and provider model id ↔ pricing
@@ -141,7 +144,7 @@ shape under their `codeybox-extra.json`:
     "AgentPricing": {
       "Rates": {
         "opencode": {
-          "deepseek-v4-pro": {
+          "opencode-go/deepseek-v4-pro": {
             "inputPerMillion":       0.27,
             "cachedInputPerMillion": 0.07,
             "outputPerMillion":      1.10
@@ -152,6 +155,10 @@ shape under their `codeybox-extra.json`:
   }
 }
 ```
+
+Use the same model id the provider CLI reports in usage events (for
+opencode-go, `opencode-go/<model-id>` per
+[opencode.ai/docs/go](https://opencode.ai/docs/go)).
 
 Operator entries override bundled entries for the same (agentKind,
 modelId). Hot-reload re-merges on each edit; the `AuditLog.ConfigReloaded`

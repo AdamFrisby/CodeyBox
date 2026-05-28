@@ -424,10 +424,15 @@ public sealed class AgentConfigHotReloadTests
             new InertCostStore(), initial.AgentBurnEstimator,
             NullLogger<AgentBurnEstimator>.Instance);
 
+        var emptyBaseline = new AgentPricingOptions();
+        var pricingState = new AgentPricingState(
+            new AgentPricingDefaultsSnapshot { Baseline = emptyBaseline },
+            AgentPricingMerge.Merge(emptyBaseline, initialPricing));
         var coordinator = new AgentConfigHotReload(
             monitor, orchFixture.Orchestrator, router, burnEstimator,
             NullLogger<AgentConfigHotReload>.Instance,
-            costCalculator: calculator);
+            costCalculator: calculator,
+            pricingState: pricingState);
         await coordinator.StartAsync(CancellationToken.None);
 
         // Fire OnChange with doubled pricing.
@@ -506,7 +511,7 @@ public sealed class AgentConfigHotReloadTests
                 },
             },
         };
-        var initialMerged = AgentPricingOptions.Merge(bundledBaseline, initialOperator);
+        var initialMerged = AgentPricingMerge.Merge(bundledBaseline, initialOperator);
         var pricingState = new AgentPricingState(
             new AgentPricingDefaultsSnapshot { Baseline = bundledBaseline },
             initialMerged);
@@ -536,7 +541,6 @@ public sealed class AgentConfigHotReloadTests
             monitor, orchFixture.Orchestrator, router, burnEstimator,
             NullLogger<AgentConfigHotReload>.Instance,
             costCalculator: calculator,
-            bundledBaseline: bundledBaseline,
             pricingState: pricingState);
         await coordinator.StartAsync(CancellationToken.None);
 
@@ -608,7 +612,7 @@ public sealed class AgentConfigHotReloadTests
                 },
             },
         };
-        var initialMerged = AgentPricingOptions.Merge(bundledBaseline, initialPricing);
+        var initialMerged = AgentPricingMerge.Merge(bundledBaseline, initialPricing);
         var pricingState = new AgentPricingState(
             new AgentPricingDefaultsSnapshot { Baseline = bundledBaseline },
             initialMerged);
@@ -633,7 +637,6 @@ public sealed class AgentConfigHotReloadTests
             monitor, orchFixture.Orchestrator, router, burnEstimator,
             NullLogger<AgentConfigHotReload>.Instance,
             costCalculator: calculator,
-            bundledBaseline: bundledBaseline,
             pricingState: pricingState);
         await coordinator.StartAsync(CancellationToken.None);
 

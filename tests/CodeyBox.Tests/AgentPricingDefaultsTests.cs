@@ -134,7 +134,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             ("claude", "claude-opus-4-7", 5.0, 0.5, 25.0),
             ("claude", "claude-haiku-4-5", 1.0, 0.1, 5.0));
 
-        var merged = AgentPricingOptions.Merge(bundled, new AgentPricingOptions());
+        var merged = AgentPricingMerge.Merge(bundled, new AgentPricingOptions());
 
         Assert.Equal(2, merged.BundledRateCount);
         Assert.Equal(0, merged.OperatorRateCount);
@@ -159,7 +159,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             }
         };
 
-        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
+        var merged = AgentPricingMerge.Merge(bundled, operatorOpts);
 
         Assert.Equal(0, merged.BundledRateCount);
         Assert.Equal(1, merged.OperatorRateCount);
@@ -184,7 +184,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             }
         };
 
-        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
+        var merged = AgentPricingMerge.Merge(bundled, operatorOpts);
 
         Assert.Equal(1, merged.BundledRateCount);
         Assert.Equal(1, merged.OperatorRateCount);
@@ -209,7 +209,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             }
         };
 
-        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
+        var merged = AgentPricingMerge.Merge(bundled, operatorOpts);
 
         Assert.Equal(2, merged.TotalRateCount);
         Assert.True(merged.Options.Rates.ContainsKey("claude"));
@@ -228,7 +228,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
             }
         };
 
-        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
+        var merged = AgentPricingMerge.Merge(bundled, operatorOpts);
 
         Assert.Equal(5.0, merged.Options.DefaultRates["codex"].InputPerMillion);
     }
@@ -239,7 +239,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
         var operatorOpts = new AgentPricingOptions();
 
-        var merged = AgentPricingOptions.Merge(bundled, operatorOpts);
+        var merged = AgentPricingMerge.Merge(bundled, operatorOpts);
 
         bundled.Rates["claude"]["claude-opus-4-7"].InputPerMillion = 999;
 
@@ -250,7 +250,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     public void Merge_InstanceMutation_DoesNotAffectMergedSnapshot()
     {
         var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
-        var merged = AgentPricingOptions.Merge(bundled, new AgentPricingOptions());
+        var merged = AgentPricingMerge.Merge(bundled, new AgentPricingOptions());
 
         bundled.Rates["claude"]["claude-opus-4-7"].InputPerMillion = 999;
 
@@ -270,7 +270,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         };
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            AgentPricingOptions.Merge(bundled, operatorOpts));
+            AgentPricingMerge.Merge(bundled, operatorOpts));
 
         Assert.Contains("null", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -287,13 +287,11 @@ public sealed class AgentPricingDefaultsTests : IDisposable
 
         Assert.False(string.IsNullOrWhiteSpace(snapshot.Meta.LastUpdated),
             "_meta.lastUpdated must be set on the shipped file");
-        Assert.True(snapshot.Baseline.Rates.ContainsKey("opencode"),
-            "shipped defaults must include opencode-go model pricing");
+        Assert.False(snapshot.Baseline.Rates.ContainsKey("opencode"),
+            "opencode-go is subscription-only; bundled defaults must not ship synthetic per-token rates");
         Assert.True(snapshot.Baseline.Rates.ContainsKey("claude"), "shipped defaults must include claude pricing");
         Assert.True(snapshot.Baseline.Rates.ContainsKey("codex"), "shipped defaults must include codex pricing");
         Assert.True(snapshot.Baseline.Rates.ContainsKey("gemini"), "shipped defaults must include gemini pricing");
-        Assert.True(snapshot.Baseline.Rates["opencode"].ContainsKey("deepseek-v4-pro"),
-            "shipped opencode defaults must include deepseek-v4-pro");
         Assert.True(snapshot.Baseline.Rates["codex"].ContainsKey("codex-5.5"),
             "shipped codex defaults must alias codex-5.5 for CLI attribution");
         Assert.True(snapshot.Baseline.Rates["gemini"].ContainsKey("gemini-3-flash-preview"),

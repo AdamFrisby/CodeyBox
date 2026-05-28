@@ -48,7 +48,6 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentClassRouter _router;
     private readonly AgentBurnEstimator _burnEstimator;
     private readonly AgentCostCalculator? _costCalculator;
-    private readonly AgentPricingOptions? _bundledBaseline;
     private readonly AgentPricingState? _pricingState;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
@@ -63,22 +62,27 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
-    public AgentConfigHotReload(
+    internal AgentConfigHotReload(
         IOptionsMonitor<CodeyBoxOptions> monitor,
         OrchestratorService orchestrator,
         AgentClassRouter router,
         AgentBurnEstimator burnEstimator,
         ILogger<AgentConfigHotReload> log,
         AgentCostCalculator? costCalculator = null,
-        AgentPricingOptions? bundledBaseline = null,
         AgentPricingState? pricingState = null)
     {
+        if (costCalculator is not null && pricingState is null)
+        {
+            throw new ArgumentException(
+                "AgentPricingState is required when AgentCostCalculator is registered for hot-reload.",
+                nameof(pricingState));
+        }
+
         _monitor = monitor;
         _orchestrator = orchestrator;
         _router = router;
         _burnEstimator = burnEstimator;
         _costCalculator = costCalculator;
-        _bundledBaseline = bundledBaseline;
         _pricingState = pricingState;
         _log = log;
     }
@@ -197,7 +201,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
     private void ApplyPricingIfChanged(CodeyBoxOptions opts)
     {
-        if (_costCalculator is null) return;
+        if (_costCalculator is null || _pricingState is null) return;
 
         var next = SerializePricing(opts.AgentPricing);
         if (string.Equals(_lastPricing, next, StringComparison.Ordinal))
@@ -210,14 +214,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             // hot-reload of CodeyBox:AgentPricing keeps bundled rates for keys
             // the operator didn't override. The bundled file is static between
             // deploys, so there is no need to reread from disk here.
-            if (_bundledBaseline is null)
-            {
-                throw new InvalidOperationException(
-                    "AgentConfigHotReload: bundled pricing baseline is required for AgentPricing hot-reload");
-            }
-            var merged = AgentPricingOptions.Merge(_bundledBaseline, opts.AgentPricing);
+            var merged = AgentPricingMerge.Merge(_pricingState.Defaults.Baseline, opts.AgentPricing);
             _costCalculator.ApplyConfigReload(merged.Options);
-            _pricingState?.RecordSuccessfulMerge(merged);
+            _pricingState.RecordSuccessfulMerge(merged);
             _lastPricing = next;
             AuditLog.ConfigReloaded("AgentPricing", prev, next);
             _log.LogInformation("Hot-reloaded AgentPricing: {OldValue} → {NewValue}", prev, next);

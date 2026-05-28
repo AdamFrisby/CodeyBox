@@ -1252,7 +1252,7 @@ builder.Services.AddSingleton<AgentPricingState>(sp =>
 {
     var defaults = sp.GetRequiredService<AgentPricingDefaultsSnapshot>();
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var merged = AgentPricingOptions.Merge(defaults.Baseline, opts.AgentPricing);
+    var merged = AgentPricingMerge.Merge(defaults.Baseline, opts.AgentPricing);
     return new AgentPricingState(defaults, merged);
 });
 builder.Services.AddSingleton<AgentCostCalculator>(sp =>
@@ -1494,7 +1494,6 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         sp.GetRequiredService<AgentBurnEstimator>(),
         sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
         sp.GetRequiredService<AgentCostCalculator>(),
-        pricingState.Defaults.Baseline,
         pricingState);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
