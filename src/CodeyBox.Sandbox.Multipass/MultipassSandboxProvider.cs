@@ -810,10 +810,24 @@ git push origin HEAD:{refName}";
             var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
             var diskBytes = detailsByName.TryGetValue(name, out details) ? details.DiskBytes : null;
             var state = detailsByName.TryGetValue(name, out details) ? details.State : null;
-            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker, state));
+            infos.Add(new ManagedSandboxInfo(
+                name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker,
+                IsSuspendLifecycleState(state)));
         }
         return infos;
     }
+
+    /// <summary>
+    /// Maps a multipass lifecycle state string to the provider-agnostic
+    /// "suspend lifecycle or frozen" flag exposed on <see cref="ManagedSandboxInfo"/>.
+    /// True for <c>Suspending</c> (snapshot in progress) and <c>Suspended</c>
+    /// (snapshot complete); the multipass state vocabulary stays inside this
+    /// provider so Core / the leak reaper see only the boolean.
+    /// </summary>
+    private static bool IsSuspendLifecycleState(string? state) =>
+        state is not null &&
+        (state.Equals("Suspending", StringComparison.OrdinalIgnoreCase) ||
+         state.Equals("Suspended", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Runs <c>multipass info --format json</c> for the given VM names and returns
@@ -1451,27 +1465,90 @@ test "$work" = present && test "$exec_wrapper" = present
     /// so a subsequent <c>multipass start</c> does not fail against a half-frozen
     /// instance. Best-effort: a non-zero `info` exit (VM gone) or an unreadable
     /// state returns immediately and lets the caller's `start` surface the real
-    /// error. The deadline bounds how long startup resume blocks per VM; if the
-    /// snapshot is still being written when it elapses we proceed and let `start`
-    /// fail into the standard stranded-item recovery path.
+    /// error.
+    ///
+    /// <para>The wait deadline is the SAME RAM-scaled budget the shutdown suspend
+    /// handler used (<see cref="SuspendTimeoutPolicy"/>), keyed off the VM's own
+    /// reported RAM (falling back to the default VM profile when info can't report
+    /// it). The previous process may have been writing the snapshot for up to that
+    /// budget; a shorter fixed cap here would `multipass start` against a still-
+    /// Suspending VM, fail, and drive the work item into stranded recovery — the
+    /// exact failure mode R8-core exists to prevent. If the snapshot is still
+    /// being written when the deadline elapses we proceed and let `start` surface
+    /// the error into the standard recovery path.</para>
     /// </summary>
     private async Task WaitWhileSuspendingAsync(
         MultipassSandboxOptions opts,
         string name,
         CancellationToken ct)
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(10);
+        var (state, memoryBytes) = await TryReadStateAndMemoryAsync(opts, name, ct);
+        // VM not found / info failed / unreadable: nothing to wait on — let start
+        // decide. Already settled (not Suspending): proceed immediately.
+        if (state is null || !state.Equals("Suspending", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        // Unknown RAM → assume the default VM profile so the cap still covers the
+        // documented worst case (30 min for the 12 GiB default) rather than
+        // collapsing to the bare floor.
+        var budget = SuspendTimeoutPolicy.For(memoryBytes ?? SandboxResourceLimits.Default.MemoryBytes);
+        var deadline = DateTime.UtcNow + budget;
         while (DateTime.UtcNow < deadline)
         {
-            ct.ThrowIfCancellationRequested();
-            var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct);
-            // VM not found, or info failed: nothing to wait on — let start decide.
-            if (info.ExitCode != 0) return;
-            if (!info.Stdout.Contains("Suspending", StringComparison.OrdinalIgnoreCase)) return;
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
+            ct.ThrowIfCancellationRequested();
+            (state, _) = await TryReadStateAndMemoryAsync(opts, name, ct);
+            if (state is null || !state.Equals("Suspending", StringComparison.OrdinalIgnoreCase))
+                return;
         }
         _log.LogWarning(
-            "multipass VM {Name} was still Suspending after 10 minutes; attempting start anyway", name);
+            "multipass VM {Name} was still Suspending after {Budget}; attempting start anyway", name, budget);
+    }
+
+    /// <summary>
+    /// Reads a single VM's lifecycle state and total RAM from
+    /// <c>multipass info &lt;name&gt; --format=json</c>. Returns
+    /// <c>(null, null)</c> when info fails, the VM is absent, or the JSON can't be
+    /// parsed — callers treat that as "nothing to wait on". Parsing the JSON
+    /// <c>state</c>/<c>memory.total</c> fields (rather than substring-matching CSV)
+    /// avoids false positives/negatives on the critical resume path.
+    /// </summary>
+    private async Task<(string? State, long? MemoryBytes)> TryReadStateAndMemoryAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        CancellationToken ct)
+    {
+        var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=json"], stdin: null, ct: ct);
+        if (info.ExitCode != 0) return (null, null);
+        try
+        {
+            using var doc = JsonDocument.Parse(info.Stdout);
+            if (!doc.RootElement.TryGetProperty("info", out var infoEl) || infoEl.ValueKind != JsonValueKind.Object)
+                return (null, null);
+            foreach (var vmEntry in infoEl.EnumerateObject())
+            {
+                string? state = null;
+                if (vmEntry.Value.TryGetProperty("state", out var stateEl) && stateEl.ValueKind == JsonValueKind.String)
+                    state = stateEl.GetString();
+
+                long? memoryBytes = null;
+                if (vmEntry.Value.TryGetProperty("memory", out var memEl) && memEl.ValueKind == JsonValueKind.Object &&
+                    memEl.TryGetProperty("total", out var totalEl))
+                {
+                    if (totalEl.ValueKind == JsonValueKind.Number && totalEl.TryGetInt64(out var totalNum))
+                        memoryBytes = totalNum;
+                    else if (totalEl.ValueKind == JsonValueKind.String &&
+                             long.TryParse(totalEl.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var totalStr))
+                        memoryBytes = totalStr;
+                }
+                return (state, memoryBytes > 0 ? memoryBytes : null);
+            }
+            return (null, null);
+        }
+        catch (JsonException)
+        {
+            return (null, null);
+        }
     }
 
     /// <summary>

@@ -44,22 +44,29 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// back to the same stranded recovery that R8-core exists to avoid — defeating
     /// the whole "restart is transparent to in-flight work" promise. 10 minutes
     /// is a safe floor; <see cref="SuspendTimeoutFor"/> scales it up for larger
-    /// VMs. The hosted service waits for all suspends to complete (it ignores the
-    /// host shutdown token so the snapshot isn't truncated mid-flight), so this
-    /// is the real bound on how long shutdown blocks per stuck VM.
+    /// VMs via <see cref="SuspendTimeoutPolicy"/>.
+    ///
+    /// <para>This bounds how long shutdown blocks per stuck VM, but it is not the
+    /// only bound: the host's global <c>HostOptions.ShutdownTimeout</c> still caps
+    /// total shutdown time. <c>Program.cs</c> raises that ceiling to cover the
+    /// largest scaled suspend budget when the multipass provider is selected, so a
+    /// healthy snapshot is not truncated. And because the (work item → VM) mapping
+    /// is persisted BEFORE the suspend is awaited (see
+    /// <see cref="SuspendOneAsync"/>), even a SIGKILL mid-snapshot still leaves a
+    /// resume mapping for the next startup — recovery does not depend on the
+    /// suspend call returning cleanly within the grace window.</para>
     /// </summary>
-    public static readonly TimeSpan DefaultPerSuspendTimeout = TimeSpan.FromMinutes(10);
+    public static readonly TimeSpan DefaultPerSuspendTimeout = SuspendTimeoutPolicy.DefaultFloor;
 
     /// <summary>
     /// Extra suspend-timeout budget per GiB of VM RAM. <c>multipass suspend</c>
     /// writes the whole RAM image to disk, so suspend time grows ~linearly with
     /// VM size; the effective per-VM timeout is
-    /// <c>max(DefaultPerSuspendTimeout, RAM_GiB × this)</c>. 150s/GiB matches the
-    /// observed ~6-minute suspend of a 4 GiB VM with headroom and gives the 12 GiB
-    /// default VM (see <see cref="SandboxResourceLimits.Default"/>) a 30-minute
-    /// ceiling.
+    /// <c>max(DefaultPerSuspendTimeout, RAM_GiB × this)</c>. Shared with the
+    /// startup resume wait and the host shutdown grace via
+    /// <see cref="SuspendTimeoutPolicy"/> so the three cannot drift apart.
     /// </summary>
-    public static readonly TimeSpan DefaultPerGiBSuspendBudget = TimeSpan.FromSeconds(150);
+    public static readonly TimeSpan DefaultPerGiBSuspendBudget = SuspendTimeoutPolicy.DefaultPerGiB;
 
     private readonly ISandboxProvider _provider;
     private readonly IWorkItemStore _store;
@@ -90,14 +97,8 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// RAM to flush to disk, so a uniform cap either truncates large VMs or wastes
     /// shutdown time waiting on small ones.
     /// </summary>
-    internal TimeSpan SuspendTimeoutFor(ISuspendableSandbox sandbox)
-    {
-        if (sandbox.MemoryBytes is not { } bytes || bytes <= 0)
-            return _perSuspendTimeout;
-        var gib = bytes / (double)(1024L * 1024 * 1024);
-        var scaled = _perGiBSuspendBudget * gib;
-        return scaled > _perSuspendTimeout ? scaled : _perSuspendTimeout;
-    }
+    internal TimeSpan SuspendTimeoutFor(ISuspendableSandbox sandbox) =>
+        SuspendTimeoutPolicy.For(sandbox.MemoryBytes, _perSuspendTimeout, _perGiBSuspendBudget);
 
     public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
@@ -117,10 +118,14 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         try
         {
             // We do NOT thread the host shutdown token into the multipass suspend
-            // calls — each suspend gets its own per-VM timeout
-            // (see SuspendTimeoutFor / SuspendOneAsync) so one stuck multipassd
-            // call can't block the rest of the drain, but the host's shutdown
-            // grace period never truncates a healthy snapshot mid-flight.
+            // calls — each suspend gets its own RAM-scaled per-VM timeout (see
+            // SuspendTimeoutFor / SuspendOneAsync) so one stuck multipassd call
+            // can't block the rest of the drain. The host still enforces
+            // HostOptions.ShutdownTimeout overall; Program.cs sizes that ceiling to
+            // cover the largest scaled suspend budget for the multipass provider so
+            // a healthy snapshot is not truncated. If the host kills us before a
+            // slow snapshot finishes, the (work item → VM) mapping persisted before
+            // the await (SuspendOneAsync) still lets the next startup resume it.
             await SuspendAllAsync();
         }
         catch (Exception ex)

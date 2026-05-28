@@ -180,7 +180,30 @@ builder.Services.Configure<HostOptions>(o =>
 {
     var cbOpts = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
         ?? new CodeyBoxOptions();
-    o.ShutdownTimeout = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
+    var grace = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
+
+    // Shutdown:GraceSeconds bounds the normal request-drain / preempt-checkpoint
+    // window. The multipass suspend-on-shutdown handler, however, can legitimately
+    // need far longer to let multipassd finish writing a VM's RAM snapshot — up to
+    // the RAM-scaled SuspendTimeoutPolicy budget (30 min for the default 12 GiB
+    // VM). If ShutdownTimeout stayed at the 60s default, the host would SIGKILL us
+    // mid-snapshot and acceptance criterion 1 (suspend completes during graceful
+    // shutdown) would fail. ShutdownTimeout is a CEILING, not a fixed wait: a
+    // shutdown with nothing to suspend still returns immediately once every hosted
+    // service's StoppingAsync completes, so raising it only affects the suspend
+    // case. Only do this for multipass — other providers don't suspend, so they
+    // keep the tighter grace.
+    var isMultipass = string.Equals(
+        (cbOpts.SandboxProvider ?? "").Trim(), "multipass", StringComparison.OrdinalIgnoreCase);
+    if (isMultipass)
+    {
+        var suspendReserve = SuspendTimeoutPolicy.For(SandboxResourceLimits.Default.MemoryBytes);
+        o.ShutdownTimeout = grace > suspendReserve ? grace : suspendReserve;
+    }
+    else
+    {
+        o.ShutdownTimeout = grace;
+    }
 });
 
 ApiKeyAuth.Configure(builder);

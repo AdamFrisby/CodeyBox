@@ -1805,9 +1805,12 @@ public sealed class PipelineRunner : IPipelineRunner
             // persisted while IsSuspended is left false (multipassd is still
             // writing the RAM snapshot). Gating only on IsSuspended would let the
             // legacy git-checkpoint + multipass-stop path race that in-flight
-            // suspend. We re-read the store (suspend ran to completion before
-            // this catch) under CancellationToken.None since ct is already
-            // cancelled by host shutdown.
+            // suspend. We re-read the store under CancellationToken.None (ct is
+            // already cancelled by host shutdown): on the per-VM suspend-timeout
+            // path the handler has persisted SuspendedVmName and returned while
+            // multipassd is still writing the snapshot and IsSuspended is still
+            // false, so the persisted mapping — not the suspend call returning — is
+            // the authoritative signal that the suspend handler owns this VM.
             if (sandbox is ISuspendableSandbox suspendable)
             {
                 var suspendHandled = suspendable.IsSuspended;

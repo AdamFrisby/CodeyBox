@@ -190,6 +190,51 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task ShutdownHandler_PersistsVmName_BEFORE_AwaitingSuspend()
+    {
+        // Acceptance criterion #3: the (work item → VM) mapping must be written
+        // BEFORE the multipass suspend is awaited, so a SIGKILL landing mid-suspend
+        // still leaves a resume mapping. Asserting the store only AFTER
+        // SuspendAllAsync returns can't distinguish "persisted before the await"
+        // from "persisted in the post-timeout handler" — both leave the same final
+        // row. So here we read the store WHILE SuspendAsync is still blocked and
+        // require the mapping to already be present.
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var sandbox = new SlowSuspendingSandbox("vm-ordering");
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        // Long per-VM timeout: the suspend stays blocked (it does NOT time out)
+        // until we explicitly release it, so any persistence we observe must have
+        // happened on the pre-await path, not in the OperationCanceledException
+        // handler.
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            perSuspendTimeout: TimeSpan.FromMinutes(5));
+
+        var suspendAll = svc.SuspendAllAsync();
+
+        // Wait until the suspend await has actually begun.
+        await sandbox.SuspendEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The mapping is already persisted even though SuspendAsync has NOT returned.
+        var midFlight = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-ordering", midFlight!.SuspendedVmName);
+        Assert.NotNull(midFlight.SuspendedAt);
+
+        // Let the suspend complete cleanly so the handler finishes.
+        sandbox.Release();
+        await suspendAll;
+
+        // Mapping survives a clean suspend too (resume reattaches the frozen VM).
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-ordering", after!.SuspendedVmName);
+    }
+
+    [Fact]
     public async Task SuspendTimeoutFor_ScalesWithVmMemory_AboveTheFloor()
     {
         // A 12 GiB VM has 3× the RAM of a 4 GiB VM to flush to disk, so it must
@@ -829,7 +874,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // Aged past LeakAgeThreshold (30m) but well within PreemptRetention (24h).
         var aged = DateTimeOffset.UtcNow.AddHours(-1);
         provider.SeedManaged(new("vm-orphan-suspending", aged, 1024L * 1024,
-            IsTrackedActive: false, HasPreemptMarker: true, State: "Suspending"));
+            IsTrackedActive: false, HasPreemptMarker: true, IsSuspendLifecycleOrFrozen: true));
 
         var webhooks = new CapturingWebhookDispatcher();
         var reaper = new SandboxLeakReaper(
@@ -846,6 +891,16 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await reaper.RunSweepAsync(CancellationToken.None);
 
         Assert.Contains("vm-orphan-suspending", provider.DisposedNames);
+        // Classified specifically as a suspend orphan (not a generic untracked
+        // leak), so the reason wired into the webhook/audit trail can't silently
+        // regress to the wrong bucket.
+        var leakEvent = Assert.Single(
+            webhooks.Events,
+            e => e.Event == "sandbox.leak_detected" &&
+                 e.Details is SandboxLeakDetails d && d.Name == "vm-orphan-suspending");
+        Assert.Equal(
+            SandboxLeakReasons.OrphanedSuspendingVm,
+            ((SandboxLeakDetails)leakEvent.Details!).Reason);
     }
 
     [Fact]
@@ -863,7 +918,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var provider = new FakeSandboxLeakProvider();
         provider.SeedManaged(new("vm-mapped-suspending", DateTimeOffset.UtcNow.AddHours(-1),
-            1024L * 1024, IsTrackedActive: false, HasPreemptMarker: true, State: "Suspending"));
+            1024L * 1024, IsTrackedActive: false, HasPreemptMarker: true, IsSuspendLifecycleOrFrozen: true));
 
         var webhooks = new CapturingWebhookDispatcher();
         var reaper = new SandboxLeakReaper(
@@ -943,17 +998,30 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
     private sealed class SlowSuspendingSandbox : ISuspendableSandbox
     {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public SlowSuspendingSandbox(string id) { Id = id; }
         public string Id { get; }
+
+        /// <summary>Completes the moment <see cref="SuspendAsync"/> is entered, so
+        /// a test can observe store state WHILE the suspend await is in flight.</summary>
+        public TaskCompletionSource SuspendEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Lets a test unblock a clean, successful suspend return (instead
+        /// of relying on the per-VM timeout cancelling the call).</summary>
+        public void Release() => _release.TrySetResult();
+
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(new SandboxExecResult(0, "", ""));
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         public Task SuspendAsync(CancellationToken ct = default)
         {
-            // Block until cancellation fires; the per-suspend timeout in
-            // SandboxSuspendOnShutdownService will cancel this.
+            SuspendEntered.TrySetResult();
+            // Block until either the per-suspend timeout cancels us (the timeout
+            // test) or a test explicitly releases for a clean return (the ordering
+            // test).
             var tcs = new TaskCompletionSource();
             ct.Register(() => tcs.TrySetException(new OperationCanceledException(ct)));
+            _release.Task.ContinueWith(_ => tcs.TrySetResult(), TaskScheduler.Default);
             return tcs.Task;
         }
     }

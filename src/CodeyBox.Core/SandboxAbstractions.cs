@@ -68,13 +68,17 @@ public interface ISandboxProvider
 /// Such sandboxes are intentionally preserved during the configured preempt
 /// retention window and must not be treated as leaks until that window expires.
 /// </param>
-/// <param name="State">
-/// Best-effort provider-reported lifecycle state of the sandbox (e.g. the
-/// multipass <c>Running</c>/<c>Suspending</c>/<c>Suspended</c>/<c>Stopped</c>
-/// state), or null when the provider does not model a persistent state. The
-/// leak reaper uses this to recognise a VM stuck in <c>Suspending</c>/
-/// <c>Suspended</c> with no live orchestrator mapping as an orphan that should
-/// not inherit the long preempt-retention grace.
+/// <param name="IsSuspendLifecycleOrFrozen">
+/// Provider-computed flag: true when the sandbox is in a suspend lifecycle
+/// state — freezing its RAM image to disk or already frozen — rather than
+/// running or stopped. This abstracts the provider's own lifecycle vocabulary
+/// (e.g. the multipass <c>Suspending</c>/<c>Suspended</c> states) to a single
+/// boolean, the same way <see cref="HasPreemptMarker"/> abstracts a provider
+/// concern. The <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> uses it to
+/// recognise a frozen VM with no live orchestrator mapping as a suspend orphan —
+/// one that must not inherit the long preempt-retention grace — without Core
+/// depending on any backend's CLI state strings. Always false for providers that
+/// do not model a persistent suspend lifecycle.
 /// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
@@ -82,7 +86,7 @@ public sealed record ManagedSandboxInfo(
     long? DiskBytes,
     bool IsTrackedActive,
     bool HasPreemptMarker = false,
-    string? State = null);
+    bool IsSuspendLifecycleOrFrozen = false);
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable
@@ -164,6 +168,48 @@ public interface ISuspendableSandbox : ISandbox
     /// than a 1 GiB idle one. Null falls back to the flat floor timeout.
     /// </summary>
     long? MemoryBytes => null;
+}
+
+/// <summary>
+/// Shared policy for how long a RAM-snapshot suspend is allowed to take, scaled
+/// by VM RAM size. Centralised so the shutdown suspend handler's per-VM timeout
+/// (<see cref="CodeyBox.Orchestrator.SandboxSuspendOnShutdownService"/>), the
+/// startup resume wait (how long to wait out a still-freezing VM before
+/// <c>multipass start</c>), and the host shutdown grace all derive from one
+/// formula and cannot drift apart. <c>multipass suspend</c> writes the whole RAM
+/// image to disk, so suspend time grows ~linearly with VM size; a uniform cap
+/// either truncates large VMs or wastes time waiting on small ones.
+/// </summary>
+public static class SuspendTimeoutPolicy
+{
+    /// <summary>Floor / fallback used when the VM's RAM size is unknown.</summary>
+    public static readonly TimeSpan DefaultFloor = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Extra budget per GiB of VM RAM. The effective budget is
+    /// <c>max(floor, RAM_GiB × perGiB)</c>. 150s/GiB matches the observed
+    /// ~6-minute suspend of a 4 GiB VM under load with headroom, and gives the
+    /// 12 GiB default VM (see <see cref="SandboxResourceLimits.Default"/>) a
+    /// 30-minute ceiling.
+    /// </summary>
+    public static readonly TimeSpan DefaultPerGiB = TimeSpan.FromSeconds(150);
+
+    /// <summary>
+    /// Effective suspend/resume budget for a VM of the given RAM size:
+    /// <c>max(floor, RAM_GiB × perGiB)</c>. Null or non-positive
+    /// <paramref name="memoryBytes"/> falls back to <paramref name="floor"/>
+    /// (never a zero or negative budget that would abandon a suspend instantly).
+    /// </summary>
+    public static TimeSpan For(long? memoryBytes, TimeSpan? floor = null, TimeSpan? perGiB = null)
+    {
+        var effectiveFloor = floor ?? DefaultFloor;
+        var effectivePerGiB = perGiB ?? DefaultPerGiB;
+        if (memoryBytes is not { } bytes || bytes <= 0)
+            return effectiveFloor;
+        var gib = bytes / (double)(1024L * 1024 * 1024);
+        var scaled = effectivePerGiB * gib;
+        return scaled > effectiveFloor ? scaled : effectiveFloor;
+    }
 }
 
 /// <summary>
