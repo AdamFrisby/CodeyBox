@@ -76,6 +76,84 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task FullProgression_RecordsPerPhaseInvolvementThroughChokepoint()
+    {
+        // Acceptance criteria #5 and #6 exercised through the REAL pipeline (not
+        // manual store seeding): a work item driven Work → Audit(fail) → Rework →
+        // Audit(pass) → Merge must leave exactly one finalized involvement row per
+        // agent run, in order, mapping 1:1 to the orchestrator's phase
+        // transitions. A regression that deletes or misplaces the chokepoint
+        // recording (RecordInvolvementStartAsync / FinalizeInvolvementAsync /
+        // ExecAuditorAsync) fails here, where the store-only test cannot.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "v1"));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("rework.txt", "v2"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+
+        // One row per phase transition, in order. The OnceFailingAuditor forces a
+        // single rework (audit iter 1 fails, iter 2 passes); the rework following
+        // audit iteration N dispatches as iteration N+1.
+        Assert.Collection(rows,
+            r => AssertInvolvement(r, AgentKind.Codex, "work", null, "success"),
+            r => AssertInvolvement(r, AgentKind.Codex, "audit:once-failing-fallback", 1, "success"),
+            r => AssertInvolvement(r, AgentKind.Codex, "rework", 2, "success"),
+            r => AssertInvolvement(r, AgentKind.Codex, "audit:once-failing-fallback", 2, "success"),
+            r => AssertInvolvement(r, AgentKind.Codex, "merge", null, "success"));
+
+        // Every row is a closed start→finalize pair (no dangling in-progress row).
+        Assert.All(rows, r => Assert.NotNull(r.EndedAt));
+    }
+
+    [Fact]
+    public async Task WorkQuotaFallback_RecordsFailureThenSuccessInvolvementRows()
+    {
+        // The quota fallback path must close the exhausted attempt's row as
+        // failure:quota and open a fresh row for the successor agent — the
+        // multi-row trail operators rely on to see "codex burned quota, claude
+        // finished it". Asserts the failure-outcome mapping that is otherwise
+        // only exercised by manual store seeding.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var workRows = rows.Where(r => r.Phase == "work").ToList();
+        Assert.Collection(workRows,
+            r => AssertInvolvement(r, AgentKind.Codex, "work", null, "failure:quota"),
+            r => AssertInvolvement(r, AgentKind.Claude, "work", null, "success"));
+        Assert.All(workRows, r => Assert.NotNull(r.EndedAt));
+    }
+
+    private static void AssertInvolvement(
+        AgentInvolvement r, AgentKind agent, string phase, int? iteration, string outcome)
+    {
+        Assert.Equal(agent, r.AgentKind);
+        Assert.Equal(phase, r.Phase);
+        Assert.Equal(iteration, r.Iteration);
+        Assert.Equal(outcome, r.Outcome);
+    }
+
+    [Fact]
     public async Task Codex_HitsQuota_FallsBackToClaude_PersistsFallbackHistoryAfterDone()
     {
         // Regression guard for the symptom "fallbackHistory: null on 25/30 Done
@@ -866,6 +944,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
+        var involvement = new InMemoryAgentInvolvementStore();
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -882,9 +961,10 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             auditQuotaProbes: [codexProbe, claudeProbe],
             classRouter: useClassRouter ? router : null,
             fallbackHistory: fallbackHistory,
-            quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }));
+            quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
+            involvement: involvement);
 
-        return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory);
+        return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
 
     private TestFixture BuildPipelineWithCost(string seedRepoUrl, IWorkItemCostStore costStore)
@@ -939,6 +1019,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
+        var involvement = new InMemoryAgentInvolvementStore();
         var calculator = new AgentCostCalculator(new AgentPricingOptions());
         var extractors = new Dictionary<AgentKind, IAgentCostExtractor>
         {
@@ -958,9 +1039,10 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             costCalculator: calculator,
             classRouter: router,
             fallbackHistory: fallbackHistory,
-            quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }));
+            quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
+            involvement: involvement);
 
-        return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory);
+        return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
 
     private sealed class FakeFallbackExtractor : IAgentCostExtractor
@@ -1245,13 +1327,15 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         public RecordingProbe ClaudeProbe { get; }
         public CapturingWebhookDispatcher Webhooks { get; }
         public InMemoryAgentFallbackHistoryStore FallbackHistory { get; }
+        public InMemoryAgentInvolvementStore Involvement { get; }
 
         public TestFixture(PipelineRunner pipeline, SqliteWorkItemStore store,
             LocalGitHost gitHost,
             ScriptableAgent codex, ScriptableAgent claude,
             RecordingProbe codexProbe, RecordingProbe claudeProbe,
             CapturingWebhookDispatcher webhooks,
-            InMemoryAgentFallbackHistoryStore fallbackHistory)
+            InMemoryAgentFallbackHistoryStore fallbackHistory,
+            InMemoryAgentInvolvementStore involvement)
         {
             Pipeline = pipeline;
             Store = store;
@@ -1262,6 +1346,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             ClaudeProbe = claudeProbe;
             Webhooks = webhooks;
             FallbackHistory = fallbackHistory;
+            Involvement = involvement;
         }
 
         public void Dispose() => Store.Dispose();

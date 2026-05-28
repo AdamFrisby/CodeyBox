@@ -905,7 +905,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IAgentAvailabilityRegistry>(),
         sp.GetService<IAgentBudgetProvider>(),
         sp.GetService<AgentConcurrencySnapshot>(),
-        sp.GetService<IInVmSmokeGate>());
+        sp.GetService<IInVmSmokeGate>(),
+        sp.GetService<IAgentInvolvementStore>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------

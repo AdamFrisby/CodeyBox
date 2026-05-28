@@ -588,11 +588,16 @@ internal static class WorkItemEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var history = involvement is null
-            ? []
-            : await involvement.ListByWorkItemAsync(item!.Id, ct);
+        // Store unwired → omit WorkAgent/AgentHistory entirely (feature disabled),
+        // matching the full GET handler. Store wired → always emit a list (possibly
+        // empty) so [] means "no agent has run yet", not "unavailable".
+        if (involvement is null)
+            return Results.Ok(new WorkItemAgentHistoryResponse(
+                WorkItemId: item!.Id.ToString(), WorkAgent: null, AgentHistory: null));
+
+        var history = await involvement.ListByWorkItemAsync(item!.Id, ct);
         return Results.Ok(new WorkItemAgentHistoryResponse(
-            WorkItemId: item!.Id.ToString(),
+            WorkItemId: item.Id.ToString(),
             WorkAgent: ResolveWorkAgent(history),
             AgentHistory: history.Select(MapInvolvement).ToList()));
     }
@@ -2456,8 +2461,13 @@ public sealed record WorkItemTimelineResponse(string WorkItemId, IReadOnlyList<T
 
 public sealed record WorkItemAgentHistoryResponse(
     string WorkItemId,
+    // Both omitted (not []/null-valued) when the involvement store is unwired, so
+    // a poller can distinguish "feature disabled" (field absent) from "wired but
+    // no agent has run yet" ([]) — mirroring the full GET /workitems/{id} handler.
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     string? WorkAgent,
-    IReadOnlyList<AgentInvolvementDto> AgentHistory);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<AgentInvolvementDto>? AgentHistory);
 
 public sealed record WorkItemDto(
     string Id,

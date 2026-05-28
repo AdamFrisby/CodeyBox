@@ -3378,7 +3378,12 @@ public sealed class PipelineRunner : IPipelineRunner
                         initialMemberOverride: _classRouter?.FindMember(
                             item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
                             pair.Runner.Kind,
-                            modelId: null));
+                            modelId: null),
+                        // ExecAuditorAsync records one involvement row per auditor
+                        // sandbox run (incl. the transient retry), so the wrapper
+                        // must not also record one per attempt — that would
+                        // double-count and collapse the retry into a single row.
+                        recordInvolvement: false);
                 }
 
                 var llmTasks = llmPairs.Select(async pair =>
@@ -3473,6 +3478,13 @@ public sealed class PipelineRunner : IPipelineRunner
             iteration: ctx.Iteration,
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
             log: _log);
+        // Record one involvement row per auditor sandbox run. ExecAuditorAsync is
+        // the single chokepoint for every auditor (tool + LLM, including the LLM
+        // transient retry), so recording here gives a 1:1 mapping between the
+        // "Running auditor" log line above and a history row — and an
+        // auditor-identifying phase the plain "audit" label could not provide.
+        var involvementId = await RecordInvolvementStartAsync(
+            ctx.WorkItemId, runner.Kind, auditorCtx.ModelId, $"audit:{auditor.Name}", ctx.Iteration);
         AuditResult result;
         try
         {
@@ -3481,12 +3493,18 @@ public sealed class PipelineRunner : IPipelineRunner
                 result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
             }
         }
+        catch (Exception ex)
+        {
+            await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
+            throw;
+        }
         finally
         {
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
         }
         sw.Stop();
+        await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner.Kind, result));
         return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs, streamCapture is not null);
     }
 
@@ -3992,7 +4010,8 @@ public sealed class PipelineRunner : IPipelineRunner
         PhaseCancellation? phaseCancellation = null,
         TimeSpan? attemptTimeout = null,
         IAgentRunner? initialRunnerOverride = null,
-        AgentMembership? initialMemberOverride = null)
+        AgentMembership? initialMemberOverride = null,
+        bool recordInvolvement = true)
     {
         // R8-core: every agent invocation gets a deterministic in-VM log path,
         // persisted on the work item BEFORE the runner starts. If SIGTERM fires
@@ -4005,15 +4024,21 @@ public sealed class PipelineRunner : IPipelineRunner
         await PersistAgentLogPathAsync(item.Id, agentLogPath, ct);
         using var logScope = AgentInvocationLogContext.BeginScope(agentLogPath);
 
-        async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, WorkItem trialItem)
+        async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, WorkItem trialItem, bool claimRoutedRow)
         {
             // Append a per-phase involvement row for the agent about to run, so the
             // full who-did-what trail captures every agent that touched the item —
             // not just the one currently stamped on WorkItem.Agent. Finalized with
             // an outcome below; on a quota/timeout fallback the next attempt records
             // its own row and this one is closed as a failure.
-            var involvementId = await RecordInvolvementStartAsync(
-                item.Id, runner.Kind, trialItem.ModelId, phase, iteration);
+            //
+            // recordInvolvement is false for the LLM-auditor path: ExecAuditorAsync
+            // records one row per auditor sandbox run (covering tool auditors and
+            // the transient retry too), so recording here as well would double-count.
+            var involvementId = recordInvolvement
+                ? await RecordInvolvementStartAsync(
+                    item.Id, runner.Kind, trialItem.ModelId, phase, iteration, reuseOpenRow: claimRoutedRow)
+                : null;
             using var attempt = phaseCancellation is not null && attemptTimeout is { } perAttempt
                 ? phaseCancellation.BeginAttemptTimeout(perAttempt)
                 : null;
@@ -4076,7 +4101,7 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             try
             {
-                return await InvokeAttemptAsync(initialRunner, initialItem);
+                return await InvokeAttemptAsync(initialRunner, initialItem, claimRoutedRow: phase == "work");
             }
             catch (AgentAttemptTimeoutException timeoutEx) when (phaseCancellation is not null)
             {
@@ -4319,14 +4344,19 @@ public sealed class PipelineRunner : IPipelineRunner
             currentItem = trialItem;
         }
 
+        var firstAttempt = true;
         while (true)
         {
             triedKeys.Add((currentMember.Agent, currentMember.ModelId ?? string.Empty));
             triedCount++;
 
+            // Only the routed agent's first work attempt adopts the router-opened
+            // row; fallback attempts (next member) always open their own row.
+            var claimRoutedRow = firstAttempt && phase == "work";
+            firstAttempt = false;
             try
             {
-                return await InvokeAttemptAsync(currentRunner, currentItem);
+                return await InvokeAttemptAsync(currentRunner, currentItem, claimRoutedRow);
             }
             catch (TerminalQuotaError quotaEx)
             {
@@ -4359,9 +4389,33 @@ public sealed class PipelineRunner : IPipelineRunner
     /// mirroring the fallback-history recording.
     /// </summary>
     private async Task<Guid?> RecordInvolvementStartAsync(
-        WorkItemId workItemId, AgentKind agent, string? modelId, string phase, int? iteration)
+        WorkItemId workItemId, AgentKind agent, string? modelId, string phase, int? iteration,
+        bool reuseOpenRow = false)
     {
         if (_involvement is null) return null;
+
+        // The quota router (AgentClassRouter.ResolveAsync) already opened an
+        // in-progress row for this work-phase pickup at routing time so deferred
+        // / gated pickups are visible before any attempt runs. The first work
+        // attempt adopts that row instead of opening a duplicate; only later
+        // fallback attempts (a different agent) open fresh rows.
+        if (reuseOpenRow)
+        {
+            try
+            {
+                var existing = await _involvement.ListByWorkItemAsync(workItemId, CancellationToken.None);
+                var open = existing.LastOrDefault(r =>
+                    r.EndedAt is null
+                    && r.Phase == phase
+                    && r.AgentKind == agent);
+                if (open is not null) return open.Id;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "agent involvement reuse lookup failed for phase '{Phase}'", phase);
+            }
+        }
+
         var id = Guid.NewGuid();
         try
         {
@@ -4379,7 +4433,10 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "agent involvement start record failed for phase '{Phase}'", phase);
+            // Best-effort like fallback-history recording: a persistence failure
+            // must not break the pipeline. Logged at Warning (not Debug) so a
+            // dropped audit-trail row is operator-visible rather than silent.
+            _log.LogWarning(ex, "agent involvement start record failed for phase '{Phase}'", phase);
             return null;
         }
     }
@@ -4399,7 +4456,9 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "agent involvement finalize failed");
+            // Best-effort; Warning (not Debug) so a missed completion stamp on the
+            // audit trail is visible to operators instead of silently swallowed.
+            _log.LogWarning(ex, "agent involvement finalize failed");
         }
     }
 
@@ -4414,6 +4473,23 @@ public sealed class PipelineRunner : IPipelineRunner
         OperationCanceledException => "failure:cancelled",
         _ => "failure:agent",
     };
+
+    /// <summary>
+    /// Maps a completed auditor run to an involvement outcome. A quota-shaped
+    /// agent failure is surfaced as <c>failure:quota</c> (the same signal that
+    /// later triggers fallback), a non-quota review-agent crash as
+    /// <c>failure:agent</c>; everything else — including a clean pass and a pass
+    /// that merely reported findings — is <c>success</c> (the agent ran fine; the
+    /// findings are the work product, not a run failure).
+    /// </summary>
+    private string AuditorRunOutcome(AgentKind kind, AuditResult result)
+    {
+        if (_quotaClassifier.Detect(kind, result.AgentStderr, result.AgentStdout) is not null)
+            return "failure:quota";
+        if (IsLlmAgentExecutionFailure(result))
+            return "failure:agent";
+        return "success";
+    }
 
     private sealed class AgentAttemptTimeoutException : OperationCanceledException
     {
@@ -6377,6 +6453,12 @@ public sealed class PipelineRunner : IPipelineRunner
             AgentResult agentResult;
             var startedAt = DateTimeOffset.UtcNow;
             var stopwatch = Stopwatch.StartNew();
+            // Merge-conflict rework is a distinct agent phase that runs outside the
+            // InvokeAgentWithQuotaFallbackAsync chokepoint, so record its
+            // involvement row directly — otherwise this real sandbox run would
+            // leave no audit-trail entry and break operator attribution.
+            var conflictInvolvementId = await RecordInvolvementStartAsync(
+                item.Id, runner.Kind, item.ModelId, ConflictReworkPhaseKey, iteration: null);
             try
             {
                 agentResult = await runner.RunAsync(
@@ -6385,6 +6467,7 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
+                await FinalizeInvolvementAsync(conflictInvolvementId, "failure:cancelled");
                 throw phase.Wrap(oce);
             }
             stopwatch.Stop();
@@ -6395,6 +6478,10 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var combined = (agentResult.Stdout ?? string.Empty) + "\n" + (agentResult.Stderr ?? string.Empty);
             var semanticIncompatible = ExtractSemanticIncompatibleReason(combined);
+            await FinalizeInvolvementAsync(conflictInvolvementId,
+                !agentResult.Success ? "failure:agent"
+                : semanticIncompatible is not null ? "failure:semantic-incompatible"
+                : "success");
             if (semanticIncompatible is not null)
             {
                 return new ConflictReworkAgentOutcome(

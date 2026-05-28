@@ -143,10 +143,14 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
     [Fact]
     public async Task WorkAuditReworkAuditMergeProgression_ProducesSevenRowHistory()
     {
-        // Acceptance criteria #5: a simulated progression
-        //   Work → Audit (3 LLM auditors) → Rework → Audit (re-check) → Merge
-        // produces exactly the 7 expected rows, in order, each closed with an
-        // outcome — mirroring the per-attempt rows the chokepoint records.
+        // STORE-CONTRACT test only: pushes the seven-row Work → Audit (3 auditors)
+        // → Rework → Audit (re-check) → Merge shape directly at the SQLite store to
+        // pin ordering, multi-row-per-iteration, and one-time finalize. It does NOT
+        // exercise PipelineRunner; the end-to-end chokepoint wiring (acceptance #5/#6)
+        // is verified by
+        // PipelineRunnerQuotaFallbackTests.FullProgression_RecordsPerPhaseInvolvementThroughChokepoint,
+        // which drives the real pipeline. Work-phase iteration is null here to match
+        // what InvokeAgentWithQuotaFallbackAsync passes in production.
         using var store = NewStore();
         var id = WorkItemId.New();
         var t = new DateTimeOffset(2026, 5, 1, 9, 0, 0, TimeSpan.Zero);
@@ -161,8 +165,8 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
             t = t.AddMinutes(1);
         }
 
-        // 1: Work phase, run by Cursor.
-        await RecordPhase(AgentKind.Cursor, "work", 1, "success");
+        // 1: Work phase, run by Cursor (iteration null, as production records it).
+        await RecordPhase(AgentKind.Cursor, "work", null, "success");
         // 2-4: Audit iteration 1 — three LLM auditors, cross-reviewed by distinct agents.
         await RecordPhase(AgentKind.Claude, "audit", 1, "success");
         await RecordPhase(AgentKind.Cursor, "audit", 1, "success");
@@ -179,7 +183,7 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
 
         // Phase/agent sequence maps 1:1 to the orchestrator's phase transitions.
         Assert.Collection(rows,
-            r => AssertRow(r, AgentKind.Cursor, "work", 1),
+            r => AssertRow(r, AgentKind.Cursor, "work", null),
             r => AssertRow(r, AgentKind.Claude, "audit", 1),
             r => AssertRow(r, AgentKind.Cursor, "audit", 1),
             r => AssertRow(r, AgentKind.Gemini, "audit", 1),

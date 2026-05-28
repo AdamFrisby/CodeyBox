@@ -111,6 +111,24 @@ public sealed class WorkItemAgentHistoryEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task AgentHistoryEndpoint_WhenWired_ReturnsEmptyArrayForNoRuns()
+    {
+        // Store wired but no agent has run yet → [] (not omitted), so a poller can
+        // tell "no agent ran yet" apart from "feature disabled".
+        var item = NewItem();
+        await _factory.Store.CreateAsync(item);
+
+        var resp = await _client.GetAsync($"/workitems/{item.Id}/agent-history");
+        resp.EnsureSuccessStatusCode();
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.True(doc.RootElement.TryGetProperty("agentHistory", out var ah),
+            "agentHistory must be present (empty array) when the store is wired");
+        Assert.Equal(JsonValueKind.Array, ah.ValueKind);
+        Assert.Equal(0, ah.GetArrayLength());
+    }
+
+    [Fact]
     public async Task Get_OnlyReturnsHistoryForRequestedWorkItem()
     {
         var requested = NewItem();
@@ -235,3 +253,4 @@ internal sealed class AgentHistoryApiFactory : WebApplicationFactory<Program>
         base.Dispose(disposing);
     }
 }
+
