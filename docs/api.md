@@ -969,6 +969,63 @@ Response: `200 OK`
 }
 ```
 
+### `GET /baselines`
+
+Returns the most recent baseline-image-reaper sweep. Each entry is one
+content-hashed Multipass baseline VM (`cb-baseline-*`) on the host, paired
+with the list of work items still pinned to it via
+`WorkItem.baselineImageRef`. `isLive=true` means at least one non-terminal
+work item references the baseline; `isLive=false` items are orphan candidates
+inside the configured grace window (default 24h) and will be reaped on a
+future sweep if no work item re-pins them.
+
+Response: `200 OK`
+
+```json
+{
+  "baselines": [
+    {
+      "name": "cb-baseline-9c74f712aa85",
+      "isLive": true,
+      "firstObservedOrphanAt": null,
+      "ageInGraceMinutes": null,
+      "workItems": [
+        { "id": "0199…", "title": "Add login flow", "state": 3 }
+      ]
+    },
+    {
+      "name": "cb-baseline-bc5b1542b6d6",
+      "isLive": false,
+      "firstObservedOrphanAt": "2026-05-25T10:00:00+00:00",
+      "ageInGraceMinutes": 240.0,
+      "workItems": []
+    }
+  ],
+  "sweepEntries": 2
+}
+```
+
+Inactive when the registered sandbox provider does not implement baseline
+imaging (process / bubblewrap) — the response is then `{ "baselines": [], "sweepEntries": 0 }`.
+
+### `GET /admin/baseline-images`
+
+Compact dashboard summary of the latest sweep. Counts only; no work-item IDs.
+
+Response: `200 OK`
+
+```json
+{
+  "total": 2,
+  "live": 1,
+  "orphanedInGrace": 1,
+  "entries": [
+    { "name": "cb-baseline-9c74f712aa85", "isLive": true, "ageInGraceMinutes": null },
+    { "name": "cb-baseline-bc5b1542b6d6", "isLive": false, "ageInGraceMinutes": 240.0 }
+  ]
+}
+```
+
 ### `POST /sandboxes/leaked/{name}/dispose`
 
 Operator-triggered dispose of a leaked sandbox by name. The name must start with

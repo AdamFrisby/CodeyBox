@@ -246,6 +246,71 @@ public interface ISuspendingSandboxProvider
 }
 
 /// <summary>
+/// Optional provider capability: implementations that model a content-hashed
+/// baseline image expose the current ref for a given (profile, flavor) here so
+/// the orchestrator can stamp <see cref="WorkItem.BaselineImageRef"/> at pickup
+/// time. Providers without baselines (process, bubblewrap) do not implement
+/// this — for those, the pipeline leaves the field null and no pinning happens.
+/// </summary>
+public interface IBaselineImageResolver
+{
+    /// <summary>
+    /// Returns the baseline image ref the provider would use right now for a
+    /// sandbox with the given network profile and flavor, based on its live
+    /// config. Returns null when the provider cannot produce a baseline for
+    /// this combination (e.g. <c>UseBaselineImages=false</c>, no network
+    /// profile selected, or the profile is unknown). The caller must treat
+    /// null as "no pin" — the work item proceeds as before.
+    /// </summary>
+    string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor);
+
+    /// <summary>
+    /// Lists every baseline image currently present on the host that this
+    /// provider considers a baseline. Used by the
+    /// <see cref="CodeyBox.Orchestrator.BaselineImageReaper"/> to compute the
+    /// orphan set (multipass baselines minus the live-ref set from the work
+    /// store). Returns an empty list when the provider has no baselines or
+    /// cannot enumerate them.
+    /// </summary>
+    Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Best-effort dispose of a single baseline image by name. Invoked by the
+    /// GC reaper on orphans past the grace window. Implementations may throw
+    /// on failure; callers wrap in try/catch.
+    /// </summary>
+    Task DisposeBaselineImageAsync(string name, CancellationToken ct);
+}
+
+/// <summary>
+/// Snapshot of one baseline image on the host, returned by
+/// <see cref="IBaselineImageResolver.ListBaselineImagesAsync"/>.
+/// </summary>
+/// <param name="Name">VM / baseline name (e.g. <c>cb-baseline-abc123</c>).</param>
+/// <param name="CreatedAt">Best-effort creation timestamp; null if not derivable.</param>
+/// <param name="DiskBytes">Reported disk usage; null when unavailable.</param>
+public sealed record BaselineImageInfo(string Name, DateTimeOffset? CreatedAt, long? DiskBytes);
+
+/// <summary>
+/// Null Object resolver for <see cref="IBaselineImageResolver"/>. Returned by
+/// the DI factory when the registered sandbox provider does not implement
+/// the capability (process / bubblewrap). Lets consumers always receive a
+/// non-null resolver without having to special-case null at every call site.
+/// </summary>
+public sealed class NullBaselineImageResolver : IBaselineImageResolver
+{
+    public static readonly NullBaselineImageResolver Instance = new();
+    private NullBaselineImageResolver() { }
+
+    public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor) => null;
+
+    public Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct) =>
+        Task.FromResult<IReadOnlyList<BaselineImageInfo>>([]);
+
+    public Task DisposeBaselineImageAsync(string name, CancellationToken ct) => Task.CompletedTask;
+}
+
+/// <summary>
 /// Description of a sandbox to provision. Mounts and environment are the only
 /// channels by which the host injects state into the sandbox.
 /// </summary>
@@ -265,6 +330,19 @@ public sealed record SandboxSpec
     /// </summary>
     public WorkItemId? TimingWorkItemId { get; init; }
     public string? TimingPhase { get; init; }
+
+    /// <summary>
+    /// Content-hashed identifier of the sandbox baseline image to pin this
+    /// sandbox to. Stamped on the work item at pickup time and threaded back
+    /// through every subsequent <see cref="ISandboxProvider.CreateAsync"/> so
+    /// audit / rework iterations keep using the same baseline as the work
+    /// phase even when the operator edits baseline-contributing config
+    /// (ExtraRuncmd, ExtraCloudInit, cloud-init contents) mid-flight.
+    /// Null = provider falls back to computing the ref from live config
+    /// (backward-compatible for items created before the stamping logic
+    /// landed, and for providers that don't model baselines).
+    /// </summary>
+    public string? BaselineImageRef { get; init; }
 }
 
 public enum SandboxProfileFlavor

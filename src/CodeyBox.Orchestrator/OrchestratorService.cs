@@ -29,6 +29,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
+    // B1 baseline-pinning: stamps WorkItem.BaselineImageRef at pickup time so
+    // subsequent phases reuse the same baseline even after an operator edits
+    // config. For providers that don't model baselines (process / bubblewrap)
+    // the DI factory hands in NullBaselineImageResolver which returns null
+    // for every resolve — pickup proceeds without a stamp.
+    private readonly IBaselineImageResolver _baselineResolver;
     // Shared swappable holder. Both this service AND PipelineRunner (the
     // pickup-time rebase-resolver's cap-aware router) read through the same
     // AgentConcurrencySnapshot, so ApplyAgentConcurrencyReload's swap is
@@ -99,7 +105,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         DeadWorkerReaper? reaper = null,
         ReleaseService? releaseService = null,
         AgentConcurrencyOptions? agentConcurrency = null,
-        AgentConcurrencySnapshot? agentConcurrencySnapshot = null)
+        AgentConcurrencySnapshot? agentConcurrencySnapshot = null,
+        IBaselineImageResolver? baselineResolver = null)
     {
         _queue = queue;
         _store = store;
@@ -115,6 +122,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _deadWorkerOpts = deadWorkerOpts;
         _reaper = reaper;
         _releaseService = releaseService;
+        _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         // Prefer the shared snapshot when DI provides one (production path —
         // PipelineRunner reads from the same instance, so hot-reload swaps
         // here are visible there). Test fixtures that pass only the legacy
@@ -995,12 +1003,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     if (item.StartedAt is null)
                     {
                         var pipelineItem = item;
+                        var baselineRef = ResolveBaselineRefForPickup(item, project);
                         item = item with
                         {
                             StartedAt = DateTimeOffset.UtcNow,
+                            BaselineImageRef = item.BaselineImageRef ?? baselineRef,
                         };
                         await _store.UpdateAsync(item, ct);
-                        item = pipelineItem with { StartedAt = item.StartedAt };
+                        item = pipelineItem with { StartedAt = item.StartedAt, BaselineImageRef = item.BaselineImageRef };
                     }
                 }
                 finally
@@ -1014,12 +1024,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 if (item.StartedAt is null)
                 {
                     var pipelineItem = item;
+                    var baselineRef = ResolveBaselineRefForPickup(item, project: null);
                     item = item with
                     {
                         StartedAt = DateTimeOffset.UtcNow,
+                        BaselineImageRef = item.BaselineImageRef ?? baselineRef,
                     };
                     await _store.UpdateAsync(item, ct);
-                    item = pipelineItem with { StartedAt = item.StartedAt };
+                    item = pipelineItem with { StartedAt = item.StartedAt, BaselineImageRef = item.BaselineImageRef };
                 }
             }
 
@@ -1179,6 +1191,40 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private SemaphoreSlim GetBudgetLock(ProjectId projectId) =>
         _budgetLocks.GetOrAdd(projectId.Value, _ => new SemaphoreSlim(1, 1));
+
+    /// <summary>
+    /// B1 stamping: returns the baseline image ref the registered sandbox
+    /// provider would currently bake for this work item's work-phase profile,
+    /// or null when no pinning applies. Returns null when the provider does
+    /// not model baselines (no <see cref="IBaselineImageResolver"/> capability),
+    /// when the project's work-phase network profile is unset, or when the
+    /// resolver returns null (provider says "no baseline for this combo" —
+    /// e.g. <c>UseBaselineImages=false</c>). The dispatcher stamps the result
+    /// on the work item right alongside the StartedAt write so subsequent
+    /// phases pick it up via <see cref="WorkItem.BaselineImageRef"/>. Never
+    /// throws — a resolver that throws would have to fail open: pinning is an
+    /// optimisation, not a correctness primitive.
+    /// </summary>
+    private string? ResolveBaselineRefForPickup(WorkItem item, Project? project)
+    {
+        // Default to the project's work-phase profile. The audit/rework
+        // phases may use different profiles; the pin applies uniformly
+        // (the provider falls back to live-config behaviour when the pinned
+        // name doesn't make sense for a given phase's profile).
+        var profile = project?.NetworkProfiles.Work;
+        // Default to Headless; the few callers using Graphical flavors resolve
+        // it in the pipeline. For B1 pinning the headless default is fine —
+        // graphical-only pipelines can extend this later if the cost matters.
+        try
+        {
+            return _baselineResolver.ResolveBaselineRef(profile, SandboxProfileFlavor.Headless);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Baseline-ref resolver threw for work item {Id}; proceeding without pin", item.Id);
+            return null;
+        }
+    }
 
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after

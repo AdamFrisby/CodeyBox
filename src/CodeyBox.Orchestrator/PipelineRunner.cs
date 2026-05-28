@@ -999,7 +999,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 allowAgentNetwork: false,
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
-                timingPhase: "pickup");
+                timingPhase: "pickup",
+                baselineImageRef: item.BaselineImageRef);
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
             await using (var cloneScope = await TimingScope.BeginAsync(
@@ -1680,7 +1681,7 @@ public sealed class PipelineRunner : IPipelineRunner
         };
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase,
-            flavor: sandboxFlavor, extraEnvironment: extraEnv);
+            flavor: sandboxFlavor, extraEnvironment: extraEnv, baselineImageRef: item.BaselineImageRef);
 
         var sandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
@@ -2544,7 +2545,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 group.Key.Caps);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
                 hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
-                flavor: sandboxTarget.Flavor);
+                flavor: sandboxTarget.Flavor, baselineImageRef: item.BaselineImageRef);
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
 
             // Within each capability group, split by Kind so tool auditors stay
@@ -2591,7 +2592,8 @@ public sealed class PipelineRunner : IPipelineRunner
                         hostNetworkProfile: sandboxTarget.NetworkProfile,
                         timingWorkItemId: ctx.WorkItemId,
                         timingPhase: "audit",
-                        flavor: sandboxTarget.Flavor);
+                        flavor: sandboxTarget.Flavor,
+                        baselineImageRef: item.BaselineImageRef);
                     return candidateSpec with
                     {
                         Mounts =
@@ -3666,7 +3668,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 [new SandboxMount { SandboxPath = LocalGitHost.SandboxRepoMountPath, HostPath = isolatedMergeRepoPath, ReadOnly = false }],
                 SandboxNetworkPolicy.Denied);
         var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: !hostMerge.HasConflicts,
-            hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge");
+            hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
+            baselineImageRef: item.BaselineImageRef);
         var mergeSandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         mergeSandboxStartSw.Stop();
@@ -5567,7 +5570,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 SandboxNetworkPolicy.Denied);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
                 hostNetworkProfile: project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
-                timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey);
+                timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,
+                baselineImageRef: item.BaselineImageRef);
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
             if (credential is not null && credential.Files.Count > 0)
@@ -6280,7 +6284,8 @@ Original merge-phase failure (for context):
         WorkItemId? timingWorkItemId = null,
         string? timingPhase = null,
         SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless,
-        IReadOnlyDictionary<string, string>? extraEnvironment = null)
+        IReadOnlyDictionary<string, string>? extraEnvironment = null,
+        string? baselineImageRef = null)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
@@ -6332,6 +6337,7 @@ Original merge-phase failure (for context):
             WorkingDirectory = SandboxConventions.WorkDir,
             TimingWorkItemId = timingWorkItemId,
             TimingPhase = timingPhase,
+            BaselineImageRef = baselineImageRef,
         };
     }
 

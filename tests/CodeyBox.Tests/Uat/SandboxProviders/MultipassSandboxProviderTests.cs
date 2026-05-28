@@ -1039,9 +1039,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
 
-        Assert.Equal("cb-baseline-graphical", baselineLaunchName);
+        // B1: baseline name is now content-hashed (cb-baseline-{12hex}); the
+        // exact value depends on cloud-init + runcmd contents. Assert the
+        // structure and that the same value is reused for the subsequent
+        // clone — re-baking would have produced a different launch name.
+        Assert.NotNull(baselineLaunchName);
+        Assert.StartsWith("cb-baseline-", baselineLaunchName);
         Assert.Equal("name=cb-graphical,mode=auto", baselineLaunchNetwork);
-        Assert.Equal("cb-baseline-graphical", cloneSource);
+        Assert.Equal(baselineLaunchName, cloneSource);
         var baselineCloudInitText = Assert.IsType<string>(baselineCloudInit);
         Assert.Contains("systemctl enable --now codeybox-route.service", baselineCloudInitText);
         Assert.DoesNotContain("apt-get install -y --no-install-recommends xvfb", baselineCloudInitText);
@@ -1138,9 +1143,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
 
-        Assert.Equal("cb-baseline-graphical-ci", baselineLaunchName);
+        // B1: see other graphical-baseline test — name is content-hashed now.
+        Assert.NotNull(baselineLaunchName);
+        Assert.StartsWith("cb-baseline-", baselineLaunchName);
         Assert.Equal("name=cb-ci,mode=auto", baselineLaunchNetwork);
-        Assert.Equal("cb-baseline-graphical-ci", cloneSource);
+        Assert.Equal(baselineLaunchName, cloneSource);
     }
 
     [Fact]

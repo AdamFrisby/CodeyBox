@@ -308,6 +308,20 @@ public sealed record WorkItem
     /// </summary>
     public ReleaseId? ReleaseId { get; init; }
 
+    /// <summary>
+    /// Content-hashed identifier of the sandbox baseline image this work item is
+    /// pinned to. Stamped at pickup time from the sandbox provider's live config
+    /// (profile, flavor, cloud-init, extra runcmd, extra cloud-init) and preserved
+    /// across audit / rework iterations so an in-flight item keeps using the
+    /// baseline it started with even when the operator edits config mid-flight.
+    /// Null for items created before this column existed, items whose pickup
+    /// predates the stamping logic, and items whose sandbox provider does not
+    /// expose a baseline-ref resolver (process / bubblewrap). When null, the
+    /// provider falls back to computing the ref from live config — backward-
+    /// compatible behaviour for the migration window.
+    /// </summary>
+    public string? BaselineImageRef { get; init; }
+
     public WorkItem With(
         WorkItemState state,
         string? error = null,

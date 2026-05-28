@@ -45,7 +45,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider
+public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -296,7 +296,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
             // the clone path skips the start (clone is born Stopped).
             if (useBaseline)
             {
-                var baselineName = await EnsureBaselineForProfileAsync(opts, spec.Network.ProfileName!, spec.Flavor, workItemId, ct);
+                var baselineName = await EnsureBaselineForProfileAsync(opts, spec.Network.ProfileName!, spec.Flavor, workItemId, spec.BaselineImageRef, ct);
                 await using var cloneScope = await TimingScope.BeginAsync(
                     timingStore, timingItemId, timingPhase, "vm.clone", log: _log);
                 await CloneFromBaselineAsync(opts, name, baselineName, workItemId, ct);
@@ -910,6 +910,7 @@ git push origin HEAD:{refName}";
         string profileName,
         SandboxProfileFlavor flavor,
         WorkItemId? workItemId,
+        string? pinnedBaselineRef,
         CancellationToken ct)
     {
         if (!opts.NetworkProfiles.TryGetValue(profileName, out _))
@@ -917,20 +918,12 @@ git push origin HEAD:{refName}";
                 $"Network profile '{profileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
                 $"Configured profiles: [{string.Join(", ", opts.NetworkProfiles.Keys)}]");
 
-        var baselineName = opts.BaselineNamePrefix + BuildBaselineKey(profileName, flavor);
-        // multipass instance names cap at 24 chars; trim if a long profile
-        // name pushes us over. We use a STABLE hash (SHA-256, first 6 hex
-        // chars) for uniqueness so two long profile names don't collide.
-        // string.GetHashCode() can't be used here — it's randomised per
-        // process, so each orchestrator restart would produce a different
-        // baseline name and re-bake unnecessarily.
-        if (baselineName.Length > 24)
-        {
-            var bytes = System.Text.Encoding.UTF8.GetBytes(baselineName);
-            var hash = System.Security.Cryptography.SHA256.HashData(bytes);
-            var hex = Convert.ToHexString(hash.AsSpan(0, 3)).ToLowerInvariant();
-            baselineName = string.Concat(baselineName.AsSpan(0, 16), "-", hex);
-        }
+        // B1: when the caller pinned a baseline ref (work item carries one from
+        // pickup), reuse it verbatim — even if live config now hashes to a
+        // different value. That's the point: an in-flight item keeps its
+        // baseline across an operator edit. When null (legacy / unsupported
+        // path), compose from live config so behaviour matches pre-B1.
+        var baselineName = pinnedBaselineRef ?? ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
 
         var sem = GetBaselineLock(baselineName);
         await sem.WaitAsync(ct);
@@ -960,14 +953,131 @@ git push origin HEAD:{refName}";
         }
     }
 
-    private static string BuildBaselineKey(string profileName, SandboxProfileFlavor flavor)
+    /// <summary>
+    /// Composes the multipass baseline VM name from live config. The hash
+    /// covers every operator-tunable input that contributes to baseline
+    /// contents — profile, flavor, the baseline cloud-init body, the install
+    /// runcmd list, and any operator-supplied extra cloud-init — so an edit
+    /// to any of them produces a fresh ref and the old baseline becomes
+    /// orphaned (eligible for the reaper after the grace window).
+    /// </summary>
+    internal static string ComposeBaselineNameFromLiveConfig(
+        MultipassSandboxOptions opts,
+        string profileName,
+        SandboxProfileFlavor flavor)
     {
-        if (flavor != SandboxProfileFlavor.Graphical)
-            return profileName;
+        var hash = ComputeBaselineHash(opts, profileName, flavor);
+        var baselineName = opts.BaselineNamePrefix + hash;
+        // multipass instance names cap at 24 chars; the prefix + 12-char hash
+        // already fits comfortably under that with the default prefix
+        // ("cb-baseline-" = 12 chars → total 24). If the operator picked a
+        // longer prefix and we overflow, trim deterministically.
+        if (baselineName.Length > 24)
+        {
+            baselineName = baselineName[..24];
+        }
+        return baselineName;
+    }
 
-        return profileName.Equals(SandboxConventions.GraphicalNetworkProfile, StringComparison.OrdinalIgnoreCase)
-            ? SandboxConventions.GraphicalNetworkProfile
-            : "graphical-" + profileName;
+    /// <summary>
+    /// Computes a 12-hex-char content hash over every input that contributes
+    /// to baseline contents. Deterministic across processes (SHA-256, not
+    /// <c>string.GetHashCode()</c>) so the same config always produces the
+    /// same ref. 12 hex chars = 48 bits; collision probability between two
+    /// distinct configs is astronomically small at the scale this is used
+    /// (handfuls of baselines per host) and the hash falls inside the
+    /// 24-char multipass name limit with the default prefix.
+    /// </summary>
+    internal static string ComputeBaselineHash(
+        MultipassSandboxOptions opts,
+        string profileName,
+        SandboxProfileFlavor flavor)
+    {
+        // The cloud-init body matches what BakeBaselineAsync writes:
+        // extraRuncmd=null, extraCloudInit=opts.ExtraCloudInit, startRouteService=true,
+        // includeGraphicalInstall=false. The install runcmds are listed
+        // separately (they run via multipass exec, not via cloud-init).
+        var cloudInit = BuildCloudInit(
+            extraRuncmd: null,
+            extraCloudInit: opts.ExtraCloudInit,
+            flavor: flavor,
+            startRouteService: true,
+            includeGraphicalInstall: false);
+        var firstBootRuncmd = BuildFirstBootRuncmd(opts, flavor);
+        // Build a canonical, version-prefixed string. The 'v1' prefix lets
+        // future schema changes invalidate every existing baseline without
+        // ambiguity. Field separator is '|' which cannot appear in profile
+        // names or flavor enum strings.
+        var canon = string.Join("|", new[]
+        {
+            "v1",
+            profileName,
+            flavor.ToString(),
+            cloudInit,
+            string.Join("\n", firstBootRuncmd),
+            opts.ExtraCloudInit ?? string.Empty,
+        });
+        var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(canon));
+        return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
+    }
+
+    /// <inheritdoc/>
+    public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
+    {
+        if (string.IsNullOrWhiteSpace(profileName)) return null;
+        var opts = ReadOptions();
+        if (!opts.UseBaselineImages) return null;
+        if (!opts.NetworkProfiles.ContainsKey(profileName)) return null;
+        return ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct)
+    {
+        var opts = ReadOptions();
+        var prefix = opts.BaselineNamePrefix;
+        var listRun = await RunAsync(opts, [opts.MultipassBinary, "list", "--format=json"], stdin: null, ct: ct);
+        if (listRun.ExitCode != 0)
+        {
+            _log.LogWarning("multipass list failed (exit {Exit}): {Stderr}", listRun.ExitCode, listRun.Stderr);
+            return [];
+        }
+        var results = new List<BaselineImageInfo>();
+        try
+        {
+            using var doc = JsonDocument.Parse(listRun.Stdout);
+            if (!doc.RootElement.TryGetProperty("list", out var list)) return results;
+            foreach (var entry in list.EnumerateArray())
+            {
+                if (!entry.TryGetProperty("name", out var nameProp)) continue;
+                var name = nameProp.GetString();
+                if (string.IsNullOrEmpty(name)) continue;
+                if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                // multipass list doesn't expose created-at in --format=json;
+                // mtime of the disk image is the next-best signal but is provider-
+                // internal — leave null and let the reaper apply the grace window
+                // based on its own bookkeeping (first-seen on a sweep).
+                results.Add(new BaselineImageInfo(name, CreatedAt: null, DiskBytes: null));
+            }
+        }
+        catch (JsonException ex)
+        {
+            _log.LogWarning(ex, "Failed to parse multipass list JSON output");
+            return [];
+        }
+        return results;
+    }
+
+    /// <inheritdoc/>
+    public async Task DisposeBaselineImageAsync(string name, CancellationToken ct)
+    {
+        var opts = ReadOptions();
+        if (!name.StartsWith(opts.BaselineNamePrefix, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"Refusing to dispose '{name}': name must start with baseline prefix '{opts.BaselineNamePrefix}'");
+        var run = await RunAsync(opts, [opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: ct);
+        if (run.ExitCode != 0)
+            throw new InvalidOperationException($"multipass delete --purge {name} failed: {run.Stderr}");
     }
 
     private async Task<bool> BaselineVmExistsAsync(

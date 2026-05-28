@@ -189,6 +189,27 @@ public interface IWorkItemStore
     IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default);
 
     /// <summary>
+    /// Returns the distinct set of non-null <see cref="WorkItem.BaselineImageRef"/>
+    /// values across all work items that are NOT in a terminal state (Done /
+    /// Failed / Cancelled / AuditFailed / MergeConflictResolutionFailed /
+    /// AbandonedAfterRecoveryAttempts). The <see cref="CodeyBox.Orchestrator.BaselineImageReaper"/>
+    /// uses this as the live-reference set for its GC sweep: any baseline VM on
+    /// the host that does not appear here and is older than the grace window can
+    /// be safely deleted. Hits the partial index on
+    /// <c>baseline_image_ref WHERE NOT NULL</c>.
+    /// </summary>
+    Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the IDs and (display) titles of every work item that currently
+    /// references <paramref name="baselineImageRef"/>. Operator endpoint helper
+    /// for <c>/baselines</c> — lets the operator see who is pinning each
+    /// baseline before disposing it.
+    /// </summary>
+    Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(
+        string baselineImageRef, CancellationToken ct = default);
+
+    /// <summary>
     /// Clears <c>replay_of_work_item_id</c> for every work item that was a replay of
     /// <paramref name="sourceId"/>. Called when the source is cancelled so replays
     /// become orphaned but keep running.

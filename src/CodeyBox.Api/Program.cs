@@ -198,6 +198,16 @@ ApiKeyAuth.Configure(builder);
 //                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
+// B1: register the baseline-image resolver capability as a derived view of
+// the registered sandbox provider. The factory returns null when the
+// provider does not implement IBaselineImageResolver (process / bubblewrap);
+// consumers must use GetService (not GetRequiredService) and handle null.
+// The factory is gated on the resolved provider — non-multipass setups get a
+// null factory hit, which the consumer treats as "no baseline pinning".
+builder.Services.AddSingleton(sp =>
+    sp.GetRequiredService<ISandboxProvider>() as IBaselineImageResolver
+        ?? NullBaselineImageResolver.Instance);
+
 static void ConfigureOtlp(OtlpExporterOptions o, OtelOptions opts)
 {
     o.Endpoint = new Uri(opts.OtlpEndpoint!);
@@ -1418,7 +1428,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<DeadWorkerReaper>(),
     sp.GetService<ReleaseService>(),
     sp.GetRequiredService<AgentConcurrencyOptions>(),
-    sp.GetRequiredService<AgentConcurrencySnapshot>()));
+    sp.GetRequiredService<AgentConcurrencySnapshot>(),
+    sp.GetRequiredService<IBaselineImageResolver>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 // R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
@@ -1511,6 +1522,23 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
 
+// --- B1 baseline-image reaper ------------------------------------------------
+// Reference-counted GC for content-hashed Multipass baseline VMs. The reaper
+// stays inactive when the registered sandbox provider does not implement
+// IBaselineImageResolver — the constructor accepts a null resolver and
+// ExecuteAsync short-circuits with an info log. Registered as a singleton so
+// the /baselines endpoint can read GetLatestReport() through DI.
+builder.Services.AddSingleton<BaselineImageReaper>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new BaselineImageReaper(
+        sp.GetRequiredService<IBaselineImageResolver>(),
+        sp.GetRequiredService<IWorkItemStore>(),
+        () => monitor.CurrentValue.BaselineImageReaper,
+        sp.GetRequiredService<ILogger<BaselineImageReaper>>());
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<BaselineImageReaper>());
+
 // --- Stale-base PR sweeper ---------------------------------------------------
 // Periodically polls open PRs across every github-upstream project, detects
 // the ones whose base branch has moved and produced a conflict the auto-merger
@@ -1588,6 +1616,7 @@ FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);
 SandboxEndpoints.Map(app);
+BaselineEndpoints.Map(app);
 QuotaRetryStatusEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 
@@ -2090,6 +2119,14 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+
+        /// <summary>
+        /// B1 baseline-image reaper configuration. Reference-counted GC for
+        /// the content-hashed baseline VMs produced by the Multipass
+        /// provider; inactive when the registered sandbox provider does not
+        /// implement <see cref="IBaselineImageResolver"/>.
+        /// </summary>
+        public BaselineImageReaperOptions BaselineImageReaper { get; set; } = new();
 
         /// <summary>
         /// Stale-base PR sweeper configuration. Detects open CodeyBox-authored

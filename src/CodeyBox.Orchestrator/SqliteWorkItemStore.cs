@@ -175,6 +175,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // the original work agent a second time.
         RunMigration("ALTER TABLE work_items ADD COLUMN conflict_rework_attempts INTEGER NOT NULL DEFAULT 0;");
 
+        // B1: content-hashed baseline image ref pinned at pickup. Lets in-flight
+        // items keep using their original baseline across an operator edit to
+        // ExtraRuncmd / ExtraCloudInit / cloud-init contents. Null for legacy rows
+        // (the provider falls back to live-config behaviour).
+        RunMigration("ALTER TABLE work_items ADD COLUMN baseline_image_ref TEXT;");
+        // Partial index used by the BaselineImageReaper's live-ref query.
+        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_baseline_image_ref ON work_items(baseline_image_ref) WHERE baseline_image_ref IS NOT NULL;");
+
         // Per-iteration dispatch record. One row per (work_item_id, iteration);
         // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
         // restart-recovery for the same iteration) overwrites the row via
@@ -273,13 +281,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
-                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts)
+                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
-                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts);
+                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -378,7 +386,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
-                    conflict_rework_attempts = $conflict_rework_attempts
+                    conflict_rework_attempts = $conflict_rework_attempts,
+                    baseline_image_ref = $baseline_image_ref
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -429,7 +438,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
-                    conflict_rework_attempts = $conflict_rework_attempts
+                    conflict_rework_attempts = $conflict_rework_attempts,
+                    baseline_image_ref = $baseline_image_ref
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -936,6 +946,58 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
+    public async Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default)
+    {
+        // Active = not in any terminal state. We do NOT exclude NeedsOperatorInput
+        // because such items are still expected to resume eventually and should
+        // keep their baseline pinned. Hits the partial index
+        // idx_work_items_baseline_image_ref so the cost scales with the number
+        // of stamped items, not the full work_items table.
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT DISTINCT baseline_image_ref FROM work_items
+            WHERE baseline_image_ref IS NOT NULL
+              AND state NOT IN (
+                {(int)WorkItemState.Done},
+                {(int)WorkItemState.Failed},
+                {(int)WorkItemState.Cancelled},
+                {(int)WorkItemState.AuditFailed},
+                {(int)WorkItemState.MergeConflictResolutionFailed},
+                {(int)WorkItemState.AbandonedAfterRecoveryAttempts}
+              );
+            """;
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            if (!reader.IsDBNull(0))
+                set.Add(reader.GetString(0));
+        }
+        return set;
+    }
+
+    public async Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(
+        string baselineImageRef, CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, title, state FROM work_items
+            WHERE baseline_image_ref = $ref
+            ORDER BY created_at ASC;
+            """;
+        cmd.Parameters.AddWithValue("$ref", baselineImageRef);
+        var result = new List<(WorkItemId, string, WorkItemState)>();
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var id = WorkItemId.Parse(reader.GetString(0));
+            var title = reader.GetString(1);
+            var state = (WorkItemState)reader.GetInt32(2);
+            result.Add((id, title, state));
+        }
+        return result;
+    }
+
     public async IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(
         WorkItemId sourceId, [EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -1161,6 +1223,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$transient_cancel_retries", item.TransientCancelRetries);
         cmd.Parameters.AddWithValue("$prompt_revision", item.PromptRevision);
         cmd.Parameters.AddWithValue("$conflict_rework_attempts", item.ConflictReworkAttempts);
+        cmd.Parameters.AddWithValue("$baseline_image_ref", (object?)item.BaselineImageRef ?? DBNull.Value);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -1212,6 +1275,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         TransientCancelRetries = ReadInt32OrDefault(r, "transient_cancel_retries", defaultValue: 0),
         PromptRevision = ReadInt32OrDefault(r, "prompt_revision", defaultValue: 1),
         ConflictReworkAttempts = ReadInt32OrDefault(r, "conflict_rework_attempts", defaultValue: 0),
+        BaselineImageRef = ReadNullableString(r, "baseline_image_ref"),
     };
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)
