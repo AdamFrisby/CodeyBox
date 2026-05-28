@@ -527,6 +527,7 @@ public sealed class AgentClassRouter
                 atCapAgents.Add(fallback.Agent);
                 continue;
             }
+
             _log.LogWarning(
                 "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
                 item.Id, classId, fallback.Agent);
