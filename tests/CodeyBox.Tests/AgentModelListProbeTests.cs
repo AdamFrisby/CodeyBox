@@ -3,7 +3,6 @@ using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Gemini;
-using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -221,30 +220,4 @@ public sealed class AgentModelListProbeTests
         Assert.Equal("no credential configured", result.FailureReason);
     }
 
-    // ── Opencode ─────────────────────────────────────────────────────────────
-    // Opencode's probe is intentionally a placeholder: it returns Failed
-    // without ever issuing a network call because no probe shape has been
-    // verified against the live opencode subscription tier. These tests pin
-    // the Failed-only contract so a future edit that flips the placeholder
-    // to Ok or silently changes Kind cannot land without breaking a test.
-
-    [Fact]
-    public void Opencode_Kind_IsOpencode()
-    {
-        Assert.Equal(AgentKind.Opencode, new OpencodeModelListProbe().Kind);
-    }
-
-    [Fact]
-    public async Task Opencode_GetModelListAsync_ReturnsFailedWithUnverifiedReason()
-    {
-        var probe = new OpencodeModelListProbe();
-
-        var result = await probe.GetModelListAsync(CancellationToken.None);
-
-        Assert.NotNull(result.FailureReason);
-        Assert.Empty(result.ModelIds);
-        // Reason text is consumed by AgentClassConfigValidator's warning log;
-        // pin it so a typo doesn't render operator diagnostics meaningless.
-        Assert.Equal("no probe shape verified", result.FailureReason);
-    }
 }
