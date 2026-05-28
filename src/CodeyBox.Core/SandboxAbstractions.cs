@@ -484,6 +484,23 @@ public sealed record SandboxMount
     public bool ReadOnly { get; init; } = true;
     public bool Tmpfs { get; init; }
     public long? SizeBytes { get; init; }
+
+    /// <summary>
+    /// Optional defensive heal hook invoked by a sandbox provider when a
+    /// bind-mount attempt reports the host source is missing. Used by the
+    /// merge / conflict-rework phase: if racing cleanup ever removes the
+    /// isolated bare clone between create and mount, the orchestrator's
+    /// callback re-clones it so the next mount attempt succeeds instead of
+    /// failing the whole work item.
+    ///
+    /// <para>Null for the common case (the source is durable and the
+    /// orchestrator has no recreation logic to offer). Providers that do not
+    /// distinguish missing-source from other mount failures may ignore this
+    /// hook entirely; only providers whose mount-time visibility of the host
+    /// path can lag behind orchestrator creation (e.g. snap-confined
+    /// Multipass) benefit from invoking it.</para>
+    /// </summary>
+    public Func<CancellationToken, Task>? RestoreHostSourceAsync { get; init; }
 }
 
 public sealed record SandboxResourceLimits

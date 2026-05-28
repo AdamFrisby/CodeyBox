@@ -39,16 +39,19 @@ public interface IGitHost
 
     /// <summary>
     /// Returns the host directory where the merge / conflict-rework phase
-    /// should stage an isolated bare clone. Implementations must return a
-    /// directory the configured <see cref="ISandboxProvider"/> can use as a
-    /// bind-mount source — for snap-confined Multipass that means inside
-    /// <c>~/snap/multipass/common/</c>, which the operator-configured
-    /// <c>GitRootDirectory</c> already satisfies for <see cref="GetRepoPath"/>.
+    /// should stage an isolated bare clone. The contract is provider-agnostic:
+    /// the returned directory MUST be usable as a bind-mount source by
+    /// whichever <see cref="ISandboxProvider"/> the orchestrator is wired up
+    /// with. Operators are responsible for configuring the host's bare-repo
+    /// root to satisfy that constraint; the default below colocates merge
+    /// staging with the durable bare repo so a single configured root covers
+    /// both.
     ///
     /// <para>Default returns the bare-repo path's parent directory so the
-    /// staged clone is a sibling of the durable bare repo and inherits its
-    /// sandbox-provider-readable property. Hosts whose <c>GetRepoPath</c> does
-    /// not sit in a sandbox-readable directory must override this.</para>
+    /// staged clone is a sibling of the durable bare repo and inherits
+    /// whatever bind-mount property <see cref="GetRepoPath"/> already has.
+    /// Hosts whose <see cref="GetRepoPath"/> does not sit in a
+    /// sandbox-mountable directory must override this method.</para>
     /// </summary>
     string GetMergeStagingRoot(string repositoryId)
     {

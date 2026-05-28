@@ -238,8 +238,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         TryChmod0700(sandboxRoot);
 
         // Pre-create host directories for tmpfs-equivalent mounts so we can
-        // bind-mount them into the VM after launch.
-        var bindMounts = new List<(string Host, string Sandbox)>();
+        // bind-mount them into the VM after launch. The optional
+        // RestoreHostSourceAsync callback is carried through so the mount loop
+        // can self-heal a missing source for callers that supply one (merge
+        // phase recreates an isolated bare clone if racing cleanup deletes it).
+        var bindMounts = new List<(string Host, string Sandbox, Func<CancellationToken, Task>? Restore)>();
         foreach (var m in spec.Mounts)
         {
             if (m.Tmpfs)
@@ -247,11 +250,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
                 var hostPath = Path.Combine(sandboxRoot, "fs" + m.SandboxPath.Replace('/', '-'));
                 Directory.CreateDirectory(hostPath);
                 TryChmod0700(hostPath);
-                bindMounts.Add((hostPath, m.SandboxPath));
+                bindMounts.Add((hostPath, m.SandboxPath, null));
             }
             else if (m.HostPath is not null)
             {
-                bindMounts.Add((m.HostPath, m.SandboxPath));
+                bindMounts.Add((m.HostPath, m.SandboxPath, m.RestoreHostSourceAsync));
             }
         }
 
@@ -1445,14 +1448,14 @@ test "$work" = present && test "$exec_wrapper" = present
     private async Task ApplyMountsAsync(
         MultipassSandboxOptions opts,
         string name,
-        List<(string Host, string Sandbox)> binds,
+        List<(string Host, string Sandbox, Func<CancellationToken, Task>? Restore)> binds,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
         if (binds.Count == 0) return;
         await WaitForStoppedAsync(opts, name, workItemId, ct);
-        foreach (var (host, sandbox) in binds)
-            await MountSingleBindWithRetryAsync(opts, name, host, sandbox, workItemId, ct);
+        foreach (var (host, sandbox, restore) in binds)
+            await MountSingleBindWithRetryAsync(opts, name, host, sandbox, workItemId, restore, ct);
     }
 
     /// <summary>
@@ -1468,26 +1471,57 @@ test "$work" = present && test "$exec_wrapper" = present
     // Exposed as internal so a unit test driving a fake IProcessRunner can
     // exercise the mount retry + source-stat branches end-to-end without
     // launching a real multipass VM.
-    internal async Task MountSingleBindWithRetryAsync(
+    // Mount retry budget. Three attempts with linear backoff (500ms * attempt)
+    // covers the realistic transient-FS-visibility race between a fresh
+    // git clone --bare and the snap-confined multipass daemon picking it up
+    // without forcing operators to wait on a permanent failure for long.
+    internal const int MountMaxAttempts = 3;
+    internal static TimeSpan MountAttemptBackoff(int attempt) =>
+        TimeSpan.FromMilliseconds(500 * attempt);
+
+    internal Task MountSingleBindWithRetryAsync(
         MultipassSandboxOptions opts,
         string name,
         string host,
         string sandbox,
         WorkItemId? workItemId,
         CancellationToken ct)
+        => MountSingleBindWithRetryAsync(
+            opts, name, host, sandbox, workItemId, restoreHostSourceAsync: null, ct);
+
+    /// <summary>
+    /// Mounts one host directory into the VM with bounded retry and per-attempt
+    /// host-state diagnostics. When <paramref name="restoreHostSourceAsync"/> is
+    /// supplied and a failed attempt reports the host source as missing, the
+    /// callback is invoked once to re-create the source before retrying — this
+    /// covers the case where racing cleanup or a failed clone removed the
+    /// staging directory between the orchestrator creating it and the mount
+    /// firing. Without the callback, a missing source is treated as terminal
+    /// (no number of retries can heal it) and reported immediately.
+    /// </summary>
+    internal async Task MountSingleBindWithRetryAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        string host,
+        string sandbox,
+        WorkItemId? workItemId,
+        Func<CancellationToken, Task>? restoreHostSourceAsync,
+        CancellationToken ct)
     {
-        const int maxAttempts = 3;
         ProcessRunResult? lastFailure = null;
         string? lastFailureState = null;
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        var attemptsRun = 0;
+        var restoreInvoked = false;
+        for (var attempt = 1; attempt <= MountMaxAttempts; attempt++)
         {
+            attemptsRun = attempt;
             // Stat the host source immediately before each mount attempt so a
             // "Source path does not exist" can be attributed to host state at
             // mount time rather than ambiguous pre-mount state.
-            var sourceState = DescribeMountSourceState(host);
+            var sourceState = await DescribeMountSourceStateAsync(host, ct);
             _log.LogInformation(
                 "multipass mount source state (attempt {Attempt}/{Max}): {Host} -> {Vm}:{Sandbox} state={State}",
-                attempt, maxAttempts, host, name, sandbox, sourceState);
+                attempt, MountMaxAttempts, host, name, sandbox, sourceState);
 
             var run = await RunAsync(
                 opts,
@@ -1496,37 +1530,48 @@ test "$work" = present && test "$exec_wrapper" = present
             if (run.ExitCode == 0)
                 return;
 
-            var postFailureState = DescribeMountSourceState(host);
+            var postFailureState = await DescribeMountSourceStateAsync(host, ct);
             lastFailure = run;
             lastFailureState = postFailureState;
-            if (attempt == maxAttempts)
+            if (attempt == MountMaxAttempts)
                 break;
 
             // Only retry when there's a plausible chance of recovery:
             //   - host source exists per Directory/File.Exists (transient
             //     daemon-side cache miss or FS sync race), OR
             //   - we hit a permission/IO error reading the source (stat-failed,
-            //     which can also be transient).
-            // If the source is definitively missing on the host, no retry can
-            // help — fail fast so the orchestrator gets the diagnostic now.
+            //     which can also be transient), OR
+            //   - the source is missing AND the caller provided a recreate
+            //     callback we have not yet invoked (defensive heal for racing
+            //     cleanup; see restoreHostSourceAsync contract).
+            // If the source is definitively missing and we have no way to
+            // recreate it, no retry can help — fail fast.
             if (postFailureState.StartsWith("exists=no", StringComparison.Ordinal))
             {
+                if (restoreHostSourceAsync is null || restoreInvoked)
+                {
+                    _log.LogWarning(
+                        "multipass mount failed and host source is missing — not retrying ({Host} -> {Vm}:{Sandbox}, attempt {Attempt}): {Stderr}",
+                        host, name, sandbox, attempt, run.Stderr.Trim());
+                    break;
+                }
+
                 _log.LogWarning(
-                    "multipass mount failed and host source is missing — not retrying ({Host} -> {Vm}:{Sandbox}, attempt {Attempt}): {Stderr}",
+                    "multipass mount source missing — invoking restore callback before retry ({Host} -> {Vm}:{Sandbox}, attempt {Attempt}): {Stderr}",
                     host, name, sandbox, attempt, run.Stderr.Trim());
-                break;
+                await restoreHostSourceAsync(ct);
+                restoreInvoked = true;
             }
 
-            var backoff = TimeSpan.FromMilliseconds(500 * attempt);
+            var backoff = MountAttemptBackoff(attempt);
             _log.LogWarning(
                 "multipass mount failed (attempt {Attempt}/{Max}, state={State}); retrying in {DelayMs}ms: {Stderr}",
-                attempt, maxAttempts, postFailureState, backoff.TotalMilliseconds, run.Stderr.Trim());
-            try { await Task.Delay(backoff, ct); }
-            catch (OperationCanceledException) { throw; }
+                attempt, MountMaxAttempts, postFailureState, backoff.TotalMilliseconds, run.Stderr.Trim());
+            await Task.Delay(backoff, ct);
         }
 
         throw new InvalidOperationException(
-            $"multipass mount {host} -> {name}:{sandbox} failed after {maxAttempts} attempts: " +
+            $"multipass mount {host} -> {name}:{sandbox} failed after {attemptsRun} attempt(s): " +
             $"{lastFailure?.Stderr.Trim()} (host source state at mount time: {lastFailureState})");
     }
 
@@ -1543,30 +1588,36 @@ test "$work" = present && test "$exec_wrapper" = present
     /// Exposed as <c>internal</c> so unit tests can pin the wire format —
     /// regressions in the format are not caught by production callers,
     /// which only read it back as opaque text in log lines.
+    ///
+    /// The owner/mode lookup goes through the injected <see cref="IProcessRunner"/>
+    /// so test doubles intercept every host process spawned at the mount
+    /// boundary; otherwise the mount path would have two parallel
+    /// process-spawn implementations (one mockable, one not).
     /// </summary>
-    internal static string DescribeMountSourceState(string hostPath)
+    internal async Task<string> DescribeMountSourceStateAsync(string hostPath, CancellationToken ct)
     {
+        // Catch only the typed exceptions Directory.Exists / new DirectoryInfo
+        // can throw for malformed inputs (NUL bytes, invalid chars). Any
+        // unexpected exception type indicates a real fault and should
+        // propagate so the mount loop fails loudly rather than masking it
+        // behind opaque "stat-failed=" diagnostics.
         try
         {
             if (Directory.Exists(hostPath))
             {
                 var info = new DirectoryInfo(hostPath);
-                return $"exists=dir mtime={info.LastWriteTimeUtc:O}{TryReadUnixStat(hostPath)}";
+                return $"exists=dir mtime={info.LastWriteTimeUtc:O}{await TryReadUnixStatAsync(hostPath, ct)}";
             }
             if (File.Exists(hostPath))
             {
                 var info = new FileInfo(hostPath);
-                return $"exists=file size={info.Length} mtime={info.LastWriteTimeUtc:O}{TryReadUnixStat(hostPath)}";
+                return $"exists=file size={info.Length} mtime={info.LastWriteTimeUtc:O}{await TryReadUnixStatAsync(hostPath, ct)}";
             }
             return "exists=no";
         }
-        catch (Exception ex)
+        catch (Exception ex) when (
+            ex is ArgumentException or IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
-            // Deliberately broad: this is defensive diagnostics. Letting an
-            // unexpected exception (e.g. ArgumentException for an invalid
-            // path) propagate would abort the entire mount loop before
-            // `multipass mount` could even be attempted, undermining the
-            // logging goal at this boundary.
             return $"stat-failed={ex.GetType().Name}:{ex.Message}";
         }
     }
@@ -1575,50 +1626,36 @@ test "$work" = present && test "$exec_wrapper" = present
     /// Returns a space-prefixed " owner=user:group(uid:gid) mode=NNN" string
     /// for the path on Linux/macOS, or empty when stat is unavailable or
     /// fails. The leading space makes string concatenation safe when this
-    /// method returns nothing on non-Unix platforms.
+    /// method returns nothing on non-Unix platforms. Routed through
+    /// <see cref="IProcessRunner"/> so unit tests can drive deterministic
+    /// stat output without spawning a real subprocess.
     /// </summary>
-    private static string TryReadUnixStat(string hostPath)
+    private async Task<string> TryReadUnixStatAsync(string hostPath, CancellationToken ct)
     {
         if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS())
             return string.Empty;
         try
         {
             // -c (Linux GNU coreutils) prints the format; macOS uses -f and a
-            // different placeholder syntax. Try GNU first — multipass-snap is
-            // Linux-only — and fall back to a label on failure.
-            var format = OperatingSystem.IsLinux() ? "%U:%G(%u:%g) mode=%a" : null;
-            var psi = new ProcessStartInfo
-            {
-                FileName = "stat",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            if (format is not null)
-            {
-                psi.ArgumentList.Add("-c");
-                psi.ArgumentList.Add(format);
-            }
-            else
-            {
-                psi.ArgumentList.Add("-f");
-                psi.ArgumentList.Add("%Su:%Sg(%u:%g) mode=%Lp");
-            }
-            psi.ArgumentList.Add(hostPath);
-            using var p = System.Diagnostics.Process.Start(psi);
-            if (p is null)
-                return string.Empty;
-            if (!p.WaitForExit(TimeSpan.FromSeconds(2)))
-            {
-                try { p.Kill(entireProcessTree: true); } catch { /* best effort */ }
-                return " owner=stat-timeout";
-            }
-            if (p.ExitCode != 0)
-                return $" owner=stat-rc={p.ExitCode}";
-            return " owner=" + p.StandardOutput.ReadToEnd().Trim();
+            // different placeholder syntax. multipass-snap is Linux-only, so
+            // GNU coreutils' format is the production path.
+            var argv = OperatingSystem.IsLinux()
+                ? new[] { "stat", "-c", "%U:%G(%u:%g) mode=%a", hostPath }
+                : new[] { "stat", "-f", "%Su:%Sg(%u:%g) mode=%Lp", hostPath };
+            // Bound the stat at 2s: a hung filesystem during diagnostics
+            // should not block the mount loop's outer cancellation budget.
+            using var statCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, statCts.Token);
+            var run = await _runner.RunAsync(argv, stdin: null, ct: linked.Token);
+            if (run.ExitCode != 0)
+                return $" owner=stat-rc={run.ExitCode}";
+            return " owner=" + run.Stdout.Trim();
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return " owner=stat-timeout";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return $" owner=stat-err:{ex.GetType().Name}";
         }

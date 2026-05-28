@@ -33,24 +33,24 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     // ── DescribeMountSourceState branches ──────────────────────────────────
 
     [Fact]
-    public void DescribeMountSourceState_ExistingDirectory_ReportsTypeAndMtime()
+    public async Task DescribeMountSourceState_ExistingDirectory_ReportsTypeAndMtime()
     {
         var dir = Path.Combine(_workspace, "live-dir");
         Directory.CreateDirectory(dir);
 
-        var state = MultipassSandboxProvider.DescribeMountSourceState(dir);
+        var state = await NewProvider(new StubRunner()).DescribeMountSourceStateAsync(dir, CancellationToken.None);
 
         Assert.StartsWith("exists=dir", state);
         Assert.Contains("mtime=", state);
     }
 
     [Fact]
-    public void DescribeMountSourceState_ExistingFile_ReportsTypeAndSize()
+    public async Task DescribeMountSourceState_ExistingFile_ReportsTypeAndSize()
     {
         var file = Path.Combine(_workspace, "live-file.txt");
         File.WriteAllText(file, "hello multipass");
 
-        var state = MultipassSandboxProvider.DescribeMountSourceState(file);
+        var state = await NewProvider(new StubRunner()).DescribeMountSourceStateAsync(file, CancellationToken.None);
 
         Assert.StartsWith("exists=file", state);
         Assert.Contains("size=15", state);
@@ -58,17 +58,17 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
-    public void DescribeMountSourceState_MissingPath_ReturnsExistsNo()
+    public async Task DescribeMountSourceState_MissingPath_ReturnsExistsNo()
     {
         var missing = Path.Combine(_workspace, "never-existed");
 
-        var state = MultipassSandboxProvider.DescribeMountSourceState(missing);
+        var state = await NewProvider(new StubRunner()).DescribeMountSourceStateAsync(missing, CancellationToken.None);
 
         Assert.Equal("exists=no", state);
     }
 
     [Fact]
-    public void DescribeMountSourceState_PathWithEmbeddedNull_DoesNotPropagateException()
+    public async Task DescribeMountSourceState_PathWithEmbeddedNull_DoesNotPropagateException()
     {
         // Inputs that Directory.Exists/File.Exists return false for must not
         // accidentally surface a typed-exception via DirectoryInfo construction
@@ -77,30 +77,66 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         // if it reaches DirectoryInfo), the call must return cleanly.
         var pathological = "\0not-a-real-path";
 
-        var state = MultipassSandboxProvider.DescribeMountSourceState(pathological);
+        var state = await NewProvider(new StubRunner()).DescribeMountSourceStateAsync(pathological, CancellationToken.None);
 
         Assert.True(state == "exists=no" || state.StartsWith("stat-failed=", StringComparison.Ordinal),
             $"unexpected state for pathological path: {state}");
     }
 
     [Fact]
-    public void DescribeMountSourceState_OnLinux_IncludesOwnerAndMode()
+    public async Task DescribeMountSourceState_OnLinux_RoutesStatThroughInjectedRunner()
     {
         // On Linux, the daemon's UID is what AppArmor confines; logging
         // user:group(uid:gid) mode=NNN lets operators see "the orchestrator
         // could stat it as user X, but multipass-daemon runs as Y" at a
-        // glance from the audit trail. Skip on macOS/Windows: macOS uses a
-        // different stat flag and Windows has no concept of POSIX owner.
+        // glance from the audit trail. The lookup must route through the
+        // injected IProcessRunner so test doubles intercept it; the previous
+        // implementation spawned `stat` directly via Process.Start which
+        // bypassed the mockable abstraction.
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             return;
 
         var dir = Path.Combine(_workspace, "live-dir-owner");
         Directory.CreateDirectory(dir);
 
-        var state = MultipassSandboxProvider.DescribeMountSourceState(dir);
+        IReadOnlyList<string>? observedArgv = null;
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count > 0 && call.Argv[0] == "stat")
+            {
+                observedArgv = call.Argv;
+                return new ProcessRunResult(0, "alice:devs(1000:1000) mode=755", "");
+            }
+            return new ProcessRunResult(0, "", "");
+        });
+        var state = await NewProvider(runner).DescribeMountSourceStateAsync(dir, CancellationToken.None);
 
-        Assert.Contains("owner=", state);
-        Assert.Contains("mode=", state);
+        Assert.NotNull(observedArgv);
+        Assert.Contains("stat", observedArgv!);
+        Assert.Contains(dir, observedArgv!);
+        Assert.Contains("owner=alice:devs(1000:1000)", state);
+        Assert.Contains("mode=755", state);
+    }
+
+    [Fact]
+    public async Task DescribeMountSourceState_StatNonZero_RecordsExitCode()
+    {
+        // A non-zero stat exit (permission denied, removed mid-stat) must
+        // surface in the diagnostic string rather than crash the mount loop.
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            return;
+
+        var dir = Path.Combine(_workspace, "live-dir-stat-fail");
+        Directory.CreateDirectory(dir);
+
+        var runner = new SequencedRunner(call =>
+            call.Argv.Count > 0 && call.Argv[0] == "stat"
+                ? new ProcessRunResult(1, "", "permission denied")
+                : new ProcessRunResult(0, "", ""));
+
+        var state = await NewProvider(runner).DescribeMountSourceStateAsync(dir, CancellationToken.None);
+
+        Assert.Contains("owner=stat-rc=1", state);
     }
 
     // ── Mount retry behaviour ──────────────────────────────────────────────
@@ -140,6 +176,53 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
+    public async Task MountSingleBindWithRetry_HostSourceMissing_InvokesRestoreCallbackAndRetries()
+    {
+        // The defensive heal hook: if the host source is gone at mount time
+        // and the caller supplied a restore callback (merge phase re-clone),
+        // invoke it once, then retry. The combined effect must be a clean
+        // mount without surfacing the original failure to the work item.
+        var hostSource = Path.Combine(_workspace, "heal-restored-source");
+        // Source is initially absent. The callback re-creates it; the second
+        // mount attempt must see it on disk and succeed.
+        Assert.False(Directory.Exists(hostSource));
+
+        var attempts = 0;
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                attempts++;
+                return Directory.Exists(hostSource)
+                    ? new ProcessRunResult(0, "", "")
+                    : new ProcessRunResult(1, "", "Source path does not exist");
+            }
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner);
+
+        var restoreInvocations = 0;
+        Task Restore(CancellationToken c)
+        {
+            restoreInvocations++;
+            Directory.CreateDirectory(hostSource);
+            return Task.CompletedTask;
+        }
+
+        await provider.MountSingleBindWithRetryAsync(
+            new MultipassSandboxOptions(),
+            name: "codeybox-test",
+            host: hostSource,
+            sandbox: "/repo",
+            workItemId: null,
+            restoreHostSourceAsync: Restore,
+            ct: CancellationToken.None);
+
+        Assert.Equal(1, restoreInvocations);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
     public async Task MountSingleBindWithRetry_HostSourceMissing_FailsFastWithoutRetry()
     {
         // If the source doesn't exist on the host filesystem, no number of
@@ -172,6 +255,12 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         Assert.Equal(1, attempts);
         Assert.Contains(missing, ex.Message);
         Assert.Contains("exists=no", ex.Message);
+        // Regression: previously the message hard-coded "after 3 attempts"
+        // (the retry budget) even when the loop broke after the first
+        // attempt. Operators reading the audit trail must see the actual
+        // attempt count so a fast missing-source failure does not look like
+        // an exhausted retry loop.
+        Assert.Contains("after 1 attempt", ex.Message);
     }
 
     [Fact]
@@ -235,5 +324,25 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null)
             => Task.FromResult(_react(new RecordedCall(argv.ToArray(), stdin)));
+    }
+
+    /// <summary>
+    /// Returns a successful empty ProcessRunResult for any call. Used by
+    /// DescribeMountSourceState tests that do not care about stat output —
+    /// the diagnostic format pinned by the test is the existence/type/size
+    /// prefix, not the owner/mode trailer.
+    /// </summary>
+    private sealed class StubRunner : IProcessRunner
+    {
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null)
+            => Task.FromResult(new ProcessRunResult(0, "", ""));
     }
 }

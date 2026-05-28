@@ -3663,169 +3663,186 @@ public sealed class PipelineRunner : IPipelineRunner
             : null;
         try
         {
-        var access = isolatedMergeRepoPath is null
-            ? _gitHost.GetSandboxAccess(repoId)
-            : _gitHost.GetIsolatedRepoSandboxAccess(isolatedMergeRepoPath);
-        var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: !hostMerge.HasConflicts,
-            hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
-            baselineImageRef: item.BaselineImageRef);
-        var mergeSandboxStartSw = Stopwatch.StartNew();
-        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-        mergeSandboxStartSw.Stop();
-        CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+            var access = isolatedMergeRepoPath is null
+                ? _gitHost.GetSandboxAccess(repoId)
+                : AttachIsolatedRepoRestoreHook(
+                    _gitHost.GetIsolatedRepoSandboxAccess(isolatedMergeRepoPath),
+                    repoId,
+                    isolatedMergeRepoPath);
+            var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: !hostMerge.HasConflicts,
+                hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
+                baselineImageRef: item.BaselineImageRef);
+            var mergeSandboxStartSw = Stopwatch.StartNew();
+            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            mergeSandboxStartSw.Stop();
+            CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
 
-        if (mergeCredential is not null && mergeCredential.Files.Count > 0)
-            await MaterialiseCredentialFilesAsync(sandbox, mergeCredential, ct);
+            if (mergeCredential is not null && mergeCredential.Files.Count > 0)
+                await MaterialiseCredentialFilesAsync(sandbox, mergeCredential, ct);
 
-        var mergeCloneScope = await TimingScope.BeginAsync(
-            _timings, item.Id, "merge", "git.clone_into_sandbox",
-            activitySource: CodeyBoxActivities.Sandbox, log: _log);
-        await using (mergeCloneScope)
-        {
-            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-        }
-        CodeyBoxMeters.SandboxLifecycle.Record(mergeCloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
-        var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
-        await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
-
-        var preMerge = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
-        }, ct);
-        if (!preMerge.Success) throw new InvalidOperationException($"pre-merge rev-parse failed: {preMerge.Stderr}");
-        if (!string.Equals(preMerge.Stdout.Trim(), preMergeSha, StringComparison.Ordinal))
-            throw new MergePhaseInconsistentResultException(
-                $"sandbox checked out {preMerge.Stdout.Trim()}, but host base '{baseBranch}' resolved to {preMergeSha}");
-
-        IReadOnlyList<ConflictHunk> conflictHunks = [];
-        if (hostMerge.HasConflicts)
-        {
-            conflictHunks = await ExtractHostConflictHunksAsync(repoId, hostMerge, ct);
-            var hostConflict = await sandbox.ExecAsync(new SandboxExec
+            var mergeCloneScope = await TimingScope.BeginAsync(
+                _timings, item.Id, "merge", "git.clone_into_sandbox",
+                activitySource: CodeyBoxActivities.Sandbox, log: _log);
+            await using (mergeCloneScope)
             {
-                Argv = ["git", "-C", SandboxConventions.WorkDir, "merge", "--no-ff", "--no-commit", $"origin/{workBranch}"],
-            }, ct);
-            if (hostConflict.Success)
-                throw new MergePhaseInconsistentResultException(
-                    "host git reported conflicts but sandbox git merged the same commits cleanly");
-        }
-
-        var prompt = hostMerge.HasConflicts
-            ? BuildConflictResolverPrompt(baseBranch, workBranch, conflictHunks, project.Audit.MergeScopeBufferLines)
-            : BuildMergePrompt(baseBranch, workBranch, hostMerge, project.Audit.MergeScopeBufferLines);
-        var mergeSw = Stopwatch.StartNew();
-        AgentResult agentResult;
-        long mergeExecElapsedMs;
-        DateTimeOffset mergeEndedAt;
-        var mergeStructuredStreamCaptured = false;
-        if (hostMerge.HasConflicts)
-        {
-            var mergeExecScope = await TimingScope.BeginAsync(
-                _timings, item.Id, "merge", "agent.exec",
-                metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value, ["capability"] = "conflict-text-only" },
-                log: _log,
-                activitySource: CodeyBoxActivities.Pipeline);
-            await using (mergeExecScope)
-            {
-                AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
-                agentResult = await RunConstrainedConflictResolverAsync(
-                    runner,
-                    sandbox,
-                    prompt,
-                    conflictHunks,
-                    credential,
-                    item.ModelId,
-                    item.ReasoningMode,
-                    ct);
+                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             }
-            mergeExecElapsedMs = mergeExecScope.ElapsedMs;
-            mergeEndedAt = DateTimeOffset.UtcNow;
-        }
-        else
-        {
-            AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
-            var mergeExecScope = await TimingScope.BeginAsync(
-                _timings, item.Id, "merge", "agent.exec",
-                metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-                log: _log,
-                activitySource: CodeyBoxActivities.Pipeline);
-            var canCaptureMergeStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "merge", ct);
-            var mergeStreamCapture = canCaptureMergeStructuredStream
-                ? await BeginAgentStreamCaptureAsync(item.Id, "merge", 1, ct)
-                : null;
-            mergeStructuredStreamCaptured = mergeStreamCapture is not null;
-            var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
-            using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            try
+            CodeyBoxMeters.SandboxLifecycle.Record(mergeCloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
+            var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
+
+            var preMerge = await sandbox.ExecAsync(new SandboxExec
             {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+            }, ct);
+            if (!preMerge.Success) throw new InvalidOperationException($"pre-merge rev-parse failed: {preMerge.Stderr}");
+            if (!string.Equals(preMerge.Stdout.Trim(), preMergeSha, StringComparison.Ordinal))
+                throw new MergePhaseInconsistentResultException(
+                    $"sandbox checked out {preMerge.Stdout.Trim()}, but host base '{baseBranch}' resolved to {preMergeSha}");
+
+            IReadOnlyList<ConflictHunk> conflictHunks = [];
+            if (hostMerge.HasConflicts)
+            {
+                conflictHunks = await ExtractHostConflictHunksAsync(repoId, hostMerge, ct);
+                var hostConflict = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", SandboxConventions.WorkDir, "merge", "--no-ff", "--no-commit", $"origin/{workBranch}"],
+                }, ct);
+                if (hostConflict.Success)
+                    throw new MergePhaseInconsistentResultException(
+                        "host git reported conflicts but sandbox git merged the same commits cleanly");
+            }
+
+            var prompt = hostMerge.HasConflicts
+                ? BuildConflictResolverPrompt(baseBranch, workBranch, conflictHunks, project.Audit.MergeScopeBufferLines)
+                : BuildMergePrompt(baseBranch, workBranch, hostMerge, project.Audit.MergeScopeBufferLines);
+            var mergeSw = Stopwatch.StartNew();
+            AgentResult agentResult;
+            long mergeExecElapsedMs;
+            DateTimeOffset mergeEndedAt;
+            var mergeStructuredStreamCaptured = false;
+            if (hostMerge.HasConflicts)
+            {
+                var mergeExecScope = await TimingScope.BeginAsync(
+                    _timings, item.Id, "merge", "agent.exec",
+                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value, ["capability"] = "conflict-text-only" },
+                    log: _log,
+                    activitySource: CodeyBoxActivities.Pipeline);
                 await using (mergeExecScope)
                 {
-                    var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
-                        stdoutChunkCallback: mergeStdoutCallback,
-                        captureStructuredStream: mergeStreamCapture is not null);
-                    var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
-                    if (completed != runTask)
+                    AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
+                    agentResult = await RunConstrainedConflictResolverAsync(
+                        runner,
+                        sandbox,
+                        prompt,
+                        conflictHunks,
+                        credential,
+                        item.ModelId,
+                        item.ReasoningMode,
+                        ct);
+                }
+                mergeExecElapsedMs = mergeExecScope.ElapsedMs;
+                mergeEndedAt = DateTimeOffset.UtcNow;
+            }
+            else
+            {
+                AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
+                var mergeExecScope = await TimingScope.BeginAsync(
+                    _timings, item.Id, "merge", "agent.exec",
+                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+                    log: _log,
+                    activitySource: CodeyBoxActivities.Pipeline);
+                var canCaptureMergeStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "merge", ct);
+                var mergeStreamCapture = canCaptureMergeStructuredStream
+                    ? await BeginAgentStreamCaptureAsync(item.Id, "merge", 1, ct)
+                    : null;
+                mergeStructuredStreamCaptured = mergeStreamCapture is not null;
+                var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
+                using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                try
+                {
+                    await using (mergeExecScope)
                     {
-                        await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
-                        completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                        var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
+                            stdoutChunkCallback: mergeStdoutCallback,
+                            captureStructuredStream: mergeStreamCapture is not null);
+                        var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                         if (completed != runTask)
-                            await runnerCts.CancelAsync();
-                    }
+                        {
+                            await RequestAgentPreemptWithDeadlineAsync(runner, sandbox, SandboxConventions.WorkDir, ct);
+                            completed = await Task.WhenAny(runTask, Task.Delay(_opts.AgentPreemptDrain, ct));
+                            if (completed != runTask)
+                                await runnerCts.CancelAsync();
+                        }
 
-                    agentResult = await runTask;
-                    if (hostShutdownToken.IsCancellationRequested)
-                        throw new OperationCanceledException(hostShutdownToken);
+                        agentResult = await runTask;
+                        if (hostShutdownToken.IsCancellationRequested)
+                            throw new OperationCanceledException(hostShutdownToken);
+                    }
+                }
+                finally
+                {
+                    if (mergeStreamCapture is not null)
+                        await mergeStreamCapture.DisposeAsync();
+                }
+                mergeExecElapsedMs = mergeExecScope.ElapsedMs;
+                mergeEndedAt = DateTimeOffset.UtcNow;
+            }
+            CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
+                new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+                new KeyValuePair<string, object?>("phase", "merge"));
+
+            var observedModelId = ResolveObservedModelId(runner, item.ModelId);
+            var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecElapsedMs);
+            if (!mergeStructuredStreamCaptured)
+                await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
+            await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
+                runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt);
+            mergeSw.Stop();
+            if (_availability is { } regOnMergeFinish)
+            {
+                var transition = regOnMergeFinish.RecordRunOutcome(runner.Kind, agentResult.Success, mergeSw.Elapsed);
+                if (!transition.PreviouslyExcluded && transition.NowExcluded)
+                {
+                    await _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "agent.smoke_failed",
+                        WorkItem = item,
+                        Project = project,
+                        Details = new AgentSmokeFailedDetails
+                        {
+                            AgentKind = runner.Kind.Value,
+                            Reason = transition.Reason,
+                        },
+                    }, CancellationToken.None);
                 }
             }
-            finally
+            AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
+                stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
+            LogAgentOutput(_log, runner.Kind, agentResult);
+            if (!agentResult.Success)
             {
-                if (mergeStreamCapture is not null)
-                    await mergeStreamCapture.DisposeAsync();
-            }
-            mergeExecElapsedMs = mergeExecScope.ElapsedMs;
-            mergeEndedAt = DateTimeOffset.UtcNow;
-        }
-        CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
-            new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
-            new KeyValuePair<string, object?>("phase", "merge"));
-
-        var observedModelId = ResolveObservedModelId(runner, item.ModelId);
-        var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecElapsedMs);
-        if (!mergeStructuredStreamCaptured)
-            await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
-        await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-            runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt);
-        mergeSw.Stop();
-        if (_availability is { } regOnMergeFinish)
-        {
-            var transition = regOnMergeFinish.RecordRunOutcome(runner.Kind, agentResult.Success, mergeSw.Elapsed);
-            if (!transition.PreviouslyExcluded && transition.NowExcluded)
-            {
-                await _webhooks.PublishAsync(new WebhookEvent
+                _quotaClassifier.EmitAdvisoryAuditEvents(
+                    runner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
+                var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
+                if (detection is not null)
                 {
-                    Event = "agent.smoke_failed",
-                    WorkItem = item,
-                    Project = project,
-                    Details = new AgentSmokeFailedDetails
-                    {
-                        AgentKind = runner.Kind.Value,
-                        Reason = transition.Reason,
-                    },
-                }, CancellationToken.None);
-            }
-        }
-        AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
-            stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
-        LogAgentOutput(_log, runner.Kind, agentResult);
-        if (!agentResult.Success)
-        {
-            _quotaClassifier.EmitAdvisoryAuditEvents(
-                runner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
-            var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
-            if (detection is not null)
-            {
+                    await _quotaClassifier.RecordIfQuotaFailureAsync(
+                        _quotaFailures,
+                        runner.Kind,
+                        observedModelId,
+                        agentResult.Summary,
+                        agentResult.Stderr,
+                        mergeEndedAt,
+                        _auditQuotaOptions.ObservedFailureRetention,
+                        ct,
+                        projectId: item.ProjectId,
+                        stdout: agentResult.Stdout);
+                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+                }
+
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     runner.Kind,
@@ -3837,53 +3854,74 @@ public sealed class PipelineRunner : IPipelineRunner
                     ct,
                     projectId: item.ProjectId,
                     stdout: agentResult.Stdout);
-                throw new TerminalQuotaError(detection.Kind, $"Merge agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+                if (hostMerge.HasConflicts)
+                    throw new MergeConflictResolutionFailedException(
+                        $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
+                throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
             }
 
-            await _quotaClassifier.RecordIfQuotaFailureAsync(
-                _quotaFailures,
-                runner.Kind,
-                observedModelId,
-                agentResult.Summary,
-                agentResult.Stderr,
-                mergeEndedAt,
-                _auditQuotaOptions.ObservedFailureRetention,
-                ct,
-                projectId: item.ProjectId,
-                stdout: agentResult.Stdout);
-            if (hostMerge.HasConflicts)
-                throw new MergeConflictResolutionFailedException(
-                    $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
-            throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
-        }
-
-        // Read suggestions.json before cleaning the working tree, then remove it
-        // so VerifyMergeStateAsync's `git status --porcelain` check sees a clean tree.
-        // Mirror the work-phase pattern: strip from the git index first so a staged
-        // suggestions.json doesn't leave a deletion entry that confuses git status.
-        var mergeSuggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
-        await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--force", "--",
-                ".codeybox/suggestions.json"],
-        }, ct);
-        await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["rm", "-f", $"{SandboxConventions.WorkDir}/.codeybox/suggestions.json"],
-        }, ct);
-
-        var verificationRef = $"refs/codeybox/merge-verification/{item.Id}";
-        string mergeSha;
-        if (hostMerge.HasConflicts)
-        {
-            try
+            // Read suggestions.json before cleaning the working tree, then remove it
+            // so VerifyMergeStateAsync's `git status --porcelain` check sees a clean tree.
+            // Mirror the work-phase pattern: strip from the git index first so a staged
+            // suggestions.json doesn't leave a deletion entry that confuses git status.
+            var mergeSuggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
+            await sandbox.ExecAsync(new SandboxExec
             {
-                var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct);
-                await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct);
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--force", "--",
+                ".codeybox/suggestions.json"],
+            }, ct);
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["rm", "-f", $"{SandboxConventions.WorkDir}/.codeybox/suggestions.json"],
+            }, ct);
+
+            var verificationRef = $"refs/codeybox/merge-verification/{item.Id}";
+            string mergeSha;
+            if (hostMerge.HasConflicts)
+            {
+                try
+                {
+                    var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct);
+                    await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct);
+                    mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
+                    await ImportIsolatedMergeCommitAsync(repoId, isolatedMergeRepoPath!, verificationRef, ct);
+                    mergeSha = await _gitHost.ResolveCommitAsync(repoId, verificationRef, ct);
+                    try
+                    {
+                        await VerifyMergeResultAgainstHostAsync(
+                            item.Id,
+                            repoId,
+                            preMergeSha,
+                            workTipSha,
+                            mergeSha,
+                            hostMerge,
+                            project.Audit.MergeScopeBufferLines,
+                            ct,
+                            project,
+                            runner,
+                            credential,
+                            conflictsResolvedByConstrainedResolver: true);
+                        await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
+                    }
+                    finally
+                    {
+                        await DeleteHostRefBestEffortAsync(repoId, verificationRef, CancellationToken.None);
+                    }
+                }
+                catch (ScopeFenceViolation ex)
+                {
+                    throw new MergeConflictResolutionFailedException(ex.Message, ex);
+                }
+                catch (InvalidOperationException ex) when (hostMerge.HasConflicts)
+                {
+                    throw new MergeConflictResolutionFailedException(ex.Message, ex);
+                }
+            }
+            else
+            {
                 mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
-                await ImportIsolatedMergeCommitAsync(repoId, isolatedMergeRepoPath!, verificationRef, ct);
-                mergeSha = await _gitHost.ResolveCommitAsync(repoId, verificationRef, ct);
                 try
                 {
                     await VerifyMergeResultAgainstHostAsync(
@@ -3897,8 +3935,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         ct,
                         project,
                         runner,
-                        credential,
-                        conflictsResolvedByConstrainedResolver: true);
+                        credential);
                     await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
                 }
                 finally
@@ -3906,45 +3943,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     await DeleteHostRefBestEffortAsync(repoId, verificationRef, CancellationToken.None);
                 }
             }
-            catch (ScopeFenceViolation ex)
-            {
-                throw new MergeConflictResolutionFailedException(ex.Message, ex);
-            }
-            catch (InvalidOperationException ex) when (hostMerge.HasConflicts)
-            {
-                throw new MergeConflictResolutionFailedException(ex.Message, ex);
-            }
-        }
-        else
-        {
-            mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
-            try
-            {
-                await VerifyMergeResultAgainstHostAsync(
-                    item.Id,
-                    repoId,
-                    preMergeSha,
-                    workTipSha,
-                    mergeSha,
-                    hostMerge,
-                    project.Audit.MergeScopeBufferLines,
-                    ct,
-                    project,
-                    runner,
-                    credential);
-                await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
-            }
-            finally
-            {
-                await DeleteHostRefBestEffortAsync(repoId, verificationRef, CancellationToken.None);
-            }
-        }
 
-        if (mergeSuggestionsJson is not null)
-            await PickUpSuggestionsAsync(item, project, mergeSuggestionsJson, ct);
+            if (mergeSuggestionsJson is not null)
+                await PickUpSuggestionsAsync(item, project, mergeSuggestionsJson, ct);
 
-        return (mergeSha, agentResult.Stdout);
+            return (mergeSha, agentResult.Stdout);
         }
         finally
         {
@@ -4238,15 +4241,12 @@ public sealed class PipelineRunner : IPipelineRunner
     /// can mutate refs without touching the durable host bare repo.
     ///
     /// <para>The staging directory comes from <see cref="IGitHost.GetMergeStagingRoot"/>
-    /// rather than <see cref="Path.GetTempPath"/> because, on snap-confined
-    /// Multipass, the daemon's AppArmor profile only allows reads inside
-    /// <c>~/snap/multipass/common/</c>. A host bind-mount source under
-    /// <c>/tmp</c> surfaces as <c>"Source path ... does not exist"</c> from
-    /// <c>multipass mount</c> even though the directory was just created by
-    /// <c>git clone --bare</c>. Other sandbox providers (process, bubblewrap)
-    /// do not share that constraint, but routing through the git host keeps
-    /// the staging-location decision on the side that knows where its
-    /// durable bare repos already live.</para>
+    /// rather than <see cref="Path.GetTempPath"/>: the configured sandbox
+    /// provider may restrict bind-mount sources (e.g. snap-confined Multipass
+    /// only reads inside <c>~/snap/multipass/common/</c>), and routing through
+    /// the git host keeps that decision on the side that knows where its
+    /// durable bare repos already live so a single operator-configured root
+    /// satisfies both.</para>
     /// </summary>
     internal async Task<string> CreateIsolatedMergeRepositoryAsync(string repoId, WorkItemId itemId, CancellationToken ct)
     {
@@ -4255,6 +4255,48 @@ public sealed class PipelineRunner : IPipelineRunner
         var target = Path.Combine(stagingRoot, $"codeybox-merge-{itemId}-{Guid.NewGuid():N}.git");
         await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, target);
         return target;
+    }
+
+    /// <summary>
+    /// Wraps a <see cref="SandboxRepositoryAccess"/> built for an isolated
+    /// merge / conflict-rework clone so the isolated host path's mount carries
+    /// a self-heal hook: if the sandbox provider reports the host source
+    /// missing at mount time, the orchestrator re-clones the bare repo into
+    /// the same target path before the mount is retried. Only the mount that
+    /// points at <paramref name="isolatedRepoHostPath"/> gets the hook —
+    /// other mounts in the access keep their default null callback.
+    /// </summary>
+    internal SandboxRepositoryAccess AttachIsolatedRepoRestoreHook(
+        SandboxRepositoryAccess access,
+        string repoId,
+        string isolatedRepoHostPath)
+    {
+        Func<CancellationToken, Task> restore = ct =>
+            RestoreIsolatedMergeRepositoryAsync(repoId, isolatedRepoHostPath, ct);
+        var rewrittenMounts = access.Mounts
+            .Select(m => string.Equals(m.HostPath, isolatedRepoHostPath, StringComparison.Ordinal)
+                ? m with { RestoreHostSourceAsync = restore }
+                : m)
+            .ToArray();
+        return access with { Mounts = rewrittenMounts };
+    }
+
+    /// <summary>
+    /// Re-clones the bare repo back into <paramref name="targetPath"/> after
+    /// the path has gone missing between create-time and mount-time. The
+    /// callback wired into <see cref="SandboxMount.RestoreHostSourceAsync"/>
+    /// invokes this so the merge mount step can self-heal a racing cleanup
+    /// without aborting the whole work item.
+    /// </summary>
+    internal async Task RestoreIsolatedMergeRepositoryAsync(string repoId, string targetPath, CancellationToken ct)
+    {
+        var source = _gitHost.GetRepoPath(repoId);
+        var stagingRoot = _gitHost.GetMergeStagingRoot(repoId);
+        // git clone refuses to overwrite an existing target — defensive remove
+        // in case a partial directory was left behind. DeleteDirectoryBestEffort
+        // is a no-op when the path is absent.
+        DeleteDirectoryBestEffort(targetPath);
+        await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, targetPath);
     }
 
     private async Task ImportIsolatedMergeCommitAsync(
@@ -5589,7 +5631,10 @@ public sealed class PipelineRunner : IPipelineRunner
             var credential = _credentials is IProjectAwareCredentialProvider pac
                 ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
                 : await _credentials.GetAsync(runner.Kind, ct);
-            var access = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
+            var access = AttachIsolatedRepoRestoreHook(
+                _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath),
+                repoId,
+                isolatedRepoPath);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
                 hostNetworkProfile: project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
                 timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,
