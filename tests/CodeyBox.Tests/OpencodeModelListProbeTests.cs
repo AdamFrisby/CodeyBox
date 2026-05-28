@@ -73,6 +73,17 @@ public sealed class OpencodeModelListProbeTests
     }
 
     [Fact]
+    public async Task GetModelListAsync_StartFailedExit_ReturnsFailedToStart()
+    {
+        var probe = new OpencodeModelListProbe(new StubOpencodeCliRunner(1, "", ""));
+
+        var result = await probe.GetModelListAsync(CancellationToken.None);
+
+        Assert.Equal("opencode CLI failed to start", result.FailureReason);
+        Assert.Empty(result.ModelIds);
+    }
+
+    [Fact]
     public async Task GetModelListAsync_NonZeroExit_ReturnsFailedWithoutStderrInReason()
     {
         var probe = new OpencodeModelListProbe(new StubOpencodeCliRunner(1, "opencode/foo\n", "secret err"));

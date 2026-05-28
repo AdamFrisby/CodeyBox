@@ -22,6 +22,19 @@ public sealed class DefaultOpencodeCliRunnerTests
     }
 
     [Fact]
+    public async Task RunModelsAsync_StartFailed_ReturnsExitOneWithEmptyStreams()
+    {
+        var runner = new StartFailedProcessRunner();
+        var cli = new DefaultOpencodeCliRunner(runner);
+
+        var result = await cli.RunModelsAsync("opencode", CancellationToken.None);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.Equal("", result.Stdout);
+        Assert.Equal("", result.Stderr);
+    }
+
+    [Fact]
     public async Task RunModelsAsync_PassesMinimalEnvironment()
     {
         var runner = new RecordingProcessRunner();
@@ -54,5 +67,19 @@ public sealed class DefaultOpencodeCliRunnerTests
             Environments.Add(environment);
             return Task.FromResult(new ProcessRunResult(0, "", ""));
         }
+    }
+
+    private sealed class StartFailedProcessRunner : IProcessRunner
+    {
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null) =>
+            Task.FromResult(new ProcessRunResult(1, "", "", StartFailed: true));
     }
 }
