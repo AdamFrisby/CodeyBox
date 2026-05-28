@@ -9,29 +9,14 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class OpencodeModelListProbeTests
 {
-    private static readonly string[] ExpectedModelIds =
-    [
-        "opencode/big-pickle",
-        "opencode/deepseek-v4-flash-free",
-        "opencode/mimo-v2.5-free",
-        "opencode/nemotron-3-super-free",
-        "opencode-go/deepseek-v4-flash",
-        "opencode-go/deepseek-v4-pro",
-        "opencode-go/glm-5",
-        "opencode-go/glm-5.1",
-        "opencode-go/kimi-k2.5",
-        "opencode-go/kimi-k2.6",
-        "opencode-go/mimo-v2.5",
-        "opencode-go/mimo-v2.5-pro",
-        "opencode-go/minimax-m2.5",
-        "opencode-go/minimax-m2.7",
-        "opencode-go/qwen3.5-plus",
-        "opencode-go/qwen3.6-plus",
-        "opencode-go/qwen3.7-max",
-    ];
-
     private static string FixturePath =>
         Path.Combine(AppContext.BaseDirectory, "Fixtures", "Opencode", "opencode-models.redacted.txt");
+
+    private static string[] ExpectedModelIds =>
+        File.ReadAllLines(FixturePath)
+            .Select(l => l.Trim())
+            .Where(l => l.Length > 0)
+            .ToArray();
 
     [Fact]
     public void Kind_IsOpencode()
@@ -88,15 +73,27 @@ public sealed class OpencodeModelListProbeTests
     }
 
     [Fact]
-    public async Task GetModelListAsync_NonZeroExit_ReturnsFailed()
+    public async Task GetModelListAsync_NonZeroExit_ReturnsFailedWithoutStderrInReason()
     {
-        var probe = new OpencodeModelListProbe(new StubOpencodeCliRunner(1, "opencode/foo\n", "err"));
+        var probe = new OpencodeModelListProbe(new StubOpencodeCliRunner(1, "opencode/foo\n", "secret err"));
 
         var result = await probe.GetModelListAsync(CancellationToken.None);
 
         Assert.NotNull(result.FailureReason);
         Assert.Empty(result.ModelIds);
-        Assert.Contains("exited 1", result.FailureReason, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("opencode models exited 1", result.FailureReason);
+        Assert.DoesNotContain("secret", result.FailureReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetModelListAsync_NonZeroExit_EmptyStderr_ReturnsExitOnlyReason()
+    {
+        var probe = new OpencodeModelListProbe(new StubOpencodeCliRunner(2, "", ""));
+
+        var result = await probe.GetModelListAsync(CancellationToken.None);
+
+        Assert.Equal("opencode models exited 2", result.FailureReason);
+        Assert.Empty(result.ModelIds);
     }
 
     [Fact]
@@ -134,13 +131,13 @@ public sealed class OpencodeModelListProbeTests
     }
 
     [Fact]
-    public async Task GetModelListAsync_GenericException_ReturnsFailed()
+    public async Task GetModelListAsync_GenericException_ReturnsFailedWithTypeName()
     {
         var probe = new OpencodeModelListProbe(new ThrowingOpencodeCliRunner(new IOException("disk full")));
 
         var result = await probe.GetModelListAsync(CancellationToken.None);
 
-        Assert.Equal("opencode models failed", result.FailureReason);
+        Assert.Equal("opencode models failed (IOException)", result.FailureReason);
         Assert.Empty(result.ModelIds);
     }
 

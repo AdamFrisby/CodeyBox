@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 
@@ -225,7 +226,7 @@ public sealed class MultipassAdoptionTests
         // surface but not this script — a regression that dropped `set -e` or
         // changed the push target would slip past those tests.
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var provider = NewProviderWithRunner(runner);
 
         var ok = await provider.PushSuspendedVmCheckpointRefAsync(
@@ -268,7 +269,7 @@ public sealed class MultipassAdoptionTests
         // the promotion failure rather than silently advancing the work item
         // as if the checkpoint succeeded.
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(1, "", "push rejected")));
+            Task.FromResult(new ProcessRunResult(1, "", "push rejected")));
         var provider = NewProviderWithRunner(runner);
 
         var ok = await provider.PushSuspendedVmCheckpointRefAsync(
@@ -309,7 +310,7 @@ public sealed class MultipassAdoptionTests
         var runner = new RecordingMultipassRunner((_, _, ct) =>
         {
             ct.ThrowIfCancellationRequested();
-            return Task.FromResult(new RunResult(0, "", ""));
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
         });
         var provider = NewProviderWithRunner(runner);
 
@@ -340,7 +341,7 @@ public sealed class MultipassAdoptionTests
         // the in-VM sh -c construction. An ArgumentException here means an
         // attacker who flipped the DB-stored value can't reach the runner.
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var provider = NewProviderWithRunner(runner);
 
         var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
@@ -361,7 +362,7 @@ public sealed class MultipassAdoptionTests
         // a subsequent shell command. Verify the script encodes the
         // apostrophe correctly.
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var provider = NewProviderWithRunner(runner);
 
         var ok = await provider.PushSuspendedVmCheckpointRefAsync(
@@ -521,16 +522,16 @@ public sealed class MultipassAdoptionTests
             if (IsTailCall(argv))
             {
                 if (ticks <= 2)
-                    return Task.FromResult(new RunResult(1, "", "transient failure"));
-                return Task.FromResult(new RunResult(0, "agent output\n", ""));
+                    return Task.FromResult(new ProcessRunResult(1, "", "transient failure"));
+                return Task.FromResult(new ProcessRunResult(0, "agent output\n", ""));
             }
             if (IsExitCall(argv))
             {
                 return ticks >= 4
-                    ? Task.FromResult(new RunResult(0, "0\n", ""))
-                    : Task.FromResult(new RunResult(1, "", ""));
+                    ? Task.FromResult(new ProcessRunResult(0, "0\n", ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", ""));
             }
-            return Task.FromResult(new RunResult(99, "", "unexpected argv"));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv"));
         });
 
         var provider = NewProviderWithRunner(runner);
@@ -625,15 +626,15 @@ public sealed class MultipassAdoptionTests
                     // Default: behave as "nothing new, no marker" so the loop
                     // can spin until the caller's cancellation/deadline fires.
                     return Task.FromResult(IsExitCall(argv)
-                        ? new RunResult(1, "", "")
-                        : new RunResult(0, "", ""));
+                        ? new ProcessRunResult(1, "", "")
+                        : new ProcessRunResult(0, "", ""));
                 }
                 return step.Kind switch
                 {
-                    StepKind.Tail => Task.FromResult(new RunResult(0, step.Body, "")),
-                    StepKind.ExitMissing => Task.FromResult(new RunResult(1, "", "")),
-                    StepKind.ExitPresent => Task.FromResult(new RunResult(0, step.Body + "\n", "")),
-                    _ => Task.FromResult(new RunResult(0, "", "")),
+                    StepKind.Tail => Task.FromResult(new ProcessRunResult(0, step.Body, "")),
+                    StepKind.ExitMissing => Task.FromResult(new ProcessRunResult(1, "", "")),
+                    StepKind.ExitPresent => Task.FromResult(new ProcessRunResult(0, step.Body + "\n", "")),
+                    _ => Task.FromResult(new ProcessRunResult(0, "", "")),
                 };
             });
         }

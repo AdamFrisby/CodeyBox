@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox.Multipass;
@@ -45,24 +46,25 @@ internal sealed record LogEntry(LogLevel Level, string Message, Exception? Excep
 
 internal sealed class RecordingMultipassRunner : IProcessRunner
 {
-    private readonly Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> _handler;
+    private readonly Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> _handler;
 
     public RecordingMultipassRunner(
-        Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> handler)
+        Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler)
     {
         _handler = handler;
     }
 
     public ConcurrentQueue<MultipassCall> Calls { get; } = new();
 
-    public async Task<RunResult> RunAsync(
+    public async Task<ProcessRunResult> RunAsync(
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
         Action<string>? stderrChunkCallback = null,
         int? maxStdoutBytes = null,
-        int? maxStderrBytes = null)
+        int? maxStderrBytes = null,
+        IReadOnlyDictionary<string, string>? environment = null)
     {
         Calls.Enqueue(new MultipassCall(argv.ToArray(), stdin, maxStdoutBytes, maxStderrBytes));
         return await _handler(argv, stdin, ct);

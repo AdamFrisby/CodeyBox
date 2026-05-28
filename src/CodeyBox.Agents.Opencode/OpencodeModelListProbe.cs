@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Agents.Opencode;
@@ -11,6 +12,7 @@ namespace CodeyBox.Agents.Opencode;
 public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
 {
     internal const int MaxModelIds = 1024;
+    private const int MaxLoggedStderrChars = 500;
 
     private readonly IOpencodeCliRunner _runner;
     private readonly string _binary;
@@ -19,41 +21,50 @@ public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
     public AgentKind Kind => AgentKind.Opencode;
 
     public OpencodeModelListProbe(ILogger<OpencodeModelListProbe>? log = null)
-        : this(new DefaultOpencodeCliRunner(), "opencode", log)
+        : this(new DefaultProcessRunner(), null, log)
+    {
+    }
+
+    public OpencodeModelListProbe(
+        IProcessRunner processRunner,
+        string? binary = null,
+        ILogger<OpencodeModelListProbe>? log = null)
+        : this(new DefaultOpencodeCliRunner(processRunner), binary, log)
     {
     }
 
     internal OpencodeModelListProbe(
         IOpencodeCliRunner runner,
-        string binary = "opencode",
+        string? binary = null,
         ILogger<OpencodeModelListProbe>? log = null)
     {
         _runner = runner;
-        _binary = binary;
+        _binary = binary ?? ResolveBinary();
         _log = log;
     }
+
+    private static string ResolveBinary() =>
+        Environment.GetEnvironmentVariable("CODEYBOX_OPENCODE_BINARY") ?? "opencode";
 
     public async Task<AgentModelListResult> GetModelListAsync(CancellationToken ct)
     {
         try
         {
             var run = await _runner.RunModelsAsync(_binary, ct).ConfigureAwait(false);
+            if (run.ExitCode == 1 && string.IsNullOrEmpty(run.Stdout) && string.IsNullOrEmpty(run.Stderr))
+                return AgentModelListResult.Failed("opencode CLI failed to start");
             if (OpencodeCliErrors.IsCliNotFoundExitCode(run.ExitCode))
                 return AgentModelListResult.Failed("opencode CLI not found");
             if (run.ExitCode != 0)
             {
-                _log?.LogDebug(
-                    "opencode models exited {ExitCode}; stderr length {StderrLen}",
-                    run.ExitCode, run.Stderr.Length);
-                var reason = string.IsNullOrWhiteSpace(run.Stderr)
-                    ? $"opencode models exited {run.ExitCode}"
-                    : $"opencode models exited {run.ExitCode}: {run.Stderr.Trim()}";
-                return AgentModelListResult.Failed(reason);
+                LogStderrAtDebug(run.Stderr, run.ExitCode);
+                return AgentModelListResult.Failed($"opencode models exited {run.ExitCode}");
             }
 
             var ids = ParseModelsOutput(run.Stdout);
             if (ids.Count == 0)
             {
+                LogStderrAtDebug(run.Stderr, exitCode: 0);
                 _log?.LogDebug("opencode models produced no parseable model ids");
                 return AgentModelListResult.Failed("no models parsed from opencode models output");
             }
@@ -72,8 +83,20 @@ public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
         catch (Exception ex)
         {
             _log?.LogDebug(ex, "opencode models probe failed");
-            return AgentModelListResult.Failed("opencode models failed");
+            return AgentModelListResult.Failed($"opencode models failed ({ex.GetType().Name})");
         }
+    }
+
+    private void LogStderrAtDebug(string stderr, int exitCode)
+    {
+        if (string.IsNullOrWhiteSpace(stderr)) return;
+        var trimmed = stderr.Trim();
+        var capped = trimmed.Length > MaxLoggedStderrChars
+            ? trimmed[..MaxLoggedStderrChars] + "…"
+            : trimmed;
+        _log?.LogDebug(
+            "opencode models stderr at exit {ExitCode} (len {Len}): {Stderr}",
+            exitCode, trimmed.Length, capped);
     }
 
     /// <summary>

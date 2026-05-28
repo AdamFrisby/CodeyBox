@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -45,9 +46,9 @@ public sealed class MultipassBaselineDisposeGuardTests : IDisposable
             if (argv is [_, "delete", "--purge", var name])
             {
                 deleteCalls.Enqueue(name);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var provider = NewProvider(runner);
 
@@ -72,9 +73,9 @@ public sealed class MultipassBaselineDisposeGuardTests : IDisposable
             if (argv is [_, "delete", "--purge", var name])
             {
                 deleteCalls.Enqueue(name);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var provider = NewProvider(runner);
 
@@ -96,8 +97,8 @@ public sealed class MultipassBaselineDisposeGuardTests : IDisposable
     {
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "delete", "--purge", _]
-                ? Task.FromResult(new RunResult(2, "", "multipass: VM is locked"))
-                : Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+                ? Task.FromResult(new ProcessRunResult(2, "", "multipass: VM is locked"))
+                : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>

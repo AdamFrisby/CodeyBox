@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -49,8 +50,8 @@ public sealed class MultipassBaselineListTests : IDisposable
         """;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
-                ? Task.FromResult(new RunResult(0, json, ""))
-                : Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+                ? Task.FromResult(new ProcessRunResult(0, json, ""))
+                : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
         var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
@@ -76,8 +77,8 @@ public sealed class MultipassBaselineListTests : IDisposable
     {
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
-                ? Task.FromResult(new RunResult(2, "", "multipass: connect: Connection refused"))
-                : Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+                ? Task.FromResult(new ProcessRunResult(2, "", "multipass: connect: Connection refused"))
+                : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
         var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
@@ -95,8 +96,8 @@ public sealed class MultipassBaselineListTests : IDisposable
     {
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
-                ? Task.FromResult(new RunResult(0, """{"version": "1.0"}""", ""))
-                : Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+                ? Task.FromResult(new ProcessRunResult(0, """{"version": "1.0"}""", ""))
+                : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
         var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
@@ -114,8 +115,8 @@ public sealed class MultipassBaselineListTests : IDisposable
     {
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
-                ? Task.FromResult(new RunResult(0, """{"list": [{"name": "cb-baseline-foo""", ""))
-                : Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+                ? Task.FromResult(new ProcessRunResult(0, """{"list": [{"name": "cb-baseline-foo""", ""))
+                : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
         var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
@@ -143,8 +144,8 @@ public sealed class MultipassBaselineListTests : IDisposable
         """;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
-                ? Task.FromResult(new RunResult(0, json, ""))
-                : Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+                ? Task.FromResult(new ProcessRunResult(0, json, ""))
+                : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
         var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
@@ -162,8 +163,8 @@ public sealed class MultipassBaselineListTests : IDisposable
     {
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
-                ? Task.FromResult(new RunResult(0, """{"list": []}""", ""))
-                : Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+                ? Task.FromResult(new ProcessRunResult(0, """{"list": []}""", ""))
+                : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
         var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
@@ -190,8 +191,8 @@ public sealed class MultipassBaselineListTests : IDisposable
         """;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
-                ? Task.FromResult(new RunResult(0, json, ""))
-                : Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
+                ? Task.FromResult(new ProcessRunResult(0, json, ""))
+                : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var opts = new MultipassSandboxOptions
         {
             MultipassBinary = "/bin/false",

@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Sandbox.Multipass;
@@ -1330,7 +1331,7 @@ git push origin HEAD:{refName}";
         var retryDelay = opts.CloudInitReadyRetryDelay < TimeSpan.Zero
             ? TimeSpan.Zero
             : opts.CloudInitReadyRetryDelay;
-        RunResult cloudInit = default;
+        ProcessRunResult cloudInit = default;
 
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
@@ -1371,7 +1372,7 @@ git push origin HEAD:{refName}";
             "Expected /work and /usr/local/bin/codeybox-exec to exist.");
     }
 
-    private Task<RunResult> ProbeCloudInitReadinessAsync(
+    private Task<ProcessRunResult> ProbeCloudInitReadinessAsync(
         MultipassSandboxOptions opts,
         string name,
         WorkItemId? workItemId,
@@ -1926,7 +1927,7 @@ test "$work" = present && test "$exec_wrapper" = present
         return commands;
     }
 
-    private Task<RunResult> RunAsync(
+    private Task<ProcessRunResult> RunAsync(
         MultipassSandboxOptions opts,
         IReadOnlyList<string> argv,
         string? stdin,
@@ -1950,185 +1951,6 @@ test "$work" = present && test "$exec_wrapper" = present
         }
         catch { /* best-effort */ }
     }
-}
-
-internal interface IProcessRunner
-{
-    Task<RunResult> RunAsync(
-        IReadOnlyList<string> argv,
-        string? stdin,
-        CancellationToken ct,
-        Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null,
-        int? maxStdoutBytes = null,
-        int? maxStderrBytes = null);
-}
-
-internal sealed class DefaultProcessRunner : IProcessRunner
-{
-    public async Task<RunResult> RunAsync(
-        IReadOnlyList<string> argv,
-        string? stdin,
-        CancellationToken ct,
-        Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null,
-        int? maxStdoutBytes = null,
-        int? maxStderrBytes = null)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = argv[0],
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            RedirectStandardInput = stdin is not null,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        for (var i = 1; i < argv.Count; i++) psi.ArgumentList.Add(argv[i]);
-
-        using var p = new Process { StartInfo = psi };
-        var stdout = new StringBuilder();
-        var stderr = new StringBuilder();
-        var limitOutput = maxStdoutBytes.HasValue || maxStderrBytes.HasValue;
-        var streamChunks = stdoutChunkCallback is not null || stderrChunkCallback is not null;
-        if (streamChunks && !limitOutput)
-        {
-            p.OutputDataReceived += (_, e) =>
-            {
-                if (e.Data is null) return;
-                var line = e.Data + "\n";
-                stdout.Append(line);
-                stdoutChunkCallback?.Invoke(line);
-            };
-            p.ErrorDataReceived += (_, e) =>
-            {
-                if (e.Data is null) return;
-                var line = e.Data + "\n";
-                stderr.Append(line);
-                stderrChunkCallback?.Invoke(line);
-            };
-        }
-
-        p.Start();
-        Task<string>? stdoutTask = null;
-        Task<string>? stderrTask = null;
-        Task<LimitedReadResult>? limitedStdoutTask = null;
-        Task<LimitedReadResult>? limitedStderrTask = null;
-        if (streamChunks && !limitOutput)
-        {
-            p.BeginOutputReadLine();
-            p.BeginErrorReadLine();
-        }
-        else if (limitOutput)
-        {
-            void KillForLimit()
-            {
-                try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
-            }
-
-            limitedStdoutTask = ReadLimitedAsync(p.StandardOutput, maxStdoutBytes, stdoutChunkCallback, KillForLimit, ct);
-            limitedStderrTask = ReadLimitedAsync(p.StandardError, maxStderrBytes, stderrChunkCallback, KillForLimit, ct);
-        }
-        else
-        {
-            stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
-            stderrTask = p.StandardError.ReadToEndAsync(ct);
-        }
-        if (stdin is not null)
-        {
-            await p.StandardInput.WriteAsync(stdin);
-            p.StandardInput.Close();
-        }
-        try { await p.WaitForExitAsync(ct); }
-        catch (OperationCanceledException)
-        {
-            try { p.Kill(entireProcessTree: true); } catch { }
-            throw;
-        }
-        if (stdoutTask is not null && stderrTask is not null)
-            return new RunResult(p.ExitCode, await stdoutTask, await stderrTask);
-        if (limitedStdoutTask is not null && limitedStderrTask is not null)
-        {
-            var stdoutResult = await limitedStdoutTask;
-            var stderrResult = await limitedStderrTask;
-            return new RunResult(
-                p.ExitCode,
-                stdoutResult.Text,
-                stderrResult.Text,
-                stdoutResult.LimitExceeded,
-                stderrResult.LimitExceeded);
-        }
-        return new RunResult(p.ExitCode, stdout.ToString(), stderr.ToString());
-    }
-
-    private static async Task<LimitedReadResult> ReadLimitedAsync(
-        StreamReader reader,
-        int? maxBytes,
-        Action<string>? chunkCallback,
-        Action onLimitExceeded,
-        CancellationToken ct)
-    {
-        var output = new StringBuilder();
-        var buffer = new char[4096];
-        var totalBytes = 0;
-
-        while (true)
-        {
-            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
-            if (read == 0)
-                return new LimitedReadResult(output.ToString(), LimitExceeded: false);
-
-            var chunk = new string(buffer, 0, read);
-            if (maxBytes is { } limit)
-            {
-                var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
-                if (totalBytes + chunkBytes > limit)
-                {
-                    var remaining = Math.Max(0, limit - totalBytes);
-                    if (remaining > 0)
-                    {
-                        var truncated = TakeUtf8Prefix(chunk, remaining);
-                        output.Append(truncated);
-                        chunkCallback?.Invoke(truncated);
-                    }
-
-                    onLimitExceeded();
-                    return new LimitedReadResult(output.ToString(), LimitExceeded: true);
-                }
-
-                totalBytes += chunkBytes;
-            }
-
-            output.Append(chunk);
-            chunkCallback?.Invoke(chunk);
-        }
-    }
-
-    private static string TakeUtf8Prefix(string value, int maxBytes)
-    {
-        var used = 0;
-        for (var i = 0; i < value.Length; i++)
-        {
-            var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(i, 1));
-            if (used + charBytes > maxBytes)
-                return value[..i];
-            used += charBytes;
-        }
-
-        return value;
-    }
-}
-
-internal readonly record struct LimitedReadResult(string Text, bool LimitExceeded);
-
-internal readonly record struct RunResult(
-    int ExitCode,
-    string Stdout,
-    string Stderr,
-    bool StdoutLimitExceeded = false,
-    bool StderrLimitExceeded = false)
-{
-    public bool Success => ExitCode == 0;
 }
 
 internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt);
@@ -2169,9 +1991,9 @@ internal static class MultipassDaemonRetry
         "mount",
     };
 
-    internal static async Task<RunResult> RunWithRetryAsync(
+    internal static async Task<ProcessRunResult> RunWithRetryAsync(
         IReadOnlyList<string> argv,
-        Func<CancellationToken, Task<RunResult>> action,
+        Func<CancellationToken, Task<ProcessRunResult>> action,
         Func<CancellationToken, Task<MultipassDaemonHealthProbeResult>> healthProbe,
         ILogger log,
         WorkItemId? workItemId,
@@ -2188,7 +2010,7 @@ internal static class MultipassDaemonRetry
         if (policy.Backoffs.Count < policy.MaxAttempts - 1)
             throw new ArgumentException("Backoffs must contain one delay per retry.", nameof(policy));
 
-        RunResult result = default;
+        ProcessRunResult result = default;
         string? errorClass = null;
         var description = Describe(argv);
 
@@ -2234,7 +2056,7 @@ internal static class MultipassDaemonRetry
         return result with { Stderr = message };
     }
 
-    internal static string? ClassifyTransient(IReadOnlyList<string> argv, RunResult result)
+    internal static string? ClassifyTransient(IReadOnlyList<string> argv, ProcessRunResult result)
     {
         if (result.ExitCode == 0 || argv.Count < 2)
             return null;
@@ -2374,7 +2196,7 @@ internal static class MultipassRetry
 
     /// <summary>
     /// Runs <paramref name="action"/>, retrying when its result's stderr
-    /// indicates SSH-not-ready. Returns the final <see cref="RunResult"/> —
+    /// indicates SSH-not-ready. Returns the final <see cref="ProcessRunResult"/> —
     /// the caller is responsible for translating a non-zero ExitCode into
     /// an exception. Non-retryable failures (any non-zero exit whose stderr
     /// is NOT a known SSH-not-ready signature) short-circuit immediately.
@@ -2382,8 +2204,8 @@ internal static class MultipassRetry
     /// <para>For tests, pass <paramref name="delay"/> and <paramref name="backoff"/>
     /// to avoid sleeping; production callers use the defaults.</para>
     /// </summary>
-    internal static async Task<RunResult> RunWithRetryAsync(
-        Func<CancellationToken, Task<RunResult>> action,
+    internal static async Task<ProcessRunResult> RunWithRetryAsync(
+        Func<CancellationToken, Task<ProcessRunResult>> action,
         ILogger log,
         string description,
         CancellationToken ct,
@@ -2398,7 +2220,7 @@ internal static class MultipassRetry
         backoff ??= attempt => ComputeBackoff(attempt, DefaultInitialDelay, DefaultMaxDelay);
         delay ??= static (d, t) => Task.Delay(d, t);
 
-        RunResult result = default;
+        ProcessRunResult result = default;
         for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
             ct.ThrowIfCancellationRequested();
@@ -2693,7 +2515,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         return new SandboxExecResult(result.ExitCode, result.Stdout, result.Stderr);
     }
 
-    private async Task<RunResult> ExecRunAsync(
+    private async Task<ProcessRunResult> ExecRunAsync(
         SandboxExec exec,
         CancellationToken ct,
         int? maxStdoutBytes = null,
@@ -3020,7 +2842,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         }
     }
 
-    private Task<RunResult> RunMultipassAsync(
+    private Task<ProcessRunResult> RunMultipassAsync(
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
@@ -3095,7 +2917,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
 
         try
         {
-            using var p = Process.Start(new ProcessStartInfo
+            using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
             {
                 FileName = _opts.MultipassBinary,
                 ArgumentList = { "stop", _name },

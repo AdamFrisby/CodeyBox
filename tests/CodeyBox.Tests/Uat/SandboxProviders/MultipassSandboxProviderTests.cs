@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
@@ -122,7 +123,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task ExecAsync_GraphicalSandboxInjectsDisplayByDefault()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
 
         await sandbox.ExecAsync(new SandboxExec { Argv = ["printenv", "DISPLAY"] });
@@ -135,7 +136,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task ExecAsync_GraphicalSandboxPreservesCallerDisplayOverride()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
 
         await sandbox.ExecAsync(new SandboxExec
@@ -158,7 +159,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task ExecAsync_GraphicalSandboxMergesDisplayIntoCallerEnvironment()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
 
         await sandbox.ExecAsync(new SandboxExec
@@ -179,7 +180,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task ExecAsync_HeadlessSandboxDoesNotInjectDisplay()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
 
         await sandbox.ExecAsync(new SandboxExec { Argv = ["printenv", "DISPLAY"] });
@@ -192,7 +193,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task GraphicalCapabilities_RejectHeadlessSandbox()
     {
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, (_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
 
         await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetScreenshotAsync());
         await Assert.ThrowsAsync<NotSupportedException>(() =>
@@ -203,7 +204,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task GetScreenshotAsync_ThrowsWhenScrotFails()
     {
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
-            Task.FromResult(new RunResult(2, "", "scrot failed")));
+            Task.FromResult(new ProcessRunResult(2, "", "scrot failed")));
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
 
@@ -215,7 +216,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task GetScreenshotAsync_ThrowsWhenCommandReturnsInvalidBase64()
     {
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
-            Task.FromResult(new RunResult(0, "not base64", "")));
+            Task.FromResult(new ProcessRunResult(0, "not base64", "")));
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
 
@@ -226,7 +227,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task GetScreenshotAsync_ReturnsDecodedPngBytes()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, Convert.ToBase64String(TinyPng), "")));
+            Task.FromResult(new ProcessRunResult(0, Convert.ToBase64String(TinyPng), "")));
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
 
         var screenshot = await sandbox.GetScreenshotAsync();
@@ -239,7 +240,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task GetScreenshotAsync_RejectsDecodedNonPngBytes()
     {
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
-            Task.FromResult(new RunResult(0, Convert.ToBase64String([1, 2, 3, 4, 5, 6, 7, 8]), "")));
+            Task.FromResult(new ProcessRunResult(0, Convert.ToBase64String([1, 2, 3, 4, 5, 6, 7, 8]), "")));
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.GetScreenshotAsync());
 
@@ -250,7 +251,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task GetScreenshotAsync_RejectsOutputPastCaptureLimit()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(
+            Task.FromResult(new ProcessRunResult(
                 137,
                 new string('A', 1024),
                 "",
@@ -269,7 +270,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task GetScreenshotAsync_RejectsStderrPastCaptureLimit()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(
+            Task.FromResult(new ProcessRunResult(
                 137,
                 "",
                 new string('e', 1024),
@@ -289,7 +290,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task GetScreenshotAsync_RejectsDecodedPngPastLimit()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, Convert.ToBase64String(new byte[5]), "")));
+            Task.FromResult(new ProcessRunResult(0, Convert.ToBase64String(new byte[5]), "")));
         var sandbox = NewMultipassSandbox(
             SandboxProfileFlavor.Graphical,
             runner,
@@ -340,7 +341,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task SynthesizeInputAsync_ThrowsWhenXdotoolFails()
     {
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
-            Task.FromResult(new RunResult(1, "", "xdotool failed")));
+            Task.FromResult(new ProcessRunResult(1, "", "xdotool failed")));
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
             sandbox.SynthesizeInputAsync([new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "Return" }]));
@@ -353,7 +354,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task SynthesizeInputAsync_RejectsMalformedInputEvents()
     {
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var invalidEvents = new[]
         {
             new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 10 },
@@ -378,7 +379,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task SynthesizeInputAsync_RejectsNullEventListAndUnknownEventType()
     {
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, (_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
 
         await Assert.ThrowsAsync<ArgumentNullException>(() =>
             sandbox.SynthesizeInputAsync(null!));
@@ -394,7 +395,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task SynthesizeInputAsync_BuildsExpectedXdotoolCommands()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
 
         await sandbox.SynthesizeInputAsync(
@@ -481,7 +482,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task DisposeLeakedAsync_RejectsUnsafeVmNamesBeforeShellingOut()
     {
         var runner = new RecordingMultipassRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "", "")));
+            Task.FromResult(new ProcessRunResult(0, "", "")));
         var provider = NewProvider(runner: runner);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
@@ -502,11 +503,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             {
                 deleteCalls++;
                 return Task.FromResult(deleteCalls == 1
-                    ? new RunResult(17, "", "still running")
-                    : new RunResult(0, "", ""));
+                    ? new ProcessRunResult(17, "", "still running")
+                    : new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var sandbox = new MultipassSandbox(
             "codeybox-deletefail",
@@ -545,35 +546,35 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 states[argv[3]] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "info", var name, "--format=csv"])
                 return Task.FromResult(states.TryGetValue(name, out var state)
-                    ? new RunResult(0, state, "")
-                    : new RunResult(1, "", "not found"));
+                    ? new ProcessRunResult(0, state, "")
+                    : new ProcessRunResult(1, "", "not found"));
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "list", "--format", "json"])
             {
@@ -582,7 +583,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                     .OrderBy(vmName => vmName, StringComparer.Ordinal)
                     .Select(vmName => new { name = vmName })
                     .ToArray();
-                return Task.FromResult(new RunResult(0, JsonSerializer.Serialize(new { list }), ""));
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { list }), ""));
             }
 
             if (argv is [_, "info", "--format", "json", ..])
@@ -598,20 +599,20 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                         },
                     },
                     StringComparer.Ordinal);
-                return Task.FromResult(new RunResult(0, JsonSerializer.Serialize(new { info }), ""));
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), ""));
             }
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 deleteCalls++;
                 if (deleteCalls == 1)
-                    return Task.FromResult(new RunResult(17, "", "transient delete failure"));
+                    return Task.FromResult(new ProcessRunResult(17, "", "transient delete failure"));
 
                 states.TryRemove(deleteName, out _);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var provider = NewProvider(
             stagingDirectory: staging,
@@ -667,35 +668,35 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 states[argv[3]] = "Running";
                 launchEntered.TrySetResult();
                 await allowLaunchToFinish.Task.WaitAsync(ct);
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
             if (argv is [_, "info", var name, "--format=csv"])
                 return states.TryGetValue(name, out var state)
-                    ? new RunResult(0, state, "")
-                    : new RunResult(1, "", "not found");
+                    ? new ProcessRunResult(0, state, "")
+                    : new ProcessRunResult(1, "", "not found");
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
 
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
 
             if (argv is [_, "list", "--format", "json"])
             {
@@ -703,7 +704,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                     .OrderBy(vmName => vmName, StringComparer.Ordinal)
                     .Select(vmName => new { name = vmName })
                     .ToArray();
-                return new RunResult(0, JsonSerializer.Serialize(new { list }), "");
+                return new ProcessRunResult(0, JsonSerializer.Serialize(new { list }), "");
             }
 
             if (argv is [_, "info", "--format", "json", ..])
@@ -716,16 +717,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                         disks = new Dictionary<string, object>(),
                     },
                     StringComparer.Ordinal);
-                return new RunResult(0, JsonSerializer.Serialize(new { info }), "");
+                return new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), "");
             }
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out _);
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
-            return new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
         });
         var provider = NewProvider(
             stagingDirectory: staging,
@@ -757,7 +758,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "list", "--format", "json"])
             {
                 listCalls++;
-                return Task.FromResult(new RunResult(0, """
+                return Task.FromResult(new ProcessRunResult(0, """
                     {"list":[
                       {"name":"primary"},
                       {"name":"cb-baseline-claude"},
@@ -772,7 +773,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv.Count >= 4 && argv[1] == "info")
             {
                 infoCalls++;
-                return Task.FromResult(new RunResult(0, """
+                return Task.FromResult(new ProcessRunResult(0, """
                     {"info":{
                       "codeybox-alpha":{"disks":{"sda1":{"used":"1048576"}}},
                       "codeybox-beta":{"disks":{"sda1":{"used":"2097152"}}},
@@ -781,7 +782,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                     """, ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + string.Join(' ', argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + string.Join(' ', argv)));
         });
         var provider = NewProvider(stagingDirectory: staging, runner: runner);
 
@@ -810,7 +811,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             if (argv is [_, "list", "--format", "json"])
-                return Task.FromResult(new RunResult(0, """
+                return Task.FromResult(new ProcessRunResult(0, """
                     {"list":[{"name":"codeybox-alias"}]}
                     """, ""));
 
@@ -824,10 +825,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                         ["disks"] = new Dictionary<string, object>(),
                     },
                 };
-                return Task.FromResult(new RunResult(0, JsonSerializer.Serialize(new { info }), ""));
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var provider = NewProvider(
             stagingDirectory: Path.Combine(_workspace, "staging-" + timestampProperty),
@@ -855,8 +856,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var name, "--format=csv"])
             {
                 if (states.TryGetValue(name, out var state))
-                    return new RunResult(0, state, "");
-                return new RunResult(1, "", "not found");
+                    return new ProcessRunResult(0, state, "");
+                return new ProcessRunResult(1, "", "not found");
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
@@ -869,23 +870,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                     launchEntered.TrySetResult();
                     await allowLaunch.Task.WaitAsync(ct);
                 }
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
             if (argv is [_, "exec", var execName, "--", "cloud-init", "status", "--wait"])
-                return new RunResult(states.ContainsKey(execName) ? 0 : 1, "", "");
+                return new ProcessRunResult(states.ContainsKey(execName) ? 0 : 1, "", "");
 
             if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", ..]
                 && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
             {
                 Interlocked.Increment(ref installCount);
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
             if (argv is [_, "clone", var source, "--name", var cloneName])
@@ -893,29 +894,29 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 Assert.StartsWith("cb-baseline-", source, StringComparison.Ordinal);
                 states[cloneName] = "Stopped";
                 Interlocked.Increment(ref cloneCount);
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out var removedState);
-                return new RunResult(0, "", "");
+                return new ProcessRunResult(0, "", "");
             }
 
-            return new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
         });
         var provider = NewProvider(
             stagingDirectory: Path.Combine(_workspace, "staging"),
@@ -960,8 +961,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var name, "--format=csv"])
             {
                 if (states.TryGetValue(name, out var state))
-                    return Task.FromResult(new RunResult(0, state, ""));
-                return Task.FromResult(new RunResult(1, "", "not found"));
+                    return Task.FromResult(new ProcessRunResult(0, state, ""));
+                return Task.FromResult(new ProcessRunResult(1, "", "not found"));
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
@@ -972,52 +973,52 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 var cloudInitIndex = argv.ToList().IndexOf("--cloud-init");
                 baselineCloudInit = cloudInitIndex >= 0 ? File.ReadAllText(argv[cloudInitIndex + 1]) : null;
                 states[baselineLaunchName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "exec", var execName, "--", "cloud-init", "status", "--wait"])
-                return Task.FromResult(new RunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
+                return Task.FromResult(new ProcessRunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
 
             if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", var command]
                 && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
             {
                 installCommands.Add(command);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "clone", var source, "--name", var cloneName])
             {
                 cloneSource = source;
                 states[cloneName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out var removedState);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var provider = NewProvider(
             stagingDirectory: Path.Combine(_workspace, "staging-graphical"),
@@ -1070,8 +1071,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var name, "--format=csv"])
             {
                 if (states.TryGetValue(name, out var state))
-                    return Task.FromResult(new RunResult(0, state, ""));
-                return Task.FromResult(new RunResult(1, "", "not found"));
+                    return Task.FromResult(new ProcessRunResult(0, state, ""));
+                return Task.FromResult(new ProcessRunResult(1, "", "not found"));
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
@@ -1080,49 +1081,49 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 var networkIndex = argv.ToList().IndexOf("--network");
                 baselineLaunchNetwork = networkIndex >= 0 ? argv[networkIndex + 1] : null;
                 states[baselineLaunchName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "exec", var execName, "--", "cloud-init", "status", "--wait"])
-                return Task.FromResult(new RunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
+                return Task.FromResult(new ProcessRunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
 
             if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", _]
                 && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "clone", var source, "--name", var cloneName])
             {
                 cloneSource = source;
                 states[cloneName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out var removedState);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var provider = NewProvider(
             stagingDirectory: Path.Combine(_workspace, "staging-graphical-profile"),
@@ -1163,56 +1164,56 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var infoName, "--format=csv"])
             {
                 return states.TryGetValue(infoName, out var state)
-                    ? Task.FromResult(new RunResult(0, state, ""))
-                    : Task.FromResult(new RunResult(1, "", "not found"));
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 states[argv[3]] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
             {
                 cloudInitCalls++;
                 return Task.FromResult(cloudInitCalls == 1
-                    ? new RunResult(1, "", "")
-                    : new RunResult(0, "", ""));
+                    ? new ProcessRunResult(1, "", "")
+                    : new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "exec", _, "--", "bash", "-c", _])
             {
                 probeCalls++;
-                return Task.FromResult(new RunResult(99, "", "readiness probe should not run after recovered cloud-init status"));
+                return Task.FromResult(new ProcessRunResult(99, "", "readiness probe should not run after recovered cloud-init status"));
             }
 
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out var removedState);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
 
         var provider = NewProvider(
@@ -1246,20 +1247,20 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var infoName, "--format=csv"])
             {
                 return states.TryGetValue(infoName, out var state)
-                    ? Task.FromResult(new RunResult(0, state, ""))
-                    : Task.FromResult(new RunResult(1, "", "not found"));
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 states[argv[3]] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
             {
                 cloudInitCalls++;
-                return Task.FromResult(new RunResult(1, "", ""));
+                return Task.FromResult(new ProcessRunResult(1, "", ""));
             }
 
             if (argv is [_, "exec", _, "--", "bash", "-c", var command])
@@ -1267,7 +1268,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 probeCalls++;
                 Assert.Contains("test -e /work", command, StringComparison.Ordinal);
                 Assert.Contains("test -e /usr/local/bin/codeybox-exec", command, StringComparison.Ordinal);
-                return Task.FromResult(new RunResult(
+                return Task.FromResult(new ProcessRunResult(
                     0,
                     "/work=present /usr/local/bin/codeybox-exec=present\n",
                     ""));
@@ -1276,29 +1277,29 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out var removedState);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
 
         var provider = NewProvider(
@@ -1338,21 +1339,21 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var infoName, "--format=csv"])
             {
                 return states.TryGetValue(infoName, out var state)
-                    ? Task.FromResult(new RunResult(0, state, ""))
-                    : Task.FromResult(new RunResult(1, "", "not found"));
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 launchedName = argv[3];
                 states[launchedName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
             {
                 cloudInitCalls++;
-                return Task.FromResult(new RunResult(1, "", ""));
+                return Task.FromResult(new ProcessRunResult(1, "", ""));
             }
 
             if (argv is [_, "exec", _, "--", "bash", "-c", var command])
@@ -1360,7 +1361,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 probeCalls++;
                 Assert.Contains("test -e /work", command, StringComparison.Ordinal);
                 Assert.Contains("test -e /usr/local/bin/codeybox-exec", command, StringComparison.Ordinal);
-                return Task.FromResult(new RunResult(
+                return Task.FromResult(new ProcessRunResult(
                     1,
                     "/work=missing /usr/local/bin/codeybox-exec=missing\n",
                     ""));
@@ -1370,10 +1371,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             {
                 deletedName = deleteName;
                 states.TryRemove(deleteName, out var removedState);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
 
         var provider = NewProvider(
@@ -1421,31 +1422,31 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var infoName, "--format=csv"])
             {
                 return states.TryGetValue(infoName, out var state)
-                    ? Task.FromResult(new RunResult(0, state, ""))
-                    : Task.FromResult(new RunResult(1, "", "not found"));
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 launchedName = argv[3];
                 states[launchedName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "exec", var execName, "--", "cloud-init", "status", "--wait"])
             {
                 cloudInitTarget = execName;
-                return Task.FromResult(new RunResult(3, "", "schema validation failed: bad runcmd"));
+                return Task.FromResult(new ProcessRunResult(3, "", "schema validation failed: bad runcmd"));
             }
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 deletedName = deleteName;
                 states.TryRemove(deleteName, out var removedState);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
 
         var provider = NewProvider(stagingDirectory: staging, runner: runner);
@@ -1500,8 +1501,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         var result = await MultipassRetry.RunWithRetryAsync(
             action: _ => Task.FromResult(++attempts == 1
-                ? new RunResult(1, "", "ssh connection failed: Connection refused")
-                : new RunResult(0, "ok", "")),
+                ? new ProcessRunResult(1, "", "ssh connection failed: Connection refused")
+                : new ProcessRunResult(0, "ok", "")),
             log: NullLogger.Instance,
             description: "uat transfer",
             ct: CancellationToken.None,
@@ -1556,7 +1557,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
     private MultipassSandbox NewMultipassSandbox(
         SandboxProfileFlavor flavor,
-        Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> handler,
+        Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler,
         int? maxScreenshotPngBytes = null)
     {
         return NewMultipassSandbox(flavor, new RecordingMultipassRunner(handler), maxScreenshotPngBytes);
@@ -1611,53 +1612,53 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "version"])
             {
                 versionCalls++;
-                return Task.FromResult(new RunResult(0, "multipass 1.15.0", ""));
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.15.0", ""));
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 launchCalls++;
                 if (launchCalls == 1)
-                    return Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket"));
+                    return Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket"));
                 states[argv[3]] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "info", var name, "--format=csv"])
             {
                 var state = states.TryGetValue(name, out var current) ? current : "Running";
-                return Task.FromResult(new RunResult(0, state, ""));
+                return Task.FromResult(new ProcessRunResult(0, state, ""));
             }
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out var removedState);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var logger = new RecordingLogger<MultipassSandboxProvider>();
         var provider = NewProvider(
@@ -1693,19 +1694,19 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "version"])
             {
                 versionCalls++;
-                return Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket"));
+                return Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket"));
             }
 
             if (argv.Count >= 2 && argv[1] == "launch")
             {
                 launchCalls++;
-                return Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket"));
+                return Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket"));
             }
 
             if (argv.Count >= 2 && argv[1] == "delete")
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var logger = new RecordingLogger<MultipassSandboxProvider>();
         var provider = NewProvider(
@@ -1749,45 +1750,45 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "version"])
             {
                 versionCalls++;
-                return Task.FromResult(new RunResult(0, "multipass 1.15.0", ""));
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.15.0", ""));
             }
 
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 states[argv[3]] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "info", var name, "--format=csv"])
-                return Task.FromResult(new RunResult(
+                return Task.FromResult(new ProcessRunResult(
                     0, states.TryGetValue(name, out var current) ? current : "Running", ""));
 
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
 
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out var removedState);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
 
             // Exec of the user payload — first attempt returns a transient
@@ -1796,12 +1797,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             {
                 execCalls++;
                 if (execCalls == 1)
-                    return Task.FromResult(new RunResult(
+                    return Task.FromResult(new ProcessRunResult(
                         1, "", "cannot connect to the multipass socket"));
-                return Task.FromResult(new RunResult(0, "hello\n", ""));
+                return Task.FromResult(new ProcessRunResult(0, "hello\n", ""));
             }
 
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
         var logger = new RecordingLogger<MultipassSandboxProvider>();
         var provider = NewProvider(
@@ -1855,9 +1856,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "suspend", "codeybox-test"])
             {
                 suspendCalls++;
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            return Task.FromResult(new RunResult(0, "", ""));
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
         });
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
 
@@ -1873,7 +1874,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             if (argv.Count >= 2 && argv[1] == "delete") deleteCalls++;
-            return Task.FromResult(new RunResult(0, "", ""));
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
         });
         // Build a second sandbox so we can verify the no-op-dispose contract
         // independently — the first sandbox above is still preserved in
@@ -1913,16 +1914,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "suspend", _])
             {
                 suspendCalls++;
-                return Task.FromResult(new RunResult(1, "", "multipassd: I/O error suspending VM"));
+                return Task.FromResult(new ProcessRunResult(1, "", "multipassd: I/O error suspending VM"));
             }
             if (argv.Count >= 2 && argv[1] == "delete")
             {
                 deleteCalls++;
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             // multipass version probe (daemon health) returns 0 from the
             // retry layer; we want the suspend to fail through.
-            return Task.FromResult(new RunResult(0, "multipass 1.16.0", ""));
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
         });
         var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
 
@@ -1947,9 +1948,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "start", var name])
             {
                 startCalls.Add(name);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            return Task.FromResult(new RunResult(0, "", ""));
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
         });
         var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
         await ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-abc123", CancellationToken.None);
@@ -1960,7 +1961,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     [Fact]
     public async Task ResumeSandboxAsync_RejectsInvalidName()
     {
-        var runner = new RecordingMultipassRunner((_, _, _) => Task.FromResult(new RunResult(0, "", "")));
+        var runner = new RecordingMultipassRunner((_, _, _) => Task.FromResult(new ProcessRunResult(0, "", "")));
         var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
         await Assert.ThrowsAsync<ArgumentException>(() =>
             ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox/../../etc/passwd", CancellationToken.None));
@@ -1972,9 +1973,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             if (argv is [_, "start", _])
-                return Task.FromResult(new RunResult(2, "", "multipassd: instance not found"));
+                return Task.FromResult(new ProcessRunResult(2, "", "multipassd: instance not found"));
             // multipass version probe responses
-            return Task.FromResult(new RunResult(0, "multipass 1.16.0", ""));
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
         });
         var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
 
@@ -2031,38 +2032,38 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         {
             ct.ThrowIfCancellationRequested();
             if (argv is [_, "version"])
-                return Task.FromResult(new RunResult(0, "multipass 1.16.0", ""));
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 states[argv[3]] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "info", var name, "--format=csv"])
-                return Task.FromResult(new RunResult(
+                return Task.FromResult(new ProcessRunResult(
                     0, states.TryGetValue(name, out var current) ? current : "Running", ""));
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out _);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            return Task.FromResult(new RunResult(99, "", "unexpected argv"));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv"));
         });
     }
 

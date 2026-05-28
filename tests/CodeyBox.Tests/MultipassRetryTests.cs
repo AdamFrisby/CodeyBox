@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Multipass;
 
 namespace CodeyBox.Tests;
@@ -19,12 +20,12 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class MultipassRetryTests
 {
-    private static RunResult Ok(string stdout = "") => new(0, stdout, "");
-    private static RunResult Refused(string extra = "") =>
+    private static ProcessRunResult Ok(string stdout = "") => new(0, stdout, "");
+    private static ProcessRunResult Refused(string extra = "") =>
         new(1, "", "ssh connection failed: 'Connection refused'" + extra);
-    private static RunResult ResetByPeer() =>
+    private static ProcessRunResult ResetByPeer() =>
         new(1, "", "ssh connection failed: 'Connection reset by peer'");
-    private static RunResult NotFound() =>
+    private static ProcessRunResult NotFound() =>
         new(2, "", "instance \"codeybox-xxxx\" does not exist");
 
     /// <summary>

@@ -163,7 +163,7 @@ internal static class WorkItemDiffEndpoints
         CancellationToken ct)
     {
         var psi = BuildGitDiffPsi(repoPath, baseSha, workSha);
-        using var proc = Process.Start(psi)!;
+        using var proc = System.Diagnostics.Process.Start(psi)!;
 
         var sb = new StringBuilder();
         long totalBytes = 0;
@@ -222,7 +222,7 @@ internal static class WorkItemDiffEndpoints
         ctx.Response.Headers.ContentDisposition = "inline; filename=\"diff.patch\"";
 
         var psi = BuildGitDiffPsi(repoPath, baseSha, workSha);
-        using var proc = Process.Start(psi)!;
+        using var proc = System.Diagnostics.Process.Start(psi)!;
 
         long totalBytes = 0;
         var hitLimit = false;
@@ -283,7 +283,7 @@ internal static class WorkItemDiffEndpoints
             CreateNoWindow = true,
         };
         foreach (var a in args) psi.ArgumentList.Add(a);
-        using var p = Process.Start(psi)!;
+        using var p = System.Diagnostics.Process.Start(psi)!;
         var readStdout = p.StandardOutput.ReadToEndAsync(ct);
         var readStderr = p.StandardError.ReadToEndAsync(ct);
         await p.WaitForExitAsync(ct);
