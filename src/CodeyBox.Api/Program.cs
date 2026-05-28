@@ -1239,15 +1239,30 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
     }
     return extractors;
 });
+// Bundled per-(agent, model) pricing defaults shipped with CodeyBox so new
+// installs get cost reporting without the operator hand-populating every
+// entry from provider docs. Operator config under CodeyBox:AgentPricing
+// always wins per (agentKind, modelId). See docs/agent-pricing.md.
+builder.Services.AddSingleton<BundledAgentPricing>(sp =>
+{
+    var env = sp.GetRequiredService<IHostEnvironment>();
+    var log = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
+    return AgentPricingDefaults.Load(env.ContentRootPath, log);
+});
 builder.Services.AddSingleton<AgentCostCalculator>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
-    var pricing = opts.AgentPricing;
+    var bundled = sp.GetRequiredService<BundledAgentPricing>();
+    var merged = AgentPricingDefaults.Merge(bundled, opts.AgentPricing);
+    startupLog.LogInformation(
+        "AgentPricing loaded: bundled={Bundled}, operator-overrides={Operator}, total={Total} (bundled lastUpdated={LastUpdated})",
+        merged.BundledRateCount, merged.OperatorRateCount, merged.TotalRateCount,
+        string.IsNullOrEmpty(bundled.Meta.LastUpdated) ? "(unknown)" : bundled.Meta.LastUpdated);
     var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
-    AgentCostCalculator.ValidateAtStartup(pricing,
+    AgentCostCalculator.ValidateAtStartup(merged.Options,
         sp.GetRequiredService<IAgentRegistry>().Available, extractors, startupLog);
-    return new AgentCostCalculator(pricing, extractors);
+    return new AgentCostCalculator(merged.Options, extractors);
 });
 builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
 {
@@ -1469,7 +1484,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp => new AgentConfigHotRelo
     sp.GetRequiredService<AgentClassRouter>(),
     sp.GetRequiredService<AgentBurnEstimator>(),
     sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
-    sp.GetRequiredService<AgentCostCalculator>()));
+    sp.GetRequiredService<AgentCostCalculator>(),
+    sp.GetRequiredService<BundledAgentPricing>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
@@ -1615,6 +1631,7 @@ IdempotencyMiddleware.Use(app);
 WorkItemEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
+AgentPricingEndpoints.Map(app);
 ProjectBudgetEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
