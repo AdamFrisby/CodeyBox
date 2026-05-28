@@ -405,6 +405,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         if (!IsValidSandboxName(name))
             throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
 
+        // The previous process may have abandoned `multipass suspend` mid-flight
+        // (per-VM suspend timeout fired, then SIGKILL), leaving multipassd still
+        // writing the RAM snapshot — the VM lingers in `Suspending`. `multipass
+        // start` against a `Suspending` instance fails, which would send the work
+        // item to stranded recovery even though the snapshot is about to finish.
+        // Wait for the transitional state to settle before starting.
+        await WaitWhileSuspendingAsync(opts, name, ct);
+
         var run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
         // Treat "instance not running" / "already started" as success: the goal
         // of ResumeSandboxAsync is "VM is Running afterwards", and multipass
@@ -801,7 +809,8 @@ git push origin HEAD:{refName}";
             var isActive = _activeSandboxNames.ContainsKey(name);
             var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
             var diskBytes = detailsByName.TryGetValue(name, out details) ? details.DiskBytes : null;
-            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker));
+            var state = detailsByName.TryGetValue(name, out details) ? details.State : null;
+            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker, state));
         }
         return infos;
     }
@@ -851,9 +860,14 @@ git push origin HEAD:{refName}";
                 if (total > 0)
                     diskBytes = total;
 
+                string? state = null;
+                if (vmEntry.Value.TryGetProperty("state", out var stateEl) && stateEl.ValueKind == JsonValueKind.String)
+                    state = stateEl.GetString();
+
                 result[vmEntry.Name] = new MultipassSandboxDetails(
                     diskBytes,
-                    TryReadCreatedAt(vmEntry.Value));
+                    TryReadCreatedAt(vmEntry.Value),
+                    state);
             }
         }
         catch (JsonException ex)
@@ -1429,6 +1443,35 @@ test "$work" = present && test "$exec_wrapper" = present
             await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
         }
         throw new InvalidOperationException($"multipass VM {name} did not reach Stopped state within 2 minutes");
+    }
+
+    /// <summary>
+    /// Polls `multipass info` while the VM is in the transitional <c>Suspending</c>
+    /// state and returns once it has settled (<c>Suspended</c>/<c>Stopped</c>/etc.)
+    /// so a subsequent <c>multipass start</c> does not fail against a half-frozen
+    /// instance. Best-effort: a non-zero `info` exit (VM gone) or an unreadable
+    /// state returns immediately and lets the caller's `start` surface the real
+    /// error. The deadline bounds how long startup resume blocks per VM; if the
+    /// snapshot is still being written when it elapses we proceed and let `start`
+    /// fail into the standard stranded-item recovery path.
+    /// </summary>
+    private async Task WaitWhileSuspendingAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct);
+            // VM not found, or info failed: nothing to wait on — let start decide.
+            if (info.ExitCode != 0) return;
+            if (!info.Stdout.Contains("Suspending", StringComparison.OrdinalIgnoreCase)) return;
+            await Task.Delay(TimeSpan.FromSeconds(1), ct);
+        }
+        _log.LogWarning(
+            "multipass VM {Name} was still Suspending after 10 minutes; attempting start anyway", name);
     }
 
     /// <summary>
@@ -2139,7 +2182,7 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 }
 
-internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt);
+internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt, string? State = null);
 
 internal sealed class MultipassDaemonRetryPolicy
 {
@@ -3168,10 +3211,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             // Do NOT set _preserveOnDispose before this point: if the multipass
             // suspend call fails we still want DisposeAsync to destroy the VM
             // so a still-Running but un-bookkept VM doesn't silently leak. The
-            // caller (SandboxSuspendOnShutdownService.SuspendOneAsync) treats
-            // any exception here as "don't persist SuspendedVmName"; the next
-            // DisposeAsync (triggered by the orchestrator's host stopping)
-            // then cleanly tears the VM down.
+            // caller (SandboxSuspendOnShutdownService.SuspendOneAsync) persists
+            // the SuspendedVmName mapping BEFORE awaiting this method, then
+            // CLEARS it again on a non-cancellation exception so this failed,
+            // still-Running VM has no resume bookkeeping; the next DisposeAsync
+            // (triggered by the orchestrator's host stopping) then cleanly tears
+            // the VM down. (A per-VM timeout, by contrast, is an
+            // OperationCanceledException that keeps the mapping so the next
+            // startup can resume the VM multipassd is still freezing.)
             throw new InvalidOperationException(
                 $"multipass suspend {_name} failed (exit {result.ExitCode}): {result.Stderr}");
         }

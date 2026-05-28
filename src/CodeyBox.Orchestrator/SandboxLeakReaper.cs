@@ -154,7 +154,18 @@ public sealed class SandboxLeakReaper : BackgroundService
                 var missingCreationMetadata = !info.CreatedAt.HasValue;
                 var createdAt = info.CreatedAt ?? now - _opts.LeakAgeThreshold;
                 var age = now - createdAt;
-                if (info.HasPreemptMarker && age < _opts.PreemptRetention)
+
+                // A VM in multipass Suspending/Suspended state that reached this
+                // point has no live SuspendedVmName mapping (those are filtered
+                // above), so the startup resume handler will never reattach it —
+                // it is an orphan from a crash between `multipass suspend` and the
+                // bookkeeping write, or from a cleared/expired mapping. SuspendAsync
+                // drops a .codeybox-preempt marker, so without this branch such a
+                // VM would inherit the 24h PreemptRetention grace and leak for a
+                // day. Treat it as a leak subject only to the normal age grace.
+                var isSuspendOrphan = IsSuspendState(info.State);
+
+                if (info.HasPreemptMarker && !isSuspendOrphan && age < _opts.PreemptRetention)
                     continue;
 
                 if (age < _opts.LeakAgeThreshold)
@@ -163,9 +174,11 @@ public sealed class SandboxLeakReaper : BackgroundService
                 var diskMb = info.DiskBytes.HasValue ? info.DiskBytes.Value / (1024 * 1024) : (long?)null;
                 var reason = missingCreationMetadata
                     ? SandboxLeakReasons.UntrackedSandboxMissingCreationMetadata
-                    : (info.HasPreemptMarker
-                        ? SandboxLeakReasons.ExpiredPreemptRetention
-                        : SandboxLeakReasons.UntrackedSandbox);
+                    : (isSuspendOrphan
+                        ? SandboxLeakReasons.OrphanedSuspendingVm
+                        : (info.HasPreemptMarker
+                            ? SandboxLeakReasons.ExpiredPreemptRetention
+                            : SandboxLeakReasons.UntrackedSandbox));
                 leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason));
                 AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb, reason);
                 _ = _webhooks.PublishAsync(new WebhookEvent
@@ -222,6 +235,17 @@ public sealed class SandboxLeakReaper : BackgroundService
             _log.LogWarning(ex, "SandboxLeakReaper: sweep failed");
         }
     }
+
+    /// <summary>
+    /// True for the multipass states that mean "frozen or freezing to disk":
+    /// <c>Suspending</c> (snapshot in progress) and <c>Suspended</c> (snapshot
+    /// complete). A VM in either state with no live SuspendedVmName mapping is an
+    /// orphan the resume handler can never reattach.
+    /// </summary>
+    private static bool IsSuspendState(string? state) =>
+        state is not null &&
+        (state.Equals("Suspending", StringComparison.OrdinalIgnoreCase) ||
+         state.Equals("Suspended", StringComparison.OrdinalIgnoreCase));
 
     private async Task<HashSet<string>> BuildSuspendedVmNameSetAsync(CancellationToken ct)
     {

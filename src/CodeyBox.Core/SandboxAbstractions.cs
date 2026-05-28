@@ -68,12 +68,21 @@ public interface ISandboxProvider
 /// Such sandboxes are intentionally preserved during the configured preempt
 /// retention window and must not be treated as leaks until that window expires.
 /// </param>
+/// <param name="State">
+/// Best-effort provider-reported lifecycle state of the sandbox (e.g. the
+/// multipass <c>Running</c>/<c>Suspending</c>/<c>Suspended</c>/<c>Stopped</c>
+/// state), or null when the provider does not model a persistent state. The
+/// leak reaper uses this to recognise a VM stuck in <c>Suspending</c>/
+/// <c>Suspended</c> with no live orchestrator mapping as an orphan that should
+/// not inherit the long preempt-retention grace.
+/// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
     DateTimeOffset? CreatedAt,
     long? DiskBytes,
     bool IsTrackedActive,
-    bool HasPreemptMarker = false);
+    bool HasPreemptMarker = false,
+    string? State = null);
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable
@@ -149,11 +158,10 @@ public interface ISuspendableSandbox : ISandbox
 
     /// <summary>
     /// Best-effort RAM size of this sandbox in bytes, or null when the provider
-    /// cannot report it. <see cref="CodeyBox.Orchestrator.SandboxSuspendOnShutdownService"/>
-    /// scales the per-VM suspend timeout by this value: <c>multipass suspend</c>
-    /// writes the whole RAM image to disk, so a 12 GiB VM under load legitimately
-    /// takes far longer than a 1 GiB idle one. Null falls back to the flat floor
-    /// timeout.
+    /// cannot report it. The suspend-on-shutdown handler scales the per-VM
+    /// suspend timeout by this value: <c>multipass suspend</c> writes the whole
+    /// RAM image to disk, so a 12 GiB VM under load legitimately takes far longer
+    /// than a 1 GiB idle one. Null falls back to the flat floor timeout.
     /// </summary>
     long? MemoryBytes => null;
 }

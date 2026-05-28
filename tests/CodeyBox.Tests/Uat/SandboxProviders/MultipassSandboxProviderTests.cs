@@ -1905,8 +1905,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // Critical safety contract: a failed `multipass suspend` MUST NOT flip
         // _preserveOnDispose to true. Otherwise the subsequent DisposeAsync
         // becomes a no-op while the VM is still Running on disk — a silent
-        // leak that the SandboxSuspendOnShutdownService caller won't even
-        // know about (the catch handler returns without persisting bookkeeping).
+        // leak. The SandboxSuspendOnShutdownService caller persists the
+        // SuspendedVmName mapping BEFORE awaiting suspend and CLEARS it again
+        // when suspend throws a non-cancellation exception, so this failed,
+        // still-Running VM is left with no resume bookkeeping and DisposeAsync
+        // tears it down.
         var suspendCalls = 0;
         var deleteCalls = 0;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
@@ -1937,6 +1940,63 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // suspend.
         await sandbox.DisposeAsync();
         Assert.Equal(1, deleteCalls);
+    }
+
+    [Fact]
+    public void MemoryBytes_ReflectsSpecLimits_ForSuspendTimeoutScaling()
+    {
+        // SandboxSuspendOnShutdownService.SuspendTimeoutFor scales the per-VM
+        // suspend timeout by ISuspendableSandbox.MemoryBytes. MultipassSandbox
+        // must surface the provisioned RAM from its SandboxSpec.Limits so that
+        // scaling is fed a real value rather than the flat floor.
+        const long sixGiB = 6L * 1024 * 1024 * 1024;
+        var sandbox = new MultipassSandbox(
+            "codeybox-mem",
+            _workspace,
+            new SandboxSpec
+            {
+                ImageReference = "ignored",
+                Flavor = SandboxProfileFlavor.Headless,
+                Limits = new SandboxResourceLimits { MemoryBytes = sixGiB },
+            },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/true" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: new RecordingMultipassRunner((_, _, _) => Task.FromResult(new ProcessRunResult(0, "", ""))));
+
+        Assert.Equal(sixGiB, ((ISuspendableSandbox)sandbox).MemoryBytes);
+    }
+
+    [Fact]
+    public async Task ResumeSandboxAsync_WaitsForSuspendingToSettleBeforeStart()
+    {
+        // The previous process may have abandoned `multipass suspend` mid-flight,
+        // leaving the VM in the transitional `Suspending` state. `multipass start`
+        // fails against a Suspending instance, so ResumeSandboxAsync must poll
+        // `multipass info` until the state settles before calling start.
+        var infoCalls = 0;
+        var startCalls = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", _, "--format=csv"])
+            {
+                infoCalls++;
+                // First two polls report Suspending, then the snapshot completes.
+                var state = infoCalls < 3 ? "Suspending" : "Suspended";
+                return Task.FromResult(new ProcessRunResult(0, state, ""));
+            }
+            if (argv is [_, "start", var name])
+            {
+                startCalls.Add(name);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
+        });
+        var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
+
+        await ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-settling", CancellationToken.None);
+
+        Assert.True(infoCalls >= 3, $"expected the resume to poll info until settled; saw {infoCalls} call(s)");
+        Assert.Equal(["codeybox-settling"], startCalls);
     }
 
     [Fact]

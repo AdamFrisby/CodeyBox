@@ -116,9 +116,11 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     {
         try
         {
-            // Suspend always uses CancellationToken.None for the multipass call
-            // so the host's shutdown grace period doesn't truncate it mid-flight.
-            // ct is honoured for the loop's early exit before we fan out.
+            // We do NOT thread the host shutdown token into the multipass suspend
+            // calls — each suspend gets its own per-VM timeout
+            // (see SuspendTimeoutFor / SuspendOneAsync) so one stuck multipassd
+            // call can't block the rest of the drain, but the host's shutdown
+            // grace period never truncates a healthy snapshot mid-flight.
             await SuspendAllAsync();
         }
         catch (Exception ex)

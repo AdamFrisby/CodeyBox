@@ -122,11 +122,40 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             NullLogger<SandboxSuspendOnShutdownService>.Instance);
         await svc.SuspendAllAsync();
 
+        // The handler persists the (work item → VM) mapping BEFORE awaiting
+        // suspend, so suspend must actually have been attempted...
+        Assert.True(sandbox.SuspendCalled);
         var after = await _store.GetAsync(item.Id);
-        // No persisted bookkeeping when suspend failed — the item flows through
-        // the standard stranded-item recovery path on the next start.
+        // ...and on a genuine (non-cancellation) suspend failure the handler
+        // CLEARS the bookkeeping again: the VM is left Running and DisposeAsync
+        // tears it down, so the item flows through the standard stranded-item
+        // recovery path on the next start with no dangling resume mapping.
         Assert.Null(after!.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_WorkItemMissingFromStore_DoesNotSuspend()
+    {
+        // The persist-before-await guard: SuspendOneAsync calls
+        // TryPersistSuspendBookkeepingAsync first, which returns false when the
+        // work item is no longer in the store (e.g. operator-deleted between
+        // dispatch and shutdown). In that case there is nowhere to record the
+        // resume mapping, so the handler must NOT call multipass suspend — a
+        // suspended-but-unmapped VM would just leak.
+        var item = MakeItem();
+        // Intentionally NOT created in the store.
+        var sandbox = new FakeSuspendableSandbox("vm-orphan");
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+        await svc.SuspendAllAsync();
+
+        Assert.False(sandbox.SuspendCalled);
+        Assert.Null(await _store.GetAsync(item.Id));
     }
 
     [Fact]
@@ -194,6 +223,15 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Equal(
             TimeSpan.FromMinutes(10),
             svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-1g", memoryBytes: 1 * gib)));
+
+        // Zero / negative reported RAM is treated the same as "unknown" → floor,
+        // never a zero or negative timeout that would cancel suspend instantly.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-0", memoryBytes: 0)));
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-neg", memoryBytes: -1)));
     }
 
     [Fact]
@@ -739,6 +777,68 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await reaper.RunSweepAsync(CancellationToken.None);
 
         Assert.Contains("vm-stale-suspended", provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task LeakReaper_OrphanedSuspendingVm_WithoutMapping_IsReapedDespitePreemptMarker()
+    {
+        // A crash (or per-VM suspend timeout followed by SIGKILL) can leave a VM
+        // in multipass `Suspending`/`Suspended` state with NO live SuspendedVmName
+        // mapping. SuspendAsync drops a .codeybox-preempt marker, so without
+        // suspend-state awareness the reaper would grant such a VM the full 24h
+        // PreemptRetention grace and it would leak for a day. With the marker but
+        // an age past the normal LeakAgeThreshold and no mapping, it must be
+        // reaped now, classified as an orphaned suspending VM.
+        var provider = new FakeSandboxLeakProvider();
+        // Aged past LeakAgeThreshold (30m) but well within PreemptRetention (24h).
+        var aged = DateTimeOffset.UtcNow.AddHours(-1);
+        provider.SeedManaged(new("vm-orphan-suspending", aged, 1024L * 1024,
+            IsTrackedActive: false, HasPreemptMarker: true, State: "Suspending"));
+
+        var webhooks = new CapturingWebhookDispatcher();
+        var reaper = new SandboxLeakReaper(
+            provider, webhooks,
+            () => new SandboxLeakOptions
+            {
+                LeakAgeThreshold = TimeSpan.FromMinutes(30),
+                PreemptRetention = TimeSpan.FromHours(24),
+                AutoDispose = true,
+            },
+            NullLogger<SandboxLeakReaper>.Instance,
+            _store);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Contains("vm-orphan-suspending", provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task LeakReaper_SuspendingVm_WithLiveMapping_IsStillProtected()
+    {
+        // Control for the orphan case: a Suspending VM that DOES have a live
+        // mid-flight SuspendedVmName mapping is being held across a restart and
+        // must never be reaped, even though its state is transitional.
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-mapped-suspending",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSandboxLeakProvider();
+        provider.SeedManaged(new("vm-mapped-suspending", DateTimeOffset.UtcNow.AddHours(-1),
+            1024L * 1024, IsTrackedActive: false, HasPreemptMarker: true, State: "Suspending"));
+
+        var webhooks = new CapturingWebhookDispatcher();
+        var reaper = new SandboxLeakReaper(
+            provider, webhooks,
+            () => new SandboxLeakOptions { LeakAgeThreshold = TimeSpan.FromMinutes(30), AutoDispose = true },
+            NullLogger<SandboxLeakReaper>.Instance,
+            _store);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("vm-mapped-suspending", provider.DisposedNames);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
