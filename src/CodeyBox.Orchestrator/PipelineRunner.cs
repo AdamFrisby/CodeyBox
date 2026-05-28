@@ -3665,15 +3665,14 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             var access = isolatedMergeRepoPath is null
                 ? _gitHost.GetSandboxAccess(repoId)
-                : AttachIsolatedRepoRestoreHook(
-                    _gitHost.GetIsolatedRepoSandboxAccess(isolatedMergeRepoPath),
-                    repoId,
-                    isolatedMergeRepoPath);
+                : _gitHost.GetIsolatedRepoSandboxAccess(isolatedMergeRepoPath);
             var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: !hostMerge.HasConflicts,
                 hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
                 baselineImageRef: item.BaselineImageRef);
             var mergeSandboxStartSw = Stopwatch.StartNew();
-            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            await using var sandbox = isolatedMergeRepoPath is null
+                ? await _sandboxes.CreateAsync(spec, ct)
+                : await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedMergeRepoPath, ct);
             mergeSandboxStartSw.Stop();
             CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
 
@@ -4254,21 +4253,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var stagingRoot = _gitHost.GetMergeStagingRoot(repoId);
         var target = Path.Combine(stagingRoot, $"codeybox-merge-{itemId}-{Guid.NewGuid():N}.git");
         await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, target);
-        // git clone exited 0, but verify the bare-repo target actually
-        // landed on disk before handing the path to the sandbox mount
-        // step. Without this guard, a silent partial clone or an external
-        // process that removed the directory between clone-exit and
-        // return would only surface later as a "Source path does not
-        // exist" mount failure — the exact failure class b044f8bd
-        // tracks. The HEAD file is created by `git clone --bare` and is
-        // the cheapest single check that distinguishes a successful bare
-        // clone from an empty directory.
-        if (!Directory.Exists(target) || !File.Exists(Path.Combine(target, "HEAD")))
-        {
-            throw new InvalidOperationException(
-                $"isolated merge clone did not land on disk: target={target} " +
-                $"exists={Directory.Exists(target)} head={File.Exists(Path.Combine(target, "HEAD"))}");
-        }
+        VerifyIsolatedMergeRepositoryOnDisk(target, "create");
         _log.LogInformation(
             "isolated merge clone landed for work item {WorkItem}: {Target}",
             itemId, target);
@@ -4276,79 +4261,109 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Wraps a <see cref="SandboxRepositoryAccess"/> built for an isolated
-    /// merge / conflict-rework clone so the isolated host path's mount carries
-    /// an <see cref="ISandboxMountSourceRestorer"/>: if the sandbox provider
-    /// reports the host source missing at mount time, the orchestrator
-    /// re-clones the bare repo into the same target path before the mount is
-    /// retried. Only the mount that points at
-    /// <paramref name="isolatedRepoHostPath"/> gets the restorer — other
-    /// mounts in the access keep their default null restorer.
+    /// Asserts a freshly-run <c>git clone --bare</c> actually produced the
+    /// expected bare-repo layout on disk: the target directory exists AND
+    /// contains a HEAD file. Called immediately after RunHostGitAsync returns
+    /// from a clone so a silent/partial clone or an external process that
+    /// removed the directory between clone-exit and verification surfaces here
+    /// instead of as a confusing "Source path does not exist" mount failure
+    /// later — the exact failure class b044f8bd tracked. The HEAD file is
+    /// created by <c>git clone --bare</c> and is the cheapest single check
+    /// that distinguishes a successful bare clone from an empty directory.
+    ///
+    /// <para>Extracted as an <c>internal static</c> so the verification
+    /// failure path is unit-testable independently of running a real
+    /// <c>git clone</c>: a regression that inverted the condition or
+    /// removed the call site would still be caught by direct calls in tests
+    /// covering both the empty-directory and missing-HEAD failure modes.</para>
     /// </summary>
-    internal SandboxRepositoryAccess AttachIsolatedRepoRestoreHook(
-        SandboxRepositoryAccess access,
-        string repoId,
-        string isolatedRepoHostPath)
+    internal static void VerifyIsolatedMergeRepositoryOnDisk(string targetPath, string operationContext)
     {
-        var restorer = new IsolatedMergeRepoSourceRestorer(this, repoId, isolatedRepoHostPath);
-        var rewrittenMounts = access.Mounts
-            .Select(m => string.Equals(m.HostPath, isolatedRepoHostPath, StringComparison.Ordinal)
-                ? m with { SourceRestorer = restorer }
-                : m)
-            .ToArray();
-        return access with { Mounts = rewrittenMounts };
+        var dirExists = Directory.Exists(targetPath);
+        var headExists = File.Exists(Path.Combine(targetPath, "HEAD"));
+        if (!dirExists || !headExists)
+        {
+            throw new InvalidOperationException(
+                $"isolated merge clone {operationContext} did not land on disk: target={targetPath} " +
+                $"exists={dirExists} head={headExists}");
+        }
     }
 
     /// <summary>
     /// Re-clones the bare repo back into <paramref name="targetPath"/> after
-    /// the path has gone missing between create-time and mount-time. The
-    /// <see cref="ISandboxMountSourceRestorer"/> wired into
-    /// <see cref="SandboxMount.SourceRestorer"/> invokes this so the merge
-    /// mount step can self-heal a racing cleanup without aborting the whole
-    /// work item.
+    /// the path has gone missing between create-time and mount-time. Called
+    /// from <see cref="CreateMergeSandboxWithStagingRestoreAsync"/> when the
+    /// sandbox provider surfaces a
+    /// <see cref="SandboxMountSourceMissingException"/> naming the staging
+    /// path, so the merge mount step can self-heal a racing cleanup without
+    /// aborting the whole work item. Keeping recovery in orchestration
+    /// (rather than threading a behavioral callback through the cross-provider
+    /// mount DTO) lets every sandbox provider stay merge-staging-agnostic.
     /// </summary>
     internal async Task RestoreIsolatedMergeRepositoryAsync(string repoId, string targetPath, CancellationToken ct)
     {
         var source = _gitHost.GetRepoPath(repoId);
         var stagingRoot = _gitHost.GetMergeStagingRoot(repoId);
+        // Containment guard: the recursive delete below must only ever land
+        // inside the configured staging root. A future wiring bug or a
+        // hostile IGitHost override that returned a path outside the root
+        // would otherwise turn this into an arbitrary host-directory delete.
+        var canonicalRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(stagingRoot));
+        var canonicalTarget = Path.GetFullPath(targetPath);
+        if (!canonicalTarget.StartsWith(canonicalRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            && !string.Equals(canonicalTarget, canonicalRoot, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"refusing to restore isolated merge clone outside staging root: target={canonicalTarget} root={canonicalRoot}");
+        }
         // git clone refuses to overwrite an existing target — defensive remove
         // in case a partial directory was left behind. DeleteDirectoryBestEffort
         // is a no-op when the path is absent.
         DeleteDirectoryBestEffort(targetPath);
         await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, targetPath);
-        // Mirror the verification in CreateIsolatedMergeRepositoryAsync —
-        // if the restore clone silently produces no on-disk output, the
-        // next mount attempt will repeat the same exists=no failure and
-        // the heal loop will give up. Surface that here instead.
-        if (!Directory.Exists(targetPath) || !File.Exists(Path.Combine(targetPath, "HEAD")))
-        {
-            throw new InvalidOperationException(
-                $"isolated merge clone restore did not land on disk: target={targetPath} " +
-                $"exists={Directory.Exists(targetPath)} head={File.Exists(Path.Combine(targetPath, "HEAD"))}");
-        }
+        VerifyIsolatedMergeRepositoryOnDisk(targetPath, "restore");
     }
 
     /// <summary>
-    /// Concrete restorer that re-runs <c>git clone --bare</c> for the merge /
-    /// conflict-rework isolated staging clone. Lives in the orchestrator so
-    /// the <c>CodeyBox.Sandbox.*</c> assemblies stay unaware of git-host
-    /// recovery logic — the sandbox provider only ever invokes the interface.
+    /// Cap on how many times we attempt CreateAsync for a merge / conflict-rework
+    /// sandbox when the sandbox provider surfaces
+    /// <see cref="SandboxMountSourceMissingException"/> naming the staging clone
+    /// host path. One re-clone-and-retry is the production heal contract — if
+    /// the source disappears AGAIN after restore, the loop falls through to
+    /// rethrow rather than spinning indefinitely on a structural failure.
     /// </summary>
-    private sealed class IsolatedMergeRepoSourceRestorer : ISandboxMountSourceRestorer
+    internal const int MergeSandboxStagingRestoreAttempts = 2;
+
+    /// <summary>
+    /// Creates a sandbox for the merge / conflict-rework phase, recovering once
+    /// from a mid-mount disappearance of the staging clone by re-running
+    /// <c>git clone --bare</c> into <paramref name="stagingPath"/> and retrying
+    /// <see cref="ISandboxProvider.CreateAsync"/>. Returns the live sandbox or
+    /// rethrows the original failure if recovery cannot land the staging clone.
+    /// </summary>
+    private async Task<ISandbox> CreateMergeSandboxWithStagingRestoreAsync(
+        SandboxSpec spec,
+        string repoId,
+        string stagingPath,
+        CancellationToken ct)
     {
-        private readonly PipelineRunner _owner;
-        private readonly string _repoId;
-        private readonly string _isolatedRepoHostPath;
-
-        public IsolatedMergeRepoSourceRestorer(PipelineRunner owner, string repoId, string isolatedRepoHostPath)
+        for (var attempt = 1; ; attempt++)
         {
-            _owner = owner;
-            _repoId = repoId;
-            _isolatedRepoHostPath = isolatedRepoHostPath;
+            try
+            {
+                return await _sandboxes.CreateAsync(spec, ct);
+            }
+            catch (SandboxMountSourceMissingException ex)
+                when (attempt < MergeSandboxStagingRestoreAttempts
+                    && string.Equals(ex.HostPath, stagingPath, StringComparison.Ordinal))
+            {
+                _log.LogWarning(
+                    ex,
+                    "merge sandbox mount source missing — re-cloning staging clone and retrying CreateAsync (attempt {Attempt}/{Max}): {Path}",
+                    attempt, MergeSandboxStagingRestoreAttempts, stagingPath);
+                await RestoreIsolatedMergeRepositoryAsync(repoId, stagingPath, ct);
+            }
         }
-
-        public Task RestoreAsync(CancellationToken ct)
-            => _owner.RestoreIsolatedMergeRepositoryAsync(_repoId, _isolatedRepoHostPath, ct);
     }
 
     private async Task ImportIsolatedMergeCommitAsync(
@@ -5683,16 +5698,13 @@ public sealed class PipelineRunner : IPipelineRunner
             var credential = _credentials is IProjectAwareCredentialProvider pac
                 ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
                 : await _credentials.GetAsync(runner.Kind, ct);
-            var access = AttachIsolatedRepoRestoreHook(
-                _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath),
-                repoId,
-                isolatedRepoPath);
+            var access = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
                 hostNetworkProfile: project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
                 timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,
                 baselineImageRef: item.BaselineImageRef);
 
-            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            await using var sandbox = await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedRepoPath, ct);
             if (credential is not null && credential.Files.Count > 0)
                 await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 

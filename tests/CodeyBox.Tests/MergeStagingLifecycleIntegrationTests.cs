@@ -163,210 +163,38 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
     }
 
     /// <summary>
-    /// Wiring guard for the production fix. PipelineRunner attaches an
-    /// <see cref="ISandboxMountSourceRestorer"/> to the merge-phase sandbox
-    /// spec only when the conflict path runs through
-    /// <see cref="PipelineRunner.AttachIsolatedRepoRestoreHook"/>. This
-    /// test drives the full conflict-merge pipeline through a sandbox
-    /// provider that captures every <see cref="SandboxSpec"/> at
-    /// <see cref="ISandboxProvider.CreateAsync"/> time, then asserts the
-    /// merge spec carries a mount with a non-null restorer pointing at
-    /// the staging directory the merge phase just created. A regression
-    /// that dropped the AttachIsolatedRepoRestoreHook call (or wired it to
-    /// the wrong mount) would fail this test loudly.
-    ///
-    /// <para>Companion to the unit assertions in
-    /// <c>MergePhaseIsolatedRepoStagingTests.AttachIsolatedRepoRestoreHook_OnlyAddsRestoreToMatchingMount</c>:
-    /// that test pins the helper's behavior on a hand-constructed access.
-    /// This one pins that the production merge phase actually invokes the
-    /// helper before handing the spec to the sandbox provider.</para>
-    /// </summary>
-    [Fact]
-    public async Task ConflictMergePhase_AttachesSourceRestorerOnStagingMountOfMergeSandboxSpec()
-    {
-        var seed = await CreateLargerSeedAsync();
-        var auditor = new MainAdvancingAuditor(_workspace, "shared.txt", "main side\n");
-        var recordingProvider = new SpecRecordingSandboxProvider(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
-        using var tp = TestSupport.BuildPipeline(
-            _workspace, seed, auditors: [auditor], sandboxProvider: recordingProvider);
-        auditor.GitRoot = tp.GitRoot;
-
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("shared.txt", "work side\n"));
-        tp.Agent.ConflictResolutionPlan.Enqueue(files =>
-        {
-            var file = Assert.Single(files);
-            return new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["shared.txt"] = "main side\nwork side\n",
-            };
-        });
-
-        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
-        await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
-
-        var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
-
-        // The merge phase is the only one that mounts an isolated bare
-        // clone (work/audit phases mount the durable bare repo without a
-        // restorer). Find the captured spec whose mounts include a
-        // codeybox-merge-*.git path.
-        var mergeSpec = recordingProvider.CapturedSpecs
-            .FirstOrDefault(s => s.Mounts.Any(m =>
-                m.HostPath is { } hp &&
-                Path.GetFileName(hp).StartsWith("codeybox-merge-", StringComparison.Ordinal) &&
-                hp.EndsWith(".git", StringComparison.Ordinal)));
-        Assert.NotNull(mergeSpec);
-
-        var stagingMount = mergeSpec!.Mounts.Single(m =>
-            m.HostPath is { } hp &&
-            Path.GetFileName(hp).StartsWith("codeybox-merge-", StringComparison.Ordinal));
-        Assert.NotNull(stagingMount.SourceRestorer);
-
-        // The restorer must point at the durable bare repo, not the
-        // staging path it is asked to heal. Sanity-check by invoking it
-        // after a simulated delete and re-checking the path; a regression
-        // that wired the restorer to a stale closure (wrong repoId,
-        // wrong target) would fail this assertion rather than silently
-        // healing the wrong path.
-        var stagingPath = stagingMount.HostPath!;
-        if (Directory.Exists(stagingPath)) Directory.Delete(stagingPath, recursive: true);
-        await stagingMount.SourceRestorer!.RestoreAsync(CancellationToken.None);
-        try
-        {
-            Assert.True(File.Exists(Path.Combine(stagingPath, "HEAD")),
-                $"restorer wired by merge phase did not recreate {stagingPath}");
-        }
-        finally
-        {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
-        }
-    }
-
-    /// <summary>
-    /// Companion wiring guard for the conflict-rework call site
-    /// (<see cref="PipelineRunner.AttachIsolatedRepoRestoreHook"/> invoked
-    /// at <c>PipelineRunner.cs:5634</c>). The rework path creates its own
-    /// isolated bare clone and a fresh sandbox; the merge-phase spec test
-    /// above does not exercise that call site, so a regression that
-    /// dropped the helper invocation in the rework branch alone would
-    /// otherwise go undetected.
-    ///
-    /// <para>Drives the rework path by leaving the merge-phase text-only
-    /// resolver's plan empty (so <see cref="MergeConflictResolutionFailedException"/>
-    /// fires) and queues a clean rework resolution. The captured rework
-    /// sandbox spec must have a non-null restorer on its staging mount.</para>
-    /// </summary>
-    [Fact]
-    public async Task ConflictReworkPhase_AttachesSourceRestorerOnStagingMountOfReworkSandboxSpec()
-    {
-        var seed = await CreateLargerSeedAsync();
-        var auditor = new MainAdvancingAuditor(_workspace, "shared.txt", "main side\n");
-        var recordingProvider = new SpecRecordingSandboxProvider(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
-        using var tp = TestSupport.BuildPipeline(
-            _workspace, seed, auditors: [auditor], sandboxProvider: recordingProvider);
-        auditor.GitRoot = tp.GitRoot;
-
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("shared.txt", "work side\n"));
-        // No ConflictResolutionPlan entry -> merge-phase resolver fails ->
-        // pipeline transitions to the rework path. The rework plan below
-        // resolves cleanly so the pipeline reaches Done after rework.
-        tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
-        {
-            // sandbox.ExecAsync rewrites argv-form sandbox-absolute paths
-            // to their host-fs equivalents (see ProcessSandboxProvider);
-            // shell redirection inside a "sh -c" string would not be
-            // rewritten, so use the stdin-into-`cat > "$0"` idiom (mirror
-            // of MergeConflictReworkTests' WriteFileAsync helper).
-            await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "cat > \"$0\"", $"{workDir}/shared.txt"],
-                Stdin = "main side\nwork side\n",
-            }, ct);
-            await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["git", "-C", workDir, "add", "shared.txt"],
-            }, ct);
-            await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["git", "-C", workDir, "-c", "core.editor=true",
-                    "-c", "sequence.editor=true", "rebase", "--continue"],
-            }, ct);
-            return new AgentResult(true, "resolved", null, null);
-        });
-
-        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
-        await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
-
-        var final = await tp.Store.GetAsync(item.Id);
-        Assert.True(final!.ConflictReworkAttempts > 0,
-            "rework path did not run — captured spec set does not include the rework sandbox");
-
-        // Capture every spec whose mounts include a codeybox-merge-*.git
-        // bind source. Both the merge-phase sandbox (3668) and the
-        // rework sandbox (5634) produce such a spec; both must carry a
-        // restorer. The rework wiring is what this test specifically
-        // pins — a regression that dropped AttachIsolatedRepoRestoreHook
-        // at PipelineRunner.cs:5634 alone would fail this assertion even
-        // if the merge-phase wiring at 3668 remained correct.
-        var stagingSpecs = recordingProvider.CapturedSpecs
-            .Where(s => s.Mounts.Any(m =>
-                m.HostPath is { } hp &&
-                Path.GetFileName(hp).StartsWith("codeybox-merge-", StringComparison.Ordinal) &&
-                hp.EndsWith(".git", StringComparison.Ordinal)))
-            .ToList();
-        Assert.True(stagingSpecs.Count >= 2,
-            $"expected at least 2 staging specs (merge + rework); captured {stagingSpecs.Count}");
-
-        foreach (var spec in stagingSpecs)
-        {
-            var stagingMount = spec.Mounts.Single(m =>
-                m.HostPath is { } hp &&
-                Path.GetFileName(hp).StartsWith("codeybox-merge-", StringComparison.Ordinal));
-            Assert.NotNull(stagingMount.SourceRestorer);
-        }
-    }
-
-    /// <summary>
-    /// End-to-end exercise of the multipass-equivalent mount heal path.
+    /// End-to-end exercise of the orchestrator-driven mount heal path.
     /// The integration test wraps <see cref="ProcessSandboxProvider"/> in
-    /// a provider that mimics multipass behavior: before each CreateAsync,
-    /// any bind mount whose host path is missing AND carries an
-    /// <see cref="ISandboxMountSourceRestorer"/> has its restorer invoked
-    /// (this is the same recovery the production
-    /// <c>MountSingleBindWithRetryAsync</c> loop performs when it sees
-    /// <c>exists=no</c>).
-    ///
-    /// <para>The test then injects mid-flight deletion: between when the
-    /// merge phase creates the staging clone and when the merge sandbox is
-    /// built, an external task deletes the staging directory. The
-    /// orchestrator-side restorer the merge phase attached must heal the
-    /// directory before the inner provider's CreateAsync runs, and the
-    /// pipeline must complete Done despite the simulated reap.</para>
+    /// a provider that mimics multipass behavior: on its first CreateAsync
+    /// call for a merge-staging mount, it deletes the staging directory
+    /// and throws <see cref="SandboxMountSourceMissingException"/> so the
+    /// orchestrator's
+    /// <c>CreateMergeSandboxWithStagingRestoreAsync</c> retry kicks in.
+    /// The orchestrator re-clones the bare repo and retries CreateAsync,
+    /// which the second-call branch lets succeed cleanly.
     ///
     /// <para>This pins the b044f8bd recovery contract end-to-end: the
     /// failure mode (missing bind source at mount time) is reproduced,
-    /// the wired restorer runs, and the pipeline survives. A regression
-    /// that broke the restorer wiring or the mount-heal handoff would
-    /// land the pipeline in Failed instead of Done.</para>
+    /// the orchestrator-side retry runs, and the pipeline survives. A
+    /// regression that broke the
+    /// CreateMergeSandboxWithStagingRestoreAsync wiring would land the
+    /// pipeline in Failed instead of Done.</para>
     /// </summary>
     [Fact]
-    public async Task ConflictMergePhase_StagingReapedBeforeMergeSandboxCreate_RestorerHealsItAndPipelineCompletesDone()
+    public async Task ConflictMergePhase_StagingReapedBeforeMergeSandboxCreate_OrchestratorRetriesAndPipelineCompletesDone()
     {
         var seed = await CreateLargerSeedAsync();
         var auditor = new MainAdvancingAuditor(_workspace, "shared.txt", "main side\n");
 
-        // The hostile provider observes each spec, deletes staging
-        // dirs (codeybox-merge-*.git) before invoking the restorer, then
-        // delegates to ProcessSandboxProvider. The deletion-then-restore
-        // sequence reproduces the multipass mount loop's behavior: a
-        // failed mount with exists=no triggers the restorer; the
-        // subsequent mount sees the recreated source and succeeds.
-        var healProvider = new ReapingThenRestoringSandboxProvider(
+        // The hostile provider observes each spec: on the first
+        // CreateAsync call for a merge-staging mount, it deletes the
+        // staging clone and throws SandboxMountSourceMissingException
+        // (matching what multipass does on exists=no). The orchestrator's
+        // CreateMergeSandboxWithStagingRestoreAsync catches it, re-clones
+        // via RestoreIsolatedMergeRepositoryAsync, and retries CreateAsync;
+        // the second call observes the staging clone back on disk and
+        // succeeds.
+        var healProvider = new ReapingThenRetryingSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed, auditors: [auditor], sandboxProvider: healProvider);
@@ -390,10 +218,11 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.NotNull(final.MergeSha);
 
-        // The restorer must have been invoked at least once — that is
-        // the whole point of this test (the recovery path ran).
-        Assert.True(healProvider.RestoreInvocations > 0,
-            "ISandboxMountSourceRestorer was never invoked — the heal path did not run");
+        // The reap-and-throw branch must have fired at least once — that
+        // is the whole point of this test (the orchestrator-driven heal
+        // path ran).
+        Assert.True(healProvider.MissingSourceThrows > 0,
+            "SandboxMountSourceMissingException was never thrown — orchestrator heal path did not run");
 
         // The finally-block cleanup must still have removed the staging
         // clone after the merge phase completed (recovery is orthogonal
@@ -634,30 +463,32 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
 
     /// <summary>
     /// ISandboxProvider wrapper that mimics the production multipass mount
-    /// loop's recovery path. Before delegating CreateAsync to the inner
-    /// provider, it deletes any bind-mount host path that looks like a
-    /// merge-staging clone (codeybox-merge-*.git) to simulate the
-    /// b044f8bd failure mode (reaper / external cleanup removed the bind
-    /// source between create and mount), then invokes the mount's
-    /// <see cref="ISandboxMountSourceRestorer"/> if one is wired —
+    /// loop's failure-on-exists-no semantics. On its FIRST CreateAsync
+    /// call that includes a merge-staging mount (codeybox-merge-*.git),
+    /// it reaps the staging directory and throws
+    /// <see cref="SandboxMountSourceMissingException"/> naming that path —
     /// matching what <c>MultipassSandboxProvider.MountSingleBindWithRetryAsync</c>
-    /// does when it sees <c>exists=no</c> after a failed mount attempt.
+    /// does when it sees <c>exists=no</c>. Subsequent calls pass through
+    /// to the inner provider, letting the orchestrator's
+    /// <c>CreateMergeSandboxWithStagingRestoreAsync</c> retry succeed
+    /// once it has re-cloned the bare repo.
     ///
-    /// <para>The reap-then-restore sequence runs only for the merge
-    /// staging path. Work / audit / non-conflict mounts are passed through
+    /// <para>The reap-and-throw sequence runs only for the merge staging
+    /// path. Work / audit / non-conflict mounts are passed through
     /// untouched so the rest of the pipeline behaves identically to a
     /// plain ProcessSandboxProvider run.</para>
     /// </summary>
-    private sealed class ReapingThenRestoringSandboxProvider : ISandboxProvider
+    private sealed class ReapingThenRetryingSandboxProvider : ISandboxProvider
     {
         private readonly ISandboxProvider _inner;
-        public int RestoreInvocations { get; private set; }
+        private readonly HashSet<string> _alreadyReaped = new(StringComparer.Ordinal);
+        public int MissingSourceThrows { get; private set; }
 
-        public ReapingThenRestoringSandboxProvider(ISandboxProvider inner) => _inner = inner;
+        public ReapingThenRetryingSandboxProvider(ISandboxProvider inner) => _inner = inner;
 
         public string Name => _inner.Name;
 
-        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {
             foreach (var mount in spec.Mounts)
             {
@@ -667,25 +498,21 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
                     && mount.HostPath.EndsWith(".git", StringComparison.Ordinal);
                 if (!isStagingClone) continue;
 
-                // Reap the staging dir so the inner CreateAsync would
-                // otherwise observe a missing bind source — the exact
-                // class of failure b044f8bd reported under multipass.
+                // Reap exactly once per staging path. The orchestrator
+                // retries CreateAsync after re-cloning; the second call
+                // must observe the staging clone back on disk and
+                // proceed without another reap.
+                if (!_alreadyReaped.Add(mount.HostPath)) continue;
+
                 if (Directory.Exists(mount.HostPath))
                     Directory.Delete(mount.HostPath, recursive: true);
-
-                // Self-heal via the wired restorer, the way the production
-                // multipass mount loop would. A missing restorer here would
-                // mean the orchestrator never wired the heal path and the
-                // pipeline would die — that is the failure this test exists
-                // to catch as a regression.
-                Assert.NotNull(mount.SourceRestorer);
-                await mount.SourceRestorer!.RestoreAsync(ct);
-                RestoreInvocations++;
-                Assert.True(Directory.Exists(mount.HostPath),
-                    $"restorer did not recreate {mount.HostPath}");
+                MissingSourceThrows++;
+                throw new SandboxMountSourceMissingException(
+                    mount.HostPath,
+                    $"simulated multipass mount source missing: {mount.HostPath}");
             }
 
-            return await _inner.CreateAsync(spec, ct);
+            return _inner.CreateAsync(spec, ct);
         }
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
