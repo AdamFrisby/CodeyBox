@@ -192,12 +192,24 @@ public sealed class LocalGitHost : IGitHost
         // Re-write the sibling sentinel before re-cloning so the heal path
         // matches the create path's in-flight protection.
         WriteInFlightSibling(targetPath, workItemId: null);
-        var rc = await RunGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, targetPath);
-        if (rc.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"git clone --bare for merge restore failed (exit {rc.ExitCode}): {rc.Stderr}{rc.Stdout}");
-        VerifyIsolatedMergeCloneOnDisk(targetPath, "restore");
-        WriteInDirectoryMarker(targetPath, workItemId: null);
+        try
+        {
+            var rc = await RunGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, targetPath);
+            if (rc.ExitCode != 0)
+                throw new InvalidOperationException(
+                    $"git clone --bare for merge restore failed (exit {rc.ExitCode}): {rc.Stderr}{rc.Stdout}");
+            VerifyIsolatedMergeCloneOnDisk(targetPath, "restore");
+            WriteInDirectoryMarker(targetPath, workItemId: null);
+        }
+        catch
+        {
+            // Mirror CreateIsolatedMergeCloneAsync: best-effort sentinel
+            // cleanup if the heal-path clone or verification failed, so a
+            // failed restore does not leave a stray `.inflight` next to
+            // the (likely absent) staging directory.
+            TryDeleteFile(targetPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix);
+            throw;
+        }
     }
 
     public async Task DisposeIsolatedMergeCloneAsync(

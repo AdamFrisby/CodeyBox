@@ -791,11 +791,77 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             // file can attribute the in-flight directory to its owner.
             var body = await File.ReadAllTextAsync(markerPath);
             Assert.Contains(workItemId.ToString(), body);
+
+            // The SIBLING sentinel is the load-bearing artifact during the
+            // create window: it must be present from before `git clone`
+            // begins until DisposeIsolatedMergeCloneAsync removes it.
+            // Without this assertion a regression that dropped
+            // WriteInFlightSibling would still let every marker test pass
+            // while re-exposing the mid-clone reap race the b044f8bd fix
+            // targets.
+            var siblingPath = stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix;
+            Assert.True(File.Exists(siblingPath),
+                $"sibling in-flight sentinel must be present after create: {siblingPath}");
+            var siblingBody = await File.ReadAllTextAsync(siblingPath);
+            Assert.Contains(workItemId.ToString(), siblingBody);
         }
         finally
         {
             try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            try { File.Delete(stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix); } catch { /* best-effort */ }
         }
+    }
+
+    [Fact]
+    public async Task CreateIsolatedMergeClone_GitCloneFails_RemovesSiblingSentinelAndThrows()
+    {
+        // CreateIsolatedMergeCloneAsync writes the sibling sentinel BEFORE
+        // running `git clone --bare`; the catch block is then responsible
+        // for deleting that sentinel if the clone (or post-clone HEAD
+        // verification) fails, so a failed create does not leave a stray
+        // `.inflight` file next to a directory that was never written.
+        // Without this test the failure branch — including its sentinel
+        // cleanup — is unobserved; a regression that swallowed the
+        // non-zero git exit, or removed the catch block, would not be
+        // caught.
+        //
+        // Driving the failure: pass a repositoryId whose bare repo never
+        // existed on disk. GetRepoPath simply constructs a path; the
+        // staging-root directory is still created by the LocalGitHost
+        // ctor so the clone process can launch, but the source path is
+        // absent so `git clone --bare` exits non-zero.
+        var gitRoot = Path.Combine(_workspace, "git-root-create-fail");
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+
+        var workItemId = WorkItemId.New();
+        const string nonexistentRepoId = "nonexistent-source-repo";
+        Assert.False(Directory.Exists(gitHost.GetRepoPath(nonexistentRepoId)),
+            "test invariant: source bare repo must not exist so git clone fails");
+
+        // Snapshot any pre-existing staging-root contents so we can verify
+        // the failed create did not leave stray `.inflight` siblings.
+        var preExistingFiles = Directory.Exists(gitRoot)
+            ? new HashSet<string>(Directory.EnumerateFiles(gitRoot), StringComparer.Ordinal)
+            : new HashSet<string>(StringComparer.Ordinal);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IGitHost)gitHost).CreateIsolatedMergeCloneAsync(
+                nonexistentRepoId, workItemId, CancellationToken.None));
+
+        Assert.Contains("git clone --bare for merge staging failed", ex.Message);
+
+        // The catch block must have removed the sibling sentinel. We do not
+        // know the exact target path (it embeds a fresh Guid), so we assert
+        // no NEW `.inflight` file remains in the staging root.
+        var leftoverSentinels = Directory.EnumerateFiles(gitRoot)
+            .Where(p => p.EndsWith(IGitHost.IsolatedMergeCloneInFlightSiblingSuffix, StringComparison.Ordinal))
+            .Where(p => !preExistingFiles.Contains(p))
+            .ToArray();
+        Assert.True(leftoverSentinels.Length == 0,
+            "failed CreateIsolatedMergeCloneAsync must clean up sibling sentinels it wrote: " +
+            string.Join(", ", leftoverSentinels));
     }
 
     [Fact]
@@ -819,6 +885,16 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         try
         {
             Directory.Delete(stagingPath, recursive: true);
+            // The create-time sibling sentinel may still be sitting next
+            // to the deleted directory (Dispose did not run). Wipe it so
+            // the assertion below confirms the restore call REWROTE the
+            // sentinel rather than just leaving the create-time one in
+            // place — a regression that dropped WriteInFlightSibling
+            // inside RestoreIsolatedMergeCloneAsync must fail this test.
+            var siblingPath = stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix;
+            try { File.Delete(siblingPath); } catch { /* best-effort */ }
+            Assert.False(File.Exists(siblingPath),
+                "test invariant: sibling sentinel must be absent before restore so the assertion below pins the rewrite");
 
             await ((IGitHost)gitHost)
                 .RestoreIsolatedMergeCloneAsync(repoId, stagingPath, CancellationToken.None);
@@ -826,10 +902,75 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             var markerPath = Path.Combine(stagingPath, IGitHost.IsolatedMergeCloneInFlightMarkerFileName);
             Assert.True(File.Exists(markerPath),
                 $"in-flight marker must be re-written after restore: {markerPath}");
+            // Sibling sentinel must also be present after restore — the
+            // heal path mirrors the create path's in-flight protection,
+            // and a regression that dropped the restore-time
+            // WriteInFlightSibling would leave the staging dir vulnerable
+            // to the same race the original fix targets.
+            Assert.True(File.Exists(siblingPath),
+                $"sibling in-flight sentinel must be re-written after restore: {siblingPath}");
         }
         finally
         {
             try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            try { File.Delete(stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task RestoreIsolatedMergeClone_GitCloneFails_RemovesSiblingSentinelAndThrows()
+    {
+        // RestoreIsolatedMergeCloneAsync writes the sibling sentinel before
+        // running `git clone --bare` to re-stage. The heal path mirrors the
+        // create path's catch-block cleanup: a failed re-clone must throw
+        // InvalidOperationException AND remove the sibling sentinel that
+        // restore just wrote, so a failed heal does not leave a stray
+        // `.inflight` file pinning a directory that is no longer present.
+        // Without this test, a regression that swallowed the non-zero git
+        // exit (or removed the catch block) would not be caught.
+        //
+        // Driving the failure: create a staging clone, then dispose the
+        // source bare repo so the heal-path `git clone --bare` exits
+        // non-zero. The staging dir is wiped before restore so the
+        // sentinel write happens through the normal heal flow.
+        var gitRoot = Path.Combine(_workspace, "git-root-restore-fail");
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+
+        var seed = await CreateSeedRepoAsync();
+        var workItemId = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(workItemId, seed);
+
+        var stagingPath = await ((IGitHost)gitHost)
+            .CreateIsolatedMergeCloneAsync(repoId, workItemId, CancellationToken.None);
+        try
+        {
+            // Simulate the staging dir going missing AND the source bare
+            // repo being unavailable when restore runs — `git clone --bare`
+            // will exit non-zero because the source path no longer exists.
+            Directory.Delete(stagingPath, recursive: true);
+            var siblingPath = stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix;
+            try { File.Delete(siblingPath); } catch { /* best-effort */ }
+            await gitHost.DisposeRepositoryAsync(repoId, CancellationToken.None);
+            Assert.False(Directory.Exists(gitHost.GetRepoPath(repoId)),
+                "test invariant: source bare repo must be gone so the restore clone fails");
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                ((IGitHost)gitHost).RestoreIsolatedMergeCloneAsync(
+                    repoId, stagingPath, CancellationToken.None));
+            Assert.Contains("git clone --bare for merge restore failed", ex.Message);
+
+            // The catch block must have removed the sentinel restore
+            // wrote, so the leftover does not survive past the failed
+            // heal call.
+            Assert.False(File.Exists(siblingPath),
+                $"failed RestoreIsolatedMergeCloneAsync must clean up the sibling sentinel it wrote: {siblingPath}");
+        }
+        finally
+        {
+            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            try { File.Delete(stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix); } catch { /* best-effort */ }
         }
     }
 
