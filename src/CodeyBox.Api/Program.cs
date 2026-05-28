@@ -184,26 +184,29 @@ builder.Services.Configure<HostOptions>(o =>
 
     // Shutdown:GraceSeconds bounds the normal request-drain / preempt-checkpoint
     // window. The multipass suspend-on-shutdown handler, however, can legitimately
-    // need far longer to let multipassd finish writing a VM's RAM snapshot — up to
-    // the RAM-scaled SuspendTimeoutPolicy budget (30 min for the default 12 GiB
-    // VM). If ShutdownTimeout stayed at the 60s default, the host would SIGKILL us
-    // mid-snapshot and acceptance criterion 1 (suspend completes during graceful
-    // shutdown) would fail. ShutdownTimeout is a CEILING, not a fixed wait: a
+    // need far longer to let multipassd finish writing each VM's RAM snapshot — up
+    // to the RAM-scaled SuspendTimeoutPolicy budget (30 min for the default 12 GiB
+    // VM). And it suspends in parallel batches (DefaultMaxParallelSuspends), so a
+    // deployment with more in-flight VMs than that cap drains over ceil(N/batch)
+    // sequential waves: the ceiling must cover the slowest wave-chain, not one VM,
+    // or the host SIGKILLs us mid-snapshot on a later wave and acceptance criterion
+    // 1 (suspend completes during graceful shutdown) fails. SuspendTimeoutPolicy.
+    // HostShutdownReserve computes waves × per-VM budget for the largest VM the
+    // deployment provisions. ShutdownTimeout is a CEILING, not a fixed wait: a
     // shutdown with nothing to suspend still returns immediately once every hosted
     // service's StoppingAsync completes, so raising it only affects the suspend
     // case. Only do this for multipass — other providers don't suspend, so they
     // keep the tighter grace.
-    var isMultipass = string.Equals(
-        (cbOpts.SandboxProvider ?? "").Trim(), "multipass", StringComparison.OrdinalIgnoreCase);
-    if (isMultipass)
-    {
-        var suspendReserve = SuspendTimeoutPolicy.For(SandboxResourceLimits.Default.MemoryBytes);
-        o.ShutdownTimeout = grace > suspendReserve ? grace : suspendReserve;
-    }
-    else
-    {
-        o.ShutdownTimeout = grace;
-    }
+    //
+    // Bound on concurrently in-flight (hence suspendable) sandboxes mirrors
+    // OrchestratorOptionsFactory's resolution: WorkerPool wins, legacy Concurrency
+    // is the fallback, default 1. All VMs are provisioned at
+    // SandboxResourceLimits.Default (no per-VM RAM override is wired through
+    // SandboxSpec today), so the default profile RAM is the largest per-VM suspend
+    // budget the host needs to cover.
+    var maxConcurrent = cbOpts.WorkerPool.MaxConcurrentWorkers ?? cbOpts.Concurrency ?? 1;
+    o.ShutdownTimeout = SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout(
+        cbOpts.SandboxProvider, grace, maxConcurrent);
 });
 
 ApiKeyAuth.Configure(builder);

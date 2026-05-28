@@ -68,6 +68,29 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// </summary>
     public static readonly TimeSpan DefaultPerGiBSuspendBudget = SuspendTimeoutPolicy.DefaultPerGiB;
 
+    /// <summary>
+    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Only the
+    /// multipass provider suspends on shutdown, and a healthy RAM snapshot must
+    /// not be truncated by a SIGKILL, so for multipass the ceiling is raised to
+    /// the worst-case suspend drain (<see cref="SuspendTimeoutPolicy.HostShutdownReserve"/>:
+    /// <c>ceil(maxConcurrent / DefaultMaxParallelSuspends)</c> waves of the
+    /// largest per-VM budget) or the grace window, whichever is larger. Other
+    /// providers keep the tighter <paramref name="grace"/>. Centralised here (and
+    /// called from <c>Program.cs</c>) so the provider guard and the max() logic
+    /// are unit-testable rather than buried in host wiring.
+    /// </summary>
+    public static TimeSpan ResolveHostShutdownTimeout(
+        string? sandboxProvider, TimeSpan grace, int maxConcurrentWorkers)
+    {
+        var isMultipass = string.Equals(
+            (sandboxProvider ?? "").Trim(), "multipass", StringComparison.OrdinalIgnoreCase);
+        if (!isMultipass)
+            return grace;
+        var reserve = SuspendTimeoutPolicy.HostShutdownReserve(
+            maxConcurrentWorkers, DefaultMaxParallelSuspends, SandboxResourceLimits.Default.MemoryBytes);
+        return grace > reserve ? grace : reserve;
+    }
+
     private readonly ISandboxProvider _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxSuspendOnShutdownService> _log;

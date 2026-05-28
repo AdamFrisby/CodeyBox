@@ -316,6 +316,69 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public void HostShutdownReserve_ScalesByParallelSuspendWaveCount()
+    {
+        const long gib = 1024L * 1024 * 1024;
+        var floor = TimeSpan.FromMinutes(10);
+        var perGiB = TimeSpan.FromSeconds(150);
+        // Default 12 GiB profile → 30 min per VM.
+        var perVm = SuspendTimeoutPolicy.For(12 * gib, floor, perGiB);
+        Assert.Equal(TimeSpan.FromMinutes(30), perVm);
+
+        // ≤ batch size → a single wave, ceiling == one per-VM budget.
+        Assert.Equal(perVm, SuspendTimeoutPolicy.HostShutdownReserve(1, 8, 12 * gib, floor, perGiB));
+        Assert.Equal(perVm, SuspendTimeoutPolicy.HostShutdownReserve(8, 8, 12 * gib, floor, perGiB));
+
+        // 9 VMs across batches of 8 → 2 waves → 60 min. This is the regression the
+        // single-wave ceiling missed: the host must not SIGKILL before wave 2.
+        Assert.Equal(perVm * 2, SuspendTimeoutPolicy.HostShutdownReserve(9, 8, 12 * gib, floor, perGiB));
+        Assert.Equal(perVm * 2, SuspendTimeoutPolicy.HostShutdownReserve(16, 8, 12 * gib, floor, perGiB));
+
+        // 17 VMs → 3 waves → 90 min.
+        Assert.Equal(perVm * 3, SuspendTimeoutPolicy.HostShutdownReserve(17, 8, 12 * gib, floor, perGiB));
+
+        // Defensive clamps: zero / negative inputs never yield a zero-wave or
+        // divide-by-zero ceiling — at minimum one wave of the floor.
+        Assert.Equal(floor, SuspendTimeoutPolicy.HostShutdownReserve(0, 8, null, floor, perGiB));
+        Assert.Equal(floor, SuspendTimeoutPolicy.HostShutdownReserve(1, 0, null, floor, perGiB));
+    }
+
+    [Fact]
+    public void ResolveHostShutdownTimeout_RaisesCeilingForMultipassOnly()
+    {
+        var grace = TimeSpan.FromSeconds(60);
+
+        // Non-multipass providers don't suspend → ceiling stays at the grace window
+        // regardless of worker count.
+        Assert.Equal(grace,
+            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("process", grace, 32));
+        Assert.Equal(grace,
+            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("bubblewrap", grace, 32));
+        Assert.Equal(grace,
+            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout(null, grace, 32));
+
+        // Multipass with a single worker → one wave of the default 12 GiB profile
+        // budget (30 min), which dwarfs the 60s grace.
+        Assert.Equal(TimeSpan.FromMinutes(30),
+            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("multipass", grace, 1));
+
+        // Provider name match is trimmed and case-insensitive.
+        Assert.Equal(TimeSpan.FromMinutes(30),
+            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("  Multipass  ", grace, 1));
+
+        // Multipass with more workers than the parallel-suspend cap (8) → the
+        // ceiling scales by wave count (16 workers → 2 waves → 60 min).
+        Assert.Equal(TimeSpan.FromMinutes(60),
+            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("multipass", grace, 16));
+
+        // If the configured grace ever exceeds the suspend reserve, the larger
+        // grace wins (max(), not a blind overwrite).
+        var hugeGrace = TimeSpan.FromHours(4);
+        Assert.Equal(hugeGrace,
+            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("multipass", hugeGrace, 1));
+    }
+
+    [Fact]
     public async Task ShutdownHandler_NonSuspendingProvider_IsNoOp()
     {
         var item = MakeItem();

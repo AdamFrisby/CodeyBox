@@ -210,6 +210,34 @@ public static class SuspendTimeoutPolicy
         var scaled = effectivePerGiB * gib;
         return scaled > effectiveFloor ? scaled : effectiveFloor;
     }
+
+    /// <summary>
+    /// Host-shutdown ceiling (<c>HostOptions.ShutdownTimeout</c>) that must cover
+    /// the worst-case suspend drain, not just a single VM. The suspend-on-shutdown
+    /// handler fans suspends out through a semaphore capped at
+    /// <paramref name="maxParallelSuspends"/> and awaits all of them, so with up to
+    /// <paramref name="maxConcurrentSandboxes"/> in-flight VMs the drain runs
+    /// <c>ceil(N / batch)</c> sequential waves. Each wave is bounded by the per-VM
+    /// budget (<see cref="For"/>) for the largest VM the deployment provisions
+    /// (<paramref name="maxVmMemoryBytes"/>). Sizing the ceiling at
+    /// <c>waves × perVmBudget</c> stops the host SIGKILLing the process mid-snapshot
+    /// before later waves finish — e.g. 16 VMs at the default profile need two
+    /// 30-minute waves, ~60 minutes, not 30. This is a CEILING: a shutdown that
+    /// suspends fewer VMs (or none) returns as soon as the handler completes.
+    /// </summary>
+    public static TimeSpan HostShutdownReserve(
+        int maxConcurrentSandboxes,
+        int maxParallelSuspends,
+        long? maxVmMemoryBytes,
+        TimeSpan? floor = null,
+        TimeSpan? perGiB = null)
+    {
+        var perVm = For(maxVmMemoryBytes, floor, perGiB);
+        var sandboxes = Math.Max(1, maxConcurrentSandboxes);
+        var batch = Math.Max(1, maxParallelSuspends);
+        var waves = (sandboxes + batch - 1) / batch;
+        return perVm * waves;
+    }
 }
 
 /// <summary>
