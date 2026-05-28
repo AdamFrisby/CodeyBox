@@ -68,7 +68,7 @@ public sealed class GitHubReleasePublishTests : IDisposable
 
         var refreshed = await _releaseStore.GetAsync(rel.Id);
         Assert.Equal(ReleaseState.Released, refreshed!.State);
-        Assert.Single(_upstream.TagAndReleaseRequests);
+        await WaitForTagRequestsAsync(expectedCount: 1);
         Assert.Equal("v1.0", _upstream.TagAndReleaseRequests[0].Tag);
     }
 
@@ -107,7 +107,9 @@ public sealed class GitHubReleasePublishTests : IDisposable
         await svc.OnWorkItemTerminalAsync(rel.Id, default);
         await WaitForStateAsync(rel.Id, ReleaseState.Released, ReleaseState.Failed);
 
-        Assert.Single(_upstream.TagAndReleaseRequests);
+        var refreshed = await _releaseStore.GetAsync(rel.Id);
+        Assert.Equal(ReleaseState.Released, refreshed!.State);
+        await WaitForTagRequestsAsync(expectedCount: 1);
         Assert.Equal("custom-tag-1.0", _upstream.TagAndReleaseRequests[0].Tag);
     }
 
@@ -189,5 +191,21 @@ public sealed class GitHubReleasePublishTests : IDisposable
             var r = await _releaseStore.GetAsync(id);
             if (r is not null && terminal.Contains(r.State)) return;
         }
+    }
+
+    /// <summary>
+    /// <see cref="ReleaseService"/> persists <see cref="ReleaseState.Released"/> before
+    /// <see cref="IUpstreamRemote.CreateTagAndReleaseAsync"/> returns; poll so assertions
+    /// are not racy when the test observes Released first.
+    /// </summary>
+    private async Task WaitForTagRequestsAsync(int expectedCount)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (_upstream.TagAndReleaseRequests.Count >= expectedCount) return;
+            await Task.Delay(50);
+        }
+        Assert.Equal(expectedCount, _upstream.TagAndReleaseRequests.Count);
     }
 }

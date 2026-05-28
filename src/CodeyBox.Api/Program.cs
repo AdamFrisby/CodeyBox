@@ -1257,7 +1257,7 @@ builder.Services.AddSingleton<AgentCostCalculator>(sp =>
     var merged = AgentPricingOptions.Merge(bundled, opts.AgentPricing);
     startupLog.LogInformation(
         "AgentPricing loaded: bundled={Bundled}, operator-overrides={Operator}, total={Total} (bundled lastUpdated={LastUpdated})",
-        merged.BundledRateCount, merged.OverlapCount, merged.TotalRateCount,
+        merged.BundledRateCount, merged.OperatorRateCount, merged.TotalRateCount,
         string.IsNullOrEmpty(bundled.Meta.LastUpdated) ? "(unknown)" : bundled.Meta.LastUpdated);
     var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
     AgentCostCalculator.ValidateAtStartup(merged.Options,
