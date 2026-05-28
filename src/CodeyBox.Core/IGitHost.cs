@@ -37,6 +37,41 @@ public interface IGitHost
     string GetRepoPath(string repositoryId)
         => throw new NotSupportedException("This git host does not expose a host repository path.");
 
+    /// <summary>
+    /// Returns the host directory where the merge / conflict-rework phase
+    /// should stage an isolated bare clone. Implementations must return a
+    /// directory the configured <see cref="ISandboxProvider"/> can use as a
+    /// bind-mount source — for snap-confined Multipass that means inside
+    /// <c>~/snap/multipass/common/</c>, which the operator-configured
+    /// <c>GitRootDirectory</c> already satisfies for <see cref="GetRepoPath"/>.
+    ///
+    /// <para>Default returns the bare-repo path's parent directory so the
+    /// staged clone is a sibling of the durable bare repo and inherits its
+    /// sandbox-provider-readable property. Hosts whose <c>GetRepoPath</c> does
+    /// not sit in a sandbox-readable directory must override this.</para>
+    /// </summary>
+    string GetMergeStagingRoot(string repositoryId)
+    {
+        var repoPath = GetRepoPath(repositoryId);
+        return Path.GetDirectoryName(repoPath)
+            ?? throw new InvalidOperationException(
+                $"unable to derive merge staging root from bare repo path '{repoPath}'");
+    }
+
+    /// <summary>
+    /// Describes how a sandbox should be wired up to reach an alternative
+    /// host-side bare repo path (e.g. the merge / conflict-rework phase's
+    /// isolated bare clone). The sandbox-side semantics match
+    /// <see cref="GetSandboxAccess"/> so the agent observes the same clone
+    /// URL/mount path it would under the normal flow.
+    ///
+    /// <para>Default throws — only hosts that bind-mount real bare repos
+    /// need to implement this.</para>
+    /// </summary>
+    SandboxRepositoryAccess GetIsolatedRepoSandboxAccess(string isolatedRepoHostPath)
+        => throw new NotSupportedException(
+            "This git host does not support sandbox access for an isolated bare repo path.");
+
     /// <summary>Returns the resolved default branch name for the repo.</summary>
     Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default);
 

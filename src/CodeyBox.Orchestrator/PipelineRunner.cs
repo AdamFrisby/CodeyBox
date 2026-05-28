@@ -3661,12 +3661,11 @@ public sealed class PipelineRunner : IPipelineRunner
         var isolatedMergeRepoPath = hostMerge.HasConflicts
             ? await CreateIsolatedMergeRepositoryAsync(repoId, item.Id, ct)
             : null;
+        try
+        {
         var access = isolatedMergeRepoPath is null
             ? _gitHost.GetSandboxAccess(repoId)
-            : new SandboxRepositoryAccess(
-                LocalGitHost.SandboxRepoMountPath,
-                [new SandboxMount { SandboxPath = LocalGitHost.SandboxRepoMountPath, HostPath = isolatedMergeRepoPath, ReadOnly = false }],
-                SandboxNetworkPolicy.Denied);
+            : _gitHost.GetIsolatedRepoSandboxAccess(isolatedMergeRepoPath);
         var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: !hostMerge.HasConflicts,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
             baselineImageRef: item.BaselineImageRef);
@@ -3945,8 +3944,18 @@ public sealed class PipelineRunner : IPipelineRunner
         if (mergeSuggestionsJson is not null)
             await PickUpSuggestionsAsync(item, project, mergeSuggestionsJson, ct);
 
-        DeleteDirectoryBestEffort(isolatedMergeRepoPath);
         return (mergeSha, agentResult.Stdout);
+        }
+        finally
+        {
+            // Clean up the isolated bare clone on every exit path (success or
+            // exception). Before this guard, a failed sandbox create, failed
+            // mount, or mid-phase throw left codeybox-merge-*.git directories
+            // accumulating as siblings of the durable bare repo under
+            // GitRootDirectory — both an operator-hygiene issue and a
+            // potential disk-pressure source over time.
+            DeleteDirectoryBestEffort(isolatedMergeRepoPath);
+        }
     }
 
     /// <summary>
@@ -4228,22 +4237,21 @@ public sealed class PipelineRunner : IPipelineRunner
     /// Bare-clones the work item's repo so the merge / conflict-rework phase
     /// can mutate refs without touching the durable host bare repo.
     ///
-    /// <para>Why this is not under <c>Path.GetTempPath()</c>: snap-confined
-    /// Multipass cannot read paths outside <c>~/snap/multipass/common/</c>
-    /// (the AppArmor profile only allows that subtree). A host bind-mount
-    /// source under <c>/tmp</c> surfaces as <c>"Source path ... does not exist"</c>
-    /// from <c>multipass mount</c> even though the directory was just created
-    /// by <c>git clone --bare</c>. The durable bare repo already lives in
-    /// the multipass-allowed location per docs/sandbox-providers.md, so
-    /// staging the isolated clone as a sibling under the same root inherits
-    /// that property and works for every sandbox provider.</para>
+    /// <para>The staging directory comes from <see cref="IGitHost.GetMergeStagingRoot"/>
+    /// rather than <see cref="Path.GetTempPath"/> because, on snap-confined
+    /// Multipass, the daemon's AppArmor profile only allows reads inside
+    /// <c>~/snap/multipass/common/</c>. A host bind-mount source under
+    /// <c>/tmp</c> surfaces as <c>"Source path ... does not exist"</c> from
+    /// <c>multipass mount</c> even though the directory was just created by
+    /// <c>git clone --bare</c>. Other sandbox providers (process, bubblewrap)
+    /// do not share that constraint, but routing through the git host keeps
+    /// the staging-location decision on the side that knows where its
+    /// durable bare repos already live.</para>
     /// </summary>
     internal async Task<string> CreateIsolatedMergeRepositoryAsync(string repoId, WorkItemId itemId, CancellationToken ct)
     {
         var source = _gitHost.GetRepoPath(repoId);
-        var stagingRoot = Path.GetDirectoryName(source)
-            ?? throw new InvalidOperationException(
-                $"unable to derive merge staging root from bare repo path '{source}'");
+        var stagingRoot = _gitHost.GetMergeStagingRoot(repoId);
         var target = Path.Combine(stagingRoot, $"codeybox-merge-{itemId}-{Guid.NewGuid():N}.git");
         await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, target);
         return target;
@@ -5581,10 +5589,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var credential = _credentials is IProjectAwareCredentialProvider pac
                 ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
                 : await _credentials.GetAsync(runner.Kind, ct);
-            var access = new SandboxRepositoryAccess(
-                LocalGitHost.SandboxRepoMountPath,
-                [new SandboxMount { SandboxPath = LocalGitHost.SandboxRepoMountPath, HostPath = isolatedRepoPath, ReadOnly = false }],
-                SandboxNetworkPolicy.Denied);
+            var access = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
                 hostNetworkProfile: project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
                 timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,

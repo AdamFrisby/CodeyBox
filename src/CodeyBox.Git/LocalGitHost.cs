@@ -110,6 +110,23 @@ public sealed class LocalGitHost : IGitHost
     /// <summary>Sandbox-side path the bare repo is mounted at. Per-item scoped.</summary>
     public const string SandboxRepoMountPath = "/repo";
 
+    /// <summary>
+    /// Wires a sandbox to an isolated (merge / conflict-rework) bare clone
+    /// using the same per-item /repo mount layout as <see cref="GetSandboxAccess"/>,
+    /// so the agent sees an identical clone URL irrespective of which on-host
+    /// path is bind-mounted.
+    /// </summary>
+    public SandboxRepositoryAccess GetIsolatedRepoSandboxAccess(string isolatedRepoHostPath)
+    {
+        var mount = new SandboxMount
+        {
+            SandboxPath = SandboxRepoMountPath,
+            HostPath = isolatedRepoHostPath,
+            ReadOnly = false,
+        };
+        return new SandboxRepositoryAccess(SandboxRepoMountPath, [mount], SandboxNetworkPolicy.Denied);
+    }
+
     public async Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);
