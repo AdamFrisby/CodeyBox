@@ -665,8 +665,18 @@ public sealed class AgentClassRouter
     /// not cover the work item's <see cref="WorkItem.RequiredCapabilities"/>),
     /// or every eligible member is currently marked exhausted in this process.
     /// </para>
+    /// <para>
+    /// Like <see cref="ResolveAsync"/>, this gates each apparently-available
+    /// candidate on a real in-sandbox CLI check (<see cref="IInVmSmokeGate"/>)
+    /// before returning it, so a mid-iteration / audit / rebase fallback never
+    /// hands work to an agent whose CLI was never in-VM smoke-checked (the
+    /// exit-127 / auth cascade). A cache hit is free; an agent the probe
+    /// benches is dropped from the returned list exactly as the primary path
+    /// would skip it.
+    /// </para>
     /// </summary>
-    public IReadOnlyList<AgentMembership> OrderedFallbackCandidates(WorkItem item, Project? project)
+    public async Task<IReadOnlyList<AgentMembership>> OrderedFallbackCandidatesAsync(
+        WorkItem item, Project? project, CancellationToken ct)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -684,12 +694,15 @@ public sealed class AgentClassRouter
                 _exhausted.TryRemove(new KeyValuePair<(AgentKind Agent, string ModelId), DateTimeOffset>(key, expiry));
         }
 
-        return agentClass.Members
+        // Score + order the eligible, non-exhausted members first. Availability
+        // (and the in-VM gate) is applied last, in score order, so we only probe
+        // members we would actually return — and never burn a probe on a member
+        // already filtered out by score or in-process exhaustion.
+        var ordered = agentClass.Members
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
             .Where(x => MemberCoversRequiredCapabilities(x.Member, item.RequiredCapabilities))
             .Where(x => !IsExhausted(x.Member, nowUtc))
-            .Where(x => _availability is null || _availability.GetAvailability(x.Member.Agent).Available)
             .Select(x => new
             {
                 x.Member,
@@ -701,12 +714,34 @@ public sealed class AgentClassRouter
             .ThenBy(x => x.ConfigIndex)
             .Select(x => x.Member)
             .ToList();
+
+        if (_availability is not { } reg)
+            return ordered;
+
+        var result = new List<AgentMembership>(ordered.Count);
+        foreach (var member in ordered)
+        {
+            var av = reg.GetAvailability(member.Agent);
+            // An agent that looks Available may simply not have been in-VM probed
+            // yet (cold start / fresh baseline). Gate the FIRST such selection on
+            // a real in-sandbox CLI check (cache hit = free) so the exit-127 /
+            // auth cascade is caught here, exactly as ResolveAsync does on the
+            // primary path. Already-excluded agents are skipped without re-probing.
+            if (av.Available && _inVmSmokeGate is not null)
+            {
+                await _inVmSmokeGate.EnsureProbedAsync(member.Agent, ct);
+                av = reg.GetAvailability(member.Agent);
+            }
+            if (av.Available)
+                result.Add(member);
+        }
+        return result;
     }
 
     /// <summary>
     /// Marks a class member as exhausted in this process for <paramref name="ttl"/>
     /// (or until <paramref name="resetAt"/>, whichever is sooner). Subsequent
-    /// calls to <see cref="OrderedFallbackCandidates"/> and
+    /// calls to <see cref="OrderedFallbackCandidatesAsync"/> and
     /// <see cref="ResolveAsync"/> will skip the member while the suppression is
     /// active. Always combine with <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
     /// so the suppression also reaches any probe-side cache.

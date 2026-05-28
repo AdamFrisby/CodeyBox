@@ -50,56 +50,56 @@ public sealed class AgentClassRouterFallbackTests
     };
 
     [Fact]
-    public void OrderedFallbackCandidates_ReturnsByEffectiveScore_HighestFirst()
+    public async Task OrderedFallbackCandidates_ReturnsByEffectiveScore_HighestFirst()
     {
         var cls = Frontier(Sub(Codex, score: 100), Sub(Claude, score: 100), Sub(Gemini, score: 95));
         var router = Build(cls);
 
-        var candidates = router.OrderedFallbackCandidates(Item(), project: null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
         // Tied scores fall back to config order; Gemini (95) ranks below the 100s.
         Assert.Equal([Codex, Claude, Gemini], candidates.Select(c => c.Agent).ToArray());
     }
 
     [Fact]
-    public void OrderedFallbackCandidates_FiltersByMinModelScore()
+    public async Task OrderedFallbackCandidates_FiltersByMinModelScore()
     {
         var cls = Frontier(Sub(Codex, score: 100), Sub(Gemini, score: 70));
         var router = Build(cls);
 
-        var candidates = router.OrderedFallbackCandidates(Item(minScore: 95), project: null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(minScore: 95), project: null, CancellationToken.None);
 
         Assert.Single(candidates);
         Assert.Equal(Codex, candidates[0].Agent);
     }
 
     [Fact]
-    public void MarkExhausted_DropsMember_FromSubsequentOrdering()
+    public async Task MarkExhausted_DropsMember_FromSubsequentOrdering()
     {
         var cls = Frontier(Sub(Codex), Sub(Claude), Sub(Gemini, score: 95));
         var router = Build(cls);
 
         router.MarkExhausted(Sub(Codex), TimeSpan.FromMinutes(30));
-        var candidates = router.OrderedFallbackCandidates(Item(), project: null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
         Assert.Equal([Claude, Gemini], candidates.Select(c => c.Agent).ToArray());
     }
 
     [Fact]
-    public void MarkExhausted_RespectsResetAt_WhenSoonerThanTtl()
+    public async Task MarkExhausted_RespectsResetAt_WhenSoonerThanTtl()
     {
         var cls = Frontier(Sub(Codex), Sub(Claude));
         var router = Build(cls);
 
         // Reset is in the past — exhaustion should expire immediately.
         router.MarkExhausted(Sub(Codex), TimeSpan.FromHours(1), resetAt: DateTimeOffset.UtcNow.AddSeconds(-1));
-        var candidates = router.OrderedFallbackCandidates(Item(), project: null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
         Assert.Equal([Codex, Claude], candidates.Select(c => c.Agent).ToArray());
     }
 
     [Fact]
-    public void MarkExhausted_PerModel_OnlyDropsMatchingModel()
+    public async Task MarkExhausted_PerModel_OnlyDropsMatchingModel()
     {
         var cls = Frontier(
             Sub(Claude, modelId: "claude-opus-4-7"),
@@ -107,19 +107,19 @@ public sealed class AgentClassRouterFallbackTests
         var router = Build(cls);
 
         router.MarkExhausted(Sub(Claude, modelId: "claude-opus-4-7"), TimeSpan.FromMinutes(30));
-        var candidates = router.OrderedFallbackCandidates(Item(), project: null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
         Assert.Single(candidates);
         Assert.Equal("claude-sonnet-4-6", candidates[0].ModelId);
     }
 
     [Fact]
-    public void OrderedFallbackCandidates_ReturnsEmpty_WhenNoClassConfigured()
+    public async Task OrderedFallbackCandidates_ReturnsEmpty_WhenNoClassConfigured()
     {
         var cls = Frontier(Sub(Claude));
         var router = Build(cls);
 
-        var candidates = router.OrderedFallbackCandidates(Item(classId: null!), project: null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(classId: null!), project: null, CancellationToken.None);
         Assert.Empty(candidates);
     }
 

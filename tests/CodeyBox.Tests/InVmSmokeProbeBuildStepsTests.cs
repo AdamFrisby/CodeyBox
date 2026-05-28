@@ -27,20 +27,24 @@ public sealed class InVmSmokeProbeBuildStepsTests
     [InlineData("claude")]
     [InlineData("codex")]
     [InlineData("gemini")]
-    public void VersionOnlyProbes_EmitSingleVersionStep_RegardlessOfCredential(string binary)
+    public void VersionOnlyProbes_EmitSingleVersionStep_PinnedToRunnerBinary(string agent)
     {
-        IInVmSmokeProbe probe = binary switch
+        // Cross-check the probe's binary against the RUNNER's binary constant
+        // (not a literal): if the probe and a literal-based test both encoded the
+        // same wrong name, dispatch would still hit exit 127 — the exact failure
+        // this feature targets. Pinning to the runner constant catches that drift.
+        (IInVmSmokeProbe Probe, string RunnerBinary) cases = agent switch
         {
-            "claude" => new ClaudeInVmSmokeProbe(),
-            "codex" => new CodexInVmSmokeProbe(),
-            _ => new GeminiInVmSmokeProbe(),
+            "claude" => (new ClaudeInVmSmokeProbe(), ClaudeAgentRunner.DefaultBinary),
+            "codex" => (new CodexInVmSmokeProbe(), CodexAgentRunner.DefaultBinary),
+            _ => (new GeminiInVmSmokeProbe(), GeminiAgentRunner.DefaultBinary),
         };
 
-        foreach (var credential in new AgentCredential?[] { null, Cred(probe.Kind) })
+        foreach (var credential in new AgentCredential?[] { null, Cred(cases.Probe.Kind) })
         {
-            var steps = probe.BuildSteps(credential);
+            var steps = cases.Probe.BuildSteps(credential);
             var step = Assert.Single(steps);
-            Assert.Equal([binary, "--version"], step.Argv);
+            Assert.Equal([cases.RunnerBinary, "--version"], step.Argv);
         }
     }
 

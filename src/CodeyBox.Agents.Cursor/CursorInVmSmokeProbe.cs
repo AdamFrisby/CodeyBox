@@ -23,8 +23,10 @@ namespace CodeyBox.Agents.Cursor;
 /// produces a false auth-failure exclusion (the host-side gate covers that).</para>
 ///
 /// <para>The "Workspace Trust Required" stage of the cascade is handled by the
-/// runner always passing <c>--trust</c> (pinned by a regression test); the
-/// version / status commands used here do not engage workspace trust.</para>
+/// runner always passing <c>--trust</c> (pinned by
+/// <c>CursorAgentRunnerTrustRegressionTests</c>); the version / status commands
+/// used here do not engage workspace trust, so that argv-level pin — not this
+/// probe — is what guarantees stage 3 cannot silently regress.</para>
 /// </summary>
 public sealed class CursorInVmSmokeProbe : IInVmSmokeProbe
 {

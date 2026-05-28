@@ -1020,8 +1020,11 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
-// Startup guard (AC#1): warn when a configured AgentClass member has no in-VM
-// probe, so a CLI-backed agent that would fail at first dispatch is flagged now.
+// Startup guard (AC#1): bench any configured AgentClass member with no in-VM
+// probe (so a CLI-backed agent that would fail at first dispatch is routed past
+// at smoke time, not first dispatch). Agents with no sandbox CLI — copilot by
+// default, see InVmSmokeOptions.ExemptAgentsWithoutProbe — are warned but not
+// benched.
 builder.Services.AddHostedService<InVmSmokeProbeCoverageValidator>();
 
 // --- Model-list probes (used by AgentClassConfigValidator at startup) --------
@@ -1134,6 +1137,10 @@ builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
         StepTimeoutSeconds = v.StepTimeoutSeconds,
         CacheTtlMinutes = v.CacheTtlMinutes,
         SweepIntervalSeconds = v.SweepIntervalSeconds,
+        // Null (unset) keeps the InVmSmokeOptions default (copilot); an explicit
+        // list — including empty — overrides it so operators can opt every agent
+        // into the in-VM coverage requirement.
+        ExemptAgentsWithoutProbe = v.ExemptAgentsWithoutProbe is { } ex ? ex : new InVmSmokeOptions().ExemptAgentsWithoutProbe,
     };
 });
 builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
@@ -2859,6 +2866,13 @@ namespace CodeyBox.Api
         /// resolves against the provider's default.
         /// </summary>
         public string? NetworkProfile { get; set; }
+
+        /// <summary>
+        /// Agents allowed to route without a registered in-VM smoke probe.
+        /// Uncovered agents are otherwise benched at startup (AC#1). Defaults to
+        /// <c>copilot</c> when unset (no sandbox CLI). Set explicitly to override.
+        /// </summary>
+        public List<string>? ExemptAgentsWithoutProbe { get; set; }
     }
 
     /// <summary>Config binding for the availability registry.</summary>

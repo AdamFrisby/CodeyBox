@@ -95,8 +95,13 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             }
             catch (Exception ex)
             {
-                // Defensive: a probe must never take down the sweep for the rest.
-                _log.LogDebug(ex, "In-VM smoke: probe for {Agent} threw; treating as transient", probe.Kind.Value);
+                // Defensive belt-and-suspenders: ProbeAgentAsync already handles
+                // the expected transient faults (provisioning / exec / timeout /
+                // credential) internally, so reaching here means something
+                // genuinely unexpected threw. Log at Warning — not Debug — so an
+                // implementation bug or misconfiguration is visible rather than
+                // silently swallowed, but still continue the sweep for the rest.
+                _log.LogWarning(ex, "In-VM smoke: probe for {Agent} threw unexpectedly; skipping this agent", probe.Kind.Value);
             }
         }
     }
@@ -126,7 +131,13 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "In-VM smoke gate: probe for {Agent} threw; treating as transient", kind.Value);
+            // The gate runs on the router hot path and must never throw. The
+            // expected transient faults are already handled inside ProbeAgentAsync
+            // (fail-open: availability is left unchanged), so reaching here is an
+            // unexpected fault worth surfacing at Warning rather than hiding at
+            // Debug — but we still swallow it so a probe fault cannot take down
+            // dispatch.
+            _log.LogWarning(ex, "In-VM smoke gate: probe for {Agent} threw unexpectedly; leaving availability unchanged", kind.Value);
         }
     }
 
@@ -160,7 +171,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "In-VM smoke: could not resolve credential for {Agent}", probe.Kind.Value);
+            // Credential store fault is an infra problem, not an agent fault.
+            // Fail open (return null → availability unchanged): benching the agent
+            // here would route work away from a CLI that may be perfectly healthy.
+            _log.LogWarning(ex, "In-VM smoke: could not resolve credential for {Agent}; treating as transient", probe.Kind.Value);
             return null;
         }
 

@@ -36,6 +36,18 @@ public sealed record InVmSmokeOptions
     public int StepTimeoutSeconds { get; init; } = 30;
 
     /// <summary>
+    /// Agents allowed to route without a registered <c>IInVmSmokeProbe</c>.
+    /// When the prober is active, an agent named in an <c>AgentClass</c> with no
+    /// in-VM probe is benched at startup (AC#1: caught at smoke time, not first
+    /// dispatch) unless its <see cref="AgentKind.Value"/> is listed here —
+    /// the escape hatch for agents with no first-party sandbox CLI driven by
+    /// this pipeline. Defaults to <c>copilot</c> (no CLI / no <c>--model</c>
+    /// flag, so it never runs the in-VM dispatch path). Matched
+    /// case-insensitively.
+    /// </summary>
+    public IReadOnlyList<string> ExemptAgentsWithoutProbe { get; init; } = [AgentKind.Copilot.Value];
+
+    /// <summary>
     /// How long an in-VM result is cached for a given baseline ref before a
     /// re-probe. Default 60 minutes — a rebake invalidates immediately via the
     /// changed ref, so this only bounds intra-baseline staleness.

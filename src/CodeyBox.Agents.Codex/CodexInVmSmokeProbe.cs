@@ -13,6 +13,6 @@ public sealed class CodexInVmSmokeProbe : IInVmSmokeProbe
 
     public IReadOnlyList<InVmSmokeStep> BuildSteps(AgentCredential? credential) =>
     [
-        new(["codex", "--version"], FailureHint: "codex binary not runnable on sandbox PATH"),
+        new([CodexAgentRunner.DefaultBinary, "--version"], FailureHint: "codex binary not runnable on sandbox PATH"),
     ];
 }

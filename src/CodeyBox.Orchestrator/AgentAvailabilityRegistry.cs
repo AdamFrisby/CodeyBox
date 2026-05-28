@@ -168,6 +168,29 @@ public sealed class AgentAvailabilityRegistry
     }
 
     /// <summary>
+    /// Benches <paramref name="kind"/> because it is named in an
+    /// <c>AgentClass</c> but has no registered in-VM smoke probe, so its
+    /// in-sandbox CLI can never be verified. Called once at startup by the
+    /// coverage validator. The exclusion is tracked under its own
+    /// <see cref="SmokeExclusionSource.MissingProbe"/> source so neither a
+    /// host- nor an in-VM-smoke pass can clear it (there is no probe to ever
+    /// pass) — only an operator <see cref="Reset"/> after a probe is registered
+    /// lifts it. Returns the transition so the caller can fire a webhook.
+    /// </summary>
+    public AvailabilityTransition ExcludeForMissingProbe(AgentKind kind, string reason)
+    {
+        var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
+        lock (entry.Sync)
+        {
+            var wasExcluded = entry.IsExcluded;
+            entry.Exclusions[SmokeExclusionSource.MissingProbe] = reason;
+            if (!wasExcluded)
+                _log.LogWarning("Agent {Agent} benched: {Reason}", kind.Value, reason);
+            return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
+        }
+    }
+
+    /// <summary>
     /// Clears the exclusion state, fast-fail counter, and prior probe
     /// timestamps for <paramref name="kind"/>. Called by the
     /// <c>/admin/agent/{name}/reset</c> endpoint after the operator has
@@ -257,6 +280,13 @@ public enum SmokeExclusionSource
 
     /// <summary>Fast-fail circuit breaker over real run outcomes.</summary>
     FastFail,
+
+    /// <summary>
+    /// Agent named in an <c>AgentClass</c> but with no registered in-VM smoke
+    /// probe, so its sandbox CLI cannot be verified. Set once at startup by the
+    /// coverage validator; cleared only by operator <see cref="AgentAvailabilityRegistry.Reset"/>.
+    /// </summary>
+    MissingProbe,
 }
 
 /// <summary>Result of <see cref="AgentAvailabilityRegistry.GetAvailability"/>.</summary>

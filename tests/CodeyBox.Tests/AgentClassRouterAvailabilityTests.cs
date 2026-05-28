@@ -9,7 +9,7 @@ namespace CodeyBox.Tests;
 /// no exit-127 cascade): the router must skip agents marked unavailable
 /// by <see cref="AgentAvailabilityRegistry"/>, both at fresh pickup
 /// (<see cref="AgentClassRouter.ResolveAsync"/>) and during mid-iteration
-/// fallback (<see cref="AgentClassRouter.OrderedFallbackCandidates"/>).
+/// fallback (<see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/>).
 /// </summary>
 public sealed class AgentClassRouterAvailabilityTests
 {
@@ -89,9 +89,53 @@ public sealed class AgentClassRouterAvailabilityTests
 
         var router = BuildRouter(cls, [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)], reg);
 
-        var candidates = router.OrderedFallbackCandidates(MakeItem(), null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(MakeItem(), null, CancellationToken.None);
         Assert.Single(candidates);
         Assert.Equal(Claude, candidates[0].Agent);
+    }
+
+    [Fact]
+    public async Task FallbackCandidates_ApplyInVmGate_AndDropAgentBenchedByFirstProbe()
+    {
+        // The fallback path (mid-iteration quota / audit / rebase reroute) must
+        // apply the same in-VM smoke gate as ResolveAsync: a member that looks
+        // Available only because it was never probed must be gated on first
+        // selection, and dropped if that probe benches it (exit 127 / auth drift).
+        var cls = FrontierClass(Sub(Cursor, score: 150), Sub(Claude, score: 100));
+        var reg = NewRegistry();
+        var gate = new FakeInVmSmokeGate(kind =>
+        {
+            if (kind == Cursor)
+                reg.MarkSmokeResult(Cursor,
+                    new AgentSmokeResult(false, "exit 127", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+        });
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            availability: reg,
+            inVmSmokeGate: gate);
+
+        var candidates = await router.OrderedFallbackCandidatesAsync(MakeItem(), null, CancellationToken.None);
+
+        Assert.Contains(Cursor, gate.Probed); // the gate was actually invoked
+        Assert.Single(candidates);
+        Assert.Equal(Claude, candidates[0].Agent);
+    }
+
+    private sealed class FakeInVmSmokeGate : IInVmSmokeGate
+    {
+        private readonly Action<AgentKind> _onProbe;
+        public List<AgentKind> Probed { get; } = [];
+        public FakeInVmSmokeGate(Action<AgentKind> onProbe) => _onProbe = onProbe;
+
+        public Task EnsureProbedAsync(AgentKind kind, CancellationToken ct)
+        {
+            Probed.Add(kind);
+            _onProbe(kind);
+            return Task.CompletedTask;
+        }
     }
 
     // ── Acceptance criterion 4: smoke-pass but fast-fail-127 also excludes ──

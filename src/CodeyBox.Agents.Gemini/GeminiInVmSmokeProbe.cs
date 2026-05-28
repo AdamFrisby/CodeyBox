@@ -13,6 +13,6 @@ public sealed class GeminiInVmSmokeProbe : IInVmSmokeProbe
 
     public IReadOnlyList<InVmSmokeStep> BuildSteps(AgentCredential? credential) =>
     [
-        new(["gemini", "--version"], FailureHint: "gemini binary not runnable on sandbox PATH"),
+        new([GeminiAgentRunner.DefaultBinary, "--version"], FailureHint: "gemini binary not runnable on sandbox PATH"),
     ];
 }

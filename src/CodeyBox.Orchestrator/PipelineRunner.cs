@@ -1513,7 +1513,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
         if (_classRouter is not null && classId is not null)
         {
-            foreach (var member in _classRouter.OrderedFallbackCandidates(item, project))
+            foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
             {
                 if (!seenKinds.Add(member.Agent))
                     continue;
@@ -3410,7 +3410,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // LlmAuditorSkippedQuota event reports. Candidates skipped for other
         // reasons (missing runner / credentials) are intentionally excluded.
         var quotaRejectedCount = 1;   // the preferred agent we just rejected
-        foreach (var member in _classRouter.OrderedFallbackCandidates(item, project))
+        foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
         {
             if (member.Agent == preferredKind.Value)
                 continue;   // already counted above
@@ -3761,7 +3761,7 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             // Find the next candidate that we haven't already tried this run.
-            var candidates = _classRouter.OrderedFallbackCandidates(item, project);
+            var candidates = await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct);
             AgentMembership? nextMember = null;
             foreach (var candidate in candidates)
             {

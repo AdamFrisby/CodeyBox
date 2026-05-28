@@ -13,6 +13,6 @@ public sealed class ClaudeInVmSmokeProbe : IInVmSmokeProbe
 
     public IReadOnlyList<InVmSmokeStep> BuildSteps(AgentCredential? credential) =>
     [
-        new(["claude", "--version"], FailureHint: "claude binary not runnable on sandbox PATH"),
+        new([ClaudeAgentRunner.DefaultBinary, "--version"], FailureHint: "claude binary not runnable on sandbox PATH"),
     ];
 }

@@ -16,7 +16,7 @@ first dispatched work item. Each stage is now caught at smoke time:
 |---|---|---|
 | 1. Binary not on PATH | `agent: command not found` (exit 127) | `agent --version` exits non-zero → agent excluded |
 | 2. Auth materialised to wrong path | exit 1, "Authentication required" | runner's `AuthMaterialiseScript` + `agent status` exits non-zero → agent excluded |
-| 3. Workspace trust required | exit 1, "Workspace Trust Required" | runner always passes `--trust` (pinned by a runner regression test); `--version`/`status` do not engage workspace trust |
+| 3. Workspace trust required | exit 1, "Workspace Trust Required" | not a smoke-time check — caught at dispatch because the runner always passes `--trust` (pinned by `CursorAgentRunnerTrustRegressionTests`); `--version`/`status` do not engage workspace trust |
 
 The probe steps reuse the runner's **exact** binary name
 (`CursorAgentRunner.DefaultBinary`) and auth-materialisation script
@@ -37,8 +37,13 @@ The router also calls `IInVmSmokeGate.EnsureProbedAsync` for any
 still-`Available` member **before trusting it**, so the *first* dispatch after
 startup or a baseline rebake is gated by a real in-sandbox check rather than
 racing the background sweep. A new `AgentClass` member whose agent has no
-registered `IInVmSmokeProbe` is flagged by `InVmSmokeProbeCoverageValidator`
-with a startup warning.
+registered `IInVmSmokeProbe` is **benched at startup** by
+`InVmSmokeProbeCoverageValidator` (under `SmokeExclusionSource.MissingProbe`),
+so its unverified CLI is routed past at smoke time rather than discovered at
+first dispatch (AC#1). Agents with no sandbox CLI — `copilot` by default — are
+exempt via `CodeyBox:Smoke:InVm:ExemptAgentsWithoutProbe` (warned, not benched).
+When the prober is disabled or no probes are registered, enforcement is inactive
+and the validator only warns.
 
 ## Caching, self-healing and operator reset
 

@@ -334,13 +334,35 @@ public sealed class InVmSmokeProberTests
         Assert.False(r2.GetAvailability(AgentKind.Cursor).Available);
         Assert.Contains("agent status failed", r2.GetAvailability(AgentKind.Cursor).Reason);
 
-        // Stage 3 (workspace trust) is handled by the runner always passing
-        // --trust; the version/status probe steps do not engage workspace trust,
-        // so with both prior stages fixed the agent smokes clean and is routable.
+        // Stage 3 (workspace trust) is NOT a smoke-time check — the version/status
+        // probe steps do not engage workspace trust — so with both prior stages
+        // fixed the agent smokes clean and is routable.
         var s3 = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
         var r3 = NewRegistry();
         await Build(s3, r3, NewCache(), new FakeBaselineResolver("base-A")).ProbeAllAsync(CancellationToken.None);
         Assert.True(r3.GetAvailability(AgentKind.Cursor).Available);
+
+        // Stage 3 is instead guaranteed at dispatch: the runner must always pass
+        // --trust. Assert that here too (and see CursorAgentRunnerTrustRegressionTests
+        // for the exhaustive sweep) so this cascade test fails if the --trust pin
+        // is removed and the agent would otherwise smoke clean yet fail first run.
+        var trustSandbox = new TrustRecordingSandbox();
+        await new CursorAgentRunner().RunAsync(trustSandbox, "/work", "p", credential: null);
+        var agentExec = Assert.Single(trustSandbox.Execs,
+            e => e.Argv.Count > 0 && e.Argv[0] == CursorAgentRunner.DefaultBinary);
+        Assert.Contains("--trust", agentExec.Argv);
+    }
+
+    private sealed class TrustRecordingSandbox : ISandbox
+    {
+        public string Id => "trust-recording";
+        public List<SandboxExec> Execs { get; } = [];
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            Execs.Add(exec);
+            return Task.FromResult(new SandboxExecResult(0, "ok", ""));
+        }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     [Fact]
@@ -381,6 +403,70 @@ public sealed class InVmSmokeProberTests
 
         registry.MarkSmokeResult(AgentKind.Cursor,
             new AgentSmokeResult(true, null, TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task StepTimeout_IsTransient_DoesNotExcludeOrCache()
+    {
+        // A step that exceeds StepTimeoutSeconds is infra flakiness, not an agent
+        // fault: the agent must stay Available and the (non-)result must not cache,
+        // so the next sweep re-probes. StepTimeoutSeconds=0 cancels the step token
+        // immediately while the fake exec only completes if the token fires.
+        var provider = new HangingSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = new InVmSmokeProber(
+            provider,
+            new FakeBaselineResolver("base-A"),
+            new ConstantCredentialProvider(CursorCred),
+            [new CursorInVmSmokeProbe()],
+            registry,
+            cache,
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions
+            {
+                Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0, StepTimeoutSeconds = 0,
+            },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task CredentialResolutionFailure_IsTransient_DoesNotExcludeOrProvision()
+    {
+        // ICredentialProvider.GetAsync throwing is a credential-store fault, not an
+        // agent fault: leave availability unchanged and never even provision a VM.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            credentials: new ThrowingCredentialProvider());
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_NeverThrows_AndDoesNotBench_OnProbeFault()
+    {
+        // The dispatch gate runs on the router hot path: a provisioning/exec fault
+        // must be swallowed (not thrown) and must not bench a possibly-working agent.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""))
+        {
+            ThrowOnCreate = new InvalidOperationException("provider blew up"),
+        };
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        // Must complete without throwing.
+        await prober.EnsureProbedAsync(AgentKind.Cursor, CancellationToken.None);
+
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
@@ -437,6 +523,49 @@ public sealed class InVmSmokeProberTests
     {
         public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default) =>
             Task.FromResult<AgentCredential?>(null);
+    }
+
+    /// <summary>Credential provider that simulates a credential-store fault.</summary>
+    private sealed class ThrowingCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default) =>
+            throw new InvalidOperationException("credential store unavailable");
+    }
+
+    /// <summary>
+    /// Provider whose sandbox exec only completes when its cancellation token
+    /// fires — so a zero step-timeout reliably trips the prober's timeout path
+    /// without real waiting. CreateAsync itself succeeds (provisioning is fine;
+    /// the step is what hangs).
+    /// </summary>
+    private sealed class HangingSandboxProvider : ISandboxProvider
+    {
+        public int CreateCount { get; private set; }
+        public string Name => "hanging";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            CreateCount++;
+            return Task.FromResult<ISandbox>(new HangingSandbox());
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
+        private sealed class HangingSandbox : ISandbox
+        {
+            public string Id => "hanging-sandbox";
+
+            public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            {
+                await Task.Delay(Timeout.Infinite, ct); // completes only on cancellation
+                return new SandboxExecResult(0, "", "");
+            }
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 
     private sealed class MutableClock : TimeProvider
