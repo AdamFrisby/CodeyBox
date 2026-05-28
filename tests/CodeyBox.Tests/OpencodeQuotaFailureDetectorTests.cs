@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 
@@ -5,6 +6,15 @@ namespace CodeyBox.Tests;
 
 public sealed class OpencodeQuotaFailureDetectorTests
 {
+    private static readonly string SubscriptionLimitFixturePath = Path.Combine(
+        AppContext.BaseDirectory,
+        "Fixtures",
+        "Opencode",
+        "opencode-subscription-limit.redacted.txt");
+
+    /// <summary>Absorbs clock skew between parse and assert for reset-window checks.</summary>
+    private static readonly TimeSpan ResetAtAssertSkew = TimeSpan.FromSeconds(5);
+
     private readonly OpencodeQuotaFailureDetector _detector = new();
 
     // --- LimitReached patterns ------------------------------------------------
@@ -101,6 +111,17 @@ public sealed class OpencodeQuotaFailureDetectorTests
         Assert.Null(_detector.Detect(stderr: code, stdout: null));
     }
 
+    [Theory]
+    [InlineData("Review the usage limit reached handler in quota.go")]
+    [InlineData("when weekly usage limit reached the cap, log a warning")]
+    [InlineData("Provider blocked request: usage limit reached.")]
+    public void Detect_UsageLimitPhrase_WithoutOpenCodeWorkspaceUrl_DoesNotFalsePositive(string code)
+    {
+        // Subscription-limit regexes require the upstream multi-line shape or
+        // opencode.ai/workspace URL; bare prose must not gate dispatch.
+        Assert.Null(_detector.Detect(stderr: code, stdout: null));
+    }
+
     // --- Source selection / cross-stream / shape edges -----------------------
 
     [Fact]
@@ -129,5 +150,92 @@ public sealed class OpencodeQuotaFailureDetectorTests
     public void Kind_IsOpencode()
     {
         Assert.Equal(AgentKind.Opencode, _detector.Kind);
+    }
+
+    // --- OpenCode subscription rolling-window stderr (upstream fixture) -------
+
+    [Fact]
+    public void Detect_FiveHourUsageLimitFixture_ClassifiesAsLimitReachedWithResetAt()
+    {
+        var stderr = File.ReadAllText(SubscriptionLimitFixturePath);
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        AssertResetAtNearExpected(detection.ResetAt, TimeSpan.FromHours(5) + TimeSpan.FromMinutes(23));
+        Assert.Null(QuotaResetParser.TryParseResetAt([stderr]));
+    }
+
+    [Fact]
+    public void Detect_WeeklyUsageLimitReached_ParsesResetAt()
+    {
+        const string stderr =
+            "weekly usage limit reached. It will reset in 2 hours 30 minutes.";
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        AssertResetAtNearExpected(detection.ResetAt, TimeSpan.FromHours(2) + TimeSpan.FromMinutes(30));
+        Assert.Null(QuotaResetParser.TryParseResetAt([stderr]));
+    }
+
+    [Fact]
+    public void Detect_MonthlyUsageLimitReached_ParsesResetAt()
+    {
+        const string stderr =
+            "monthly usage limit reached. It will reset in 4 hours 15 minutes.";
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        AssertResetAtNearExpected(detection.ResetAt, TimeSpan.FromHours(4) + TimeSpan.FromMinutes(15));
+        Assert.Null(QuotaResetParser.TryParseResetAt([stderr]));
+    }
+
+    [Fact]
+    public void Detect_UsageLimitReachedFallback_WithWorkspaceUrl_ReturnsLimitReachedWithNullResetAt()
+    {
+        const string stderr =
+            """
+            5 hour usage limit reached.
+            To continue using this model now, enable usage from your available balance -
+            https://opencode.ai/workspace/wrk_REDACTEDXXXXXXXXXXXXXXXXXXXXXX/go
+            """;
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        Assert.Null(detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_UsageLimitReached_OnStdout_ClassifiesAsLimitReachedWithResetAt()
+    {
+        const string stdout =
+            "monthly usage limit reached. It will reset in 1 hour 5 minutes.";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+        AssertResetAtNearExpected(detection.ResetAt, TimeSpan.FromHours(1) + TimeSpan.FromMinutes(5));
+    }
+
+    private static void AssertResetAtNearExpected(DateTimeOffset? resetAt, TimeSpan expectedDuration)
+    {
+        Assert.NotNull(resetAt);
+        var diff = resetAt!.Value - DateTimeOffset.UtcNow;
+        var skew = ResetAtAssertSkew.TotalSeconds;
+        Assert.InRange(diff.TotalSeconds, expectedDuration.TotalSeconds - skew, expectedDuration.TotalSeconds + skew);
+    }
+
+    [Fact]
+    public void Detect_UnrelatedStderr_DoesNotClassifyAsQuota()
+    {
+        Assert.Null(_detector.Detect(stderr: "npm: command not found", stdout: null));
     }
 }
