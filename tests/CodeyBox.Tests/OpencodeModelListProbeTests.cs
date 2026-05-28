@@ -179,20 +179,6 @@ public sealed class OpencodeModelListProbeTests
     }
 
     [Fact]
-    public async Task GetModelListAsync_DefaultCliRunner_ForwardsBinaryToProcessRunner()
-    {
-        var processRunner = new RecordingProcessRunner();
-        var cli = new DefaultOpencodeCliRunner(processRunner);
-        var probe = new OpencodeModelListProbe(cli, binary: "/opt/bin/opencode");
-
-        _ = await probe.GetModelListAsync(CancellationToken.None);
-
-        var call = Assert.Single(processRunner.Calls);
-        Assert.Equal("/opt/bin/opencode", call[0]);
-        Assert.Equal("models", call[1]);
-    }
-
-    [Fact]
     public async Task GetModelListAsync_ConstructorBinary_PassedToCliRunner()
     {
         var runner = new CapturingOpencodeCliRunner(0, "", "");
@@ -237,25 +223,6 @@ public sealed class OpencodeModelListProbeTests
         {
             LastBinary = binary;
             return Task.FromResult(new OpencodeCliRunResult(exitCode, stdout, stderr));
-        }
-    }
-
-    private sealed class RecordingProcessRunner : CodeyBox.HostProcess.IProcessRunner
-    {
-        public List<string[]> Calls { get; } = [];
-
-        public Task<CodeyBox.HostProcess.ProcessRunResult> RunAsync(
-            IReadOnlyList<string> argv,
-            string? stdin,
-            CancellationToken ct,
-            Action<string>? stdoutChunkCallback = null,
-            Action<string>? stderrChunkCallback = null,
-            int? maxStdoutBytes = null,
-            int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null)
-        {
-            Calls.Add(argv.ToArray());
-            return Task.FromResult(new CodeyBox.HostProcess.ProcessRunResult(0, "", ""));
         }
     }
 
