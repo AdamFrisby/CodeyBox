@@ -4343,21 +4343,6 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    private void DeleteDirectoryBestEffort(string? path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return;
-        try
-        {
-            if (Directory.Exists(path))
-                Directory.Delete(path, recursive: true);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            _log.LogWarning(ex, "Failed to delete isolated merge repository {Path}", path);
-        }
-    }
-
     private async Task VerifyMergeAncestryAsync(
         string repoId,
         string preMergeSha,

@@ -835,10 +835,10 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         // directory containing the marker. The marker exists for the lifetime
         // of the create-then-mount window and is removed alongside the
         // staging directory when the merge phase finishes (finally-block
-        // DeleteDirectoryBestEffort). This test pins the convention so a
-        // regression that dropped the marker write would surface
-        // immediately, and so the marker file name remains a stable contract
-        // visible to operators reading their own cleanup scripts.
+        // IGitHost.DisposeIsolatedMergeCloneAsync). This test pins the
+        // convention so a regression that dropped the marker write would
+        // surface immediately, and so the marker file name remains a stable
+        // contract visible to operators reading their own cleanup scripts.
         var gitRoot = Path.Combine(_workspace, "git-root-marker");
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
