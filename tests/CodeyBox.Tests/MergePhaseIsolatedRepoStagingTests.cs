@@ -659,23 +659,32 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         // wrapped the retry loop in `while (true)` (or skipped the
         // attempt-count guard) would silently spin and starve the merge
         // phase.
+        //
+        // To also catch a regression that SKIPPED RestoreIsolatedMerge­Repository­Async
+        // between attempts (the catch block invokes restore, but a refactor
+        // could drop that call while leaving the retry loop intact — total
+        // CreateAsync count would still be 2), spy on the git host. The
+        // RestoreCountingHost decorator counts each restore call so the
+        // test asserts both the retry cap AND the heal call that is
+        // supposed to sit between attempts.
         var gitRoot = Path.Combine(_workspace, "git-root-exhausted-retry");
-        var gitHost = new LocalGitHost(
+        var inner = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
+        var spyHost = new StagingRootRecordingHost(inner);
 
         var seed = await CreateSeedRepoAsync();
         var workItemId = WorkItemId.New();
-        var repoId = await gitHost.EnsureRepositoryAsync(workItemId, seed);
+        var repoId = await inner.EnsureRepositoryAsync(workItemId, seed);
 
         var alwaysMissingProvider = new AlwaysMissingSourceSandboxProvider();
-        var pipeline = CreatePipeline(gitHost, alwaysMissingProvider);
+        var pipeline = CreatePipeline(spyHost, alwaysMissingProvider);
 
         var stagingPath = await pipeline.CreateIsolatedMergeRepositoryAsync(
             repoId, workItemId, CancellationToken.None);
         try
         {
-            var access = ((IGitHost)gitHost).GetIsolatedRepoSandboxAccess(stagingPath);
+            var access = ((IGitHost)inner).GetIsolatedRepoSandboxAccess(stagingPath);
             var spec = new SandboxSpec { ImageReference = "ignored", Mounts = access.Mounts };
 
             var ex = await Assert.ThrowsAsync<SandboxMountSourceMissingException>(() =>
@@ -689,9 +698,68 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
 
             // Production cap is 2: one initial attempt + one re-clone +
             // retry = 2 total CreateAsync invocations. A regression that
-            // looped past the cap or skipped restore-after-first-failure
-            // would change this count.
+            // looped past the cap would change this count.
             Assert.Equal(PipelineRunner.MergeSandboxStagingRestoreAttempts, alwaysMissingProvider.CreateAsyncCalls);
+
+            // The orchestrator MUST have called RestoreIsolatedMergeCloneAsync
+            // exactly once: after the first CreateAsync failure, before the
+            // second attempt. A regression that removed the restore call
+            // from CreateMergeSandboxWithStagingRestoreAsync's catch block
+            // would still pass the CreateAsync==2 check above (the retry
+            // loop runs regardless), but would fail this assertion. Pinning
+            // the spy count is what closes the gap the auditor flagged.
+            var restoreCall = Assert.Single(spyHost.RestoreIsolatedMergeCloneCalls);
+            Assert.Equal(stagingPath, restoreCall);
+        }
+        finally
+        {
+            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task CreateMergeSandboxWithStagingRestore_FirstAttemptMissing_RestoresAndSucceedsOnSecondAttempt()
+    {
+        // The production heal contract for CreateMergeSandboxWithStagingRestoreAsync
+        // is: first CreateAsync throws SandboxMountSourceMissingException naming
+        // the staging path → orchestrator calls
+        // RestoreIsolatedMergeRepositoryAsync → second CreateAsync succeeds.
+        // The existing exhausted-retry test pins the retry cap, and the
+        // mismatched-path test pins the catch filter, but neither pins the
+        // most common production-success shape: one failure, one restore,
+        // one success. Add a unit-level pin so a regression that broke the
+        // catch filter's HostPath equality, or never retried after restore,
+        // would surface here without relying on integration coverage.
+        var gitRoot = Path.Combine(_workspace, "git-root-heal-success");
+        var inner = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var spyHost = new StagingRootRecordingHost(inner);
+
+        var seed = await CreateSeedRepoAsync();
+        var workItemId = WorkItemId.New();
+        var repoId = await inner.EnsureRepositoryAsync(workItemId, seed);
+
+        var healProvider = new OneShotMissingThenSucceedSandboxProvider();
+        var pipeline = CreatePipeline(spyHost, healProvider);
+
+        var stagingPath = await pipeline.CreateIsolatedMergeRepositoryAsync(
+            repoId, workItemId, CancellationToken.None);
+        try
+        {
+            var access = ((IGitHost)inner).GetIsolatedRepoSandboxAccess(stagingPath);
+            var spec = new SandboxSpec { ImageReference = "ignored", Mounts = access.Mounts };
+
+            await using var sandbox = await pipeline.CreateMergeSandboxWithStagingRestoreAsync(
+                spec, repoId, stagingPath, CancellationToken.None);
+
+            // CreateAsync ran exactly twice — first throw, then success after restore.
+            Assert.Equal(2, healProvider.CreateAsyncCalls);
+            // Restore ran exactly once, with the staging path as its target.
+            var restoreCall = Assert.Single(spyHost.RestoreIsolatedMergeCloneCalls);
+            Assert.Equal(stagingPath, restoreCall);
+            // The returned sandbox is the one the second CreateAsync produced.
+            Assert.NotNull(sandbox);
         }
         finally
         {
@@ -975,6 +1043,89 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
     }
 
     [Fact]
+    public async Task DisposeIsolatedMergeClone_RemovesStagingDirectoryAndSiblingSentinel()
+    {
+        // DisposeIsolatedMergeCloneAsync is the finally-block cleanup the
+        // orchestrator runs on every merge / conflict-rework exit path. Its
+        // contract is to remove BOTH the staging bare-clone directory AND
+        // the sibling .inflight sentinel that CreateIsolatedMergeCloneAsync
+        // wrote alongside it. Without a direct behavioral test, a regression
+        // that deleted only the directory (or only the sentinel) would slip
+        // past coverage: every other staging-lifecycle test uses
+        // AssertNoStagingDirsRemain (which enumerates codeybox-merge-* and
+        // would NOT catch a leftover .inflight file next to a now-absent
+        // directory). Pin both artifacts here so the orchestrator's finally
+        // block can rely on Dispose for full cleanup.
+        var gitRoot = Path.Combine(_workspace, "git-root-dispose");
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+
+        var seed = await CreateSeedRepoAsync();
+        var workItemId = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(workItemId, seed);
+
+        var stagingPath = await ((IGitHost)gitHost)
+            .CreateIsolatedMergeCloneAsync(repoId, workItemId, CancellationToken.None);
+        var siblingPath = stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix;
+
+        // Pre-conditions: Create must have produced both artifacts. The
+        // assertions below would be vacuous if either was already absent.
+        Assert.True(Directory.Exists(stagingPath),
+            "test invariant: staging directory must exist before Dispose runs");
+        Assert.True(File.Exists(siblingPath),
+            "test invariant: sibling sentinel must exist before Dispose runs");
+
+        await ((IGitHost)gitHost)
+            .DisposeIsolatedMergeCloneAsync(repoId, stagingPath, CancellationToken.None);
+
+        // Both artifacts must be gone — directory AND sibling sentinel.
+        // A regression that removed only one would still pass directory-only
+        // assertions elsewhere; this test exists so that gap closes here.
+        Assert.False(Directory.Exists(stagingPath),
+            $"DisposeIsolatedMergeCloneAsync must remove the staging directory: {stagingPath}");
+        Assert.False(File.Exists(siblingPath),
+            $"DisposeIsolatedMergeCloneAsync must remove the sibling .inflight sentinel: {siblingPath}");
+    }
+
+    [Fact]
+    public async Task DisposeIsolatedMergeClone_RemovesSentinelEvenWhenDirectoryAlreadyGone()
+    {
+        // The finally-block cleanup must be idempotent against a half-reaped
+        // state: an external sweep that deleted the staging DIRECTORY (the
+        // race the b044f8bd fix targets) can still leave the sibling sentinel
+        // behind. Dispose must remove that orphaned sentinel; otherwise a
+        // graceful merge-phase exit would accumulate .inflight files in the
+        // staging root indefinitely. Drive that branch directly by deleting
+        // the directory after create and confirming Dispose still wipes the
+        // sentinel.
+        var gitRoot = Path.Combine(_workspace, "git-root-dispose-orphan");
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+
+        var seed = await CreateSeedRepoAsync();
+        var workItemId = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(workItemId, seed);
+
+        var stagingPath = await ((IGitHost)gitHost)
+            .CreateIsolatedMergeCloneAsync(repoId, workItemId, CancellationToken.None);
+        var siblingPath = stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix;
+
+        Directory.Delete(stagingPath, recursive: true);
+        Assert.False(Directory.Exists(stagingPath),
+            "test invariant: directory must be gone so the orphan-sentinel branch is exercised");
+        Assert.True(File.Exists(siblingPath),
+            "test invariant: sibling sentinel must still be present after directory delete");
+
+        await ((IGitHost)gitHost)
+            .DisposeIsolatedMergeCloneAsync(repoId, stagingPath, CancellationToken.None);
+
+        Assert.False(File.Exists(siblingPath),
+            $"DisposeIsolatedMergeCloneAsync must remove orphan sibling sentinel even when directory is already gone: {siblingPath}");
+    }
+
+    [Fact]
     public void LocalGitHost_GetIsolatedRepoSandboxAccess_BindsAtRepoMountPathWithDeniedNetwork()
     {
         // LocalGitHost wires an isolated bare clone the same way the durable
@@ -1236,6 +1387,55 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
     }
 
     /// <summary>
+    /// Sandbox provider that throws SandboxMountSourceMissingException ONCE
+    /// (naming the first staging mount it sees) and then succeeds on every
+    /// subsequent CreateAsync. Used to drive the heal-and-succeed path of
+    /// CreateMergeSandboxWithStagingRestoreAsync at unit-test scope so a
+    /// regression that broke the catch filter or skipped the post-restore
+    /// retry would surface without requiring full integration coverage.
+    /// </summary>
+    private sealed class OneShotMissingThenSucceedSandboxProvider : ISandboxProvider
+    {
+        public string Name => "one-shot-missing-then-succeed-fake";
+        public int CreateAsyncCalls { get; private set; }
+        private bool _alreadyThrew;
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            CreateAsyncCalls++;
+            if (!_alreadyThrew)
+            {
+                foreach (var mount in spec.Mounts)
+                {
+                    if (mount.HostPath is null) continue;
+                    var name = Path.GetFileName(mount.HostPath);
+                    if (name.StartsWith("codeybox-merge-", StringComparison.Ordinal)
+                        && mount.HostPath.EndsWith(".git", StringComparison.Ordinal))
+                    {
+                        _alreadyThrew = true;
+                        throw new SandboxMountSourceMissingException(
+                            mount.HostPath,
+                            $"simulated one-shot mount source missing: {mount.HostPath}");
+                    }
+                }
+            }
+            return Task.FromResult<ISandbox>(new NoopSandbox());
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
+        private sealed class NoopSandbox : ISandbox
+        {
+            public string Id { get; } = "noop-fake-" + Guid.NewGuid().ToString("N")[..8];
+            public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+                => Task.FromResult(new SandboxExecResult(0, "", ""));
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    /// <summary>
     /// Sandbox provider that always throws SandboxMountSourceMissingException
     /// naming a fixed, unrelated host path — NOT the staging clone the
     /// orchestrator passed in. Used to drive the HostPath-mismatch branch
@@ -1289,8 +1489,13 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             return ((IGitHost)_inner).CreateIsolatedMergeCloneAsync(repositoryId, workItemId, ct);
         }
 
+        public List<string> RestoreIsolatedMergeCloneCalls { get; } = [];
+
         public Task RestoreIsolatedMergeCloneAsync(string repositoryId, string targetPath, CancellationToken ct = default)
-            => ((IGitHost)_inner).RestoreIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
+        {
+            RestoreIsolatedMergeCloneCalls.Add(targetPath);
+            return ((IGitHost)_inner).RestoreIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
+        }
 
         public string GetRepoPath(string repositoryId) => _inner.GetRepoPath(repositoryId);
         public SandboxRepositoryAccess GetSandboxAccess(string repositoryId) => _inner.GetSandboxAccess(repositoryId);
