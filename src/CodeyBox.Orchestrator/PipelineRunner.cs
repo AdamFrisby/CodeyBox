@@ -68,6 +68,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly QuotaRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
+    private readonly IAgentInvolvementStore? _involvement;
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly IPreMergeVerifier? _preMergeVerifier;
@@ -192,7 +193,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         AgenticConflictResolver? agenticConflictResolver = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        IAgentInvolvementStore? involvement = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -233,6 +235,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _retryScheduler = retryScheduler;
         _classRouter = classRouter;
         _fallbackHistory = fallbackHistory;
+        _involvement = involvement;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -4004,19 +4007,29 @@ public sealed class PipelineRunner : IPipelineRunner
 
         async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, WorkItem trialItem)
         {
+            // Append a per-phase involvement row for the agent about to run, so the
+            // full who-did-what trail captures every agent that touched the item —
+            // not just the one currently stamped on WorkItem.Agent. Finalized with
+            // an outcome below; on a quota/timeout fallback the next attempt records
+            // its own row and this one is closed as a failure.
+            var involvementId = await RecordInvolvementStartAsync(
+                item.Id, runner.Kind, trialItem.ModelId, phase, iteration);
             using var attempt = phaseCancellation is not null && attemptTimeout is { } perAttempt
                 ? phaseCancellation.BeginAttemptTimeout(perAttempt)
                 : null;
             var attemptCt = attempt?.Token ?? phaseCancellation?.Token ?? ct;
             try
             {
-                return await invoker(runner, trialItem, attemptCt);
+                var result = await invoker(runner, trialItem, attemptCt);
+                await FinalizeInvolvementAsync(involvementId, "success");
+                return result;
             }
             catch (OperationCanceledException oce) when (
                 attempt is { TimeoutElapsed: true }
                 && phaseCancellation is not null
                 && oce is not PhaseCancellationException)
             {
+                await FinalizeInvolvementAsync(involvementId, "failure:timeout");
                 if (phaseCancellation.Token.IsCancellationRequested
                     || phaseCancellation.Source is not null)
                     throw phaseCancellation.Wrap(oce);
@@ -4026,6 +4039,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     runner.Kind,
                     attemptTimeout!.Value,
                     oce);
+            }
+            catch (Exception ex)
+            {
+                await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
+                throw;
             }
         }
 
@@ -4333,6 +4351,69 @@ public sealed class PipelineRunner : IPipelineRunner
             }
         }
     }
+
+    /// <summary>
+    /// Appends an in-progress <see cref="AgentInvolvement"/> row for the agent
+    /// about to run a phase and returns its id (or null when no involvement store
+    /// is wired). Best-effort: a failure to persist never breaks the pipeline,
+    /// mirroring the fallback-history recording.
+    /// </summary>
+    private async Task<Guid?> RecordInvolvementStartAsync(
+        WorkItemId workItemId, AgentKind agent, string? modelId, string phase, int? iteration)
+    {
+        if (_involvement is null) return null;
+        var id = Guid.NewGuid();
+        try
+        {
+            await _involvement.RecordStartAsync(new AgentInvolvement(
+                Id: id,
+                WorkItemId: workItemId,
+                AgentKind: agent,
+                ModelId: modelId,
+                Phase: phase,
+                StartedAt: DateTimeOffset.UtcNow,
+                EndedAt: null,
+                Iteration: iteration,
+                Outcome: null), CancellationToken.None);
+            return id;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "agent involvement start record failed for phase '{Phase}'", phase);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Stamps the completion outcome on a previously-started involvement row.
+    /// No-op when no store is wired or no row was recorded. Best-effort; uses
+    /// <see cref="CancellationToken.None"/> so the audit stamp lands even when
+    /// the phase was cancelled.
+    /// </summary>
+    private async Task FinalizeInvolvementAsync(Guid? involvementId, string outcome)
+    {
+        if (_involvement is null || involvementId is not { } id) return;
+        try
+        {
+            await _involvement.FinalizeAsync(id, DateTimeOffset.UtcNow, outcome, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "agent involvement finalize failed");
+        }
+    }
+
+    /// <summary>
+    /// Maps an attempt-terminating exception to a compact involvement outcome
+    /// label ("failure:&lt;reason&gt;") for operator-facing attribution.
+    /// </summary>
+    private static string OutcomeForFailure(Exception ex) => ex switch
+    {
+        TerminalQuotaError => "failure:quota",
+        AgentAttemptTimeoutException => "failure:timeout",
+        OperationCanceledException => "failure:cancelled",
+        _ => "failure:agent",
+    };
 
     private sealed class AgentAttemptTimeoutException : OperationCanceledException
     {

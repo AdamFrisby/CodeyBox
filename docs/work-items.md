@@ -263,6 +263,37 @@ non-`Done` state, including the terminal-failure states
 (`Failed` / `AuditFailed` / `MergeConflictResolutionFailed` /
 `AbandonedAfterRecoveryAttempts`) — see *Closing terminal-failure items* above.
 
+### Per-phase agent involvement
+
+The single `agent` field reflects only the **current** phase's agent and is overwritten as an item moves through Work → Audit → Rework → Merge. To see who-did-what at every stage, the read model exposes a per-phase audit trail.
+
+`GET /workitems/{id}` includes (when the involvement store is wired):
+
+```jsonc
+{
+  "agent":     "claude",   // current-phase agent (unchanged contract)
+  "workAgent": "cursor",   // agent that ran the original Work phase, or null
+  "agentHistory": [
+    { "id": "…", "agentKind": "cursor", "modelId": "composer-2.5",
+      "phase": "work",  "startedAt": "…", "endedAt": "…", "iteration": 1, "outcome": "success" },
+    { "id": "…", "agentKind": "claude", "modelId": null,
+      "phase": "audit", "startedAt": "…", "endedAt": null, "iteration": 1, "outcome": null }
+  ]
+}
+```
+
+A new `agentHistory` row is appended on every phase transition — once per agent attempt for the Work, Rework, and Merge phases, and once per LLM auditor for each Audit iteration. Quota/timeout fallbacks append an additional row for the agent that took over, so every agent that touched the item is recorded. Entries are an immutable audit trail: `endedAt` / `outcome` are `null` while the phase is in progress and stamped exactly once on completion (`outcome` is `"success"` or `"failure:<reason>"`). `agentHistory` is `[]` (not omitted) when the store is wired but nothing has run yet; history starts empty for items created before the feature existed.
+
+`workAgent` is derived from the first `work`-phase entry — the original implementer, distinct from "who's currently auditing it".
+
+### `GET /workitems/{id}/agent-history`
+
+Returns just the involvement trail — cheaper than the full work-item read for UI polling:
+
+```jsonc
+{ "workItemId": "<id>", "workAgent": "cursor", "agentHistory": [ … ] }
+```
+
 ---
 
 ## Model quality routing

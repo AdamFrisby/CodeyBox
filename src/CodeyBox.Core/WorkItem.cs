@@ -50,6 +50,13 @@ public sealed record WorkItem
     /// member is at its cap, the router spills to the next eligible-and-free member.
     /// Only when every eligible member is at its cap does the item defer. There is no
     /// mechanism today to hard-pin a work item to a specific agent inside a class.
+    /// <para>
+    /// Reflects the CURRENT phase's agent and is overwritten as the item moves
+    /// through Work → Audit → Rework → Merge; for the full per-phase audit trail
+    /// (who ran each phase, with start/end and outcome) use
+    /// <see cref="IAgentInvolvementStore"/> / the <c>agentHistory</c> array on
+    /// the work-item read model.
+    /// </para>
     /// </summary>
     public AgentKind? Agent { get; init; }
 

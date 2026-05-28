@@ -747,6 +747,11 @@ builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteAgentFallbackHistoryStore(cbOpts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IAgentInvolvementStore>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteAgentInvolvementStore(cbOpts.StateDatabasePath);
+});
 // OAuth-refreshing quota-token sources. These wrap the raw credential file
 // sources with provider-specific refresh logic so an expired access_token is
 // re-minted via the provider's OAuth refresh endpoint before the probe sends
@@ -1727,11 +1732,12 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<AgentConcurrencyOptions>(),
     sp.GetRequiredService<IPreMergeVerifier>(),
     sp.GetRequiredService<AgentConcurrencySnapshot>(),
-    sp.GetService<IAgentUsageStore>(),
-    sp.GetService<IAgentBudgetProvider>(),
-    sp.GetRequiredService<IncrementalRebaseSnapshot>(),
-    sp.GetRequiredService<PipelineTuningSnapshot>(),
-    inVmSmokeGate: sp.GetService<IInVmSmokeGate>()));
+    usageStore: sp.GetService<IAgentUsageStore>(),
+    budgetProvider: sp.GetService<IAgentBudgetProvider>(),
+    incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+    pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
+    inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
+    involvement: sp.GetService<IAgentInvolvementStore>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

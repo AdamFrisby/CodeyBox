@@ -18,6 +18,7 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}", GetAsync);
         group.MapDelete("/{id}", CancelAsync);
         group.MapGet("/{id}/dependents", GetDependentsAsync);
+        group.MapGet("/{id}/agent-history", GetAgentHistoryAsync);
         group.MapGet("/{id}/replays", GetReplaysAsync);
         group.MapPatch("/{id}", PatchWorkItemAsync);
         group.MapPatch("/{id}/external-ids", PatchExternalIdsAsync);
@@ -518,6 +519,7 @@ internal static class WorkItemEndpoints
         IWorkItemCostStore? costs,
         ILoggerFactory loggerFactory,
         IAgentFallbackHistoryStore? fallbackHistory,
+        IAgentInvolvementStore? involvement,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -555,7 +557,44 @@ internal static class WorkItemEndpoints
                     : Array.Empty<AgentFallbackDto>(),
             };
         }
+        if (involvement is not null)
+        {
+            // Always emit a list (possibly empty) when the store is wired so
+            // consumers distinguish "no agent ran yet / history started
+            // post-migration" ([]) from "store unavailable" (omitted). WorkAgent
+            // is the original implementer, derived from the first Work entry.
+            var involvementHistory = await involvement.ListByWorkItemAsync(item.Id, ct);
+            dto = dto with
+            {
+                AgentHistory = involvementHistory.Count > 0
+                    ? involvementHistory.Select(MapInvolvement).ToList()
+                    : Array.Empty<AgentInvolvementDto>(),
+                WorkAgent = ResolveWorkAgent(involvementHistory),
+            };
+        }
         return Results.Ok(dto);
+    }
+
+    /// <summary>
+    /// GET /workitems/{id}/agent-history — the per-phase agent involvement trail
+    /// alone. Cheaper than the full <c>GET /workitems/{id}</c> for UI polling.
+    /// </summary>
+    private static async Task<IResult> GetAgentHistoryAsync(
+        string id,
+        IWorkItemStore store,
+        IAgentInvolvementStore? involvement,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var history = involvement is null
+            ? []
+            : await involvement.ListByWorkItemAsync(item!.Id, ct);
+        return Results.Ok(new WorkItemAgentHistoryResponse(
+            WorkItemId: item!.Id.ToString(),
+            WorkAgent: ResolveWorkAgent(history),
+            AgentHistory: history.Select(MapInvolvement).ToList()));
     }
 
     private static async Task<WorkItemUsageSummary?> TryGetUsageSummaryAsync(
@@ -584,6 +623,28 @@ internal static class WorkItemEndpoints
             return new Dictionary<string, WorkItemUsageSummary>(StringComparer.Ordinal);
         }
     }
+
+    private static AgentInvolvementDto MapInvolvement(AgentInvolvement r) =>
+        new(
+            Id: r.Id.ToString(),
+            AgentKind: r.AgentKind.Value,
+            ModelId: r.ModelId,
+            Phase: r.Phase,
+            StartedAt: r.StartedAt,
+            EndedAt: r.EndedAt,
+            Iteration: r.Iteration,
+            Outcome: r.Outcome);
+
+    /// <summary>
+    /// The agent that ran the original implementation: the first
+    /// <c>Work</c>-phase involvement entry. Distinct from
+    /// <see cref="WorkItem.Agent"/>, which reflects whichever phase is current.
+    /// Phase match is case-insensitive ("work" vs "Work").
+    /// </summary>
+    private static string? ResolveWorkAgent(IReadOnlyList<AgentInvolvement> history) =>
+        history
+            .FirstOrDefault(h => string.Equals(h.Phase, "work", StringComparison.OrdinalIgnoreCase))
+            ?.AgentKind.Value;
 
     private static AgentFallbackDto MapFallback(AgentFallbackRecord r) =>
         new(
@@ -2393,6 +2454,11 @@ public sealed record PauseQueueRequest(string Reason = "");
 
 public sealed record WorkItemTimelineResponse(string WorkItemId, IReadOnlyList<TimelineEntry> Entries);
 
+public sealed record WorkItemAgentHistoryResponse(
+    string WorkItemId,
+    string? WorkAgent,
+    IReadOnlyList<AgentInvolvementDto> AgentHistory);
+
 public sealed record WorkItemDto(
     string Id,
     string? ExternalId,
@@ -2444,7 +2510,26 @@ public sealed record WorkItemDto(
     CheckVerdict? Verdict = null,
     string? OriginCheckWorkItemId = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    IReadOnlyList<CheckVerdict>? ReCheckVerdicts = null);
+    IReadOnlyList<CheckVerdict>? ReCheckVerdicts = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<AgentInvolvementDto>? AgentHistory = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? WorkAgent = null);
+
+/// <summary>
+/// One entry in a work item's per-phase agent involvement trail. Mirrors
+/// <see cref="CodeyBox.Core.AgentInvolvement"/>; <see cref="EndedAt"/> /
+/// <see cref="Outcome"/> are null while the agent is still running that phase.
+/// </summary>
+public sealed record AgentInvolvementDto(
+    string Id,
+    string AgentKind,
+    string? ModelId,
+    string Phase,
+    DateTimeOffset StartedAt,
+    DateTimeOffset? EndedAt,
+    int? Iteration,
+    string? Outcome);
 
 public sealed record AgentFallbackDto(
     string Id,
