@@ -87,7 +87,7 @@ public sealed class CursorAgentRunnerTests
             e.Argv.Count >= 3
             && e.Argv[0] == "bash"
             && e.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal)
-            && e.Argv[2].Contains("$HOME/.cursor/credentials.json", StringComparison.Ordinal));
+            && e.Argv[2].Contains("$HOME/.config/cursor/auth.json", StringComparison.Ordinal));
         var agentIdx = sandbox.Execs.FindIndex(e => e.Argv.Count > 0 && e.Argv[0] == "agent");
         Assert.True(authIdx >= 0, "auth materialisation bash command was not invoked");
         Assert.True(agentIdx >= 0, "agent CLI was not invoked");
@@ -125,10 +125,10 @@ public sealed class CursorAgentRunnerTests
         Assert.NotNull(prepExec);
         var script = prepExec!.Argv[2];
 
-        var existenceCheckIdx = script.IndexOf("$HOME/.cursor/credentials.json", StringComparison.Ordinal);
+        var existenceCheckIdx = script.IndexOf("$HOME/.config/cursor/auth.json", StringComparison.Ordinal);
         var earlyExitIdx = script.IndexOf("exit 0", StringComparison.Ordinal);
         var writeIdx = script.IndexOf("printf", StringComparison.Ordinal);
-        Assert.True(existenceCheckIdx >= 0, "script must reference $HOME/.cursor/credentials.json");
+        Assert.True(existenceCheckIdx >= 0, "script must reference $HOME/.config/cursor/auth.json");
         Assert.True(earlyExitIdx >= 0, "script must short-circuit when file is present (exit 0)");
         Assert.True(writeIdx >= 0, "script must still have a printf-from-env fallback");
         Assert.True(earlyExitIdx < writeIdx,
@@ -197,7 +197,7 @@ public sealed class CursorAgentRunnerTests
             if (exec.Argv.Count >= 3
                 && exec.Argv[0] == "bash"
                 && exec.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal)
-                && exec.Argv[2].Contains(".cursor/credentials.json", StringComparison.Ordinal))
+                && exec.Argv[2].Contains(".config/cursor/auth.json", StringComparison.Ordinal))
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }
