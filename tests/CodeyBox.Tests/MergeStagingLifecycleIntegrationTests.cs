@@ -63,7 +63,19 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
     {
         var seed = await CreateLargerSeedAsync();
         var auditor = new MainAdvancingAuditor(_workspace, "shared.txt", "main side\n");
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        // Wrap the sandbox provider so each CreateAsync observes whether the
+        // codeybox-merge-*.git bind source exists on disk AT THE MOMENT the
+        // merge-phase sandbox is being built. Without this observation, the
+        // test could pass even if the staging directory were deleted and
+        // recreated mid-flight (or never existed at all and the pipeline
+        // recovered some other way). The b044f8bd acceptance criterion is
+        // specifically about mid-flight survival of the staging path, so
+        // assert it here at the only moment that matters: when the merge
+        // sandbox is about to mount it.
+        var stagingObserver = new StagingMountObservingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed, auditors: [auditor], sandboxProvider: stagingObserver);
         auditor.GitRoot = tp.GitRoot;
 
         // Work agent writes the same file as the auditor's main-advance, so
@@ -131,6 +143,18 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
         // the test pass vacuously.
         Assert.True(reaperProvider.ListCalls > 0,
             "reaper sweep loop never ran — concurrency window was not exercised");
+
+        // Acceptance criterion #3, the part the iteration-7 audit flagged
+        // as missing: at least one codeybox-merge-*.git bind source must
+        // have been observed on disk at the moment its sandbox was being
+        // built. The observer asserts inline that the path existed when
+        // CreateAsync ran; here we additionally pin that the observation
+        // happened (so a regression that bypassed the staging mount
+        // altogether could not pass this test vacuously).
+        Assert.True(stagingObserver.StagingMountObservations > 0,
+            "merge-phase staging mount was never observed mid-flight — " +
+            "either AC#3 setup never produced a staging clone, or the merge " +
+            "sandbox bypassed the wrapper");
 
         // After completion, no codeybox-merge-*.git directories remain
         // under GitRoot — the finally-block cleanup in
@@ -547,6 +571,57 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {
             CapturedSpecs.Add(spec);
+            return _inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    /// <summary>
+    /// ISandboxProvider wrapper that, for each CreateAsync call, asserts
+    /// the bind-mount host path of any codeybox-merge-*.git staging clone
+    /// exists on disk AT THE MOMENT the sandbox is being built — the
+    /// exact mid-flight observation b044f8bd acceptance criterion #3
+    /// calls for. Without this hook, the AC#3 test could only assert
+    /// terminal state (Done) and post-run cleanup, neither of which
+    /// distinguishes "staging survived" from "staging was reaped and
+    /// the pipeline silently recovered some other way".
+    /// </summary>
+    private sealed class StagingMountObservingSandboxProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+        public int StagingMountObservations { get; private set; }
+
+        public StagingMountObservingSandboxProvider(ISandboxProvider inner) => _inner = inner;
+
+        public string Name => _inner.Name;
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            foreach (var mount in spec.Mounts)
+            {
+                if (mount.HostPath is null) continue;
+                var isStagingClone = Path.GetFileName(mount.HostPath)
+                    .StartsWith("codeybox-merge-", StringComparison.Ordinal)
+                    && mount.HostPath.EndsWith(".git", StringComparison.Ordinal);
+                if (!isStagingClone) continue;
+
+                // The b044f8bd observable: the bind source must exist on
+                // disk at the moment its sandbox is being built. A
+                // regression that reaped staging mid-flight (or never
+                // created it in the first place) would fail this loud
+                // assertion at the only moment that matters for the
+                // mount step.
+                Assert.True(Directory.Exists(mount.HostPath),
+                    $"staging mount bind source missing at sandbox create time: {mount.HostPath}");
+                Assert.True(File.Exists(Path.Combine(mount.HostPath, "HEAD")),
+                    $"staging mount bind source is not a valid bare repo at sandbox create time: {mount.HostPath}");
+                StagingMountObservations++;
+            }
             return _inner.CreateAsync(spec, ct);
         }
 

@@ -457,6 +457,71 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         Assert.Contains(hostSource, ex.Message);
     }
 
+    [Fact]
+    public async Task MountSingleBindWithRetry_HostSourceFirstGoesMissingOnFinalAttempt_InvokesRestoreAndRetries()
+    {
+        // Regression for iteration-7 audit Error finding (quality:llm-review):
+        // when MountSingleBindWithRetryAsync ran the early `if (attempt ==
+        // MountMaxAttempts) break` immediately after recording post-failure
+        // state, an exists=no observed only on the final attempt would
+        // never reach the restorer branch — defeating the entire purpose
+        // of the heal hook in the racing-cleanup-after-two-flaky-attempts
+        // case. The loop must invoke the one-shot restorer even on the
+        // final attempt and grant one additional mount try after it heals.
+        //
+        // Sequence under test:
+        //   attempt 1: source exists, mount fails (exists=dir transient)
+        //   attempt 2: source exists, mount fails (exists=dir transient)
+        //   attempt 3: source has been deleted out from under us (exists=no)
+        //              → restore must run, fourth mount must succeed.
+        var hostSource = Path.Combine(_workspace, "late-disappearing-source");
+        Directory.CreateDirectory(hostSource);
+
+        var attempts = 0;
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                attempts++;
+                if (attempts == 3 && Directory.Exists(hostSource))
+                {
+                    // Simulate the external cleanup landing during the
+                    // third mount call so the post-failure stat lands as
+                    // exists=no — exactly the late-disappearance case the
+                    // heal hook is meant to cover.
+                    Directory.Delete(hostSource, recursive: true);
+                }
+                return Directory.Exists(hostSource) && attempts >= 4
+                    ? new ProcessRunResult(0, "", "")
+                    : new ProcessRunResult(1, "", "Source path does not exist");
+            }
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner);
+
+        var restorer = new RecordingRestorer(_ =>
+        {
+            Directory.CreateDirectory(hostSource);
+            return Task.CompletedTask;
+        });
+
+        await provider.MountSingleBindWithRetryAsync(
+            new MultipassSandboxOptions(),
+            name: "codeybox-test",
+            host: hostSource,
+            sandbox: "/repo",
+            workItemId: null,
+            sourceRestorer: restorer,
+            ct: CancellationToken.None);
+
+        // Four mount attempts (3 transients + 1 post-heal success), one
+        // single-shot restore invocation. A regression that broke before
+        // the restorer branch on the final attempt would yield Invocations
+        // == 0 and an InvalidOperationException instead of returning.
+        Assert.Equal(1, restorer.Invocations);
+        Assert.Equal(4, attempts);
+    }
+
     private static MultipassSandboxProvider NewProvider(IProcessRunner runner) => new(
         new MultipassSandboxOptions { StagingDirectory = Path.GetTempPath() },
         NullLogger<MultipassSandboxProvider>.Instance,

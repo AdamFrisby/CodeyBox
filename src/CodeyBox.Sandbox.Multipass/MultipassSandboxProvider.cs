@@ -1522,7 +1522,12 @@ test "$work" = present && test "$exec_wrapper" = present
         string? lastFailureState = null;
         var attemptsRun = 0;
         var restoreInvoked = false;
-        for (var attempt = 1; attempt <= MountMaxAttempts; attempt++)
+        // Mutable so the one-shot restore branch can extend the budget by
+        // one when the source first goes missing on the final attempt —
+        // otherwise the loop would record exists=no, break, and never give
+        // the restorer a chance to heal a racing-cleanup that landed late.
+        var maxAttempts = MountMaxAttempts;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
             attemptsRun = attempt;
             // Stat the host source immediately before each mount attempt so a
@@ -1531,7 +1536,7 @@ test "$work" = present && test "$exec_wrapper" = present
             var sourceState = await DescribeMountSourceStateAsync(host, ct);
             _log.LogInformation(
                 "multipass mount source state (attempt {Attempt}/{Max}): {Host} -> {Vm}:{Sandbox} state={State}",
-                attempt, MountMaxAttempts, host, name, sandbox, sourceState);
+                attempt, maxAttempts, host, name, sandbox, sourceState);
 
             var run = await RunAsync(
                 opts,
@@ -1543,40 +1548,45 @@ test "$work" = present && test "$exec_wrapper" = present
             var postFailureState = await DescribeMountSourceStateAsync(host, ct);
             lastFailure = run;
             lastFailureState = postFailureState;
-            if (attempt == MountMaxAttempts)
-                break;
 
-            // Only retry when there's a plausible chance of recovery:
-            //   - host source exists per Directory/File.Exists (transient
-            //     daemon-side cache miss or FS sync race), OR
-            //   - we hit a permission/IO error reading the source (stat-failed,
-            //     which can also be transient), OR
-            //   - the source is missing AND the caller provided a restorer
-            //     we have not yet invoked (defensive heal for racing
-            //     cleanup; see ISandboxMountSourceRestorer contract).
-            // If the source is definitively missing and we have no way to
-            // recreate it, no retry can help — fail fast.
-            if (postFailureState.StartsWith("exists=no", StringComparison.Ordinal))
+            var isMissing = postFailureState.StartsWith("exists=no", StringComparison.Ordinal);
+
+            // Defensive heal: when the host source is gone and we have a
+            // not-yet-used restorer, invoke it once. This branch runs
+            // BEFORE the budget-exhausted check so a source that first
+            // disappears on the final attempt (e.g. external cleanup raced
+            // after two earlier exists=dir failures) still gets one
+            // heal-then-mount pass instead of breaking out with the
+            // restorer untouched.
+            if (isMissing && sourceRestorer is not null && !restoreInvoked)
             {
-                if (sourceRestorer is null || restoreInvoked)
-                {
-                    _log.LogWarning(
-                        "multipass mount failed and host source is missing — not retrying ({Host} -> {Vm}:{Sandbox}, attempt {Attempt}): {Stderr}",
-                        host, name, sandbox, attempt, run.Stderr.Trim());
-                    break;
-                }
-
                 _log.LogWarning(
                     "multipass mount source missing — invoking restore callback before retry ({Host} -> {Vm}:{Sandbox}, attempt {Attempt}): {Stderr}",
                     host, name, sandbox, attempt, run.Stderr.Trim());
                 await sourceRestorer.RestoreAsync(ct);
                 restoreInvoked = true;
+                if (attempt == maxAttempts)
+                    maxAttempts++;
+            }
+            else if (attempt == maxAttempts)
+            {
+                break;
+            }
+            else if (isMissing)
+            {
+                // Source is definitively missing and we have no way to
+                // recreate it (no restorer, or the one-shot already
+                // fired). No amount of retrying can help — fail fast.
+                _log.LogWarning(
+                    "multipass mount failed and host source is missing — not retrying ({Host} -> {Vm}:{Sandbox}, attempt {Attempt}): {Stderr}",
+                    host, name, sandbox, attempt, run.Stderr.Trim());
+                break;
             }
 
             var backoff = MountAttemptBackoff(attempt);
             _log.LogWarning(
                 "multipass mount failed (attempt {Attempt}/{Max}, state={State}); retrying in {DelayMs}ms: {Stderr}",
-                attempt, MountMaxAttempts, postFailureState, backoff.TotalMilliseconds, run.Stderr.Trim());
+                attempt, maxAttempts, postFailureState, backoff.TotalMilliseconds, run.Stderr.Trim());
             await Task.Delay(backoff, ct);
         }
 

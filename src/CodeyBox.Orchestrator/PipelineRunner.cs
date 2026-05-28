@@ -4254,6 +4254,24 @@ public sealed class PipelineRunner : IPipelineRunner
         var stagingRoot = _gitHost.GetMergeStagingRoot(repoId);
         var target = Path.Combine(stagingRoot, $"codeybox-merge-{itemId}-{Guid.NewGuid():N}.git");
         await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, target);
+        // git clone exited 0, but verify the bare-repo target actually
+        // landed on disk before handing the path to the sandbox mount
+        // step. Without this guard, a silent partial clone or an external
+        // process that removed the directory between clone-exit and
+        // return would only surface later as a "Source path does not
+        // exist" mount failure — the exact failure class b044f8bd
+        // tracks. The HEAD file is created by `git clone --bare` and is
+        // the cheapest single check that distinguishes a successful bare
+        // clone from an empty directory.
+        if (!Directory.Exists(target) || !File.Exists(Path.Combine(target, "HEAD")))
+        {
+            throw new InvalidOperationException(
+                $"isolated merge clone did not land on disk: target={target} " +
+                $"exists={Directory.Exists(target)} head={File.Exists(Path.Combine(target, "HEAD"))}");
+        }
+        _log.LogInformation(
+            "isolated merge clone landed for work item {WorkItem}: {Target}",
+            itemId, target);
         return target;
     }
 
@@ -4298,6 +4316,16 @@ public sealed class PipelineRunner : IPipelineRunner
         // is a no-op when the path is absent.
         DeleteDirectoryBestEffort(targetPath);
         await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, targetPath);
+        // Mirror the verification in CreateIsolatedMergeRepositoryAsync —
+        // if the restore clone silently produces no on-disk output, the
+        // next mount attempt will repeat the same exists=no failure and
+        // the heal loop will give up. Surface that here instead.
+        if (!Directory.Exists(targetPath) || !File.Exists(Path.Combine(targetPath, "HEAD")))
+        {
+            throw new InvalidOperationException(
+                $"isolated merge clone restore did not land on disk: target={targetPath} " +
+                $"exists={Directory.Exists(targetPath)} head={File.Exists(Path.Combine(targetPath, "HEAD"))}");
+        }
     }
 
     /// <summary>
