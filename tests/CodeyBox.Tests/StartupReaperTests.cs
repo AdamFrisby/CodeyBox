@@ -30,7 +30,7 @@ public sealed class StartupReaperTests : IDisposable
     {
         _store.Dispose();
         _registry.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        try { File.Delete(_dbPath); } catch { /* best-effort temp file cleanup */ }
     }
 
     [Fact]

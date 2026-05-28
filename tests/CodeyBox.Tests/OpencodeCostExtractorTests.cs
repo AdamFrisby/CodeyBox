@@ -65,6 +65,32 @@ public sealed class OpencodeCostExtractorTests
     }
 
     [Fact]
+    public void Json_AnthropicShape_ParsesCacheReadInputTokens()
+    {
+        var stdout = """{"usage":{"input_tokens":82750,"cache_read_input_tokens":82000,"output_tokens":290}}""";
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(82750, result!.InputTokens);
+        Assert.Equal(82000, result.CachedInputTokens);
+        Assert.Equal(290, result.OutputTokens);
+    }
+
+    [Fact]
+    public void Json_OpenAiShape_ParsesPromptTokensDetailsCachedTokens()
+    {
+        var stdout = """{"usage":{"prompt_tokens":82750,"completion_tokens":290,"prompt_tokens_details":{"cached_tokens":82000}}}""";
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(82750, result!.InputTokens);
+        Assert.Equal(82000, result.CachedInputTokens);
+        Assert.Equal(290, result.OutputTokens);
+    }
+
+    [Fact]
     public void Json_MixedShape_PrefersPromptOverInputAndCompletionOverOutput()
     {
         // If both shapes appear together the OpenAI keys should win because

@@ -1239,15 +1239,38 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
     }
     return extractors;
 });
+// Bundled per-(agent, model) pricing defaults shipped with CodeyBox so new
+// installs get cost reporting without the operator hand-populating every
+// entry from provider docs. Operator config under CodeyBox:AgentPricing
+// always wins per (agentKind, modelId). See docs/agent-pricing.md.
+builder.Services.AddSingleton<AgentPricingDefaultsSnapshot>(sp =>
+{
+    var env = sp.GetRequiredService<IHostEnvironment>();
+    return AgentPricingDefaults.Load(env.ContentRootPath);
+});
+builder.Services.AddSingleton<AgentPricingState>(sp =>
+{
+    var defaults = sp.GetRequiredService<AgentPricingDefaultsSnapshot>();
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var merged = AgentPricingMerge.Merge(defaults.Baseline, opts.AgentPricing);
+    return new AgentPricingState(defaults, merged);
+});
 builder.Services.AddSingleton<AgentCostCalculator>(sp =>
 {
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var pricingState = sp.GetRequiredService<AgentPricingState>();
+    var merged = pricingState.LastMerge;
+    var defaults = pricingState.Defaults;
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.AgentPricing");
-    var pricing = opts.AgentPricing;
+    startupLog.LogInformation(
+        "AgentPricing loaded: bundled={Bundled}, operator-overrides={Operator}, total={Total} (bundled lastUpdated={LastUpdated})",
+        merged.BundledRateCount, merged.OperatorRateCount, merged.TotalRateCount,
+        string.IsNullOrEmpty(defaults.Meta.LastUpdated) ? "(unknown)" : defaults.Meta.LastUpdated);
     var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
-    AgentCostCalculator.ValidateAtStartup(pricing,
+    AgentCostCalculator.ValidateAtStartup(merged.Options,
         sp.GetRequiredService<IAgentRegistry>().Available, extractors, startupLog);
-    return new AgentCostCalculator(pricing, extractors);
+    var calculator = new AgentCostCalculator(new AgentPricingOptions(), extractors);
+    pricingState.ApplySuccessfulMerge(merged, calculator);
+    return calculator;
 });
 builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
 {
@@ -1463,13 +1486,18 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
 // orchestrator/router are constructed with the initial options, so the
 // coordinator captures that same baseline at StartAsync to avoid emitting a
 // spurious "config_reloaded" entry on the first OnChange.
-builder.Services.AddSingleton<AgentConfigHotReload>(sp => new AgentConfigHotReload(
-    sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>(),
-    sp.GetRequiredService<OrchestratorService>(),
-    sp.GetRequiredService<AgentClassRouter>(),
-    sp.GetRequiredService<AgentBurnEstimator>(),
-    sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
-    sp.GetRequiredService<AgentCostCalculator>()));
+builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
+{
+    var pricingState = sp.GetRequiredService<AgentPricingState>();
+    return new AgentConfigHotReload(
+        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>(),
+        sp.GetRequiredService<OrchestratorService>(),
+        sp.GetRequiredService<AgentClassRouter>(),
+        sp.GetRequiredService<AgentBurnEstimator>(),
+        sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
+        sp.GetRequiredService<AgentCostCalculator>(),
+        pricingState);
+});
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
@@ -1615,6 +1643,7 @@ IdempotencyMiddleware.Use(app);
 WorkItemEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
+AgentPricingEndpoints.Map(app);
 ProjectBudgetEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);

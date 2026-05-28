@@ -134,6 +134,41 @@ public sealed class AgentCostCalculatorTests
     }
 
     [Fact]
+    public void NullRatesInConfig_ValidateAtStartupThrows()
+    {
+        var opts = new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["claude"] = new Dictionary<string, ModelRateConfig>
+                {
+                    ["claude-opus-4-7"] = null!,
+                },
+            },
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Claude], AllExtractors(), NullLogger.Instance));
+        Assert.Contains("configured", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void NullDefaultRatesInConfig_ValidateAtStartupThrows()
+    {
+        var opts = new AgentPricingOptions
+        {
+            DefaultRates = new Dictionary<string, ModelRateConfig>
+            {
+                ["gemini"] = null!,
+            },
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentCostCalculator.ValidateAtStartup(opts, [AgentKind.Gemini], AllExtractors(), NullLogger.Instance));
+        Assert.Contains("configured", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void MissingPricing_ValidateAtStartupDoesNotThrow()
     {
         // Gemini has no registered pricing; provider built-in fallback exists so only a Warning is emitted.

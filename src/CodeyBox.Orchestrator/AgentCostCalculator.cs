@@ -12,7 +12,7 @@ namespace CodeyBox.Orchestrator;
 /// "AgentPricing": {
 ///   "Rates": {
 ///     "claude": {
-///       "claude-opus-4-7": { "inputPerMillion": 15.0, "cachedInputPerMillion": 1.50, "outputPerMillion": 75.0 },
+///       "claude-opus-4-7": { "inputPerMillion": 5.0, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.0 },
 ///       "claude-sonnet-4-6": { ... }
 ///     }
 ///   },
@@ -29,6 +29,43 @@ public sealed class AgentPricingOptions
 
     /// <summary>Fallback rate per agent kind when the model is not in <see cref="Rates"/>.</summary>
     public Dictionary<string, ModelRateConfig> DefaultRates { get; set; } = [];
+
+    public static void ValidateRateNotNull(ModelRateConfig? rate, string agentKey, string modelKey, string source)
+    {
+        if (rate is null)
+            throw new InvalidOperationException(
+                $"AgentPricing: {source} rate is null for agent '{agentKey}' model '{modelKey}'");
+    }
+
+    /// <summary>
+    /// Deep-clones a pricing snapshot for defensive reads and reload swaps.
+    /// </summary>
+    public static AgentPricingOptions CloneSnapshot(AgentPricingOptions source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var clone = new AgentPricingOptions
+        {
+            DefaultRates = source.DefaultRates.ToDictionary(
+                kv => kv.Key,
+                kv => CloneRate(kv.Value),
+                StringComparer.Ordinal),
+        };
+        foreach (var (agentKey, modelMap) in source.Rates)
+        {
+            var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
+            foreach (var (modelKey, rate) in modelMap)
+                copy[modelKey] = CloneRate(rate);
+            clone.Rates[agentKey] = copy;
+        }
+        return clone;
+    }
+
+    private static ModelRateConfig CloneRate(ModelRateConfig rate) => new()
+    {
+        InputPerMillion = rate.InputPerMillion,
+        CachedInputPerMillion = rate.CachedInputPerMillion,
+        OutputPerMillion = rate.OutputPerMillion,
+    };
 }
 
 /// <summary>
@@ -60,15 +97,14 @@ public sealed class AgentCostCalculator
         AgentPricingOptions opts,
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null)
     {
-        _opts = opts;
+        _opts = AgentPricingOptions.CloneSnapshot(opts);
         _extractors = extractors ?? new Dictionary<AgentKind, IAgentCostExtractor>();
     }
 
     /// <summary>
-    /// Swaps the held pricing snapshot. Called by <c>AgentConfigHotReload</c>
-    /// when <c>CodeyBox:AgentPricing</c> changes so operators can update rates
-    /// without restarting CodeyBox. The new snapshot is validated by the same
-    /// rules as the startup snapshot before the swap.
+    /// Swaps the held pricing snapshot. Called by the API host after a successful
+    /// merge (startup or hot-reload). The new snapshot is
+    /// validated by the same rules as the startup snapshot before the swap.
     /// </summary>
     public void ApplyConfigReload(AgentPricingOptions next)
     {
@@ -76,6 +112,7 @@ public sealed class AgentCostCalculator
         {
             foreach (var (modelKey, rate) in modelMap)
             {
+                AgentPricingOptions.ValidateRateNotNull(rate, agentKey, modelKey, "reload");
                 if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                     throw new InvalidOperationException(
                         $"AgentPricing: negative rate for agent '{agentKey}' model '{modelKey}'");
@@ -83,11 +120,12 @@ public sealed class AgentCostCalculator
         }
         foreach (var (agentKey, rate) in next.DefaultRates)
         {
+            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "reload");
             if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                 throw new InvalidOperationException(
                     $"AgentPricing: negative default rate for agent '{agentKey}'");
         }
-        _opts = next;
+        _opts = AgentPricingOptions.CloneSnapshot(next);
     }
 
     /// <summary>
@@ -168,6 +206,7 @@ public sealed class AgentCostCalculator
         {
             foreach (var (modelKey, rate) in modelMap)
             {
+                AgentPricingOptions.ValidateRateNotNull(rate, agentKey, modelKey, "configured");
                 if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                     throw new InvalidOperationException(
                         $"AgentPricing: negative rate for agent '{agentKey}' model '{modelKey}'");
@@ -175,6 +214,7 @@ public sealed class AgentCostCalculator
         }
         foreach (var (agentKey, rate) in opts.DefaultRates)
         {
+            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "configured");
             if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
                 throw new InvalidOperationException(
                     $"AgentPricing: negative default rate for agent '{agentKey}'");
