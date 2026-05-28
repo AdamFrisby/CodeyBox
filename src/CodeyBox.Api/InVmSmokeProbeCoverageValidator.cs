@@ -5,9 +5,9 @@ namespace CodeyBox.Api;
 
 /// <summary>
 /// Hosted service that, at host start, hands every agent named in a
-/// <c>CodeyBox:AgentClasses</c> member to the in-VM smoke gate
-/// (<see cref="IInVmSmokeGate.EnforceMissingProbeCoverage"/>), which benches any
-/// member whose agent has no registered in-VM probe.
+/// <c>CodeyBox:AgentClasses</c> member to the in-VM smoke coverage policy
+/// (<see cref="IInVmSmokeCoveragePolicy.EnforceMissingProbeCoverage"/>), which
+/// benches any member whose agent has no registered in-VM probe.
 ///
 /// <para>A class member whose agent has no in-VM probe can never be verified
 /// inside the sandbox, so a missing binary / broken auth would only surface on
@@ -19,24 +19,24 @@ namespace CodeyBox.Api;
 ///
 /// <para>This service owns no smoke policy of its own: the enablement decision,
 /// the exempt list, the registered-probe set, and the availability mutation all
-/// live behind <see cref="IInVmSmokeGate"/>, so the host/presentation layer
-/// never recomputes enablement or binds to the concrete availability registry.
-/// Its only job is to read the configured class catalog and surface the gate's
-/// per-agent outcome to operators as a loud startup warning.</para>
+/// live behind <see cref="IInVmSmokeCoveragePolicy"/>, so the host/presentation
+/// layer never recomputes enablement or binds to the concrete availability
+/// registry. Its only job is to read the configured class catalog and surface
+/// the policy's per-agent outcome to operators as a loud startup warning.</para>
 /// </summary>
 internal sealed class InVmSmokeProbeCoverageValidator : IHostedService
 {
     private readonly IOptions<CodeyBoxOptions> _options;
-    private readonly IInVmSmokeGate _gate;
+    private readonly IInVmSmokeCoveragePolicy _coverage;
     private readonly ILogger<InVmSmokeProbeCoverageValidator> _log;
 
     public InVmSmokeProbeCoverageValidator(
         IOptions<CodeyBoxOptions> options,
-        IInVmSmokeGate gate,
+        IInVmSmokeCoveragePolicy coverage,
         ILogger<InVmSmokeProbeCoverageValidator> log)
     {
         _options = options;
-        _gate = gate;
+        _coverage = coverage;
         _log = log;
     }
 
@@ -45,13 +45,9 @@ internal sealed class InVmSmokeProbeCoverageValidator : IHostedService
         var classes = _options.Value.AgentClasses;
         if (classes.Count == 0) return Task.CompletedTask;
 
-        var coverage = classes
-            .Select(c => new InVmSmokeClassCoverage(
-                c.Id,
-                c.Members.Select(m => m.Agent).Where(a => !string.IsNullOrWhiteSpace(a)).ToList()))
-            .ToList();
+        var coverage = InVmSmokeCoverageRequest.FromAgentClasses(classes);
 
-        foreach (var outcome in _gate.EnforceMissingProbeCoverage(coverage))
+        foreach (var outcome in _coverage.EnforceMissingProbeCoverage(coverage))
             LogOutcome(outcome);
 
         return Task.CompletedTask;

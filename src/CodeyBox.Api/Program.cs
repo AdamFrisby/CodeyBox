@@ -1137,6 +1137,7 @@ builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
         StepTimeoutSeconds = v.StepTimeoutSeconds,
         CacheTtlMinutes = v.CacheTtlMinutes,
         SweepIntervalSeconds = v.SweepIntervalSeconds,
+        FailClosedOnProbeFault = v.FailClosedOnProbeFault,
         // Null (unset) keeps the InVmSmokeOptions default (copilot); an explicit
         // list — including empty — overrides it so operators can opt every agent
         // into the in-VM coverage requirement.
@@ -1160,6 +1161,14 @@ builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
 // single InVmSmokeProber instance so the gate, the background sweep service,
 // and the cache all observe the same state.
 builder.Services.AddSingleton<IInVmSmokeGate>(sp => sp.GetRequiredService<InVmSmokeProber>());
+// Coverage enforcement (startup validator + hot-reload) is a pure config policy
+// with no VM provisioning, kept in a separate type from the runtime dispatch
+// gate so those consumers depend only on the narrow IInVmSmokeCoveragePolicy
+// port rather than the full gate contract (interface segregation).
+builder.Services.AddSingleton<IInVmSmokeCoveragePolicy>(sp => new InVmSmokeCoveragePolicy(
+    sp.GetServices<IInVmSmokeProbe>(),
+    sp.GetRequiredService<AgentAvailabilityRegistry>(),
+    sp.GetRequiredService<InVmSmokeOptions>()));
 builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
     sp.GetRequiredService<IInVmSmokeGate>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
@@ -1808,7 +1817,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
         incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
-        smokeGate: sp.GetService<IInVmSmokeGate>());
+        coverage: sp.GetService<IInVmSmokeCoveragePolicy>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -2861,6 +2870,15 @@ namespace CodeyBox.Api
 
         /// <summary>Background sweep interval in seconds. Default 300 (5 min); set 0 to disable.</summary>
         public int SweepIntervalSeconds { get; set; } = 300;
+
+        /// <summary>
+        /// Fail-closed dispatch-gate policy. When true, an in-VM probe that
+        /// cannot reach a verdict (provisioning/exec/timeout/credential fault)
+        /// temporarily benches the agent so the router never dispatches to an
+        /// unverified CLI. Default false (fail-open). See
+        /// <see cref="InVmSmokeOptions.FailClosedOnProbeFault"/>.
+        /// </summary>
+        public bool FailClosedOnProbeFault { get; set; } = false;
 
         /// <summary>
         /// Host network profile for the probe sandbox; also selects which

@@ -110,64 +110,6 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _resolver.ResolveBaselineRef(_opts.NetworkProfile, SandboxProfileFlavor.Headless) ?? LiveRefSentinel;
 
     /// <summary>
-    /// <see cref="IInVmSmokeGate.EnforceMissingProbeCoverage"/>. Owns the
-    /// enablement decision, exempt list, registered-probe set, and registry
-    /// mutation so no caller has to. Pure (no provisioning) — safe to call at
-    /// startup and on every config hot-reload.
-    /// </summary>
-    public IReadOnlyList<InVmSmokeCoverageOutcome> EnforceMissingProbeCoverage(
-        IReadOnlyList<InVmSmokeClassCoverage> classes)
-    {
-        var covered = new HashSet<string>(_probes.Select(p => p.Kind.Value), StringComparer.OrdinalIgnoreCase);
-        var exempt = new HashSet<string>(_opts.ExemptAgentsWithoutProbe, StringComparer.OrdinalIgnoreCase);
-
-        // Distinct (agent -> the classes that name it) so each uncovered agent is
-        // reported once with the full blast radius.
-        var uncovered = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var cls in classes)
-        {
-            foreach (var agent in cls.Agents)
-            {
-                if (string.IsNullOrWhiteSpace(agent)) continue;
-                if (covered.Contains(agent)) continue;
-                if (!uncovered.TryGetValue(agent, out var ids))
-                {
-                    ids = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-                    uncovered[agent] = ids;
-                }
-                ids.Add(cls.ClassId);
-            }
-        }
-
-        var outcomes = new List<InVmSmokeCoverageOutcome>(uncovered.Count);
-        foreach (var (agent, classIds) in uncovered)
-        {
-            InVmSmokeCoverageAction action;
-            // Benching only makes sense when the prober is active: with it
-            // disabled or no probes registered, benching every member would be a
-            // self-inflicted outage, so fall back to warn-only.
-            if (!Enabled)
-            {
-                action = InVmSmokeCoverageAction.ProberInactive;
-            }
-            else if (exempt.Contains(agent))
-            {
-                action = InVmSmokeCoverageAction.Exempt;
-            }
-            else
-            {
-                var classList = string.Join(", ", classIds);
-                _availability.ExcludeForMissingProbe(
-                    new AgentKind(agent),
-                    $"no registered IInVmSmokeProbe — in-sandbox CLI cannot be verified (used by class(es): {classList})");
-                action = InVmSmokeCoverageAction.Benched;
-            }
-            outcomes.Add(new InVmSmokeCoverageOutcome(agent, classIds.ToList(), action));
-        }
-        return outcomes;
-    }
-
-    /// <summary>
     /// <see cref="IInVmSmokeGate.EnsureProbedAsync"/>. Called on the dispatch
     /// path (router) before an agent's <c>Available</c> state is trusted, so the
     /// very first work item after startup or a baseline rebake is gated by a

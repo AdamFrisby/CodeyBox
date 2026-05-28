@@ -34,7 +34,19 @@ public interface IInVmSmokeGate
     /// at a time) and never throws. A no-op when disabled.
     /// </summary>
     Task ProbeAllAsync(CancellationToken ct);
+}
 
+/// <summary>
+/// Startup/hot-reload coverage policy for the in-VM smoke subsystem. Kept
+/// separate from <see cref="IInVmSmokeGate"/> (interface segregation): coverage
+/// enforcement is a pure config-driven decision that never provisions a VM,
+/// whereas the gate's <see cref="IInVmSmokeGate.EnsureProbedAsync"/> /
+/// <see cref="IInVmSmokeGate.ProbeAllAsync"/> are runtime hooks that may. Callers
+/// that only enforce coverage (startup validator, hot-reload bridge) depend on
+/// this narrow port rather than the full dispatch-gate contract.
+/// </summary>
+public interface IInVmSmokeCoveragePolicy
+{
     /// <summary>
     /// Benches every agent named in <paramref name="classes"/> that has no
     /// registered in-VM probe (AC#1: an agent whose sandbox CLI can never be
@@ -44,11 +56,12 @@ public interface IInVmSmokeGate
     /// abstraction so callers (startup coverage validator, hot-reload bridge)
     /// never duplicate that policy or bind to the concrete registry.
     ///
-    /// <para>Benching only happens when the prober is active (<see cref="Enabled"/>)
-    /// and the agent is not on the exempt list; otherwise the uncovered agent is
-    /// reported but left routable. Idempotent — safe to re-run on every config
-    /// reload. Returns one outcome per <em>uncovered</em> agent so the caller can
-    /// surface it to operators; covered agents are omitted.</para>
+    /// <para>Benching only happens when the prober is active (feature enabled and
+    /// at least one probe registered) and the agent is not on the exempt list;
+    /// otherwise the uncovered agent is reported but left routable. Idempotent —
+    /// safe to re-run on every config reload. Returns one outcome per
+    /// <em>uncovered</em> agent so the caller can surface it to operators;
+    /// covered agents are omitted.</para>
     /// </summary>
     IReadOnlyList<InVmSmokeCoverageOutcome> EnforceMissingProbeCoverage(
         IReadOnlyList<InVmSmokeClassCoverage> classes);
@@ -56,7 +69,7 @@ public interface IInVmSmokeGate
 
 /// <summary>
 /// One agent class's membership, passed to
-/// <see cref="IInVmSmokeGate.EnforceMissingProbeCoverage"/>. <see cref="Agents"/>
+/// <see cref="IInVmSmokeCoveragePolicy.EnforceMissingProbeCoverage"/>. <see cref="Agents"/>
 /// are the raw configured agent names (the same strings the router treats as
 /// <c>AgentMembership.Agent</c>), so the bench is keyed identically to the
 /// router's availability read.
@@ -78,7 +91,7 @@ public enum InVmSmokeCoverageAction
 
 /// <summary>
 /// Per-uncovered-agent result of
-/// <see cref="IInVmSmokeGate.EnforceMissingProbeCoverage"/>. <see cref="ClassIds"/>
+/// <see cref="IInVmSmokeCoveragePolicy.EnforceMissingProbeCoverage"/>. <see cref="ClassIds"/>
 /// is the full set of classes that named the agent (its blast radius).
 /// </summary>
 public sealed record InVmSmokeCoverageOutcome(

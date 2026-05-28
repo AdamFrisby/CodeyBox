@@ -60,7 +60,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentPricingState? _pricingState;
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
     private readonly QuotaRouterOptions? _quotaRouterOptions;
-    private readonly IInVmSmokeGate? _smokeGate;
+    private readonly IInVmSmokeCoveragePolicy? _coverage;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -92,7 +92,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         IAgentBudgetConfigReloadable? budgetReloader = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
         QuotaRouterOptions? quotaRouterOptions = null,
-        IInVmSmokeGate? smokeGate = null)
+        IInVmSmokeCoveragePolicy? coverage = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -112,7 +112,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _pricingState = pricingState;
         _incrementalRebase = incrementalRebase;
         _quotaRouterOptions = quotaRouterOptions;
-        _smokeGate = smokeGate;
+        _coverage = coverage;
         _log = log;
     }
 
@@ -334,13 +334,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
     private void EnforceProbeCoverage(CodeyBoxOptions opts)
     {
-        if (_smokeGate is null) return;
-        var coverage = opts.AgentClasses
-            .Select(c => new InVmSmokeClassCoverage(
-                c.Id,
-                c.Members.Select(m => m.Agent).Where(a => !string.IsNullOrWhiteSpace(a)).ToList()))
-            .ToList();
-        foreach (var outcome in _smokeGate.EnforceMissingProbeCoverage(coverage))
+        if (_coverage is null) return;
+        var coverage = InVmSmokeCoverageRequest.FromAgentClasses(opts.AgentClasses);
+        foreach (var outcome in _coverage.EnforceMissingProbeCoverage(coverage))
         {
             if (outcome.Action == InVmSmokeCoverageAction.Benched)
                 _log.LogWarning(

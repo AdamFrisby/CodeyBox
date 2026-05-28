@@ -335,24 +335,18 @@ public sealed class AgentConfigHotReloadTests
             new InertCostStore(), new AgentBurnEstimatorOptions(),
             NullLogger<AgentBurnEstimator>.Instance);
 
-        // Real gate: claude has a probe (covered), cursor does not (uncovered).
+        // Real coverage policy: claude has a probe (covered), cursor does not.
         var registry = new AgentAvailabilityRegistry(
             new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
-        var gate = new InVmSmokeProber(
-            new ScriptedSandboxProvider(_ => new SandboxExecResult(0, "", "")),
-            new StubBaselineResolver("base-A"),
-            new NullCredentialProvider(),
+        var coverage = new InVmSmokeCoveragePolicy(
             [new CodeyBox.Agents.Claude.ClaudeInVmSmokeProbe()],
             registry,
-            new InVmSmokeCache(TimeSpan.FromMinutes(60)),
-            new CodeyBox.Webhooks.NullWebhookDispatcher(),
-            new InVmSmokeOptions { Enabled = true },
-            NullLogger<InVmSmokeProber>.Instance);
+            new InVmSmokeOptions { Enabled = true });
 
         var coordinator = new AgentConfigHotReload(
             monitor, orchFixture.Orchestrator, router, burnEstimator,
             NullLogger<AgentConfigHotReload>.Instance,
-            smokeGate: gate);
+            coverage: coverage);
         await coordinator.StartAsync(CancellationToken.None);
 
         // Add a class naming an uncovered agent at runtime.

@@ -180,6 +180,39 @@ public sealed class AuditAgentResolutionTests : IDisposable
         Assert.Equal(AgentKind.Claude, llmAuditor.ObservedRunnerKind);
     }
 
+    // ── In-VM smoke gate benches preferred audit agent → fall back to work ───
+
+    [Fact]
+    public async Task BenchedPreferredAuditAgent_FallsBackToWorkAgent_AndGateRanBeforeDispatch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var llmAuditor = new ContextCapturingAuditor("security:llm-review", AuditCapabilities.AgentCredentials | AuditCapabilities.Network);
+
+        // Gemini is the preferred audit agent and is registered + credentialed,
+        // so without the in-VM gate it would run audit. The gate is invoked
+        // before the audit fast path trusts it and benches it (the exit-127 /
+        // auth cascade caught in-sandbox), so audit must fall back to the work
+        // agent rather than dispatch to an unverified CLI.
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        var gate = new BenchOnProbeGate(availability, AgentKind.Gemini);
+
+        using var tp = BuildCrossReviewPipeline(seed, [llmAuditor],
+            workAgent: AgentKind.Claude,
+            auditAgent: AgentKind.Gemini,
+            credentialsForGemini: true,
+            availability: availability,
+            inVmSmokeGate: gate);
+
+        await RunItemAsync(tp);
+
+        // The audit-path gate actually invoked the in-VM probe before trusting
+        // the preferred agent (regression guard for the fast-path hole).
+        Assert.Contains(AgentKind.Gemini, gate.Probed);
+        // Benched in-VM → audit falls back to the work agent.
+        Assert.Equal(AgentKind.Claude, llmAuditor.ObservedRunnerKind);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private TestPipelineWithCapture BuildCrossReviewPipeline(
@@ -190,7 +223,9 @@ public sealed class AuditAgentResolutionTests : IDisposable
         bool credentialsForGemini,
         bool registerGemini = true,
         bool registerCodex = false,
-        IReadOnlyDictionary<string, AgentKind>? perAuditorAgent = null)
+        IReadOnlyDictionary<string, AgentKind>? perAuditorAgent = null,
+        AgentAvailabilityRegistry? availability = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -235,7 +270,9 @@ public sealed class AuditAgentResolutionTests : IDisposable
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            availability: availability,
+            inVmSmokeGate: inVmSmokeGate);
 
         return new TestPipelineWithCapture(pipeline, store, claudeAgent, webhooks);
     }
@@ -317,6 +354,42 @@ internal sealed class SelectiveCredentialProvider : ICredentialProvider
                 new AgentCredential(agent, new Dictionary<string, string>(), new Dictionary<string, string>()));
         return Task.FromResult<AgentCredential?>(null);
     }
+}
+
+/// <summary>
+/// In-VM smoke gate stub that records every <see cref="EnsureProbedAsync"/> call
+/// and, for one target kind, benches it in the availability registry on probe —
+/// modelling an in-sandbox CLI that fails (exit 127 / auth). Lets the audit-path
+/// test assert both that the gate ran before audit dispatch and that a benched
+/// preferred agent is routed past.
+/// </summary>
+internal sealed class BenchOnProbeGate : IInVmSmokeGate
+{
+    private readonly AgentAvailabilityRegistry _registry;
+    private readonly AgentKind _benchKind;
+    public List<AgentKind> Probed { get; } = [];
+
+    public BenchOnProbeGate(AgentAvailabilityRegistry registry, AgentKind benchKind)
+    {
+        _registry = registry;
+        _benchKind = benchKind;
+    }
+
+    public bool Enabled => true;
+
+    public Task EnsureProbedAsync(AgentKind kind, CancellationToken ct)
+    {
+        Probed.Add(kind);
+        if (kind == _benchKind)
+            _registry.MarkSmokeResult(
+                kind,
+                new AgentSmokeResult(false, "in-VM agent --version exit 127", TimeSpan.Zero),
+                SmokeExclusionSource.InVmSmoke,
+                clearsFastFail: false);
+        return Task.CompletedTask;
+    }
+
+    public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
 }
 
 internal sealed class TestPipelineWithCapture : IDisposable
