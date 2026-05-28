@@ -22,6 +22,21 @@ public sealed class DefaultOpencodeCliRunnerTests
     }
 
     [Fact]
+    public async Task RunModelsAsync_Success_ForwardsStdoutAndStderr()
+    {
+        const string stdout = "opencode/big-pickle\nopencode-go/glm-5\n";
+        const string stderr = "Loading providers...\n";
+        var runner = new SuccessOutputProcessRunner(stdout, stderr);
+        var cli = new DefaultOpencodeCliRunner(runner);
+
+        var result = await cli.RunModelsAsync("opencode", CancellationToken.None);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal(stdout, result.Stdout);
+        Assert.Equal(stderr, result.Stderr);
+    }
+
+    [Fact]
     public async Task RunModelsAsync_StartFailed_ReturnsExitOneWithEmptyStreams()
     {
         var runner = new StartFailedProcessRunner();
@@ -67,6 +82,20 @@ public sealed class DefaultOpencodeCliRunnerTests
             Environments.Add(environment);
             return Task.FromResult(new ProcessRunResult(0, "", ""));
         }
+    }
+
+    private sealed class SuccessOutputProcessRunner(string stdout, string stderr) : IProcessRunner
+    {
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null) =>
+            Task.FromResult(new ProcessRunResult(0, stdout, stderr));
     }
 
     private sealed class StartFailedProcessRunner : IProcessRunner
