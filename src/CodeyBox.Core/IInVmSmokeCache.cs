@@ -16,4 +16,12 @@ public interface IInVmSmokeCache
 
     /// <summary>Stores a smoke result with the configured TTL.</summary>
     void Set(AgentKind kind, string baselineRef, AgentSmokeResult result);
+
+    /// <summary>
+    /// Drops every cached entry for <paramref name="kind"/> across all baseline
+    /// refs. Called when an operator resets an agent (<c>/admin/agent/{name}/reset</c>)
+    /// so the next sweep / dispatch re-execs the CLI from scratch instead of
+    /// replaying a verdict captured before the operator's fix.
+    /// </summary>
+    void Invalidate(AgentKind kind);
 }

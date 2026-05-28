@@ -15,9 +15,12 @@ namespace CodeyBox.Agents.Cursor;
 ///   credential is missing or unreadable, which is the #138 signal).</item>
 /// </list>
 ///
-/// <para>When no credential is configured the probe runs only the
-/// binary-presence step, so a missing credential never produces a false
-/// binary-failure exclusion (the host-side credential gate handles that case).</para>
+/// <para>When the auth credential is absent — either no credential bundle at
+/// all, or one without <c>CODEYBOX_CURSOR_AUTH_JSON</c> — the probe returns only
+/// the binary-presence step. The prober still execs it (see
+/// <see cref="IInVmSmokeProbe.BuildSteps"/>), so a binary missing from PATH is
+/// caught even before auth is configured, while a missing credential never
+/// produces a false auth-failure exclusion (the host-side gate covers that).</para>
 ///
 /// <para>The "Workspace Trust Required" stage of the cascade is handled by the
 /// runner always passing <c>--trust</c> (pinned by a regression test); the

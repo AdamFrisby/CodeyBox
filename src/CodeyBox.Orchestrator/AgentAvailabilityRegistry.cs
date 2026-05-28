@@ -65,50 +65,60 @@ public sealed class AgentAvailabilityRegistry
 
         lock (entry.Sync)
         {
-            if (entry.ExcludedReason is null)
-                return new AgentAvailability(true, null, entry.LastSmokePassedAt);
-            return new AgentAvailability(false, entry.ExcludedReason, entry.LastSmokePassedAt);
+            var reason = entry.CombinedReason();
+            return new AgentAvailability(reason is null, reason, entry.LastSmokePassedAt);
         }
     }
 
     /// <summary>
-    /// Feeds a smoke-probe outcome. Passing transitions the agent to available
-    /// and resets the fast-fail counter; failing excludes the agent until a
-    /// later probe passes or <see cref="Reset"/> is called.
+    /// Feeds a smoke-probe outcome from a specific <paramref name="source"/>
+    /// (host credential check vs. in-sandbox CLI check). Passing clears that
+    /// source's exclusion (and the fast-fail breaker, since a passing probe
+    /// proves the binary launches); failing excludes the agent under that
+    /// source until a later probe from the <em>same</em> source passes or
+    /// <see cref="Reset"/> is called.
+    ///
+    /// <para>Exclusions are tracked per source so the over-permissive host
+    /// credential probe can never clear an in-VM exclusion (exit 127 / auth
+    /// path drift) it cannot itself observe — the agent stays benched until the
+    /// in-VM probe that benched it passes again.</para>
     /// </summary>
-    public AvailabilityTransition MarkSmokeResult(AgentKind kind, AgentSmokeResult result)
+    public AvailabilityTransition MarkSmokeResult(
+        AgentKind kind, AgentSmokeResult result, SmokeExclusionSource source = SmokeExclusionSource.HostSmoke)
     {
         var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
         var now = _time.GetUtcNow();
 
         lock (entry.Sync)
         {
-            var wasExcluded = entry.ExcludedReason is not null;
+            var wasExcluded = entry.IsExcluded;
             if (result.Ok)
             {
                 entry.LastSmokePassedAt = now;
                 entry.ConsecutiveFastFails = 0;
-                entry.ExcludedReason = null;
-                if (wasExcluded)
+                entry.Exclusions.Remove(source);
+                entry.Exclusions.Remove(SmokeExclusionSource.FastFail);
+                var stillExcluded = entry.IsExcluded;
+                if (wasExcluded && !stillExcluded)
                     _log.LogInformation(
-                        "Agent {Agent} smoke transitioned FAIL -> PASS at {At}",
-                        kind.Value, now);
+                        "Agent {Agent} smoke transitioned FAIL -> PASS at {At} (source {Source})",
+                        kind.Value, now, source);
                 return new AvailabilityTransition(
                     PreviouslyExcluded: wasExcluded,
-                    NowExcluded: false,
-                    Reason: null);
+                    NowExcluded: stillExcluded,
+                    Reason: entry.CombinedReason());
             }
 
             entry.LastSmokeFailedAt = now;
-            entry.ExcludedReason = $"smoke probe failed: {result.FailureReason ?? "unknown"}";
+            entry.Exclusions[source] = $"smoke probe failed: {result.FailureReason ?? "unknown"}";
             if (!wasExcluded)
                 _log.LogWarning(
-                    "Agent {Agent} smoke transitioned PASS -> FAIL at {At}: {Reason}",
-                    kind.Value, now, entry.ExcludedReason);
+                    "Agent {Agent} smoke transitioned PASS -> FAIL at {At} (source {Source}): {Reason}",
+                    kind.Value, now, source, entry.Exclusions[source]);
             return new AvailabilityTransition(
                 PreviouslyExcluded: wasExcluded,
                 NowExcluded: true,
-                Reason: entry.ExcludedReason);
+                Reason: entry.CombinedReason());
         }
     }
 
@@ -131,28 +141,29 @@ public sealed class AgentAvailabilityRegistry
 
         lock (entry.Sync)
         {
-            var wasExcluded = entry.ExcludedReason is not null;
+            var wasExcluded = entry.IsExcluded;
             if (success || duration >= fastFailThreshold)
             {
                 entry.ConsecutiveFastFails = 0;
-                return new AvailabilityTransition(wasExcluded, wasExcluded, entry.ExcludedReason);
+                return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
             }
 
             entry.ConsecutiveFastFails++;
             entry.LastFastFailAt = now;
             entry.LastFastFailDuration = duration;
 
-            if (entry.ConsecutiveFastFails >= _opts.MaxConsecutiveFastFails && entry.ExcludedReason is null)
+            if (entry.ConsecutiveFastFails >= _opts.MaxConsecutiveFastFails
+                && !entry.Exclusions.ContainsKey(SmokeExclusionSource.FastFail))
             {
-                entry.ExcludedReason =
+                entry.Exclusions[SmokeExclusionSource.FastFail] =
                     $"fast-fail circuit breaker: {entry.ConsecutiveFastFails} consecutive sub-{_opts.FastFailThresholdSeconds}s non-zero exits";
                 _log.LogWarning(
                     "Agent {Agent} excluded by fast-fail circuit breaker after {Count} consecutive sub-{Threshold}s failures",
                     kind.Value, entry.ConsecutiveFastFails, _opts.FastFailThresholdSeconds);
-                return new AvailabilityTransition(wasExcluded, true, entry.ExcludedReason);
+                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
             }
 
-            return new AvailabilityTransition(wasExcluded, wasExcluded, entry.ExcludedReason);
+            return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
         }
     }
 
@@ -171,7 +182,7 @@ public sealed class AgentAvailabilityRegistry
         lock (entry.Sync)
         {
             entry.ConsecutiveFastFails = 0;
-            entry.ExcludedReason = null;
+            entry.Exclusions.Clear();
             entry.LastFastFailAt = null;
             entry.LastFastFailDuration = null;
             entry.LastSmokePassedAt = null;
@@ -192,10 +203,11 @@ public sealed class AgentAvailabilityRegistry
             var entry = kvp.Value;
             lock (entry.Sync)
             {
+                var reason = entry.CombinedReason();
                 results.Add(new AgentAvailabilitySnapshot(
                     Agent: kvp.Key,
-                    Excluded: entry.ExcludedReason is not null,
-                    Reason: entry.ExcludedReason,
+                    Excluded: reason is not null,
+                    Reason: reason,
                     ConsecutiveFastFails: entry.ConsecutiveFastFails,
                     LastSmokePassedAt: entry.LastSmokePassedAt,
                     LastSmokeFailedAt: entry.LastSmokeFailedAt,
@@ -213,8 +225,38 @@ public sealed class AgentAvailabilityRegistry
         public DateTimeOffset? LastSmokeFailedAt;
         public DateTimeOffset? LastFastFailAt;
         public TimeSpan? LastFastFailDuration;
-        public string? ExcludedReason;
+
+        /// <summary>
+        /// Active exclusions keyed by the signal that raised them. The agent is
+        /// excluded while any entry is present; each source clears only its own
+        /// entry, so a host-smoke pass cannot lift an in-VM-smoke exclusion.
+        /// </summary>
+        public readonly Dictionary<SmokeExclusionSource, string> Exclusions = new();
+
+        public bool IsExcluded => Exclusions.Count > 0;
+
+        /// <summary>Null when available; the joined reasons across sources otherwise.</summary>
+        public string? CombinedReason() =>
+            Exclusions.Count == 0 ? null : string.Join("; ", Exclusions.Values);
     }
+}
+
+/// <summary>
+/// The signal that benched an agent. Tracked separately so a pass from one
+/// signal never clears another's exclusion — the over-permissive host
+/// credential probe must not be able to un-bench an agent that the in-sandbox
+/// CLI probe (or the fast-fail breaker) marked broken.
+/// </summary>
+public enum SmokeExclusionSource
+{
+    /// <summary>Host-side credential probe (<see cref="CredentialSmokeGate"/> / periodic sweeps).</summary>
+    HostSmoke,
+
+    /// <summary>In-sandbox CLI probe (<see cref="InVmSmokeProber"/>).</summary>
+    InVmSmoke,
+
+    /// <summary>Fast-fail circuit breaker over real run outcomes.</summary>
+    FastFail,
 }
 
 /// <summary>Result of <see cref="AgentAvailabilityRegistry.GetAvailability"/>.</summary>

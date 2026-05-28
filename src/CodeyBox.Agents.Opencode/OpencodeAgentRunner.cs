@@ -34,7 +34,6 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
 
     public override AgentKind Kind => AgentKind.Opencode;
 
-    /// <summary>Path to the opencode binary inside the sandbox.</summary>
     /// <summary>
     /// Default opencode CLI binary name inside the sandbox. Shared with
     /// <c>OpencodeInVmSmokeProbe</c> so the smoke check and the real runner
@@ -59,6 +58,7 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         "  chmod 600 \"$dest\"\n" +
         "fi\n";
 
+    /// <summary>Path to the opencode binary inside the sandbox. Defaults to <see cref="DefaultBinary"/>.</summary>
     public string Binary { get; init; } = DefaultBinary;
 
     /// <summary>

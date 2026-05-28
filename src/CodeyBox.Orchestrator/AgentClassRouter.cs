@@ -52,6 +52,7 @@ public sealed class AgentClassRouter
     // (legacy test fixtures) — the cap-spill check falls back to "no cap" and
     // the router behaves as before this feature.
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
+    private readonly IInVmSmokeGate? _inVmSmokeGate;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -75,7 +76,8 @@ public sealed class AgentClassRouter
         IAgentRunningCounters? runningCounters = null,
         AgentAvailabilityRegistry? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
-        AgentConcurrencySnapshot? concurrencySnapshot = null)
+        AgentConcurrencySnapshot? concurrencySnapshot = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -97,6 +99,7 @@ public sealed class AgentClassRouter
         _availability = availability;
         _budgetProvider = budgetProvider;
         _concurrencySnapshot = concurrencySnapshot;
+        _inVmSmokeGate = inVmSmokeGate;
     }
 
     /// <summary>
@@ -327,6 +330,16 @@ public sealed class AgentClassRouter
             if (_availability is { } reg)
             {
                 var av = reg.GetAvailability(member.Agent);
+                // An agent that looks Available may simply not have been in-VM
+                // probed yet (cold start / fresh baseline). Gate the FIRST such
+                // dispatch on a real in-sandbox CLI check (cache hit = free) so
+                // the exit-127 / auth cascade is caught here, not on first run.
+                // Already-excluded agents are skipped above without re-probing.
+                if (av.Available && _inVmSmokeGate is not null)
+                {
+                    await _inVmSmokeGate.EnsureProbedAsync(member.Agent, ct);
+                    av = reg.GetAvailability(member.Agent);
+                }
                 if (!av.Available)
                 {
                     var smokeReason = $"smoke gate: {av.Reason}";

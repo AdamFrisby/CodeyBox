@@ -43,4 +43,13 @@ public sealed class InVmSmokeCache : IInVmSmokeCache
             _entries[(kind, baselineRef)] = (result, _time.GetUtcNow() + _ttl);
         }
     }
+
+    public void Invalidate(AgentKind kind)
+    {
+        lock (_lock)
+        {
+            foreach (var key in _entries.Keys.Where(k => k.Item1 == kind).ToList())
+                _entries.Remove(key);
+        }
+    }
 }

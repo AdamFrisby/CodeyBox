@@ -18,19 +18,27 @@ namespace CodeyBox.Orchestrator;
 /// a failing in-VM probe routes the work item past the broken agent to a
 /// working alternative (AC#1) without any router change.</para>
 ///
-/// <para><b>Caching (AC#2 / AC#3).</b> Each result is cached by
-/// <c>(agent, baselineRef)</c>. A cache hit provisions nothing, so steady-state
-/// sweeps are free; a baseline rebake changes the content-hash ref and the next
-/// sweep re-probes against the new image.</para>
+/// <para><b>Caching (AC#2 / AC#3).</b> Only a <em>passing</em> result is cached,
+/// keyed by <c>(agent, baselineRef)</c>: a cache hit provisions nothing, so
+/// steady-state sweeps and dispatches are free. A baseline rebake changes the
+/// content-hash ref and the next sweep re-probes against the new image. A
+/// failing probe is never cached, so the next sweep (or an operator who fixes
+/// the CLI) re-execs immediately rather than waiting out a TTL — that is the
+/// excluded-agent self-healing path.</para>
+///
+/// <para><b>Reconciliation.</b> Every probe — including a cache hit — feeds its
+/// verdict into <see cref="AgentAvailabilityRegistry"/> under
+/// <see cref="SmokeExclusionSource.InVmSmoke"/>, so the registry and cache can
+/// never silently diverge (e.g. after an operator reset clears the registry).</para>
 ///
 /// <para><b>What excludes vs. what is transient.</b> Only a <em>clean</em>
-/// negative signal — a step that exits non-zero, or whose output is missing the
-/// expected marker — excludes an agent. Provisioning failures, exec
-/// exceptions, and step timeouts are treated as transient infrastructure
-/// problems: they are logged and skipped without mutating availability or the
-/// cache, so a flaky host never wrongly benches a working agent.</para>
+/// negative signal — a step that exits non-zero — excludes an agent.
+/// Provisioning failures, exec exceptions, and step timeouts are treated as
+/// transient infrastructure problems: they are logged and skipped without
+/// mutating availability or the cache, so a flaky host never wrongly benches a
+/// working agent.</para>
 /// </summary>
-public sealed class InVmSmokeProber
+public sealed class InVmSmokeProber : IInVmSmokeGate
 {
     private const string LiveRefSentinel = "live";
 
@@ -76,8 +84,7 @@ public sealed class InVmSmokeProber
     {
         if (!Enabled) return;
 
-        var baselineRef = _resolver.ResolveBaselineRef(_opts.NetworkProfile, SandboxProfileFlavor.Headless)
-            ?? LiveRefSentinel;
+        var baselineRef = ResolveBaselineRef();
 
         foreach (var probe in _probes)
         {
@@ -94,18 +101,56 @@ public sealed class InVmSmokeProber
         }
     }
 
+    private string ResolveBaselineRef() =>
+        _resolver.ResolveBaselineRef(_opts.NetworkProfile, SandboxProfileFlavor.Headless) ?? LiveRefSentinel;
+
     /// <summary>
-    /// Probes one agent. Returns the result that was applied, or null when the
-    /// probe was skipped (cache hit, no credential, or a transient failure that
-    /// must not change availability).
+    /// <see cref="IInVmSmokeGate.EnsureProbedAsync"/>. Called on the dispatch
+    /// path (router) before an agent's <c>Available</c> state is trusted, so the
+    /// very first work item after startup or a baseline rebake is gated by a
+    /// real in-sandbox CLI check rather than racing the background sweep. A
+    /// cache hit is free (no VM); a miss provisions one VM and feeds the
+    /// registry, after which the router re-reads availability and skips a newly
+    /// excluded agent. Never throws — the dispatch path must not be taken down
+    /// by a probe fault.
+    /// </summary>
+    public async Task EnsureProbedAsync(AgentKind kind, CancellationToken ct)
+    {
+        if (!Enabled) return;
+        var probe = _probes.FirstOrDefault(p => p.Kind == kind);
+        if (probe is null) return;
+
+        try
+        {
+            await ProbeAgentAsync(probe, ResolveBaselineRef(), ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "In-VM smoke gate: probe for {Agent} threw; treating as transient", kind.Value);
+        }
+    }
+
+    /// <summary>
+    /// Probes one agent. Returns the result that was applied, or null when a
+    /// transient failure (provisioning / exec / timeout) means availability must
+    /// not change. A cache hit re-applies the cached <em>passing</em> verdict to
+    /// the registry (reconciliation) and returns it without provisioning a VM.
     /// </summary>
     internal async Task<AgentSmokeResult?> ProbeAgentAsync(
         IInVmSmokeProbe probe, string baselineRef, CancellationToken ct)
     {
-        if (_cache.TryGet(probe.Kind, baselineRef) is not null)
+        if (_cache.TryGet(probe.Kind, baselineRef) is { } cached)
         {
+            // Only passing verdicts are cached, so this re-asserts availability.
+            // Re-applying keeps the registry reconciled with the cache even after
+            // an operator reset cleared the registry without a fresh probe.
+            // No AuditLog/Stopwatch entry here: a cache hit happens on every
+            // gated dispatch in steady state, so only surface a webhook on an
+            // actual availability transition (e.g. reconciling after a reset).
             _log.LogDebug("In-VM smoke: cache hit for {Agent} @ {Ref}", probe.Kind.Value, baselineRef);
-            return null;
+            var hitTransition = _availability.MarkSmokeResult(probe.Kind, cached, SmokeExclusionSource.InVmSmoke);
+            await EmitTransitionWebhookAsync(probe.Kind, cached, hitTransition);
+            return cached;
         }
 
         AgentCredential? credential;
@@ -118,12 +163,11 @@ public sealed class InVmSmokeProber
             _log.LogDebug(ex, "In-VM smoke: could not resolve credential for {Agent}", probe.Kind.Value);
             return null;
         }
-        if (credential is null)
-        {
-            _log.LogDebug("In-VM smoke: no credential configured for {Agent}; skipping", probe.Kind.Value);
-            return null;
-        }
 
+        // A null credential does NOT skip the agent: the probe still returns its
+        // credential-independent steps (e.g. `--version`), so a binary missing
+        // from the sandbox PATH (exit 127) is caught even before any credential
+        // is configured. This is the IInVmSmokeProbe.BuildSteps(null) contract.
         var steps = probe.BuildSteps(credential);
         if (steps.Count == 0) return null;
 
@@ -131,7 +175,7 @@ public sealed class InVmSmokeProber
         AgentSmokeResult result;
         try
         {
-            result = await RunStepsInSandboxAsync(probe.Kind, credential, baselineRef, steps, sw, ct);
+            result = await RunStepsInSandboxAsync(credential, baselineRef, steps, sw, ct);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -147,15 +191,17 @@ public sealed class InVmSmokeProber
             return null;
         }
 
-        _cache.Set(probe.Kind, baselineRef, result);
-        var transition = _availability.MarkSmokeResult(probe.Kind, result);
+        // Cache only passes: a failure must be re-checked on the next sweep /
+        // dispatch (self-healing) rather than pinned for the whole TTL.
+        if (result.Ok)
+            _cache.Set(probe.Kind, baselineRef, result);
+        var transition = _availability.MarkSmokeResult(probe.Kind, result, SmokeExclusionSource.InVmSmoke);
         await EmitTransitionEventsAsync(probe.Kind, result, transition);
         return result;
     }
 
     private async Task<AgentSmokeResult> RunStepsInSandboxAsync(
-        AgentKind kind,
-        AgentCredential credential,
+        AgentCredential? credential,
         string baselineRef,
         IReadOnlyList<InVmSmokeStep> steps,
         Stopwatch sw,
@@ -187,14 +233,14 @@ public sealed class InVmSmokeProber
         return new AgentSmokeResult(true, null, sw.Elapsed);
     }
 
-    private SandboxSpec BuildSpec(AgentCredential credential, string baselineRef)
+    private SandboxSpec BuildSpec(AgentCredential? credential, string baselineRef)
     {
-        var mounts = new List<SandboxMount>(credential.Mounts)
+        var mounts = new List<SandboxMount>(credential?.Mounts ?? [])
         {
             new() { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
         };
 
-        var env = new Dictionary<string, string>(credential.EnvironmentVariables);
+        var env = new Dictionary<string, string>(credential?.EnvironmentVariables ?? new Dictionary<string, string>());
 
         return new SandboxSpec
         {
@@ -221,6 +267,12 @@ public sealed class InVmSmokeProber
         else
             AuditLog.AgentSmokeFailed(kind, result.FailureReason, result.Duration);
 
+        await EmitTransitionWebhookAsync(kind, result, transition);
+    }
+
+    private async Task EmitTransitionWebhookAsync(
+        AgentKind kind, AgentSmokeResult result, AvailabilityTransition transition)
+    {
         if (!transition.PreviouslyExcluded && transition.NowExcluded)
         {
             await _webhooks.PublishAsync(new WebhookEvent

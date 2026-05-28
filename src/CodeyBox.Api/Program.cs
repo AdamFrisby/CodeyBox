@@ -898,7 +898,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IAgentRunningCounters>(),
         sp.GetService<AgentAvailabilityRegistry>(),
         sp.GetService<IAgentBudgetProvider>(),
-        sp.GetService<AgentConcurrencySnapshot>());
+        sp.GetService<AgentConcurrencySnapshot>(),
+        sp.GetService<IInVmSmokeGate>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -1019,6 +1020,9 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
+// Startup guard (AC#1): warn when a configured AgentClass member has no in-VM
+// probe, so a CLI-backed agent that would fail at first dispatch is flagged now.
+builder.Services.AddHostedService<InVmSmokeProbeCoverageValidator>();
 
 // --- Model-list probes (used by AgentClassConfigValidator at startup) --------
 // Registered as IEnumerable<IAgentModelListProbe>; the validator resolves by Kind.
@@ -1144,6 +1148,11 @@ builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProber>()));
+// The router consults the prober as a dispatch gate (IInVmSmokeGate) so the
+// first work item per baseline is verified in-VM before routing; share the
+// single InVmSmokeProber instance so the gate, the background sweep service,
+// and the cache all observe the same state.
+builder.Services.AddSingleton<IInVmSmokeGate>(sp => sp.GetRequiredService<InVmSmokeProber>());
 builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
     sp.GetRequiredService<InVmSmokeProber>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
@@ -2181,7 +2190,7 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     });
 });
 
-app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry registry, IAgentRegistry agents) =>
+app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry registry, IAgentRegistry agents, IInVmSmokeCache inVmCache) =>
 {
     // Mirror /smoke: normalise to lowercase so case-mismatched names match the
     // canonical kinds returned by IAgentRegistry.Available.
@@ -2192,6 +2201,9 @@ app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry
     if (!agents.Available.Contains(kind))
         return Results.NotFound(new { error = $"unknown agent '{name}'" });
     registry.Reset(kind);
+    // Drop any cached in-VM verdict too, so the next sweep / dispatch re-execs
+    // the CLI rather than replaying a result captured before the operator's fix.
+    inVmCache.Invalidate(kind);
     var availability = registry.GetAvailability(kind);
     return Results.Ok(new
     {

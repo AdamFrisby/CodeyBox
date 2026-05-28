@@ -1,4 +1,5 @@
 using CodeyBox.Agents.Cursor;
+using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Webhooks;
@@ -20,24 +21,33 @@ public sealed class InVmSmokeProberTests
         new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{\"token\":\"t\"}" },
         new Dictionary<string, string>());
 
+    private static readonly AgentCredential OpencodeCred = new(
+        AgentKind.Opencode,
+        new Dictionary<string, string> { ["OPENCODE_AUTH_JSON"] = "{\"token\":\"t\"}" },
+        new Dictionary<string, string>());
+
     private static InVmSmokeProber Build(
         FakeSandboxProvider provider,
         AgentAvailabilityRegistry registry,
         InVmSmokeCache cache,
         FakeBaselineResolver resolver,
-        InVmSmokeOptions? opts = null)
+        InVmSmokeOptions? opts = null,
+        ICredentialProvider? credentials = null,
+        IEnumerable<IInVmSmokeProbe>? probes = null)
     {
         return new InVmSmokeProber(
             provider,
             resolver,
-            new ConstantCredentialProvider(CursorCred),
-            [new CursorInVmSmokeProbe()],
+            credentials ?? new ConstantCredentialProvider(CursorCred),
+            probes ?? [new CursorInVmSmokeProbe()],
             registry,
             cache,
             new NullWebhookDispatcher(),
             opts ?? new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
             NullLogger<InVmSmokeProber>.Instance);
     }
+
+    private static InVmSmokeCache NewCache() => new(TimeSpan.FromMinutes(60));
 
     private static AgentAvailabilityRegistry NewRegistry() =>
         new(new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
@@ -161,8 +171,221 @@ public sealed class InVmSmokeProberTests
         Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
+    [Fact]
+    public async Task Disabled_DoesNotProvisionOrMutateRegistry()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(127, "", "not found"));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions { Enabled = false, ImageReference = "img", SweepIntervalSeconds = 0 });
+
+        Assert.False(prober.Enabled);
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task NullCredential_StillRunsVersionStep_AndExcludesOnExit127()
+    {
+        // No credential bundle at all: the prober must still exec the
+        // credential-independent --version step (BuildSteps(null) contract), so
+        // a binary missing from PATH is caught rather than silently skipped.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(127, "", "command not found"));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            credentials: new NullCredentialProvider());
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.Equal(1, provider.CreateCount);
+        Assert.Single(provider.ExecutedArgv); // only --version; no auth steps
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Contains("agent binary not runnable", registry.GetAvailability(AgentKind.Cursor).Reason);
+    }
+
+    [Fact]
+    public async Task AuthMaterialiseStepFailure_ExcludesWithMaterialiseHint()
+    {
+        // The PR #138 path-drift stage: version is fine, but the bash auth
+        // materialisation step exits non-zero (e.g. unwritable dest).
+        var provider = new FakeSandboxProvider(exec =>
+            exec.Argv.Count > 0 && exec.Argv[0] == "bash"
+                ? new SandboxExecResult(1, "", "permission denied")
+                : new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("materialise cursor auth.json", av.Reason);
+    }
+
+    [Fact]
+    public async Task FailingProbe_IsNotCached_NextSweepReprobes()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(127, "", "not found"));
+        var cache = NewCache();
+        var prober = Build(provider, NewRegistry(), cache, new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A")); // failures are never cached
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        // No cached pass to short-circuit on, so the failing agent is re-probed
+        // every sweep — the self-healing path once the CLI is fixed.
+        Assert.Equal(2, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task CacheHit_ReappliesPassToRegistry_WithoutReprovisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(1, provider.CreateCount);
+
+        // Simulate the registry diverging from the cache (e.g. an operator reset
+        // cleared it, or another signal benched it). A cache hit must reconcile.
+        registry.MarkSmokeResult(AgentKind.Cursor,
+            new AgentSmokeResult(false, "drift", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.Equal(1, provider.CreateCount); // cache hit: no new VM
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available); // reconciled
+    }
+
+    [Fact]
+    public async Task CacheInvalidate_ForcesReprobe()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var cache = NewCache();
+        var prober = Build(provider, NewRegistry(), cache, new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(1, provider.CreateCount);
+
+        // /admin/agent/{name}/reset invalidates the cache so the next sweep
+        // re-execs the CLI instead of replaying the stale pass.
+        cache.Invalidate(AgentKind.Cursor);
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(2, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task CacheTtlExpiry_Reprobes()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var clock = new MutableClock(DateTimeOffset.UnixEpoch);
+        var cache = new InVmSmokeCache(TimeSpan.FromMinutes(60), clock);
+        var prober = Build(provider, NewRegistry(), cache, new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(1, provider.CreateCount);
+
+        clock.Advance(TimeSpan.FromMinutes(61)); // TTL elapsed
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(2, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task AllStepsPass_ExecutesVersionMaterialiseStatusInOrder()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var prober = Build(provider, NewRegistry(), NewCache(), new FakeBaselineResolver("base-A"));
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        // Pins the smoke contract: same binary + auth script the runner uses.
+        Assert.Equal(3, provider.ExecutedArgv.Count);
+        Assert.Equal([CursorAgentRunner.DefaultBinary, "--version"], provider.ExecutedArgv[0]);
+        Assert.Equal(["bash", "-c", CursorAgentRunner.AuthMaterialiseScript], provider.ExecutedArgv[1]);
+        Assert.Equal([CursorAgentRunner.DefaultBinary, "status"], provider.ExecutedArgv[2]);
+    }
+
+    [Fact]
+    public async Task ThreeStageCascade_EachStageCaughtAtSmokeTime()
+    {
+        // AC#5: the 2026-05-28 cursor cascade, stage by stage, all caught here.
+
+        // Stage 1 — binary missing from PATH (exit 127).
+        var s1 = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "--version") ? new SandboxExecResult(127, "", "command not found")
+                                       : new SandboxExecResult(0, "", ""));
+        var r1 = NewRegistry();
+        await Build(s1, r1, NewCache(), new FakeBaselineResolver("base-A")).ProbeAllAsync(CancellationToken.None);
+        Assert.False(r1.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Contains("agent binary not runnable", r1.GetAvailability(AgentKind.Cursor).Reason);
+
+        // Stage 2 — auth materialised to the wrong path → `agent status` fails.
+        var s2 = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status") ? new SandboxExecResult(1, "", "Authentication required")
+                                    : new SandboxExecResult(0, "", ""));
+        var r2 = NewRegistry();
+        await Build(s2, r2, NewCache(), new FakeBaselineResolver("base-A")).ProbeAllAsync(CancellationToken.None);
+        Assert.False(r2.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Contains("agent status failed", r2.GetAvailability(AgentKind.Cursor).Reason);
+
+        // Stage 3 (workspace trust) is handled by the runner always passing
+        // --trust; the version/status probe steps do not engage workspace trust,
+        // so with both prior stages fixed the agent smokes clean and is routable.
+        var s3 = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var r3 = NewRegistry();
+        await Build(s3, r3, NewCache(), new FakeBaselineResolver("base-A")).ProbeAllAsync(CancellationToken.None);
+        Assert.True(r3.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task Opencode_ProvidersStepFailure_ExcludesAgent()
+    {
+        var provider = new FakeSandboxProvider(exec =>
+            exec.Argv.Count >= 2 && exec.Argv[0] == OpencodeAgentRunner.DefaultBinary && exec.Argv[1] == "providers"
+                ? new SandboxExecResult(1, "", "no providers configured")
+                : new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            credentials: new ConstantCredentialProvider(OpencodeCred),
+            probes: [new OpencodeInVmSmokeProbe()]);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        var av = registry.GetAvailability(AgentKind.Opencode);
+        Assert.False(av.Available);
+        Assert.Contains("opencode providers failed", av.Reason);
+    }
+
+    [Fact]
+    public async Task HostSmokePass_DoesNotClearInVmExclusion()
+    {
+        // The core defect: the over-permissive host credential probe (env-var
+        // only) must not be able to un-bench an agent that the in-VM probe
+        // failed (exit 127 / auth drift it cannot itself observe).
+        var registry = NewRegistry();
+        registry.MarkSmokeResult(AgentKind.Cursor,
+            new AgentSmokeResult(false, "exit 127", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        registry.MarkSmokeResult(AgentKind.Cursor,
+            new AgentSmokeResult(true, null, TimeSpan.Zero), SmokeExclusionSource.HostSmoke);
+
+        // In-VM exclusion still stands — only an in-VM pass clears it.
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        registry.MarkSmokeResult(AgentKind.Cursor,
+            new AgentSmokeResult(true, null, TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
     private static bool IsAgent(SandboxExec exec, string sub) =>
-        exec.Argv.Count >= 2 && exec.Argv[0] == "agent" && exec.Argv[1] == sub;
+        exec.Argv.Count >= 2 && exec.Argv[0] == CursorAgentRunner.DefaultBinary && exec.Argv[1] == sub;
 
     // ── Fakes ──────────────────────────────────────────────────────────────
 
@@ -172,6 +395,8 @@ public sealed class InVmSmokeProberTests
         public int CreateCount { get; private set; }
         public string? LastBaselineRef { get; private set; }
         public Exception? ThrowOnCreate { get; set; }
+        // Every argv exec'd across all sandboxes this provider created, in order.
+        public List<IReadOnlyList<string>> ExecutedArgv { get; } = new();
 
         public FakeSandboxProvider(Func<SandboxExec, SandboxExecResult> onExec) => _onExec = onExec;
 
@@ -182,7 +407,11 @@ public sealed class InVmSmokeProberTests
             CreateCount++;
             LastBaselineRef = spec.BaselineImageRef;
             if (ThrowOnCreate is not null) throw ThrowOnCreate;
-            return Task.FromResult<ISandbox>(new FakeSandbox(_onExec));
+            return Task.FromResult<ISandbox>(new FakeSandbox(exec =>
+            {
+                ExecutedArgv.Add(exec.Argv);
+                return _onExec(exec);
+            }));
         }
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
@@ -201,6 +430,21 @@ public sealed class InVmSmokeProberTests
             Task.FromResult(_onExec(exec));
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>Credential provider that resolves null for every agent.</summary>
+    private sealed class NullCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default) =>
+            Task.FromResult<AgentCredential?>(null);
+    }
+
+    private sealed class MutableClock : TimeProvider
+    {
+        private DateTimeOffset _now;
+        public MutableClock(DateTimeOffset start) => _now = start;
+        public override DateTimeOffset GetUtcNow() => _now;
+        public void Advance(TimeSpan by) => _now += by;
     }
 
     private sealed class FakeBaselineResolver : IBaselineImageResolver

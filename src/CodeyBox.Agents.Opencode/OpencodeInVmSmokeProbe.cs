@@ -12,8 +12,11 @@ namespace CodeyBox.Agents.Opencode;
 ///   in the right place and the CLI can enumerate its configured providers.</item>
 /// </list>
 ///
-/// <para>When no credential is configured the probe runs only the
-/// binary-presence step. See <see cref="IInVmSmokeProbe"/>.</para>
+/// <para>When the auth credential is absent — no credential bundle, or one
+/// without <c>OPENCODE_AUTH_JSON</c> — the probe returns only the
+/// binary-presence step (still exec'd by the prober), so a binary missing from
+/// PATH is caught without a false auth-failure exclusion. See
+/// <see cref="IInVmSmokeProbe"/>.</para>
 /// </summary>
 public sealed class OpencodeInVmSmokeProbe : IInVmSmokeProbe
 {

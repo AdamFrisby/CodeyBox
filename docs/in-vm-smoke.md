@@ -1,0 +1,73 @@
+# In-VM smoke probe
+
+The host-side credential smoke gate (`CredentialSmokeGate`) only proves the
+orchestrator *host* holds the right credential env-vars. It cannot see whether
+the agent CLI actually runs **inside** the sandbox. The in-VM smoke prober
+(`InVmSmokeProber`) closes that gap: it clones a sandbox from the active
+baseline image and execs each agent's declared smoke sequence
+(`IInVmSmokeProbe.BuildSteps`) inside it.
+
+## What it catches — the three-stage cursor cascade
+
+Activating cursor on 2026-05-28 produced a three-stage failure cascade on the
+first dispatched work item. Each stage is now caught at smoke time:
+
+| Stage | Real-dispatch symptom | In-VM smoke step that catches it |
+|---|---|---|
+| 1. Binary not on PATH | `agent: command not found` (exit 127) | `agent --version` exits non-zero → agent excluded |
+| 2. Auth materialised to wrong path | exit 1, "Authentication required" | runner's `AuthMaterialiseScript` + `agent status` exits non-zero → agent excluded |
+| 3. Workspace trust required | exit 1, "Workspace Trust Required" | runner always passes `--trust` (pinned by a runner regression test); `--version`/`status` do not engage workspace trust |
+
+The probe steps reuse the runner's **exact** binary name
+(`CursorAgentRunner.DefaultBinary`) and auth-materialisation script
+(`CursorAgentRunner.AuthMaterialiseScript`), so path drift like PR #138 is
+exercised by the probe, not discovered at first dispatch.
+
+Checks are **exit-code only** — never output-text matching. CLI auth wording
+drifts between releases and `"Not logged in"` contains `"logged in"`, so a
+substring guard both false-passes and risks false-benching a healthy agent.
+
+## How a failure routes past the broken agent (AC#1)
+
+A failing probe marks the agent excluded in `AgentAvailabilityRegistry` under
+`SmokeExclusionSource.InVmSmoke`. `AgentClassRouter` already skips excluded
+members, so the work item routes to a working alternative — no router change.
+
+The router also calls `IInVmSmokeGate.EnsureProbedAsync` for any
+still-`Available` member **before trusting it**, so the *first* dispatch after
+startup or a baseline rebake is gated by a real in-sandbox check rather than
+racing the background sweep. A new `AgentClass` member whose agent has no
+registered `IInVmSmokeProbe` is flagged by `InVmSmokeProbeCoverageValidator`
+with a startup warning.
+
+## Caching, self-healing and operator reset
+
+- Only **passing** verdicts are cached, keyed by `(agent, baselineRef)`. A
+  cache hit provisions nothing — steady-state dispatch is free (AC#2).
+- A **failing** verdict is never cached, so the next background sweep (default
+  every 5 min) re-execs the CLI. Once the operator fixes the binary/auth and
+  rebakes (new content-hash ref) or the next sweep passes, the agent rejoins
+  routing — the self-healing path.
+- A baseline rebake changes the content-hash ref, so the next sweep re-probes
+  against the new image (AC#3).
+- `POST /admin/agent/{name}/reset` clears the registry **and** invalidates the
+  in-VM cache for that agent, so a reset always forces a fresh re-probe rather
+  than replaying a verdict captured before the fix.
+
+## Operator runbook: verifying the cascade is caught at smoke time
+
+1. Break stage 1 in the baseline image (e.g. remove the `~/.local/bin/agent`
+   symlink) and rebake. Watch the logs: the next sweep logs
+   `Agent cursor smoke transitioned PASS -> FAIL ... agent binary not runnable`
+   and `/admin/agents/availability` shows cursor excluded. New work items route
+   to the next class member instead of failing.
+2. Restore the symlink but break stage 2 (materialise auth to the legacy
+   `~/.cursor/credentials.json`). The probe's `agent status` step exits
+   non-zero and cursor stays excluded with `agent status failed` — caught before
+   any work item is dispatched.
+3. Fix both and call `POST /admin/agent/cursor/reset`. The cache is invalidated;
+   the next sweep/dispatch re-probes, the probe passes, and cursor returns to
+   routing.
+
+The unit suite mirrors this in `InVmSmokeProberTests`
+(`ThreeStageCascade_EachStageCaughtAtSmokeTime`) using a scripted sandbox.
