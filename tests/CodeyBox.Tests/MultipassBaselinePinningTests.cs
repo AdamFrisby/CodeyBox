@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -150,48 +151,48 @@ public sealed class MultipassBaselinePinningTests : IDisposable
             {
                 infoQueries.Enqueue(name);
                 return Task.FromResult(states.TryGetValue(name, out var s)
-                    ? new RunResult(0, s, "")
-                    : new RunResult(1, "", "not found"));
+                    ? new ProcessRunResult(0, s, "")
+                    : new ProcessRunResult(1, "", "not found"));
             }
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 var launched = argv[3];
                 launchNames.Enqueue(launched);
                 states[launched] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "exec", var execName, "--", "cloud-init", "status", "--wait"])
-                return Task.FromResult(new RunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
+                return Task.FromResult(new ProcessRunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
             if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", ..]
                 && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "clone", var source, "--name", var cloneName])
             {
                 cloneSources.Enqueue(source);
                 states[cloneName] = "Stopped";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "start", var startName])
             {
                 states[startName] = "Running";
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "transfer", _, var destination]
                 && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 states.TryRemove(deleteName, out _);
-                return Task.FromResult(new RunResult(0, "", ""));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            return Task.FromResult(new RunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
         });
     }
 }

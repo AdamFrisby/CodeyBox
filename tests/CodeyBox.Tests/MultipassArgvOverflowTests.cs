@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Multipass;
 
 namespace CodeyBox.Tests;
@@ -122,20 +123,21 @@ public sealed class MultipassArgvOverflowTests : IDisposable
         public List<RecordedCall> Calls { get; } = [];
         public List<RecordedTransfer> Transfers { get; } = [];
 
-        public Task<RunResult> RunAsync(
+        public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
             string? stdin,
             CancellationToken ct,
             Action<string>? stdoutChunkCallback = null,
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
-            int? maxStderrBytes = null)
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null)
         {
             Calls.Add(new RecordedCall(argv.ToArray(), stdin));
             if (argv is ["multipass", "transfer", var source, var destination])
                 Transfers.Add(new RecordedTransfer(source, destination, File.ReadAllText(source)));
             stdoutChunkCallback?.Invoke("ok\n");
-            return Task.FromResult(new RunResult(0, "ok\n", ""));
+            return Task.FromResult(new ProcessRunResult(0, "ok\n", ""));
         }
     }
 }

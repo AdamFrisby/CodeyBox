@@ -908,7 +908,14 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
         },
         loggerFactory.CreateLogger<CodexModelListProbe>());
 });
-builder.Services.AddSingleton<IAgentModelListProbe>(_ => new OpencodeModelListProbe());
+builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    return new OpencodeModelListProbe(
+        new DefaultOpencodeCliRunner(),
+        binary: Environment.GetEnvironmentVariable("CODEYBOX_OPENCODE_BINARY"),
+        loggerFactory.CreateLogger<OpencodeModelListProbe>());
+});
 builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();

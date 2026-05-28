@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Multipass;
 using Serilog;
 using Serilog.Events;
@@ -39,7 +40,7 @@ public sealed class MultipassDaemonRetryTests
     {
         Assert.Null(MultipassDaemonRetry.ClassifyTransient(
             Argv("launch"),
-            new RunResult(0, "", "cannot connect to the multipass socket")));
+            new ProcessRunResult(0, "", "cannot connect to the multipass socket")));
     }
 
     [Fact]
@@ -52,7 +53,7 @@ public sealed class MultipassDaemonRetryTests
         {
             var classification = MultipassDaemonRetry.ClassifyTransient(
                 Argv(nonRetryable, "codeybox-x"),
-                new RunResult(1, "", "cannot connect to the multipass socket"));
+                new ProcessRunResult(1, "", "cannot connect to the multipass socket"));
             Assert.Null(classification);
         }
     }
@@ -62,7 +63,7 @@ public sealed class MultipassDaemonRetryTests
     {
         var classification = MultipassDaemonRetry.ClassifyTransient(
             Argv("start", "codeybox-x"),
-            new RunResult(1, "", "multipassd: qemu-system-x86_64; error: Process crashed"));
+            new ProcessRunResult(1, "", "multipassd: qemu-system-x86_64; error: Process crashed"));
         Assert.Equal("qemu-process-crashed", classification);
     }
 
@@ -71,7 +72,7 @@ public sealed class MultipassDaemonRetryTests
     {
         var classification = MultipassDaemonRetry.ClassifyTransient(
             Argv("launch", "--name", "codeybox-x"),
-            new RunResult(1, "", "launch failed: cannot connect to the multipass socket"));
+            new ProcessRunResult(1, "", "launch failed: cannot connect to the multipass socket"));
         Assert.Equal("multipass-socket-unreachable", classification);
     }
 
@@ -84,7 +85,7 @@ public sealed class MultipassDaemonRetryTests
         {
             var classification = MultipassDaemonRetry.ClassifyTransient(
                 Argv(command, "codeybox-x"),
-                new RunResult(1, "", "cannot connect to multipassd at /run/multipass_socket.sock"));
+                new ProcessRunResult(1, "", "cannot connect to multipassd at /run/multipass_socket.sock"));
             Assert.Equal("multipass-daemon-unreachable", classification);
         }
     }
@@ -98,7 +99,7 @@ public sealed class MultipassDaemonRetryTests
         {
             var classification = MultipassDaemonRetry.ClassifyTransient(
                 Argv(command, "codeybox-x"),
-                new RunResult(1, "", "cannot connect to api.example"));
+                new ProcessRunResult(1, "", "cannot connect to api.example"));
             Assert.Null(classification);
         }
     }
@@ -111,7 +112,7 @@ public sealed class MultipassDaemonRetryTests
         // wording.
         var classification = MultipassDaemonRetry.ClassifyTransient(
             Argv("exec", "codeybox-x"),
-            new RunResult(1, "", "exec failed: snap.multipass socket disappeared"));
+            new ProcessRunResult(1, "", "exec failed: snap.multipass socket disappeared"));
         Assert.Equal("multipass-socket-error", classification);
     }
 
@@ -121,7 +122,7 @@ public sealed class MultipassDaemonRetryTests
         // Image-not-found, auth, etc. — these MUST fail fast.
         var classification = MultipassDaemonRetry.ClassifyTransient(
             Argv("launch", "--name", "codeybox-x"),
-            new RunResult(2, "", "image 'bogus' not found in remote 'release'"));
+            new ProcessRunResult(2, "", "image 'bogus' not found in remote 'release'"));
         Assert.Null(classification);
     }
 
@@ -141,7 +142,7 @@ public sealed class MultipassDaemonRetryTests
             _ =>
             {
                 attempts++;
-                return Task.FromResult(new RunResult(2, "", "image not found"));
+                return Task.FromResult(new ProcessRunResult(2, "", "image not found"));
             },
             Healthy,
             NullLogger.Instance,
@@ -165,7 +166,7 @@ public sealed class MultipassDaemonRetryTests
             _ =>
             {
                 attempts++;
-                return Task.FromResult(new RunResult(
+                return Task.FromResult(new ProcessRunResult(
                     1, "", "qemu-system-x86_64; error: Process crashed"));
             },
             ct => Task.FromResult(MultipassDaemonHealthProbeResult.Unhealthy("daemon down")),
@@ -188,7 +189,7 @@ public sealed class MultipassDaemonRetryTests
         var argv = Argv("launch", "--name", "codeybox-x");
         var result = await MultipassDaemonRetry.RunWithRetryAsync(
             argv,
-            _ => Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket")),
+            _ => Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket")),
             Healthy,
             NullLogger.Instance,
             WorkItemId.New(),
@@ -217,7 +218,7 @@ public sealed class MultipassDaemonRetryTests
 
         await MultipassDaemonRetry.RunWithRetryAsync(
             argv,
-            _ => Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket")),
+            _ => Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket")),
             Healthy,
             NullLogger.Instance,
             WorkItemId.New(),
@@ -237,7 +238,7 @@ public sealed class MultipassDaemonRetryTests
 
         await MultipassDaemonRetry.RunWithRetryAsync(
             argv,
-            _ => Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket")),
+            _ => Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket")),
             Healthy,
             logger,
             WorkItemId.New(),
@@ -275,7 +276,7 @@ public sealed class MultipassDaemonRetryTests
                 _ =>
                 {
                     attempts++;
-                    return Task.FromResult(new RunResult(
+                    return Task.FromResult(new ProcessRunResult(
                         1, "", "cannot connect to the multipass socket"));
                 },
                 Healthy,
@@ -300,7 +301,7 @@ public sealed class MultipassDaemonRetryTests
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
             MultipassDaemonRetry.RunWithRetryAsync(
                 Argv("launch"),
-                _ => Task.FromResult(new RunResult(0, "", "")),
+                _ => Task.FromResult(new ProcessRunResult(0, "", "")),
                 Healthy,
                 NullLogger.Instance,
                 WorkItemId.New(),
@@ -320,7 +321,7 @@ public sealed class MultipassDaemonRetryTests
         await Assert.ThrowsAsync<ArgumentException>(() =>
             MultipassDaemonRetry.RunWithRetryAsync(
                 Argv("launch"),
-                _ => Task.FromResult(new RunResult(0, "", "")),
+                _ => Task.FromResult(new ProcessRunResult(0, "", "")),
                 Healthy,
                 NullLogger.Instance,
                 WorkItemId.New(),
@@ -336,7 +337,7 @@ public sealed class MultipassDaemonRetryTests
     public async Task ProbeDaemon_ReturnsHealthy_OnZeroExit()
     {
         var runner = new StubProcessRunner((_, _, _) =>
-            Task.FromResult(new RunResult(0, "multipass 1.15.0", "")));
+            Task.FromResult(new ProcessRunResult(0, "multipass 1.15.0", "")));
         var result = await MultipassDaemonRetry.ProbeDaemonAsync(
             runner, "multipass", TimeSpan.FromSeconds(5), CancellationToken.None);
         Assert.True(result.IsHealthy);
@@ -346,7 +347,7 @@ public sealed class MultipassDaemonRetryTests
     public async Task ProbeDaemon_ReturnsUnhealthy_OnNonZeroExit()
     {
         var runner = new StubProcessRunner((_, _, _) =>
-            Task.FromResult(new RunResult(1, "", "boom")));
+            Task.FromResult(new ProcessRunResult(1, "", "boom")));
         var result = await MultipassDaemonRetry.ProbeDaemonAsync(
             runner, "multipass", TimeSpan.FromSeconds(5), CancellationToken.None);
         Assert.False(result.IsHealthy);
@@ -363,7 +364,7 @@ public sealed class MultipassDaemonRetryTests
         var runner = new StubProcessRunner(async (_, _, runnerCt) =>
         {
             await Task.Delay(TimeSpan.FromSeconds(30), runnerCt);
-            return new RunResult(0, "", "");
+            return new ProcessRunResult(0, "", "");
         });
         var result = await MultipassDaemonRetry.ProbeDaemonAsync(
             runner, "multipass", TimeSpan.FromMilliseconds(5), CancellationToken.None);
@@ -382,7 +383,7 @@ public sealed class MultipassDaemonRetryTests
         var runner = new StubProcessRunner(async (_, _, runnerCt) =>
         {
             await Task.Delay(TimeSpan.FromSeconds(30), runnerCt);
-            return new RunResult(0, "", "");
+            return new ProcessRunResult(0, "", "");
         });
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             MultipassDaemonRetry.ProbeDaemonAsync(
@@ -406,22 +407,23 @@ public sealed class MultipassDaemonRetryTests
 
     private sealed class StubProcessRunner : IProcessRunner
     {
-        private readonly Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> _handler;
+        private readonly Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> _handler;
 
         public StubProcessRunner(
-            Func<IReadOnlyList<string>, string?, CancellationToken, Task<RunResult>> handler)
+            Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler)
         {
             _handler = handler;
         }
 
-        public Task<RunResult> RunAsync(
+        public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
             string? stdin,
             CancellationToken ct,
             Action<string>? stdoutChunkCallback = null,
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
-            int? maxStderrBytes = null) =>
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null) =>
             _handler(argv, stdin, ct);
     }
 
@@ -495,7 +497,7 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
         var workItemId = WorkItemId.New();
         await MultipassDaemonRetry.RunWithRetryAsync(
             Argv("launch", "--name", "codeybox-x"),
-            _ => Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket")),
+            _ => Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket")),
             Healthy,
             NullLogger.Instance,
             workItemId,
@@ -527,7 +529,7 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
         // null-check on errorClass.
         await MultipassDaemonRetry.RunWithRetryAsync(
             Argv("launch", "--name", "codeybox-x"),
-            _ => Task.FromResult(new RunResult(0, "ok", "")),
+            _ => Task.FromResult(new ProcessRunResult(0, "ok", "")),
             Healthy,
             NullLogger.Instance,
             WorkItemId.New(),
@@ -545,7 +547,7 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
         // so the audit emission is suppressed but the retry still runs.
         await MultipassDaemonRetry.RunWithRetryAsync(
             Argv("launch", "--name", "codeybox-x"),
-            _ => Task.FromResult(new RunResult(1, "", "cannot connect to the multipass socket")),
+            _ => Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket")),
             Healthy,
             NullLogger.Instance,
             workItemId: null,

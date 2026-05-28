@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 
@@ -188,14 +189,15 @@ public sealed class DiskGuardPreflightTests : IDisposable
     /// </summary>
     private sealed class ThrowingProcessRunner : IProcessRunner
     {
-        public Task<RunResult> RunAsync(
+        public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
             string? stdin,
             CancellationToken ct,
             Action<string>? stdoutChunkCallback = null,
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
-            int? maxStderrBytes = null) =>
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null) =>
             throw new InvalidOperationException("preflight tests must not reach the multipass launch path");
     }
 }

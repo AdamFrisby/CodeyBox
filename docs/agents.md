@@ -204,9 +204,11 @@ observed failure history until a real probe endpoint is wired.
 **Smoke probe.** Credential-presence check only (no network call); see
 the per-agent probe table below.
 
-**Model-list probe.** Skipped (returns Failed): `AgentClassConfigValidator`
-logs a warning and accepts any operator-chosen `ModelId`. Confirm
-correctness by watching the first dispatched Done item.
+**Model-list probe.** Runs `opencode models` on the API host (operator must
+install the CLI there) and validates `ModelId` values at startup via
+`AgentClassConfigValidator`. Set `CODEYBOX_OPENCODE_BINARY` to override the
+`opencode` binary path. When the CLI is missing, validation is skipped with
+a warning.
 
 ### Google Gemini CLI (`@google/gemini-cli`)
 
