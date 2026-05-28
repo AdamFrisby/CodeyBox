@@ -18,8 +18,13 @@ public sealed class IdempotencyKeyRetentionServiceTests
     private sealed class RecordingStore : IIdempotencyStore
     {
         private readonly Func<int>? _resultOrThrow;
+        private readonly TaskCompletionSource _firstCall =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int DeleteExpiredCallCount { get; private set; }
         public List<DateTimeOffset> CutoffsObserved { get; } = new();
+
+        /// <summary>Completes the first time <see cref="DeleteExpiredAsync"/> runs.</summary>
+        public Task FirstCall => _firstCall.Task;
 
         public RecordingStore(Func<int>? resultOrThrow = null) => _resultOrThrow = resultOrThrow;
 
@@ -33,6 +38,7 @@ public sealed class IdempotencyKeyRetentionServiceTests
         {
             DeleteExpiredCallCount++;
             CutoffsObserved.Add(cutoff);
+            _firstCall.TrySetResult();
             var result = _resultOrThrow?.Invoke() ?? 0;
             return Task.FromResult(result);
         }
@@ -49,10 +55,11 @@ public sealed class IdempotencyKeyRetentionServiceTests
             store, NullLogger<IdempotencyKeyRetentionService>.Instance,
             interval: TimeSpan.FromMilliseconds(50));
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-        var task = service.StartAsync(cts.Token);
-        // Give the first iteration time to run.
-        await WaitForAsync(() => store.DeleteExpiredCallCount >= 1, TimeSpan.FromSeconds(2));
+        var task = service.StartAsync(CancellationToken.None);
+        // Deterministically await the first sweep rather than polling — under a
+        // saturated thread pool a fixed timeout could expire before the
+        // background continuation is scheduled, which is a flaky failure mode.
+        await store.FirstCall.WaitAsync(TimeSpan.FromSeconds(30));
         await service.StopAsync(CancellationToken.None);
         await task;
 

@@ -73,18 +73,29 @@ public sealed class AgentAvailabilityRegistry
     /// <summary>
     /// Feeds a smoke-probe outcome from a specific <paramref name="source"/>
     /// (host credential check vs. in-sandbox CLI check). Passing clears that
-    /// source's exclusion (and the fast-fail breaker, since a passing probe
-    /// proves the binary launches); failing excludes the agent under that
-    /// source until a later probe from the <em>same</em> source passes or
-    /// <see cref="Reset"/> is called.
+    /// source's exclusion; failing excludes the agent under that source until a
+    /// later probe from the <em>same</em> source passes or <see cref="Reset"/>
+    /// is called.
     ///
     /// <para>Exclusions are tracked per source so the over-permissive host
     /// credential probe can never clear an in-VM exclusion (exit 127 / auth
     /// path drift) it cannot itself observe — the agent stays benched until the
     /// in-VM probe that benched it passes again.</para>
+    ///
+    /// <para>The fast-fail circuit breaker (earned from real sub-threshold
+    /// dispatch failures) is only lifted when <paramref name="clearsFastFail"/>
+    /// is set — i.e. by a <em>freshly executed</em> in-VM probe that actually
+    /// ran the binary in a sandbox. A host credential check (proves nothing
+    /// about whether the binary launches) and a <em>cached</em> in-VM verdict
+    /// (no CLI was re-executed) must pass <c>false</c>, so a stale or
+    /// over-permissive pass can never un-bench a circuit-broken agent without a
+    /// fresh run.</para>
     /// </summary>
     public AvailabilityTransition MarkSmokeResult(
-        AgentKind kind, AgentSmokeResult result, SmokeExclusionSource source = SmokeExclusionSource.HostSmoke)
+        AgentKind kind,
+        AgentSmokeResult result,
+        SmokeExclusionSource source = SmokeExclusionSource.HostSmoke,
+        bool clearsFastFail = false)
     {
         var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
         var now = _time.GetUtcNow();
@@ -95,9 +106,12 @@ public sealed class AgentAvailabilityRegistry
             if (result.Ok)
             {
                 entry.LastSmokePassedAt = now;
-                entry.ConsecutiveFastFails = 0;
                 entry.Exclusions.Remove(source);
-                entry.Exclusions.Remove(SmokeExclusionSource.FastFail);
+                if (clearsFastFail)
+                {
+                    entry.ConsecutiveFastFails = 0;
+                    entry.Exclusions.Remove(SmokeExclusionSource.FastFail);
+                }
                 var stillExcluded = entry.IsExcluded;
                 if (wasExcluded && !stillExcluded)
                     _log.LogInformation(

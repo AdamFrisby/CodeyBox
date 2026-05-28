@@ -158,8 +158,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // No AuditLog/Stopwatch entry here: a cache hit happens on every
             // gated dispatch in steady state, so only surface a webhook on an
             // actual availability transition (e.g. reconciling after a reset).
+            // clearsFastFail:false — a cache hit re-executed no CLI, so it must
+            // not lift a fast-fail bench earned from real dispatch failures. It
+            // only reconciles this source's (InVmSmoke) exclusion.
             _log.LogDebug("In-VM smoke: cache hit for {Agent} @ {Ref}", probe.Kind.Value, baselineRef);
-            var hitTransition = _availability.MarkSmokeResult(probe.Kind, cached, SmokeExclusionSource.InVmSmoke);
+            var hitTransition = _availability.MarkSmokeResult(
+                probe.Kind, cached, SmokeExclusionSource.InVmSmoke, clearsFastFail: false);
             await EmitTransitionWebhookAsync(probe.Kind, cached, hitTransition);
             return cached;
         }
@@ -209,7 +213,11 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         // dispatch (self-healing) rather than pinned for the whole TTL.
         if (result.Ok)
             _cache.Set(probe.Kind, baselineRef, result);
-        var transition = _availability.MarkSmokeResult(probe.Kind, result, SmokeExclusionSource.InVmSmoke);
+        // clearsFastFail:true — this verdict comes from a freshly executed in-VM
+        // probe that actually ran the binary in a sandbox, so a pass is valid
+        // evidence the CLI launches and may lift the fast-fail circuit breaker.
+        var transition = _availability.MarkSmokeResult(
+            probe.Kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
         await EmitTransitionEventsAsync(probe.Kind, result, transition);
         return result;
     }

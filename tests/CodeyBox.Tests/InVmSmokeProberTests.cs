@@ -426,7 +426,10 @@ public sealed class InVmSmokeProberTests
             new NullWebhookDispatcher(),
             new InVmSmokeOptions
             {
-                Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0, StepTimeoutSeconds = 0,
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                StepTimeoutSeconds = 0,
             },
             NullLogger<InVmSmokeProber>.Instance);
 

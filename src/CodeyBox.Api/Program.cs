@@ -1161,7 +1161,7 @@ builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
 // and the cache all observe the same state.
 builder.Services.AddSingleton<IInVmSmokeGate>(sp => sp.GetRequiredService<InVmSmokeProber>());
 builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
-    sp.GetRequiredService<InVmSmokeProber>(),
+    sp.GetRequiredService<IInVmSmokeGate>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProbeService>()));
 

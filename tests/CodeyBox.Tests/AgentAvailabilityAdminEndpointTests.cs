@@ -116,6 +116,25 @@ public sealed class AgentAvailabilityAdminEndpointTests
     }
 
     [Fact]
+    public async Task PostReset_InvalidatesInVmSmokeCache_ForcingReprobe()
+    {
+        // The reset endpoint must drop any cached passing in-VM verdict so the
+        // next sweep / gated dispatch re-execs the CLI instead of replaying a
+        // stale pass (which could mark a broken binary Available without re-
+        // running it). A regression that dropped the inVmCache.Invalidate call
+        // would leave the entry in place.
+        var cache = _factory.Services.GetRequiredService<IInVmSmokeCache>();
+        cache.Set(AgentKind.Claude, "baseline-ref-A", new AgentSmokeResult(true, null, TimeSpan.Zero));
+        Assert.NotNull(cache.TryGet(AgentKind.Claude, "baseline-ref-A"));
+
+        var client = _factory.CreateClient();
+        var resp = await client.PostAsync("/admin/agent/claude/reset", content: null);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        Assert.Null(cache.TryGet(AgentKind.Claude, "baseline-ref-A"));
+    }
+
+    [Fact]
     public async Task PostReset_UnknownAgent_Returns404()
     {
         // An operator typo (/admin/agent/curser/reset) used to silently return

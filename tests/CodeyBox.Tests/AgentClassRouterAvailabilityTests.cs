@@ -130,12 +130,16 @@ public sealed class AgentClassRouterAvailabilityTests
         public List<AgentKind> Probed { get; } = [];
         public FakeInVmSmokeGate(Action<AgentKind> onProbe) => _onProbe = onProbe;
 
+        public bool Enabled => true;
+
         public Task EnsureProbedAsync(AgentKind kind, CancellationToken ct)
         {
             Probed.Add(kind);
             _onProbe(kind);
             return Task.CompletedTask;
         }
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
     }
 
     // ── Acceptance criterion 4: smoke-pass but fast-fail-127 also excludes ──
