@@ -33,14 +33,17 @@ public sealed class OpencodeQuotaFailureDetector : IAgentQuotaFailureDetector
     /// <summary>
     /// OpenCode subscription rate-limit stderr shapes (rolling / weekly /
     /// monthly windows). Checked before generic substring patterns so reset
-    /// windows in the same message are parsed via <see cref="QuotaResetParser"/>.
+    /// windows in the same message are parsed via <see cref="OpencodeQuotaResetParser"/>.
     /// </summary>
     private static readonly Regex[] UsageLimitReachedRegexes =
     [
         new(@"(?:\d+)\s+hour usage limit reached\.\s*It will reset in\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new(@"weekly usage limit reached\.\s*It will reset in\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new(@"monthly usage limit reached\.\s*It will reset in\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
-        new(@"\busage limit reached\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        // Defensive fallback: require the opencode.ai workspace URL that accompanies
+        // real subscription-limit stderr so code-review prose mentioning
+        // "usage limit reached" does not gate dispatch.
+        new(@"\busage limit reached\b[\s\S]*?opencode\.ai/workspace/", RegexOptions.IgnoreCase | RegexOptions.Compiled),
     ];
 
     private static readonly (string Pattern, QuotaFailureKind Kind)[] Patterns =
@@ -77,8 +80,8 @@ public sealed class OpencodeQuotaFailureDetector : IAgentQuotaFailureDetector
 
         foreach (var (pattern, kind) in Patterns)
         {
-            var inStderr = !string.IsNullOrEmpty(stderr) && stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase);
-            var inStdout = !string.IsNullOrEmpty(stdout) && stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase);
+            var inStderr = !string.IsNullOrEmpty(stderr) && ContainsPattern(stderr, pattern);
+            var inStdout = !string.IsNullOrEmpty(stdout) && ContainsPattern(stdout, pattern);
             if (inStderr || inStdout)
             {
                 var sources = CollectSources(stderr, stdout);
@@ -104,12 +107,24 @@ public sealed class OpencodeQuotaFailureDetector : IAgentQuotaFailureDetector
                 var sources = CollectSources(stderr, stdout);
                 detection = new QuotaDetection(
                     QuotaFailureKind.LimitReached,
-                    QuotaResetParser.TryParseResetAt(sources));
+                    OpencodeQuotaResetParser.TryParseResetAt(sources));
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static bool ContainsPattern(string text, string pattern)
+    {
+        // "usage limit reached" contains the substring "limit reached" but is
+        // handled by UsageLimitReachedRegexes; skip the generic row to avoid
+        // misclassifying code-review prose about subscription-limit handlers.
+        if (pattern.Equals("limit reached", StringComparison.Ordinal)
+            && text.Contains("usage limit reached", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return text.Contains(pattern, StringComparison.OrdinalIgnoreCase);
     }
 
     private static List<string?> CollectSources(string? stderr, string? stdout)
