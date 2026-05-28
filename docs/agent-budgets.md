@@ -62,6 +62,7 @@ next dispatch without a restart.
 | Field | Meaning |
 |---|---|
 | `RetentionDays` | Days of usage events to keep. Default 90. An hourly sweep prunes older rows. `0` disables pruning. The sweep never deletes rows still inside an active Weekly/Monthly/Rolling window even if `RetentionDays` is shorter than the window span, so a configured cap can never be fail-opened by aggressive retention. |
+| `CacheTtl` | How long a computed snapshot is cached for the **`/quota` visibility summary only**. Default 60s. The dispatch gate never serves a cached snapshot — it always recomputes so an accounting outage fails closed immediately (see below). |
 | `Kind: "Rolling"` | Sliding window of `Hours` hours. |
 | `Kind: "Weekly"` | Calendar ISO week (Monday 00:00 UTC → next Monday). |
 | `Kind: "Monthly"` | Calendar month (1st 00:00 UTC → 1st of next month). |
