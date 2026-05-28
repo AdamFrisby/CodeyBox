@@ -2557,15 +2557,18 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             : null;
         try
         {
-            var result = await RunMultipassAsync(
-                argv,
-                exec.Stdin,
-                ct,
-                exec.StdoutChunkCallback,
-                exec.StderrChunkCallback,
-                maxStdoutBytes,
-                maxStderrBytes);
-            return result;
+            return await MultipassRetry.RunWithRetryAsync(
+                action: innerCt => RunMultipassAsync(
+                    argv,
+                    exec.Stdin,
+                    innerCt,
+                    exec.StdoutChunkCallback,
+                    exec.StderrChunkCallback,
+                    maxStdoutBytes,
+                    maxStderrBytes),
+                log: _log,
+                description: $"exec on {_name}",
+                ct: ct);
         }
         finally
         {
