@@ -214,12 +214,20 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             TimeSpan.FromMinutes(10),
             svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-4g", memoryBytes: 4 * gib)));
 
+        // 8 GiB → 8 × 150s = 1200s = 20 min, strictly between floor and the
+        // 12 GiB case so a wrong GiB divisor or off-by-one scaling can't pass by
+        // coincidentally landing on the floor or a round endpoint.
+        Assert.Equal(
+            TimeSpan.FromMinutes(20),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-8g", memoryBytes: 8 * gib)));
+
         // 12 GiB → 12 × 150s = 1800s, well above the floor.
         Assert.Equal(
             TimeSpan.FromMinutes(30),
             svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-12g", memoryBytes: 12 * gib)));
 
-        // 1 GiB → 150s, below the floor → floor wins.
+        // 1 GiB → 150s, below the floor → floor wins (catches a min/max swap:
+        // min would yield 150s here, not the 10-min floor).
         Assert.Equal(
             TimeSpan.FromMinutes(10),
             svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-1g", memoryBytes: 1 * gib)));
@@ -232,6 +240,34 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Equal(
             TimeSpan.FromMinutes(10),
             svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-neg", memoryBytes: -1)));
+    }
+
+    [Fact]
+    public void SuspendTimeoutFor_DefaultConstructor_UsesShippedConstants()
+    {
+        // The production DI registration constructs this service WITHOUT
+        // injected timeouts, so the regression fix only holds if the default
+        // constructor actually applies the raised floor (10 min) and the
+        // RAM-scaling budget (150s/GiB). Pin both via wall-clock literals so a
+        // silent revert of either constant fails here.
+        Assert.Equal(TimeSpan.FromMinutes(10), SandboxSuspendOnShutdownService.DefaultPerSuspendTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(150), SandboxSuspendOnShutdownService.DefaultPerGiBSuspendBudget);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            new FakeSuspendingProvider(), _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+
+        const long gib = 1024L * 1024 * 1024;
+
+        // No reported RAM → the 10-minute default floor.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-default")));
+
+        // 20 GiB → 20 × 150s = 3000s = 50 min, scaled off the default budget.
+        Assert.Equal(
+            TimeSpan.FromMinutes(50),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-20g", memoryBytes: 20 * gib)));
     }
 
     [Fact]

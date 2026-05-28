@@ -3182,7 +3182,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// <c>_preserveOnDispose</c> so the host-side handle's DisposeAsync becomes
     /// a no-op — the orchestrator owns destruction via the startup resume
     /// handler (which will <c>multipass start</c> the same VM) or the leak
-    /// reaper (if the persisted bookkeeping has expired).
+    /// reaper (if the persisted bookkeeping has expired). The flag is also set
+    /// when the call is abandoned by <see cref="OperationCanceledException"/>
+    /// (per-VM suspend timeout): multipassd keeps writing the snapshot after we
+    /// give up, so the VM must not be purged on dispose even though we never
+    /// observed the suspend exit cleanly.
     ///
     /// <para>Writes the same <c>.codeybox-preempt</c> marker as
     /// <see cref="StopAndPreserveAsync"/> so the SandboxLeakReaper applies the
@@ -3202,23 +3206,45 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             _log.LogWarning(ex, "Failed to write preempt marker for suspended multipass VM {Name}", _name);
         }
 
-        var result = await RunMultipassAsync(
-            [_opts.MultipassBinary, "suspend", _name],
-            stdin: null,
-            ct: ct);
+        ProcessRunResult result;
+        try
+        {
+            result = await RunMultipassAsync(
+                [_opts.MultipassBinary, "suspend", _name],
+                stdin: null,
+                ct: ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // The per-VM suspend timeout fired (or host shutdown cancelled the
+            // call) while `multipass suspend` was still running. multipassd
+            // keeps writing the RAM snapshot after our call is abandoned, so the
+            // VM still reaches Suspended on disk. DisposeAsync MUST NOT
+            // `delete --purge` it: the orchestrator owns destruction via the
+            // startup resume handler (which retries `multipass start`) or the
+            // leak reaper (which honours the .codeybox-preempt marker grace
+            // window written above). The caller
+            // (SandboxSuspendOnShutdownService.SuspendOneAsync) keeps the
+            // persisted SuspendedVmName mapping on this OCE so the next startup
+            // can reattach. We deliberately do NOT set _isSuspended: the VM is
+            // not confirmed frozen yet, so PipelineRunner falls back to the
+            // persisted-mapping gate rather than asserting IsSuspended.
+            _preserveOnDispose = true;
+            throw;
+        }
         if (result.ExitCode != 0)
         {
-            // Do NOT set _preserveOnDispose before this point: if the multipass
-            // suspend call fails we still want DisposeAsync to destroy the VM
-            // so a still-Running but un-bookkept VM doesn't silently leak. The
-            // caller (SandboxSuspendOnShutdownService.SuspendOneAsync) persists
-            // the SuspendedVmName mapping BEFORE awaiting this method, then
-            // CLEARS it again on a non-cancellation exception so this failed,
-            // still-Running VM has no resume bookkeeping; the next DisposeAsync
-            // (triggered by the orchestrator's host stopping) then cleanly tears
-            // the VM down. (A per-VM timeout, by contrast, is an
-            // OperationCanceledException that keeps the mapping so the next
-            // startup can resume the VM multipassd is still freezing.)
+            // Do NOT set _preserveOnDispose on a non-zero exit: a genuine
+            // suspend failure leaves the VM Running, so DisposeAsync must
+            // destroy it rather than leak a still-Running but un-bookkept VM.
+            // The caller persists the SuspendedVmName mapping BEFORE awaiting
+            // this method, then CLEARS it again on this non-cancellation
+            // exception so the failed VM has no resume bookkeeping; the next
+            // DisposeAsync (triggered by the orchestrator's host stopping) then
+            // cleanly tears the VM down. (A per-VM timeout, by contrast, is the
+            // OperationCanceledException handled above: it keeps the mapping and
+            // preserves the VM so the next startup can resume the snapshot
+            // multipassd is still writing.)
             throw new InvalidOperationException(
                 $"multipass suspend {_name} failed (exit {result.ExitCode}): {result.Stderr}");
         }
