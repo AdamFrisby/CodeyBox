@@ -486,34 +486,60 @@ public sealed record SandboxMount
     public long? SizeBytes { get; init; }
 
     /// <summary>
-    /// Optional defensive heal hook invoked by a sandbox provider when a
-    /// bind-mount attempt fails AND the post-failure orchestrator-side stat
-    /// of <see cref="HostPath"/> shows the directory really is absent on the
-    /// host. Used by the merge / conflict-rework phase: if racing cleanup
-    /// removes the isolated bare clone between create and mount, the
-    /// orchestrator's callback re-clones it so the next mount attempt
-    /// succeeds instead of failing the whole work item.
-    ///
-    /// <para><b>Out of scope.</b> The hook is NOT a general-purpose
-    /// "mount failed for any reason" recovery. Cases where the host path
-    /// still exists from the orchestrator's view but is invisible to the
-    /// sandbox daemon (e.g. AppArmor confines snap-Multipass to a subset of
-    /// the host filesystem — the path the orchestrator can <c>stat</c>
-    /// returns Directory.Exists=true but multipass logs
-    /// "Source path does not exist") do NOT trigger the callback. That
-    /// failure class is structural — no number of re-clones can heal it —
-    /// and is addressed by <see cref="IGitHost.GetMergeStagingRoot"/>
-    /// placing the bind source under a provider-readable root, not by this
-    /// hook.</para>
-    ///
-    /// <para><b>Honoring providers.</b> Currently only
-    /// <c>MultipassSandboxProvider</c> consumes this callback. Process and
-    /// bubblewrap providers ignore it (their bind-mount paths share the
-    /// orchestrator's filesystem namespace, so the racing-cleanup window
-    /// the hook targets does not apply). The hook is null for the common
-    /// case (durable source, no recreation logic to offer).</para>
+    /// Optional self-heal collaborator that re-creates the host bind source
+    /// when a sandbox provider observes <see cref="HostPath"/> missing at
+    /// mount time. The mount record only references the abstraction; the
+    /// orchestrator owns the concrete implementation (e.g. re-running
+    /// <c>git clone --bare</c> for the merge / conflict-rework isolated
+    /// staging directory) and providers invoke it through the interface so
+    /// recovery logic stays out of the domain DTO. See
+    /// <see cref="ISandboxMountSourceRestorer"/> for the full contract.
     /// </summary>
-    public Func<CancellationToken, Task>? RestoreHostSourceAsync { get; init; }
+    public ISandboxMountSourceRestorer? SourceRestorer { get; init; }
+}
+
+/// <summary>
+/// Self-heal collaborator that re-creates the host bind source for a
+/// <see cref="SandboxMount"/> when a sandbox provider observes the path
+/// missing at mount time. The merge / conflict-rework phase wires an
+/// implementation backed by <c>git clone --bare</c>: if racing host-side
+/// cleanup deletes the isolated bare clone between create and mount, the
+/// provider invokes <see cref="RestoreAsync"/> once and retries the mount.
+///
+/// <para><b>Layering.</b> The restorer interface lives in
+/// <c>CodeyBox.Core</c> so <see cref="SandboxMount"/> can reference it
+/// without depending on <c>CodeyBox.Orchestrator</c>, but every concrete
+/// implementation lives above the sandbox-provider layer. Providers are
+/// only ever invokers — they never see the underlying recreation logic.</para>
+///
+/// <para><b>Out of scope.</b> The restorer is NOT a general-purpose
+/// "mount failed for any reason" recovery. Cases where the host path
+/// still exists from the orchestrator's view but is invisible to the
+/// sandbox daemon (e.g. AppArmor confines snap-Multipass to a subset of
+/// the host filesystem — the path the orchestrator can <c>stat</c>
+/// returns Directory.Exists=true but multipass logs
+/// "Source path does not exist") do NOT trigger the restorer. That
+/// failure class is structural — no number of re-clones can heal it —
+/// and is addressed by <see cref="IGitHost.GetMergeStagingRoot"/>
+/// placing the bind source under a provider-readable root, not by this
+/// hook.</para>
+///
+/// <para><b>Honoring providers.</b> Currently only
+/// <c>MultipassSandboxProvider</c> consumes this collaborator. Process
+/// and bubblewrap providers ignore it (their bind-mount paths share the
+/// orchestrator's filesystem namespace, so the racing-cleanup window
+/// the restorer targets does not apply).</para>
+/// </summary>
+public interface ISandboxMountSourceRestorer
+{
+    /// <summary>
+    /// Re-creates the host bind source for the mount this restorer is
+    /// attached to. Invoked at most once per mount attempt sequence by a
+    /// honoring sandbox provider. Implementations must be idempotent over
+    /// the residue of a partial prior attempt at the target path (e.g.
+    /// delete the leftover directory before re-cloning).
+    /// </summary>
+    Task RestoreAsync(CancellationToken ct);
 }
 
 public sealed record SandboxResourceLimits

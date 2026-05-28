@@ -201,13 +201,11 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         });
         var provider = NewProvider(runner);
 
-        var restoreInvocations = 0;
-        Task Restore(CancellationToken c)
+        var restorer = new RecordingRestorer(_ =>
         {
-            restoreInvocations++;
             Directory.CreateDirectory(hostSource);
             return Task.CompletedTask;
-        }
+        });
 
         await provider.MountSingleBindWithRetryAsync(
             new MultipassSandboxOptions(),
@@ -215,11 +213,58 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
             host: hostSource,
             sandbox: "/repo",
             workItemId: null,
-            restoreHostSourceAsync: Restore,
+            sourceRestorer: restorer,
             ct: CancellationToken.None);
 
-        Assert.Equal(1, restoreInvocations);
+        Assert.Equal(1, restorer.Invocations);
         Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task MountSingleBindWithRetry_RestoreDoesNotRecreateSource_FailsFastWithoutSecondRestore()
+    {
+        // The fast-fail branch after the single-shot restore: the source
+        // is missing, the restorer is invoked, but the restore does not
+        // recreate the path (e.g. underlying git clone failed silently,
+        // or external cleanup deleted it again). The next iteration must
+        // not invoke the restorer a second time AND must not exhaust the
+        // full retry budget — both would waste audit time and obscure the
+        // structural failure in the audit trail.
+        var hostSource = Path.Combine(_workspace, "heal-stays-missing");
+        Assert.False(Directory.Exists(hostSource));
+
+        var attempts = 0;
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                attempts++;
+                return new ProcessRunResult(1, "", "Source path does not exist");
+            }
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner);
+
+        var restorer = new RecordingRestorer(_ => Task.CompletedTask);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.MountSingleBindWithRetryAsync(
+                new MultipassSandboxOptions(),
+                name: "codeybox-test",
+                host: hostSource,
+                sandbox: "/repo",
+                workItemId: null,
+                sourceRestorer: restorer,
+                ct: CancellationToken.None));
+
+        // Exactly one restore call (the single-shot guard) and exactly two
+        // mount attempts (first fails -> restore -> second fails -> fast-fail
+        // since restoreInvoked is now true). A regression that retried beyond
+        // attempt 2 or invoked the restorer twice would fail this test.
+        Assert.Equal(1, restorer.Invocations);
+        Assert.Equal(2, attempts);
+        Assert.Contains("after 2 attempt", ex.Message);
+        Assert.Contains("exists=no", ex.Message);
     }
 
     [Fact]
@@ -324,6 +369,25 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null)
             => Task.FromResult(_react(new RecordedCall(argv.ToArray(), stdin)));
+    }
+
+    /// <summary>
+    /// In-test <see cref="ISandboxMountSourceRestorer"/> that runs a
+    /// caller-supplied side effect and counts invocations. Replaces the
+    /// pre-refactor <c>Func&lt;CancellationToken, Task&gt;</c> hook.
+    /// </summary>
+    private sealed class RecordingRestorer : ISandboxMountSourceRestorer
+    {
+        private readonly Func<CancellationToken, Task> _impl;
+        public int Invocations { get; private set; }
+
+        public RecordingRestorer(Func<CancellationToken, Task> impl) => _impl = impl;
+
+        public Task RestoreAsync(CancellationToken ct)
+        {
+            Invocations++;
+            return _impl(ct);
+        }
     }
 
     /// <summary>

@@ -239,10 +239,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
 
         // Pre-create host directories for tmpfs-equivalent mounts so we can
         // bind-mount them into the VM after launch. The optional
-        // RestoreHostSourceAsync callback is carried through so the mount loop
+        // ISandboxMountSourceRestorer is carried through so the mount loop
         // can self-heal a missing source for callers that supply one (merge
         // phase recreates an isolated bare clone if racing cleanup deletes it).
-        var bindMounts = new List<(string Host, string Sandbox, Func<CancellationToken, Task>? Restore)>();
+        var bindMounts = new List<(string Host, string Sandbox, ISandboxMountSourceRestorer? Restorer)>();
         foreach (var m in spec.Mounts)
         {
             if (m.Tmpfs)
@@ -254,7 +254,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
             }
             else if (m.HostPath is not null)
             {
-                bindMounts.Add((m.HostPath, m.SandboxPath, m.RestoreHostSourceAsync));
+                bindMounts.Add((m.HostPath, m.SandboxPath, m.SourceRestorer));
             }
         }
 
@@ -1448,14 +1448,14 @@ test "$work" = present && test "$exec_wrapper" = present
     private async Task ApplyMountsAsync(
         MultipassSandboxOptions opts,
         string name,
-        List<(string Host, string Sandbox, Func<CancellationToken, Task>? Restore)> binds,
+        List<(string Host, string Sandbox, ISandboxMountSourceRestorer? Restorer)> binds,
         WorkItemId? workItemId,
         CancellationToken ct)
     {
         if (binds.Count == 0) return;
         await WaitForStoppedAsync(opts, name, workItemId, ct);
-        foreach (var (host, sandbox, restore) in binds)
-            await MountSingleBindWithRetryAsync(opts, name, host, sandbox, workItemId, restore, ct);
+        foreach (var (host, sandbox, restorer) in binds)
+            await MountSingleBindWithRetryAsync(opts, name, host, sandbox, workItemId, restorer, ct);
     }
 
     /// <summary>
@@ -1487,24 +1487,24 @@ test "$work" = present && test "$exec_wrapper" = present
         WorkItemId? workItemId,
         CancellationToken ct)
         => MountSingleBindWithRetryAsync(
-            opts, name, host, sandbox, workItemId, restoreHostSourceAsync: null, ct);
+            opts, name, host, sandbox, workItemId, sourceRestorer: null, ct);
 
     /// <summary>
     /// Mounts one host directory into the VM with bounded retry and per-attempt
-    /// host-state diagnostics. When <paramref name="restoreHostSourceAsync"/> is
+    /// host-state diagnostics. When <paramref name="sourceRestorer"/> is
     /// supplied and the post-failure orchestrator-side stat of the source path
-    /// returns <c>exists=no</c>, the callback is invoked once to re-create the
-    /// source before retrying — this covers the case where racing cleanup or a
-    /// failed clone removed the staging directory between the orchestrator
-    /// creating it and the mount firing. Without the callback, a missing
-    /// source is treated as terminal (no number of retries can heal it) and
-    /// reported immediately.
+    /// returns <c>exists=no</c>, <see cref="ISandboxMountSourceRestorer.RestoreAsync"/>
+    /// is invoked once to re-create the source before retrying — this covers
+    /// the case where racing cleanup or a failed clone removed the staging
+    /// directory between the orchestrator creating it and the mount firing.
+    /// Without a restorer, a missing source is treated as terminal (no number
+    /// of retries can heal it) and reported immediately.
     ///
-    /// <para><b>Out of scope for the callback.</b> Mount failures where the
+    /// <para><b>Out of scope for the restorer.</b> Mount failures where the
     /// orchestrator can stat the path fine but multipass cannot (e.g.
     /// snap-confined daemon's AppArmor profile only allows reads under
     /// <c>~/snap/multipass/common/</c>) yield <c>exists=dir</c> in
-    /// post-failure state and therefore never invoke <paramref name="restoreHostSourceAsync"/>.
+    /// post-failure state and therefore never invoke <paramref name="sourceRestorer"/>.
     /// Re-cloning the source would not change that visibility class.
     /// The structural fix for that case lives in <see cref="IGitHost.GetMergeStagingRoot"/>:
     /// route the bind source under a provider-readable root.</para>
@@ -1515,7 +1515,7 @@ test "$work" = present && test "$exec_wrapper" = present
         string host,
         string sandbox,
         WorkItemId? workItemId,
-        Func<CancellationToken, Task>? restoreHostSourceAsync,
+        ISandboxMountSourceRestorer? sourceRestorer,
         CancellationToken ct)
     {
         ProcessRunResult? lastFailure = null;
@@ -1551,14 +1551,14 @@ test "$work" = present && test "$exec_wrapper" = present
             //     daemon-side cache miss or FS sync race), OR
             //   - we hit a permission/IO error reading the source (stat-failed,
             //     which can also be transient), OR
-            //   - the source is missing AND the caller provided a recreate
-            //     callback we have not yet invoked (defensive heal for racing
-            //     cleanup; see restoreHostSourceAsync contract).
+            //   - the source is missing AND the caller provided a restorer
+            //     we have not yet invoked (defensive heal for racing
+            //     cleanup; see ISandboxMountSourceRestorer contract).
             // If the source is definitively missing and we have no way to
             // recreate it, no retry can help — fail fast.
             if (postFailureState.StartsWith("exists=no", StringComparison.Ordinal))
             {
-                if (restoreHostSourceAsync is null || restoreInvoked)
+                if (sourceRestorer is null || restoreInvoked)
                 {
                     _log.LogWarning(
                         "multipass mount failed and host source is missing — not retrying ({Host} -> {Vm}:{Sandbox}, attempt {Attempt}): {Stderr}",
@@ -1569,7 +1569,7 @@ test "$work" = present && test "$exec_wrapper" = present
                 _log.LogWarning(
                     "multipass mount source missing — invoking restore callback before retry ({Host} -> {Vm}:{Sandbox}, attempt {Attempt}): {Stderr}",
                     host, name, sandbox, attempt, run.Stderr.Trim());
-                await restoreHostSourceAsync(ct);
+                await sourceRestorer.RestoreAsync(ct);
                 restoreInvoked = true;
             }
 

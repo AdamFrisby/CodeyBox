@@ -56,9 +56,17 @@ public interface IGitHost
     string GetMergeStagingRoot(string repositoryId)
     {
         var repoPath = GetRepoPath(repositoryId);
-        return Path.GetDirectoryName(repoPath)
-            ?? throw new InvalidOperationException(
-                $"unable to derive merge staging root from bare repo path '{repoPath}'");
+        var parent = Path.GetDirectoryName(repoPath);
+        // Guard null AND empty: on Unix, a bare-repo path with no directory
+        // component (e.g. "id.git" relative path, or a hostile GetRepoPath
+        // override) yields string.Empty rather than null from
+        // Path.GetDirectoryName. Without the empty guard, the staging clone
+        // would land in the orchestrator process CWD and bypass the
+        // sandbox-mountable-root contract this method exists to enforce.
+        return string.IsNullOrEmpty(parent)
+            ? throw new InvalidOperationException(
+                $"unable to derive merge staging root from bare repo path '{repoPath}'")
+            : parent;
     }
 
     /// <summary>

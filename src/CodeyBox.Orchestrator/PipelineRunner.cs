@@ -4260,22 +4260,22 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <summary>
     /// Wraps a <see cref="SandboxRepositoryAccess"/> built for an isolated
     /// merge / conflict-rework clone so the isolated host path's mount carries
-    /// a self-heal hook: if the sandbox provider reports the host source
-    /// missing at mount time, the orchestrator re-clones the bare repo into
-    /// the same target path before the mount is retried. Only the mount that
-    /// points at <paramref name="isolatedRepoHostPath"/> gets the hook —
-    /// other mounts in the access keep their default null callback.
+    /// an <see cref="ISandboxMountSourceRestorer"/>: if the sandbox provider
+    /// reports the host source missing at mount time, the orchestrator
+    /// re-clones the bare repo into the same target path before the mount is
+    /// retried. Only the mount that points at
+    /// <paramref name="isolatedRepoHostPath"/> gets the restorer — other
+    /// mounts in the access keep their default null restorer.
     /// </summary>
     internal SandboxRepositoryAccess AttachIsolatedRepoRestoreHook(
         SandboxRepositoryAccess access,
         string repoId,
         string isolatedRepoHostPath)
     {
-        Func<CancellationToken, Task> restore = ct =>
-            RestoreIsolatedMergeRepositoryAsync(repoId, isolatedRepoHostPath, ct);
+        var restorer = new IsolatedMergeRepoSourceRestorer(this, repoId, isolatedRepoHostPath);
         var rewrittenMounts = access.Mounts
             .Select(m => string.Equals(m.HostPath, isolatedRepoHostPath, StringComparison.Ordinal)
-                ? m with { RestoreHostSourceAsync = restore }
+                ? m with { SourceRestorer = restorer }
                 : m)
             .ToArray();
         return access with { Mounts = rewrittenMounts };
@@ -4284,9 +4284,10 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <summary>
     /// Re-clones the bare repo back into <paramref name="targetPath"/> after
     /// the path has gone missing between create-time and mount-time. The
-    /// callback wired into <see cref="SandboxMount.RestoreHostSourceAsync"/>
-    /// invokes this so the merge mount step can self-heal a racing cleanup
-    /// without aborting the whole work item.
+    /// <see cref="ISandboxMountSourceRestorer"/> wired into
+    /// <see cref="SandboxMount.SourceRestorer"/> invokes this so the merge
+    /// mount step can self-heal a racing cleanup without aborting the whole
+    /// work item.
     /// </summary>
     internal async Task RestoreIsolatedMergeRepositoryAsync(string repoId, string targetPath, CancellationToken ct)
     {
@@ -4297,6 +4298,29 @@ public sealed class PipelineRunner : IPipelineRunner
         // is a no-op when the path is absent.
         DeleteDirectoryBestEffort(targetPath);
         await RunHostGitAsync(stagingRoot, ct, "clone", "--bare", "--", source, targetPath);
+    }
+
+    /// <summary>
+    /// Concrete restorer that re-runs <c>git clone --bare</c> for the merge /
+    /// conflict-rework isolated staging clone. Lives in the orchestrator so
+    /// the <c>CodeyBox.Sandbox.*</c> assemblies stay unaware of git-host
+    /// recovery logic — the sandbox provider only ever invokes the interface.
+    /// </summary>
+    private sealed class IsolatedMergeRepoSourceRestorer : ISandboxMountSourceRestorer
+    {
+        private readonly PipelineRunner _owner;
+        private readonly string _repoId;
+        private readonly string _isolatedRepoHostPath;
+
+        public IsolatedMergeRepoSourceRestorer(PipelineRunner owner, string repoId, string isolatedRepoHostPath)
+        {
+            _owner = owner;
+            _repoId = repoId;
+            _isolatedRepoHostPath = isolatedRepoHostPath;
+        }
+
+        public Task RestoreAsync(CancellationToken ct)
+            => _owner.RestoreIsolatedMergeRepositoryAsync(_repoId, _isolatedRepoHostPath, ct);
     }
 
     private async Task ImportIsolatedMergeCommitAsync(

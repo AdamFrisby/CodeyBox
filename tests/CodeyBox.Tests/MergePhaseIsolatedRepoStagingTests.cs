@@ -207,13 +207,24 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
 
             // The acceptance invariant: every concurrently-created staging
             // dir is still a valid bare git repo on disk after the reaper
-            // ran many sweeps overlapping with the create phase.
+            // ran many sweeps overlapping with the create phase. Each
+            // staging dir MUST sit under the configured GitRoot (not under
+            // Path.GetTempPath()) — that placement is the structural fix
+            // for the b044f8bd incident, and the regression guard below
+            // would fail this test if a future change reverted to /tmp
+            // staging even while the reaper-doesn't-touch-host-fs contract
+            // was preserved.
+            var tempPathNormalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath()));
             foreach (var path in inflightStagings)
             {
                 Assert.True(Directory.Exists(path),
                     $"merge staging dir reaped mid-flight: {path}");
                 Assert.True(File.Exists(Path.Combine(path, "HEAD")),
                     $"merge staging dir corrupted mid-flight: {path}");
+                Assert.Equal(gitRoot, Path.GetDirectoryName(path));
+                Assert.NotEqual(
+                    tempPathNormalized,
+                    Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetDirectoryName(path)!)));
             }
 
             // The reaper enumerated its provider but never touched the host
@@ -228,6 +239,86 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             {
                 try { Directory.Delete(path, recursive: true); } catch { /* best-effort */ }
             }
+        }
+    }
+
+    [Fact]
+    public async Task ExternalCleanupReapingStagingMidFlight_RestorerHealsItRepeatedly()
+    {
+        // Active-simulation companion to
+        // ConcurrentReaperSweepsRunningDuringMergeStaging_LeaveAllStagingDirsIntact:
+        // that test pins the current reaper contract (provider-list-only,
+        // never touches the host filesystem). This test pins what would
+        // happen if the contract were violated — e.g. a future
+        // SandboxLeakReaper variant gained host-side directory cleanup,
+        // or an external tool like tmpwatch reaped the staging dir between
+        // CreateIsolatedMergeRepositoryAsync and the mount call.
+        //
+        // The orchestrator-side fix is the ISandboxMountSourceRestorer
+        // wired by AttachIsolatedRepoRestoreHook: when the sandbox provider
+        // sees a missing host source at mount time, it invokes the
+        // restorer, which re-clones the bare repo at the same path. This
+        // test simulates repeated reaping by deleting the staging dir and
+        // re-invoking the restorer in a sequential loop, mirroring the
+        // pattern of repeated mount-retry-with-heal that would run if an
+        // external tool reaped the dir multiple times during a long-running
+        // mount window. After every reap, the next restore call must
+        // recreate a valid bare clone at the same path.
+        //
+        // Without ISandboxMountSourceRestorer (the pre-fix state), no
+        // amount of looping would recover the directory because the
+        // orchestrator never re-cloned at mount time.
+        //
+        // Sequential rather than truly-concurrent on purpose: the production
+        // restore path is invoked at most once per mount retry attempt and
+        // is not re-entrant. Two concurrent RestoreAsync calls race
+        // DeleteDirectoryBestEffort against `git clone`'s pre-flight check
+        // and would deadlock or fail spuriously — neither of which models a
+        // real reaper. The loop below simulates "reaper deletes, restorer
+        // heals, mount succeeds" repeatedly to demonstrate convergence.
+        var gitRoot = Path.Combine(_workspace, "git-root-deletion-race");
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+
+        var seed = await CreateSeedRepoAsync();
+        var workItemId = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(workItemId, seed);
+        var pipeline = CreatePipeline(gitHost);
+
+        var stagingPath = await pipeline.CreateIsolatedMergeRepositoryAsync(repoId, workItemId, CancellationToken.None);
+        try
+        {
+            // Production restorer wiring: AttachIsolatedRepoRestoreHook
+            // builds the same ISandboxMountSourceRestorer the merge phase
+            // would receive in production.
+            var access = ((IGitHost)gitHost).GetIsolatedRepoSandboxAccess(stagingPath);
+            var hooked = pipeline.AttachIsolatedRepoRestoreHook(access, repoId, stagingPath);
+            var restorer = hooked.Mounts.Single(m => m.HostPath == stagingPath).SourceRestorer!;
+
+            // Five reap-then-restore iterations. Each iteration deletes the
+            // staging dir (the simulated reap), then asks the restorer to
+            // recreate it. After every restore the directory must be a
+            // valid bare repository — a regression that broke the heal
+            // path on any iteration would fail this test immediately.
+            for (var i = 0; i < 5; i++)
+            {
+                Assert.True(Directory.Exists(stagingPath),
+                    $"iteration {i}: staging dir missing before simulated reap");
+                Directory.Delete(stagingPath, recursive: true);
+                Assert.False(Directory.Exists(stagingPath));
+
+                await restorer.RestoreAsync(CancellationToken.None);
+
+                Assert.True(Directory.Exists(stagingPath),
+                    $"iteration {i}: restore did not recreate {stagingPath}");
+                Assert.True(File.Exists(Path.Combine(stagingPath, "HEAD")),
+                    $"iteration {i}: restored staging dir is not a valid bare git repository");
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
         }
     }
 
@@ -439,15 +530,15 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             var hooked = pipeline.AttachIsolatedRepoRestoreHook(baseAccess, repoId, stagingPath);
 
             var hookedRepoMount = Assert.Single(hooked.Mounts, m => m.HostPath == stagingPath);
-            Assert.NotNull(hookedRepoMount.RestoreHostSourceAsync);
+            Assert.NotNull(hookedRepoMount.SourceRestorer);
             var hookedTmpfs = Assert.Single(hooked.Mounts, m => m.Tmpfs);
-            Assert.Null(hookedTmpfs.RestoreHostSourceAsync);
+            Assert.Null(hookedTmpfs.SourceRestorer);
 
-            // Exercise the wired callback end-to-end: deleting the staging
-            // dir, invoking the hook, and re-stating must show the bare
+            // Exercise the wired restorer end-to-end: deleting the staging
+            // dir, invoking the restorer, and re-stating must show the bare
             // clone has been recreated under the same path.
             Directory.Delete(stagingPath, recursive: true);
-            await hookedRepoMount.RestoreHostSourceAsync!(CancellationToken.None);
+            await hookedRepoMount.SourceRestorer!.RestoreAsync(CancellationToken.None);
             Assert.True(File.Exists(Path.Combine(stagingPath, "HEAD")),
                 "restore callback wired by the orchestrator must re-clone the bare repo at the original path");
         }
@@ -590,6 +681,23 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
 
         var ex = Assert.Throws<InvalidOperationException>(
             () => rootHost.GetMergeStagingRoot("any"));
+        Assert.Contains("merge staging root", ex.Message);
+    }
+
+    [Fact]
+    public void GetMergeStagingRoot_DefaultThrowsWhenRepoPathHasEmptyParent()
+    {
+        // Regression: on Unix, Path.GetDirectoryName returns string.Empty
+        // (not null) for a bare-repo path with no directory component (e.g.
+        // "id.git"). The previous `?? throw` guard only caught null, which
+        // meant staging silently landed in the orchestrator process CWD
+        // — bypassing the GitRoot / snap-mountable-layout invariant this
+        // method exists to enforce. The default must reject both null and
+        // empty parents with the same operator-readable failure.
+        IGitHost rootlessHost = new RootlessGitHost();
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => rootlessHost.GetMergeStagingRoot("any"));
         Assert.Contains("merge staging root", ex.Message);
     }
 
