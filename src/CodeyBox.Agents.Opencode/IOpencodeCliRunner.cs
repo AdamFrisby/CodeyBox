@@ -2,9 +2,10 @@ namespace CodeyBox.Agents.Opencode;
 
 /// <summary>
 /// Runs the <c>opencode</c> CLI on the host for probes that need local output.
-/// Abstracted so unit tests can stub exit codes and stdout without shelling out.
+/// Abstracted so unit tests and the API composition root can substitute process
+/// execution without leaking <see cref="CodeyBox.HostProcess.IProcessRunner"/>.
 /// </summary>
-internal interface IOpencodeCliRunner
+public interface IOpencodeCliRunner
 {
     /// <summary>
     /// Runs <c>{binary} models</c> and returns exit code plus captured streams.
@@ -14,4 +15,4 @@ internal interface IOpencodeCliRunner
     Task<OpencodeCliRunResult> RunModelsAsync(string binary, CancellationToken ct);
 }
 
-internal readonly record struct OpencodeCliRunResult(int ExitCode, string Stdout, string Stderr);
+public readonly record struct OpencodeCliRunResult(int ExitCode, string Stdout, string Stderr);

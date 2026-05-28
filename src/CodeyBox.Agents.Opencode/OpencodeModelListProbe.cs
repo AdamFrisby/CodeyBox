@@ -1,6 +1,5 @@
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
-using CodeyBox.HostProcess;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Agents.Opencode;
@@ -20,20 +19,7 @@ public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
 
     public AgentKind Kind => AgentKind.Opencode;
 
-    public OpencodeModelListProbe(ILogger<OpencodeModelListProbe>? log = null)
-        : this(new DefaultProcessRunner(), null, log)
-    {
-    }
-
     public OpencodeModelListProbe(
-        IProcessRunner processRunner,
-        string? binary = null,
-        ILogger<OpencodeModelListProbe>? log = null)
-        : this(new DefaultOpencodeCliRunner(processRunner), binary, log)
-    {
-    }
-
-    internal OpencodeModelListProbe(
         IOpencodeCliRunner runner,
         string? binary = null,
         ILogger<OpencodeModelListProbe>? log = null)

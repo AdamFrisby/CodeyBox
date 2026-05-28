@@ -20,7 +20,9 @@ public sealed class OpencodeModelListProbeTests
 
     [Fact]
     public void Kind_IsOpencode()
-        => Assert.Equal(AgentKind.Opencode, new OpencodeModelListProbe().Kind);
+        => Assert.Equal(
+            AgentKind.Opencode,
+            new OpencodeModelListProbe(new StubOpencodeCliRunner(0, "", "")).Kind);
 
     [Fact]
     public void ParseModelsOutput_Fixture_YieldsExactlySeventeenModelIds()
@@ -176,10 +178,85 @@ public sealed class OpencodeModelListProbeTests
         Assert.Equal(ExpectedModelIds, result.ModelIds);
     }
 
+    [Fact]
+    public async Task GetModelListAsync_DefaultCliRunner_ForwardsBinaryToProcessRunner()
+    {
+        var processRunner = new RecordingProcessRunner();
+        var cli = new DefaultOpencodeCliRunner(processRunner);
+        var probe = new OpencodeModelListProbe(cli, binary: "/opt/bin/opencode");
+
+        _ = await probe.GetModelListAsync(CancellationToken.None);
+
+        var call = Assert.Single(processRunner.Calls);
+        Assert.Equal("/opt/bin/opencode", call[0]);
+        Assert.Equal("models", call[1]);
+    }
+
+    [Fact]
+    public async Task GetModelListAsync_ConstructorBinary_PassedToCliRunner()
+    {
+        var runner = new CapturingOpencodeCliRunner(0, "", "");
+        var probe = new OpencodeModelListProbe(runner, binary: "/custom/opencode");
+
+        _ = await probe.GetModelListAsync(CancellationToken.None);
+
+        Assert.Equal("/custom/opencode", runner.LastBinary);
+    }
+
+    [Fact]
+    public async Task GetModelListAsync_CodeyboxOpencodeBinaryEnv_ResolvedWhenBinaryOmitted()
+    {
+        var prior = Environment.GetEnvironmentVariable("CODEYBOX_OPENCODE_BINARY");
+        try
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_OPENCODE_BINARY", "/env/opencode");
+            var runner = new CapturingOpencodeCliRunner(0, "", "");
+            var probe = new OpencodeModelListProbe(runner);
+
+            _ = await probe.GetModelListAsync(CancellationToken.None);
+
+            Assert.Equal("/env/opencode", runner.LastBinary);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_OPENCODE_BINARY", prior);
+        }
+    }
+
     private sealed class StubOpencodeCliRunner(int exitCode, string stdout, string stderr) : IOpencodeCliRunner
     {
         public Task<OpencodeCliRunResult> RunModelsAsync(string binary, CancellationToken ct) =>
             Task.FromResult(new OpencodeCliRunResult(exitCode, stdout, stderr));
+    }
+
+    private sealed class CapturingOpencodeCliRunner(int exitCode, string stdout, string stderr) : IOpencodeCliRunner
+    {
+        public string? LastBinary { get; private set; }
+
+        public Task<OpencodeCliRunResult> RunModelsAsync(string binary, CancellationToken ct)
+        {
+            LastBinary = binary;
+            return Task.FromResult(new OpencodeCliRunResult(exitCode, stdout, stderr));
+        }
+    }
+
+    private sealed class RecordingProcessRunner : CodeyBox.HostProcess.IProcessRunner
+    {
+        public List<string[]> Calls { get; } = [];
+
+        public Task<CodeyBox.HostProcess.ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null)
+        {
+            Calls.Add(argv.ToArray());
+            return Task.FromResult(new CodeyBox.HostProcess.ProcessRunResult(0, "", ""));
+        }
     }
 
     private sealed class ThrowingOpencodeCliRunner(Exception ex) : IOpencodeCliRunner

@@ -19,7 +19,6 @@ using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
-using CodeyBox.HostProcess;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Multipass;
@@ -909,12 +908,11 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
         },
         loggerFactory.CreateLogger<CodexModelListProbe>());
 });
-builder.Services.AddSingleton<IProcessRunner, DefaultProcessRunner>();
 builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     return new OpencodeModelListProbe(
-        sp.GetRequiredService<IProcessRunner>(),
+        new DefaultOpencodeCliRunner(),
         binary: Environment.GetEnvironmentVariable("CODEYBOX_OPENCODE_BINARY"),
         loggerFactory.CreateLogger<OpencodeModelListProbe>());
 });

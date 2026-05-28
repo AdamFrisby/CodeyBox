@@ -5,7 +5,7 @@ namespace CodeyBox.Agents.Opencode;
 /// <summary>
 /// Host process runner for <c>opencode models</c> via shared <see cref="IProcessRunner"/>.
 /// </summary>
-internal sealed class DefaultOpencodeCliRunner : IOpencodeCliRunner
+public sealed class DefaultOpencodeCliRunner : IOpencodeCliRunner
 {
     private const int MaxOutputBytes = 512 * 1024;
     private readonly IProcessRunner _runner;
