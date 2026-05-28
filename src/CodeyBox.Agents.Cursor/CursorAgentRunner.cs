@@ -118,10 +118,22 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         // Cursor release adds one, wire it here.
         _ = reasoningMode;
 
-        // captureStructuredStream is accepted for interface uniformity. The
-        // Cursor CLI does not advertise a stream-json output mode; the runner
-        // is text-only. CursorStreamParser is intentionally absent.
-        _ = captureStructuredStream;
+        // Cursor CLI (verified against 2026.05.27-fe9a6e2) emits NDJSON in
+        // the same system/user/assistant/result shape as Claude when
+        // --output-format stream-json --stream-partial-output are set.
+        // Enabling these makes the orchestrator's AgentStreams capture the
+        // structured stream live to disk, giving the same audit / cost-
+        // extraction visibility we get for Claude. Earlier releases of this
+        // CLI did not expose the flags; if a baseline image installs an
+        // older Cursor the dispatch will fail with "unknown option" and the
+        // operator can either pin captureStructuredStream off for cursor or
+        // rebake with a newer Cursor in MultipassExtraRuncmd.
+        if (captureStructuredStream)
+        {
+            argv.Add("--output-format");
+            argv.Add("stream-json");
+            argv.Add("--stream-partial-output");
+        }
 
         // Pass the prompt via stdin rather than positional argv. Linux's
         // MAX_ARG_STRLEN is 128 KiB per single argv element; rework prompts
