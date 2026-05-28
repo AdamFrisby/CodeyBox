@@ -16,11 +16,10 @@ namespace CodeyBox.Agents.Opencode;
 /// human-readable fallback is intentionally generous.</para>
 ///
 /// <para>No <see cref="DefaultPricing"/> is shipped: opencode fronts many
-/// providers with very different per-token economics (DeepSeek vs Anthropic
-/// vs OpenAI). Operators set per-model pricing under
-/// <c>CodeyBox:AgentPricing</c> in appsettings keyed by the model id the
-/// extractor records, matching the cost-reporting flow for the other
-/// agents.</para>
+/// providers with very different per-token economics. Per-model rates ship in
+/// <c>agent-pricing-defaults.json</c> (subscription-equivalent for OpenCode Go)
+/// and can be overridden under <c>CodeyBox:AgentPricing</c> in
+/// <c>codeybox-extra.json</c>, keyed by the model id this extractor records.</para>
 /// </summary>
 public sealed class OpencodeCostExtractor : IAgentCostExtractor
 {
@@ -100,7 +99,7 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
     {
         if (!root.TryGetProperty("usage", out var usage)) return null;
 
-        int input = 0, output = 0;
+        int input = 0, cached = 0, output = 0;
         string? modelId = null;
 
         if (usage.TryGetProperty("prompt_tokens", out var pt) && pt.TryGetInt32(out var ptv)) input = ptv;
@@ -109,6 +108,8 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
         if (usage.TryGetProperty("completion_tokens", out var ct) && ct.TryGetInt32(out var ctv)) output = ctv;
         else if (usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv)) output = otv;
 
+        cached = TryReadCachedInputTokens(usage);
+
         if (root.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String)
         {
             var raw = m.GetString();
@@ -116,7 +117,22 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
         }
 
         if (input == 0 && output == 0) return null;
-        return new AgentCostSnapshot(input, 0, output, modelId);
+        return new AgentCostSnapshot(input, cached, output, modelId);
+    }
+
+    private static int TryReadCachedInputTokens(JsonElement usage)
+    {
+        if (usage.TryGetProperty("cache_read_input_tokens", out var anthropic) && anthropic.TryGetInt32(out var ac))
+            return ac;
+
+        if (usage.TryGetProperty("prompt_tokens_details", out var details)
+            && details.TryGetProperty("cached_tokens", out var openAiCached)
+            && openAiCached.TryGetInt32(out var oc))
+        {
+            return oc;
+        }
+
+        return 0;
     }
 
     private static AgentCostSnapshot? TryParseHumanReadable(string? text)

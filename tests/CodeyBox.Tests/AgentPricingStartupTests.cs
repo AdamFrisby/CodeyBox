@@ -42,6 +42,26 @@ public sealed class AgentPricingStartupTests : IClassFixture<AgentPricingStartup
     }
 
     [Fact]
+    public void AgentCostCalculator_OpencodeDeepSeekTypicalUsage_MatchesFiveHourBudgetPerRequest()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var calculator = scope.ServiceProvider.GetRequiredService<AgentCostCalculator>();
+
+        // Typical mix from https://opencode.ai/docs/go: 750 input, 82k cached, 290 output.
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 82_750,
+            CachedInputTokens: 82_000,
+            OutputTokens: 290,
+            ModelId: "opencode-go/deepseek-v4-pro");
+
+        var cost = calculator.Calculate(snapshot, AgentKind.Opencode);
+
+        // $12 per 5h ÷ 3,450 requests/5h; bundled rate rounds to 4 dp in JSON.
+        const decimal expectedPerRequest = 12m / 3450m;
+        Assert.InRange(cost, expectedPerRequest * 0.999m, expectedPerRequest * 1.001m);
+    }
+
+    [Fact]
     public void AgentCostCalculator_UsesBundledCodexCliModelId()
     {
         using var scope = _factory.Services.CreateScope();

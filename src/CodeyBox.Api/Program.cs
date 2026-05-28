@@ -1268,7 +1268,9 @@ builder.Services.AddSingleton<AgentCostCalculator>(sp =>
     var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
     AgentCostCalculator.ValidateAtStartup(merged.Options,
         sp.GetRequiredService<IAgentRegistry>().Available, extractors, startupLog);
-    return new AgentCostCalculator(merged.Options, extractors);
+    var calculator = new AgentCostCalculator(new AgentPricingOptions(), extractors);
+    pricingState.ApplySuccessfulMerge(merged, calculator);
+    return calculator;
 });
 builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
 {

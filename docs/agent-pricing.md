@@ -55,7 +55,7 @@ in its structured-stream usage events.
 | `claude`  | Yes               | Anthropic publishes per-token rates. |
 | `codex`   | Yes               | OpenAI publishes per-token rates. |
 | `gemini`  | Yes               | Google publishes per-token rates. |
-| `opencode` | Yes (notes)      | OpenCode Go is subscription-priced; bundled rates are **subscription-equivalent USD per token** derived from the $12/5h usage budget and typical token mix on [opencode.ai/docs/go](https://opencode.ai/docs/go). Keys use `opencode-go/<model-id>`. |
+| `opencode` | Yes (notes)      | OpenCode Go is subscription-priced; bundled rates are a **single subscription-equivalent USD/M** per model (same value for input, cached input, and output) derived from the $12/5h budget, each model's requests-per-5h limit, and the typical token mix on [opencode.ai/docs/go](https://opencode.ai/docs/go). Keys use `opencode-go/<model-id>`. |
 | `cursor`  | No (notes)        | Cursor is a flat-rate subscription. No per-token rate is published. |
 | `copilot` | No (notes)        | Copilot is a flat-rate subscription. No per-token rate is published. |
 
@@ -100,7 +100,7 @@ Returns the merged table plus the bundled `_meta`:
   "meta": {
     "lastUpdated": "2026-05-28",
     "sources": { "claude": "https://...", ... },
-    "notes":   { "opencode": "subscription-only — no per-token rates published", ... },
+    "notes":   { "opencode": "subscription-equivalent USD/M from $12/5h budget …", ... },
     "sourcePath": "<absolute path the bundle was loaded from>",
     "counts": { "bundled": 11, "operatorOverrides": 0, "total": 11, "overlap": 0 }
   },
@@ -146,9 +146,9 @@ shape under their `codeybox-extra.json`:
       "Rates": {
         "opencode": {
           "opencode-go/deepseek-v4-pro": {
-            "inputPerMillion":       0.27,
-            "cachedInputPerMillion": 0.07,
-            "outputPerMillion":      1.10
+            "inputPerMillion":       0.0419,
+            "cachedInputPerMillion": 0.0419,
+            "outputPerMillion":      0.0419
           }
         }
       }
