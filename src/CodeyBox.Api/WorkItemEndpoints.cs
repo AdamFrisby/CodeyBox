@@ -1916,6 +1916,15 @@ public sealed record CreateWorkItemRequest(
     string ProjectId,
     string Title,
     string Prompt,
+    /// <summary>
+    /// Optional agent preference. When <c>agentClassId</c> is omitted, selects the agent
+    /// directly (overriding the project default). When <c>agentClassId</c> is set, acts as
+    /// the <b>initial choice</b> only: the router may override it when the named agent fails
+    /// the smoke gate, hits its per-agent concurrency cap, or is outscored by another class
+    /// member. The persisted work item's <c>agent</c> field is <b>rewritten</b> at pickup to
+    /// whichever member the router actually chose. There is no mechanism today to hard-pin a
+    /// work item to a specific agent inside a class.
+    /// </summary>
     string? Agent,
     string? AuditorProfile,
     string? AgentClassId,
