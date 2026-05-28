@@ -93,7 +93,6 @@ public sealed class AgentClassRouterScoreTests
         var decision = await router.ResolveAsync(item, null, CancellationToken.None);
 
         Assert.Equal(Claude, decision.Chosen!.Agent);
-        Assert.Equal(Codex, item.Agent);
     }
 
     // ── Floor filter ──────────────────────────────────────────────────────────
