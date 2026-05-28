@@ -473,6 +473,79 @@ public sealed class InVmSmokeProberTests
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
+    [Fact]
+    public async Task FastFailBench_CacheHitDoesNotClear_FreshPassClears()
+    {
+        // End-to-end pin for the clearsFastFail wiring at the prober's two call
+        // sites (cache hit → false, fresh pass → true). A fast-fail bench earned
+        // from real dispatch failures must survive a cached in-VM reconciliation
+        // (no CLI was re-executed) and only be lifted by a freshly executed pass.
+        // Swapping the two boolean arguments would make this test fail.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
+
+        // 1) Fresh pass populates the cache (clearsFastFail:true, nothing to clear yet).
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(1, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        // 2) Real dispatch fast-fails three times → fast-fail circuit breaker benches it.
+        for (var i = 0; i < 3; i++)
+            registry.RecordRunOutcome(AgentKind.Cursor, success: false, duration: TimeSpan.FromMilliseconds(500));
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        // 3) A CACHE HIT re-asserts the in-VM pass but re-executed no CLI, so it
+        //    must NOT lift the fast-fail bench (clearsFastFail:false).
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(1, provider.CreateCount); // cache hit: no new VM
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        // 4) A FRESH pass (cache invalidated → CLI actually re-executed) IS valid
+        //    evidence the binary launches, so it clears the fast-fail bench.
+        cache.Invalidate(AgentKind.Cursor);
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(2, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task FailClosed_DispatchGate_BenchesOnProbeFault_SweepStillFailsOpen()
+    {
+        // Opt-in fail-closed dispatch policy: an inconclusive dispatch-gate probe
+        // (provisioning fault) must temporarily bench the agent so routing avoids
+        // an unverified CLI — but the background sweep must still fail open.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""))
+        {
+            ThrowOnCreate = new InvalidOperationException("provider blew up"),
+        };
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                FailClosedOnProbeFault = true,
+            });
+
+        // The sweep performs no dispatch, so a transient fault there never benches.
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A")); // fault never cached
+
+        // The dispatch gate, under fail-closed, benches the agent so the router
+        // routes past it instead of dispatching to a CLI it could not verify.
+        await prober.EnsureProbedAsync(AgentKind.Cursor, CancellationToken.None);
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        // The fault is not cached, so a later (recovered) probe self-heals it.
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
     private static bool IsAgent(SandboxExec exec, string sub) =>
         exec.Argv.Count >= 2 && exec.Argv[0] == CursorAgentRunner.DefaultBinary && exec.Argv[1] == sub;
 

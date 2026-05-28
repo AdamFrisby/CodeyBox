@@ -50,6 +50,18 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     public const string DefaultBinary = "agent";
 
     /// <summary>
+    /// The flag that auto-accepts Cursor's workspace-trust prompt — stage 3 of
+    /// the 2026-05-28 cascade ("Workspace Trust Required", exit 1). The runner
+    /// must ALWAYS pass it (the multipass VM boundary is the security perimeter,
+    /// so per-workspace consent inside the sandbox is noise). Exposed as a single
+    /// source of truth so <c>BuildInvocation</c> and
+    /// <c>CursorAgentRunnerTrustRegressionTests</c> — the load-bearing pin for
+    /// stage 3, which the in-VM smoke probe's version/status steps cannot engage —
+    /// reference the same literal and cannot drift apart.
+    /// </summary>
+    public const string WorkspaceTrustFlag = "--trust";
+
+    /// <summary>
     /// Bash that materialises Cursor's subscription credentials into the
     /// sandbox at <c>~/.config/cursor/auth.json</c> from
     /// <c>CODEYBOX_CURSOR_AUTH_JSON</c>. Shared verbatim with
@@ -128,7 +140,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         // noise. --force is the same idea for per-command tool prompts (see
         // Claude's --dangerously-skip-permissions for the equivalent
         // rationale on that runner).
-        var argv = new List<string> { Binary, "--print", "--trust", "--force" };
+        var argv = new List<string> { Binary, "--print", WorkspaceTrustFlag, "--force" };
 
         var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))

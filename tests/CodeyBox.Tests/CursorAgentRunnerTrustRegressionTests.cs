@@ -78,8 +78,8 @@ public sealed class CursorAgentRunnerTrustRegressionTests
         Assert.NotEmpty(agentExecs);
         foreach (var exec in agentExecs)
         {
-            Assert.True(exec.Argv.Contains("--trust"),
-                $"Cursor runner omitted --trust from argv [{string.Join(' ', exec.Argv)}]. " +
+            Assert.True(exec.Argv.Contains(CursorAgentRunner.WorkspaceTrustFlag),
+                $"Cursor runner omitted {CursorAgentRunner.WorkspaceTrustFlag} from argv [{string.Join(' ', exec.Argv)}]. " +
                 $"The CLI requires --trust to run non-interactively on a workspace " +
                 $"(2026-05-28 cascade stage 3); the in-VM smoke probe does not cover " +
                 $"workspace trust, so this pin is the only guard. See CursorAgentRunner.cs.");

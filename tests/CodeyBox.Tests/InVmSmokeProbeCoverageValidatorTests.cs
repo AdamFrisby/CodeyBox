@@ -5,6 +5,7 @@ using CodeyBox.Agents.Claude;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -131,11 +132,25 @@ public sealed class InVmSmokeProbeCoverageValidatorTests
     {
         var cbOpts = new CodeyBoxOptions { AgentClasses = classes.ToList() };
         capture = new WarningCapturingLogger();
-        return new InVmSmokeProbeCoverageValidator(
-            Options.Create(cbOpts),
+        // The validator now drives benching through the IInVmSmokeGate abstraction
+        // (the real prober) rather than touching the registry directly, so the
+        // coverage policy (enablement, exempt list, registered-probe set,
+        // availability mutation) is exercised end-to-end here. EnforceMissingProbeCoverage
+        // is pure — it never provisions — so the sandbox/resolver/credential/cache
+        // deps are inert stubs.
+        var gate = new InVmSmokeProber(
+            new ScriptedSandboxProvider(_ => new SandboxExecResult(0, "", "")),
+            new StubBaselineResolver("base-A"),
+            new NullCredentialProvider(),
             probes,
             reg,
+            new InVmSmokeCache(TimeSpan.FromMinutes(60)),
+            new NullWebhookDispatcher(),
             opts ?? new InVmSmokeOptions { Enabled = true },
+            NullLogger<InVmSmokeProber>.Instance);
+        return new InVmSmokeProbeCoverageValidator(
+            Options.Create(cbOpts),
+            gate,
             capture);
     }
 

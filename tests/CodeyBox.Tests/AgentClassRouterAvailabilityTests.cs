@@ -140,6 +140,9 @@ public sealed class AgentClassRouterAvailabilityTests
         }
 
         public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public IReadOnlyList<InVmSmokeCoverageOutcome> EnforceMissingProbeCoverage(
+            IReadOnlyList<InVmSmokeClassCoverage> classes) => [];
     }
 
     // ── Acceptance criterion 4: smoke-pass but fast-fail-127 also excludes ──

@@ -34,4 +34,54 @@ public interface IInVmSmokeGate
     /// at a time) and never throws. A no-op when disabled.
     /// </summary>
     Task ProbeAllAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Benches every agent named in <paramref name="classes"/> that has no
+    /// registered in-VM probe (AC#1: an agent whose sandbox CLI can never be
+    /// verified must be routed past at smoke time, not discovered at first
+    /// dispatch). Ownership of the enablement decision, the exempt list, the
+    /// registered-probe set, and the availability mutation all live behind this
+    /// abstraction so callers (startup coverage validator, hot-reload bridge)
+    /// never duplicate that policy or bind to the concrete registry.
+    ///
+    /// <para>Benching only happens when the prober is active (<see cref="Enabled"/>)
+    /// and the agent is not on the exempt list; otherwise the uncovered agent is
+    /// reported but left routable. Idempotent — safe to re-run on every config
+    /// reload. Returns one outcome per <em>uncovered</em> agent so the caller can
+    /// surface it to operators; covered agents are omitted.</para>
+    /// </summary>
+    IReadOnlyList<InVmSmokeCoverageOutcome> EnforceMissingProbeCoverage(
+        IReadOnlyList<InVmSmokeClassCoverage> classes);
 }
+
+/// <summary>
+/// One agent class's membership, passed to
+/// <see cref="IInVmSmokeGate.EnforceMissingProbeCoverage"/>. <see cref="Agents"/>
+/// are the raw configured agent names (the same strings the router treats as
+/// <c>AgentMembership.Agent</c>), so the bench is keyed identically to the
+/// router's availability read.
+/// </summary>
+public sealed record InVmSmokeClassCoverage(string ClassId, IReadOnlyList<string> Agents);
+
+/// <summary>What happened to an uncovered agent during coverage enforcement.</summary>
+public enum InVmSmokeCoverageAction
+{
+    /// <summary>Benched under the missing-probe source so the router routes past it.</summary>
+    Benched,
+
+    /// <summary>Uncovered but on the exempt list (no first-party sandbox CLI) — warned only.</summary>
+    Exempt,
+
+    /// <summary>Uncovered but the prober is inactive (disabled / no probes) — warned only.</summary>
+    ProberInactive,
+}
+
+/// <summary>
+/// Per-uncovered-agent result of
+/// <see cref="IInVmSmokeGate.EnforceMissingProbeCoverage"/>. <see cref="ClassIds"/>
+/// is the full set of classes that named the agent (its blast radius).
+/// </summary>
+public sealed record InVmSmokeCoverageOutcome(
+    string Agent,
+    IReadOnlyList<string> ClassIds,
+    InVmSmokeCoverageAction Action);

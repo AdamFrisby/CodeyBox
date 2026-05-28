@@ -1671,7 +1671,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<AgentConcurrencySnapshot>(),
     sp.GetService<IAgentUsageStore>(),
     sp.GetService<IAgentBudgetProvider>(),
-    sp.GetRequiredService<IncrementalRebaseSnapshot>()));
+    sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+    inVmSmokeGate: sp.GetService<IInVmSmokeGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1806,7 +1807,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
         incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
-        quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>());
+        quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
+        smokeGate: sp.GetService<IInVmSmokeGate>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(

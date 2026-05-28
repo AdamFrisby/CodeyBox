@@ -110,6 +110,64 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _resolver.ResolveBaselineRef(_opts.NetworkProfile, SandboxProfileFlavor.Headless) ?? LiveRefSentinel;
 
     /// <summary>
+    /// <see cref="IInVmSmokeGate.EnforceMissingProbeCoverage"/>. Owns the
+    /// enablement decision, exempt list, registered-probe set, and registry
+    /// mutation so no caller has to. Pure (no provisioning) — safe to call at
+    /// startup and on every config hot-reload.
+    /// </summary>
+    public IReadOnlyList<InVmSmokeCoverageOutcome> EnforceMissingProbeCoverage(
+        IReadOnlyList<InVmSmokeClassCoverage> classes)
+    {
+        var covered = new HashSet<string>(_probes.Select(p => p.Kind.Value), StringComparer.OrdinalIgnoreCase);
+        var exempt = new HashSet<string>(_opts.ExemptAgentsWithoutProbe, StringComparer.OrdinalIgnoreCase);
+
+        // Distinct (agent -> the classes that name it) so each uncovered agent is
+        // reported once with the full blast radius.
+        var uncovered = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var cls in classes)
+        {
+            foreach (var agent in cls.Agents)
+            {
+                if (string.IsNullOrWhiteSpace(agent)) continue;
+                if (covered.Contains(agent)) continue;
+                if (!uncovered.TryGetValue(agent, out var ids))
+                {
+                    ids = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+                    uncovered[agent] = ids;
+                }
+                ids.Add(cls.ClassId);
+            }
+        }
+
+        var outcomes = new List<InVmSmokeCoverageOutcome>(uncovered.Count);
+        foreach (var (agent, classIds) in uncovered)
+        {
+            InVmSmokeCoverageAction action;
+            // Benching only makes sense when the prober is active: with it
+            // disabled or no probes registered, benching every member would be a
+            // self-inflicted outage, so fall back to warn-only.
+            if (!Enabled)
+            {
+                action = InVmSmokeCoverageAction.ProberInactive;
+            }
+            else if (exempt.Contains(agent))
+            {
+                action = InVmSmokeCoverageAction.Exempt;
+            }
+            else
+            {
+                var classList = string.Join(", ", classIds);
+                _availability.ExcludeForMissingProbe(
+                    new AgentKind(agent),
+                    $"no registered IInVmSmokeProbe — in-sandbox CLI cannot be verified (used by class(es): {classList})");
+                action = InVmSmokeCoverageAction.Benched;
+            }
+            outcomes.Add(new InVmSmokeCoverageOutcome(agent, classIds.ToList(), action));
+        }
+        return outcomes;
+    }
+
+    /// <summary>
     /// <see cref="IInVmSmokeGate.EnsureProbedAsync"/>. Called on the dispatch
     /// path (router) before an agent's <c>Available</c> state is trusted, so the
     /// very first work item after startup or a baseline rebake is gated by a
@@ -127,16 +185,18 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
 
         try
         {
-            await ProbeAgentAsync(probe, ResolveBaselineRef(), ct);
+            // On the dispatch gate, honour the operator's probe-fault policy:
+            // fail-closed temporarily benches the agent when the probe can't run
+            // to a verdict (see InVmSmokeOptions.FailClosedOnProbeFault).
+            await ProbeAgentAsync(probe, ResolveBaselineRef(), ct, benchOnTransientFault: _opts.FailClosedOnProbeFault);
         }
         catch (Exception ex)
         {
             // The gate runs on the router hot path and must never throw. The
             // expected transient faults are already handled inside ProbeAgentAsync
-            // (fail-open: availability is left unchanged), so reaching here is an
-            // unexpected fault worth surfacing at Warning rather than hiding at
-            // Debug — but we still swallow it so a probe fault cannot take down
-            // dispatch.
+            // (per the fault policy), so reaching here is an unexpected fault
+            // worth surfacing at Warning rather than hiding at Debug — but we
+            // still swallow it so a probe fault cannot take down dispatch.
             _log.LogWarning(ex, "In-VM smoke gate: probe for {Agent} threw unexpectedly; leaving availability unchanged", kind.Value);
         }
     }
@@ -148,7 +208,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// the registry (reconciliation) and returns it without provisioning a VM.
     /// </summary>
     internal async Task<AgentSmokeResult?> ProbeAgentAsync(
-        IInVmSmokeProbe probe, string baselineRef, CancellationToken ct)
+        IInVmSmokeProbe probe, string baselineRef, CancellationToken ct,
+        bool benchOnTransientFault = false)
     {
         if (_cache.TryGet(probe.Kind, baselineRef) is { } cached)
         {
@@ -176,10 +237,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         catch (Exception ex)
         {
             // Credential store fault is an infra problem, not an agent fault.
-            // Fail open (return null → availability unchanged): benching the agent
-            // here would route work away from a CLI that may be perfectly healthy.
+            // Fail open by default (return null → availability unchanged):
+            // benching here would route work away from a CLI that may be
+            // perfectly healthy. Under the fail-closed dispatch policy, bench
+            // it temporarily instead so dispatch never proceeds unverified.
             _log.LogWarning(ex, "In-VM smoke: could not resolve credential for {Agent}; treating as transient", probe.Kind.Value);
-            return null;
+            return BenchTransientFaultIfRequested(probe.Kind, "credential resolution failed", benchOnTransientFault);
         }
 
         // A null credential does NOT skip the agent: the probe still returns its
@@ -199,14 +262,16 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         {
             // A step timed out — treat as transient infra, not an agent fault.
             _log.LogWarning("In-VM smoke for {Agent}: timed out; treating as transient", probe.Kind.Value);
-            return null;
+            return BenchTransientFaultIfRequested(probe.Kind, "probe step timed out", benchOnTransientFault);
         }
         catch (Exception ex)
         {
             // Provisioning or exec error — the host/provider is unhealthy, not
-            // the agent CLI. Do not exclude; let the next sweep retry.
+            // the agent CLI. Do not exclude by default; let the next sweep retry.
+            // Under fail-closed dispatch, bench temporarily so the gate does not
+            // hand work to a CLI it could not verify.
             _log.LogWarning(ex, "In-VM smoke for {Agent}: provisioning/exec failed; treating as transient", probe.Kind.Value);
-            return null;
+            return BenchTransientFaultIfRequested(probe.Kind, "probe provisioning/exec failed", benchOnTransientFault);
         }
 
         // Cache only passes: a failure must be re-checked on the next sweep /
@@ -219,6 +284,28 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         var transition = _availability.MarkSmokeResult(
             probe.Kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
         await EmitTransitionEventsAsync(probe.Kind, result, transition);
+        return result;
+    }
+
+    /// <summary>
+    /// Under the fail-closed dispatch policy, benches <paramref name="kind"/>
+    /// under <see cref="SmokeExclusionSource.InVmSmoke"/> for an inconclusive
+    /// (transient-fault) probe so the router routes past an unverified CLI. The
+    /// failing result is intentionally <em>not</em> cached (the caller's cache
+    /// path only stores passes), so it is re-probed on the next sweep / gate
+    /// call and self-heals once the host recovers. <c>clearsFastFail:false</c>
+    /// because an inconclusive probe is not evidence the binary launches.
+    /// Returns null when benching is not requested (fail-open), leaving
+    /// availability unchanged.
+    /// </summary>
+    private AgentSmokeResult? BenchTransientFaultIfRequested(AgentKind kind, string reason, bool bench)
+    {
+        if (!bench) return null;
+        var result = new AgentSmokeResult(false, $"in-VM probe inconclusive: {reason}", TimeSpan.Zero);
+        _availability.MarkSmokeResult(kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: false);
+        _log.LogWarning(
+            "In-VM smoke gate (fail-closed): benched {Agent} on inconclusive probe ({Reason}); will re-probe next sweep/dispatch",
+            kind.Value, reason);
         return result;
     }
 

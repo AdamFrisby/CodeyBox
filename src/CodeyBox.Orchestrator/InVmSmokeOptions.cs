@@ -36,6 +36,30 @@ public sealed record InVmSmokeOptions
     public int StepTimeoutSeconds { get; init; } = 30;
 
     /// <summary>
+    /// How the <em>dispatch gate</em> (<see cref="InVmSmokeProber.EnsureProbedAsync"/>)
+    /// reacts when an in-VM probe cannot run to a verdict — provisioning fault,
+    /// exec error, step timeout, or credential-store fault.
+    ///
+    /// <para><b>false (default, fail-open):</b> a transient fault leaves
+    /// availability unchanged, so a flaky host never benches a working agent;
+    /// the trade-off is that the exit-127 / auth cascade window stays open for
+    /// the first dispatch until a later probe runs. <b>true (fail-closed):</b>
+    /// an inconclusive dispatch-gate probe temporarily benches the agent under
+    /// the in-VM smoke source so routing avoids an unverified CLI; the bench is
+    /// not cached and self-heals on the next successful probe (background sweep
+    /// or a later gate probe), so it converges back without an operator reset
+    /// once the host recovers. Operators who require "never dispatch to an
+    /// unverified CLI" semantics set this true and keep the background sweep
+    /// enabled so benched agents can recover.</para>
+    ///
+    /// <para>The background sweep (<see cref="InVmSmokeProber.ProbeAllAsync"/>)
+    /// always fails open regardless of this setting — it performs no dispatch,
+    /// so a transient sweep fault has no cascade to gate and benching there
+    /// would only risk a self-inflicted outage.</para>
+    /// </summary>
+    public bool FailClosedOnProbeFault { get; init; } = false;
+
+    /// <summary>
     /// Agents allowed to route without a registered <c>IInVmSmokeProbe</c>.
     /// When the prober is active, an agent named in an <c>AgentClass</c> with no
     /// in-VM probe is benched at startup (AC#1: caught at smoke time, not first

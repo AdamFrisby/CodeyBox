@@ -69,6 +69,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly AgentAvailabilityRegistry? _availability;
+    private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly IPreMergeVerifier? _preMergeVerifier;
     // Hot-reloadable feature flag for the between-iteration incremental
     // rebase. Optional: when null the feature is disabled regardless of
@@ -190,7 +191,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentUsageStore? usageStore = null,
         IAgentBudgetProvider? budgetProvider = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
-        AgenticConflictResolver? agenticConflictResolver = null)
+        AgenticConflictResolver? agenticConflictResolver = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -247,6 +249,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _availability = availability;
+        _inVmSmokeGate = inVmSmokeGate;
         _agentRunningCounters = agentRunningCounters;
         // Prefer the shared snapshot when DI supplies it (production path —
         // OrchestratorService holds the same instance, so hot-reload swaps
@@ -3386,14 +3389,26 @@ public sealed class PipelineRunner : IPipelineRunner
             QualityScore = 100,
         };
 
+        // Gate the preferred agent on in-VM smoke + availability exactly as the
+        // work-phase router (AgentClassRouter.ResolveAsync) does, BEFORE trusting
+        // it. An agent benched by in-VM smoke (exit 127 / auth drift) or by the
+        // fast-fail breaker must not run audit even when named explicitly — the
+        // class-chain walk below already gates its members via
+        // OrderedFallbackCandidatesAsync, so without this the preferred fast path
+        // was the one hole left open.
+        var preferredAvailable = await EnsureAgentSmokeAvailableAsync(preferredKind.Value, ct);
+
         var (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
             preferredKind.Value, preferredProbeMember, ct);
-        if (preferredOk)
+        if (preferredAvailable && preferredOk)
             return preferredRunner;
 
+        var rejectReason = preferredAvailable
+            ? preferredReason
+            : $"smoke gate: {(_availability?.GetAvailability(preferredKind.Value).Reason ?? "unavailable")}";
         _log.LogInformation(
             "Audit agent '{AuditKind}' rejected ({Reason}) for auditor '{Auditor}'",
-            preferredKind.Value.Value, preferredReason, auditorName);
+            preferredKind.Value.Value, rejectReason, auditorName);
 
         // No class chain to walk — preserve legacy fall-through to the work
         // agent. With no class configured, the operator hasn't opted into
@@ -3577,6 +3592,28 @@ public sealed class PipelineRunner : IPipelineRunner
             // above) means we have no evidence the candidate is unavailable.
             _ => (true, "quota unknown; no recent observed failure"),
         };
+    }
+
+    /// <summary>
+    /// Returns whether <paramref name="kind"/> is currently routable per the
+    /// availability registry, gating the FIRST trust of an apparently-available
+    /// agent on a real in-sandbox CLI check (<see cref="IInVmSmokeGate"/>, cache
+    /// hit = free) so the exit-127 / auth cascade is caught here rather than at
+    /// dispatch. Mirrors <see cref="AgentClassRouter.ResolveAsync"/>'s gate so
+    /// the audit phase and the work phase agree on what "available" means.
+    /// Returns true when no availability registry is wired (legacy callers
+    /// preserve their prior behaviour).
+    /// </summary>
+    private async Task<bool> EnsureAgentSmokeAvailableAsync(AgentKind kind, CancellationToken ct)
+    {
+        if (_availability is not { } reg) return true;
+        var av = reg.GetAvailability(kind);
+        if (av.Available && _inVmSmokeGate is not null)
+        {
+            await _inVmSmokeGate.EnsureProbedAsync(kind, ct);
+            av = reg.GetAvailability(kind);
+        }
+        return av.Available;
     }
 
     private Task<AgentCredential?> ResolveAgentCredentialAsync(AgentKind kind, Project project, CancellationToken ct)
