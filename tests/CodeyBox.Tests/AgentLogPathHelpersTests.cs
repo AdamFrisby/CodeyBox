@@ -207,6 +207,10 @@ public sealed class AgentLogPathHelpersTests : IDisposable
             => Task.FromResult<IReadOnlyDictionary<string, bool>>(new Dictionary<string, bool>());
         public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) => Empty();
         public IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) => Empty();
+        public Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlySet<string>>(new HashSet<string>(StringComparer.Ordinal));
+        public Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(string baselineImageRef, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<(WorkItemId, string, WorkItemState)>>([]);
         public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => Task.CompletedTask;
         public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => Empty();
         public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default)
