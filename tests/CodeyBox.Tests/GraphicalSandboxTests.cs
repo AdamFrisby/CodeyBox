@@ -270,16 +270,20 @@ public sealed class GraphicalSandboxTests
         await rateLimited.ExecuteAsync(rateSandbox, new ComputerUseRequest { Action = "click" });
         Assert.Equal(2, rateSandbox.Events.Count);
 
-        await using var slowSandbox = new DelayingGraphicalSandbox();
+        await using var slowSandbox = new HangingGraphicalSandbox();
+        var time = new ManualTimeProvider();
         var timeoutBridge = new ComputerUseBridge(new ComputerUseBridgeOptions
         {
             ToolCallTimeout = TimeSpan.FromMilliseconds(10),
-        });
+        }, timeProvider: time);
 
-        await Assert.ThrowsAsync<TimeoutException>(() =>
-            timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "screenshot" }));
-        await Assert.ThrowsAsync<TimeoutException>(() =>
-            timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "click" }));
+        var screenshotTask = timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "screenshot" });
+        time.Advance(TimeSpan.FromMilliseconds(10));
+        await Assert.ThrowsAsync<TimeoutException>(() => screenshotTask);
+
+        var clickTask = timeoutBridge.ExecuteAsync(slowSandbox, new ComputerUseRequest { Action = "click" });
+        time.Advance(TimeSpan.FromMilliseconds(10));
+        await Assert.ThrowsAsync<TimeoutException>(() => clickTask);
     }
 
     [Fact]
@@ -866,21 +870,21 @@ public sealed class GraphicalSandboxTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    private sealed class DelayingGraphicalSandbox : ISandbox
+    private sealed class HangingGraphicalSandbox : ISandbox
     {
-        public string Id => "delaying-graphical-test";
+        public string Id => "hanging-graphical-test";
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(new SandboxExecResult(0, "", ""));
 
         public async Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
         {
-            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return NonUniformPng;
         }
 
-        public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
-            => await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+            => Task.Delay(Timeout.InfiniteTimeSpan, ct);
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }

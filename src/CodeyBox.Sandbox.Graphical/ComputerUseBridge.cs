@@ -11,16 +11,21 @@ namespace CodeyBox.Sandbox.Graphical;
 public sealed class ComputerUseBridge
 {
     private readonly ComputerUseBridgeOptions _options;
+    private readonly TimeProvider _timeProvider;
     private readonly Func<DateTimeOffset> _utcNow;
     private readonly object _inputBudgetGuard = new();
     private readonly Queue<(DateTimeOffset Timestamp, int Count)> _inputBudget = new();
     private int _inputBudgetUsed;
 
-    public ComputerUseBridge(ComputerUseBridgeOptions? options = null, Func<DateTimeOffset>? utcNow = null)
+    public ComputerUseBridge(
+        ComputerUseBridgeOptions? options = null,
+        Func<DateTimeOffset>? utcNow = null,
+        TimeProvider? timeProvider = null)
     {
         _options = options ?? new ComputerUseBridgeOptions();
         ValidateOptions(_options);
-        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _utcNow = utcNow ?? (() => _timeProvider.GetUtcNow());
     }
 
     public async Task<ComputerUseResult> ExecuteAsync(
@@ -145,13 +150,19 @@ public sealed class ComputerUseBridge
 
     private async Task WithToolTimeoutAsync(Func<CancellationToken, Task> operation, CancellationToken ct)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(_options.ToolCallTimeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        using var timeoutCts = new CancellationTokenSource(_options.ToolCallTimeout, _timeProvider);
+        using var timeoutRegistration = timeoutCts.Token.Register(static state =>
+        {
+            try { ((CancellationTokenSource)state!).Cancel(); }
+            catch (ObjectDisposedException) { /* operation already completed */ }
+        }, linked);
+
         try
         {
-            await operation(timeout.Token);
+            await operation(linked.Token);
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeout.IsCancellationRequested)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
         {
             throw new TimeoutException($"Computer-use tool call exceeded timeout {_options.ToolCallTimeout}.");
         }
@@ -159,13 +170,19 @@ public sealed class ComputerUseBridge
 
     private async Task<T> WithToolTimeoutAsync<T>(Func<CancellationToken, Task<T>> operation, CancellationToken ct)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(_options.ToolCallTimeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        using var timeoutCts = new CancellationTokenSource(_options.ToolCallTimeout, _timeProvider);
+        using var timeoutRegistration = timeoutCts.Token.Register(static state =>
+        {
+            try { ((CancellationTokenSource)state!).Cancel(); }
+            catch (ObjectDisposedException) { /* operation already completed */ }
+        }, linked);
+
         try
         {
-            return await operation(timeout.Token);
+            return await operation(linked.Token);
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeout.IsCancellationRequested)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
         {
             throw new TimeoutException($"Computer-use tool call exceeded timeout {_options.ToolCallTimeout}.");
         }
