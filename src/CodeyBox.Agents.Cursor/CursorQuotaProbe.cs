@@ -49,6 +49,16 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
 
+    private static readonly string[] FallbackAutoBucketModels =
+    [
+        "default",
+        DefaultRoutedModelId,
+        "composer-1.5",
+        "composer-2",
+        "composer-2.5-fast",
+        "composer-3-preview",
+    ];
+
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly Func<AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
@@ -293,17 +303,22 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
 
     private static IEnumerable<string> ParseAutoBucketModels(JsonElement root)
     {
-        if (!root.TryGetProperty("autoBucketModels", out var models) ||
-            models.ValueKind != JsonValueKind.Array)
-            yield break;
-
-        foreach (var item in models.EnumerateArray())
+        if (root.TryGetProperty("autoBucketModels", out var models) &&
+            models.ValueKind == JsonValueKind.Array)
         {
-            if (item.ValueKind != JsonValueKind.String) continue;
-            var id = item.GetString();
-            if (!string.IsNullOrWhiteSpace(id))
-                yield return id;
+            foreach (var item in models.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.String) continue;
+                var id = item.GetString();
+                if (!string.IsNullOrWhiteSpace(id))
+                    yield return id;
+            }
+
+            yield break;
         }
+
+        foreach (var modelId in FallbackAutoBucketModels)
+            yield return modelId;
     }
 
     private static DateTimeOffset? TryGetBillingCycleEnd(JsonElement root)
