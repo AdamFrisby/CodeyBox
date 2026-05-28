@@ -12,13 +12,10 @@ internal static class AgentPricingEndpoints
 {
     public static void Map(WebApplication app)
     {
-        app.MapGet("/agent-pricing", (
-            AgentCostCalculator calculator,
-            AgentPricingState pricingState) =>
+        app.MapGet("/agent-pricing", (AgentPricingState pricingState) =>
         {
-            var effective = calculator.GetEffectivePricing();
             var defaults = pricingState.Defaults;
-            var stats = pricingState.LastMerge;
+            var merge = pricingState.LastMerge;
 
             return Results.Ok(new
             {
@@ -31,14 +28,14 @@ internal static class AgentPricingEndpoints
                     bundledFile = AgentPricingDefaults.FileName,
                     counts = new
                     {
-                        bundled = stats.BundledRateCount,
-                        operatorOverrides = stats.OperatorRateCount,
-                        total = stats.TotalRateCount,
-                        overlap = stats.OverlapCount,
+                        bundled = merge.BundledRateCount,
+                        operatorOverrides = merge.OperatorRateCount,
+                        total = merge.TotalRateCount,
+                        overlap = merge.OverlapCount,
                     },
                 },
-                rates = effective.Rates,
-                defaultRates = effective.DefaultRates,
+                rates = merge.Options.Rates,
+                defaultRates = merge.Options.DefaultRates,
             });
         });
     }

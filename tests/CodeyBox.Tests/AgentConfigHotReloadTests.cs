@@ -457,6 +457,8 @@ public sealed class AgentConfigHotReloadTests
 
         // Calculator must see the doubled rate via the live calculator instance.
         Assert.Equal(0.180000m, calculator.Calculate(snapshot, Claude));
+        Assert.Equal(1, pricingState.LastMerge.OperatorRateCount);
+        Assert.Equal(30.0, pricingState.LastMerge.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
 
         await coordinator.StopAsync(CancellationToken.None);
     }
@@ -571,6 +573,12 @@ public sealed class AgentConfigHotReloadTests
         // Haiku still gets the bundled rate — the merge branch ran instead of
         // overwriting the calculator with operator-only config.
         Assert.Equal(0.006000m, calculator.Calculate(haikuSnapshot, Claude));
+        Assert.Equal(2, pricingState.LastMerge.BundledRateCount);
+        Assert.Equal(1, pricingState.LastMerge.OperatorRateCount);
+        Assert.Equal(1, pricingState.LastMerge.OverlapCount);
+        Assert.Equal(2, pricingState.LastMerge.TotalRateCount);
+        Assert.Equal(30.0, pricingState.LastMerge.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
+        Assert.Equal(1.0, pricingState.LastMerge.Options.Rates["claude"]["claude-haiku-4-5"].InputPerMillion);
 
         await coordinator.StopAsync(CancellationToken.None);
     }
@@ -622,6 +630,7 @@ public sealed class AgentConfigHotReloadTests
         var snapshot = new AgentCostSnapshot(
             InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-opus-4-7");
         var priorCost = calculator.Calculate(snapshot, Claude);
+        var priorMerge = pricingState.LastMerge;
 
         var router = new AgentClassRouter(
             Array.Empty<AgentClass>(),
@@ -662,6 +671,11 @@ public sealed class AgentConfigHotReloadTests
 
         // Prior pricing snapshot still in effect after the rejected reload.
         Assert.Equal(priorCost, calculator.Calculate(snapshot, Claude));
+        Assert.Equal(priorMerge.OperatorRateCount, pricingState.LastMerge.OperatorRateCount);
+        Assert.Equal(priorMerge.TotalRateCount, pricingState.LastMerge.TotalRateCount);
+        Assert.Equal(
+            priorMerge.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion,
+            pricingState.LastMerge.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
         var haikuSnapshot = new AgentCostSnapshot(
             InputTokens: 1000, CachedInputTokens: 0, OutputTokens: 1000, ModelId: "claude-haiku-4-5");
         Assert.Equal(0.006000m, calculator.Calculate(haikuSnapshot, Claude));
@@ -688,6 +702,7 @@ public sealed class AgentConfigHotReloadTests
         });
 
         Assert.Equal(0.180000m, calculator.Calculate(snapshot, Claude));
+        Assert.Equal(30.0, pricingState.LastMerge.Options.Rates["claude"]["claude-opus-4-7"].InputPerMillion);
 
         await coordinator.StopAsync(CancellationToken.None);
     }

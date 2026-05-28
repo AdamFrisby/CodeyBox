@@ -22,7 +22,8 @@ namespace CodeyBox.Api;
 ///   the router stores them as a single coherent snapshot, and TOD modifiers
 ///   only have meaning relative to the class catalog they tag.</item>
 /// <item><c>CodeyBox:AgentBurnEstimator</c> → <see cref="AgentBurnEstimator.ApplyConfigReload"/>.</item>
-/// <item><c>CodeyBox:AgentPricing</c> → <see cref="AgentCostCalculator.ApplyConfigReload"/>.</item>
+/// <item><c>CodeyBox:AgentPricing</c> → re-merge with bundled defaults, then
+///   <see cref="AgentPricingState.ApplySuccessfulMerge"/>.</item>
 /// </list>
 /// </para>
 ///
@@ -215,8 +216,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             // the operator didn't override. The bundled file is static between
             // deploys, so there is no need to reread from disk here.
             var merged = AgentPricingMerge.Merge(_pricingState.Defaults.Baseline, opts.AgentPricing);
-            _costCalculator.ApplyConfigReload(merged.Options);
-            _pricingState.RecordSuccessfulMerge(merged);
+            _pricingState.ApplySuccessfulMerge(merged, _costCalculator);
             _lastPricing = next;
             AuditLog.ConfigReloaded("AgentPricing", prev, next);
             _log.LogInformation("Hot-reloaded AgentPricing: {OldValue} → {NewValue}", prev, next);

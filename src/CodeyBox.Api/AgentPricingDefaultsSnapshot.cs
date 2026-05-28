@@ -59,5 +59,14 @@ internal sealed class AgentPricingState
         LastMerge = initial;
     }
 
-    public void RecordSuccessfulMerge(MergedAgentPricing merge) => LastMerge = merge;
+    /// <summary>
+    /// Atomically records the merged snapshot and updates the calculator so
+    /// cost calculation and <c>GET /agent-pricing</c> always share one view.
+    /// </summary>
+    public void ApplySuccessfulMerge(MergedAgentPricing merge, AgentCostCalculator calculator)
+    {
+        ArgumentNullException.ThrowIfNull(calculator);
+        calculator.ApplyConfigReload(merge.Options);
+        LastMerge = merge;
+    }
 }

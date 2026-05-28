@@ -31,7 +31,7 @@ internal static class AgentPricingMerge
                 kv => kv.Key,
                 kv =>
                 {
-                    ValidateRateNotNull(kv.Value, kv.Key, "(default)", "operator");
+                    AgentPricingOptions.ValidateRateNotNull(kv.Value, kv.Key, "(default)", "operator");
                     return CloneRate(kv.Value);
                 },
                 StringComparer.Ordinal),
@@ -61,7 +61,7 @@ internal static class AgentPricingMerge
             }
             foreach (var (modelKey, rate) in modelMap)
             {
-                ValidateRateNotNull(rate, agentKey, modelKey, "operator");
+                AgentPricingOptions.ValidateRateNotNull(rate, agentKey, modelKey, "operator");
                 if (bucket.ContainsKey(modelKey))
                     overlapCount++;
                 bucket[modelKey] = CloneRate(rate);
@@ -70,34 +70,6 @@ internal static class AgentPricingMerge
         }
 
         return new MergedAgentPricing(merged, bundledCount, operatorCount, overlapCount);
-    }
-
-    /// <summary>Deep-clones a pricing snapshot for defensive reads and reload swaps.</summary>
-    public static AgentPricingOptions CloneSnapshot(AgentPricingOptions source)
-    {
-        ArgumentNullException.ThrowIfNull(source);
-        var clone = new AgentPricingOptions
-        {
-            DefaultRates = source.DefaultRates.ToDictionary(
-                kv => kv.Key,
-                kv => CloneRate(kv.Value),
-                StringComparer.Ordinal),
-        };
-        foreach (var (agentKey, modelMap) in source.Rates)
-        {
-            var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
-            foreach (var (modelKey, rate) in modelMap)
-                copy[modelKey] = CloneRate(rate);
-            clone.Rates[agentKey] = copy;
-        }
-        return clone;
-    }
-
-    private static void ValidateRateNotNull(ModelRateConfig? rate, string agentKey, string modelKey, string source)
-    {
-        if (rate is null)
-            throw new InvalidOperationException(
-                $"AgentPricing: {source} rate is null for agent '{agentKey}' model '{modelKey}'");
     }
 
     private static ModelRateConfig CloneRate(ModelRateConfig rate) => new()

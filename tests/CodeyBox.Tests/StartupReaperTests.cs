@@ -28,9 +28,9 @@ public sealed class StartupReaperTests : IDisposable
 
     public void Dispose()
     {
-        try { _store.Dispose(); } catch { }
-        try { _registry.Dispose(); } catch { }
-        try { File.Delete(_dbPath); } catch { }
+        _store.Dispose();
+        _registry.Dispose();
+        try { File.Delete(_dbPath); } catch { /* best-effort temp file cleanup */ }
     }
 
     [Fact]

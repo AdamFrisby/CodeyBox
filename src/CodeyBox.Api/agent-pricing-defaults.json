@@ -2,12 +2,13 @@
   "_meta": {
     "lastUpdated": "2026-05-29",
     "sources": {
+      "opencode-go": "https://opencode.ai/docs/go",
       "claude": "https://docs.anthropic.com/en/docs/about-claude/pricing",
       "codex":  "https://openai.com/api/pricing/",
       "gemini": "https://ai.google.dev/gemini-api/docs/pricing"
     },
     "notes": {
-      "opencode": "OpenCode Go is a flat subscription (https://opencode.ai/docs/go); no per-token rates are published. Operators may override per model under CodeyBox:AgentPricing.",
+      "opencode": "OpenCode Go is a flat subscription ($12 per 5h usage budget on https://opencode.ai/docs/go). Bundled rates are subscription-equivalent USD per token derived from that budget, each model's requests-per-5h limit, and the typical token mix published on the same page (cachedInputPerMillion = 0.25 × inputPerMillion, outputPerMillion = 4 × inputPerMillion). Keys use opencode-go/<model-id> per the docs.",
       "claude": "Cache-hit (read) rate captured under cachedInputPerMillion. Cache-write rates (1.25x base for 5m, 2x for 1h) are not represented; cost framework treats CachedInputTokens as read-side discount.",
       "codex":  "gpt-5.5 short-context rate ($5/$30). codex-5.5 aliases the same rate for CLI JSON attribution. Long-context tier (above ~270k input tokens) is not represented.",
       "gemini": "gemini-3-flash-preview is the default AgentClasses model. Pro preview models use short-context rates (<= 200k tokens); long-context tier (>200k) is not represented.",
@@ -16,6 +17,21 @@
     }
   },
   "Rates": {
+    "opencode": {
+      "opencode-go/glm-5.1":           { "inputPerMillion": 0.9536, "cachedInputPerMillion": 0.2384, "outputPerMillion": 3.8144 },
+      "opencode-go/glm-5":             { "inputPerMillion": 0.7297, "cachedInputPerMillion": 0.1824, "outputPerMillion": 2.9188 },
+      "opencode-go/kimi-k2.5":         { "inputPerMillion": 0.4207, "cachedInputPerMillion": 0.1052, "outputPerMillion": 1.6826 },
+      "opencode-go/kimi-k2.6":         { "inputPerMillion": 0.6767, "cachedInputPerMillion": 0.1692, "outputPerMillion": 2.7068 },
+      "opencode-go/mimo-v2.5":         { "inputPerMillion": 0.0200, "cachedInputPerMillion": 0.0050, "outputPerMillion": 0.0802 },
+      "opencode-go/mimo-v2.5-pro":     { "inputPerMillion": 0.1571, "cachedInputPerMillion": 0.0393, "outputPerMillion": 0.6282 },
+      "opencode-go/minimax-m2.7":      { "inputPerMillion": 0.2426, "cachedInputPerMillion": 0.0606, "outputPerMillion": 0.9703 },
+      "opencode-go/minimax-m2.5":      { "inputPerMillion": 0.1309, "cachedInputPerMillion": 0.0327, "outputPerMillion": 0.5236 },
+      "opencode-go/qwen3.7-max":       { "inputPerMillion": 0.7128, "cachedInputPerMillion": 0.1782, "outputPerMillion": 2.8514 },
+      "opencode-go/qwen3.6-plus":      { "inputPerMillion": 0.2345, "cachedInputPerMillion": 0.0586, "outputPerMillion": 0.9378 },
+      "opencode-go/qwen3.5-plus":      { "inputPerMillion": 0.0925, "cachedInputPerMillion": 0.0231, "outputPerMillion": 0.3700 },
+      "opencode-go/deepseek-v4-pro":   { "inputPerMillion": 0.1552, "cachedInputPerMillion": 0.0388, "outputPerMillion": 0.6208 },
+      "opencode-go/deepseek-v4-flash": { "inputPerMillion": 0.0201, "cachedInputPerMillion": 0.0050, "outputPerMillion": 0.0802 }
+    },
     "claude": {
       "claude-opus-4-7":   { "inputPerMillion": 5.00, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.00 },
       "claude-opus-4-6":   { "inputPerMillion": 5.00, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.00 },

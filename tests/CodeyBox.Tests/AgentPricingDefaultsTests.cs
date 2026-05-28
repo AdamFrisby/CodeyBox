@@ -276,6 +276,21 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     }
 
     [Fact]
+    public void Merge_NullOperatorDefaultRate_Throws()
+    {
+        var bundled = new AgentPricingOptions();
+        var operatorOpts = new AgentPricingOptions
+        {
+            DefaultRates = new() { ["codex"] = null! }
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AgentPricingMerge.Merge(bundled, operatorOpts));
+
+        Assert.Contains("null", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void ShippedDefaultsFile_LoadsCleanly()
     {
         var sourceFile = LocateShippedFile();
@@ -287,8 +302,10 @@ public sealed class AgentPricingDefaultsTests : IDisposable
 
         Assert.False(string.IsNullOrWhiteSpace(snapshot.Meta.LastUpdated),
             "_meta.lastUpdated must be set on the shipped file");
-        Assert.False(snapshot.Baseline.Rates.ContainsKey("opencode"),
-            "opencode-go is subscription-only; bundled defaults must not ship synthetic per-token rates");
+        Assert.True(snapshot.Baseline.Rates.ContainsKey("opencode"),
+            "shipped defaults must include opencode-go subscription-equivalent rates");
+        Assert.True(snapshot.Baseline.Rates["opencode"].ContainsKey("opencode-go/deepseek-v4-pro"),
+            "opencode model ids must use opencode-go/<model-id> per opencode.ai/docs/go");
         Assert.True(snapshot.Baseline.Rates.ContainsKey("claude"), "shipped defaults must include claude pricing");
         Assert.True(snapshot.Baseline.Rates.ContainsKey("codex"), "shipped defaults must include codex pricing");
         Assert.True(snapshot.Baseline.Rates.ContainsKey("gemini"), "shipped defaults must include gemini pricing");

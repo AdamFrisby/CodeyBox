@@ -36,6 +36,36 @@ public sealed class AgentPricingOptions
             throw new InvalidOperationException(
                 $"AgentPricing: {source} rate is null for agent '{agentKey}' model '{modelKey}'");
     }
+
+    /// <summary>
+    /// Deep-clones a pricing snapshot for defensive reads and reload swaps.
+    /// </summary>
+    public static AgentPricingOptions CloneSnapshot(AgentPricingOptions source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var clone = new AgentPricingOptions
+        {
+            DefaultRates = source.DefaultRates.ToDictionary(
+                kv => kv.Key,
+                kv => CloneRate(kv.Value),
+                StringComparer.Ordinal),
+        };
+        foreach (var (agentKey, modelMap) in source.Rates)
+        {
+            var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
+            foreach (var (modelKey, rate) in modelMap)
+                copy[modelKey] = CloneRate(rate);
+            clone.Rates[agentKey] = copy;
+        }
+        return clone;
+    }
+
+    private static ModelRateConfig CloneRate(ModelRateConfig rate) => new()
+    {
+        InputPerMillion = rate.InputPerMillion,
+        CachedInputPerMillion = rate.CachedInputPerMillion,
+        OutputPerMillion = rate.OutputPerMillion,
+    };
 }
 
 /// <summary>
@@ -67,22 +97,14 @@ public sealed class AgentCostCalculator
         AgentPricingOptions opts,
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null)
     {
-        _opts = CloneSnapshot(opts);
+        _opts = AgentPricingOptions.CloneSnapshot(opts);
         _extractors = extractors ?? new Dictionary<AgentKind, IAgentCostExtractor>();
     }
 
     /// <summary>
-    /// The pricing snapshot currently used by <see cref="Calculate"/>, including
-    /// after a successful hot-reload. Returns a defensive copy so callers cannot
-    /// mutate the live calculator state.
-    /// </summary>
-    public AgentPricingOptions GetEffectivePricing() => CloneSnapshot(_opts);
-
-    /// <summary>
-    /// Swaps the held pricing snapshot. Called by <c>AgentConfigHotReload</c>
-    /// when <c>CodeyBox:AgentPricing</c> changes so operators can update rates
-    /// without restarting CodeyBox. The new snapshot is validated by the same
-    /// rules as the startup snapshot before the swap.
+    /// Swaps the held pricing snapshot. Called by the API host after a successful
+    /// merge (startup or hot-reload). The new snapshot is
+    /// validated by the same rules as the startup snapshot before the swap.
     /// </summary>
     public void ApplyConfigReload(AgentPricingOptions next)
     {
@@ -103,38 +125,7 @@ public sealed class AgentCostCalculator
                 throw new InvalidOperationException(
                     $"AgentPricing: negative default rate for agent '{agentKey}'");
         }
-        _opts = CloneSnapshot(next);
-    }
-
-    private static AgentPricingOptions CloneSnapshot(AgentPricingOptions source)
-    {
-        var clone = new AgentPricingOptions
-        {
-            DefaultRates = source.DefaultRates.ToDictionary(
-                kv => kv.Key,
-                kv => new ModelRateConfig
-                {
-                    InputPerMillion = kv.Value.InputPerMillion,
-                    CachedInputPerMillion = kv.Value.CachedInputPerMillion,
-                    OutputPerMillion = kv.Value.OutputPerMillion,
-                },
-                StringComparer.Ordinal),
-        };
-        foreach (var (agentKey, modelMap) in source.Rates)
-        {
-            var copy = new Dictionary<string, ModelRateConfig>(modelMap.Count, StringComparer.Ordinal);
-            foreach (var (modelKey, rate) in modelMap)
-            {
-                copy[modelKey] = new ModelRateConfig
-                {
-                    InputPerMillion = rate.InputPerMillion,
-                    CachedInputPerMillion = rate.CachedInputPerMillion,
-                    OutputPerMillion = rate.OutputPerMillion,
-                };
-            }
-            clone.Rates[agentKey] = copy;
-        }
-        return clone;
+        _opts = AgentPricingOptions.CloneSnapshot(next);
     }
 
     /// <summary>

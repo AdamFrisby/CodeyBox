@@ -55,7 +55,7 @@ in its structured-stream usage events.
 | `claude`  | Yes               | Anthropic publishes per-token rates. |
 | `codex`   | Yes               | OpenAI publishes per-token rates. |
 | `gemini`  | Yes               | Google publishes per-token rates. |
-| `opencode` | No (notes)       | opencode-go is a flat-rate subscription ($10/mo). No per-token rate is published for its bundled models. |
+| `opencode` | Yes (notes)      | OpenCode Go is subscription-priced; bundled rates are **subscription-equivalent USD per token** derived from the $12/5h usage budget and typical token mix on [opencode.ai/docs/go](https://opencode.ai/docs/go). Keys use `opencode-go/<model-id>`. |
 | `cursor`  | No (notes)        | Cursor is a flat-rate subscription. No per-token rate is published. |
 | `copilot` | No (notes)        | Copilot is a flat-rate subscription. No per-token rate is published. |
 
