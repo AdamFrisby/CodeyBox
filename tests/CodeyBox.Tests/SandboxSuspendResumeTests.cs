@@ -130,14 +130,16 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ShutdownHandler_SuspendTimeout_DoesNotPersistVmName()
+    public async Task ShutdownHandler_SuspendTimeout_PersistsVmNameSoResumeCanReattach()
     {
         // The suspend handler bounds each multipass suspend with a per-VM
         // timeout. When the inner suspend exceeds it (OperationCanceledException),
-        // the handler logs and returns WITHOUT persisting SuspendedVmName so
-        // the item flows through the standard stranded-item recovery path.
-        // Distinct from the generic Exception branch — both must lead to the
-        // same "no bookkeeping" outcome.
+        // multipassd is still writing the RAM snapshot in the background and the
+        // VM WILL reach Suspended — so the handler must leave the persisted
+        // (work item → VM) mapping in place so the next startup can resume that
+        // VM. (Regression: the timeout used to clear the mapping, which is why
+        // R8-core's first real-world test fell back to stranded recovery and
+        // discarded ~2.5h of in-flight work.)
         var item = MakeItem();
         await _store.CreateAsync(item);
 
@@ -152,10 +154,46 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await svc.SuspendAllAsync();
 
         var after = await _store.GetAsync(item.Id);
-        // Timeout fired before the sandbox SuspendAsync could complete; no
-        // bookkeeping must have been persisted.
-        Assert.Null(after!.SuspendedVmName);
-        Assert.Null(after.SuspendedAt);
+        // Mapping persisted up front and kept on timeout — the VM is still being
+        // suspended by multipassd, so the startup resume handler must know about it.
+        Assert.Equal("vm-slow", after!.SuspendedVmName);
+        Assert.NotNull(after.SuspendedAt);
+    }
+
+    [Fact]
+    public async Task SuspendTimeoutFor_ScalesWithVmMemory_AboveTheFloor()
+    {
+        // A 12 GiB VM has 3× the RAM of a 4 GiB VM to flush to disk, so it must
+        // get a proportionally longer suspend timeout — a uniform cap would
+        // truncate the large VM's snapshot. Below the floor (or with no reported
+        // RAM size) the flat floor applies.
+        var svc = new SandboxSuspendOnShutdownService(
+            new FakeSuspendingProvider(), _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            perSuspendTimeout: TimeSpan.FromMinutes(10),
+            perGiBSuspendBudget: TimeSpan.FromSeconds(150));
+
+        const long gib = 1024L * 1024 * 1024;
+
+        // No reported memory → floor.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-unknown")));
+
+        // 4 GiB → 4 × 150s = 600s, equal to the floor.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-4g", memoryBytes: 4 * gib)));
+
+        // 12 GiB → 12 × 150s = 1800s, well above the floor.
+        Assert.Equal(
+            TimeSpan.FromMinutes(30),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-12g", memoryBytes: 12 * gib)));
+
+        // 1 GiB → 150s, below the floor → floor wins.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-1g", memoryBytes: 1 * gib)));
     }
 
     [Fact]
@@ -748,12 +786,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     {
         public bool SuspendCalled { get; private set; }
         private readonly bool _shouldThrow;
-        public FakeSuspendableSandbox(string id, bool shouldThrow = false)
+        public FakeSuspendableSandbox(string id, bool shouldThrow = false, long? memoryBytes = null)
         {
             Id = id;
             _shouldThrow = shouldThrow;
+            MemoryBytes = memoryBytes;
         }
         public string Id { get; }
+        public long? MemoryBytes { get; }
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(new SandboxExecResult(0, "", ""));
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

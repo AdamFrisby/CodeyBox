@@ -2664,6 +2664,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// </summary>
     public bool IsSuspended => _isSuspended;
 
+    /// <summary>
+    /// RAM size this VM was provisioned with, surfaced so the suspend-on-shutdown
+    /// service can scale its per-VM timeout: a larger VM has more RAM to flush to
+    /// disk on <c>multipass suspend</c>.
+    /// </summary>
+    public long? MemoryBytes => _spec.Limits.MemoryBytes;
+
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
         Action<string>? onDisposed = null, Action<string>? onNoLongerTrackedActive = null, IProcessRunner? runner = null,

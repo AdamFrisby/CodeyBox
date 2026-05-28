@@ -146,6 +146,16 @@ public interface ISuspendableSandbox : ISandbox
     /// model suspension state.
     /// </summary>
     bool IsSuspended => false;
+
+    /// <summary>
+    /// Best-effort RAM size of this sandbox in bytes, or null when the provider
+    /// cannot report it. <see cref="CodeyBox.Orchestrator.SandboxSuspendOnShutdownService"/>
+    /// scales the per-VM suspend timeout by this value: <c>multipass suspend</c>
+    /// writes the whole RAM image to disk, so a 12 GiB VM under load legitimately
+    /// takes far longer than a 1 GiB idle one. Null falls back to the flat floor
+    /// timeout.
+    /// </summary>
+    long? MemoryBytes => null;
 }
 
 /// <summary>

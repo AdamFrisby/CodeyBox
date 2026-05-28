@@ -36,32 +36,67 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     public const int DefaultMaxParallelSuspends = 8;
 
     /// <summary>
-    /// Per-VM suspend timeout. Suspending a 4GB VM takes a few seconds; this
-    /// cap exists so one stuck multipassd call cannot block the rest of the
-    /// shutdown drain. The hosted service waits for the slower of (all
-    /// suspends complete) or (cumulative ShutdownGrace expiry, applied by the
-    /// host).
+    /// Floor for the per-VM suspend timeout, and the value used when a sandbox
+    /// can't report its RAM size. The earlier 30s cap was below multipass's
+    /// real-world case: a 4 GB VM with an active LLM session was observed taking
+    /// &gt;6 minutes to write its RAM snapshot to disk. At 30s the suspend timed
+    /// out, the (work item → VM) mapping was never persisted, and the item fell
+    /// back to the same stranded recovery that R8-core exists to avoid — defeating
+    /// the whole "restart is transparent to in-flight work" promise. 10 minutes
+    /// is a safe floor; <see cref="SuspendTimeoutFor"/> scales it up for larger
+    /// VMs. The hosted service waits for all suspends to complete (it ignores the
+    /// host shutdown token so the snapshot isn't truncated mid-flight), so this
+    /// is the real bound on how long shutdown blocks per stuck VM.
     /// </summary>
-    public static readonly TimeSpan DefaultPerSuspendTimeout = TimeSpan.FromSeconds(30);
+    public static readonly TimeSpan DefaultPerSuspendTimeout = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Extra suspend-timeout budget per GiB of VM RAM. <c>multipass suspend</c>
+    /// writes the whole RAM image to disk, so suspend time grows ~linearly with
+    /// VM size; the effective per-VM timeout is
+    /// <c>max(DefaultPerSuspendTimeout, RAM_GiB × this)</c>. 150s/GiB matches the
+    /// observed ~6-minute suspend of a 4 GiB VM with headroom and gives the 12 GiB
+    /// default VM (see <see cref="SandboxResourceLimits.Default"/>) a 30-minute
+    /// ceiling.
+    /// </summary>
+    public static readonly TimeSpan DefaultPerGiBSuspendBudget = TimeSpan.FromSeconds(150);
 
     private readonly ISandboxProvider _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxSuspendOnShutdownService> _log;
     private readonly int _maxParallel;
     private readonly TimeSpan _perSuspendTimeout;
+    private readonly TimeSpan _perGiBSuspendBudget;
 
     public SandboxSuspendOnShutdownService(
         ISandboxProvider provider,
         IWorkItemStore store,
         ILogger<SandboxSuspendOnShutdownService> log,
         int? maxParallel = null,
-        TimeSpan? perSuspendTimeout = null)
+        TimeSpan? perSuspendTimeout = null,
+        TimeSpan? perGiBSuspendBudget = null)
     {
         _provider = provider;
         _store = store;
         _log = log;
         _maxParallel = maxParallel is > 0 ? maxParallel.Value : DefaultMaxParallelSuspends;
         _perSuspendTimeout = perSuspendTimeout is { } t && t > TimeSpan.Zero ? t : DefaultPerSuspendTimeout;
+        _perGiBSuspendBudget = perGiBSuspendBudget is { } g && g > TimeSpan.Zero ? g : DefaultPerGiBSuspendBudget;
+    }
+
+    /// <summary>
+    /// Effective per-VM suspend timeout: the floor (<see cref="_perSuspendTimeout"/>)
+    /// scaled up by RAM size when the sandbox reports it. A bigger VM has more
+    /// RAM to flush to disk, so a uniform cap either truncates large VMs or wastes
+    /// shutdown time waiting on small ones.
+    /// </summary>
+    internal TimeSpan SuspendTimeoutFor(ISuspendableSandbox sandbox)
+    {
+        if (sandbox.MemoryBytes is not { } bytes || bytes <= 0)
+            return _perSuspendTimeout;
+        var gib = bytes / (double)(1024L * 1024 * 1024);
+        var scaled = _perGiBSuspendBudget * gib;
+        return scaled > _perSuspendTimeout ? scaled : _perSuspendTimeout;
     }
 
     public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
@@ -132,7 +167,22 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 
     private async Task SuspendOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
     {
-        using var timeoutCts = new CancellationTokenSource(_perSuspendTimeout);
+        var timeout = SuspendTimeoutFor(sandbox);
+
+        // Persist (workItemId → vmName) BEFORE awaiting the suspend. The RAM
+        // snapshot is written by multipassd, which keeps going even if our
+        // per-VM timeout fires or the service manager SIGKILLs us mid-shutdown —
+        // the VM still reaches Suspended on disk. Recording the mapping up front
+        // means the next startup can reattach to that VM no matter how our
+        // suspend call ends. We only clear the mapping again on a *genuine*
+        // suspend failure, where the VM is left Running and DisposeAsync tears it
+        // down (so there is nothing to resume). The DB write uses
+        // CancellationToken.None: a single-row SQLite UPDATE is fast enough to
+        // finish even under shutdown pressure.
+        if (!await TryPersistSuspendBookkeepingAsync(workItemId, sandbox.Id))
+            return;
+
+        using var timeoutCts = new CancellationTokenSource(timeout);
         try
         {
             await sandbox.SuspendAsync(timeoutCts.Token);
@@ -140,41 +190,51 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         catch (OperationCanceledException)
         {
             _log.LogWarning(
-                "Suspend timed out after {Timeout} for work item {WorkItemId} sandbox {SandboxId}; the item will recover via the standard stranded-item path on next startup",
-                _perSuspendTimeout, workItemId, sandbox.Id);
+                "Suspend exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; multipassd is likely still writing the RAM snapshot. The (work item → VM) mapping is persisted, so the next startup will attempt to resume this VM.",
+                timeout, workItemId, sandbox.Id);
             return;
         }
         catch (Exception ex)
         {
             _log.LogWarning(ex,
-                "Suspend failed for work item {WorkItemId} sandbox {SandboxId}; the item will recover via the standard stranded-item path on next startup",
+                "Suspend failed for work item {WorkItemId} sandbox {SandboxId}; clearing suspend bookkeeping so the item recovers via the standard stranded-item path",
                 workItemId, sandbox.Id);
+            await ClearSuspendBookkeepingAsync(workItemId);
             return;
         }
 
-        // Persist (workItemId → vmName) so the startup handler can match a
-        // resumed VM to the work item it belongs to. The DB write uses
-        // CancellationToken.None: the host's shutdown drain might be racing,
-        // and a SQLite UPDATE for a single row is fast enough to finish even
-        // under shutdown pressure. Losing the row would leave the VM
-        // suspended on disk with no orchestrator-side bookkeeping — the leak
-        // reaper's PreemptRetention window keeps it around long enough for
-        // operator inspection (multipass list shows it as Suspended).
+        AuditLog.SandboxSuspendedOnShutdown(workItemId, sandbox.Id);
+    }
+
+    private async Task<bool> TryPersistSuspendBookkeepingAsync(WorkItemId workItemId, string vmName)
+    {
         var item = await _store.GetAsync(workItemId, CancellationToken.None);
         if (item is null)
         {
             _log.LogWarning(
-                "Suspended sandbox {SandboxId} for work item {WorkItemId}, but the item is no longer present in the store",
-                sandbox.Id, workItemId);
-            return;
+                "Cannot persist suspend bookkeeping for sandbox {SandboxId}: work item {WorkItemId} is no longer present in the store",
+                vmName, workItemId);
+            return false;
         }
-        var updated = item with
+        var now = DateTimeOffset.UtcNow;
+        await _store.UpdateAsync(item with
         {
-            SuspendedVmName = sandbox.Id,
-            SuspendedAt = DateTimeOffset.UtcNow,
+            SuspendedVmName = vmName,
+            SuspendedAt = now,
+            UpdatedAt = now,
+        }, CancellationToken.None);
+        return true;
+    }
+
+    private async Task ClearSuspendBookkeepingAsync(WorkItemId workItemId)
+    {
+        var item = await _store.GetAsync(workItemId, CancellationToken.None);
+        if (item is null) return;
+        await _store.UpdateAsync(item with
+        {
+            SuspendedVmName = null,
+            SuspendedAt = null,
             UpdatedAt = DateTimeOffset.UtcNow,
-        };
-        await _store.UpdateAsync(updated, CancellationToken.None);
-        AuditLog.SandboxSuspendedOnShutdown(workItemId, sandbox.Id);
+        }, CancellationToken.None);
     }
 }
