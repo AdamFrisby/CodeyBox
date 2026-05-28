@@ -250,35 +250,41 @@ public static class SuspendTimeoutPolicy
     }
 
     /// <summary>
-    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Only the
-    /// multipass provider suspends on shutdown, and a healthy RAM snapshot must
-    /// not be truncated by a SIGKILL, so for multipass the ceiling is raised to
-    /// the worst-case suspend drain (<see cref="HostShutdownReserve"/>:
+    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Providers
+    /// that suspend on shutdown must not have a healthy RAM snapshot truncated by
+    /// a SIGKILL, so when <paramref name="providerSuspendsOnShutdown"/> is set the
+    /// ceiling is raised to the worst-case suspend drain
+    /// (<see cref="HostShutdownReserve"/>:
     /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
     /// per-VM budget) or the requested <paramref name="grace"/>, whichever is
-    /// larger. Other providers keep the tighter <paramref name="grace"/>.
+    /// larger. Providers that don't suspend keep the tighter <paramref name="grace"/>.
+    ///
+    /// <para>This is deliberately capability-driven, not provider-name-driven:
+    /// the caller passes whether the configured provider implements
+    /// <see cref="ISuspendingSandboxProvider"/> (i.e. participates in
+    /// suspend-on-shutdown). Core therefore stays provider-agnostic — a new
+    /// suspend-capable backend raises the ceiling automatically without adding
+    /// another magic string here.</para>
     ///
     /// <para>Lives on the Core policy (rather than on the orchestrator suspend
     /// handler) so the API composition root can size the ceiling without
-    /// depending on a concrete hosted-service type, and so the provider guard
+    /// depending on a concrete hosted-service type, and so the capability guard
     /// and the max() logic stay co-located with the suspend/resume budget
     /// formula they must agree with.</para>
     /// </summary>
-    /// <param name="sandboxProvider">Configured provider name; only "multipass" raises the ceiling.</param>
+    /// <param name="providerSuspendsOnShutdown">True when the configured provider implements <see cref="ISuspendingSandboxProvider"/> and so freezes VMs on shutdown.</param>
     /// <param name="grace">Baseline shutdown grace (request-drain / preempt-checkpoint window).</param>
     /// <param name="maxConcurrentSandboxes">Upper bound on concurrently in-flight (hence suspendable) VMs.</param>
     /// <param name="maxParallelSuspends">Parallel-suspend batch size; defaults to <see cref="DefaultMaxParallelSuspends"/>.</param>
     /// <param name="maxVmMemoryBytes">Largest per-VM RAM the deployment provisions; null uses <see cref="SandboxResourceLimits.Default"/>.</param>
     public static TimeSpan ResolveHostShutdownTimeout(
-        string? sandboxProvider,
+        bool providerSuspendsOnShutdown,
         TimeSpan grace,
         int maxConcurrentSandboxes,
         int maxParallelSuspends = DefaultMaxParallelSuspends,
         long? maxVmMemoryBytes = null)
     {
-        var isMultipass = string.Equals(
-            (sandboxProvider ?? "").Trim(), "multipass", StringComparison.OrdinalIgnoreCase);
-        if (!isMultipass)
+        if (!providerSuspendsOnShutdown)
             return grace;
         var reserve = HostShutdownReserve(
             maxConcurrentSandboxes,

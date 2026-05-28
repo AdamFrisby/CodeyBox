@@ -190,6 +190,49 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task ShutdownHandler_SuspendOneAsync_UsesRamScaledTimeout_NotTheFlatFloor()
+    {
+        // Regression guard for the core production fix: SuspendOneAsync must build
+        // its per-VM CancellationTokenSource from SuspendTimeoutFor(sandbox)
+        // (RAM-scaled), NOT the flat floor (_perSuspendTimeout). The reported bug
+        // was a loaded 4 GiB VM timing out under the old uniform cap; if the
+        // handler regressed to use the floor again, the SuspendTimeoutFor unit
+        // tests would still pass while large VMs got only the floor.
+        //
+        // Construction: floor = 100ms (would cancel almost immediately), but the
+        // RAM-scaled budget for 4 GiB is 4 × 3000ms = 12s. The fake suspend takes
+        // ~500ms. Under the correct scaled budget it completes cleanly; a
+        // regression to the 100ms floor would cancel it (OperationCanceledException).
+        const long gib = 1024L * 1024 * 1024;
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var sandbox = new MemoryAwareDelaySandbox(
+            "vm-4g", memoryBytes: 4 * gib, delay: TimeSpan.FromMilliseconds(500));
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            perSuspendTimeout: TimeSpan.FromMilliseconds(100),
+            perGiBSuspendBudget: TimeSpan.FromMilliseconds(3000));
+
+        // The budget SuspendOneAsync must apply is the scaled 12s, not the 100ms floor.
+        Assert.Equal(TimeSpan.FromSeconds(12), svc.SuspendTimeoutFor(sandbox));
+
+        await svc.SuspendAllAsync();
+
+        Assert.True(sandbox.Completed,
+            "suspend should run to completion under the RAM-scaled budget");
+        Assert.False(sandbox.TimedOut,
+            "suspend must not be cancelled by the flat floor — that is the regressed behaviour");
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-4g", after!.SuspendedVmName);
+    }
+
+    [Fact]
     public async Task ShutdownHandler_PersistsVmName_BEFORE_AwaitingSuspend()
     {
         // Acceptance criterion #3: the (work item → VM) mapping must be written
@@ -344,38 +387,31 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
-    public void ResolveHostShutdownTimeout_RaisesCeilingForMultipassOnly()
+    public void ResolveHostShutdownTimeout_RaisesCeilingForSuspendingProvidersOnly()
     {
         var grace = TimeSpan.FromSeconds(60);
 
-        // Non-multipass providers don't suspend → ceiling stays at the grace window
-        // regardless of worker count.
+        // Providers that don't suspend on shutdown → ceiling stays at the grace
+        // window regardless of worker count. The decision is capability-driven
+        // (providerSuspendsOnShutdown=false), not a provider-name comparison.
         Assert.Equal(grace,
-            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("process", grace, 32));
-        Assert.Equal(grace,
-            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("bubblewrap", grace, 32));
-        Assert.Equal(grace,
-            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout(null, grace, 32));
+            SuspendTimeoutPolicy.ResolveHostShutdownTimeout(false, grace, 32));
 
-        // Multipass with a single worker → one wave of the default 12 GiB profile
-        // budget (30 min), which dwarfs the 60s grace.
+        // Suspend-capable provider with a single worker → one wave of the default
+        // 12 GiB profile budget (30 min), which dwarfs the 60s grace.
         Assert.Equal(TimeSpan.FromMinutes(30),
-            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("multipass", grace, 1));
+            SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, grace, 1));
 
-        // Provider name match is trimmed and case-insensitive.
-        Assert.Equal(TimeSpan.FromMinutes(30),
-            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("  Multipass  ", grace, 1));
-
-        // Multipass with more workers than the parallel-suspend cap (8) → the
-        // ceiling scales by wave count (16 workers → 2 waves → 60 min).
+        // More workers than the parallel-suspend cap (8) → the ceiling scales by
+        // wave count (16 workers → 2 waves → 60 min).
         Assert.Equal(TimeSpan.FromMinutes(60),
-            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("multipass", grace, 16));
+            SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, grace, 16));
 
         // If the configured grace ever exceeds the suspend reserve, the larger
         // grace wins (max(), not a blind overwrite).
         var hugeGrace = TimeSpan.FromHours(4);
         Assert.Equal(hugeGrace,
-            SandboxSuspendOnShutdownService.ResolveHostShutdownTimeout("multipass", hugeGrace, 1));
+            SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, hugeGrace, 1));
     }
 
     [Fact]
@@ -1062,6 +1098,41 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             SuspendCalled = true;
             if (_shouldThrow) throw new InvalidOperationException("simulated suspend failure");
             return Task.CompletedTask;
+        }
+    }
+
+    // A suspendable sandbox that reports a RAM size and runs a real (short) delay
+    // inside SuspendAsync, honouring the cancellation token. Lets a test prove the
+    // per-VM timeout the handler applies is the RAM-scaled budget (delay completes)
+    // rather than a smaller flat floor (delay would be cancelled).
+    private sealed class MemoryAwareDelaySandbox : ISuspendableSandbox
+    {
+        private readonly TimeSpan _delay;
+        public MemoryAwareDelaySandbox(string id, long memoryBytes, TimeSpan delay)
+        {
+            Id = id;
+            MemoryBytes = memoryBytes;
+            _delay = delay;
+        }
+        public string Id { get; }
+        public long? MemoryBytes { get; }
+        public bool Completed { get; private set; }
+        public bool TimedOut { get; private set; }
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public async Task SuspendAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                await Task.Delay(_delay, ct);
+                Completed = true;
+            }
+            catch (OperationCanceledException)
+            {
+                TimedOut = true;
+                throw;
+            }
         }
     }
 

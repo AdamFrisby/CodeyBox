@@ -90,6 +90,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
     // Suspending) without controlling wall-clock time.
     internal TimeSpan? SuspendSettleBudgetOverride { get; set; }
 
+    // Test seam: override the WaitForAdoptedAgentCompletionAsync poll interval.
+    // Production polls every 2s; tests set a small value so the loop is not
+    // wall-clock-bound (a real 2s Task.Delay can drift well past a short test
+    // deadline under thread-pool starvation, making the test flaky).
+    internal TimeSpan? AdoptionPollIntervalOverride { get; set; }
+
     // Cache for ListAllManagedAsync results to avoid hammering multipassd.
     private IReadOnlyList<ManagedSandboxInfo>? _listCache;
     private DateTimeOffset _listCacheExpiry = DateTimeOffset.MinValue;
@@ -461,7 +467,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         // read failure so we do not silently drop output if the file was
         // rotated by some VM-side tool.
         long offset = 0;
-        var pollInterval = TimeSpan.FromSeconds(2);
+        var pollInterval = AdoptionPollIntervalOverride ?? TimeSpan.FromSeconds(2);
         var maxStdoutBytes = 1024 * 1024;
 
         while (!ct.IsCancellationRequested)

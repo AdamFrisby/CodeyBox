@@ -70,22 +70,6 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// </summary>
     public static readonly TimeSpan DefaultPerGiBSuspendBudget = SuspendTimeoutPolicy.DefaultPerGiB;
 
-    /// <summary>
-    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Only the
-    /// multipass provider suspends on shutdown, and a healthy RAM snapshot must
-    /// not be truncated by a SIGKILL, so for multipass the ceiling is raised to
-    /// the worst-case suspend drain or the grace window, whichever is larger.
-    /// Thin delegate to <see cref="SuspendTimeoutPolicy.ResolveHostShutdownTimeout"/>
-    /// — the provider guard and max() logic live on the Core policy so the API
-    /// composition root can size the ceiling without depending on this concrete
-    /// hosted-service type. Retained here for callers/tests that already
-    /// reference the suspend handler.
-    /// </summary>
-    public static TimeSpan ResolveHostShutdownTimeout(
-        string? sandboxProvider, TimeSpan grace, int maxConcurrentWorkers) =>
-        SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
-            sandboxProvider, grace, maxConcurrentWorkers, DefaultMaxParallelSuspends);
-
     private readonly ISandboxProvider _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxSuspendOnShutdownService> _log;
