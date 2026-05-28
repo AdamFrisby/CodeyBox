@@ -14,36 +14,46 @@ public static class OrchestratorOptionsFactory
     /// optional legacy <c>CodeyBox:Concurrency</c> value.
     /// </summary>
     /// <param name="legacyConcurrency">
-    /// Value of <c>CodeyBox:Concurrency</c> (nullable). When non-null, it is
-    /// used as <see cref="WorkerPoolOptions.MaxConcurrentWorkers"/> and a
-    /// deprecation warning is emitted via <paramref name="log"/>.
+    /// Value of <c>CodeyBox:Concurrency</c> (nullable). Used as
+    /// <see cref="WorkerPoolOptions.MaxConcurrentWorkers"/> only when that key is
+    /// not explicitly set; a deprecation warning is emitted via <paramref name="log"/>.
     /// </param>
     /// <param name="workerPool">Parsed <see cref="WorkerPoolOptions"/> (from <c>CodeyBox:WorkerPool</c>).</param>
-    /// <param name="log">Logger for the deprecation warning.</param>
+    /// <param name="log">Logger for deprecation warnings.</param>
     /// <returns>Validated <see cref="OrchestratorOptions"/>.</returns>
     /// <exception cref="InvalidOperationException">Thrown when any option value is out of range.</exception>
     public static OrchestratorOptions Build(int? legacyConcurrency, WorkerPoolOptions workerPool, ILogger log)
     {
         var wp = workerPool;
+        int maxConcurrent;
 
-        if (legacyConcurrency is { } legacyValue)
+        if (wp.MaxConcurrentWorkers is { } workerPoolMax)
         {
-            var discardSuffix = wp.MaxConcurrentWorkers != legacyValue
-                ? $" Ignoring WorkerPool:MaxConcurrentWorkers={wp.MaxConcurrentWorkers}."
-                : string.Empty;
+            maxConcurrent = workerPoolMax;
+            if (legacyConcurrency is { } legacyValue)
+            {
+                log.LogWarning(
+                    "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
+                    "Deprecated value ({LegacyValue}) is set but overridden by " +
+                    "CodeyBox:WorkerPool:MaxConcurrentWorkers={WorkerPoolMax}; remove the deprecated key.",
+                    legacyValue, workerPoolMax);
+            }
+        }
+        else if (legacyConcurrency is { } legacyValue)
+        {
             log.LogWarning(
                 "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
                 "Use CodeyBox:WorkerPool:MaxConcurrentWorkers instead. " +
-                "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.{DiscardSuffix}",
-                legacyValue, discardSuffix);
-            wp = new WorkerPoolOptions
-            {
-                MaxConcurrentWorkers = legacyValue,
-                MinSpawnInterval = wp.MinSpawnInterval,
-            };
+                "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.",
+                legacyValue);
+            maxConcurrent = legacyValue;
+        }
+        else
+        {
+            maxConcurrent = 1;
         }
 
-        if (wp.MaxConcurrentWorkers < 1)
+        if (maxConcurrent < 1)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
         if (wp.MinSpawnInterval < TimeSpan.Zero)
@@ -55,7 +65,7 @@ public static class OrchestratorOptionsFactory
 
         return new OrchestratorOptions
         {
-            MaxConcurrentWorkers = wp.MaxConcurrentWorkers,
+            MaxConcurrentWorkers = maxConcurrent,
             MinSpawnInterval = wp.MinSpawnInterval,
         };
     }
