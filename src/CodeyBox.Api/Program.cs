@@ -1114,6 +1114,11 @@ builder.Services.AddSingleton<AgentAvailabilityRegistry>(sp => new AgentAvailabi
 // same singleton, exposed as the read/run-outcome/snapshot/reset surface.
 builder.Services.AddSingleton<IAgentAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+// The smoke-mutator port the in-VM prober, coverage policy, and host smoke
+// services bind to — same singleton, exposed as the exclusion-taxonomy
+// surface (MarkSmokeResult / ExcludeForMissingProbe) those owners need.
+builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
 {
     var opts = sp.GetRequiredService<SmokeOptions>();
@@ -1155,7 +1160,7 @@ builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<IBaselineImageResolver>(),
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetServices<IInVmSmokeProbe>(),
-    sp.GetRequiredService<AgentAvailabilityRegistry>(),
+    sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     sp.GetRequiredService<IInVmSmokeCache>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
@@ -1171,7 +1176,7 @@ builder.Services.AddSingleton<IInVmSmokeGate>(sp => sp.GetRequiredService<InVmSm
 // port rather than the full gate contract (interface segregation).
 builder.Services.AddSingleton<IInVmSmokeCoveragePolicy>(sp => new InVmSmokeCoveragePolicy(
     sp.GetServices<IInVmSmokeProbe>(),
-    sp.GetRequiredService<AgentAvailabilityRegistry>(),
+    sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     sp.GetRequiredService<InVmSmokeOptions>()));
 builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
     sp.GetRequiredService<IInVmSmokeGate>(),
@@ -1830,14 +1835,14 @@ builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<SmokeOptions>(),
     sp.GetRequiredService<ILogger<StartupSmokeProbeService>>(),
-    sp.GetService<AgentAvailabilityRegistry>()));
+    sp.GetService<ISmokeAvailabilityRegistry>()));
 builder.Services.AddSingleton<PeriodicSmokeProbeService>(sp => new PeriodicSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetServices<IAgentSmokeProbe>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<SmokeOptions>(),
     sp.GetRequiredService<AvailabilityOptions>(),
-    sp.GetRequiredService<AgentAvailabilityRegistry>(),
+    sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     sp.GetRequiredService<ILogger<PeriodicSmokeProbeService>>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PeriodicSmokeProbeService>());
 builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
@@ -2876,13 +2881,15 @@ namespace CodeyBox.Api
         public int SweepIntervalSeconds { get; set; } = 300;
 
         /// <summary>
-        /// Fail-closed dispatch-gate policy. When true, an in-VM probe that
-        /// cannot reach a verdict (provisioning/exec/timeout/credential fault)
-        /// temporarily benches the agent so the router never dispatches to an
-        /// unverified CLI. Default false (fail-open). See
+        /// Fail-closed dispatch-gate policy. When true (the default), an in-VM
+        /// probe that cannot reach a verdict (provisioning/exec/timeout/credential
+        /// fault) temporarily benches the agent so the router never dispatches to
+        /// an unverified CLI; the bench self-heals on the next successful probe.
+        /// Set false only on infra so flaky that benching disrupts more than the
+        /// exit-127 / auth cascade it guards against. See
         /// <see cref="InVmSmokeOptions.FailClosedOnProbeFault"/>.
         /// </summary>
-        public bool FailClosedOnProbeFault { get; set; } = false;
+        public bool FailClosedOnProbeFault { get; set; } = true;
 
         /// <summary>
         /// Host network profile for the probe sandbox; also selects which

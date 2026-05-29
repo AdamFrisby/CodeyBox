@@ -18,12 +18,12 @@ namespace CodeyBox.Orchestrator;
 public sealed class InVmSmokeCoveragePolicy : IInVmSmokeCoveragePolicy
 {
     private readonly IReadOnlyList<IInVmSmokeProbe> _probes;
-    private readonly AgentAvailabilityRegistry _availability;
+    private readonly ISmokeAvailabilityRegistry _availability;
     private readonly InVmSmokeOptions _opts;
 
     public InVmSmokeCoveragePolicy(
         IEnumerable<IInVmSmokeProbe> probes,
-        AgentAvailabilityRegistry availability,
+        ISmokeAvailabilityRegistry availability,
         InVmSmokeOptions opts)
     {
         _probes = probes.ToList();

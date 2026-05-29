@@ -54,10 +54,12 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     /// the 2026-05-28 cascade ("Workspace Trust Required", exit 1). The runner
     /// must ALWAYS pass it (the multipass VM boundary is the security perimeter,
     /// so per-workspace consent inside the sandbox is noise). Exposed as a single
-    /// source of truth so <c>BuildInvocation</c> and
-    /// <c>CursorAgentRunnerTrustRegressionTests</c> — the load-bearing pin for
-    /// stage 3, which the in-VM smoke probe's version/status steps cannot engage —
-    /// reference the same literal and cannot drift apart.
+    /// source of truth so <c>BuildInvocation</c> (real dispatch),
+    /// <c>CursorInVmSmokeProbe</c>'s stage-3 trust step (via
+    /// <see cref="WorkspaceTrustInvocationPrefix"/>), and
+    /// <c>CursorAgentRunnerTrustRegressionTests</c> (the argv-level pin) all
+    /// reference the same literal and cannot drift apart. Stage 3 is therefore
+    /// caught at smoke time too, not only by the argv regression test.
     /// </summary>
     public const string WorkspaceTrustFlag = "--trust";
 

@@ -462,21 +462,54 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
-    public async Task EnsureProbedAsync_NeverThrows_AndDoesNotBench_OnProbeFault()
+    public async Task EnsureProbedAsync_FailOpenOptOut_NeverThrows_AndDoesNotBench_OnProbeFault()
     {
-        // The dispatch gate runs on the router hot path: a provisioning/exec fault
-        // must be swallowed (not thrown) and must not bench a possibly-working agent.
+        // With the opt-out fail-open policy (FailClosedOnProbeFault:false), a
+        // provisioning/exec fault on the dispatch gate must be swallowed (not
+        // thrown) and must NOT bench a possibly-working agent.
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""))
         {
             ThrowOnCreate = new InvalidOperationException("provider blew up"),
         };
         var registry = NewRegistry();
-        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                FailClosedOnProbeFault = false,
+            });
 
         // Must complete without throwing.
         await prober.EnsureProbedAsync(AgentKind.Cursor, CancellationToken.None);
 
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_DefaultFailClosed_NeverThrows_AndBenches_OnProbeFault()
+    {
+        // The default dispatch-gate policy is fail-closed: a provisioning/exec
+        // fault must be swallowed (not thrown) but bench the agent so the router
+        // never dispatches to a CLI that was never verified in-sandbox.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""))
+        {
+            ThrowOnCreate = new InvalidOperationException("provider blew up"),
+        };
+        var registry = NewRegistry();
+        var cache = NewCache();
+        // Build() uses the default InVmSmokeOptions, where FailClosedOnProbeFault
+        // now defaults to true.
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, CancellationToken.None);
+
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        // The fault is not cached, so a later (recovered) probe self-heals it.
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
     }
 
     [Fact]

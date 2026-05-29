@@ -25,7 +25,7 @@ public sealed class PeriodicSmokeProbeService : BackgroundService
     private readonly IWebhookDispatcher _webhooks;
     private readonly SmokeOptions _smokeOpts;
     private readonly AvailabilityOptions _availOpts;
-    private readonly AgentAvailabilityRegistry _availability;
+    private readonly ISmokeAvailabilityRegistry _availability;
     private readonly ILogger<PeriodicSmokeProbeService> _log;
 
     public PeriodicSmokeProbeService(
@@ -34,7 +34,7 @@ public sealed class PeriodicSmokeProbeService : BackgroundService
         IWebhookDispatcher webhooks,
         SmokeOptions smokeOpts,
         AvailabilityOptions availOpts,
-        AgentAvailabilityRegistry availability,
+        ISmokeAvailabilityRegistry availability,
         ILogger<PeriodicSmokeProbeService> log)
     {
         _credentials = credentials;

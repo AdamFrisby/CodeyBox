@@ -362,7 +362,16 @@ public sealed class PipelineRunner : IPipelineRunner
         // would otherwise reach the runner without any in-VM check and reproduce
         // the exit-127 / auth cascade. Gate the work-phase agent here too — a
         // cache hit is free, so a class-routed item just re-asserts its verdict.
-        if (!project.SkipCredentialSmokeTest && !await EnsureAgentSmokeAvailableAsync(agentKind, ct))
+        //
+        // Deliberately NOT tied to project.SkipCredentialSmokeTest: that flag
+        // opts out of the host-side *credential* probe (HTTP env-var check),
+        // which is exactly the over-permissive check this in-VM gate exists to
+        // backstop. Skipping the in-sandbox binary/auth/trust verification for a
+        // project that disabled credential smoke would reopen the very cascade
+        // this gate closes. Agents with no first-party sandbox CLI (e.g. copilot)
+        // have no IInVmSmokeProbe and are exempted in the coverage policy, so the
+        // gate is a free pass-through for them regardless of this flag.
+        if (!await EnsureAgentSmokeAvailableAsync(agentKind, ct))
         {
             var reason = _availability?.GetAvailability(agentKind).Reason ?? "in-VM smoke gate excluded agent";
             AuditLog.AgentSmokeFailed(agentKind, reason, TimeSpan.Zero);

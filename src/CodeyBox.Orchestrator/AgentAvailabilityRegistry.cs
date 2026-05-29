@@ -36,7 +36,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -330,6 +330,37 @@ public interface IAgentAvailabilityRegistry
 
     /// <summary>Clears all exclusion state and counters for an agent (operator reset).</summary>
     void Reset(AgentKind kind);
+}
+
+/// <summary>
+/// Smoke-subsystem port over <see cref="AgentAvailabilityRegistry"/>. Carries
+/// the exclusion-taxonomy mutators that the in-VM prober
+/// (<see cref="InVmSmokeProber"/>), the coverage policy
+/// (<see cref="InVmSmokeCoveragePolicy"/>), and the host smoke services
+/// (<see cref="StartupSmokeProbeService"/> / <see cref="PeriodicSmokeProbeService"/>)
+/// need to feed probe verdicts back into availability.
+///
+/// <para>Deliberately separate from <see cref="IAgentAvailabilityRegistry"/>:
+/// routing/dispatch/admin consumers depend on that narrow read/run-outcome port
+/// and must not see <see cref="MarkSmokeResult"/> (source + clearsFastFail) or
+/// <see cref="ExcludeForMissingProbe"/>, while the smoke services that own the
+/// exclusion model depend on this one — so neither side is pinned to the
+/// concrete registry type (interface segregation; loose coupling).</para>
+/// </summary>
+public interface ISmokeAvailabilityRegistry
+{
+    /// <summary>Current routable verdict for an agent (shared with the read port).</summary>
+    AgentAvailability GetAvailability(AgentKind kind);
+
+    /// <summary>Feeds a smoke-probe outcome from a specific source into availability.</summary>
+    AvailabilityTransition MarkSmokeResult(
+        AgentKind kind,
+        AgentSmokeResult result,
+        SmokeExclusionSource source = SmokeExclusionSource.HostSmoke,
+        bool clearsFastFail = false);
+
+    /// <summary>Benches an agent named in a class but with no registered in-VM probe.</summary>
+    AvailabilityTransition ExcludeForMissingProbe(AgentKind kind, string reason);
 }
 
 /// <summary>

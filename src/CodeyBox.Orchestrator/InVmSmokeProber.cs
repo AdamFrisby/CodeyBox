@@ -31,12 +31,19 @@ namespace CodeyBox.Orchestrator;
 /// <see cref="SmokeExclusionSource.InVmSmoke"/>, so the registry and cache can
 /// never silently diverge (e.g. after an operator reset clears the registry).</para>
 ///
-/// <para><b>What excludes vs. what is transient.</b> Only a <em>clean</em>
-/// negative signal — a step that exits non-zero — excludes an agent.
-/// Provisioning failures, exec exceptions, and step timeouts are treated as
-/// transient infrastructure problems: they are logged and skipped without
-/// mutating availability or the cache, so a flaky host never wrongly benches a
-/// working agent.</para>
+/// <para><b>What excludes vs. what is transient.</b> A <em>clean</em> negative
+/// signal — a step that exits non-zero — always excludes an agent. Provisioning
+/// failures, exec exceptions, and step timeouts are transient infrastructure
+/// problems; how they are handled depends on the call path. On the background
+/// sweep (<see cref="ProbeAllAsync"/>) they are always logged and skipped
+/// without mutating availability or the cache, so a flaky host never wrongly
+/// benches a working agent. On the dispatch gate
+/// (<see cref="EnsureProbedAsync"/>) the operator's
+/// <see cref="InVmSmokeOptions.FailClosedOnProbeFault"/> policy applies: under
+/// the default fail-closed policy a transient fault temporarily benches the
+/// agent (never cached, so it self-heals on the next successful probe) so the
+/// router does not dispatch to a CLI it could not verify; under the opt-out
+/// fail-open policy it leaves availability unchanged like the sweep.</para>
 /// </summary>
 public sealed class InVmSmokeProber : IInVmSmokeGate
 {
@@ -46,7 +53,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     private readonly IBaselineImageResolver _resolver;
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IInVmSmokeProbe> _probes;
-    private readonly AgentAvailabilityRegistry _availability;
+    private readonly ISmokeAvailabilityRegistry _availability;
     private readonly IInVmSmokeCache _cache;
     private readonly IWebhookDispatcher _webhooks;
     private readonly InVmSmokeOptions _opts;
@@ -57,7 +64,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         IBaselineImageResolver resolver,
         ICredentialProvider credentials,
         IEnumerable<IInVmSmokeProbe> probes,
-        AgentAvailabilityRegistry availability,
+        ISmokeAvailabilityRegistry availability,
         IInVmSmokeCache cache,
         IWebhookDispatcher webhooks,
         InVmSmokeOptions opts,

@@ -11,11 +11,13 @@ namespace CodeyBox.Tests;
 /// non-interactively unless invoked with <c>--trust</c> ("Workspace Trust
 /// Required", exit 1). The multipass VM boundary is the security perimeter, so
 /// per-workspace consent inside the sandbox is noise — the runner must ALWAYS
-/// pass <c>--trust</c>. The in-VM smoke probe deliberately does not exercise
-/// workspace trust (its <c>--version</c> / <c>status</c> steps don't engage it),
-/// so this argv-level pin is what guarantees stage 3 cannot regress; without it,
-/// removing <c>--trust</c> would pass smoke yet fail at first dispatch.
-/// <c>CursorInVmSmokeProbe</c> documents that this suite is the pin.</para>
+/// pass <c>--trust</c>. The in-VM smoke probe DOES exercise workspace trust at
+/// smoke time: <c>CursorInVmSmokeProbe</c> runs a stage-3 trust-bearing turn via
+/// <c>CursorAgentRunner.WorkspaceTrustInvocationPrefix</c> (covered by
+/// <c>InVmSmokeProberTests.ThreeStageCascade_EachStageCaughtAtSmokeTime</c>), so
+/// a dropped <c>--trust</c> is caught both at smoke time and here. This argv-level
+/// suite remains the fast, sandbox-free pin on the exact dispatch argv — it pairs
+/// with the smoke coverage rather than being the sole stage-3 guard.</para>
 /// </summary>
 public sealed class CursorAgentRunnerTrustRegressionTests
 {
