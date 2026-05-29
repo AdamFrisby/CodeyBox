@@ -6,28 +6,16 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Pickup-time rebase resolver must consult an agent's text-only credential
-/// viability before invoking <see cref="ITextOnlyAgentRunner.RunTextOnlyAsync"/>.
-/// Before this fix the resolver hard-routed to whichever agent the work item
-/// had been routed to at pickup-time — so an OAuth-only Gemini configuration
-/// (no <c>GEMINI_API_KEY</c>) failed every pickup-time rebase with a misleading
-/// <see cref="WorkItemState.MergeConflictResolutionFailed"/>, even when the
-/// project's class chain had Claude/Codex available with working credentials.
-///
-/// <para>
-/// Coverage targets the bug's acceptance criteria:
-/// </para>
-/// <list type="number">
-///   <item>Gemini missing API_KEY + Claude/Codex with OAuth → rebase routes to
-///         Claude or Codex and completes (Gemini's text-only path never fires).</item>
-///   <item>Every class member missing text-only credentials → item fails with
-///         <c>failureKind=agent_unavailable</c>, not
-///         <see cref="WorkItemState.MergeConflictResolutionFailed"/>.</item>
-/// </list>
+/// Pickup-time rebase resolver walks the agent-class chain for text-only-capable
+/// members (host <see cref="ITextOnlyAgentRunner"/> or sandbox
+/// <see cref="ISandboxTextOnlyAgentRunner"/>), cascades on transient failures,
+/// and emits operator-visible audit events for chosen/attempted/skipped agents.
 /// </summary>
 [Collection("Pipeline integration")]
 public sealed class RebaseResolverAgentRoutingTests : IDisposable
@@ -427,6 +415,123 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxTextOnlyAgent_InvokeTextOnlyUsesSandboxPath()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var cursor = new SandboxTextOnlyScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Cursor,
+        };
+        cursor.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildFixture(seed, [cursor]);
+
+        var item = NewItem(AgentKind.Cursor) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Single(cursor.SandboxTextOnlyInvocations);
+        Assert.StartsWith("# Merge conflict resolver", cursor.SandboxTextOnlyInvocations[0]);
+    }
+
+    [Fact]
+    public async Task AllCascadeTextOnlyAttemptsFail_ParksMergeConflictResolutionFailed()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+
+        claude.TextOnlyResults.Enqueue(new TextOnlyAgentResult(false, "HTTP 404", null, "not found"));
+        codex.TextOnlyResults.Enqueue(new TextOnlyAgentResult(false, "HTTP 503", null, "unavailable"));
+
+        using var fix = BuildFixture(seed, [claude, codex]);
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+        var preRebaseTip = await RevParseAsync(barePath, item.WorkBranch!);
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Single(claude.TextOnlyInvocations);
+        Assert.Single(codex.TextOnlyInvocations);
+        Assert.Equal(preRebaseTip, await RevParseAsync(barePath, item.WorkBranch!));
+    }
+
+    [Fact]
+    public async Task ClaudeTextOnlyFails_EmitsCascadeAuditEvents()
+    {
+        var sink = new TestSink();
+        var previousLogger = Log.Logger;
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Verbose()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+            var claude = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+            var codex = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+
+            claude.TextOnlyResults.Enqueue(new TextOnlyAgentResult(false, "HTTP 404", null, "not found"));
+            codex.ConflictResolutionPlan.Enqueue(files =>
+            {
+                var file = Assert.Single(files);
+                return new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    [file.Path] = "main branch change\nwork branch change\n",
+                };
+            });
+
+            using var fix = BuildFixture(seed, [claude, codex]);
+
+            var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+            var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+            var barePath = fix.GitHost.GetRepoPath(repoId);
+            await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+            await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+            Assert.Contains(sink.Events, e => GetAuditEventName(e) == "rebase_resolver.cascade_planned");
+            Assert.Contains(sink.Events, e => GetAuditEventName(e) == "rebase_resolver.text_only_attempt_failed");
+            Assert.Contains(sink.Events, e =>
+                GetAuditEventName(e) == "rebase_resolver.succeeded"
+                && GetAuditScalar<string>(e, "ChosenAgent") == "codex");
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+            Log.Logger = previousLogger;
+        }
+    }
+
+    [Fact]
     public async Task NoCapConfigured_ResolverIgnoresRunningCount_UsesPrimary()
     {
         // Sanity check: when MaxConcurrent=0 (unset / "no per-agent cap"),
@@ -631,5 +736,19 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
 
         public IReadOnlyDictionary<AgentKind, int> Snapshot()
             => new Dictionary<AgentKind, int>(this);
+    }
+
+    private static string? GetAuditEventName(LogEvent evt) =>
+        GetAuditScalar<string>(evt, "EventName");
+
+    private static T? GetAuditScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        if (sv.Value is T t)
+            return t;
+        if (typeof(T) == typeof(int) && sv.Value is long l)
+            return (T)(object)(int)l;
+        return default;
     }
 }

@@ -70,12 +70,14 @@ public interface ITextOnlyAgentRunner : IAgentRunner
 
     /// <summary>
     /// Cheap, credential-only viability probe. Returns <c>null</c> when the
-    /// supplied credential is sufficient for <see cref="RunTextOnlyAsync"/> to
-    /// reach the provider; otherwise returns a short human-readable reason
-    /// (e.g. <c>"GEMINI_API_KEY is required"</c>). The default implementation
-    /// is permissive — runners that need specific env vars override this so
-    /// the rebase-resolver router can walk the class chain past a runner with
-    /// no viable text-only credential rather than hard-failing the work item.
+    /// supplied credential is sufficient for this runner's text-only path to
+    /// reach the provider (host <see cref="RunTextOnlyAsync"/> or, for
+    /// <see cref="ISandboxTextOnlyAgentRunner"/>, sandbox execution); otherwise
+    /// returns a short human-readable reason (e.g. <c>"GEMINI_API_KEY is required"</c>).
+    /// The default implementation is permissive — runners that need specific env
+    /// vars override this so the rebase-resolver router can walk the class chain
+    /// past a runner with no viable text-only credential rather than hard-failing
+    /// the work item.
     /// </summary>
     string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) => null;
 }
@@ -85,8 +87,11 @@ public interface ITextOnlyAgentRunner : IAgentRunner
 /// execute inside the work-item sandbox. Host-side CLI invocations with
 /// auto-approved tool prompts are not permitted for text-only calls.
 /// </summary>
-public interface ISandboxTextOnlyAgentRunner : ITextOnlyAgentRunner
+public interface ISandboxTextOnlyAgentRunner : IAgentRunner
 {
+    /// <inheritdoc cref="ITextOnlyAgentRunner.GetTextOnlyUnavailabilityReason"/>
+    string? GetTextOnlyUnavailabilityReason(AgentCredential? credential);
+
     Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,

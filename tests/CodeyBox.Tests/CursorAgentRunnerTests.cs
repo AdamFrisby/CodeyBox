@@ -185,34 +185,19 @@ public sealed class CursorAgentRunnerTests
     {
         var runner = new CursorAgentRunner();
         Assert.Equal(
-            "CODEYBOX_CURSOR_AUTH_JSON is required",
+            "cursor text-only requires a credential bundle",
             runner.GetTextOnlyUnavailabilityReason(credential: null));
     }
 
     [Fact]
-    public void GetTextOnlyUnavailabilityReason_EmptyAuth_ReturnsReason()
+    public void GetTextOnlyUnavailabilityReason_WithCredentialBundle_ReturnsNull()
     {
         var runner = new CursorAgentRunner();
         var cred = new AgentCredential(
             AgentKind.Cursor,
-            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "" },
+            new Dictionary<string, string>(),
             new Dictionary<string, string>());
-        Assert.Equal("CODEYBOX_CURSOR_AUTH_JSON is required", runner.GetTextOnlyUnavailabilityReason(cred));
-    }
-
-    [Fact]
-    public async Task RunTextOnlyAsync_OnHost_ReturnsFailure()
-    {
-        var runner = new CursorAgentRunner();
-        var cred = new AgentCredential(
-            AgentKind.Cursor,
-            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
-            new Dictionary<string, string>());
-
-        var result = await runner.RunTextOnlyAsync("prompt", cred);
-
-        Assert.False(result.Success);
-        Assert.Contains("sandbox", result.Summary, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
     }
 
     [Fact]

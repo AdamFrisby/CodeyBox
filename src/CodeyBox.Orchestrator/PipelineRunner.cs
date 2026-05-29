@@ -1241,6 +1241,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     sandbox,
                     prompt,
                     hunks,
+                    item.Agent ?? runner.Kind,
                     item.ModelId,
                     item.ReasoningMode,
                     ct);
@@ -1296,20 +1297,6 @@ public sealed class PipelineRunner : IPipelineRunner
             resolvedAnyConflict ? chosenCredential : null);
     }
 
-    /// <summary>
-    /// Returns the primary runner + credential from the pickup-time rebase
-    /// resolver cascade. Prefer
-    /// <see cref="ResolveTextOnlyRebaseResolverCascadeAsync"/> when the full
-    /// ordered try-list is needed.
-    /// </summary>
-    private async Task<(IAgentRunner Runner, AgentCredential? Credential)>
-        ResolveTextOnlyRebaseResolverAsync(
-            WorkItem item, Project project, IAgentRunner primaryRunner, CancellationToken ct)
-    {
-        var cascade = await ResolveTextOnlyRebaseResolverCascadeAsync(item, project, primaryRunner, ct);
-        return cascade.Candidates[0];
-    }
-
     private sealed record TextOnlyRebaseResolverCascade(
         IReadOnlyList<(IAgentRunner Runner, AgentCredential? Credential)> Candidates,
         string SkippedReasons);
@@ -1351,8 +1338,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 reasons);
         }
 
+        const int capSortPreferred = 0;
+        const int capSortDeprioritized = 1;
         var ordered = viable
-            .OrderBy(c => IsAtAgentCap(c.Runner.Kind) ? 1 : 0)
+            .OrderBy(c => IsAtAgentCap(c.Runner.Kind) ? capSortDeprioritized : capSortPreferred)
             .ToList();
 
         var skipped = candidateReasons.Count == 0 ? "(none)" : string.Join("; ", candidateReasons);
@@ -1375,12 +1364,6 @@ public sealed class PipelineRunner : IPipelineRunner
                     $"{primaryRunner.Kind.Value} text-only credential missing; using class member");
             }
         }
-        else if (primaryAtCap && ordered.Count > 1 && !IsAtAgentCap(ordered[1].Runner.Kind))
-        {
-            AuditLog.RebaseResolverAgentCapReroute(
-                primaryRunner.Kind, ordered[1].Runner.Kind,
-                GetRunningSafe(primaryRunner.Kind), GetCapSafe(primaryRunner.Kind));
-        }
         else if (primaryAtCap && ordered.All(c => IsAtAgentCap(c.Runner.Kind)))
         {
             AuditLog.RebaseResolverAllAtCap(
@@ -1394,14 +1377,19 @@ public sealed class PipelineRunner : IPipelineRunner
         async Task TryAddCandidateAsync(IAgentRunner candidate, CancellationToken token)
         {
             seenKinds.Add(candidate.Kind);
-            if (candidate is not ITextOnlyAgentRunner textOnly)
+            if (candidate is not ITextOnlyAgentRunner and not ISandboxTextOnlyAgentRunner)
             {
                 candidateReasons.Add($"{candidate.Kind.Value}: runner does not implement text-only mode");
                 return;
             }
 
             var credential = await ResolveAgentCredentialAsync(candidate.Kind, project, token);
-            var reason = textOnly.GetTextOnlyUnavailabilityReason(credential);
+            var reason = candidate switch
+            {
+                ITextOnlyAgentRunner textOnly => textOnly.GetTextOnlyUnavailabilityReason(credential),
+                ISandboxTextOnlyAgentRunner sandboxTextOnly => sandboxTextOnly.GetTextOnlyUnavailabilityReason(credential),
+                _ => "runner does not implement text-only mode",
+            };
             if (reason is not null)
             {
                 candidateReasons.Add($"{candidate.Kind.Value}: {reason}");
@@ -1421,6 +1409,7 @@ public sealed class PipelineRunner : IPipelineRunner
         ISandbox sandbox,
         string prompt,
         IReadOnlyList<ConflictHunk> conflictHunks,
+        AgentKind workAgentKind,
         string? modelId,
         string? reasoningMode,
         CancellationToken ct)
@@ -1431,14 +1420,15 @@ public sealed class PipelineRunner : IPipelineRunner
 
         foreach (var (resolverRunner, resolverCredential) in cascade.Candidates)
         {
+            var crossKind = resolverRunner.Kind != workAgentKind;
             var agentResult = await RunConstrainedConflictResolverAsync(
                 resolverRunner,
                 sandbox,
                 prompt,
                 conflictHunks,
                 resolverCredential,
-                modelId,
-                reasoningMode,
+                crossKind ? null : modelId,
+                crossKind ? null : reasoningMode,
                 ct);
             lastResult = agentResult;
             if (agentResult.Success)
@@ -1459,7 +1449,7 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private static async Task<TextOnlyAgentResult> InvokeTextOnlyAsync(
-        ITextOnlyAgentRunner runner,
+        IAgentRunner runner,
         ISandbox? sandbox,
         string? workingDirectory,
         string prompt,
@@ -1482,7 +1472,14 @@ public sealed class PipelineRunner : IPipelineRunner
                 ct);
         }
 
-        return await runner.RunTextOnlyAsync(prompt, credential, modelId, reasoningMode, ct);
+        if (runner is ITextOnlyAgentRunner hostRunner)
+            return await hostRunner.RunTextOnlyAsync(prompt, credential, modelId, reasoningMode, ct);
+
+        return new TextOnlyAgentResult(
+            false,
+            $"agent {runner.Kind.Value} does not support text-only calls without a sandbox",
+            null,
+            null);
     }
 
     /// <summary>
@@ -3978,6 +3975,7 @@ public sealed class PipelineRunner : IPipelineRunner
                             project,
                             runner,
                             credential,
+                            sandbox,
                             conflictsResolvedByConstrainedResolver: true);
                         await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
                     }
@@ -4012,7 +4010,8 @@ public sealed class PipelineRunner : IPipelineRunner
                         ct,
                         project,
                         runner,
-                        credential);
+                        credential,
+                        sandbox);
                     await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
                 }
                 finally
@@ -4095,13 +4094,13 @@ public sealed class PipelineRunner : IPipelineRunner
         string? reasoningMode,
         CancellationToken ct)
     {
-        if (runner is not ITextOnlyAgentRunner textOnlyRunner)
+        if (runner is not ITextOnlyAgentRunner and not ISandboxTextOnlyAgentRunner)
         {
             return new AgentResult(
                 false,
                 $"agent {runner.Kind} does not implement text-only merge conflict resolution",
                 null,
-                "conflicted merges require ITextOnlyAgentRunner");
+                "conflicted merges require a text-only-capable agent runner");
         }
 
         var files = conflictHunks
@@ -4130,7 +4129,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var resolverPrompt = BuildConflictResolverTextOnlyPrompt(prompt, resolverFiles);
         var textResult = await InvokeTextOnlyAsync(
-            textOnlyRunner,
+            runner,
             sandbox,
             SandboxConventions.WorkDir,
             resolverPrompt,
@@ -4525,6 +4524,7 @@ public sealed class PipelineRunner : IPipelineRunner
         Project? project = null,
         IAgentRunner? securityReviewRunner = null,
         AgentCredential? securityReviewCredential = null,
+        ISandbox? sandbox = null,
         bool conflictsResolvedByConstrainedResolver = false)
     {
         await VerifyMergeAncestryAsync(repoId, preMergeSha, workTipSha, mergeSha, ct);
@@ -4545,7 +4545,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 throw new MergePhaseInconsistentResultException(
                     $"merge agent commit tree {agentTree} does not match host git merge-tree {hostMerge.TreeSha}");
             }
-            await RecordMergeSecurityReviewAsync(workItemId, repoId, preMergeSha, mergeSha, [], project, securityReviewRunner, securityReviewCredential, sandbox: null, ct);
+            await RecordMergeSecurityReviewAsync(workItemId, repoId, preMergeSha, mergeSha, [], project, securityReviewRunner, securityReviewCredential, sandbox, ct);
             return;
         }
 
@@ -4566,7 +4566,7 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new MergeConflictResolutionFailedException(ex.Message, ex);
         }
 
-        await RecordMergeSecurityReviewAsync(workItemId, repoId, preMergeSha, mergeSha, hostMerge.ConflictedFiles, project, securityReviewRunner, securityReviewCredential, sandbox: null, ct);
+        await RecordMergeSecurityReviewAsync(workItemId, repoId, preMergeSha, mergeSha, hostMerge.ConflictedFiles, project, securityReviewRunner, securityReviewCredential, sandbox, ct);
     }
 
     private async Task RecordMergeSecurityReviewAsync(
@@ -4674,7 +4674,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         _ = workItemId;
         _ = project;
-        if (runner is not ITextOnlyAgentRunner textOnlyRunner)
+        if (runner is not ITextOnlyAgentRunner and not ISandboxTextOnlyAgentRunner)
         {
             _log.LogWarning(
                 "Advisory merge security review skipped because agent {AgentKind} does not implement text-only review",
@@ -4684,7 +4684,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         var prompt = BuildMergeSecurityReviewPrompt(diff);
         var result = await InvokeTextOnlyAsync(
-            textOnlyRunner,
+            runner,
             sandbox,
             sandbox is null ? null : SandboxConventions.WorkDir,
             prompt,

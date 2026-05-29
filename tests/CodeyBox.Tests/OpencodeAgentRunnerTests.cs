@@ -347,28 +347,15 @@ public sealed class OpencodeAgentRunnerTests
     {
         var runner = new OpencodeAgentRunner();
         Assert.Equal(
-            "OPENCODE_AUTH_JSON is required",
+            "opencode text-only requires a credential bundle",
             runner.GetTextOnlyUnavailabilityReason(credential: null));
     }
 
     [Fact]
-    public void GetTextOnlyUnavailabilityReason_EmptyAuth_ReturnsReason()
+    public void GetTextOnlyUnavailabilityReason_WithCredentialBundle_ReturnsNull()
     {
         var runner = new OpencodeAgentRunner();
-        var cred = OpencodeCred("");
-        Assert.Equal("OPENCODE_AUTH_JSON is required", runner.GetTextOnlyUnavailabilityReason(cred));
-    }
-
-    [Fact]
-    public async Task RunTextOnlyAsync_OnHost_ReturnsFailure()
-    {
-        var runner = new OpencodeAgentRunner();
-        var cred = OpencodeCred("""{"token":"x"}""");
-
-        var result = await runner.RunTextOnlyAsync("prompt", cred);
-
-        Assert.False(result.Success);
-        Assert.Contains("sandbox", result.Summary, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(OpencodeCred("")));
     }
 
     [Fact]

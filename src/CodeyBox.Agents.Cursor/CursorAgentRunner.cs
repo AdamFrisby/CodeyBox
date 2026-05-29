@@ -28,7 +28,7 @@ namespace CodeyBox.Agents.Cursor;
 /// CLI is expected to use whatever auth path the operator provisioned in the
 /// image.</para>
 /// </summary>
-public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, ISandboxTextOnlyAgentRunner
+public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ISandboxTextOnlyAgentRunner
 {
     public override AgentKind Kind => AgentKind.Cursor;
 
@@ -144,33 +144,9 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     }
 
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
-    {
-        if (credential is null)
-            return "CODEYBOX_CURSOR_AUTH_JSON is required";
-        return credential.EnvironmentVariables.TryGetValue("CODEYBOX_CURSOR_AUTH_JSON", out var cursor)
-               && !string.IsNullOrEmpty(cursor)
-            ? null
-            : "CODEYBOX_CURSOR_AUTH_JSON is required";
-    }
-
-    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        CancellationToken ct = default)
-    {
-        _ = prompt;
-        _ = credential;
-        _ = modelId;
-        _ = reasoningMode;
-        _ = ct;
-        return Task.FromResult(new TextOnlyAgentResult(
-            false,
-            "Cursor text-only calls must run inside the work-item sandbox",
-            null,
-            null));
-    }
+        => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
+            credential,
+            "cursor text-only requires a credential bundle");
 
     public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
         ISandbox sandbox,

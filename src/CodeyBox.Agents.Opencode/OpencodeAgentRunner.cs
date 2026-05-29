@@ -21,7 +21,7 @@ namespace CodeyBox.Agents.Opencode;
 /// materialises the file from <c>OPENCODE_AUTH_JSON</c> in the credential
 /// bundle before invoking the CLI, mirroring the Codex pattern.</para>
 /// </summary>
-public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, ISandboxTextOnlyAgentRunner
+public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ISandboxTextOnlyAgentRunner
 {
     public override AgentKind Kind => AgentKind.Opencode;
 
@@ -152,33 +152,9 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
     }
 
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
-    {
-        if (credential is null)
-            return "OPENCODE_AUTH_JSON is required";
-        return credential.EnvironmentVariables.TryGetValue("OPENCODE_AUTH_JSON", out var opencode)
-               && !string.IsNullOrEmpty(opencode)
-            ? null
-            : "OPENCODE_AUTH_JSON is required";
-    }
-
-    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        CancellationToken ct = default)
-    {
-        _ = prompt;
-        _ = credential;
-        _ = modelId;
-        _ = reasoningMode;
-        _ = ct;
-        return Task.FromResult(new TextOnlyAgentResult(
-            false,
-            "Opencode text-only calls must run inside the work-item sandbox",
-            null,
-            null));
-    }
+        => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
+            credential,
+            "opencode text-only requires a credential bundle");
 
     public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
         ISandbox sandbox,

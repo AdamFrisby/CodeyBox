@@ -257,7 +257,7 @@ internal enum MergeStrategy
 /// File-write contents are consumed in order; provide one entry per
 /// expected work-phase (or rework-phase) invocation.
 /// </summary>
-internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
+internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
@@ -455,6 +455,36 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
 
     [GeneratedRegex(@"merge branch `([^`]+)` into branch\s+`([^`]+)`", RegexOptions.CultureInvariant | RegexOptions.Singleline)]
     private static partial Regex MergePromptShape();
+}
+
+/// <summary>
+/// Scripted agent implementing <see cref="ISandboxTextOnlyAgentRunner"/> so
+/// orchestrator integration tests exercise the sandbox dispatch path in
+/// <c>PipelineRunner.InvokeTextOnlyAsync</c>.
+/// </summary>
+internal sealed class SandboxTextOnlyScriptedAgent : ScriptedAgent, ISandboxTextOnlyAgentRunner
+{
+    public SandboxTextOnlyScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
+        : base(mergeStrategies)
+    {
+    }
+
+    public List<string> SandboxTextOnlyInvocations { get; } = new();
+
+    public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        SandboxTextOnlyInvocations.Add(prompt);
+        return RunTextOnlyAsync(prompt, credential, modelId, reasoningMode, ct);
+    }
 }
 
 internal sealed record FileWrite(string FileName, string Contents);

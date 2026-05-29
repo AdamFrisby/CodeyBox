@@ -114,6 +114,18 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     }
 
     /// <summary>
+    /// Viability probe for subscription CLIs whose sandbox auth materialisation
+    /// no-ops when the auth-json env var is absent (image-baked CLI auth).
+    /// Returns null when a credential bundle is present.
+    /// </summary>
+    protected static string? GetSandboxSubscriptionTextOnlyUnavailabilityReason(
+        AgentCredential? credential,
+        string missingCredentialMessage)
+    {
+        return credential is null ? missingCredentialMessage : null;
+    }
+
+    /// <summary>
     /// Runs a one-shot print-mode CLI invocation inside the sandbox for
     /// text-only resolver/review calls. The VM boundary is the security
     /// perimeter, so sandbox invocations may use the runner's normal
@@ -145,7 +157,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             var detail = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
             return new TextOnlyAgentResult(
                 false,
-                $"agent text-only call failed: exit {result.ExitCode}",
+                $"{Kind.Value} text-only call failed: exit {result.ExitCode}",
                 result.Stdout,
                 detail.Trim());
         }
