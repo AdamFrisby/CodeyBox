@@ -110,6 +110,41 @@ When `DELETE /workitems/{id}` is called:
 
 Cascade cancellation is transitive: if A → B → C and A is cancelled, B and C (both `Queued`) are cancelled.
 
+### Closing terminal-failure items (operator bookkeeping)
+
+`DELETE /workitems/{id}` also accepts items already in a terminal-failure state
+— `Failed`, `AuditFailed`, `MergeConflictResolutionFailed`, and
+`AbandonedAfterRecoveryAttempts` — and transitions them to `Cancelled` with
+`cancellationReason=OperatorRequested`. This is the operator-facing close path
+for items the orchestrator could not finish but the operator has resolved
+out-of-band (e.g. manually merging the work after a
+`MergeConflictResolutionFailed`). The transition is pure bookkeeping: no
+pipeline state is replayed, no cascade is triggered (those dependents already
+saw a non-`Done` parent), and the underlying terminal-failure rows are not
+re-dispatched (Cancelled and the failure states are all excluded from the
+dispatcher's pickup query).
+
+Optional query parameters:
+
+| Parameter | Purpose |
+|-----------|---------|
+| `reason` | Free-form note (≤500 chars, no control characters), appended to `lastError` so the audit trail captures the operator's justification. |
+| `resolutionSha` | 7–40 character hex SHA of the commit on `main` that carries the resolution. Included in `lastError` so triage tooling can link back to the manual fix. |
+
+```
+DELETE /workitems/{id}?reason=manually+merged+as+abc123&resolutionSha=abc123de
+```
+
+A subsequent `DELETE` on an already-`Cancelled` item is a no-op (`202 Accepted`)
+so retry-safe operator scripts do not need to read the current state first.
+`DELETE` on `Done` still returns `409 Conflict` — a successful merge cannot be
+cancelled away.
+
+The audit-log event `work_item.cancelled` and the corresponding
+`work_item.cancelled` webhook event carry the prior state, reason, and
+resolution SHA in the webhook `details` payload so trackers can attribute the
+manual close.
+
 ### Uncancelling items
 
 Use `POST /workitems/{id}/uncancel` to reset a `Cancelled` item back to `Queued` when:
@@ -215,6 +250,18 @@ Returns the list of work items that have this item in their `dependsOn`. Useful 
 ### `GET /workitems/{id}/dependents`
 
 Returns the array of work item records (same shape as `GET /workitems/{id}`) that directly declare a dependency on `{id}`.
+
+### `DELETE /workitems/{id}` — new optional query parameters
+
+```
+DELETE /workitems/{id}?reason=<text>&resolutionSha=<7-40 hex chars>
+```
+
+`reason` and `resolutionSha` are surfaced in `lastError` on the resulting
+`Cancelled` row and in the webhook `details` payload. Accepted from any
+non-`Done` state, including the terminal-failure states
+(`Failed` / `AuditFailed` / `MergeConflictResolutionFailed` /
+`AbandonedAfterRecoveryAttempts`) — see *Closing terminal-failure items* above.
 
 ---
 

@@ -728,7 +728,7 @@ When the question was already dismissed (idempotent no-op):
 
 ### `DELETE /workitems/{id}`
 
-Cancel a non-terminal work item.
+Cancel a work item or close out a terminal-failure item.
 
 * If the item is currently being processed by a worker, its
   `CancellationToken` is signalled. The pipeline catches the cancellation,
@@ -739,8 +739,25 @@ Cancel a non-terminal work item.
 * All `Queued` items that transitively depend on this one are also
   transitioned to `Cancelled` (`lastError = "parent dependency cancelled"`).
   In-flight dependents are left to run their course.
+* From a terminal-failure state (`Failed`, `AuditFailed`,
+  `MergeConflictResolutionFailed`, `AbandonedAfterRecoveryAttempts`), the
+  item is transitioned to `Cancelled` for bookkeeping — used after an
+  operator resolves the work out-of-band (e.g. manually merging the
+  branch). No cascade, no replay; the pipeline never re-dispatches the
+  row. See [docs/work-items.md](work-items.md#closing-terminal-failure-items-operator-bookkeeping).
+* Already-`Cancelled` items return `202 Accepted` as a no-op (idempotent).
+* `Done` items return `409 Conflict` — a successful merge cannot be cancelled.
 
-Returns `202 Accepted`.
+Optional query parameters (recorded in `lastError` and the webhook
+`details` payload):
+
+| Parameter | Purpose |
+|-----------|---------|
+| `reason` | Free-form note (≤500 chars, no control characters). |
+| `resolutionSha` | 7–40 character hex SHA of the resolution commit. |
+
+Returns `202 Accepted` on success, `400 Bad Request` for malformed
+`reason` / `resolutionSha`.
 
 ### `PATCH /workitems/{id}`
 

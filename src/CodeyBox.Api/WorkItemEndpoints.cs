@@ -802,22 +802,75 @@ internal static class WorkItemEndpoints
         IWebhookDispatcher webhooks,
         IProjectRepository projects,
         ITimingStore? timings,
+        string? reason,
+        string? resolutionSha,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
         var workItemId = item!.Id;
 
-        if (item.State is WorkItemState.Done or WorkItemState.Failed
-            or WorkItemState.Cancelled or WorkItemState.AuditFailed
-            or WorkItemState.MergeConflictResolutionFailed
-            or WorkItemState.AbandonedAfterRecoveryAttempts)
+        // Validate optional close-out metadata. Same shape as /resume's reason
+        // guard (no control chars, ≤500 chars); resolutionSha is a Git-shaped
+        // hex SHA so triage tooling can link the manual-resolution commit.
+        if (reason is not null)
+        {
+            if (reason.Any(char.IsControl))
+                return Results.BadRequest(new { error = "reason must not contain control characters" });
+            if (reason.Length > 500)
+                return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+        }
+        if (resolutionSha is not null)
+        {
+            if (resolutionSha.Length is < 7 or > 40
+                || !resolutionSha.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                return Results.BadRequest(new { error = "resolutionSha must be a 7-40 character hex string" });
+        }
+
+        // Bookkeeping close-out path: when an operator resolves a terminal-failure
+        // item out-of-band (e.g. manually merges after MergeConflictResolutionFailed),
+        // DELETE used to 409 — leaving the item stranded forever. Transition it to
+        // Cancelled with the same OperatorRequested reason as the in-flight path so
+        // there is a single terminal-closed shape regardless of how it got there.
+        if (IsTerminalFailureCloseable(item.State))
+        {
+            var priorState = item.State;
+            var lastError = BuildCloseLastError(priorState, reason, resolutionSha);
+            var closed = item.With(WorkItemState.Cancelled, lastError,
+                WorkItemCancellationReason.OperatorRequested);
+            await store.UpdateAsync(closed, ct);
+            AuditLog.WorkItemCancelled(workItemId);
+            var project = await projects.GetAsync(item.ProjectId, ct);
+            if (project is not null)
+                await webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.cancelled",
+                    WorkItem = closed,
+                    Project = project,
+                    Details = new
+                    {
+                        priorState = priorState.ToString(),
+                        reason,
+                        resolutionSha,
+                    },
+                }, ct);
+            return Results.Accepted($"/workitems/{workItemId}");
+        }
+
+        // Idempotent close: an already-cancelled item is a no-op rather than 409.
+        // Lets operator scripts and the audit UI retry DELETE safely.
+        if (item.State == WorkItemState.Cancelled)
+            return Results.Accepted($"/workitems/{workItemId}");
+
+        if (item.State == WorkItemState.Done)
             return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
 
         var wasActive = cancellations.Cancel(workItemId);
         if (!wasActive)
         {
-            var cancelled = item.With(WorkItemState.Cancelled, "cancelled via API",
+            var lastError = BuildCloseLastError(item.State, reason, resolutionSha)
+                ?? "cancelled via API";
+            var cancelled = item.With(WorkItemState.Cancelled, lastError,
                 WorkItemCancellationReason.OperatorRequested);
             await store.UpdateAsync(cancelled, ct);
             AuditLog.WorkItemCancelled(workItemId);
@@ -828,6 +881,12 @@ internal static class WorkItemEndpoints
                     Event = "work_item.cancelled",
                     WorkItem = cancelled,
                     Project = project,
+                    Details = reason is null && resolutionSha is null ? null : new
+                    {
+                        priorState = item.State.ToString(),
+                        reason,
+                        resolutionSha,
+                    },
                 }, ct);
 
             // Only delete timing rows when the pipeline was not active. If the
@@ -846,6 +905,20 @@ internal static class WorkItemEndpoints
         await store.OrphanReplaysAsync(workItemId, ct);
 
         return Results.Accepted($"/workitems/{workItemId}");
+    }
+
+    private static bool IsTerminalFailureCloseable(WorkItemState state) =>
+        state is WorkItemState.Failed
+            or WorkItemState.AuditFailed
+            or WorkItemState.MergeConflictResolutionFailed
+            or WorkItemState.AbandonedAfterRecoveryAttempts;
+
+    private static string? BuildCloseLastError(WorkItemState priorState, string? reason, string? resolutionSha)
+    {
+        if (reason is null && resolutionSha is null) return null;
+        var prefix = $"closed by operator from {priorState}";
+        if (resolutionSha is not null) prefix += $" (resolution-sha={resolutionSha})";
+        return reason is null ? prefix : $"{prefix}: {reason}";
     }
 
     private static async Task CascadeCancelDependentsAsync(

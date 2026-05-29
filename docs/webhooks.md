@@ -354,6 +354,33 @@ When `event` is `work_item.auto_retry`, the `details` field is populated:
 | `attemptNumber` | int | Which auto-retry attempt this is (1-indexed). Capped at `AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem`. |
 | `triggeredBy` | string | `"targeted"` if fired by the per-item timer at `QuotaResetAt + ClockDriftSafetyMargin`; `"periodic"` if fired by the safety-net sweep; `"rearm-overdue"` if fired immediately during startup re-arm because `nextQuotaRetryAt` was already in the past. |
 
+### `cancelled` details
+
+When `event` is `work_item.cancelled` and the operator passed `reason` or
+`resolutionSha` to `DELETE /workitems/{id}` — typically when closing out a
+terminal-failure item that was resolved out-of-band — the `details` field is
+populated:
+
+```json
+{
+  "details": {
+    "priorState": "MergeConflictResolutionFailed",
+    "reason": "manually merged after rebase",
+    "resolutionSha": "b15a69e0"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `priorState` | string | State the item was in immediately before the cancel transition |
+| `reason` | string\|null | Free-form note (≤500 chars) provided by the operator, or `null` if omitted |
+| `resolutionSha` | string\|null | 7–40 character hex SHA of the resolution commit, or `null` if omitted |
+
+`details` is `null` for the in-flight / queued cancel path when neither
+`reason` nor `resolutionSha` is supplied — preserves the legacy payload shape
+for receivers that have not opted into the close-out metadata.
+
 ### `question_dismissed` details
 
 When `event` is `work_item.question_dismissed`, the `details` field carries the dismissed question:
