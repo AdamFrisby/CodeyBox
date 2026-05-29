@@ -32,10 +32,31 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // Wake the dispatch loop so it observes the flag immediately rather
             // than blocking on DequeueAsync until the next natural kick. A
             // default WorkItemId (Guid.Empty) is treated as a spurious kick by
-            // the loop — the IsDispatchPaused check at the top fires before
-            // PickNextEligibleAsync runs and exits the loop cleanly.
-            try { _ = _queue.EnqueueAsync(default, CancellationToken.None); }
-            catch { /* best-effort: queue may already be shutting down */ }
+            // the loop — both the IsDispatchPaused check at the top and the
+            // explicit `kick == default` skip in ExecuteAsync fire before
+            // PickNextEligibleAsync runs and exit the loop cleanly.
+            //
+            // ContinueWith observes (rather than discards) any fault on the
+            // returned task so an asynchronous channel-writer exception during
+            // shutdown surfaces as a debug log instead of an unobserved task
+            // exception bubbling up to TaskScheduler.UnobservedTaskException
+            // (which some deployments promote to a fatal AppDomain.Unhandled —
+            // SIGKILL during shutdown is exactly the wedge case this gate
+            // exists to prevent).
+            try
+            {
+                var kickTask = _queue.EnqueueAsync(default, CancellationToken.None);
+                if (!kickTask.IsCompletedSuccessfully)
+                {
+                    kickTask.AsTask().ContinueWith(
+                        t => _log.LogDebug(t.Exception, "PauseDispatch wake-up kick faulted"),
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "PauseDispatch wake-up kick threw synchronously; queue likely already shutting down");
+            }
         }
     }
 
@@ -423,6 +444,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // sandbox that races the snapshot.
             if (IsDispatchPaused) break;
 
+            // Defence-in-depth: a default WorkItemId is the PauseDispatch
+            // wake-up sentinel — never a real work item. If the IsDispatchPaused
+            // re-check above is ever removed/reordered by a future refactor, or
+            // if some other path enqueues default(WorkItemId), discard it here
+            // rather than letting PickNextEligibleAsync pick up any eligible
+            // store item against the contract.
+            if (kick.Value == default) continue;
+
             // A kick for an item currently sleeping in a defer-requeue delay is
             // treated as an explicit "retry now" signal: clear the deferred mark
             // so the priority pickup considers the item again on this tick. In
@@ -445,6 +474,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // is in-flight is reflected when the gate next frees up.
             try { await _concurrencyGate.WaitAsync(stoppingToken); }
             catch (OperationCanceledException) { break; }
+
+            // Late dispatch-pause check: PauseDispatch may have fired while we
+            // were blocked on the concurrency gate. Without this check, one
+            // final worker could be spawned after dispatch was paused (the
+            // very race this gate exists to close — that final sandbox would
+            // miss the SnapshotSuspendableActive snapshot and be torn down
+            // uncleanly when the BackgroundService cancellation token fires).
+            if (IsDispatchPaused)
+            {
+                TryReleaseConcurrencyGate();
+                break;
+            }
 
             // Resolve the next eligible item by priority: highest Priority first,
             // ties broken by CreatedAt ascending. Skips items currently in-flight

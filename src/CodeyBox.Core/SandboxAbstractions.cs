@@ -161,6 +161,30 @@ public interface ISuspendableSandbox : ISandbox
     bool IsSuspended => false;
 
     /// <summary>
+    /// True once the suspend-on-shutdown handler has taken ownership of this
+    /// VM's teardown — via Suspend (RAM frozen), Stop (clean shutdown), or
+    /// Dispose (delete --purge). PipelineRunner reads this in its host-shutdown
+    /// OCE catch block to short-circuit the legacy in-VM preempt-checkpoint flow:
+    /// the git add/commit/push inside the VM would hang (Suspend), fail (Stop
+    /// — the VM is no longer running the agent), or fault (Dispose — the VM
+    /// is gone), in any case stalling or breaking the orchestrator exit while
+    /// also leaving the work item Working without a checkpoint. Suspend mode
+    /// flips this implicitly via <see cref="IsSuspended"/>; Stop and Dispose
+    /// modes call <see cref="MarkOwnedByShutdownHandler"/>.
+    /// </summary>
+    bool IsOwnedByShutdownHandler => IsSuspended;
+
+    /// <summary>
+    /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
+    /// <c>SandboxSuspendOnShutdownService</c> immediately before non-Suspend
+    /// teardown modes begin so PipelineRunner sees the "skip checkpoint" signal
+    /// even though the suspend path was not taken. Default no-op: fakes that
+    /// don't track teardown ownership keep <see cref="IsOwnedByShutdownHandler"/>
+    /// at the <see cref="IsSuspended"/> fallback.
+    /// </summary>
+    void MarkOwnedByShutdownHandler() { }
+
+    /// <summary>
     /// Best-effort RAM size of this sandbox in bytes, or null when the provider
     /// cannot report it. The suspend-on-shutdown handler scales the per-VM
     /// suspend timeout by this value: <c>multipass suspend</c> writes the whole

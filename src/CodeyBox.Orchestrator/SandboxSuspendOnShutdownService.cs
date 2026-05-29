@@ -216,12 +216,19 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     }
 
     private Task TeardownOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox) =>
+        // The default arm throws rather than silently routing through suspend.
+        // Silent fallthrough would defeat the whole feature's intent: a new
+        // teardown mode added without an explicit case here would re-introduce
+        // the qemu-lock wedge this code path exists to avoid. The throw is
+        // caught by SuspendAllAsync's per-VM Task.Run / await Task.WhenAll
+        // wrapper so one mis-bound enum value cannot break the whole drain.
         _teardownMode switch
         {
             SandboxTeardownMode.Suspend => SuspendOneAsync(workItemId, sandbox),
             SandboxTeardownMode.Stop => StopOneAsync(workItemId, sandbox),
             SandboxTeardownMode.Dispose => DisposeOneAsync(workItemId, sandbox),
-            _ => SuspendOneAsync(workItemId, sandbox),
+            _ => Task.FromException(new InvalidOperationException(
+                $"SandboxTeardownMode {(int)_teardownMode} is not handled; add an explicit case in TeardownOneAsync rather than relying on silent fallthrough.")),
         };
 
     /// <summary>
@@ -231,9 +238,20 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// interrupted suspend can leave qemu holding the lock. The work item's
     /// existing preempt-checkpoint flow drives recovery on restart, the same
     /// way it does for non-suspending providers (process / bubblewrap).
+    ///
+    /// <para>Calls <see cref="ISuspendableSandbox.MarkOwnedByShutdownHandler"/>
+    /// FIRST so PipelineRunner's host-shutdown OCE catch block (which fires
+    /// after the BackgroundService cancellation token, AFTER StoppingAsync has
+    /// already torn down the VM here) skips its legacy in-VM git checkpoint
+    /// flow — otherwise the catch block would run <c>git add/commit/push</c>
+    /// inside a now-stopped VM, fail, and leave the work item Working without
+    /// a PreemptCheckpoint (next-boot DeadWorkerReaper would then mark it
+    /// Failed). The signal is set before any teardown call so even an early
+    /// timeout or exception still gives PipelineRunner the right answer.</para>
     /// </summary>
     private async Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
     {
+        sandbox.MarkOwnedByShutdownHandler();
         var timeout = SuspendTimeoutFor(sandbox);
         using var timeoutCts = new CancellationTokenSource(timeout);
         try
@@ -245,11 +263,20 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
                 return;
             }
 
+            // No IPreemptibleSandbox capability — multipass-stop equivalent is
+            // not available, so fall back to dispose. Audited as
+            // SandboxDisposedOnShutdown so the audit log reflects what
+            // actually happened (the VM is gone, not merely stopped); a future
+            // post-incident triage reading 'sandbox.disposed_on_shutdown'
+            // correctly concludes the VM is no longer present. Honour the
+            // per-VM timeout via WaitAsync so a hung DisposeAsync (the wedge
+            // case this code path defends against) cannot block the rest of
+            // the shutdown drain past the configured grace window.
             _log.LogWarning(
                 "Sandbox {SandboxId} for work item {WorkItemId} does not implement IPreemptibleSandbox; falling back to dispose",
                 sandbox.Id, workItemId);
-            await sandbox.DisposeAsync();
-            AuditLog.SandboxStoppedOnShutdown(workItemId, sandbox.Id);
+            await sandbox.DisposeAsync().AsTask().WaitAsync(timeoutCts.Token);
+            AuditLog.SandboxDisposedOnShutdown(workItemId, sandbox.Id);
         }
         catch (OperationCanceledException)
         {
@@ -271,9 +298,17 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// standard stranded-item path on the next startup. The simplest and most
     /// robust mode against multipassd lock contention, at the cost of losing
     /// any in-VM agent state.
+    ///
+    /// <para>Calls <see cref="ISuspendableSandbox.MarkOwnedByShutdownHandler"/>
+    /// FIRST so PipelineRunner's host-shutdown OCE catch block skips its
+    /// in-VM git checkpoint flow against a VM that is about to be (or has
+    /// already been) <c>multipass delete --purge</c>'d — without this signal
+    /// the catch block would fault inside a non-existent VM, leaving the work
+    /// item Working with no PreemptCheckpoint.</para>
     /// </summary>
     private async Task DisposeOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
     {
+        sandbox.MarkOwnedByShutdownHandler();
         var timeout = SuspendTimeoutFor(sandbox);
         using var timeoutCts = new CancellationTokenSource(timeout);
         try

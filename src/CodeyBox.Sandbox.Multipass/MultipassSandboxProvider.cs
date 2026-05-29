@@ -826,6 +826,7 @@ git push origin HEAD:{refName}";
             return [];
         }
 
+        var opts = ReadOptions();
         var unrecoverable = new List<string>();
         foreach (var info in managed)
         {
@@ -839,13 +840,23 @@ git push origin HEAD:{refName}";
             // the current boot — leave it alone, it is not stale.
             if (info.IsTrackedActive) continue;
 
+            // Sample the VM state once so the audit event reports what actually
+            // ran. ManagedSandboxInfo.IsSuspendLifecycleOrFrozen is true for
+            // both Suspending and Suspended; only the former needs the stop
+            // preamble (DisposeLeakedAsync gates on NeedsStopBeforePurge).
+            // Without this lookup the audit event hard-codes 'stop+purge' even
+            // on the Suspended path that ran purge alone — misleading anyone
+            // triaging a future leak from this code path.
+            var (state, _) = await TryReadStateAndMemoryAsync(opts, info.Name, ct);
+            var action = NeedsStopBeforePurge(state) ? "stop+purge" : "purge";
+
             _log.LogInformation(
-                "Startup reconciler: recovering orphaned VM {Name} (suspend-lifecycle, no live mapping)",
-                info.Name);
+                "Startup reconciler: recovering orphaned VM {Name} (suspend-lifecycle state={State}, no live mapping)",
+                info.Name, state);
             try
             {
                 await DisposeLeakedAsync(info.Name, ct);
-                AuditLog.SandboxStartupReconciled(info.Name, "stop+purge");
+                AuditLog.SandboxStartupReconciled(info.Name, action);
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -2918,6 +2929,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     private bool _disposed;
     private bool _preserveOnDispose;
     private bool _isSuspended;
+    private bool _ownedByShutdownHandler;
 
     /// <summary>
     /// True once <see cref="SuspendAsync"/> has frozen this VM's RAM via
@@ -2927,6 +2939,25 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// stall the orchestrator's exit).
     /// </summary>
     public bool IsSuspended => _isSuspended;
+
+    /// <summary>
+    /// True once the suspend-on-shutdown handler has taken responsibility for
+    /// this VM's teardown. Set implicitly when <see cref="SuspendAsync"/> flips
+    /// <see cref="IsSuspended"/>; set explicitly by
+    /// <see cref="MarkOwnedByShutdownHandler"/> for Stop / Dispose teardown
+    /// modes whose teardown call does not go through SuspendAsync. Read by
+    /// PipelineRunner to skip the legacy in-VM preempt-checkpoint flow against
+    /// a stopped / disposed / frozen VM.
+    /// </summary>
+    public bool IsOwnedByShutdownHandler => _isSuspended || _ownedByShutdownHandler;
+
+    /// <summary>
+    /// Called by <c>SandboxSuspendOnShutdownService</c> before Stop / Dispose
+    /// teardown modes begin so PipelineRunner's shutdown catch sees the
+    /// "skip in-VM checkpoint" signal even though the suspend path was not
+    /// taken. Idempotent; safe to call multiple times.
+    /// </summary>
+    public void MarkOwnedByShutdownHandler() => _ownedByShutdownHandler = true;
 
     /// <summary>
     /// RAM size this VM was provisioned with, surfaced so the suspend-on-shutdown
