@@ -102,6 +102,15 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
     private readonly TimeSpan _listCacheTtl = TimeSpan.FromMinutes(2);
     private readonly SemaphoreSlim _listLock = new(1, 1);
 
+    // Provisioning throttle: limits how many multipass launch/start
+    // operations execute concurrently. Decoupled from
+    // WorkerPool.MaxConcurrentWorkers so workers can be running while only
+    // a few VMs boot at once, preventing host CPU/IO contention from
+    // exceeding the 180 s 'reach Running' start timeout.
+    private readonly object _bootGateGuard = new();
+    private SemaphoreSlim? _bootGate;
+    private int _bootGateCapacity;
+
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings = null)
         : this(() => opts, log, timings, new DefaultProcessRunner())
@@ -322,11 +331,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
                 var cloudInit = BuildCloudInit(opts.ExtraRuncmd, opts.ExtraCloudInit, spec.Flavor);
                 var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
                 await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
-                await using (var launchScope = await TimingScope.BeginAsync(
-                    timingStore, timingItemId, timingPhase, "vm.launch", log: _log))
+                using (await EnterBootGateAsync(opts, ct))
                 {
-                    await LaunchAsync(opts, name, spec, cloudInitPath, workItemId, ct);
-                    await WaitForRunningAsync(opts, name, workItemId, ct);
+                    await using (var launchScope = await TimingScope.BeginAsync(
+                        timingStore, timingItemId, timingPhase, "vm.launch", log: _log))
+                    {
+                        await LaunchAsync(opts, name, spec, cloudInitPath, workItemId, ct);
+                        await WaitForRunningAsync(opts, name, workItemId, ct);
+                    }
                 }
                 // Stop the freshly-launched VM so we can mount (outside vm.launch scope).
                 var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
@@ -342,10 +354,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
                 await ApplyMountsAsync(opts, name, bindMounts, workItemId, ct);
             }
 
-            await using (var startScope = await TimingScope.BeginAsync(
-                timingStore, timingItemId, timingPhase, "vm.start", log: _log))
+            using (await EnterBootGateAsync(opts, ct))
             {
-                await StartAndWaitForRunningAsync(opts, name, workItemId, ct);
+                await using (var startScope = await TimingScope.BeginAsync(
+                    timingStore, timingItemId, timingPhase, "vm.start", log: _log))
+                {
+                    await StartAndWaitForRunningAsync(opts, name, workItemId, ct);
+                }
             }
 
             await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
@@ -427,7 +442,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         // Wait for the transitional state to settle before starting.
         await WaitWhileSuspendingAsync(opts, name, ct);
 
-        var run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
+        ProcessRunResult run;
+        using (await EnterBootGateAsync(opts, ct))
+        {
+            run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
+        }
         // Treat "instance not running" / "already started" as success: the goal
         // of ResumeSandboxAsync is "VM is Running afterwards", and multipass
         // start on an already-Running VM is the same desired postcondition. We
@@ -1186,14 +1205,17 @@ git push origin HEAD:{refName}";
 
         try
         {
-            var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
-            if (run.ExitCode != 0)
-                throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
+            using (await EnterBootGateAsync(opts, ct))
+            {
+                var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
+                if (run.ExitCode != 0)
+                    throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
 
-            // Wait for the (now-minimal) cloud-init to finish — write_files
-            // and the route service install. Doesn't include the heavy
-            // installs, so should be fast.
-            await WaitForRunningAsync(opts, baselineName, workItemId, ct);
+                // Wait for the (now-minimal) cloud-init to finish — write_files
+                // and the route service install. Doesn't include the heavy
+                // installs, so should be fast.
+                await WaitForRunningAsync(opts, baselineName, workItemId, ct);
+            }
 
             // Run the install commands now, via multipass exec under sudo.
             // Each entry in ExtraRuncmd is a single shell command.
@@ -2241,6 +2263,93 @@ test "$work" = present && test "$exec_wrapper" = present
 
     private MultipassSandboxOptions ReadOptions() => _optsAccessor();
 
+    /// <summary>
+    /// Acquires the provisioning gate, limiting concurrent multipass
+    /// launch/start operations to <see cref="MultipassSandboxOptions.MaxConcurrentBoots"/>.
+    /// <para>
+    /// The gate is hot-reloadable: if the configured limit changes between
+    /// acquisitions the semaphore is recreated at the new size (lock-guarded).
+    /// Callers MUST dispose the returned handle to release the slot.
+    /// </para>
+    /// <para>
+    /// Downward reconfiguration transiently exceeds the new limit: in-flight
+    /// holders still reference the old semaphore and do not count against
+    /// the new capacity until they release. This window is bounded by the
+    /// duration of the longest in-flight boot operation and is the safe
+    /// trade-off vs. disposing the old semaphore (which would crash
+    /// in-flight holders that later call Release() on a disposed object).
+    /// </para>
+    /// </summary>
+    internal async Task<IDisposable> EnterBootGateAsync(MultipassSandboxOptions opts, CancellationToken ct)
+    {
+        var desired = opts.MaxConcurrentBoots;
+        if (desired < 1)
+        {
+            _log.LogWarning(
+                "MaxConcurrentBoots is {ConfiguredValue}; clamping to 1. " +
+                "Negative or zero values are invalid and are ignored.",
+                opts.MaxConcurrentBoots);
+            desired = 1;
+        }
+
+        SemaphoreSlim sem;
+        lock (_bootGateGuard)
+        {
+            if (_bootGate is null || _bootGateCapacity != desired)
+            {
+                // Do NOT dispose the old gate: in-flight BootGateReleaser
+                // instances still reference it and will Release() in their
+                // Dispose(). The old semaphore becomes unreferenced once all
+                // in-flight holders complete and will be GC'd normally.
+                _bootGate = new SemaphoreSlim(desired, desired);
+                if (_bootGateCapacity == 0)
+                    _log.LogDebug("Provisioning gate created with capacity {Capacity}", desired);
+                else
+                    _log.LogDebug(
+                        "Provisioning gate size changed from {OldCapacity} to {NewCapacity}",
+                        _bootGateCapacity, desired);
+                _bootGateCapacity = desired;
+            }
+            sem = _bootGate;
+        }
+
+        await sem.WaitAsync(ct);
+
+        var delay = opts.BootLaunchDelay;
+        if (delay < TimeSpan.Zero)
+        {
+            _log.LogWarning(
+                "BootLaunchDelay is negative ({ConfiguredDelay}); ignoring. " +
+                "Use zero or a positive duration to enable the inter-boot delay.",
+                delay);
+        }
+        else if (delay > TimeSpan.Zero)
+        {
+            try
+            {
+                await Task.Delay(delay, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                sem.Release();
+                throw;
+            }
+        }
+
+        return new BootGateReleaser(sem);
+    }
+
+    private sealed class BootGateReleaser(SemaphoreSlim sem) : IDisposable
+    {
+        private SemaphoreSlim? _sem = sem;
+
+        public void Dispose()
+        {
+            var sem = Interlocked.Exchange(ref _sem, null);
+            sem?.Release();
+        }
+    }
+
     private static IReadOnlyList<string> BuildFirstBootRuncmd(
         MultipassSandboxOptions opts,
         SandboxProfileFlavor flavor)
@@ -2583,6 +2692,8 @@ public sealed record MultipassSandboxOptions
     public static readonly TimeSpan DefaultCloudInitReadyRetryDelay = TimeSpan.FromSeconds(10);
     public static readonly TimeSpan DefaultVmStartTimeout = TimeSpan.FromMinutes(3);
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
+    public const int DefaultMaxConcurrentBoots = 2;
+    public static readonly TimeSpan DefaultBootLaunchDelay = TimeSpan.Zero;
 
     public string MultipassBinary { get; init; } = "multipass";
 
@@ -2742,6 +2853,26 @@ public sealed record MultipassSandboxOptions
     /// Null (default) disables the preflight entirely.
     /// </summary>
     public MultipassDiskGuardOptions? DiskGuard { get; init; }
+
+    /// <summary>
+    /// Maximum number of concurrent multipass launch/start operations.
+    /// Independent of <c>WorkerPool.MaxConcurrentWorkers</c>: workers can be
+    /// running (e.g. agent logic executing inside an already-booted VM) while
+    /// only N VMs boot at once, so no individual boot exceeds the 180 s
+    /// 'reach Running' timeout due to host CPU/IO contention.
+    /// </summary>
+    public int MaxConcurrentBoots { get; init; } = DefaultMaxConcurrentBoots;
+
+    /// <summary>
+    /// Optional delay applied after acquiring the provisioning gate and
+    /// before the actual multipass launch/start. Each holder incurs this
+    /// delay individually; up to <see cref="MaxConcurrentBoots"/> holders
+    /// can be in the delay phase concurrently. Acquiers beyond
+    /// MaxConcurrentBoots are gated behind releasing slots, producing
+    /// inter-boot stagger so that CPU/IO spikes don't align. 0 means no
+    /// delay.
+    /// </summary>
+    public TimeSpan BootLaunchDelay { get; init; } = DefaultBootLaunchDelay;
 }
 
 /// <summary>

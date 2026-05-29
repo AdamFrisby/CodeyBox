@@ -304,6 +304,8 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
                 CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
                 VmStartTimeout = multipassSandbox.VmStartTimeout,
                 VmStopTimeout = multipassSandbox.VmStopTimeout,
+                MaxConcurrentBoots = multipassSandbox.MaxConcurrentBoots,
+                BootLaunchDelay = TimeSpan.FromMilliseconds(multipassSandbox.BootLaunchDelayMs),
                 DiskGuard = diskGuard,
             };
         },
@@ -2056,6 +2058,19 @@ namespace CodeyBox.Api
         /// </summary>
         public TimeSpan VmStopTimeout { get; set; } =
             MultipassSandboxOptions.DefaultVmStopTimeout;
+
+        /// <summary>
+        /// Max concurrent multipass launch/start operations.
+        /// Independent of worker pool concurrency. Default 2.
+        /// </summary>
+        public int MaxConcurrentBoots { get; set; } =
+            MultipassSandboxOptions.DefaultMaxConcurrentBoots;
+
+        /// <summary>
+        /// Optional inter-boot delay in milliseconds. 0 = no delay.
+        /// </summary>
+        public int BootLaunchDelayMs { get; set; } =
+            (int)MultipassSandboxOptions.DefaultBootLaunchDelay.TotalMilliseconds;
     }
 
     /// <summary>

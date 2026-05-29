@@ -1,0 +1,51 @@
+{
+  "iteration": 4,
+  "resolvedFindings": [
+    {
+      "id": "completeness-001",
+      "severity": "Error",
+      "category": "completeness",
+      "description": "agent did not write audit/result.json",
+      "status": "resolved",
+      "resolution": "Created audit/result.json with resolved findings"
+    },
+    {
+      "id": "quality-001",
+      "severity": "Warning",
+      "category": "quality",
+      "description": "Bare catch clause in provisioning gate delay handler",
+      "status": "resolved",
+      "resolution": "Changed bare catch to catch (OperationCanceledException) at MultipassSandboxProvider.cs:2320"
+    },
+    {
+      "id": "quality-002",
+      "severity": "Info",
+      "category": "quality",
+      "description": "Misleading log message on first gate creation",
+      "status": "resolved",
+      "resolution": "Added guard: log 'created' when capacity was 0, else 'changed from' at MultipassSandboxProvider.cs:2293"
+    },
+    {
+      "id": "architecture-001",
+      "severity": "Info",
+      "category": "architecture",
+      "description": "Negative BootLaunchDelay silently ignored",
+      "status": "resolved",
+      "resolution": "Added negative check with log warning before positive delay check at MultipassSandboxProvider.cs:2307"
+    },
+    {
+      "id": "tests-001",
+      "severity": "Info",
+      "category": "tests",
+      "description": "Data-racy read of maxConcurrentLaunches outside lock",
+      "status": "resolved",
+      "resolution": "Moved maxConcurrentLaunches comparison into the lock block at MultipassSandboxProviderTests.cs:2586"
+    }
+  ],
+  "notes": [
+    "security:gitleaks and security:semgrep are Info-level findings; tools not installed in sandbox.",
+    "architecture boot-stagger findings are Info-level documentation clarifications, not code defects.",
+    "tests:meaningfulness-review baseline-bake coverage is Warning; adding integration test is noted for future iteration.",
+    "BootGateReleaser double-dispose idempotency test is low-risk Info; no code change."
+  ]
+}

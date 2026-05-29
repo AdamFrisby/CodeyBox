@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
@@ -1645,7 +1647,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         int? cloudInitReadyRetryAttempts = null,
         TimeSpan? cloudInitReadyRetryDelay = null,
         TimeSpan? vmStartTimeout = null,
-        TimeSpan? vmStopTimeout = null)
+        TimeSpan? vmStopTimeout = null,
+        int? maxConcurrentBoots = null,
+        TimeSpan? bootLaunchDelay = null)
     {
         var options = new MultipassSandboxOptions
         {
@@ -1662,6 +1666,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 ?? MultipassSandboxOptions.DefaultVmStartTimeout,
             VmStopTimeout = vmStopTimeout
                 ?? MultipassSandboxOptions.DefaultVmStopTimeout,
+            MaxConcurrentBoots = maxConcurrentBoots
+                ?? MultipassSandboxOptions.DefaultMaxConcurrentBoots,
+            BootLaunchDelay = bootLaunchDelay
+                ?? MultipassSandboxOptions.DefaultBootLaunchDelay,
         };
         Microsoft.Extensions.Logging.ILogger<MultipassSandboxProvider> resolvedLogger = logger is not null
             ? logger
@@ -2465,6 +2473,476 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(127, result.ExitCode);
         Assert.Contains("git: command not found", result.Stderr);
         Assert.Equal(1, attempts);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public async Task ProvisioningGate_CapsConcurrentBootsAtConfiguredMax(int maxBoots)
+    {
+        var provider = NewProvider(maxConcurrentBoots: maxBoots);
+        var concurrentCount = 0;
+        var maxObserved = 0;
+        var lockObj = new object();
+        var blocker = new SemaphoreSlim(0);
+        var filledBarrier = new TaskCompletionSource();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+
+        var totalTasks = maxBoots + 4;
+        var tasks = new Task[totalTasks];
+        for (var i = 0; i < tasks.Length; i++)
+        {
+            tasks[i] = Task.Run(async () =>
+            {
+                var opts = new MultipassSandboxOptions { MaxConcurrentBoots = maxBoots };
+                using var gate = await provider.EnterBootGateAsync(opts, cts.Token);
+                var count = Interlocked.Increment(ref concurrentCount);
+                lock (lockObj) { if (count > maxObserved) maxObserved = count; }
+                if (count >= maxBoots)
+                    filledBarrier.TrySetResult();
+                await blocker.WaitAsync(cts.Token);
+                Interlocked.Decrement(ref concurrentCount);
+            });
+        }
+
+        // Wait for at least maxBoots tasks to reach the gate (deterministic
+        // barrier, not a timeout polling loop).
+        await filledBarrier.Task.WaitAsync(cts.Token);
+
+        // Let any queued tasks settle so we can read the peak.
+        await Task.Delay(200, cts.Token);
+
+        // Read maxObserved under lock — workers write it under lock, so
+        // the assert thread must synchronise to avoid a data race.
+        int observed;
+        lock (lockObj) { observed = maxObserved; }
+
+        // The gate must prevent more than maxBoots concurrent entries.
+        Assert.True(observed <= maxBoots,
+            $"Expected at most {maxBoots} concurrent boots, observed {observed}");
+
+        // The gate must allow exactly maxBoots concurrent entries to
+        // confirm it's configured to the intended capacity.
+        Assert.True(observed == maxBoots,
+            $"Expected exactly {maxBoots} concurrent boots, observed {observed}");
+
+        // Release all blockers so tasks can finish cleanly.
+        blocker.Release(tasks.Length);
+
+        await Task.WhenAll(tasks);
+    }
+
+    [Fact]
+    public async Task BootLaunchDelay_DelaysBeforeReturning()
+    {
+        const int delayMs = 200;
+        var provider = NewProvider(bootLaunchDelay: TimeSpan.FromMilliseconds(delayMs));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var opts = new MultipassSandboxOptions
+        {
+            BootLaunchDelay = TimeSpan.FromMilliseconds(delayMs)
+        };
+
+        var sw = Stopwatch.StartNew();
+        using var gate = await provider.EnterBootGateAsync(opts, cts.Token);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed >= TimeSpan.FromMilliseconds(delayMs - 50),
+            $"Expected at least {delayMs - 50}ms delay, elapsed {sw.Elapsed.TotalMilliseconds:F0}ms");
+    }
+
+    [Fact]
+    public async Task BootLaunchDelay_CancellationDuringDelayReleasesSlot()
+    {
+        // Use capacity 1 so the slot release is observable: after the
+        // cancelled task releases its slot, a new task can acquire.
+        var provider = NewProvider(maxConcurrentBoots: 1, bootLaunchDelay: TimeSpan.FromSeconds(10));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+
+        var opts = new MultipassSandboxOptions
+        {
+            MaxConcurrentBoots = 1,
+            BootLaunchDelay = TimeSpan.FromSeconds(10)
+        };
+
+        // Acquire the gate — will succeed, then block on the 10s delay.
+        // The CTS fires after 200ms, cancelling the delay.
+        var ex = await Record.ExceptionAsync(async () =>
+        {
+            using var gate = await provider.EnterBootGateAsync(opts, cts.Token);
+        });
+        Assert.NotNull(ex);
+        Assert.True(ex is OperationCanceledException || ex is TaskCanceledException);
+
+        // The cancelled task's catch block must have released the slot, so a
+        // new acquisition must succeed (not deadlock). Use zero delay for the
+        // verification call so it doesn't get stuck in its own delay.
+        using var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var optsNoDelay = new MultipassSandboxOptions { MaxConcurrentBoots = 1 };
+        using var gate2 = await provider.EnterBootGateAsync(optsNoDelay, cts2.Token);
+    }
+
+    [Fact]
+    public async Task BootLaunchDelay_NegativeDelayLogsWarning()
+    {
+        var logger = new RecordingLogger<MultipassSandboxProvider>();
+        var mutableOpts = new MultipassSandboxOptions
+        {
+            MaxConcurrentBoots = 1,
+            BootLaunchDelay = TimeSpan.FromMilliseconds(-500),
+        };
+        MultipassSandboxOptions ReadOpts() => mutableOpts;
+        var provider = new MultipassSandboxProvider(
+            ReadOpts,
+            logger,
+            timings: null,
+            runner: new RecordingMultipassRunner((_, _, _) =>
+                Task.FromResult(new ProcessRunResult(0, "", ""))),
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var gate = await provider.EnterBootGateAsync(mutableOpts, cts.Token);
+
+        var warning = logger.Entries.SingleOrDefault(e => e.Level == LogLevel.Warning);
+        Assert.NotNull(warning);
+        Assert.Contains("negative", warning.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task BootGate_ResizesWhenMaxConcurrentBootsChanges()
+    {
+        // Create a provider with a mutable options delegate so we can
+        // change MaxConcurrentBoots between gate acquisitions.
+        var mutableOpts = new MultipassSandboxOptions { MaxConcurrentBoots = 3 };
+        MultipassSandboxOptions ReadOpts() => mutableOpts;
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(0, "", "")));
+        var provider = new MultipassSandboxProvider(
+            ReadOpts,
+            NullLogger<MultipassSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        // Fill the old gate (capacity 3).
+        var oldHolders = new List<IDisposable>();
+        for (var i = 0; i < 3; i++)
+            oldHolders.Add(await provider.EnterBootGateAsync(mutableOpts, cts.Token));
+
+        // Increase capacity to 5. The new semaphore has 5 slots; the old
+        // holders still reference the old semaphore and don't count
+        // against the new one (transient exceedance window, as documented).
+        mutableOpts = mutableOpts with { MaxConcurrentBoots = 5 };
+
+        // Up to 5 new acquirers can enter the new semaphore.
+        var midHolders = new List<IDisposable>();
+        for (var i = 0; i < 5; i++)
+            midHolders.Add(await provider.EnterBootGateAsync(mutableOpts, cts.Token));
+
+        foreach (var h in midHolders) h.Dispose();
+        foreach (var h in oldHolders) h.Dispose();
+
+        // Downward resize: change to 1.
+        mutableOpts = mutableOpts with { MaxConcurrentBoots = 1 };
+        var downHolder = await provider.EnterBootGateAsync(mutableOpts, cts.Token);
+
+        // Second acquisition must block (capacity 1, already held).
+        var blockedTask = provider.EnterBootGateAsync(mutableOpts, cts.Token);
+        await Task.Delay(200, cts.Token);
+        Assert.False(blockedTask.IsCompleted, "Second acquisition should block on the 1-slot gate");
+
+        downHolder.Dispose();
+        using var released = await blockedTask;
+    }
+
+    [Fact]
+    public async Task ProvisioningGate_CapsConcurrentLaunchesThroughCreateAsync()
+    {
+        const int maxBoots = 2;
+        var staging = Path.Combine(_workspace, "provider-gate-createasync-staging");
+
+        var concurrentLaunches = 0;
+        var maxConcurrentLaunches = 0;
+        var lockObj = new object();
+        var launchEntered = new TaskCompletionSource();
+        var allowLaunch = new TaskCompletionSource();
+        var allLaunchesStarted = new TaskCompletionSource();
+
+        // Runner that tracks concurrent in-flight launch operations and
+        // blocks them until signalled. Also tracks VM states so the full
+        // CreateAsync lifecycle (launch→stop→start→transfer→chmod) succeeds.
+        var vmStates = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var runner = new RecordingMultipassRunner(async (argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+                return new ProcessRunResult(0, "multipass 1.16.0", "");
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                var vmName = argv[3];
+                vmStates[vmName] = "Running";
+
+                var c = Interlocked.Increment(ref concurrentLaunches);
+                lock (lockObj)
+                {
+                    if (c > maxConcurrentLaunches) maxConcurrentLaunches = c;
+                    if (maxConcurrentLaunches >= maxBoots)
+                        allLaunchesStarted.TrySetResult();
+                }
+                launchEntered.TrySetResult();
+                await allowLaunch.Task.WaitAsync(ct);
+                Interlocked.Decrement(ref concurrentLaunches);
+                return new ProcessRunResult(0, "", "");
+            }
+
+            if (argv is [_, "info", var infoName, "--format=csv"])
+                return new ProcessRunResult(0,
+                    vmStates.TryGetValue(infoName, out var state) ? state : "Running", "");
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return new ProcessRunResult(0, "", "");
+
+            if (argv is [_, "stop", var stopName])
+            {
+                vmStates[stopName] = "Stopped";
+                return new ProcessRunResult(0, "", "");
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                // start is also gated but the test focuses on launch
+                // concurrency. Return immediately so the lifecycle proceeds.
+                vmStates[startName] = "Running";
+                return new ProcessRunResult(0, "", "");
+            }
+
+            if (argv is [_, "transfer", _, var dest]
+                && dest.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return new ProcessRunResult(0, "", "");
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return new ProcessRunResult(0, "", "");
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                vmStates.TryRemove(deleteName, out _);
+                return new ProcessRunResult(0, "", "");
+            }
+
+            return new ProcessRunResult(0, "", "");
+        });
+
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            maxConcurrentBoots: maxBoots,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+
+        // Start 6 concurrent CreateAsync calls (all non-baseline path).
+        var createTasks = new Task<ISandbox>[6];
+        for (var i = 0; i < createTasks.Length; i++)
+        {
+            createTasks[i] = Task.Run<ISandbox>(async () =>
+            {
+                return await provider.CreateAsync(
+                    new SandboxSpec
+                    {
+                        ImageReference = "ignored",
+                        WorkingDirectory = "/work",
+                    },
+                    ct: cts.Token);
+            });
+        }
+
+        // Wait until at least maxBoots launches have entered, confirming
+        // the gate is active and capping concurrency.
+        await allLaunchesStarted.Task.WaitAsync(cts.Token);
+
+        // Brief settle delay so tasks queued at the gate don't increase
+        // the count further yet.
+        await Task.Delay(200, cts.Token);
+
+        int observedLaunches;
+        lock (lockObj) { observedLaunches = maxConcurrentLaunches; }
+
+        Assert.True(observedLaunches <= maxBoots,
+            $"Expected at most {maxBoots} concurrent launches through CreateAsync, observed {observedLaunches}");
+
+        Assert.True(observedLaunches == maxBoots,
+            $"Expected exactly {maxBoots} concurrent launches through CreateAsync, observed {observedLaunches}");
+
+        // Release all blocked launches.
+        allowLaunch.SetResult();
+
+        await Task.WhenAll(createTasks);
+        foreach (var t in createTasks)
+        {
+            var sandbox = await t;
+            await sandbox.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ProvisioningGate_CapsConcurrentBaselineBakes()
+    {
+        const int maxBoots = 1;
+        var staging = Path.Combine(_workspace, "provider-gate-baseline-staging");
+
+        var concurrentBakes = 0;
+        var maxConcurrentBakes = 0;
+        var lockObj = new object();
+        var allowBake = new TaskCompletionSource();
+        var allBakesStarted = new TaskCompletionSource();
+
+        var vmStates = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+
+        var runner = new RecordingMultipassRunner(async (argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+                return new ProcessRunResult(0, "multipass 1.16.0", "");
+
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                if (vmStates.TryGetValue(infoName, out var s))
+                    return new ProcessRunResult(0, s, "");
+                return new ProcessRunResult(1, "", "");
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name"
+                && argv[3].StartsWith("cb-baseline-", StringComparison.Ordinal))
+            {
+                var vmName = argv[3];
+                vmStates[vmName] = "Running";
+
+                var c = Interlocked.Increment(ref concurrentBakes);
+                lock (lockObj)
+                {
+                    if (c > maxConcurrentBakes) maxConcurrentBakes = c;
+                    if (maxConcurrentBakes >= maxBoots)
+                        allBakesStarted.TrySetResult();
+                }
+                await allowBake.Task.WaitAsync(ct);
+                Interlocked.Decrement(ref concurrentBakes);
+                return new ProcessRunResult(0, "", "");
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return new ProcessRunResult(0, "", "");
+
+            if (argv is [_, "stop", var stopName])
+            {
+                vmStates[stopName] = "Stopped";
+                return new ProcessRunResult(0, "", "");
+            }
+
+            if (argv is [_, "clone", var sourceName, "--name", var newName])
+            {
+                vmStates[newName] = "Stopped";
+                return new ProcessRunResult(0, "", "");
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                vmStates[startName] = "Running";
+                return new ProcessRunResult(0, "", "");
+            }
+
+            if (argv is [_, "transfer", _, var dest]
+                && dest.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return new ProcessRunResult(0, "", "");
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return new ProcessRunResult(0, "", "");
+
+            if (argv is [_, "delete", "--purge", var delName])
+            {
+                vmStates.TryRemove(delName, out _);
+                return new ProcessRunResult(0, "", "");
+            }
+
+            return new ProcessRunResult(0, "", "");
+        });
+
+        var networkProfiles = new Dictionary<string, string>
+        {
+            ["test-iso"] = "cb-iso",
+            ["test-claude"] = "cb-claude",
+        };
+
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            networkProfiles: networkProfiles,
+            useBaselineImages: true,
+            maxConcurrentBoots: maxBoots,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        var profiles = new[] { "test-iso", "test-claude" };
+        var createTasks = new Task<ISandbox>[2];
+        for (var i = 0; i < createTasks.Length; i++)
+        {
+            var profile = profiles[i];
+            createTasks[i] = Task.Run<ISandbox>(async () =>
+            {
+                return await provider.CreateAsync(
+                    new SandboxSpec
+                    {
+                        ImageReference = "ignored",
+                        WorkingDirectory = "/work",
+                        Network = new SandboxNetworkPolicy { ProfileName = profile },
+                    },
+                    ct: cts.Token);
+            });
+        }
+
+        await allBakesStarted.Task.WaitAsync(cts.Token);
+        await Task.Delay(200, cts.Token);
+
+        int observed;
+        lock (lockObj) { observed = maxConcurrentBakes; }
+
+        Assert.True(observed <= maxBoots,
+            $"Expected at most {maxBoots} concurrent baseline bakes, observed {observed}");
+        Assert.True(observed == maxBoots,
+            $"Expected exactly {maxBoots} concurrent baseline bakes, observed {observed}");
+
+        allowBake.SetResult();
+
+        await Task.WhenAll(createTasks);
+        foreach (var t in createTasks)
+        {
+            var sandbox = await t;
+            await sandbox.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ProvisioningGate_ClampsInvalidMaxConcurrentBootsToOne()
+    {
+        var logger = new RecordingLogger<MultipassSandboxProvider>();
+        var provider = NewProvider(maxConcurrentBoots: 0, logger: logger);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var opts = new MultipassSandboxOptions { MaxConcurrentBoots = 0 };
+
+        using var gate = await provider.EnterBootGateAsync(opts, cts.Token);
+
+        var warning = logger.Entries.SingleOrDefault(e => e.Level == LogLevel.Warning);
+        Assert.NotNull(warning);
+        Assert.Contains("clamping to 1", warning.Message);
+        Assert.Contains("0", warning.Message);
     }
 
     private static MultipassDaemonRetryPolicy InstantDaemonRetryPolicy() => new()
