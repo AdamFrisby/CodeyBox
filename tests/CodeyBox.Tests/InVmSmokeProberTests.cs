@@ -556,6 +556,52 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task EnsureAvailableAsync_GloballyBenched_PinnedRefHasCachedPass_ReProbesAndRecovers()
+    {
+        // B1 pinning: in-VM verdicts are cached per (agent, baselineRef) but the
+        // registry exclusion is global. A failure probed against the active
+        // baseline benches cursor everywhere — but a work item pinned to a
+        // different, known-good baseline (cached pass) must still route there.
+        // The gate must NOT short-circuit on the global bench when the pinned ref
+        // has its own cached pass; the cache hit reconciles the pass back onto
+        // the registry without provisioning a VM.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        // Active-baseline probe failed → cursor globally benched under InVmSmoke.
+        registry.MarkSmokeResult(AgentKind.Cursor,
+            new AgentSmokeResult(false, "exit 127 on base-ACTIVE", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+        // But the pinned baseline was previously probed clean (cached pass).
+        cache.Set(AgentKind.Cursor, "base-PINNED", new AgentSmokeResult(true, null, TimeSpan.Zero));
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
+
+        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: "base-PINNED", CancellationToken.None);
+
+        Assert.True(av.Available); // pinned-image verdict, not the active-image bench
+        Assert.Equal(0, provider.CreateCount); // cache hit → no VM provisioned
+    }
+
+    [Fact]
+    public async Task EnsureAvailableAsync_GloballyBenched_PinnedRefNeverProbed_HonoursBench_NoProvision()
+    {
+        // Companion to the cached-pass case: with no positive per-ref evidence
+        // the gate honours the global bench rather than provisioning a fresh VM
+        // for an agent the router skips everywhere else (hot-path / sandbox-slot
+        // protection). A never-probed pinned image is no proof the CLI works there.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        registry.MarkSmokeResult(AgentKind.Cursor,
+            new AgentSmokeResult(false, "exit 127 on base-ACTIVE", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
+
+        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: "base-OTHER", CancellationToken.None);
+
+        Assert.False(av.Available);
+        Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
     public async Task EnsureProbedAsync_PinnedBaselineRef_ProbesAndCachesAgainstPinnedImage()
     {
         // B1 pinning: the dispatch gate must probe the work item's pinned baseline

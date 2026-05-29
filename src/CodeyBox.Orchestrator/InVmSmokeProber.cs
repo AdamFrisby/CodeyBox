@@ -136,17 +136,33 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// <see cref="IInVmSmokeGate.EnsureAvailableAsync"/>. Owns the full
     /// read→probe→re-read sequence so routing consumers get a verdict from this
     /// one call. Returns the agent's prior availability untouched when the gate
-    /// is disabled or the agent is already excluded (no point probing a binary
-    /// the router will skip regardless); otherwise probes and returns the
-    /// reconciled availability. A cache hit is free.
+    /// is disabled; otherwise probes and returns the reconciled availability. A
+    /// cache hit is free.
     /// <paramref name="baselineRef"/> is the work item's pinned baseline (or null
     /// for unpinned work → active baseline); the probe runs against the image the
     /// dispatch will actually clone, not just whatever baseline is active now.
+    ///
+    /// <para>When the agent is already excluded we normally short-circuit — no
+    /// point probing a binary the router will skip regardless. But in-VM verdicts
+    /// are cached per <c>(agent, baselineRef)</c> while registry exclusions are
+    /// <em>global</em> per agent, so a failure probed against one baseline (e.g. a
+    /// rebaked active image) benches the agent for every baseline. That must not
+    /// permanently strand work pinned to a <em>different</em>, known-good baseline:
+    /// if this work item's pinned ref has its own cached pass, we fall through to
+    /// (re-)probe — a free cache hit that reconciles the pinned-image verdict back
+    /// onto the registry — rather than returning the unrelated active-image bench
+    /// (B1 pinning contract). With no positive per-ref evidence we honour the
+    /// global bench: provisioning a fresh VM for an agent benched everywhere else
+    /// would defeat the short-circuit and risk exhausting sandbox slots on the hot
+    /// path, and a never-probed pinned image is no evidence the CLI works there.</para>
     /// </summary>
     public async Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
     {
         var current = _availability.GetAvailability(kind);
-        if (!Enabled || !current.Available)
+        if (!Enabled)
+            return current;
+        if (!current.Available &&
+            _cache.TryGet(kind, baselineRef ?? ResolveBaselineRef()) is null)
             return current;
         await EnsureProbedAsync(kind, baselineRef, ct);
         return _availability.GetAvailability(kind);

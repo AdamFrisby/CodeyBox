@@ -57,6 +57,9 @@ public sealed class AgentClassRouterAvailabilityTests
     private static AgentMembership Sub(AgentKind kind, int score = 100) =>
         new() { Agent = kind, Billing = AgentBilling.Subscription, QualityScore = score };
 
+    private static AgentMembership Api(AgentKind kind, int score = 100) =>
+        new() { Agent = kind, Billing = AgentBilling.PayPerApi, QualityScore = score };
+
     // ── Acceptance criterion 1: missing binary → smoke fails → excluded ──────
 
     [Fact]
@@ -222,6 +225,60 @@ public sealed class AgentClassRouterAvailabilityTests
         // attention and imply quota recovery, not a smoke sweep / reset).
         Assert.Contains("smoke gate", decision.Reason, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("threshold", decision.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ── PayPerApi-only fallback must honour the smoke gate (AC#1) ─────────────
+
+    [Fact]
+    public async Task PayPerApiOnly_AllSmokeBenched_Waits_DoesNotFireBrokenBinary()
+    {
+        // The PayPerApi-only fallback fires a member "despite apparent low quota"
+        // to cover quota-probe inaccuracy — but it must NEVER fire a member the
+        // in-VM smoke gate benched: a smoke bench means the binary exits 127 / can't
+        // auth, the exact cascade AC#1 exists to prevent. With the sole PayPerApi
+        // member benched, the router must wait for the sweep / operator reset, not
+        // route to the broken CLI.
+        var cls = FrontierClass(Api(Cursor, score: 100));
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Cursor,
+            new AgentSmokeResult(false, "exit 127", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+
+        var router = BuildRouter(cls, [], reg);
+
+        var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
+
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+        Assert.Contains("smoke gate", decision.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PayPerApiOnly_HigherScoredBenched_FallbackSkipsItAndFiresNextMember()
+    {
+        // Reach the PayPerApi-only fallback with a benched higher-scored member and
+        // a routable lower-scored one. PayPerApi members never fail the main-loop
+        // quota gate, so the lower-scored member is forced to be skipped there via
+        // in-process exhaustion (a quota signal the fallback is allowed to override);
+        // the fallback must then pick the first NON-benched member
+        // (sorted.FirstOrDefault(!smokeExcluded)), not sorted[0] — the benched
+        // Cursor. A regression restoring sorted[0] would route to the broken binary
+        // and reproduce the exit-127 cascade AC#1 targets.
+        var cls = FrontierClass(Api(Cursor, score: 150), Api(Claude, score: 100));
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Cursor,
+            new AgentSmokeResult(false, "exit 127", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
+
+        var router = BuildRouter(cls, [], reg);
+        // Quota-exhaust the healthy member so the main loop skips it and the
+        // PayPerApi-only fallback block is the path that selects a member.
+        router.MarkExhausted(Api(Claude), TimeSpan.FromMinutes(5));
+
+        var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Claude, decision.Chosen!.Agent); // not the benched, higher-scored Cursor
+        Assert.Equal(AgentBilling.PayPerApi, decision.Chosen.Billing);
+        Assert.False(decision.ShouldWait);
     }
 
     // ── Recovery path ────────────────────────────────────────────────────────

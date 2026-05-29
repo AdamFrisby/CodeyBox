@@ -83,8 +83,10 @@ public sealed class CursorAgentRunnerTrustRegressionTests
             Assert.True(exec.Argv.Contains(CursorAgentRunner.WorkspaceTrustFlag),
                 $"Cursor runner omitted {CursorAgentRunner.WorkspaceTrustFlag} from argv [{string.Join(' ', exec.Argv)}]. " +
                 $"The CLI requires --trust to run non-interactively on a workspace " +
-                $"(2026-05-28 cascade stage 3); the in-VM smoke probe does not cover " +
-                $"workspace trust, so this pin is the only guard. See CursorAgentRunner.cs.");
+                $"(2026-05-28 cascade stage 3). The in-VM smoke probe now also exercises " +
+                $"workspace trust (CursorInVmSmokeProbe stage 3, covered by " +
+                $"InVmSmokeProberTests.ThreeStageCascade_EachStageCaughtAtSmokeTime); this " +
+                $"argv pin is the fast dispatch-path guard that pairs with it. See CursorAgentRunner.cs.");
         }
     }
 
