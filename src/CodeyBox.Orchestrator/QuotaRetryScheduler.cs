@@ -19,6 +19,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     private readonly IWebhookDispatcher? _webhooks;
     private readonly OrchestratorOptions _opts;
     private readonly TimeProvider _time;
+    private readonly IBaselineImageResolver _baselineResolver;
     private readonly ILogger<QuotaRetryScheduler> _log;
 
     // Active timers for targeted wakeups. Key = WorkItemId.
@@ -34,7 +35,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         IProjectRepository? projects = null,
         IQueueController? queueController = null,
         IWebhookDispatcher? webhooks = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IBaselineImageResolver? baselineResolver = null)
     {
         _store = store;
         _retrier = retrier;
@@ -45,6 +47,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         _queueController = queueController;
         _webhooks = webhooks;
         _time = timeProvider ?? TimeProvider.System;
+        _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -293,6 +296,19 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
             _log.LogInformation("Quota router unavailable; skipping auto-retry for work item {Id}", item.Id);
             return new QuotaRetryAttemptResult("skipped:router-unavailable");
         }
+        // Pin the baseline ref before the router gates, mirroring the dispatch
+        // pickup path: the in-VM smoke gate must probe the image this item will
+        // actually be cloned from, not the active baseline. Retried items are
+        // normally already stamped from their first pickup; this only fills a
+        // null ref (e.g. an item that never ran) so the gate never probes/caches
+        // under the wrong image.
+        if (item.BaselineImageRef is null)
+        {
+            var pinnedRef = ResolveBaselineRefForRetry(item, project);
+            if (pinnedRef is not null)
+                item = item with { BaselineImageRef = pinnedRef };
+        }
+
         var decision = await _router.ResolveAsync(item, project, ct);
         if (decision.ShouldWait)
         {
@@ -307,6 +323,26 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
 
         // 5. Trigger retry.
         return await PerformRetryAsync(item, trigger, ct);
+    }
+
+    /// <summary>
+    /// Resolves the baseline image ref this item would be cloned from at pickup,
+    /// using the project's work-phase network profile (mirrors
+    /// <c>OrchestratorService.ResolveBaselineRefForPickup</c>). Returns null when
+    /// no resolver is wired or the resolver cannot pin a ref.
+    /// </summary>
+    private string? ResolveBaselineRefForRetry(WorkItem item, Project project)
+    {
+        try
+        {
+            return _baselineResolver.ResolveBaselineRef(
+                project.NetworkProfiles.Work, SandboxProfileFlavor.Headless);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Baseline-ref resolver threw for work item {Id}; proceeding without pin", item.Id);
+            return null;
+        }
     }
 
     private async Task<QuotaRetryAttemptResult> PerformRetryAsync(WorkItem item, string trigger, CancellationToken ct)

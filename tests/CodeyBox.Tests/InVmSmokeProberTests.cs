@@ -623,6 +623,79 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task ForceProbeAsync_ReProbesBenchedAgent_ClearsBench_WhenSandboxNowPasses()
+    {
+        // Operator-recovery path (the /admin/agent/{name}/smoke endpoint). Unlike
+        // EnsureAvailableAsync — which short-circuits an already-excluded agent —
+        // ForceProbeAsync must re-exec the CLI even when the agent stands benched,
+        // because re-verifying a benched binary is the whole point of the operator
+        // call. After the operator fixes the exit-127 cause, the forced re-probe
+        // provisions a fresh VM, sees the binary pass, clears the in-VM bench, and
+        // returns the updated (now-Available) availability — rather than waiting
+        // for the next background sweep. Guards against a regression that made the
+        // call a no-op, routed it through the short-circuiting EnsureAvailableAsync,
+        // or failed to feed the new verdict back into the registry.
+        var broken = true;
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "--version") && broken
+                ? new SandboxExecResult(127, "", "bash: agent: command not found")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
+
+        // First probe fails (exit 127) → cursor benched under InVmSmoke.
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        var createsAfterBench = provider.CreateCount;
+
+        // Operator fixes the binary; force a re-probe of the still-benched agent.
+        broken = false;
+        var result = await prober.ForceProbeAsync(AgentKind.Cursor, CancellationToken.None);
+
+        // A fresh VM was provisioned despite the standing bench (i.e. it did NOT
+        // short-circuit like EnsureAvailableAsync would), and both the returned
+        // value and the registry reflect the now-passing CLI.
+        Assert.True(provider.CreateCount > createsAfterBench);
+        Assert.NotNull(result);
+        Assert.True(result!.Available);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task ForceProbeAsync_NoRegisteredProbeForKind_ReturnsNull_NoProvision()
+    {
+        // The admin endpoint falls back to the host-probe verdict (and its 404
+        // decision) when ForceProbeAsync returns null, which it must do for an
+        // agent that has no registered in-VM probe — without provisioning a VM.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        // Only a cursor probe is registered; ask to force-probe claude.
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        var result = await prober.ForceProbeAsync(AgentKind.Claude, CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task ForceProbeAsync_Disabled_ReturnsNull_NoProvision()
+    {
+        // When in-VM smoke is disabled the gate provisions nothing and returns
+        // null so the admin endpoint relies on the host probe alone.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions { Enabled = false, ImageReference = "img", SweepIntervalSeconds = 0 });
+
+        var result = await prober.ForceProbeAsync(AgentKind.Cursor, CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
     public async Task EnsureProbedAsync_FailOpenOptOut_NeverThrows_AndDoesNotBench_OnProbeFault()
     {
         // With the opt-out fail-open policy (FailClosedOnProbeFault:false), a

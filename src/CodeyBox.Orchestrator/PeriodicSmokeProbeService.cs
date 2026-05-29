@@ -18,7 +18,7 @@ namespace CodeyBox.Orchestrator;
 /// fires after one full interval — startup probes (<see cref="StartupSmokeProbeService"/>)
 /// already cover boot-time coverage, so re-firing on tick 0 would be redundant.</para>
 /// </summary>
-public sealed class PeriodicSmokeProbeService : BackgroundService
+public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokeProbeRunner
 {
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IAgentSmokeProbe> _probes;
@@ -80,8 +80,9 @@ public sealed class PeriodicSmokeProbeService : BackgroundService
     }
 
     /// <summary>
-    /// Runs the probe registered for <paramref name="kind"/>, if any, and
-    /// returns the result. Returns null when no probe is registered.
+    /// <see cref="IHostSmokeProbeRunner.ProbeAsync"/>. Runs the probe registered
+    /// for <paramref name="kind"/>, if any, and returns the result. Returns null
+    /// when no probe is registered.
     /// </summary>
     public async Task<AgentSmokeResult?> ProbeAsync(AgentKind kind, CancellationToken ct)
     {

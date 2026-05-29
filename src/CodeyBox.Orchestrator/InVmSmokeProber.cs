@@ -182,7 +182,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// on the pinned image, not on a freshly rebaked active baseline. Null falls
     /// back to the active baseline for unpinned work.
     /// </summary>
-    public async Task EnsureProbedAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    internal async Task EnsureProbedAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
     {
         if (!Enabled) return;
         var probe = _probes.FirstOrDefault(p => p.Kind == kind);

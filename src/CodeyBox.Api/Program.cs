@@ -1137,12 +1137,22 @@ builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var v = cbOpts.Smoke.InVm;
+    // When the operator did not pin an explicit smoke network profile, inherit
+    // the default project work-phase profile. The baseline-clone path only
+    // triggers when ProfileName is non-empty; a null profile silently forces
+    // the cloud-init launch path, so the probe would test a different image
+    // than the dispatch (which clones the work-profile baseline) and miss drift
+    // baked only into that baseline (e.g. PATH symlinks from MultipassExtraRuncmd).
+    // Inheriting the work profile keeps the probe on the same clone-vs-launch
+    // path as dispatch by default; an explicit Smoke:InVm:NetworkProfile wins.
+    var defaultWorkProfile = sp.GetService<IOptions<ProjectsOptions>>()?.Value
+        .Defaults?.NetworkProfiles?.Work;
     return new InVmSmokeOptions
     {
         Enabled = v.Enabled,
         ImageReference = cbOpts.SandboxImageReference,
         AllowedHosts = cbOpts.AgentAllowedHosts,
-        NetworkProfile = v.NetworkProfile,
+        NetworkProfile = v.NetworkProfile ?? defaultWorkProfile,
         StepTimeoutSeconds = v.StepTimeoutSeconds,
         CacheTtlMinutes = v.CacheTtlMinutes,
         SweepIntervalSeconds = v.SweepIntervalSeconds,
@@ -1708,7 +1718,9 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     sp.GetRequiredService<AgentClassRouter>(),
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
-    sp.GetRequiredService<IWebhookDispatcher>()));
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetService<TimeProvider>(),
+    sp.GetRequiredService<IBaselineImageResolver>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
@@ -1852,6 +1864,9 @@ builder.Services.AddSingleton<PeriodicSmokeProbeService>(sp => new PeriodicSmoke
     sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     sp.GetRequiredService<ILogger<PeriodicSmokeProbeService>>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PeriodicSmokeProbeService>());
+// Expose the host-side on-demand probe through the core port so the admin
+// /smoke endpoint depends on the abstraction, not the background-service type.
+builder.Services.AddSingleton<IHostSmokeProbeRunner>(sp => sp.GetRequiredService<PeriodicSmokeProbeService>());
 builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<ICredentialProvider>(),
@@ -2194,7 +2209,7 @@ app.MapGet("/concurrency", async (
 
 app.MapPost("/admin/agent/{name}/smoke", async (
     string name,
-    PeriodicSmokeProbeService periodic,
+    IHostSmokeProbeRunner hostProbe,
     IInVmSmokeGate inVmGate,
     IAgentAvailabilityRegistry registry,
     CancellationToken ct) =>
@@ -2206,7 +2221,7 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     var kind = new AgentKind(name.ToLowerInvariant());
 
     // Host-side credential probe (env-var presence on the orchestrator host).
-    var hostResult = await periodic.ProbeAsync(kind, ct);
+    var hostResult = await hostProbe.ProbeAsync(kind, ct);
 
     // In-VM gate: the real in-sandbox CLI verification the host probe could not
     // be (exit 127 / auth-path drift / workspace-trust). Force a re-probe so an
@@ -2923,8 +2938,11 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Host network profile for the probe sandbox; also selects which
-        /// baseline ref to probe (baselines are keyed by profile+flavor). Null
-        /// resolves against the provider's default.
+        /// baseline ref to probe (baselines are keyed by profile+flavor). When
+        /// unset, inherits <c>CodeyBox:Defaults:NetworkProfiles:Work</c> so the
+        /// probe clones the same baseline image dispatch does — set it only to
+        /// override that inheritance. Leave both null only when not using
+        /// baseline images (the probe then matches dispatch's cloud-init path).
         /// </summary>
         public string? NetworkProfile { get; set; }
 
