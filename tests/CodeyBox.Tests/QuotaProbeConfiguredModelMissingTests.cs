@@ -191,7 +191,7 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     {
         var body = """
         {
-          "planUsage": { "totalPercentUsed": 10, "autoPercentUsed": 10, "apiPercentUsed": 0 },
+          "planUsage": { "remaining": 90, "limit": 100, "autoPercentUsed": 10, "apiPercentUsed": 0 },
           "autoBucketModels": ["composer-2"]
         }
         """;
@@ -216,7 +216,7 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     {
         var body = """
         {
-          "planUsage": { "totalPercentUsed": 30, "autoPercentUsed": 25, "apiPercentUsed": 0 },
+          "planUsage": { "remaining": 70, "limit": 100, "autoPercentUsed": 25, "apiPercentUsed": 0 },
           "autoBucketModels": ["composer-2.5"]
         }
         """;
@@ -239,7 +239,7 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     [Fact]
     public async Task Cursor_NoConfiguredModelId_PreservesOverallAvailability()
     {
-        var body = """{"planUsage":{"totalPercentUsed":30}}""";
+        var body = """{"planUsage":{"remaining":70,"limit":100}}""";
         var probe = BuildCursorProbe(body);
 
         var member = new AgentMembership
