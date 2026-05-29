@@ -446,6 +446,48 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task StepTimeout_OnDispatchGate_DefaultFailClosed_Benches()
+    {
+        // Companion to StepTimeout_IsTransient_* (which exercises the sweep /
+        // fail-open path): on the DISPATCH gate under the default fail-closed
+        // policy a step timeout must bench the agent rather than leave it
+        // routable, so the router never hands work to a CLI whose probe could not
+        // reach a verdict. Without this, a regression that only applied
+        // fail-closed to the credential / provisioning catches (not the timeout
+        // catch at InVmSmokeProber.cs:249) would go uncaught.
+        var provider = new HangingSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        // Build() uses the default InVmSmokeOptions → FailClosedOnProbeFault = true;
+        // StepTimeoutSeconds=0 trips the timeout path immediately.
+        var prober = new InVmSmokeProber(
+            provider,
+            new FakeBaselineResolver("base-A"),
+            new ConstantCredentialProvider(CursorCred),
+            [new CursorInVmSmokeProbe()],
+            registry,
+            cache,
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                StepTimeoutSeconds = 0,
+            },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("probe step timed out", av.Reason);
+        // The fault is not cached, so a later (recovered) probe self-heals it.
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
     public async Task CredentialResolutionFailure_IsTransient_DoesNotExcludeOrProvision()
     {
         // ICredentialProvider.GetAsync throwing is a credential-store fault, not an
