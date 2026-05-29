@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -49,8 +50,17 @@ public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return null;
 
+        // Terminal API crashes (e.g. Claude 400 thinking-block modification)
+        // are not quota exhaustion. Check before provider detectors so stale
+        // quota keywords in earlier NDJSON lines cannot false-positive the final
+        // failure on long multi-turn runs.
+        if (AgentQuotaStreamScope.IsNonQuotaAgentApiCrash(stderr, stdout))
+            return null;
+
+        var scopedStdout = AgentQuotaStreamScope.ScopeStdoutForQuotaDetection(stdout);
+
         return _detectors.TryGetValue(agent, out var detector)
-            ? detector.Detect(stderr, stdout)
+            ? detector.Detect(stderr, scopedStdout)
             : null;
     }
 
