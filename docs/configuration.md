@@ -37,7 +37,8 @@ Hot-reloadable today:
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
 - `MultipassExtraRuncmd` / `MultipassExtraCloudInit` / `SandboxNetworkProfiles` /
-  `MultipassUseBaselineImages` / `MultipassSandbox.CloudInitReadyRetryAttempts`
+  `MultipassUseBaselineImages` / `MultipassSandbox.CloudInitReadyRetryAttempts` /
+  `MultipassSandbox.VmStartTimeout` / `MultipassSandbox.VmStopTimeout`
   — re-read on every sandbox launch. VMs already running keep the snapshot they
   booted with.
 - `SandboxLeak.LeakAgeThreshold` / `PreemptRetention` / `AutoDispose` /
@@ -107,6 +108,8 @@ startup); we add explicit guards as we tighten the contract.
 | `SandboxProvider` | string | — | One of `multipass`, `bubblewrap`, `process`. Required in non-Development environments. |
 | `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Conventional bridge mapping for projects that explicitly select the `graphical` network profile; create it with `scripts/setup-host-networks.sh`. |
 | `MultipassSandbox.CloudInitReadyRetryAttempts` | int | `3` | Number of `cloud-init status --wait` attempts before probing VM readiness when cloud-init returns exit 1. |
+| `MultipassSandbox.VmStartTimeout` | TimeSpan | `00:03:00` | Deadline for the post-launch poll that waits for the VM to reach `Running`. Bump on hosts that observe boot contention under concurrent launches. |
+| `MultipassSandbox.VmStopTimeout` | TimeSpan | `00:02:00` | Deadline for the post-stop poll that waits for the VM to reach `Stopped`. |
 | `CredentialFileWatchers` | bool | `true` | Enables host-side OAuth credential file watchers. Set false only in constrained test hosts; credential reads still use a stat-based freshness check on each access. |
 | `DangerouslyAllowProcessSandbox` | bool | `false` | Allow process sandbox outside Development. Do not use in production. |
 | `UpstreamPushMaxAttempts` | int | `5` | Retry count for upstream push (GitHub PR creation). |

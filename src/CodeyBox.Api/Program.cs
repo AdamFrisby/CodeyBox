@@ -302,6 +302,8 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
                 NetworkProfiles = live.SandboxNetworkProfiles,
                 UseBaselineImages = live.MultipassUseBaselineImages,
                 CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
+                VmStartTimeout = multipassSandbox.VmStartTimeout,
+                VmStopTimeout = multipassSandbox.VmStopTimeout,
                 DiskGuard = diskGuard,
             };
         },
@@ -1936,6 +1938,21 @@ namespace CodeyBox.Api
         /// </summary>
         public int CloudInitReadyRetryAttempts { get; set; } =
             MultipassSandboxOptions.DefaultCloudInitReadyRetryAttempts;
+
+        /// <summary>
+        /// Deadline for the post-launch poll that waits for the VM to reach
+        /// the <c>Running</c> state. Defaults to 3 minutes. Bump on hosts that
+        /// observe boot contention under concurrent launches.
+        /// </summary>
+        public TimeSpan VmStartTimeout { get; set; } =
+            MultipassSandboxOptions.DefaultVmStartTimeout;
+
+        /// <summary>
+        /// Deadline for the post-stop poll that waits for the VM to reach the
+        /// <c>Stopped</c> state. Defaults to 2 minutes.
+        /// </summary>
+        public TimeSpan VmStopTimeout { get; set; } =
+            MultipassSandboxOptions.DefaultVmStopTimeout;
     }
 
     /// <summary>

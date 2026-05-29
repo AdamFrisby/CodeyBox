@@ -1336,7 +1336,10 @@ git push origin HEAD:{refName}";
         // wrapper is needed before any ExecAsync; the route swap is
         // needed before any agent traffic actually leaves the VM via
         // the host-enforced bridge.
-        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(3);
+        var startTimeout = opts.VmStartTimeout > TimeSpan.Zero
+            ? opts.VmStartTimeout
+            : MultipassSandboxOptions.DefaultVmStartTimeout;
+        var deadline = DateTime.UtcNow + startTimeout;
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
@@ -1346,7 +1349,8 @@ git push origin HEAD:{refName}";
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
         }
         if (DateTime.UtcNow >= deadline)
-            throw new InvalidOperationException($"multipass VM {name} did not reach Running state within 3 minutes");
+            throw new InvalidOperationException(
+                $"multipass VM {name} did not reach Running state within {startTimeout}");
 
         await WaitForCloudInitReadyAsync(opts, name, workItemId, ct);
     }
@@ -1461,7 +1465,10 @@ test "$work" = present && test "$exec_wrapper" = present
         WorkItemId? workItemId,
         CancellationToken ct)
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
+        var stopTimeout = opts.VmStopTimeout > TimeSpan.Zero
+            ? opts.VmStopTimeout
+            : MultipassSandboxOptions.DefaultVmStopTimeout;
+        var deadline = DateTime.UtcNow + stopTimeout;
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
@@ -1470,7 +1477,8 @@ test "$work" = present && test "$exec_wrapper" = present
                 return;
             await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
         }
-        throw new InvalidOperationException($"multipass VM {name} did not reach Stopped state within 2 minutes");
+        throw new InvalidOperationException(
+            $"multipass VM {name} did not reach Stopped state within {stopTimeout}");
     }
 
     /// <summary>
@@ -2570,6 +2578,8 @@ public sealed record MultipassSandboxOptions
 {
     public const int DefaultCloudInitReadyRetryAttempts = 3;
     public static readonly TimeSpan DefaultCloudInitReadyRetryDelay = TimeSpan.FromSeconds(10);
+    public static readonly TimeSpan DefaultVmStartTimeout = TimeSpan.FromMinutes(3);
+    public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
 
     public string MultipassBinary { get; init; } = "multipass";
 
@@ -2622,6 +2632,21 @@ public sealed record MultipassSandboxOptions
     /// Delay between retries when <c>cloud-init status --wait</c> returns exit 1.
     /// </summary>
     public TimeSpan CloudInitReadyRetryDelay { get; init; } = DefaultCloudInitReadyRetryDelay;
+
+    /// <summary>
+    /// Deadline for the post-launch poll that waits for <c>multipass info</c>
+    /// to report the VM in the <c>Running</c> state. Defaults to 3 minutes.
+    /// Bump on hosts that observe boot contention (concurrent launches starving
+    /// disk/CPU) — a healthy VM can exceed the default when 6+ VMs boot at once
+    /// even though a clean isolated launch completes in ~106s.
+    /// </summary>
+    public TimeSpan VmStartTimeout { get; init; } = DefaultVmStartTimeout;
+
+    /// <summary>
+    /// Deadline for the post-stop poll that waits for <c>multipass info</c> to
+    /// report the VM in the <c>Stopped</c> state. Defaults to 2 minutes.
+    /// </summary>
+    public TimeSpan VmStopTimeout { get; init; } = DefaultVmStopTimeout;
 
     /// <summary>
     /// Maps logical network-profile names (selected via
