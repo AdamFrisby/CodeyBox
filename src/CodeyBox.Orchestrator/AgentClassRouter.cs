@@ -287,6 +287,14 @@ public sealed class AgentClassRouter
         }
 
         var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
+        // Track subscription members benched purely by the availability gate
+        // (in-VM smoke / fast-fail breaker / missing-probe). If every
+        // subscription member fell out for that reason — and none for quota —
+        // the "wait" we return below is unblocked by the smoke sweep / operator
+        // reset, NOT a quota recheck, so the reason text must say so rather than
+        // claim a quota threshold.
+        var subscriptionTotal = sorted.Count(x => x.Member.Billing == AgentBilling.Subscription);
+        var subscriptionSmokeExcluded = 0;
 
         // PayPerApi members that an exhausted operator budget pushed below threshold:
         // these must NOT be fired by the no-Subscription fallthrough below (doing so
@@ -336,6 +344,8 @@ public sealed class AgentClassRouter
                 var smokeReason = $"smoke gate: {availability.Reason}";
                 _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
+                if (member.Billing == AgentBilling.Subscription)
+                    subscriptionSmokeExcluded++;
                 continue;
             }
             if (member.Billing == AgentBilling.Subscription && _quotaFailures is not null)
@@ -456,25 +466,24 @@ public sealed class AgentClassRouter
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
-        // No member was chosen. If at least one quota-passing member was
-        // blocked by the per-agent concurrency cap, surface AnyMemberAtCap
-        // so the caller can defer with the short cap-retry instead of the
-        // full quota recheck — operator-set caps free up much faster than a
-        // quota window resets, and a 5-minute idle on a fleet that's just
-        // rate-limited by config is wasted throughput. The flag is set on
-        // any-at-cap (not all-at-cap) because even one cap-blocked member
-        // means a worker finishing on that agent will free up a routable
-        // slot within the cap-retry window.
+        // No member was chosen. Distinguish stall reasons so the caller picks
+        // the right defer interval and the audit log shows what actually
+        // blocked dispatch:
+        //  - cap-blocked: operator concurrency cap — clears in seconds, so
+        //    surface AnyMemberAtCap and use the cap-retry interval. Even one
+        //    cap-blocked member means a worker finishing on that agent will
+        //    free up a routable slot within the cap-retry window.
+        //  - smoke-excluded: cleared by the in-VM smoke sweep / operator
+        //    reset, NOT by quota recovery — don't misreport it as quota.
+        //  - quota-below-floor: clears when the quota window resets.
         var anyAtCap = atCapAgents.Count > 0;
         if (hasSubscription || anyAtCap)
         {
-            // Reason text differentiates a pure cap stall from a mixed stall
-            // (cap + quota/availability) so audit-log readers can tell them
-            // apart. When a member was blocked only by per-agent cap (not
-            // quota), a slot frees up far sooner than a quota window resets,
-            // so the soonest of cap-retry vs quota-recheck is surfaced — the
-            // operator may have configured a shorter QuotaRecheckInterval and
-            // we always honour the earliest plausible retry.
+            // When a member was blocked only by per-agent cap (not quota), a
+            // slot frees up far sooner than a quota window resets, so the
+            // soonest of cap-retry vs quota-recheck is surfaced — the operator
+            // may have configured a shorter QuotaRecheckInterval and we always
+            // honour the earliest plausible retry.
             var capBlocked = atCapAgents.Count > 0 || capSaturatedMembers.Count > 0;
             var capRetry = _opts.QuotaRecheckInterval < _opts.CapRetryRecheckInterval
                 ? _opts.QuotaRecheckInterval
@@ -483,6 +492,7 @@ public sealed class AgentClassRouter
                 r.RejectReason != "per-agent cap reached"
                 && r.RejectReason != "ranked lower"
                 && !r.RejectReason.StartsWith("per-agent cap:", StringComparison.Ordinal));
+            var allSmokeExcluded = subscriptionTotal > 0 && subscriptionSmokeExcluded == subscriptionTotal;
             string reason;
             TimeSpan suggested;
             if (capBlocked && hasNonCapRejection)
@@ -494,6 +504,12 @@ public sealed class AgentClassRouter
             {
                 reason = $"every quota-passing member of class '{classId}' is at its per-agent concurrency cap";
                 suggested = capRetry;
+            }
+            else if (allSmokeExcluded)
+            {
+                reason = $"all subscription members of class '{classId}' are benched by the smoke gate / fast-fail breaker — "
+                         + "waiting for the in-VM smoke sweep or an operator reset to clear them";
+                suggested = _opts.QuotaRecheckInterval;
             }
             else
             {

@@ -3,9 +3,17 @@ namespace CodeyBox.Core;
 /// <summary>
 /// Narrow availability port for cross-cutting routing/dispatch consumers
 /// (the agent-class router, the pipeline runner, the admin availability
-/// endpoints). Exposes only the read / run-outcome / snapshot / reset surface
+/// endpoints). Exposes only the read / run-outcome / snapshot surface
 /// those callers need, so they depend on this rather than the concrete
 /// availability registry.
+///
+/// <para>Reset is deliberately absent: operator reset must clear both the
+/// registry and the in-VM smoke cache atomically, so it lives only on
+/// <see cref="IAgentAvailabilityReset"/>. If reset were exposed here, a routing
+/// or dispatch consumer could clear the registry while leaving a cached in-VM
+/// pass intact, which the next gated dispatch would reconcile straight back
+/// onto the registry — re-asserting the pre-fix verdict before the operator's
+/// fix is re-verified.</para>
 ///
 /// <para>Lives in <c>CodeyBox.Core</c> alongside <see cref="AgentAvailability"/>
 /// and <see cref="IInVmSmokeGate"/> so the host (<c>CodeyBox.Api</c> admin
@@ -29,9 +37,6 @@ public interface IAgentAvailabilityRegistry
 
     /// <summary>Snapshot of every tracked agent's current state.</summary>
     IReadOnlyList<AgentAvailabilitySnapshot> Snapshot();
-
-    /// <summary>Clears all exclusion state and counters for an agent (operator reset).</summary>
-    void Reset(AgentKind kind);
 }
 
 /// <summary>

@@ -1160,7 +1160,7 @@ builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
 // pass to reconcile back onto the registry before the operator's fix is
 // re-verified. The admin endpoint depends on this one contract.
 builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabilityReset(
-    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
+    sp.GetRequiredService<AgentAvailabilityRegistry>(),
     sp.GetRequiredService<IInVmSmokeCache>()));
 builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<ISandboxProvider>(),

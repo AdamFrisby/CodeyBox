@@ -8,10 +8,10 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class AgentAvailabilityReset : IAgentAvailabilityReset
 {
-    private readonly IAgentAvailabilityRegistry _registry;
+    private readonly AgentAvailabilityRegistry _registry;
     private readonly IInVmSmokeCache _cache;
 
-    public AgentAvailabilityReset(IAgentAvailabilityRegistry registry, IInVmSmokeCache cache)
+    public AgentAvailabilityReset(AgentAvailabilityRegistry registry, IInVmSmokeCache cache)
     {
         _registry = registry;
         _cache = cache;

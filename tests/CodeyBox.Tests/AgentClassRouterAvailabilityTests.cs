@@ -210,6 +210,11 @@ public sealed class AgentClassRouterAvailabilityTests
         // the periodic sweep + operator reset is what unblocks it.
         Assert.Null(decision.Chosen);
         Assert.True(decision.ShouldWait);
+        // The wait reason must reflect the smoke bench, not falsely claim the
+        // members are below the quota threshold (which would misroute operator
+        // attention and imply quota recovery, not a smoke sweep / reset).
+        Assert.Contains("smoke gate", decision.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("threshold", decision.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     // ── Recovery path ────────────────────────────────────────────────────────
