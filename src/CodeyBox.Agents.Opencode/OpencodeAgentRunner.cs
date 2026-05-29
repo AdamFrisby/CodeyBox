@@ -1,6 +1,5 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
-using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Agents.Opencode;
@@ -22,15 +21,8 @@ namespace CodeyBox.Agents.Opencode;
 /// materialises the file from <c>OPENCODE_AUTH_JSON</c> in the credential
 /// bundle before invoking the CLI, mirroring the Codex pattern.</para>
 /// </summary>
-public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, ISandboxTextOnlyAgentRunner
 {
-    private readonly IProcessRunner _hostCliRunner;
-
-    public OpencodeAgentRunner(IProcessRunner? hostCliRunner = null)
-    {
-        _hostCliRunner = hostCliRunner ?? new DefaultProcessRunner();
-    }
-
     public override AgentKind Kind => AgentKind.Opencode;
 
     /// <summary>Path to the opencode binary inside the sandbox.</summary>
@@ -160,7 +152,14 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
     }
 
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
-        => HostCliTextOnlyAuthScope.GetUnavailabilityReason(credential, HostCliTextOnlyAuthKind.Opencode);
+    {
+        if (credential is null)
+            return "OPENCODE_AUTH_JSON is required";
+        return credential.EnvironmentVariables.TryGetValue("OPENCODE_AUTH_JSON", out var opencode)
+               && !string.IsNullOrEmpty(opencode)
+            ? null
+            : "OPENCODE_AUTH_JSON is required";
+    }
 
     public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
@@ -169,30 +168,32 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         string? reasoningMode = null,
         CancellationToken ct = default)
     {
-        var argv = new List<string> { Binary, "run" };
-        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
-        if (!string.IsNullOrEmpty(effectiveModel))
-        {
-            argv.Add("--model");
-            argv.Add(effectiveModel);
-        }
-
-        if (!string.IsNullOrEmpty(reasoningMode))
-        {
-            var flag = Environment.GetEnvironmentVariable("OPENCODE_REASONING_FLAG");
-            if (!string.IsNullOrEmpty(flag))
-            {
-                argv.Add(flag);
-                argv.Add(reasoningMode);
-            }
-        }
-
-        return HostCliTextOnlyInvoker.RunAsync(
-            _hostCliRunner,
-            argv,
-            stdin: prompt,
-            credential,
-            HostCliTextOnlyAuthKind.Opencode,
-            ct);
+        _ = prompt;
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = ct;
+        return Task.FromResult(new TextOnlyAgentResult(
+            false,
+            "Opencode text-only calls must run inside the work-item sandbox",
+            null,
+            null));
     }
+
+    public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+        => ExecuteTextOnlyInSandboxAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct);
 }

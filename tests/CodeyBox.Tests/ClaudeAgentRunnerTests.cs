@@ -7,7 +7,7 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Unit tests for <see cref="ClaudeAgentRunner"/> focusing on the load-bearing
-/// <see cref="ClaudeAgentRunner.DefaultModelId"/> pin (claude-opus-4-7) that
+/// <see cref="ClaudeAgentRunner.DefaultModelId"/> pin (claude-opus-4-8) that
 /// prevents the CLI from falling back to a lighter default model.
 /// </summary>
 public sealed class ClaudeAgentRunnerTests
@@ -18,14 +18,14 @@ public sealed class ClaudeAgentRunnerTests
     public async Task RunAsync_NoModelIdOverride_PassesDefaultModelFlag()
     {
         var sandbox = new CapturingSandbox();
-        var runner = new ClaudeAgentRunner(); // DefaultModelId = "claude-opus-4-7"
+        var runner = new ClaudeAgentRunner(); // DefaultModelId = "claude-opus-4-8"
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: null);
 
         var argv = sandbox.CapturedExec!.Argv.ToList();
         var modelIdx = argv.IndexOf("--model");
         Assert.True(modelIdx >= 0, "argv must contain --model when DefaultModelId is set");
-        Assert.Equal("claude-opus-4-7", argv[modelIdx + 1]);
+        Assert.Equal("claude-opus-4-8", argv[modelIdx + 1]);
     }
 
     [Fact]
@@ -54,10 +54,10 @@ public sealed class ClaudeAgentRunnerTests
     }
 
     [Fact]
-    public void DefaultModelId_IsOpus47()
+    public void DefaultModelId_IsOpus48()
     {
         var runner = new ClaudeAgentRunner();
-        Assert.Equal("claude-opus-4-7", runner.DefaultModelId);
+        Assert.Equal("claude-opus-4-8", runner.DefaultModelId);
     }
 
     // ── Core argv shape ───────────────────────────────────────────────────────

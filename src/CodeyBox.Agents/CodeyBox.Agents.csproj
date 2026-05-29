@@ -2,7 +2,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
-    <ProjectReference Include="..\CodeyBox.HostProcess\CodeyBox.HostProcess.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />
   </ItemGroup>
 
@@ -11,10 +10,5 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
-
-  <ItemGroup>
-    <InternalsVisibleTo Include="CodeyBox.Agents.Cursor" />
-    <InternalsVisibleTo Include="CodeyBox.Agents.Opencode" />
-  </ItemGroup>
 
 </Project>

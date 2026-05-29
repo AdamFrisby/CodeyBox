@@ -80,6 +80,23 @@ public interface ITextOnlyAgentRunner : IAgentRunner
     string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) => null;
 }
 
+/// <summary>
+/// Optional runner capability for subscription CLIs whose text-only path must
+/// execute inside the work-item sandbox. Host-side CLI invocations with
+/// auto-approved tool prompts are not permitted for text-only calls.
+/// </summary>
+public interface ISandboxTextOnlyAgentRunner : ITextOnlyAgentRunner
+{
+    Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default);
+}
+
 public sealed record TextOnlyAgentResult(bool Success, string Summary, string? Output, string? Error);
 
 public sealed record ConflictResolverFile(string Path, string Content);

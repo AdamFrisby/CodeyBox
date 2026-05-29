@@ -113,6 +113,47 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Stderr: result.Stderr);
     }
 
+    /// <summary>
+    /// Runs a one-shot print-mode CLI invocation inside the sandbox for
+    /// text-only resolver/review calls. The VM boundary is the security
+    /// perimeter, so sandbox invocations may use the runner's normal
+    /// non-interactive argv (including trust/force flags where applicable).
+    /// </summary>
+    protected async Task<TextOnlyAgentResult> ExecuteTextOnlyInSandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct)
+    {
+        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
+        if (preparation is not null)
+            return new TextOnlyAgentResult(false, preparation.Summary, preparation.Stdout, preparation.Stderr);
+
+        var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream: false);
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = invocation.Argv,
+            WorkingDirectory = workingDirectory,
+            Stdin = invocation.Stdin,
+        }, ct);
+
+        if (!result.Success)
+        {
+            var detail = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+            return new TextOnlyAgentResult(
+                false,
+                $"agent text-only call failed: exit {result.ExitCode}",
+                result.Stdout,
+                detail.Trim());
+        }
+
+        var output = string.IsNullOrWhiteSpace(result.Stdout) ? result.Stderr : result.Stdout;
+        return new TextOnlyAgentResult(true, "ok", output.Trim(), null);
+    }
+
     public virtual async Task<AgentResult> RunResumedAsync(
         ISandbox sandbox,
         string workingDirectory,

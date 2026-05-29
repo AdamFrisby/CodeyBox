@@ -1,6 +1,5 @@
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
-using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
@@ -343,10 +342,6 @@ public sealed class OpencodeAgentRunnerTests
         Assert.Contains("OPENCODE_AUTH_JSON", script);
     }
 
-    /// <summary>
-    /// Sandbox that records every exec invocation and lets the test stub a
-    /// specific exit code for the auth-materialisation bash script.
-    /// </summary>
     [Fact]
     public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsReason()
     {
@@ -357,48 +352,73 @@ public sealed class OpencodeAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunTextOnlyAsync_InvokesOpencodeRunWithModelAndStdin()
+    public void GetTextOnlyUnavailabilityReason_EmptyAuth_ReturnsReason()
+    {
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("");
+        Assert.Equal("OPENCODE_AUTH_JSON is required", runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_OnHost_ReturnsFailure()
+    {
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"token":"x"}""");
+
+        var result = await runner.RunTextOnlyAsync("prompt", cred);
+
+        Assert.False(result.Success);
+        Assert.Contains("sandbox", result.Summary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyInSandboxAsync_InvokesOpencodeRunWithModelAndStdin()
     {
         const string prompt = "resolve this conflict";
-        var process = new RecordingProcessRunner();
-        var runner = new OpencodeAgentRunner(process);
-        var cred = new AgentCredential(
-            AgentKind.Opencode,
-            new Dictionary<string, string> { ["OPENCODE_AUTH_JSON"] = """{"token":"x"}""" },
-            new Dictionary<string, string>());
+        var sandbox = new TextOnlyRecordingSandbox("resolved json");
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"token":"x"}""");
 
-        var result = await runner.RunTextOnlyAsync(prompt, cred);
+        var result = await runner.RunTextOnlyInSandboxAsync(sandbox, "/work", prompt, cred);
 
         Assert.True(result.Success);
         Assert.Equal("resolved json", result.Output);
-        var call = Assert.Single(process.Calls);
-        Assert.Equal("opencode", call[0]);
-        Assert.Equal("run", call[1]);
-        Assert.Contains("--model", call);
-        Assert.Equal(prompt, process.Stdins[0]);
+        var agentExec = sandbox.Execs.Last();
+        Assert.Equal("opencode", agentExec.Argv[0]);
+        Assert.Equal("run", agentExec.Argv[1]);
+        Assert.Contains("--model", agentExec.Argv);
+        Assert.Equal(prompt, agentExec.Stdin);
     }
 
-    private sealed class RecordingProcessRunner : IProcessRunner
+    [Fact]
+    public async Task RunTextOnlyInSandboxAsync_WithReasoningFlag_AppendsFlagToArgv()
     {
-        public List<string[]> Calls { get; } = [];
-        public List<string?> Stdins { get; } = [];
-
-        public Task<ProcessRunResult> RunAsync(
-            IReadOnlyList<string> argv,
-            string? stdin,
-            CancellationToken ct,
-            Action<string>? stdoutChunkCallback = null,
-            Action<string>? stderrChunkCallback = null,
-            int? maxStdoutBytes = null,
-            int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null)
+        var prior = Environment.GetEnvironmentVariable("OPENCODE_REASONING_FLAG");
+        Environment.SetEnvironmentVariable("OPENCODE_REASONING_FLAG", "--reasoning-effort");
+        try
         {
-            Calls.Add(argv.ToArray());
-            Stdins.Add(stdin);
-            return Task.FromResult(new ProcessRunResult(0, "resolved json", ""));
+            var sandbox = new TextOnlyRecordingSandbox("ok");
+            var runner = new OpencodeAgentRunner();
+            var cred = OpencodeCred("""{"token":"x"}""");
+
+            var result = await runner.RunTextOnlyInSandboxAsync(
+                sandbox, "/work", "prompt", cred, reasoningMode: "high");
+
+            Assert.True(result.Success);
+            var agentExec = sandbox.Execs.Last();
+            Assert.Contains("--reasoning-effort", agentExec.Argv);
+            Assert.Contains("high", agentExec.Argv);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OPENCODE_REASONING_FLAG", prior);
         }
     }
 
+    /// <summary>
+    /// Sandbox that records every exec invocation and lets the test stub a
+    /// specific exit code for the auth-materialisation bash script.
+    /// </summary>
     private sealed class RecordingSandbox : ISandbox
     {
         private readonly int _authWriteExitCode;
@@ -421,6 +441,31 @@ public sealed class OpencodeAgentRunnerTests
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }
+            return Task.FromResult(new SandboxExecResult(0, "ok", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class TextOnlyRecordingSandbox(string agentStdout) : ISandbox
+    {
+        public string Id => "recording-text-only";
+        public List<SandboxExec> Execs { get; } = [];
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            Execs.Add(exec);
+            if (exec.Argv.Count >= 3
+                && exec.Argv[0] == "bash"
+                && exec.Argv[1] == "-c"
+                && exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
+            if (exec.Argv.Count >= 2 && exec.Argv[0] == "opencode" && exec.Argv[1] == "run")
+                return Task.FromResult(new SandboxExecResult(0, agentStdout, ""));
+
             return Task.FromResult(new SandboxExecResult(0, "ok", ""));
         }
 

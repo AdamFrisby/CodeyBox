@@ -32,6 +32,11 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
 
     public SqliteWorkItemStoreDiskFullTests()
     {
+        ConfigureLogger();
+    }
+
+    private void ConfigureLogger()
+    {
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Verbose()
             .Enrich.FromLogContext()
@@ -50,6 +55,8 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
     [Fact]
     public async Task CreateAsync_TranslatesSqliteFull_ToTypedException()
     {
+        ConfigureLogger();
+        _sink.Clear();
         using var store = new SqliteWorkItemStore(_dbPath);
 
         store.ForceMaxPageCountForTesting(1);
@@ -72,6 +79,8 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
     [Fact]
     public async Task UpdateAsync_TranslatesSqliteFull_ToTypedException()
     {
+        ConfigureLogger();
+        _sink.Clear();
         using var store = new SqliteWorkItemStore(_dbPath);
 
         var item = new WorkItem
@@ -107,6 +116,8 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
     [Fact]
     public async Task TryUpdateIfStateAsync_TranslatesSqliteFull_ToTypedException()
     {
+        ConfigureLogger();
+        _sink.Clear();
         using var store = new SqliteWorkItemStore(_dbPath);
 
         var item = new WorkItem

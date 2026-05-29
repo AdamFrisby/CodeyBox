@@ -1,6 +1,5 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
-using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Agents.Cursor;
@@ -29,15 +28,8 @@ namespace CodeyBox.Agents.Cursor;
 /// CLI is expected to use whatever auth path the operator provisioned in the
 /// image.</para>
 /// </summary>
-public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, ISandboxTextOnlyAgentRunner
 {
-    private readonly IProcessRunner _hostCliRunner;
-
-    public CursorAgentRunner(IProcessRunner? hostCliRunner = null)
-    {
-        _hostCliRunner = hostCliRunner ?? new DefaultProcessRunner();
-    }
-
     public override AgentKind Kind => AgentKind.Cursor;
 
     /// <summary>
@@ -152,7 +144,14 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     }
 
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
-        => HostCliTextOnlyAuthScope.GetUnavailabilityReason(credential, HostCliTextOnlyAuthKind.Cursor);
+    {
+        if (credential is null)
+            return "CODEYBOX_CURSOR_AUTH_JSON is required";
+        return credential.EnvironmentVariables.TryGetValue("CODEYBOX_CURSOR_AUTH_JSON", out var cursor)
+               && !string.IsNullOrEmpty(cursor)
+            ? null
+            : "CODEYBOX_CURSOR_AUTH_JSON is required";
+    }
 
     public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
@@ -161,21 +160,32 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         string? reasoningMode = null,
         CancellationToken ct = default)
     {
+        _ = prompt;
+        _ = credential;
+        _ = modelId;
         _ = reasoningMode;
-        var argv = new List<string> { Binary, "--print", "--trust", "--force" };
-        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
-        if (!string.IsNullOrEmpty(effectiveModel))
-        {
-            argv.Add("--model");
-            argv.Add(effectiveModel);
-        }
-
-        return HostCliTextOnlyInvoker.RunAsync(
-            _hostCliRunner,
-            argv,
-            stdin: prompt,
-            credential,
-            HostCliTextOnlyAuthKind.Cursor,
-            ct);
+        _ = ct;
+        return Task.FromResult(new TextOnlyAgentResult(
+            false,
+            "Cursor text-only calls must run inside the work-item sandbox",
+            null,
+            null));
     }
+
+    public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+        => ExecuteTextOnlyInSandboxAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct);
 }
