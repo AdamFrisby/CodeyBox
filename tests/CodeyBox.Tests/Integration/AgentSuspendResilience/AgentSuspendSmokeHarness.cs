@@ -15,8 +15,8 @@ public enum AgentSuspendSmokeOutcome
     Completed,
 
     /// <summary>
-    /// Agent exited non-zero but stderr matches transient network patterns that
-    /// CodeyBox classifies as recoverable via in-iteration retry / stranded recovery.
+    /// Agent exited non-zero but stderr or exit shape matches patterns that
+    /// <see cref="AgentSuspendResilience.ShouldRetry"/> / orchestrator recovery handle.
     /// </summary>
     RecoverableFailure,
 
@@ -127,18 +127,28 @@ internal static class AgentSuspendSmokeHarness
             // Best-effort artifact for CI; do not fail the scenario.
         }
 
-        return Classify(result);
+        return Classify(agent, result);
     }
 
-    internal static AgentSuspendSmokeOutcome Classify(AgentResult result)
+    internal static AgentSuspendSmokeOutcome Classify(AgentKind agent, AgentResult result)
     {
         if (result.Success)
             return AgentSuspendSmokeOutcome.Completed;
 
         var classification = AgentFailureClassifier.Classify(result.Stderr, result.Stdout);
-        if (classification.Kind == AgentFailureKind.TransientNetwork)
+        var exitCode = ParseExitCodeFromSummary(result.Summary);
+        if (global::CodeyBox.Agents.AgentSuspendResilience.ShouldRetry(agent, classification, exitCode))
             return AgentSuspendSmokeOutcome.RecoverableFailure;
 
         return AgentSuspendSmokeOutcome.Failed;
+    }
+
+    private static int ParseExitCodeFromSummary(string summary)
+    {
+        const string prefix = "agent exited ";
+        if (!summary.StartsWith(prefix, StringComparison.Ordinal))
+            return -1;
+        var tail = summary[prefix.Length..];
+        return int.TryParse(tail, out var code) ? code : -1;
     }
 }

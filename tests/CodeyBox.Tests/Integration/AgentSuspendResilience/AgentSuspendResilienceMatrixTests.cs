@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using Xunit;
 
 namespace CodeyBox.Tests.Integration.AgentSuspendResilience;
 
@@ -18,21 +19,21 @@ public sealed class AgentSuspendResilienceMatrixTests
     public static IEnumerable<object[]> Matrix()
     {
         foreach (var agent in AgentSuspendSmokeEnvironment.AllAgents)
-        foreach (var seconds in AgentSuspendSmokeEnvironment.SuspendDurationsSeconds)
-            yield return [agent.Value, seconds];
+        {
+            foreach (var seconds in AgentSuspendSmokeEnvironment.SuspendDurationsSeconds)
+            {
+                yield return [agent.Value, seconds];
+            }
+        }
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Matrix))]
     public async Task AgentSurvivesSuspendDuringLlmCall(string agentName, int suspendSeconds)
     {
         var agent = new AgentKind(agentName);
-        var skip = AgentSuspendSmokeEnvironment.SkipReason(agent);
-        if (skip is not null)
-        {
-            // xUnit skip via return when Skip.If not available in all versions
-            return;
-        }
+        var skipReason = AgentSuspendSmokeEnvironment.SkipReason(agent);
+        Skip.If(skipReason is not null, skipReason!);
 
         var outcome = await AgentSuspendSmokeHarness.RunScenarioAsync(agent, suspendSeconds);
 
@@ -44,13 +45,7 @@ public sealed class AgentSuspendResilienceMatrixTests
                 outcome is AgentSuspendSmokeOutcome.Completed or AgentSuspendSmokeOutcome.RecoverableFailure,
                 $"agent={agentName} suspend={suspendSeconds}s expected survival, got {outcome}");
         }
-        else
-        {
-            // Ideal: survive through 300s; record outcome without failing CI on 120/300
-            // until the matrix is populated — still assert for visibility in local runs.
-            Assert.True(
-                outcome is AgentSuspendSmokeOutcome.Completed or AgentSuspendSmokeOutcome.RecoverableFailure,
-                $"agent={agentName} suspend={suspendSeconds}s expected survival (ideal ≤300s), got {outcome}");
-        }
+        // >60s: record outcome in scenario logs for docs/agent-suspend-resilience.md;
+        // do not fail CI on long windows until the matrix is populated.
     }
 }

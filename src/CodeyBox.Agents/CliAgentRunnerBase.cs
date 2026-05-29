@@ -126,7 +126,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             if (last.Success || attempt >= AgentSuspendResilience.MaxRetries)
                 return last;
 
-            var classification = AgentFailureClassifier.Classify(last.Stderr, last.Stdout);
+            var classification = ((IAgentRunner)this).ClassifyFailure(last);
             var exitCode = ParseExitCodeFromSummary(last.Summary);
             if (!AgentSuspendResilience.ShouldRetry(Kind, classification, exitCode))
                 return last;

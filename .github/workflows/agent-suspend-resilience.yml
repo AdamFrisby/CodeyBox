@@ -26,7 +26,9 @@ concurrency:
 jobs:
   matrix:
     name: agent × suspend duration smoke
-    runs-on: ubuntu-latest
+    # GitHub-hosted ubuntu-latest does not ship multipass/KVM; register a
+    # self-hosted runner with the `multipass` label (see docs/agent-suspend-resilience.md).
+    runs-on: [self-hosted, multipass]
     timeout-minutes: 360
     env:
       CODEYBOX_RUN_AGENT_SUSPEND_SMOKE: "1"

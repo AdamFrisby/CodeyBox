@@ -29,11 +29,16 @@ seconds, then `multipass start`.
 
 | Agent \\ Suspend (s) | 5 | 60 | 120 | 300 |
 |----------------------|---|----|-----|-----|
-| `claude` | run smoke | run smoke | run smoke | run smoke |
-| `codex` | run smoke | run smoke | run smoke | run smoke |
-| `gemini` | run smoke | run smoke | run smoke | run smoke |
-| `cursor` | run smoke | run smoke | run smoke | run smoke |
-| `opencode` | run smoke | run smoke | run smoke | run smoke |
+| `claude` | Not measured | Not measured | Not measured | Not measured |
+| `codex` | Not measured | Not measured | Not measured | Not measured |
+| `gemini` | Not measured | Not measured | Not measured | Not measured |
+| `cursor` | Not measured | Not measured | Not measured | Not measured |
+| `opencode` | Not measured | Not measured | Not measured | Not measured |
+
+Cells are updated from the `agent-suspend-resilience` workflow artifacts after a
+successful matrix run on a multipass-capable host (see **Running the smoke
+matrix** below). Until then, treat the table as a template — not evidence of
+≤60s survival.
 
 **Outcome legend**
 
@@ -82,9 +87,9 @@ windows.
 ## CI
 
 The [`agent-suspend-resilience`](../.github/workflows/agent-suspend-resilience.yml)
-workflow runs the same filter on a self-hosted or manually triggered runner
-with secrets configured. It does **not** run on every push to `main` (cost
-and duration).
+workflow runs the same filter on a **self-hosted runner labeled `multipass`**
+(with KVM and agent credentials). It does **not** run on every push to `main`
+(cost and duration). Register such a runner before enabling the schedule.
 
 ## When to add a stronger wrapper
 

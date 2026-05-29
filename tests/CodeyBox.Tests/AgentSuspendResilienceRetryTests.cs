@@ -85,6 +85,46 @@ public sealed class AgentSuspendResilienceRetryTests
         Assert.Equal(expected, AgentSuspendResilience.ShouldRetry(new AgentKind(agent), classification, exitCode: 1));
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(52)]
+    [InlineData(56)]
+    [InlineData(92)]
+    public void ShouldRetry_UnknownWithSuspendExitCodes_ReturnsTrueForSupportedAgents(int exitCode)
+    {
+        var classification = new AgentFailureClassification(AgentFailureKind.Unknown);
+        Assert.True(AgentSuspendResilience.ShouldRetry(AgentKind.Claude, classification, exitCode));
+    }
+
+    [Fact]
+    public void ShouldRetry_UnknownWithUnrelatedExitCode_ReturnsFalse()
+    {
+        var classification = new AgentFailureClassification(AgentFailureKind.Unknown);
+        Assert.False(AgentSuspendResilience.ShouldRetry(AgentKind.Claude, classification, exitCode: 2));
+    }
+
+    [Fact]
+    public async Task RunAsync_UnknownExitCodeOnly_RetriesOnceAndSucceeds()
+    {
+        var calls = 0;
+        var sandbox = new RetryRecordingSandbox(() =>
+        {
+            calls++;
+            return calls == 1
+                ? new SandboxExecResult(52, "", "")
+                : new SandboxExecResult(0, "ok", "");
+        });
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox,
+            "/work",
+            "hi",
+            credential: null);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, calls);
+    }
+
     private sealed class RetryRecordingSandbox(Func<SandboxExecResult> onExec) : ISandbox
     {
         public string Id => "codeybox-retry-test";
