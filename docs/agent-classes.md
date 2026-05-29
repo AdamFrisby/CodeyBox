@@ -345,7 +345,11 @@ Configured under `CodeyBox:QuotaRouter`:
       "QuotaCacheTtlSeconds": 60,
       "UnknownPolicy": "UseObservedFailures",
       "ObservedFailureWindowMinutes": 10,
-      "ObservedFailureRetentionMinutes": 30
+      "ObservedFailureRetentionMinutes": 30,
+      "ProbeMaxRetries": 2,
+      "ProbeRetryInitialDelayMs": 250,
+      "ProbeMaxConsecutiveFailures": 3,
+      "ProbeMaxStalenessSeconds": 300
     }
   }
 }
@@ -359,6 +363,10 @@ Configured under `CodeyBox:QuotaRouter`:
 | `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. |
 | `ObservedFailureWindowMinutes` | `10` | Minutes a quota-shaped stderr failure blocks the same agent/model. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed failures are retained in `state.db`. |
+| `ProbeMaxRetries` | `2` | Additional retries on a transient probe failure (network error / timeout / 5xx) before recording the failure. Hot-reloadable; currently honoured by the Claude probe. |
+| `ProbeRetryInitialDelayMs` | `250` | Base retry backoff in milliseconds; doubles each attempt. Hot-reloadable. |
+| `ProbeMaxConsecutiveFailures` | `3` | Consecutive probe failures tolerated before the probe stops returning the retained last-known-good snapshot. A single transient blip cannot silently disable the `MinQuotaPct` floor. Hot-reloadable. |
+| `ProbeMaxStalenessSeconds` | `300` | Maximum age of a retained last-known-good snapshot before it is dropped in favour of `AvailablePct=-1` (unknown). Hot-reloadable. |
 
 ---
 

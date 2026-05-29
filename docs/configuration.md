@@ -227,7 +227,11 @@ Tuning knobs for the quota probe and deferred-requeue logic.
   "QuotaCacheTtlSeconds": 60,
   "UnknownPolicy": "UseObservedFailures",
   "ObservedFailureWindowMinutes": 10,
-  "ObservedFailureRetentionMinutes": 30
+  "ObservedFailureRetentionMinutes": 30,
+  "ProbeMaxRetries": 2,
+  "ProbeRetryInitialDelayMs": 250,
+  "ProbeMaxConsecutiveFailures": 3,
+  "ProbeMaxStalenessSeconds": 300
 }
 ```
 
@@ -239,6 +243,10 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `UnknownPolicy` | `UseObservedFailures` | How to treat unknown probe snapshots: `UseObservedFailures`, `FailCautious`, or opt-in `FailOpen`. |
 | `ObservedFailureWindowMinutes` | `10` | Minutes a recent quota-shaped failure blocks the same agent/model across all projects. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed quota failures remain in `state.db`. |
+| `ProbeMaxRetries` | `2` | Additional retries on a transient probe failure (network error / timeout / 5xx) before recording the failure. Hot-reloadable; currently honoured by the Claude probe. |
+| `ProbeRetryInitialDelayMs` | `250` | Base retry backoff in milliseconds; doubles each attempt. Hot-reloadable. |
+| `ProbeMaxConsecutiveFailures` | `3` | Consecutive probe failures tolerated before the probe stops returning the retained last-known-good snapshot. A single transient blip will not silently disable the `MinQuotaPct` floor. Hot-reloadable. |
+| `ProbeMaxStalenessSeconds` | `300` | Maximum age of a retained last-known-good snapshot before it is dropped in favour of `AvailablePct=-1` (unknown). Hot-reloadable. |
 
 ---
 
