@@ -702,6 +702,7 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         UnknownPolicy = qr.UnknownPolicy,
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
+        CapRetryInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
     };
 });
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
@@ -2673,6 +2674,13 @@ namespace CodeyBox.Api
         public int ObservedFailureWindowMinutes { get; set; } = 10;
         /// <summary>Minutes observed quota failures are retained in state.db. Default 30.</summary>
         public int ObservedFailureRetentionMinutes { get; set; } = 30;
+        /// <summary>
+        /// Seconds before a cap-spill-deferred work item is reconsidered (every
+        /// eligible class member was at its per-agent concurrency cap). Default
+        /// 15; the orchestrator's own atomic-reservation defer uses the same
+        /// 15s cadence, so leave defaults aligned unless you have a reason.
+        /// </summary>
+        public int CapRetryIntervalSeconds { get; set; } = 15;
     }
 
     /// <summary>

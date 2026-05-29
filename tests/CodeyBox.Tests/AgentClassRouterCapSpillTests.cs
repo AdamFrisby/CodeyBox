@@ -217,18 +217,36 @@ public sealed class AgentClassRouterCapSpillTests
         {
             [Codex] = 0.0, // codex spend cap fully consumed
         });
+        var capRetry = TimeSpan.FromSeconds(15);
+        var quotaRecheck = TimeSpan.FromMinutes(5);
         var router = BuildRouter(
             [cls],
             [new FakeProbe(Claude, 100.0), new FakeProbe(Codex, 100.0)],
             counters, caps,
-            options: new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            options: new QuotaRouterOptions
+            {
+                MinQuotaPct = 10.0,
+                QuotaRecheckInterval = quotaRecheck,
+                CapRetryInterval = capRetry,
+            },
             budgetProvider: budgetProvider);
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
         Assert.Null(decision.Chosen);
         Assert.True(decision.ShouldWait);
-        Assert.DoesNotContain("Chosen", decision.Reason);
+        // Mixed-blocker park reason: both budget-exhausted AND cap-saturated
+        // members exist. The reason string must distinguish both blockers so an
+        // operator reading the audit can see WHY the class parked — a regression
+        // that drops either branch would mis-attribute the cause.
+        Assert.Contains("budget-exhausted", decision.Reason);
+        Assert.Contains("concurrency cap", decision.Reason);
+        // Park interval shrinks to CapRetryInterval (15s) because the cap is the
+        // soonest blocker to clear — a slot freeing is far quicker than waiting
+        // out the longer quota recheck window. A regression that omits the cap
+        // shrink in the mixed branch would silently park for QuotaRecheckInterval
+        // (5 min) — the exact throughput regression this feature prevents.
+        Assert.Equal(capRetry, decision.SuggestedRecheckIn);
     }
 
     [Fact]
@@ -463,16 +481,31 @@ public sealed class AgentClassRouterCapSpillTests
         counters.Increment(Claude);
         counters.Increment(Codex);
         var caps = CapsFor((Claude, 1), (Codex, 1));
+        var capRetry = TimeSpan.FromSeconds(20);
+        var quotaRecheck = TimeSpan.FromMinutes(5);
         var router = BuildRouter(
             [cls],
             [new FakeProbe(Claude, 100.0), new FakeProbe(Codex, 100.0)],
-            counters, caps);
+            counters, caps,
+            options: new QuotaRouterOptions
+            {
+                MinQuotaPct = 10.0,
+                QuotaRecheckInterval = quotaRecheck,
+                CapRetryInterval = capRetry,
+            });
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
         Assert.Null(decision.Chosen);
         Assert.True(decision.ShouldWait);
         Assert.Contains("per-agent concurrency cap", decision.Reason);
+        // PayPerApi-only cap-saturated park MUST shrink the recheck to the
+        // CapRetryInterval. If the production code drops this shrink for the
+        // PayPerApi branch, items would park for the much longer
+        // QuotaRecheckInterval (5 min default) — the throughput regression
+        // this feature is meant to prevent. Mirrors the Subscription assertion
+        // in AllEligibleMembersAtCap_DefersWithCapRetryInterval.
+        Assert.Equal(capRetry, decision.SuggestedRecheckIn);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
