@@ -121,9 +121,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                 .ConfigureAwait(false);
             if (sanitized is not null)
             {
-                // Log but continue — the original run may still succeed.
-                // The sanitiser failure detail is surfaced through the
-                // reactive retry path if the run later 400s.
+                AuditLog.ClaudeTranscriptSanitizerFailed(sanitized.Summary, sanitized.Stderr);
             }
         }
 

@@ -38,12 +38,6 @@ public static class ClaudeSessionSanitizer
     internal const string AssistantType = "assistant";
     internal const string UserType = "user";
 
-    // Reuse the upstream-bug signature constant from the single source of truth
-    // (ClaudeQuotaFailureDetector) so drift cannot occur when the API message
-    // wording changes.
-    internal static string ThinkingBlockSignature =>
-        ClaudeQuotaFailureDetector.ThinkingBlockSignature;
-
     private const int MaxFileBytes = 52428800; // 50 MiB
 
     /// <summary>
@@ -486,7 +480,6 @@ public static class ClaudeSessionSanitizer
         // coalesced assistant lines at their first-occurrence position.
         // Non-assistant lines, lines from coalesced msg_id groups at non-first
         // positions, and lines already processed are skipped.
-        var emittedMsgIds = new HashSet<string>(StringComparer.Ordinal);
         var sb = new StringBuilder(jsonlContent.Length);
 
         for (var i = 0; i < lines.Length; i++)

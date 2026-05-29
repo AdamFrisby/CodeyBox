@@ -723,6 +723,90 @@ public sealed class ClaudeSessionSanitizerTests
             e.Argv.Count > 0 && e.Argv[0] == "claude");
         Assert.Equal(1, claudeCount);
     }
+
+    // ── SanitizeTranscriptsAsync pipeline through ISandbox ────────────────────
+
+    [Fact]
+    public async Task SanitizeTranscriptsAsync_Pipeline_ReadsSanitizesAndWrites()
+    {
+        var transcript = """
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"prompt"}]}}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"thought"},{"type":"text","text":"reply"}]}}
+            """;
+
+        var sandbox = new ThinkingBlockRetrySandbox(
+            initialFailures: 0,
+            sanitizerExitsZero: true,
+            useThinkingBlockError: true,
+            fileListStdout: "/home/user/.claude/projects/test/session.jsonl",
+            catReadStdout: transcript,
+            catWriteSuccess: true);
+
+        var result = await ClaudeSessionSanitizer.SanitizeTranscriptsAsync(
+            sandbox, CancellationToken.None);
+
+        Assert.Null(result);
+
+        var execs = sandbox.AllExecs;
+        Assert.Contains(execs, e =>
+            e.Argv.Count > 0 && e.Argv[0] == "bash"
+            && e.Argv[2]?.Contains("cp -P") == true);
+        Assert.Contains(execs, e =>
+            e.Argv.Count > 0 && e.Argv[0] == "bash"
+            && e.Argv[2]?.Contains("cat --") == true);
+        Assert.Contains(execs, e =>
+            e.Argv.Count > 0 && e.Argv[0] == "bash"
+            && e.Argv[2]?.Contains("cat >") == true);
+    }
+
+    [Fact]
+    public async Task SanitizeTranscriptsAsync_WriteBackFailure_ReturnsError()
+    {
+        var sandbox = new ThinkingBlockRetrySandbox(
+            initialFailures: 0,
+            sanitizerExitsZero: true,
+            useThinkingBlockError: true,
+            fileListStdout: "/home/user/.claude/projects/foo/session.jsonl",
+            catReadStdout: "{}",
+            catWriteSuccess: false);
+
+        var result = await ClaudeSessionSanitizer.SanitizeTranscriptsAsync(
+            sandbox, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.False(result.Success);
+        Assert.Contains("session.jsonl", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RunResumedAsync_WriteBackFailure_NoRetryAndFoldsError()
+    {
+        // Backup succeeds and returns a file, cat read succeeds, but cat
+        // write-back fails — the sanitizer itself returns an error result
+        // and TryReactiveRetryAsync folds the detail without retrying.
+        var sandbox = new ThinkingBlockRetrySandbox(
+            initialFailures: 1,
+            sanitizerExitsZero: true,
+            useThinkingBlockError: true,
+            fileListStdout: "/home/user/.claude/projects/test/session.jsonl",
+            catReadStdout: "{}",
+            catWriteSuccess: false);
+        var config = new ClaudeThinkingBlockSanitizerConfig { Enabled = true };
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new ClaudeAgentRunner(defaults, null, config);
+
+        var result = await runner.RunResumedAsync(
+            sandbox, "/work", "prompt", credential: null,
+            resume: new AgentResumeContext("refs/heads/codeybox/preempt/test"));
+
+        Assert.False(result.Success);
+        Assert.Contains("sanitiser failed", result.Summary, StringComparison.Ordinal);
+
+        var claudeCount = sandbox.AllExecs.Count(e =>
+            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        Assert.Equal(1, claudeCount);
+    }
 }
 
 /// <summary>
@@ -735,16 +819,35 @@ internal sealed class ThinkingBlockRetrySandbox : ISandbox
     private readonly int _initialFailures;
     private readonly bool _sanitizerExitsZero;
     private readonly bool _useThinkingBlockError;
+    private readonly string? _fileListStdout;
+    private readonly string? _catReadStdout;
+    private readonly bool _catWriteSuccess;
     private int _callCount;
+    private int _bashCallCount;
 
     public ThinkingBlockRetrySandbox(
         int initialFailures,
         bool sanitizerExitsZero,
         bool useThinkingBlockError = true)
+        : this(initialFailures, sanitizerExitsZero, useThinkingBlockError,
+               fileListStdout: null, catReadStdout: null, catWriteSuccess: true)
+    {
+    }
+
+    public ThinkingBlockRetrySandbox(
+        int initialFailures,
+        bool sanitizerExitsZero,
+        bool useThinkingBlockError,
+        string? fileListStdout,
+        string? catReadStdout,
+        bool catWriteSuccess)
     {
         _initialFailures = initialFailures;
         _sanitizerExitsZero = sanitizerExitsZero;
         _useThinkingBlockError = useThinkingBlockError;
+        _fileListStdout = fileListStdout;
+        _catReadStdout = catReadStdout;
+        _catWriteSuccess = catWriteSuccess;
     }
 
     public string Id => "thinking-block-retry";
@@ -754,18 +857,49 @@ internal sealed class ThinkingBlockRetrySandbox : ISandbox
     {
         AllExecs.Add(exec);
 
-        // Sanitizer bash calls — return based on configuration
+        // Sanitizer / helper bash calls — return based on configuration
         if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
         {
+            _bashCallCount++;
+
             // Detect the sanitizer's backup script by looking for the "cp -P" fingerprint
             if (exec.Argv.Count >= 3 && exec.Argv[1] == "-c"
                 && (exec.Argv[2]?.Contains("cp -P") == true))
             {
+                if (_sanitizerExitsZero)
+                {
+                    return Task.FromResult(new SandboxExecResult(
+                        0,
+                        _fileListStdout ?? string.Empty,
+                        string.Empty));
+                }
                 return Task.FromResult(new SandboxExecResult(
-                    _sanitizerExitsZero ? 0 : 1, string.Empty,
-                    _sanitizerExitsZero ? string.Empty : "sanitizer failed"));
+                    1, string.Empty, "sanitizer failed"));
             }
-            // Other bash calls (scratchpad restore, cat, etc.) succeed
+
+            // Detect cat read calls: "cat -- \"$1\" 2>/dev/null || true"
+            if (exec.Argv.Count >= 3 && exec.Argv[1] == "-c"
+                && exec.Argv[2] is not null
+                && exec.Argv[2].Contains("cat -- \"$1\"", StringComparison.Ordinal)
+                && _catReadStdout is not null)
+            {
+                return Task.FromResult(new SandboxExecResult(
+                    0, _catReadStdout, string.Empty));
+            }
+
+            // Detect cat write-back calls: "cat > \"$1\""
+            if (exec.Argv.Count >= 3 && exec.Argv[1] == "-c"
+                && exec.Argv[2] is not null
+                && exec.Argv[2].Contains("cat > \"$1\"", StringComparison.Ordinal)
+                && !exec.Argv[2].Contains("cat -- \"$1\"", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(
+                    _catWriteSuccess ? 0 : 1,
+                    string.Empty,
+                    _catWriteSuccess ? string.Empty : "write error"));
+            }
+
+            // Other bash calls (scratchpad restore, etc.) succeed
             return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
         }
 

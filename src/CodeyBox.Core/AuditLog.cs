@@ -824,6 +824,22 @@ public static class AuditLog
             .Information("Configuration reloaded: block={Block} oldValue={OldValue} newValue={NewValue}",
                 block, oldValue, newValue);
 
+    // ── Transcript sanitisation ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Emitted when the preventive Claude thinking-block transcript sanitizer
+    /// fails inside <c>PrepareSandboxAsync</c>. The run continues — the
+    /// failure detail surfaces later via the reactive retry path if the CLI
+    /// call subsequently 400s. This event gives operators an early signal
+    /// that the primary prevention mechanism is unhealthy.
+    /// </summary>
+    public static void ClaudeTranscriptSanitizerFailed(string summary, string? stderr) =>
+        Audit("agent.claude_transcript_sanitizer_failed")
+            .Warning(
+                "Preventive Claude transcript sanitization failed ({Summary}); " +
+                "the run will continue but thinking-block 400s may follow. stderr={Stderr}",
+                summary, stderr ?? "none");
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>
