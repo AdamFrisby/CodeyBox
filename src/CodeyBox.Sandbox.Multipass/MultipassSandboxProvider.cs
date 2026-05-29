@@ -747,6 +747,35 @@ git push origin HEAD:{refName}";
             throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
 
         _log.LogInformation("SandboxLeakReaper: purging leaked VM {Name}", name);
+
+        // R8.1 (incident 2026-05-29): if the VM is in a transitional / suspend
+        // lifecycle state, qemu is likely holding the disk-image write-lock and
+        // `multipass delete --purge` will fail with "Failed to get shared
+        // 'write' lock". Try `multipass stop` first to release the lock cleanly
+        // when multipassd is still responsive — this is the recovery path the
+        // post-incident review documented as "do this first before delete".
+        var (state, _) = await TryReadStateAndMemoryAsync(opts, name, ct);
+        if (NeedsStopBeforePurge(state))
+        {
+            _log.LogInformation(
+                "DisposeLeakedAsync({Name}): VM is in transitional state '{State}'; attempting stop to release qemu disk-image lock before delete --purge",
+                name, state);
+            try
+            {
+                var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
+                if (stop.ExitCode != 0)
+                    _log.LogWarning(
+                        "DisposeLeakedAsync({Name}): multipass stop pre-purge returned exit {ExitCode}: {Stderr}",
+                        name, stop.ExitCode, stop.Stderr);
+            }
+            catch (Exception stopEx) when (stopEx is not OperationCanceledException)
+            {
+                _log.LogWarning(stopEx,
+                    "DisposeLeakedAsync({Name}): multipass stop pre-purge threw; proceeding to delete --purge anyway",
+                    name);
+            }
+        }
+
         var run = await RunAsync(opts, [opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: ct);
         if (run.ExitCode != 0)
             throw new InvalidOperationException($"multipass delete --purge {name} failed (exit {run.ExitCode}): {run.Stderr}");
@@ -757,6 +786,78 @@ git push origin HEAD:{refName}";
         // Remove from active set and invalidate cache.
         _activeSandboxNames.TryRemove(name, out _);
         _listCacheExpiry = DateTimeOffset.MinValue;
+    }
+
+    /// <summary>
+    /// True when the VM's state is one in which qemu is likely still holding
+    /// the disk-image write-lock — Suspending (mid-snapshot) or Unknown
+    /// (qemu present but multipassd cannot describe it, classic symptom of the
+    /// wedge from incident 2026-05-29). In those states a clean
+    /// <c>multipass stop</c> should precede <c>delete --purge</c>.
+    /// </summary>
+    internal static bool NeedsStopBeforePurge(string? state) =>
+        state is not null &&
+        (state.Equals("Suspending", StringComparison.OrdinalIgnoreCase) ||
+         state.Equals("Unknown", StringComparison.OrdinalIgnoreCase));
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
+        IReadOnlySet<string> liveSuspendedNames,
+        CancellationToken ct)
+    {
+        // Startup reconciliation: enumerate every managed VM, identify the ones
+        // in suspend lifecycle / transitional state with NO live mapping (i.e.
+        // orphans from a prior unclean shutdown), and try to bring each back to
+        // a clean state via DisposeLeakedAsync. DisposeLeakedAsync now does
+        // stop-then-purge for transitional VMs, which is what releases the
+        // qemu lock for the wedge case from incident 2026-05-29. VMs the
+        // resume handler will reattach (those in liveSuspendedNames) are
+        // intentionally untouched.
+        IReadOnlyList<ManagedSandboxInfo> managed;
+        try
+        {
+            managed = await ListAllManagedAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "ReconcileStuckSandboxesAsync: failed to list managed sandboxes; nothing to reconcile");
+            return [];
+        }
+
+        var unrecoverable = new List<string>();
+        foreach (var info in managed)
+        {
+            if (ct.IsCancellationRequested) break;
+            // Live mapping → resume handler owns this VM; do NOT touch.
+            if (liveSuspendedNames.Contains(info.Name)) continue;
+            // Not in a transitional / suspend-lifecycle state → not the wedge case
+            // this reconciler exists for; the leak reaper handles ordinary stale VMs.
+            if (!info.IsSuspendLifecycleOrFrozen) continue;
+            // A still-tracked-active VM means this very process created it during
+            // the current boot — leave it alone, it is not stale.
+            if (info.IsTrackedActive) continue;
+
+            _log.LogInformation(
+                "Startup reconciler: recovering orphaned VM {Name} (suspend-lifecycle, no live mapping)",
+                info.Name);
+            try
+            {
+                await DisposeLeakedAsync(info.Name, ct);
+                AuditLog.SandboxStartupReconciled(info.Name, "stop+purge");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "Startup reconciler: could not recover orphaned VM {Name}; operator/root cleanup likely required",
+                    info.Name);
+                unrecoverable.Add(info.Name);
+            }
+        }
+
+        return unrecoverable;
     }
 
     private async Task<IReadOnlyList<ManagedSandboxInfo>> FetchManagedSandboxesAsync(MultipassSandboxOptions opts, CancellationToken ct)

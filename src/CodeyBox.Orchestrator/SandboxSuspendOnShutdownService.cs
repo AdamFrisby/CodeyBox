@@ -76,6 +76,20 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     private readonly int _maxParallel;
     private readonly TimeSpan _perSuspendTimeout;
     private readonly TimeSpan _perGiBSuspendBudget;
+    // R8.1 (VM-wedging incident 2026-05-29): dispatch must be paused BEFORE
+    // SnapshotSuspendableActive runs, otherwise the orchestrator's dispatch
+    // loop keeps creating new sandboxes that race the snapshot and are then
+    // torn down uncleanly when the BackgroundService cancellation fires later
+    // in the shutdown sequence. Nullable so test fixtures driving SuspendAllAsync
+    // directly don't need to hand in a gate.
+    private readonly IShutdownDispatchGate? _dispatchGate;
+    // R8.1: ephemeral worker VMs can be torn down by Suspend (current default,
+    // preserves in-RAM agent state across restart), Stop (clean multipass stop,
+    // preserves VM disk but kills the agent process — far less likely to wedge
+    // multipassd than suspend), or Dispose (delete --purge, full teardown — no
+    // suspended-resume bookkeeping is written, the work item recovers via the
+    // existing preempt-checkpoint flow). Default Suspend for backward compat.
+    private readonly SandboxTeardownMode _teardownMode;
 
     public SandboxSuspendOnShutdownService(
         ISandboxProvider provider,
@@ -83,7 +97,9 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         ILogger<SandboxSuspendOnShutdownService> log,
         int? maxParallel = null,
         TimeSpan? perSuspendTimeout = null,
-        TimeSpan? perGiBSuspendBudget = null)
+        TimeSpan? perGiBSuspendBudget = null,
+        IShutdownDispatchGate? dispatchGate = null,
+        SandboxTeardownMode teardownMode = SandboxTeardownMode.Suspend)
     {
         _provider = provider;
         _store = store;
@@ -91,7 +107,14 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         _maxParallel = maxParallel is > 0 ? maxParallel.Value : DefaultMaxParallelSuspends;
         _perSuspendTimeout = perSuspendTimeout is { } t && t > TimeSpan.Zero ? t : DefaultPerSuspendTimeout;
         _perGiBSuspendBudget = perGiBSuspendBudget is { } g && g > TimeSpan.Zero ? g : DefaultPerGiBSuspendBudget;
+        _dispatchGate = dispatchGate;
+        _teardownMode = teardownMode;
     }
+
+    /// <summary>The dispatch-pause-was-called signal as observed by SuspendAllAsync.</summary>
+    internal bool DispatchPauseObserved { get; private set; }
+    /// <summary>Whether dispatch was paused before the first per-VM teardown call. Test seam.</summary>
+    internal bool DispatchPausedBeforeTeardown { get; private set; }
 
     /// <summary>
     /// Effective per-VM suspend timeout: the floor (<see cref="_perSuspendTimeout"/>)
@@ -138,6 +161,18 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 
     internal async Task SuspendAllAsync()
     {
+        // R8.1 (incident 2026-05-29): pause dispatch BEFORE we snapshot or do
+        // any per-VM teardown. The snapshot is a point-in-time view, so if
+        // dispatch keeps running we'll miss any new sandbox the orchestrator
+        // creates between the snapshot and the BackgroundService cancellation,
+        // leaving those VMs to be torn down uncleanly. Idempotent — a test that
+        // wires the gate but pauses first still observes the same DispatchPauseObserved.
+        if (_dispatchGate is not null)
+        {
+            DispatchPauseObserved = true;
+            _dispatchGate.PauseDispatch();
+        }
+
         if (_provider is not ISuspendingSandboxProvider suspending)
         {
             _log.LogDebug("Sandbox provider {Provider} does not support suspend; skipping suspend-on-shutdown sweep",
@@ -148,11 +183,17 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         var entries = suspending.SnapshotSuspendableActive();
         if (entries.Count == 0)
         {
-            _log.LogInformation("Suspend-on-shutdown: no in-flight sandboxes to suspend");
+            _log.LogInformation("Suspend-on-shutdown: no in-flight sandboxes to {Mode} before exit", _teardownMode);
             return;
         }
 
-        _log.LogInformation("Suspend-on-shutdown: freezing {Count} in-flight sandbox(es) before exit", entries.Count);
+        // Test seam: the gate (if any) must already be paused when we begin
+        // tearing down individual VMs — that ordering is the whole point.
+        DispatchPausedBeforeTeardown = _dispatchGate is null || _dispatchGate.IsDispatchPaused;
+
+        _log.LogInformation(
+            "Sandbox shutdown teardown ({Mode}): {Count} in-flight sandbox(es)",
+            _teardownMode, entries.Count);
 
         using var gate = new SemaphoreSlim(_maxParallel, _maxParallel);
         var tasks = new List<Task>(entries.Count);
@@ -163,7 +204,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             {
                 try
                 {
-                    await SuspendOneAsync(workItemId, sandbox);
+                    await TeardownOneAsync(workItemId, sandbox);
                 }
                 finally
                 {
@@ -172,6 +213,86 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             }));
         }
         await Task.WhenAll(tasks);
+    }
+
+    private Task TeardownOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox) =>
+        _teardownMode switch
+        {
+            SandboxTeardownMode.Suspend => SuspendOneAsync(workItemId, sandbox),
+            SandboxTeardownMode.Stop => StopOneAsync(workItemId, sandbox),
+            SandboxTeardownMode.Dispose => DisposeOneAsync(workItemId, sandbox),
+            _ => SuspendOneAsync(workItemId, sandbox),
+        };
+
+    /// <summary>
+    /// Teardown via clean stop (preserves VM disk but kills the in-VM agent
+    /// process). Faster than suspend and much less likely to wedge multipassd:
+    /// stop releases the qemu disk-image write-lock cleanly, whereas an
+    /// interrupted suspend can leave qemu holding the lock. The work item's
+    /// existing preempt-checkpoint flow drives recovery on restart, the same
+    /// way it does for non-suspending providers (process / bubblewrap).
+    /// </summary>
+    private async Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
+    {
+        var timeout = SuspendTimeoutFor(sandbox);
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        try
+        {
+            if (sandbox is IPreemptibleSandbox preemptible)
+            {
+                await preemptible.StopAndPreserveAsync(timeoutCts.Token);
+                AuditLog.SandboxStoppedOnShutdown(workItemId, sandbox.Id);
+                return;
+            }
+
+            _log.LogWarning(
+                "Sandbox {SandboxId} for work item {WorkItemId} does not implement IPreemptibleSandbox; falling back to dispose",
+                sandbox.Id, workItemId);
+            await sandbox.DisposeAsync();
+            AuditLog.SandboxStoppedOnShutdown(workItemId, sandbox.Id);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning(
+                "Stop exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; surfacing as needing operator attention",
+                timeout, workItemId, sandbox.Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Stop failed for work item {WorkItemId} sandbox {SandboxId}",
+                workItemId, sandbox.Id);
+        }
+    }
+
+    /// <summary>
+    /// Teardown via dispose (delete --purge). Skips the preserve-on-dispose
+    /// path entirely — the VM is destroyed, the work item recovers via the
+    /// standard stranded-item path on the next startup. The simplest and most
+    /// robust mode against multipassd lock contention, at the cost of losing
+    /// any in-VM agent state.
+    /// </summary>
+    private async Task DisposeOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
+    {
+        var timeout = SuspendTimeoutFor(sandbox);
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        try
+        {
+            await sandbox.DisposeAsync().AsTask().WaitAsync(timeoutCts.Token);
+            AuditLog.SandboxDisposedOnShutdown(workItemId, sandbox.Id);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning(
+                "Dispose exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; surfacing as needing operator attention",
+                timeout, workItemId, sandbox.Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Dispose failed for work item {WorkItemId} sandbox {SandboxId}",
+                workItemId, sandbox.Id);
+        }
     }
 
     private async Task SuspendOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)

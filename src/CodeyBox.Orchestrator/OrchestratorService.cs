@@ -13,8 +13,33 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IShutdownDispatchGate
 {
+    // Flipped by PauseDispatch() — the SandboxSuspendOnShutdownService calls it
+    // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
+    // VMs, so the dispatch loop stops picking up new items and creating new
+    // sandboxes that would race the snapshot. In-flight workers continue to
+    // completion until the BackgroundService cancellation token fires later in
+    // the shutdown sequence. Read on every dispatch loop iteration.
+    private int _shutdownDispatchPaused;
+    public bool IsDispatchPaused => Volatile.Read(ref _shutdownDispatchPaused) != 0;
+    public void PauseDispatch()
+    {
+        if (Interlocked.Exchange(ref _shutdownDispatchPaused, 1) == 0)
+        {
+            _log.LogInformation(
+                "OrchestratorService: dispatch paused for shutdown — no new work will be picked up");
+            // Wake the dispatch loop so it observes the flag immediately rather
+            // than blocking on DequeueAsync until the next natural kick. A
+            // default WorkItemId (Guid.Empty) is treated as a spurious kick by
+            // the loop — the IsDispatchPaused check at the top fires before
+            // PickNextEligibleAsync runs and exits the loop cleanly.
+            try { _ = _queue.EnqueueAsync(default, CancellationToken.None); }
+            catch { /* best-effort: queue may already be shutting down */ }
+        }
+    }
+
+
     private readonly ITaskQueue _queue;
     private readonly IWorkItemStore _store;
     private readonly IPipelineRunner _pipeline;
@@ -367,6 +392,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Shutdown dispatch gate (R8.1 fix for VM-wedging incident
+            // 2026-05-29): the suspend-on-shutdown handler calls PauseDispatch()
+            // BEFORE it snapshots SnapshotSuspendableActive(), so once the flag
+            // is set the dispatch loop MUST stop picking up new work and
+            // creating new sandboxes that would race the snapshot — those
+            // would otherwise be left mid-launch when the BackgroundService
+            // cancellation token fires later in the shutdown sequence. The
+            // in-flight worker tasks already in flight continue normally.
+            if (IsDispatchPaused) break;
+
             // Pause gate: spin-wait while the queue is paused, without consuming
             // from the channel. In-flight workers continue normally during pause.
             if (!await WaitIfPausedAsync(stoppingToken)) break;
@@ -379,6 +414,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             try { kick = await _queue.DequeueAsync(stoppingToken); }
             catch (OperationCanceledException) { break; }
             if (kick is null) break;
+
+            // Re-check after dequeue: PauseDispatch may have fired while
+            // DequeueAsync was blocked, and the wake-up kick (a default
+            // WorkItemId enqueued by PauseDispatch itself) must not be allowed
+            // to flow through to PickNextEligibleAsync — that would happily
+            // pick up a real queued item from the store and spawn a new
+            // sandbox that races the snapshot.
+            if (IsDispatchPaused) break;
 
             // A kick for an item currently sleeping in a defer-requeue delay is
             // treated as an explicit "retry now" signal: clear the deferred mark

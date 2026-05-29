@@ -1531,6 +1531,11 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<AgentConcurrencySnapshot>(),
     sp.GetRequiredService<IBaselineImageResolver>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
+// R8.1: expose the orchestrator as IShutdownDispatchGate so the
+// SandboxSuspendOnShutdownService can pause new dispatch before the per-VM
+// teardown begins (incident 2026-05-29 fix).
+builder.Services.AddSingleton<IShutdownDispatchGate>(
+    sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
 // R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
 // can resume them. Both halves of the cycle are IHostedLifecycleService so the
@@ -1538,10 +1543,28 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>(
 // rather than blocking a thread-pool callback. The resume runs BEFORE
 // OrchestratorService.ExecuteAsync (and before the dead-worker reaper) so
 // adopted in-VM agents are observed before the standard recovery sweep fires.
+//
+// R8.1 (incident 2026-05-29): the suspend handler is wired with the orchestrator
+// as an IShutdownDispatchGate so it pauses new dispatch BEFORE snapshotting the
+// suspendable set — without that ordering, the dispatch loop keeps creating
+// new sandboxes that race the snapshot. Teardown mode is operator-tunable via
+// CodeyBox:Shutdown:SandboxTeardownMode (Suspend / Stop / Dispose); default
+// Suspend for backward compatibility.
 builder.Services.AddHostedService(sp => new SandboxSuspendOnShutdownService(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
-    sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>()));
+    sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>(),
+    dispatchGate: sp.GetService<IShutdownDispatchGate>(),
+    teardownMode: sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+        .CurrentValue.Shutdown.SandboxTeardownMode));
+// Startup reconciler runs BEFORE the resume handler (registration order ==
+// StartingAsync execution order) so VMs left wedged in Suspending state from
+// a prior unclean shutdown are returned to a clean state before resume tries
+// to multipass-start them or the leak reaper considers them on its first sweep.
+builder.Services.AddHostedService(sp => new StartupSandboxReconciliationService(
+    sp.GetService<ISandboxProvider>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ILogger<StartupSandboxReconciliationService>>()));
 builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
     sp.GetService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -2408,6 +2431,20 @@ namespace CodeyBox.Api
         /// during SIGTERM/Ctrl-C. Defaults to 60 seconds.
         /// </summary>
         public int GraceSeconds { get; set; } = 60;
+
+        /// <summary>
+        /// How to tear down in-flight worker sandboxes during graceful shutdown.
+        /// Default <see cref="SandboxTeardownMode.Suspend"/> (original
+        /// behaviour: freeze RAM via <c>multipass suspend</c> and resume on
+        /// next startup). Operators running stateless workloads that recover
+        /// fully from the preempt-checkpoint flow should consider
+        /// <see cref="SandboxTeardownMode.Stop"/> or
+        /// <see cref="SandboxTeardownMode.Dispose"/> — both avoid the qemu disk-image
+        /// write-lock wedge that caused the 2026-05-29 incident, where a
+        /// SIGKILL during suspend stranded the orphan qemu processes and
+        /// blocked <c>multipass stop</c>/<c>multipass delete --purge</c>.
+        /// </summary>
+        public SandboxTeardownMode SandboxTeardownMode { get; set; } = SandboxTeardownMode.Suspend;
     }
 
     /// <summary>
