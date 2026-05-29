@@ -126,6 +126,33 @@ public sealed class MultipassDaemonRetryTests
         Assert.Null(classification);
     }
 
+    [Fact]
+    public void ClassifyTransient_DetectsInstanceLockContention()
+    {
+        var classification = MultipassDaemonRetry.ClassifyTransient(
+            Argv("clone", "baseline-xxx", "--name", "codeybox-y"),
+            new ProcessRunResult(1, "", "clone failed: Could not acquire lock for '/var/snap/multipass/common/data/multipassd/multipassd-vm-instances.json'"));
+        Assert.Equal("multipass-instance-lock-contention", classification);
+    }
+
+    [Fact]
+    public void ClassifyTransient_DetectsInstanceLockContention_OnLaunch()
+    {
+        var classification = MultipassDaemonRetry.ClassifyTransient(
+            Argv("launch", "--name", "codeybox-x"),
+            new ProcessRunResult(1, "", "launch failed: Could not acquire lock for '/var/snap/multipass/common/data/multipassd/multipassd-vm-instances.json'"));
+        Assert.Equal("multipass-instance-lock-contention", classification);
+    }
+
+    [Fact]
+    public void ClassifyTransient_LockContention_RequiresVmInstancesPath()
+    {
+        var classification = MultipassDaemonRetry.ClassifyTransient(
+            Argv("clone", "baseline-xxx", "--name", "codeybox-y"),
+            new ProcessRunResult(1, "", "Could not acquire lock for '/tmp/other.lock'"));
+        Assert.Null(classification);
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // RunWithRetryAsync: retry & audit & log behaviour
     // ────────────────────────────────────────────────────────────────────
@@ -228,6 +255,52 @@ public sealed class MultipassDaemonRetryTests
         Assert.Equal(
             [TimeSpan.FromMilliseconds(7), TimeSpan.FromMilliseconds(13)],
             delays);
+    }
+
+    [Fact]
+    public async Task RunWithRetry_CloneRetriesLockContention_ThenSucceeds()
+    {
+        var argv = Argv("clone", "baseline-xxx", "--name", "codeybox-y");
+        var attempts = 0;
+
+        var result = await MultipassDaemonRetry.RunWithRetryAsync(
+            argv,
+            _ =>
+            {
+                attempts++;
+                if (attempts == 1)
+                    return Task.FromResult(new ProcessRunResult(
+                        1, "", "clone failed: Could not acquire lock for '/var/snap/multipass/common/data/multipassd/multipassd-vm-instances.json'"));
+                return Task.FromResult(new ProcessRunResult(0, "done", ""));
+            },
+            Healthy,
+            NullLogger.Instance,
+            WorkItemId.New(),
+            CancellationToken.None,
+            InstantPolicy());
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal("done", result.Stdout);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task RunWithRetry_LaunchRetriesLockContention_ExhaustsThenSurfaces()
+    {
+        var argv = Argv("launch", "--name", "codeybox-x");
+        var stderr = "launch failed: Could not acquire lock for '/var/snap/multipass/common/data/multipassd/multipassd-vm-instances.json'";
+
+        var result = await MultipassDaemonRetry.RunWithRetryAsync(
+            argv,
+            _ => Task.FromResult(new ProcessRunResult(1, "", stderr)),
+            ct => Task.FromResult(MultipassDaemonHealthProbeResult.Unhealthy("daemon stalled")),
+            NullLogger.Instance,
+            WorkItemId.New(),
+            CancellationToken.None,
+            InstantPolicy());
+
+        Assert.Contains("multipass daemon unreachable after 2 retries", result.Stderr);
+        Assert.Contains("multipass-instance-lock-contention", result.Stderr);
     }
 
     [Fact]
