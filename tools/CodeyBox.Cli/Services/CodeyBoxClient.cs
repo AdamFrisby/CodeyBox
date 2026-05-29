@@ -107,12 +107,6 @@ internal sealed class CodeyBoxClient
             return SseWatchResult.ShouldFallback;
         }
 
-        if (resp.StatusCode == HttpStatusCode.NotFound)
-        {
-            resp.Dispose();
-            return SseWatchResult.NotFound;
-        }
-
         if (!resp.IsSuccessStatusCode)
         {
             resp.Dispose();
@@ -124,7 +118,6 @@ internal sealed class CodeyBoxClient
             await using var stream = await resp.Content.ReadAsStreamAsync(ct);
             using var reader = new StreamReader(stream);
             string? lastState = null;
-            var sawTerminal = false;
 
             while (!ct.IsCancellationRequested)
             {
@@ -158,13 +151,13 @@ internal sealed class CodeyBoxClient
                 }
 
                 if (WorkItemDto.IsTerminalState(state))
-                {
-                    sawTerminal = true;
                     return SseWatchResult.Completed;
-                }
             }
 
-            return sawTerminal ? SseWatchResult.Completed : SseWatchResult.ShouldFallback;
+            if (ct.IsCancellationRequested)
+                throw new OperationCanceledException(ct);
+
+            return SseWatchResult.ShouldFallback;
         }
         finally
         {

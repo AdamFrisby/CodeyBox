@@ -10,7 +10,4 @@ internal enum SseWatchResult
 
     /// <summary>SSE could not be used; caller should fall back to polling.</summary>
     ShouldFallback,
-
-    /// <summary>Work item does not exist (HTTP 404).</summary>
-    NotFound,
 }

@@ -19,7 +19,7 @@ internal static class QueueWatch
         var pollOpt = new Option<bool>("--poll", "Use HTTP polling instead of the SSE event stream");
         var streamOpt = new Option<bool>(
             "--stream",
-            "(reserved) Stream agent stdout when available — not implemented yet");
+            "Stream agent stdout when available (not implemented; watch uses state transitions)");
 
         cmd.AddArgument(idArg);
         cmd.AddOption(pollOpt);
@@ -38,9 +38,7 @@ internal static class QueueWatch
             if (streamStdout)
             {
                 await Console.Error.WriteLineAsync(
-                    "Error: --stream is reserved and not implemented yet.");
-                ctx.ExitCode = 1;
-                return;
+                    "Note: --stream is not implemented yet; watching state transitions only.");
             }
 
             var config = ConfigResolver.Resolve(flagUrl, flagKey);
@@ -56,30 +54,29 @@ internal static class QueueWatch
 
             try
             {
+                string? lastPrintedState = null;
+
                 if (!forcePoll)
                 {
-                    var sseResult = await WatchViaSseAsync(client, id, ct);
-                    switch (sseResult)
+                    var sseResult = await WatchViaSseAsync(client, id, state =>
                     {
-                        case SseWatchResult.Completed:
-                            return;
-                        case SseWatchResult.NotFound:
-                            await Console.Error.WriteLineAsync($"Error: work item '{id}' not found.");
-                            ctx.ExitCode = 1;
-                            return;
-                        case SseWatchResult.ShouldFallback:
-                            await Console.Error.WriteLineAsync(
-                                "Note: SSE unavailable; using state polling.");
-                            break;
-                    }
+                        PrintStateTransition(state);
+                        lastPrintedState = state;
+                    }, ct);
+
+                    if (sseResult == SseWatchResult.Completed)
+                        return;
+
+                    await Console.Error.WriteLineAsync(
+                        "Note: SSE unavailable; using state polling.");
                 }
 
-                if (!await WatchViaPollingAsync(client, id, ct))
+                if (!await WatchViaPollingAsync(client, id, lastPrintedState, ct))
                     ctx.ExitCode = 1;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                // Normal exit on Ctrl+C
+                // Ctrl+C: exit 0 without treating cancellation as SSE failure or polling error.
             }
             catch (CodeyBoxApiException ex)
             {
@@ -97,13 +94,19 @@ internal static class QueueWatch
     }
 
     private static Task<SseWatchResult> WatchViaSseAsync(
-        CodeyBoxClient client, string id, CancellationToken ct) =>
-        client.TryWatchWorkItemEventsAsync(id, PrintStateTransition, ct);
+        CodeyBoxClient client,
+        string id,
+        Action<string> onStateTransition,
+        CancellationToken ct) =>
+        client.TryWatchWorkItemEventsAsync(id, onStateTransition, ct);
 
     /// <returns><c>false</c> when the work item was not found.</returns>
-    private static async Task<bool> WatchViaPollingAsync(CodeyBoxClient client, string id, CancellationToken ct)
+    private static async Task<bool> WatchViaPollingAsync(
+        CodeyBoxClient client,
+        string id,
+        string? lastState,
+        CancellationToken ct)
     {
-        string? lastState = null;
 
         while (!ct.IsCancellationRequested)
         {
