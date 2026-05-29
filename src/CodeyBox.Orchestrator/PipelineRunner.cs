@@ -4411,16 +4411,35 @@ public sealed class PipelineRunner : IPipelineRunner
                 Outcome: null), CancellationToken.None);
             return id;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (IsTolerableInvolvementPersistenceFault(ex))
         {
-            // Best-effort like fallback-history recording: a persistence failure
-            // must not break the pipeline. Logged at Warning (not Debug) so a
-            // dropped audit-trail row is operator-visible rather than silent.
+            // Best-effort like fallback-history recording: a *transient* persistence
+            // fault (DB busy/locked/I-O hiccup, or a store disposed during host
+            // shutdown) must not break a work item that did real work. Logged at
+            // Warning (not Debug) so a dropped audit-trail row is operator-visible.
+            // Only this bounded set is swallowed — an unexpected exception (e.g. a
+            // wiring/programming bug in the recording path) propagates so it surfaces
+            // in CI rather than silently eroding the 1:1 phase→row guarantee.
             // Cancellation is never swallowed — it propagates to abort the phase.
             _log.LogWarning(ex, "agent involvement start record failed for phase '{Phase}'", phase);
             return null;
         }
     }
+
+    /// <summary>
+    /// True for the bounded set of exceptions involvement persistence is allowed
+    /// to swallow: transient store faults (any <see cref="System.Data.Common.DbException"/>
+    /// such as SQLite busy/locked, an <see cref="IOException"/>, a
+    /// <see cref="TimeoutException"/>) and an <see cref="ObjectDisposedException"/>
+    /// from a store torn down during host shutdown. Cancellation is excluded so it
+    /// keeps propagating; anything else is an unexpected bug that must surface.
+    /// </summary>
+    private static bool IsTolerableInvolvementPersistenceFault(Exception ex) =>
+        ex is not OperationCanceledException
+        && ex is System.Data.Common.DbException
+            or IOException
+            or TimeoutException
+            or ObjectDisposedException;
 
     /// <summary>
     /// Stamps the completion outcome on a previously-started involvement row.
@@ -4435,10 +4454,12 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             await _involvement.FinalizeAsync(id, DateTimeOffset.UtcNow, outcome, CancellationToken.None);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (IsTolerableInvolvementPersistenceFault(ex))
         {
             // Best-effort; Warning (not Debug) so a missed completion stamp on the
             // audit trail is visible to operators instead of silently swallowed.
+            // Only transient persistence faults are swallowed (see
+            // IsTolerableInvolvementPersistenceFault) — an unexpected bug propagates.
             // Cancellation is never swallowed — it propagates to abort the phase.
             _log.LogWarning(ex, "agent involvement finalize failed");
         }

@@ -572,9 +572,10 @@ internal static class WorkItemEndpoints
             var involvementHistory = await involvement.ListByWorkItemAsync(item.Id, ct);
             dto = dto with
             {
-                AgentHistory = involvementHistory.Count > 0
-                    ? involvementHistory.Select(MapInvolvement).ToList()
-                    : Array.Empty<AgentInvolvementDto>(),
+                // Select(...).ToList() already yields an empty (non-null) list for an
+                // empty trail, so [] still distinguishes "no agent ran yet" from the
+                // store-unwired case above (where AgentHistory is left null/omitted).
+                AgentHistory = involvementHistory.Select(MapInvolvement).ToList(),
                 WorkAgent = ResolveWorkAgent(involvementHistory),
             };
         }

@@ -142,20 +142,11 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
 }
 
 /// <summary>
-/// No-op implementation used when involvement persistence is not wired (tests,
-/// embedded-only deployments). Recording is silently dropped; lists return empty.
-/// </summary>
-public sealed class NullAgentInvolvementStore : IAgentInvolvementStore
-{
-    public Task RecordStartAsync(AgentInvolvement entry, CancellationToken ct = default) => Task.CompletedTask;
-    public Task FinalizeAsync(Guid id, DateTimeOffset endedAt, string outcome, CancellationToken ct = default) => Task.CompletedTask;
-    public Task<IReadOnlyList<AgentInvolvement>> ListByWorkItemAsync(WorkItemId workItemId, CancellationToken ct = default)
-        => Task.FromResult<IReadOnlyList<AgentInvolvement>>([]);
-}
-
-/// <summary>
 /// In-memory implementation used by tests so they can assert the expected
-/// involvement trail was recorded without hitting SQLite.
+/// involvement trail was recorded without hitting SQLite. When no store is
+/// wired (embedded-only deployments) the orchestrator simply leaves
+/// <see cref="IAgentInvolvementStore"/> null and skips recording — there is no
+/// separate no-op store to keep in sync.
 /// </summary>
 public sealed class InMemoryAgentInvolvementStore : IAgentInvolvementStore
 {

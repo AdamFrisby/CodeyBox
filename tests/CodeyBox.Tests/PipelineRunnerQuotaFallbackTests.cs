@@ -115,16 +115,25 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
-    public async Task MultiAuditorProgression_RecordsPerAuditorInvolvementThroughPipeline()
+    public async Task Ac5_ThreeAuditorProgression_WorkAuditReworkAuditMerge_RecordsPerAuditorTrail()
     {
-        // Acceptance criteria #5 and #6, driven end-to-end through the REAL
-        // pipeline with THREE distinct LLM auditors (not one, and not a store
-        // round-trip). Progression: Work → Audit(3 auditors, one fails) → Rework
-        // → Audit(3 auditors, all pass) → Merge. ExecAuditorAsync is the single
-        // chokepoint that records one involvement row per auditor sandbox run, so
-        // the per-iteration audit rows must carry distinct "audit:{name}" phases
-        // for all three auditors. A regression that collapses multi-auditor
-        // recording, drops the chokepoint, or mislabels phases fails here.
+        // THE acceptance-criterion-#5 literal-scenario guard, driven end-to-end
+        // through the REAL pipeline with the EXACT progression AC#5 names —
+        // "Work → Audit (3 LLM auditors) → Rework → Audit → Merge" — with THREE
+        // distinct LLM auditors (not one, not a store round-trip).
+        //
+        // AC#5 states this scenario yields a "7-row" history, but that count
+        // assumes the post-rework re-audit runs a SINGLE auditor. The orchestrator
+        // deliberately re-runs the FULL auditor list on every iteration (a rework
+        // can regress a dimension a previously-passing auditor would catch), so the
+        // row count for N auditors is 1 + N + 1 + N + 1 = 2N + 3. For the literal
+        // three-auditor scenario that is 9 rows, not 7; AC#5's "7" corresponds to
+        // N = 2 and is pinned exactly by
+        // TwoAuditorProgression_RecordsExactlySevenRowInvolvementTrailThroughPipeline.
+        // This test pins the three-auditor count and the per-auditor "audit:{name}"
+        // phase labelling (AC#6's 1:1 mapping). A regression that collapses
+        // multi-auditor recording, drops the chokepoint, skips the post-rework
+        // re-audit, or mislabels phases fails here.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var alpha = new ScriptedLlmAuditor("review-alpha", failOnCall: 1);
         var beta = new ScriptedLlmAuditor("review-beta");
@@ -245,6 +254,70 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             r => AssertInvolvement(r, AgentKind.Codex, "work", null, "failure:quota"),
             r => AssertInvolvement(r, AgentKind.Claude, "work", null, "success"));
         Assert.All(workRows, r => Assert.NotNull(r.EndedAt));
+    }
+
+    [Fact]
+    public async Task AuditQuotaShapedStderr_FinalizesAuditInvolvementFailureQuota()
+    {
+        // End-to-end guard for the AUDIT-phase failure:quota mapping in
+        // ExecAuditorAsync (AuditorRunOutcome → _quotaClassifier.Detect on the
+        // review agent's stderr). The LLM auditor passes the gate (no findings)
+        // but its agent emitted quota-shaped stderr, so the involvement row must
+        // close as failure:quota even though the work item still reaches Done. A
+        // regression that always stamped audit rows "success", or mapped quota to
+        // failure:agent, would slip past the success-only progression tests; this
+        // is the only e2e assertion of an audit row's failure:quota outcome.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedLlmAuditor("review-quota", quotaStderrOnCall: 1);
+        using var fix = BuildPipeline(seed, [auditor], maxAuditIterations: 1);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "v1"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var auditRow = Assert.Single(
+            await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "audit:review-quota");
+        AssertInvolvement(auditRow, AgentKind.Codex, "audit:review-quota", 1, "failure:quota");
+        Assert.NotNull(auditRow.EndedAt);
+    }
+
+    [Fact]
+    public async Task AuditAgentExecutionFailure_FinalizesAuditInvolvementFailureAgent()
+    {
+        // End-to-end guard for the AUDIT-phase failure:agent mapping in
+        // ExecAuditorAsync (AuditorRunOutcome → IsLlmAgentExecutionFailure). The
+        // first auditor run returns the "review agent failed to run" infra-failure
+        // shape; ExecAuditorAsync closes that row failure:agent. The pipeline's
+        // transient-retry then re-runs the auditor in a fresh sandbox, which
+        // succeeds and records a separate success row, so the item reaches Done.
+        // Without this test a regression that mislabeled the run failure (e.g. as
+        // success, or as failure:quota for non-quota stderr) would go unnoticed.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedLlmAuditor("review-crash", agentFailOnCall: 1);
+        using var fix = BuildPipeline(seed, [auditor], maxAuditIterations: 1);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "v1"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var auditRows = (await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase == "audit:review-crash").ToList();
+        // The failed run + its fresh-sandbox retry each record a row.
+        var failedAudit = Assert.Single(auditRows, r => r.Outcome == "failure:agent");
+        AssertInvolvement(failedAudit, AgentKind.Codex, "audit:review-crash", 1, "failure:agent");
+        Assert.NotNull(failedAudit.EndedAt);
+        Assert.Contains(auditRows, r => r.Outcome == "success");
     }
 
     private static void AssertInvolvement(
@@ -1628,12 +1701,20 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
 internal sealed class ScriptedLlmAuditor : IAuditor
 {
     private readonly int _failOnCall;
+    private readonly int _quotaStderrOnCall;
+    private readonly int _agentFailOnCall;
     private int _calls;
 
-    public ScriptedLlmAuditor(string name, int failOnCall = 0)
+    public ScriptedLlmAuditor(
+        string name,
+        int failOnCall = 0,
+        int quotaStderrOnCall = 0,
+        int agentFailOnCall = 0)
     {
         Name = name;
         _failOnCall = failOnCall;
+        _quotaStderrOnCall = quotaStderrOnCall;
+        _agentFailOnCall = agentFailOnCall;
     }
 
     public string Name { get; }
@@ -1647,6 +1728,31 @@ internal sealed class ScriptedLlmAuditor : IAuditor
         _ = context;
         _ = ct;
         var call = Interlocked.Increment(ref _calls);
+        if (call == _quotaStderrOnCall)
+        {
+            // The review agent ran but emitted quota-shaped stderr. ExecAuditorAsync's
+            // AuditorRunOutcome maps that to failure:quota for the involvement row,
+            // while the audit itself passes (no findings) so the pipeline proceeds.
+            return Task.FromResult(new AuditResult(
+                Passed: true,
+                Findings: [],
+                AgentStderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        }
+
+        if (call == _agentFailOnCall)
+        {
+            // The review agent failed to RUN (audit infrastructure failure, not a
+            // source-code finding). IsLlmAgentExecutionFailure recognises this
+            // shape and AuditorRunOutcome maps it to failure:agent. A non-quota
+            // (null) stderr keeps the quota classifier from claiming it first.
+            return Task.FromResult(new AuditResult(
+                Passed: false,
+                Findings: [
+                    new AuditFinding(Name, AuditSeverity.Error, "review agent failed to run", "simulated agent crash"),
+                ],
+                AgentSummary: "agent exited 1"));
+        }
+
         if (call == _failOnCall)
         {
             return Task.FromResult(new AuditResult(false, [

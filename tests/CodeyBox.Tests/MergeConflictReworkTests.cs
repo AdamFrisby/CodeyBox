@@ -310,6 +310,58 @@ public sealed class MergeConflictReworkTests : IDisposable
     }
 
     /// <summary>
+    /// Plain (non-semantic, non-cancelled) conflict-rework agent failure: the
+    /// agent exits unsuccessfully without declaring SEMANTIC_INCOMPATIBLE, so
+    /// <c>RunConflictReworkAgentAsync</c> must finalize the involvement row
+    /// <c>failure:agent</c> — the generic <c>!Success</c> branch that sits AFTER
+    /// the semantic-incompatible check. This is the only end-to-end assertion of
+    /// that outcome; a regression that stamped <c>success</c> on a failed rework
+    /// run, or that mis-ordered the semantic check ahead of the generic failure,
+    /// would otherwise go uncaught.
+    /// </summary>
+    [Fact]
+    public async Task ConflictRework_AgentPlainFailure_FinalizesInvolvementFailureAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], involvement: involvement);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        // Agent fails to resolve the conflict and returns unsuccessfully WITHOUT a
+        // SEMANTIC_INCOMPATIBLE marker — a generic agent failure, not a deliberate
+        // bail-out. Must NOT be classified as semantic-incompatible.
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+        {
+            _ = sandbox;
+            _ = workDir;
+            _ = ct;
+            return Task.FromResult(new AgentResult(
+                Success: false,
+                Summary: "could not resolve conflict",
+                Stdout: "tried to merge but gave up",
+                Stderr: "fatal: rebase failed"));
+        });
+
+        var workBranch = "codeybox/" + WorkItemId.New().ToString()[..8];
+        var item = NewItem(workBranch);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(1, final.ConflictReworkAttempts);
+
+        var conflictRow = Assert.Single(
+            await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "conflict_rework");
+        Assert.Equal("failure:agent", conflictRow.Outcome);
+        Assert.NotNull(conflictRow.EndedAt);
+    }
+
+    /// <summary>
     /// Anti-abandonment guard: when the rework agent runs
     /// <c>git reset --hard origin/main</c> mid-iteration (discarding prior
     /// commits), the orchestrator detects that the prior commits are no

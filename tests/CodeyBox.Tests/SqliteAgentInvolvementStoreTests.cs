@@ -178,8 +178,12 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
         await RecordPhase(AgentKind.Claude, "audit:security", 1, "success");
         await RecordPhase(AgentKind.Cursor, "audit:quality", 1, "success");
         await RecordPhase(AgentKind.Gemini, "audit:completeness", 1, "success");
-        // 5: Rework, back to the original work agent.
-        await RecordPhase(AgentKind.Cursor, "rework", 1, "success");
+        // 5: Rework, back to the original work agent. Production dispatches the
+        // rework that follows audit iteration N as iteration N+1
+        // (reworkIterationNumber = iteration + 1 in PipelineRunner), so the rework
+        // after audit iteration 1 is iteration 2 — matching the real-pipeline
+        // progression tests.
+        await RecordPhase(AgentKind.Cursor, "rework", 2, "success");
         // 6-8: Audit iteration 2 — the SAME full auditor list re-runs (production
         // re-runs all auditors every iteration; it is not a single re-check).
         await RecordPhase(AgentKind.Claude, "audit:security", 2, "success");
@@ -197,7 +201,7 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
             r => AssertRow(r, AgentKind.Claude, "audit:security", 1),
             r => AssertRow(r, AgentKind.Cursor, "audit:quality", 1),
             r => AssertRow(r, AgentKind.Gemini, "audit:completeness", 1),
-            r => AssertRow(r, AgentKind.Cursor, "rework", 1),
+            r => AssertRow(r, AgentKind.Cursor, "rework", 2),
             r => AssertRow(r, AgentKind.Claude, "audit:security", 2),
             r => AssertRow(r, AgentKind.Cursor, "audit:quality", 2),
             r => AssertRow(r, AgentKind.Gemini, "audit:completeness", 2),
