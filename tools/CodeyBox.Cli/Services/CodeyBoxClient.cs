@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -14,20 +15,34 @@ internal sealed class CodeyBoxApiException(int statusCode, string body)
 internal sealed class CodeyBoxClient
 {
     private readonly HttpClient _http;
+    private readonly HttpClient _sseHttp;
 
-    internal CodeyBoxClient(HttpClient http) => _http = http;
+    internal CodeyBoxClient(HttpClient http) : this(http, http) { }
+
+    internal CodeyBoxClient(HttpClient http, HttpClient sseHttp)
+    {
+        _http = http;
+        _sseHttp = sseHttp;
+    }
 
     internal static CodeyBoxClient Create(ResolvedConfig config)
+    {
+        var http = CreateHttpClient(config, TimeSpan.FromSeconds(30));
+        var sseHttp = CreateHttpClient(config, Timeout.InfiniteTimeSpan);
+        return new CodeyBoxClient(http, sseHttp);
+    }
+
+    private static HttpClient CreateHttpClient(ResolvedConfig config, TimeSpan timeout)
     {
         var http = new HttpClient
         {
             BaseAddress = new Uri(config.ApiBaseUrl),
-            Timeout = TimeSpan.FromSeconds(30),
+            Timeout = timeout,
         };
         if (!string.IsNullOrEmpty(config.ApiKey))
             http.DefaultRequestHeaders.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ApiKey);
-        return new CodeyBoxClient(http);
+                new AuthenticationHeaderValue("Bearer", config.ApiKey);
+        return http;
     }
 
     internal async Task<List<WorkItemDto>> GetWorkItemsAsync(
@@ -48,7 +63,7 @@ internal sealed class CodeyBoxClient
     internal async Task<WorkItemDto?> GetWorkItemAsync(string id, CancellationToken ct = default)
     {
         var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}", ct);
-        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        if (resp.StatusCode == HttpStatusCode.NotFound) return null;
         await EnsureSuccessAsync(resp, ct);
         return await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct);
     }
@@ -68,10 +83,8 @@ internal sealed class CodeyBoxClient
 
     /// <summary>
     /// Watches a work item via SSE (<c>GET /workitems/{id}/events</c>).
-    /// Returns <c>true</c> when the stream ends after a terminal state (or closes);
-    /// returns <c>false</c> when the caller should fall back to polling (connect error, non-200).
     /// </summary>
-    internal async Task<bool> TryWatchWorkItemEventsAsync(
+    internal async Task<SseWatchResult> TryWatchWorkItemEventsAsync(
         string id,
         Action<string> onStateTransition,
         CancellationToken ct = default)
@@ -83,17 +96,27 @@ internal sealed class CodeyBoxClient
         HttpResponseMessage resp;
         try
         {
-            resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            resp = await _sseHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         }
         catch (HttpRequestException)
         {
-            return false;
+            return SseWatchResult.ShouldFallback;
+        }
+        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return SseWatchResult.ShouldFallback;
+        }
+
+        if (resp.StatusCode == HttpStatusCode.NotFound)
+        {
+            resp.Dispose();
+            return SseWatchResult.NotFound;
         }
 
         if (!resp.IsSuccessStatusCode)
         {
             resp.Dispose();
-            return false;
+            return SseWatchResult.ShouldFallback;
         }
 
         try
@@ -101,10 +124,20 @@ internal sealed class CodeyBoxClient
             await using var stream = await resp.Content.ReadAsStreamAsync(ct);
             using var reader = new StreamReader(stream);
             string? lastState = null;
+            var sawTerminal = false;
 
             while (!ct.IsCancellationRequested)
             {
-                var line = await reader.ReadLineAsync(ct);
+                string? line;
+                try
+                {
+                    line = await reader.ReadLineAsync(ct);
+                }
+                catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    return SseWatchResult.ShouldFallback;
+                }
+
                 if (line is null)
                     break;
 
@@ -125,10 +158,13 @@ internal sealed class CodeyBoxClient
                 }
 
                 if (WorkItemDto.IsTerminalState(state))
-                    return true;
+                {
+                    sawTerminal = true;
+                    return SseWatchResult.Completed;
+                }
             }
 
-            return true;
+            return sawTerminal ? SseWatchResult.Completed : SseWatchResult.ShouldFallback;
         }
         finally
         {

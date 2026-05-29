@@ -27,8 +27,11 @@ internal sealed class WorkItemDto
     public Dictionary<string, string?> DependsOnExternalIds { get; set; } = [];
     public long QueuePosition { get; set; }
 
+    /// <summary>
+    /// Matches orchestrator <c>WorkItemDependencies.TerminalStates</c> (Merged is not terminal).
+    /// </summary>
     internal static bool IsTerminalState(string state) =>
-        state is "Done" or "Merged" or "Failed" or "Cancelled" or "AuditFailed"
+        state is "Done" or "Failed" or "Cancelled" or "AuditFailed"
             or "MergeConflictResolutionFailed" or "AbandonedAfterRecoveryAttempts";
 
     internal bool IsTerminal => IsTerminalState(State);

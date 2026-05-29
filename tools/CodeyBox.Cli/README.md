@@ -135,10 +135,9 @@ Watch a work item via SSE (`GET /workitems/{id}/events`), printing each state tr
 ```bash
 codeybox queue watch aabbccdd-...
 codeybox queue watch aabbccdd-... --poll     # force HTTP polling
-codeybox queue watch aabbccdd-... --stream   # also stream agent stdout when available
 ```
 
-Exits when the item reaches a terminal state (`Done`, `Merged`, `Failed`, `Cancelled`, `AuditFailed`, `MergeConflictResolutionFailed`, `AbandonedAfterRecoveryAttempts`).
+Exits when the item reaches a terminal state (`Done`, `Failed`, `Cancelled`, `AuditFailed`, `MergeConflictResolutionFailed`, `AbandonedAfterRecoveryAttempts`). Intermediate states such as `Merged` are followed until the item finishes.
 Press `Ctrl+C` to stop early.
 
 ### `codeybox version`
