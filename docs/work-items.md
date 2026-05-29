@@ -277,7 +277,7 @@ The single `agent` field reflects only the **current** phase's agent and is over
     { "id": "…", "agentKind": "cursor", "modelId": "composer-2.5",
       "phase": "work",  "startedAt": "…", "endedAt": "…", "iteration": 1, "outcome": "success" },
     { "id": "…", "agentKind": "claude", "modelId": null,
-      "phase": "audit", "startedAt": "…", "endedAt": null, "iteration": 1, "outcome": null }
+      "phase": "audit:security", "startedAt": "…", "endedAt": null, "iteration": 1, "outcome": null }
   ]
 }
 ```

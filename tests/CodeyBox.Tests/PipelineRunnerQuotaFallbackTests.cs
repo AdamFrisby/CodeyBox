@@ -115,6 +115,60 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task MultiAuditorProgression_RecordsPerAuditorInvolvementThroughPipeline()
+    {
+        // Acceptance criteria #5 and #6, driven end-to-end through the REAL
+        // pipeline with THREE distinct LLM auditors (not one, and not a store
+        // round-trip). Progression: Work → Audit(3 auditors, one fails) → Rework
+        // → Audit(3 auditors, all pass) → Merge. ExecAuditorAsync is the single
+        // chokepoint that records one involvement row per auditor sandbox run, so
+        // the per-iteration audit rows must carry distinct "audit:{name}" phases
+        // for all three auditors. A regression that collapses multi-auditor
+        // recording, drops the chokepoint, or mislabels phases fails here.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var alpha = new ScriptedLlmAuditor("review-alpha", failOnCall: 1);
+        var beta = new ScriptedLlmAuditor("review-beta");
+        var gamma = new ScriptedLlmAuditor("review-gamma");
+        using var fix = BuildPipeline(seed, [alpha, beta, gamma], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "v1"));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("rework.txt", "v2"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+
+        // 1 work + 3 audits(iter1) + 1 rework + 3 audits(iter2) + 1 merge = 9.
+        // The three LLM auditors run concurrently, so rows within a single audit
+        // iteration are not strictly ordered; phase boundaries (work → audits →
+        // rework → audits → merge) are ordered by started_at and stable.
+        Assert.Equal(9, rows.Count);
+        Assert.All(rows, r => Assert.NotNull(r.EndedAt));
+        Assert.All(rows, r => Assert.Equal(AgentKind.Codex, r.AgentKind));
+
+        AssertInvolvement(rows[0], AgentKind.Codex, "work", null, "success");
+        AssertInvolvement(rows[4], AgentKind.Codex, "rework", 2, "success");
+        AssertInvolvement(rows[8], AgentKind.Codex, "merge", null, "success");
+
+        var auditPhases = new[] { "audit:review-alpha", "audit:review-beta", "audit:review-gamma" };
+
+        var iter1Audits = rows.Skip(1).Take(3).ToList();
+        Assert.All(iter1Audits, r => Assert.Equal(1, r.Iteration));
+        Assert.All(iter1Audits, r => Assert.Equal("success", r.Outcome));
+        Assert.Equal(auditPhases, iter1Audits.Select(r => r.Phase).OrderBy(p => p));
+
+        var iter2Audits = rows.Skip(5).Take(3).ToList();
+        Assert.All(iter2Audits, r => Assert.Equal(2, r.Iteration));
+        Assert.All(iter2Audits, r => Assert.Equal("success", r.Outcome));
+        Assert.Equal(auditPhases, iter2Audits.Select(r => r.Phase).OrderBy(p => p));
+    }
+
+    [Fact]
     public async Task WorkQuotaFallback_RecordsFailureThenSuccessInvolvementRows()
     {
         // The quota fallback path must close the exhausted attempt's row as
@@ -1484,6 +1538,46 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         ISandbox? sandbox = null,
         string? workingDirectory = null)
         => Task.FromResult(new TextOnlyAgentResult(false, "not used", null, null));
+}
+
+/// <summary>
+/// LLM-kind auditor (Kind="llm", no required capabilities) that routes through
+/// CollectFindingsAsync's concurrent LLM path and the ExecAuditorAsync recording
+/// chokepoint, without dragging in credential machinery. Emits a blocking Error
+/// finding on its Nth call (1-based) when <c>failOnCall</c> matches, otherwise
+/// passes — enough to force exactly one rework iteration when one auditor fails.
+/// </summary>
+internal sealed class ScriptedLlmAuditor : IAuditor
+{
+    private readonly int _failOnCall;
+    private int _calls;
+
+    public ScriptedLlmAuditor(string name, int failOnCall = 0)
+    {
+        Name = name;
+        _failOnCall = failOnCall;
+    }
+
+    public string Name { get; }
+    public string Kind => "llm";
+    public AuditCapabilities Required => AuditCapabilities.None;
+
+    public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        _ = context;
+        _ = ct;
+        var call = Interlocked.Increment(ref _calls);
+        if (call == _failOnCall)
+        {
+            return Task.FromResult(new AuditResult(false, [
+                new AuditFinding(Name, AuditSeverity.Error, "force rework", $"{Name} fails on call {_failOnCall}"),
+            ]));
+        }
+
+        return Task.FromResult(new AuditResult(true, []));
+    }
 }
 
 internal sealed class OnceFailingAuditor : IAuditor

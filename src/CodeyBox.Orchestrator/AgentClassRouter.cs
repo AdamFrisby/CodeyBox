@@ -53,7 +53,6 @@ public sealed class AgentClassRouter
     // the router behaves as before this feature.
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
-    private readonly IAgentInvolvementStore? _involvement;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -78,8 +77,7 @@ public sealed class AgentClassRouter
         IAgentAvailabilityRegistry? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
         AgentConcurrencySnapshot? concurrencySnapshot = null,
-        IInVmSmokeGate? inVmSmokeGate = null,
-        IAgentInvolvementStore? involvement = null)
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -102,7 +100,6 @@ public sealed class AgentClassRouter
         _budgetProvider = budgetProvider;
         _concurrencySnapshot = concurrencySnapshot;
         _inVmSmokeGate = inVmSmokeGate;
-        _involvement = involvement;
     }
 
     /// <summary>
@@ -465,14 +462,6 @@ public sealed class AgentClassRouter
                     member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
                     quota.AvailablePct);
 
-                // Persist the work-phase routing decision the instant it is made —
-                // alongside the QuotaRouterScored audit line above — so a pickup
-                // that later defers (concurrency cap, budget, pause, ShouldWait
-                // requeue) before any attempt runs still leaves a history row. The
-                // first work attempt in PipelineRunner adopts this open row rather
-                // than opening a duplicate.
-                await RecordRoutedInvolvementAsync(item.Id, member.Agent, member.ModelId, ct);
-
                 return new AgentRoutingDecision
                 {
                     Chosen = member,
@@ -655,33 +644,6 @@ public sealed class AgentClassRouter
             && entry is { MaxConcurrent: > 0 }
             ? entry.MaxConcurrent
             : 0;
-    }
-
-    /// <summary>
-    /// Appends an in-progress Work-phase <see cref="AgentInvolvement"/> row for a
-    /// freshly-routed agent. Best-effort: a persistence failure must not fail
-    /// routing, but it is logged (not swallowed) so a dropped row is visible.
-    /// </summary>
-    private async Task RecordRoutedInvolvementAsync(WorkItemId workItemId, AgentKind agent, string? modelId, CancellationToken ct)
-    {
-        if (_involvement is null) return;
-        try
-        {
-            await _involvement.RecordStartAsync(new AgentInvolvement(
-                Id: Guid.NewGuid(),
-                WorkItemId: workItemId,
-                AgentKind: agent,
-                ModelId: modelId,
-                Phase: "work",
-                StartedAt: _time.GetUtcNow(),
-                EndedAt: null,
-                Iteration: null,
-                Outcome: null), ct);
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Work item {Id}: failed to persist routed work-phase involvement row", workItemId);
-        }
     }
 
     /// <summary>

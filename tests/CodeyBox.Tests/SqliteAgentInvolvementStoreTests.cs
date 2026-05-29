@@ -148,9 +148,12 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
         // pin ordering, multi-row-per-iteration, and one-time finalize. It does NOT
         // exercise PipelineRunner; the end-to-end chokepoint wiring (acceptance #5/#6)
         // is verified by
-        // PipelineRunnerQuotaFallbackTests.FullProgression_RecordsPerPhaseInvolvementThroughChokepoint,
-        // which drives the real pipeline. Work-phase iteration is null here to match
-        // what InvokeAgentWithQuotaFallbackAsync passes in production.
+        // PipelineRunnerQuotaFallbackTests.MultiAuditorProgression_RecordsPerAuditorInvolvementThroughPipeline,
+        // which drives the real pipeline with three distinct LLM auditors. Phase
+        // strings here use the production "audit:{auditor.Name}" format that
+        // ExecAuditorAsync emits, so this test also guards that label shape.
+        // Work-phase iteration is null here to match what
+        // InvokeAgentWithQuotaFallbackAsync passes in production.
         using var store = NewStore();
         var id = WorkItemId.New();
         var t = new DateTimeOffset(2026, 5, 1, 9, 0, 0, TimeSpan.Zero);
@@ -167,14 +170,15 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
 
         // 1: Work phase, run by Cursor (iteration null, as production records it).
         await RecordPhase(AgentKind.Cursor, "work", null, "success");
-        // 2-4: Audit iteration 1 — three LLM auditors, cross-reviewed by distinct agents.
-        await RecordPhase(AgentKind.Claude, "audit", 1, "success");
-        await RecordPhase(AgentKind.Cursor, "audit", 1, "success");
-        await RecordPhase(AgentKind.Gemini, "audit", 1, "success");
+        // 2-4: Audit iteration 1 — three LLM auditors, each recorded under its
+        // own "audit:{name}" phase (the label ExecAuditorAsync actually emits).
+        await RecordPhase(AgentKind.Claude, "audit:security", 1, "success");
+        await RecordPhase(AgentKind.Cursor, "audit:quality", 1, "success");
+        await RecordPhase(AgentKind.Gemini, "audit:completeness", 1, "success");
         // 5: Rework, back to the original work agent.
         await RecordPhase(AgentKind.Cursor, "rework", 1, "success");
         // 6: Audit iteration 2 — single re-check after the rework.
-        await RecordPhase(AgentKind.Claude, "audit", 2, "success");
+        await RecordPhase(AgentKind.Claude, "audit:security", 2, "success");
         // 7: Merge phase.
         await RecordPhase(AgentKind.Cursor, "merge", null, "success");
 
@@ -184,11 +188,11 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
         // Phase/agent sequence maps 1:1 to the orchestrator's phase transitions.
         Assert.Collection(rows,
             r => AssertRow(r, AgentKind.Cursor, "work", null),
-            r => AssertRow(r, AgentKind.Claude, "audit", 1),
-            r => AssertRow(r, AgentKind.Cursor, "audit", 1),
-            r => AssertRow(r, AgentKind.Gemini, "audit", 1),
+            r => AssertRow(r, AgentKind.Claude, "audit:security", 1),
+            r => AssertRow(r, AgentKind.Cursor, "audit:quality", 1),
+            r => AssertRow(r, AgentKind.Gemini, "audit:completeness", 1),
             r => AssertRow(r, AgentKind.Cursor, "rework", 1),
-            r => AssertRow(r, AgentKind.Claude, "audit", 2),
+            r => AssertRow(r, AgentKind.Claude, "audit:security", 2),
             r => AssertRow(r, AgentKind.Cursor, "merge", null));
 
         // Every row is finalized; none is left dangling in-progress.

@@ -335,6 +335,7 @@ public sealed class MergeConflictReworkTests : IDisposable
             [AgentKind.Claude] = extractor,
         };
         var calculator = new AgentCostCalculator(new AgentPricingOptions());
+        var involvement = new InMemoryAgentInvolvementStore();
 
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
@@ -342,7 +343,8 @@ public sealed class MergeConflictReworkTests : IDisposable
             costStore: costStore,
             costExtractors: extractors,
             costCalculator: calculator,
-            stateDbPathOverride: sharedDb);
+            stateDbPathOverride: sharedDb,
+            involvement: involvement);
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 
@@ -372,6 +374,19 @@ public sealed class MergeConflictReworkTests : IDisposable
         var reworkRow = rows.First(r => r.Phase == "conflict_rework");
         Assert.Equal(1234, reworkRow.InputTokens);
         Assert.Equal(567, reworkRow.OutputTokens);
+
+        // The conflict-rework agent run is recorded outside the
+        // InvokeAgentWithQuotaFallbackAsync chokepoint, so assert its involvement
+        // row directly: exactly one closed conflict_rework entry, finalized
+        // success, for the work agent. A regression that drops the direct
+        // RecordInvolvementStartAsync/FinalizeInvolvementAsync calls in
+        // ReworkConflictAsync leaves the audit trail blind to this phase.
+        var inv = await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var conflictRow = Assert.Single(inv, r => r.Phase == "conflict_rework");
+        Assert.Equal(AgentKind.Claude, conflictRow.AgentKind);
+        Assert.Null(conflictRow.Iteration);
+        Assert.NotNull(conflictRow.EndedAt);
+        Assert.Equal("success", conflictRow.Outcome);
     }
 
     /// <summary>
