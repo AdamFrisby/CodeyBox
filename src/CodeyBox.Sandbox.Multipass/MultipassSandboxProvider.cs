@@ -2441,7 +2441,7 @@ test "$work" = present && test "$exec_wrapper" = present
             {
                 await Task.Delay(delay, ct);
             }
-            catch (OperationCanceledException)
+            catch
             {
                 sem.Release();
                 throw;
