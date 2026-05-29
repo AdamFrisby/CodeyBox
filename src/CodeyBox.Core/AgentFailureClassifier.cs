@@ -79,6 +79,15 @@ public static class AgentFailureClassifier
         "503 Service Unavailable",
         "504 Gateway Timeout",
         "upstream connect error",
+        // Common post-suspend shapes when the peer closed during the freeze window
+        "socket hang up",
+        "Socket hang up",
+        "EPIPE",
+        "Broken pipe",
+        "fetch failed",
+        "Network request failed",
+        "Client network socket disconnected",
+        "read ECONNRESET",
     };
 
     /// <summary>
