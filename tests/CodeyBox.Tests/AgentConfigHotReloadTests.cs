@@ -154,9 +154,10 @@ public sealed class AgentConfigHotReloadTests
     [Fact]
     public void Orchestrator_ApplyAgentConcurrencyReload_DoesNotRetroactivelyKillInFlight()
     {
-        // Reserve a claude slot under the initial cap=1, then drop cap to 0
-        // mid-flight. The already-reserved running count must remain — the new
-        // cap only gates *new* dispatches; lowering it must not snap the
+        // Reserve a claude slot under the initial cap=1, then reload to remove
+        // the entry entirely (the supported way to express "uncapped") mid-flight.
+        // The already-reserved running count must remain — the new cap only
+        // gates *new* dispatches; lowering or removing it must not snap the
         // running call.
         using var fixture = OrchestratorFixture.Build(new AgentConcurrencyOptions
         {
@@ -165,18 +166,12 @@ public sealed class AgentConfigHotReloadTests
         Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
         Assert.Equal(1, fixture.Orchestrator.GetRunning(Claude));
 
-        fixture.Orchestrator.ApplyAgentConcurrencyReload(new AgentConcurrencyOptions
-        {
-            Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 0 } },
-        });
+        fixture.Orchestrator.ApplyAgentConcurrencyReload(new AgentConcurrencyOptions());
 
         // The reservation already past the gate keeps its slot.
         Assert.Equal(1, fixture.Orchestrator.GetRunning(Claude));
 
-        // New reservation attempt sees the post-reload cap (0 = unlimited per
-        // the spec, since values < 1 are "no cap"). A negative path would be a
-        // distinct cap setting; the contract here is that lowering the cap
-        // does not yank in-flight work.
+        // The contract here is that removing the cap does not yank in-flight work.
         fixture.Orchestrator.ReleaseAgentSlotForTest(Claude);
         Assert.Equal(0, fixture.Orchestrator.GetRunning(Claude));
     }

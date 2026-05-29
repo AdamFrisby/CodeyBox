@@ -25,7 +25,12 @@ Hot-reloadable today:
   does not move the goalposts for an item already running.
 - `AgentConcurrency` — re-applied via `AgentConfigHotReload`. Reload propagates
   to `OrchestratorService` (dispatch gate) and `PipelineRunner` (rebase-resolver
-  cap-aware routing) through a shared snapshot.
+  cap-aware routing) through a shared snapshot. `MaxConcurrent` values **must
+  be >= 1**; `<= 0` is rejected (the prior view is retained on hot-reload).
+  To leave an agent uncapped, **omit** the entry — do NOT set `MaxConcurrent: 0`.
+  To stop dispatch to an agent, remove it from `AgentClasses[*].Members` or
+  pause the queue. The resolved caps are logged at orchestrator startup and on
+  every successful hot-reload so the effective value is visible to operators.
 - `AgentClasses` + `AgentScoreModifiers` — re-applied via `AgentConfigHotReload`
   to the live `AgentClassRouter` catalog. In-flight routing calls finish against
   the snapshot they started with.

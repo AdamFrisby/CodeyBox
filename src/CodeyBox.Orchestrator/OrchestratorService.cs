@@ -129,7 +129,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // options-shaped parameter get a fresh, unshared snapshot.
         _concurrencySnapshot = agentConcurrencySnapshot
             ?? new AgentConcurrencySnapshot(agentConcurrency ?? new AgentConcurrencyOptions());
+        // Reject MaxConcurrent <= 0 loudly at startup. The same call runs again
+        // on every hot-reload via ApplyAgentConcurrencyReload — keeping the
+        // semantics identical between cold-start and config-edit paths.
+        AgentConcurrencyOptions.ValidateAndThrow(_concurrencySnapshot.Current);
         _concurrencyGate = new SemaphoreSlim(opts.MaxConcurrentWorkers, opts.MaxConcurrentWorkers);
+        LogResolvedAgentCaps(_concurrencySnapshot.Current, reason: "startup");
     }
 
     /// <inheritdoc />
@@ -149,11 +154,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// <summary>
     /// Returns the per-agent cap configured for <paramref name="agent"/>, or 0
     /// when no cap is configured (treated as "unlimited within global pool").
+    /// Values <c>&lt;= 0</c> in the stored entry are rejected at load by
+    /// <see cref="AgentConcurrencyOptions.ValidateAndThrow"/>, so the
+    /// <c>entry.MaxConcurrent &gt; 0</c> guard here is defence-in-depth — any
+    /// non-positive value reaching this read indicates the validator was
+    /// bypassed (e.g. test constructor passing a hand-built options instance).
     /// </summary>
     internal int GetAgentCap(AgentKind agent)
     {
         var opts = _concurrencySnapshot.Current;
-        return opts.Members.TryGetValue(agent.Value, out var entry) && entry.MaxConcurrent > 0
+        return opts.Members.TryGetValue(agent.Value, out var entry) && entry is { MaxConcurrent: > 0 }
             ? entry.MaxConcurrent
             : 0;
     }
@@ -165,10 +175,38 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// reads; in-flight items already past the gate are unaffected (caps are
     /// only consulted at dispatch time).
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="next"/> contains a <c>MaxConcurrent &lt;= 0</c>
+    /// entry. The hot-reload coordinator catches and surfaces this so the prior
+    /// config remains in effect rather than the dangerously-permissive default.
+    /// </exception>
     public void ApplyAgentConcurrencyReload(AgentConcurrencyOptions next)
     {
         ArgumentNullException.ThrowIfNull(next);
+        AgentConcurrencyOptions.ValidateAndThrow(next);
         _concurrencySnapshot.Replace(next);
+        LogResolvedAgentCaps(next, reason: "hot-reload");
+    }
+
+    /// <summary>
+    /// Emits the effective per-agent caps to the log so operators can confirm
+    /// (a) what the config-binder actually produced at startup, and (b) what a
+    /// hot-reload landed. Agents with no entry are listed as "unlimited" so
+    /// the line includes every agent that has work routed to it in this pool.
+    /// </summary>
+    private void LogResolvedAgentCaps(AgentConcurrencyOptions opts, string reason)
+    {
+        // Capped agents first (sorted for stable log output), so the line reads
+        // top-down by tightest constraint.
+        var rendered = opts.Members
+            .Where(kv => kv.Value is { MaxConcurrent: > 0 })
+            .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(kv => $"{kv.Key}={kv.Value.MaxConcurrent}")
+            .ToList();
+        var summary = rendered.Count == 0 ? "<none>" : string.Join(", ", rendered);
+        _log.LogInformation(
+            "AgentConcurrency caps resolved ({Reason}): {Caps} (agents not listed are uncapped within global pool of {GlobalCap})",
+            reason, summary, _opts.MaxConcurrentWorkers);
     }
 
     /// <summary>
@@ -181,7 +219,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var caps = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var kv in opts.Members)
         {
-            if (kv.Value.MaxConcurrent > 0)
+            // Defence-in-depth: validation rejects MaxConcurrent <= 0 entries
+            // at load, so the guard only fires when a test constructed an
+            // options instance directly without going through the validator.
+            if (kv.Value is { MaxConcurrent: > 0 })
                 caps[kv.Key] = kv.Value.MaxConcurrent;
         }
         var running = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
