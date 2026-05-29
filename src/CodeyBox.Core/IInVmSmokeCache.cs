@@ -24,4 +24,15 @@ public interface IInVmSmokeCache
     /// replaying a verdict captured before the operator's fix.
     /// </summary>
     void Invalidate(AgentKind kind);
+
+    /// <summary>
+    /// Drops the cached entry for a single <c>(kind, baselineRef)</c> pair.
+    /// Called when a real probe against that exact ref returns a non-passing
+    /// verdict: only passes are stored, so a baseline that regresses within the
+    /// same content-hash ref + TTL window would otherwise leave a stale pass that
+    /// a later cache hit could reconcile back to Available without re-execing the
+    /// CLI. Scoped to the failing ref so a known-good pinned baseline's entry is
+    /// left intact (B1 pinning).
+    /// </summary>
+    void Invalidate(AgentKind kind, string baselineRef);
 }

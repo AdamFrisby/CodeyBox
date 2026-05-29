@@ -1145,8 +1145,15 @@ builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
     // baked only into that baseline (e.g. PATH symlinks from MultipassExtraRuncmd).
     // Inheriting the work profile keeps the probe on the same clone-vs-launch
     // path as dispatch by default; an explicit Smoke:InVm:NetworkProfile wins.
-    var defaultWorkProfile = sp.GetService<IOptions<ProjectsOptions>>()?.Value
-        .Defaults?.NetworkProfiles?.Work;
+    // Read straight from configuration rather than IOptions<ProjectsOptions>:
+    // resolving the latter eagerly runs ProjectsOptionsRemovalValidator, whose
+    // store query throws whenever non-terminal work items reference a project
+    // absent from the bound config — which would surface here as a spurious
+    // construction failure (e.g. test hosts that seed the store but not the
+    // Projects config section). This singleton is built once at startup and
+    // does not hot-reload the profile, so a one-shot config read is sufficient.
+    var defaultWorkProfile = sp.GetRequiredService<IConfiguration>()
+        .GetValue<string?>("CodeyBox:Defaults:NetworkProfiles:Work");
     return new InVmSmokeOptions
     {
         Enabled = v.Enabled,

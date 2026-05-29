@@ -123,12 +123,17 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// than only by the background sweep. Never throws. Returns null when disabled
     /// or no probe is registered for the kind so the admin endpoint can fall back
     /// to the host-probe verdict for its response / 404 decision.
+    ///
+    /// <para>Bypasses the cache: the operator triggers this <em>after</em> fixing
+    /// a CLI, so replaying a verdict captured before the fix (a stale cached pass
+    /// for the same ref within TTL, or a stale fail) would defeat the recovery.
+    /// It always re-execs the in-VM sequence and reconciles the fresh verdict.</para>
     /// </summary>
     public async Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
     {
         if (!Enabled) return null;
         if (_probes.All(p => p.Kind != kind)) return null;
-        await EnsureProbedAsync(kind, baselineRef: null, ct);
+        await EnsureProbedAsync(kind, baselineRef: null, ct, bypassCache: true);
         return _availability.GetAvailability(kind);
     }
 
@@ -182,7 +187,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// on the pinned image, not on a freshly rebaked active baseline. Null falls
     /// back to the active baseline for unpinned work.
     /// </summary>
-    internal async Task EnsureProbedAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    internal async Task EnsureProbedAsync(AgentKind kind, string? baselineRef, CancellationToken ct, bool bypassCache = false)
     {
         if (!Enabled) return;
         var probe = _probes.FirstOrDefault(p => p.Kind == kind);
@@ -195,7 +200,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // to a verdict (see InVmSmokeOptions.FailClosedOnProbeFault). Probe
             // the pinned baseline when supplied so the verdict matches the image
             // the dispatch will clone; otherwise fall back to the active baseline.
-            await ProbeAgentAsync(probe, baselineRef ?? ResolveBaselineRef(), ct, benchOnTransientFault: _opts.FailClosedOnProbeFault);
+            await ProbeAgentAsync(probe, baselineRef ?? ResolveBaselineRef(), ct, benchOnTransientFault: _opts.FailClosedOnProbeFault, bypassCache: bypassCache);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -229,9 +234,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// </summary>
     internal async Task<AgentSmokeResult?> ProbeAgentAsync(
         IInVmSmokeProbe probe, string baselineRef, CancellationToken ct,
-        bool benchOnTransientFault = false)
+        bool benchOnTransientFault = false,
+        bool bypassCache = false)
     {
-        if (_cache.TryGet(probe.Kind, baselineRef) is { } cached)
+        if (!bypassCache && _cache.TryGet(probe.Kind, baselineRef) is { } cached)
         {
             // Only passing verdicts are cached, so this re-asserts availability.
             // Re-applying keeps the registry reconciled with the cache even after
@@ -295,9 +301,16 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         }
 
         // Cache only passes: a failure must be re-checked on the next sweep /
-        // dispatch (self-healing) rather than pinned for the whole TTL.
+        // dispatch (self-healing) rather than pinned for the whole TTL. A clean
+        // failure also invalidates any prior cached pass for this exact ref so a
+        // baseline that regressed within the same content-hash + TTL window can't
+        // leave a stale pass that a later cache hit reconciles back to Available
+        // without re-execing the CLI. Scoped to this ref so a known-good pinned
+        // baseline's entry survives (B1 pinning).
         if (result.Ok)
             _cache.Set(probe.Kind, baselineRef, result);
+        else
+            _cache.Invalidate(probe.Kind, baselineRef);
         // clearsFastFail:true — this verdict comes from a freshly executed in-VM
         // probe that actually ran the binary in a sandbox, so a pass is valid
         // evidence the CLI launches and may lift the fast-fail circuit breaker.

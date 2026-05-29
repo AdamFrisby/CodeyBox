@@ -52,4 +52,12 @@ public sealed class InVmSmokeCache : IInVmSmokeCache
                 _entries.Remove(key);
         }
     }
+
+    public void Invalidate(AgentKind kind, string baselineRef)
+    {
+        lock (_lock)
+        {
+            _entries.Remove((kind, baselineRef));
+        }
+    }
 }

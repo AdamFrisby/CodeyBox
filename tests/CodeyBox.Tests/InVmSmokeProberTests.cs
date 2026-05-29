@@ -663,6 +663,53 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task StalePass_RegressesWithinSameRef_ForceProbeReExecsAndInvalidates_NextSweepStaysBenched()
+    {
+        // Production regression the smoke gate exists to catch: a baseline that
+        // regresses (CLI breaks, auth/trust expires) WITHIN the same content-hash
+        // ref + TTL window. Only passes are cached and ProbeAgentAsync consults
+        // the cache first, so without a cache bypass + failure-invalidation the
+        // stale pass would be replayed forever — reconciling the agent back to
+        // Available without ever re-execing the now-broken CLI.
+        var broken = false;
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "--version") && broken
+                ? new SandboxExecResult(127, "", "bash: agent: command not found")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
+
+        // Pass: cursor Available, pass cached for base-A.
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(1, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.NotNull(cache.TryGet(AgentKind.Cursor, "base-A"));
+
+        // Baseline regresses on the SAME ref. A plain sweep keeps hitting the
+        // cached pass and never notices (CreateCount unchanged).
+        broken = true;
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(1, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        // Operator force-probe MUST bypass the cache, re-exec the CLI, observe the
+        // regression, bench the agent, and purge the now-stale cached pass.
+        var forced = await prober.ForceProbeAsync(AgentKind.Cursor, CancellationToken.None);
+        Assert.Equal(2, provider.CreateCount);
+        Assert.NotNull(forced);
+        Assert.False(forced!.Available);
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+
+        // With the stale pass gone, the next background sweep re-execs (cache
+        // miss) rather than reconciling the old pass back to Available.
+        await prober.ProbeAllAsync(CancellationToken.None);
+        Assert.Equal(3, provider.CreateCount);
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
     public async Task ForceProbeAsync_NoRegisteredProbeForKind_ReturnsNull_NoProvision()
     {
         // The admin endpoint falls back to the host-probe verdict (and its 404
