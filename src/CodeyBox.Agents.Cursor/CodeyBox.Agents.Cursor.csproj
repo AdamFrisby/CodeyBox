@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
     <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\CodeyBox.HostProcess\CodeyBox.HostProcess.csproj" />
   </ItemGroup>
 
   <ItemGroup>

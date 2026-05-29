@@ -1,5 +1,6 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Agents.Cursor;
@@ -28,8 +29,15 @@ namespace CodeyBox.Agents.Cursor;
 /// CLI is expected to use whatever auth path the operator provisioned in the
 /// image.</para>
 /// </summary>
-public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider
+public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
+    private readonly IProcessRunner _hostCliRunner;
+
+    public CursorAgentRunner(IProcessRunner? hostCliRunner = null)
+    {
+        _hostCliRunner = hostCliRunner ?? new DefaultProcessRunner();
+    }
+
     public override AgentKind Kind => AgentKind.Cursor;
 
     /// <summary>
@@ -141,5 +149,33 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         // from the sandbox wrapper's `exec "$@"`. The sandbox wrapper forwards
         // stdin automatically when SandboxExec.Stdin is non-null.
         return new AgentInvocation(argv, Stdin: prompt);
+    }
+
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+        => HostCliTextOnlyAuthScope.GetUnavailabilityReason(credential, HostCliTextOnlyAuthKind.Cursor);
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        _ = reasoningMode;
+        var argv = new List<string> { Binary, "--print", "--trust", "--force" };
+        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
+        if (!string.IsNullOrEmpty(effectiveModel))
+        {
+            argv.Add("--model");
+            argv.Add(effectiveModel);
+        }
+
+        return HostCliTextOnlyInvoker.RunAsync(
+            _hostCliRunner,
+            argv,
+            stdin: prompt,
+            credential,
+            HostCliTextOnlyAuthKind.Cursor,
+            ct);
     }
 }

@@ -1,5 +1,6 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Agents.Opencode;
@@ -21,8 +22,15 @@ namespace CodeyBox.Agents.Opencode;
 /// materialises the file from <c>OPENCODE_AUTH_JSON</c> in the credential
 /// bundle before invoking the CLI, mirroring the Codex pattern.</para>
 /// </summary>
-public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider
+public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
+    private readonly IProcessRunner _hostCliRunner;
+
+    public OpencodeAgentRunner(IProcessRunner? hostCliRunner = null)
+    {
+        _hostCliRunner = hostCliRunner ?? new DefaultProcessRunner();
+    }
+
     public override AgentKind Kind => AgentKind.Opencode;
 
     /// <summary>Path to the opencode binary inside the sandbox.</summary>
@@ -149,5 +157,42 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
 
         _ = captureStructuredStream;
         return new AgentInvocation(argv, Stdin: prompt);
+    }
+
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+        => HostCliTextOnlyAuthScope.GetUnavailabilityReason(credential, HostCliTextOnlyAuthKind.Opencode);
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        var argv = new List<string> { Binary, "run" };
+        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
+        if (!string.IsNullOrEmpty(effectiveModel))
+        {
+            argv.Add("--model");
+            argv.Add(effectiveModel);
+        }
+
+        if (!string.IsNullOrEmpty(reasoningMode))
+        {
+            var flag = Environment.GetEnvironmentVariable("OPENCODE_REASONING_FLAG");
+            if (!string.IsNullOrEmpty(flag))
+            {
+                argv.Add(flag);
+                argv.Add(reasoningMode);
+            }
+        }
+
+        return HostCliTextOnlyInvoker.RunAsync(
+            _hostCliRunner,
+            argv,
+            stdin: prompt,
+            credential,
+            HostCliTextOnlyAuthKind.Opencode,
+            ct);
     }
 }

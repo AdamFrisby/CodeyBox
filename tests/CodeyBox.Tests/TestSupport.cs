@@ -293,6 +293,12 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
     /// </summary>
     public string? TextOnlyUnavailabilityReason { get; set; }
     public List<string> TextOnlyInvocations { get; } = new();
+    /// <summary>
+    /// When non-empty, each <see cref="RunTextOnlyAsync"/> call dequeues a
+    /// scripted result before the default conflict-resolution handler runs.
+    /// Used to simulate transient text-only failures during resolver cascade.
+    /// </summary>
+    public Queue<TextOnlyAgentResult> TextOnlyResults { get; } = new();
 
     private sealed record ConflictResolverInputJson(List<ConflictResolverInputFileJson>? Files);
     private sealed record ConflictResolverInputFileJson(string? Path, string? Content);
@@ -326,6 +332,8 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         _ = reasoningMode;
         _ = ct;
         TextOnlyInvocations.Add(prompt);
+        if (TextOnlyResults.Count > 0)
+            return Task.FromResult(TextOnlyResults.Dequeue());
         if (prompt.StartsWith("# Merge conflict resolver", StringComparison.Ordinal))
         {
             if (ConflictResolutionPlan.Count == 0)

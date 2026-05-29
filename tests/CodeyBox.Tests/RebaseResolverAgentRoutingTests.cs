@@ -338,6 +338,95 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task CodexMissingApiKey_ResolverRoutesToCursor()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+            TextOnlyUnavailabilityReason = "OPENAI_API_KEY is required for text-only calls",
+        };
+        var cursor = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Cursor,
+        };
+
+        cursor.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildFixture(seed, [codex, cursor]);
+
+        var item = NewItem(AgentKind.Codex) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(codex.TextOnlyInvocations);
+        Assert.Single(cursor.TextOnlyInvocations);
+        Assert.StartsWith("# Merge conflict resolver", cursor.TextOnlyInvocations[0]);
+    }
+
+    [Fact]
+    public async Task ClaudeTextOnlyFails_ResolverCascadeReachesCodex()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Claude,
+        };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+        };
+
+        claude.TextOnlyResults.Enqueue(new TextOnlyAgentResult(
+            false,
+            "Claude text-only call failed: HTTP 404",
+            null,
+            "not found"));
+        codex.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildFixture(seed, [claude, codex]);
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Single(claude.TextOnlyInvocations);
+        Assert.Single(codex.TextOnlyInvocations);
+    }
+
+    [Fact]
     public async Task NoCapConfigured_ResolverIgnoresRunningCount_UsesPrimary()
     {
         // Sanity check: when MaxConcurrent=0 (unset / "no per-agent cap"),

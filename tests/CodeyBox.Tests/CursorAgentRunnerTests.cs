@@ -1,5 +1,6 @@
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 
 namespace CodeyBox.Tests;
 
@@ -177,6 +178,62 @@ public sealed class CursorAgentRunnerTests
         // binary name avoids a subtle install-path regression.
         var runner = new CursorAgentRunner();
         Assert.Equal("agent", runner.Binary);
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsReason()
+    {
+        var runner = new CursorAgentRunner();
+        Assert.Equal(
+            "CODEYBOX_CURSOR_AUTH_JSON is required",
+            runner.GetTextOnlyUnavailabilityReason(credential: null));
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_InvokesAgentPrintWithModelAndStdin()
+    {
+        const string prompt = "resolve this conflict";
+        var process = new RecordingProcessRunner();
+        var runner = new CursorAgentRunner(process);
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync(prompt, cred);
+
+        Assert.True(result.Success, $"{result.Summary} | {result.Error}");
+        Assert.Equal("assistant text", result.Output);
+        var call = Assert.Single(process.Calls);
+        Assert.Equal("agent", call[0]);
+        Assert.Contains("--print", call);
+        Assert.Contains("--model", call);
+        Assert.Contains("composer-2.5", call);
+        Assert.Equal(prompt, process.Stdins[0]);
+        Assert.False(string.IsNullOrWhiteSpace(process.Environments[0]?["HOME"]));
+    }
+
+    private sealed class RecordingProcessRunner : IProcessRunner
+    {
+        public List<string[]> Calls { get; } = [];
+        public List<string?> Stdins { get; } = [];
+        public List<IReadOnlyDictionary<string, string>?> Environments { get; } = [];
+
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null)
+        {
+            Calls.Add(argv.ToArray());
+            Stdins.Add(stdin);
+            Environments.Add(environment);
+            return Task.FromResult(new ProcessRunResult(0, "assistant text", ""));
+        }
     }
 
     private sealed class RecordingSandbox : ISandbox

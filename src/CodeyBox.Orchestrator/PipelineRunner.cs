@@ -1191,11 +1191,11 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var conflictFiles = new SortedSet<string>(StringComparer.Ordinal);
         var resolvedAnyConflict = false;
-        // Resolver runner + credential are resolved lazily on first conflict so
-        // a clean rebase (no conflicts) is never blocked when no class member
-        // has viable text-only credentials. The same pair is reused for every
+        // Resolver cascade is resolved lazily on first conflict so a clean
+        // rebase (no conflicts) is never blocked when no class member has
+        // viable text-only credentials. The same cascade is reused for every
         // conflict iteration within this rebase.
-        (IAgentRunner Runner, AgentCredential? Credential)? resolverPair = null;
+        TextOnlyRebaseResolverCascade? resolverCascade = null;
 
         var rebase = await sandbox.ExecAsync(new SandboxExec
         {
@@ -1222,20 +1222,20 @@ public sealed class PipelineRunner : IPipelineRunner
                 foreach (var path in hunks.Select(static h => h.Path))
                     conflictFiles.Add(path);
 
-                resolverPair ??= await ResolveTextOnlyRebaseResolverAsync(item, project, runner, ct);
+                resolverCascade ??= await ResolveTextOnlyRebaseResolverCascadeAsync(item, project, runner, ct);
 
                 var baselines = await ReadConflictFilesAsync(sandbox, hunks, ct);
                 var prompt = BuildRebaseConflictResolverPrompt(baseBranch, workBranch, hunks, project.Audit.MergeScopeBufferLines);
-                var agentResult = await RunConstrainedConflictResolverAsync(
-                    resolverPair.Value.Runner,
+                var (agentResult, chosenResolver) = await RunRebaseConflictResolverCascadeAsync(
+                    item.Id,
+                    resolverCascade,
                     sandbox,
                     prompt,
                     hunks,
-                    resolverPair.Value.Credential,
                     item.ModelId,
                     item.ReasoningMode,
                     ct);
-                if (!agentResult.Success)
+                if (!agentResult.Success || chosenResolver is null)
                     throw new MergeConflictResolutionFailedException(
                         $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {agentResult.Summary}");
 
@@ -1326,19 +1326,22 @@ public sealed class PipelineRunner : IPipelineRunner
         ResolveTextOnlyRebaseResolverAsync(
             WorkItem item, Project project, IAgentRunner primaryRunner, CancellationToken ct)
     {
+        var cascade = await ResolveTextOnlyRebaseResolverCascadeAsync(item, project, primaryRunner, ct);
+        return cascade.Candidates[0];
+    }
+
+    private sealed record TextOnlyRebaseResolverCascade(
+        IReadOnlyList<(IAgentRunner Runner, AgentCredential? Credential)> Candidates,
+        string SkippedReasons);
+
+    private async Task<TextOnlyRebaseResolverCascade> ResolveTextOnlyRebaseResolverCascadeAsync(
+        WorkItem item, Project project, IAgentRunner primaryRunner, CancellationToken ct)
+    {
         var candidateReasons = new List<string>();
         var seenKinds = new HashSet<AgentKind>();
+        var viable = new List<(IAgentRunner Runner, AgentCredential? Credential)>();
 
-        var primary = await TryCandidateAsync(primaryRunner, ct);
-        var primaryAtCap = primary is not null && IsAtAgentCap(primaryRunner.Kind);
-        if (primary is { } primaryPair && !primaryAtCap)
-            return primaryPair;
-
-        // Walk the class chain. Track both the first non-at-cap viable
-        // candidate (strict preference) and the first at-cap viable candidate
-        // (permissive fallback for when nothing else is free).
-        (AgentKind Kind, IAgentRunner Runner, AgentCredential? Credential)? strictFallback = null;
-        (AgentKind Kind, IAgentRunner Runner, AgentCredential? Credential)? atCapFallback = null;
+        await TryAddCandidateAsync(primaryRunner, ct);
 
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
         if (_classRouter is not null && classId is not null)
@@ -1352,69 +1355,69 @@ public sealed class PipelineRunner : IPipelineRunner
                     candidateReasons.Add($"{member.Agent.Value}: no runner registered");
                     continue;
                 }
-                var memberPair = await TryCandidateAsync(memberRunner, ct);
-                if (memberPair is not { } chosen)
-                    continue;
-                if (IsAtAgentCap(member.Agent))
-                {
-                    atCapFallback ??= (member.Agent, chosen.Runner, chosen.Credential);
-                }
-                else
-                {
-                    strictFallback = (member.Agent, chosen.Runner, chosen.Credential);
-                    break;
-                }
+
+                await TryAddCandidateAsync(memberRunner, ct);
             }
         }
 
-        if (strictFallback is { } strict)
+        if (viable.Count == 0)
+        {
+            var reasons = candidateReasons.Count == 0
+                ? "no text-only-capable agent registered"
+                : string.Join("; ", candidateReasons);
+            AuditLog.RebaseResolverAgentUnavailable(item.Id, reasons);
+            throw new AgentUnavailableException(
+                $"pickup-time rebase resolver could not run: no text-only-capable agent has viable credentials ({reasons})",
+                reasons);
+        }
+
+        var ordered = viable
+            .OrderBy(c => IsAtAgentCap(c.Runner.Kind) ? 1 : 0)
+            .ToList();
+
+        var skipped = candidateReasons.Count == 0 ? "(none)" : string.Join("; ", candidateReasons);
+        var orderLabel = string.Join(">", ordered.Select(static c => c.Runner.Kind.Value));
+        AuditLog.RebaseResolverCascadePlanned(item.Id, orderLabel, skipped);
+
+        var primaryAtCap = IsAtAgentCap(primaryRunner.Kind);
+        var first = ordered[0];
+        if (!ReferenceEquals(first.Runner, primaryRunner))
         {
             if (primaryAtCap)
             {
                 AuditLog.RebaseResolverAgentCapReroute(
-                    primaryRunner.Kind, strict.Kind,
+                    primaryRunner.Kind, first.Runner.Kind,
                     GetRunningSafe(primaryRunner.Kind), GetCapSafe(primaryRunner.Kind));
             }
             else
             {
-                AuditLog.RebaseResolverAgentRerouted(primaryRunner.Kind, strict.Kind,
+                AuditLog.RebaseResolverAgentRerouted(primaryRunner.Kind, first.Runner.Kind,
                     $"{primaryRunner.Kind.Value} text-only credential missing; using class member");
             }
-            return (strict.Runner, strict.Credential);
         }
-
-        // No non-at-cap candidate. Prefer primary if its creds are viable
-        // (avoid swapping agents just because every option is saturated);
-        // otherwise an at-cap class member with viable creds.
-        if (primary is { } primaryViable)
+        else if (primaryAtCap && ordered.Count > 1 && !IsAtAgentCap(ordered[1].Runner.Kind))
+        {
+            AuditLog.RebaseResolverAgentCapReroute(
+                primaryRunner.Kind, ordered[1].Runner.Kind,
+                GetRunningSafe(primaryRunner.Kind), GetCapSafe(primaryRunner.Kind));
+        }
+        else if (primaryAtCap && ordered.All(c => IsAtAgentCap(c.Runner.Kind)))
         {
             AuditLog.RebaseResolverAllAtCap(
-                primaryRunner.Kind,
-                GetRunningSafe(primaryRunner.Kind),
-                GetCapSafe(primaryRunner.Kind));
-            return primaryViable;
-        }
-        if (atCapFallback is { } atCap)
-        {
-            AuditLog.RebaseResolverAllAtCap(
-                atCap.Kind, GetRunningSafe(atCap.Kind), GetCapSafe(atCap.Kind));
-            return (atCap.Runner, atCap.Credential);
+                first.Runner.Kind,
+                GetRunningSafe(first.Runner.Kind),
+                GetCapSafe(first.Runner.Kind));
         }
 
-        var reasons = candidateReasons.Count == 0 ? "no text-only-capable agent registered" : string.Join("; ", candidateReasons);
-        AuditLog.RebaseResolverAgentUnavailable(item.Id, reasons);
-        throw new AgentUnavailableException(
-            $"pickup-time rebase resolver could not run: no text-only-capable agent has viable credentials ({reasons})",
-            reasons);
+        return new TextOnlyRebaseResolverCascade(ordered, skipped);
 
-        async Task<(IAgentRunner Runner, AgentCredential? Credential)?> TryCandidateAsync(
-            IAgentRunner candidate, CancellationToken token)
+        async Task TryAddCandidateAsync(IAgentRunner candidate, CancellationToken token)
         {
             seenKinds.Add(candidate.Kind);
             if (candidate is not ITextOnlyAgentRunner textOnly)
             {
                 candidateReasons.Add($"{candidate.Kind.Value}: runner does not implement text-only mode");
-                return null;
+                return;
             }
 
             var credential = await ResolveAgentCredentialAsync(candidate.Kind, project, token);
@@ -1422,11 +1425,57 @@ public sealed class PipelineRunner : IPipelineRunner
             if (reason is not null)
             {
                 candidateReasons.Add($"{candidate.Kind.Value}: {reason}");
-                return null;
+                return;
             }
 
-            return (candidate, credential);
+            if (viable.Any(v => v.Runner.Kind == candidate.Kind))
+                return;
+
+            viable.Add((candidate, credential));
         }
+    }
+
+    private async Task<(AgentResult Result, IAgentRunner? ChosenRunner)> RunRebaseConflictResolverCascadeAsync(
+        WorkItemId workItemId,
+        TextOnlyRebaseResolverCascade cascade,
+        ISandbox sandbox,
+        string prompt,
+        IReadOnlyList<ConflictHunk> conflictHunks,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct)
+    {
+        var attemptTrail = new List<string>();
+        AgentResult? lastResult = null;
+        IAgentRunner? chosen = null;
+
+        foreach (var (resolverRunner, resolverCredential) in cascade.Candidates)
+        {
+            var agentResult = await RunConstrainedConflictResolverAsync(
+                resolverRunner,
+                sandbox,
+                prompt,
+                conflictHunks,
+                resolverCredential,
+                modelId,
+                reasoningMode,
+                ct);
+            lastResult = agentResult;
+            if (agentResult.Success)
+            {
+                chosen = resolverRunner;
+                var attempted = attemptTrail.Count == 0
+                    ? "(none)"
+                    : string.Join("; ", attemptTrail);
+                AuditLog.RebaseResolverSucceeded(workItemId, resolverRunner.Kind, attempted, cascade.SkippedReasons);
+                return (agentResult, chosen);
+            }
+
+            attemptTrail.Add($"{resolverRunner.Kind.Value}({agentResult.Summary})");
+            AuditLog.RebaseResolverTextOnlyAttemptFailed(workItemId, resolverRunner.Kind, agentResult.Summary);
+        }
+
+        return (lastResult ?? new AgentResult(false, "no text-only resolver candidates", null, null), chosen);
     }
 
     /// <summary>

@@ -1,5 +1,6 @@
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
@@ -346,6 +347,58 @@ public sealed class OpencodeAgentRunnerTests
     /// Sandbox that records every exec invocation and lets the test stub a
     /// specific exit code for the auth-materialisation bash script.
     /// </summary>
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsReason()
+    {
+        var runner = new OpencodeAgentRunner();
+        Assert.Equal(
+            "OPENCODE_AUTH_JSON is required",
+            runner.GetTextOnlyUnavailabilityReason(credential: null));
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_InvokesOpencodeRunWithModelAndStdin()
+    {
+        const string prompt = "resolve this conflict";
+        var process = new RecordingProcessRunner();
+        var runner = new OpencodeAgentRunner(process);
+        var cred = new AgentCredential(
+            AgentKind.Opencode,
+            new Dictionary<string, string> { ["OPENCODE_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync(prompt, cred);
+
+        Assert.True(result.Success);
+        Assert.Equal("resolved json", result.Output);
+        var call = Assert.Single(process.Calls);
+        Assert.Equal("opencode", call[0]);
+        Assert.Equal("run", call[1]);
+        Assert.Contains("--model", call);
+        Assert.Equal(prompt, process.Stdins[0]);
+    }
+
+    private sealed class RecordingProcessRunner : IProcessRunner
+    {
+        public List<string[]> Calls { get; } = [];
+        public List<string?> Stdins { get; } = [];
+
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null)
+        {
+            Calls.Add(argv.ToArray());
+            Stdins.Add(stdin);
+            return Task.FromResult(new ProcessRunResult(0, "resolved json", ""));
+        }
+    }
+
     private sealed class RecordingSandbox : ISandbox
     {
         private readonly int _authWriteExitCode;
