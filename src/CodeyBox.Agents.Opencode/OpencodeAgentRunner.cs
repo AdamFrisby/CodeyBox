@@ -21,7 +21,7 @@ namespace CodeyBox.Agents.Opencode;
 /// materialises the file from <c>OPENCODE_AUTH_JSON</c> in the credential
 /// bundle before invoking the CLI, mirroring the Codex pattern.</para>
 /// </summary>
-public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, ISandboxTextOnlyAgentRunner
+public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     public override AgentKind Kind => AgentKind.Opencode;
 
@@ -89,7 +89,6 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         var write = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["bash", "-c", script],
-            ExtraEnvironment = MergeCredentialEnvironment(null, credential),
         }, ct);
         if (!write.Success)
         {
@@ -152,34 +151,31 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         return new AgentInvocation(argv, Stdin: prompt);
     }
 
+    protected override AgentInvocation BuildTextOnlyInvocation(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null)
+        => BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream: false);
+
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
         => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
             credential,
-            "opencode text-only requires a credential bundle");
+            "OPENCODE_AUTH_JSON");
 
     public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
     {
-        _ = prompt;
-        _ = credential;
-        _ = modelId;
-        _ = reasoningMode;
-        return RunTextOnlyRequiresSandboxAsync(ct);
-    }
+        if (sandbox is null || workingDirectory is null)
+            return RunTextOnlyRequiresSandboxAsync(ct);
 
-    public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        CancellationToken ct = default)
-        => ExecuteTextOnlyInSandboxAsync(
+        return ExecuteTextOnlyInSandboxAsync(
             sandbox,
             workingDirectory,
             prompt,
@@ -187,4 +183,5 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
             modelId,
             reasoningMode,
             ct);
+    }
 }

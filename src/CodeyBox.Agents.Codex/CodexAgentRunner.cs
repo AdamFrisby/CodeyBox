@@ -133,8 +133,12 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
     {
+        _ = sandbox;
+        _ = workingDirectory;
         var apiKey = ResolveOpenAiApiKey(credential);
         if (string.IsNullOrEmpty(apiKey))
             return new TextOnlyAgentResult(false, "missing Codex text-only credential", null, "OPENAI_API_KEY is required for text-only calls");

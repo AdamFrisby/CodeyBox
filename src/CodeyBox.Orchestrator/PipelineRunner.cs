@@ -63,7 +63,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly AgentAvailabilityRegistry? _availability;
     private readonly IPreMergeVerifier? _preMergeVerifier;
-    // Per-agent concurrency view used by ResolveTextOnlyRebaseResolverAsync to
+    // Per-agent concurrency view used by ResolveTextOnlyRebaseResolverCascadeAsync to
     // route the pickup-time rebase resolver away from agents whose
     // operator-configured cap is at ceiling. The cap is shorthand for "this
     // agent's API account budget is currently saturated"; a second concurrent
@@ -1360,8 +1360,13 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             else
             {
+                var primarySkip = candidateReasons
+                    .FirstOrDefault(r => r.StartsWith($"{primaryRunner.Kind.Value}:", StringComparison.Ordinal));
+                var skipDetail = primarySkip is not null
+                    ? primarySkip[(primaryRunner.Kind.Value.Length + 2)..]
+                    : "text-only not available";
                 AuditLog.RebaseResolverAgentRerouted(primaryRunner.Kind, first.Runner.Kind,
-                    $"{primaryRunner.Kind.Value} text-only credential missing; using class member");
+                    $"{primaryRunner.Kind.Value} skipped ({skipDetail}); using class member");
             }
         }
         else if (primaryAtCap && ordered.All(c => IsAtAgentCap(c.Runner.Kind)))
@@ -1377,19 +1382,14 @@ public sealed class PipelineRunner : IPipelineRunner
         async Task TryAddCandidateAsync(IAgentRunner candidate, CancellationToken token)
         {
             seenKinds.Add(candidate.Kind);
-            if (candidate is not ITextOnlyAgentRunner and not ISandboxTextOnlyAgentRunner)
+            if (candidate is not ITextOnlyAgentRunner)
             {
                 candidateReasons.Add($"{candidate.Kind.Value}: runner does not implement text-only mode");
                 return;
             }
 
             var credential = await ResolveAgentCredentialAsync(candidate.Kind, project, token);
-            var reason = candidate switch
-            {
-                ITextOnlyAgentRunner textOnly => textOnly.GetTextOnlyUnavailabilityReason(credential),
-                ISandboxTextOnlyAgentRunner sandboxTextOnly => sandboxTextOnly.GetTextOnlyUnavailabilityReason(credential),
-                _ => "runner does not implement text-only mode",
-            };
+            var reason = ((ITextOnlyAgentRunner)candidate).GetTextOnlyUnavailabilityReason(credential);
             if (reason is not null)
             {
                 candidateReasons.Add($"{candidate.Kind.Value}: {reason}");
@@ -1416,7 +1416,6 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var attemptTrail = new List<string>();
         AgentResult? lastResult = null;
-        IAgentRunner? chosen = null;
 
         foreach (var (resolverRunner, resolverCredential) in cascade.Candidates)
         {
@@ -1433,7 +1432,6 @@ public sealed class PipelineRunner : IPipelineRunner
             lastResult = agentResult;
             if (agentResult.Success)
             {
-                chosen = resolverRunner;
                 var attempted = attemptTrail.Count == 0
                     ? "(none)"
                     : string.Join("; ", attemptTrail);
@@ -1445,7 +1443,7 @@ public sealed class PipelineRunner : IPipelineRunner
             AuditLog.RebaseResolverTextOnlyAttemptFailed(workItemId, resolverRunner.Kind, agentResult.Summary);
         }
 
-        return (lastResult ?? new AgentResult(false, "no text-only resolver candidates", null, null), chosen, null);
+        return (lastResult ?? new AgentResult(false, "no text-only resolver candidates", null, null), null, null);
     }
 
     internal static async Task<TextOnlyAgentResult> InvokeTextOnlyAsync(
@@ -1458,26 +1456,21 @@ public sealed class PipelineRunner : IPipelineRunner
         string? reasoningMode,
         CancellationToken ct)
     {
-        if (sandbox is not null
-            && workingDirectory is not null
-            && runner is ISandboxTextOnlyAgentRunner sandboxRunner)
+        if (runner is ITextOnlyAgentRunner textOnlyRunner)
         {
-            return await sandboxRunner.RunTextOnlyInSandboxAsync(
-                sandbox,
-                workingDirectory,
+            return await textOnlyRunner.RunTextOnlyAsync(
                 prompt,
                 credential,
                 modelId,
                 reasoningMode,
-                ct);
+                ct,
+                sandbox,
+                workingDirectory);
         }
-
-        if (runner is ITextOnlyAgentRunner hostRunner)
-            return await hostRunner.RunTextOnlyAsync(prompt, credential, modelId, reasoningMode, ct);
 
         return new TextOnlyAgentResult(
             false,
-            $"agent {runner.Kind.Value} does not support text-only calls without a sandbox",
+            $"agent {runner.Kind.Value} does not support text-only calls",
             null,
             null);
     }
@@ -4094,7 +4087,7 @@ public sealed class PipelineRunner : IPipelineRunner
         string? reasoningMode,
         CancellationToken ct)
     {
-        if (runner is not ITextOnlyAgentRunner and not ISandboxTextOnlyAgentRunner)
+        if (runner is not ITextOnlyAgentRunner)
         {
             return new AgentResult(
                 false,
@@ -4674,7 +4667,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         _ = workItemId;
         _ = project;
-        if (runner is not ITextOnlyAgentRunner and not ISandboxTextOnlyAgentRunner)
+        if (runner is not ITextOnlyAgentRunner)
         {
             _log.LogWarning(
                 "Advisory merge security review skipped because agent {AgentKind} does not implement text-only review",
@@ -4733,8 +4726,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
             You are a read-only security reviewer running as a pure text-in/text-out
             model call. Review only the resolved merge-conflict diff provided in this
-            prompt. You have no shell, filesystem, repository checkout, agent tools,
-            or model-controlled network access.
+            prompt. Do not invoke tools, shell commands, filesystem access, or network
+            requests — respond with analysis text only.
 
             This review is advisory only. The deterministic host scope fence is the merge gate.
             Surface suspicious patterns such as dynamic code execution, network access,

@@ -343,30 +343,41 @@ public sealed class OpencodeAgentRunnerTests
     }
 
     [Fact]
-    public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsReason()
+    public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsNull()
     {
         var runner = new OpencodeAgentRunner();
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(credential: null));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_EmptyCredentialBundle_ReturnsReason()
+    {
+        var runner = new OpencodeAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Opencode,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
         Assert.Equal(
-            "opencode text-only requires a credential bundle",
-            runner.GetTextOnlyUnavailabilityReason(credential: null));
+            "OPENCODE_AUTH_JSON is required when a credential bundle is supplied",
+            runner.GetTextOnlyUnavailabilityReason(cred));
     }
 
     [Fact]
-    public void GetTextOnlyUnavailabilityReason_WithCredentialBundle_ReturnsNull()
+    public void GetTextOnlyUnavailabilityReason_WithAuthJson_ReturnsNull()
     {
         var runner = new OpencodeAgentRunner();
-        Assert.Null(runner.GetTextOnlyUnavailabilityReason(OpencodeCred("")));
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(OpencodeCred("""{"token":"x"}""")));
     }
 
     [Fact]
-    public async Task RunTextOnlyInSandboxAsync_InvokesOpencodeRunWithModelAndStdin()
+    public async Task RunTextOnlyAsync_InvokesOpencodeRunWithModelAndStdin()
     {
         const string prompt = "resolve this conflict";
         var sandbox = new TextOnlyRecordingSandbox("resolved json");
         var runner = new OpencodeAgentRunner();
         var cred = OpencodeCred("""{"token":"x"}""");
 
-        var result = await runner.RunTextOnlyInSandboxAsync(sandbox, "/work", prompt, cred);
+        var result = await runner.RunTextOnlyAsync(prompt, cred, sandbox: sandbox, workingDirectory: "/work");
 
         Assert.True(result.Success);
         Assert.Equal("resolved json", result.Output);
@@ -374,11 +385,12 @@ public sealed class OpencodeAgentRunnerTests
         Assert.Equal("opencode", agentExec.Argv[0]);
         Assert.Equal("run", agentExec.Argv[1]);
         Assert.Contains("--model", agentExec.Argv);
+        Assert.Contains("deepseek/deepseek-coder", agentExec.Argv);
         Assert.Equal(prompt, agentExec.Stdin);
     }
 
     [Fact]
-    public async Task RunTextOnlyInSandboxAsync_WithReasoningFlag_AppendsFlagToArgv()
+    public async Task RunTextOnlyAsync_WithReasoningFlag_AppendsFlagToArgv()
     {
         var prior = Environment.GetEnvironmentVariable("OPENCODE_REASONING_FLAG");
         Environment.SetEnvironmentVariable("OPENCODE_REASONING_FLAG", "--reasoning-effort");
@@ -388,8 +400,8 @@ public sealed class OpencodeAgentRunnerTests
             var runner = new OpencodeAgentRunner();
             var cred = OpencodeCred("""{"token":"x"}""");
 
-            var result = await runner.RunTextOnlyInSandboxAsync(
-                sandbox, "/work", "prompt", cred, reasoningMode: "high");
+            var result = await runner.RunTextOnlyAsync(
+                "prompt", cred, sandbox: sandbox, workingDirectory: "/work", reasoningMode: "high");
 
             Assert.True(result.Success);
             var agentExec = sandbox.Execs.Last();

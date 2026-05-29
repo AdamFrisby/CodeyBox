@@ -13,8 +13,7 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Pickup-time rebase resolver walks the agent-class chain for text-only-capable
-/// members (host <see cref="ITextOnlyAgentRunner"/> or sandbox
-/// <see cref="ISandboxTextOnlyAgentRunner"/>), cascades on transient failures,
+/// members implementing <see cref="ITextOnlyAgentRunner"/>, cascades on transient failures,
 /// and emits operator-visible audit events for chosen/attempted/skipped agents.
 /// </summary>
 [Collection("Pipeline integration")]
@@ -622,6 +621,97 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task CodexMissingApiKey_ResolverRoutesToOpencode()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+            TextOnlyUnavailabilityReason = "OPENAI_API_KEY is required for text-only calls",
+        };
+        var opencode = new SandboxTextOnlyScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Opencode,
+        };
+
+        opencode.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildFixture(seed, [codex, opencode]);
+
+        var item = NewItem(AgentKind.Codex) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(codex.TextOnlyInvocations);
+        Assert.Single(opencode.SandboxTextOnlyInvocations);
+        Assert.StartsWith("# Merge conflict resolver", opencode.SandboxTextOnlyInvocations[0]);
+    }
+
+    [Fact]
+    public async Task ClaudeTextOnlyFails_AdvisoryReviewUsesCascadeWinner()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditStore = new CapturingAuditReportStore();
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+
+        claude.TextOnlyResults.Enqueue(new TextOnlyAgentResult(
+            false,
+            "Claude text-only call failed: HTTP 404",
+            null,
+            "not found"));
+        codex.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildFixture(seed, [claude, codex], auditReportStore: auditStore);
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Single(claude.TextOnlyInvocations);
+        Assert.Equal(2, codex.TextOnlyInvocations.Count);
+        Assert.StartsWith("# Merge conflict resolver", codex.TextOnlyInvocations[0]);
+        Assert.StartsWith("# Advisory merge security review", codex.TextOnlyInvocations[1]);
+        Assert.DoesNotContain(
+            claude.TextOnlyInvocations,
+            p => p.StartsWith("# Advisory merge security review", StringComparison.Ordinal));
+        Assert.NotEmpty(auditStore.Reports);
+        Assert.Equal("merge-security-review", auditStore.Reports[0].AuditorName);
+    }
+
+    [Fact]
     public async Task NoCapConfigured_ResolverIgnoresRunningCount_UsesPrimary()
     {
         // Sanity check: when MaxConcurrent=0 (unset / "no per-agent cap"),
@@ -681,7 +771,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         string seedRepoUrl,
         IReadOnlyList<IAgentRunner> agents,
         IAgentRunningCounters? runningCounters = null,
-        AgentConcurrencyOptions? agentConcurrency = null)
+        AgentConcurrencyOptions? agentConcurrency = null,
+        IAuditReportStore? auditReportStore = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -743,7 +834,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             classRouter: router,
             agentRunningCounters: runningCounters,
-            agentConcurrency: agentConcurrency);
+            agentConcurrency: agentConcurrency,
+            auditReports: auditReportStore);
 
         return new RoutingFixture(pipeline, store, gitHost);
     }
@@ -800,10 +892,7 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     private sealed class PermissiveCredentialProvider : ICredentialProvider
     {
         public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
-            => Task.FromResult<AgentCredential?>(new AgentCredential(
-                agent,
-                EnvironmentVariables: new Dictionary<string, string>(),
-                Files: new Dictionary<string, string>()));
+            => Task.FromResult<AgentCredential?>(null);
     }
 
     private sealed record RoutingFixture(
@@ -860,5 +949,25 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         if (typeof(T) == typeof(int) && sv.Value is long l)
             return (T)(object)(int)l;
         return default;
+    }
+
+    private sealed class CapturingAuditReportStore : IAuditReportStore
+    {
+        public List<AuditReport> Reports { get; } = [];
+
+        public Task CreateAsync(AuditReport report, CancellationToken ct = default)
+        {
+            Reports.Add(report);
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<AuditReport>>(Reports.Where(r => r.WorkItemId == workItemId).ToList());
+
+        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+            => Task.FromResult<string?>(null);
+
+        public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
+            => Task.FromResult(0);
     }
 }

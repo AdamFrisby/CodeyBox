@@ -181,21 +181,32 @@ public sealed class CursorAgentRunnerTests
     }
 
     [Fact]
-    public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsReason()
+    public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsNull()
     {
         var runner = new CursorAgentRunner();
-        Assert.Equal(
-            "cursor text-only requires a credential bundle",
-            runner.GetTextOnlyUnavailabilityReason(credential: null));
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(credential: null));
     }
 
     [Fact]
-    public void GetTextOnlyUnavailabilityReason_WithCredentialBundle_ReturnsNull()
+    public void GetTextOnlyUnavailabilityReason_EmptyCredentialBundle_ReturnsReason()
     {
         var runner = new CursorAgentRunner();
         var cred = new AgentCredential(
             AgentKind.Cursor,
             new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+        Assert.Equal(
+            "CODEYBOX_CURSOR_AUTH_JSON is required when a credential bundle is supplied",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_WithAuthJson_ReturnsNull()
+    {
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
             new Dictionary<string, string>());
         Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
     }
@@ -211,20 +222,19 @@ public sealed class CursorAgentRunnerTests
             new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
             new Dictionary<string, string>());
 
-        var result = await runner.RunTextOnlyInSandboxAsync(sandbox, "/work", prompt, cred);
+        var result = await runner.RunTextOnlyAsync(prompt, cred, sandbox: sandbox, workingDirectory: "/work");
 
         Assert.True(result.Success, $"{result.Summary} | {result.Error}");
         Assert.Equal("assistant text", result.Output);
         var agentExec = sandbox.Execs.Last();
         Assert.Equal("agent", agentExec.Argv[0]);
         Assert.Contains("--print", agentExec.Argv);
-        Assert.Contains("--trust", agentExec.Argv);
-        Assert.Contains("--force", agentExec.Argv);
+        Assert.DoesNotContain("--trust", agentExec.Argv);
+        Assert.DoesNotContain("--force", agentExec.Argv);
         Assert.Contains("--model", agentExec.Argv);
         Assert.Contains("composer-2.5", agentExec.Argv);
         Assert.Equal(prompt, agentExec.Stdin);
-        Assert.NotNull(agentExec.ExtraEnvironment);
-        Assert.Equal("""{"token":"x"}""", agentExec.ExtraEnvironment["CODEYBOX_CURSOR_AUTH_JSON"]);
+        Assert.Null(agentExec.ExtraEnvironment);
     }
 
     [Fact]
@@ -252,7 +262,7 @@ public sealed class CursorAgentRunnerTests
             new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
             new Dictionary<string, string>());
 
-        var result = await runner.RunTextOnlyInSandboxAsync(sandbox, "/work", "prompt", cred);
+        var result = await runner.RunTextOnlyAsync("prompt", cred, sandbox: sandbox, workingDirectory: "/work");
 
         Assert.False(result.Success);
         Assert.Equal("model unavailable", result.Error);
@@ -268,7 +278,7 @@ public sealed class CursorAgentRunnerTests
             new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
             new Dictionary<string, string>());
 
-        var result = await runner.RunTextOnlyInSandboxAsync(sandbox, "/work", "prompt", cred);
+        var result = await runner.RunTextOnlyAsync("prompt", cred, sandbox: sandbox, workingDirectory: "/work");
 
         Assert.True(result.Success);
         Assert.Equal("stderr-only", result.Output);

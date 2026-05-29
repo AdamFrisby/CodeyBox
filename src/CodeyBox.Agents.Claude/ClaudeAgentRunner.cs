@@ -224,8 +224,12 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
     {
+        _ = sandbox;
+        _ = workingDirectory;
         _ = reasoningMode;
         string? oauthToken = null;
         string? apiKey = null;

@@ -325,12 +325,15 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
     {
         _ = credential;
         _ = modelId;
         _ = reasoningMode;
         _ = ct;
+        OnTextOnlyInvoked(sandbox, workingDirectory, prompt);
         TextOnlyInvocations.Add(prompt);
         if (TextOnlyResults.Count > 0)
             return Task.FromResult(TextOnlyResults.Dequeue());
@@ -360,6 +363,13 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         }
 
         return Task.FromResult(new TextOnlyAgentResult(false, "unsupported text-only prompt", null, null));
+    }
+
+    protected virtual void OnTextOnlyInvoked(ISandbox? sandbox, string? workingDirectory, string prompt)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        _ = prompt;
     }
 
     public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
@@ -458,11 +468,10 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
 }
 
 /// <summary>
-/// Scripted agent implementing <see cref="ISandboxTextOnlyAgentRunner"/> so
-/// orchestrator integration tests exercise the sandbox dispatch path in
-/// <c>PipelineRunner.InvokeTextOnlyAsync</c>.
+/// Scripted agent whose text-only path records sandbox-dispatched invocations
+/// separately for orchestrator routing tests.
 /// </summary>
-internal sealed class SandboxTextOnlyScriptedAgent : ScriptedAgent, ISandboxTextOnlyAgentRunner
+internal sealed class SandboxTextOnlyScriptedAgent : ScriptedAgent
 {
     public SandboxTextOnlyScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
         : base(mergeStrategies)
@@ -471,19 +480,10 @@ internal sealed class SandboxTextOnlyScriptedAgent : ScriptedAgent, ISandboxText
 
     public List<string> SandboxTextOnlyInvocations { get; } = new();
 
-    public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        CancellationToken ct = default)
+    protected override void OnTextOnlyInvoked(ISandbox? sandbox, string? workingDirectory, string prompt)
     {
-        _ = sandbox;
-        _ = workingDirectory;
-        SandboxTextOnlyInvocations.Add(prompt);
-        return RunTextOnlyAsync(prompt, credential, modelId, reasoningMode, ct);
+        if (sandbox is not null && workingDirectory is not null)
+            SandboxTextOnlyInvocations.Add(prompt);
     }
 }
 

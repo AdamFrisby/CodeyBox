@@ -114,26 +114,43 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     }
 
     /// <summary>
+    /// Build argv for text-only sandbox calls. Must not include tool-auto-approve
+    /// flags (<c>--trust</c>, <c>--force</c>, <c>--dangerously-skip-permissions</c>).
+    /// Returns <c>null</c> when this runner has no sandbox text-only CLI path.
+    /// </summary>
+    protected virtual AgentInvocation? BuildTextOnlyInvocation(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null)
+        => null;
+
+    /// <summary>
     /// Viability probe for subscription CLIs whose sandbox auth materialisation
     /// no-ops when the auth-json env var is absent (image-baked CLI auth).
-    /// Returns null when a credential bundle is present.
+    /// Returns null when text-only may proceed (including with no host credential).
     /// </summary>
     protected static string? GetSandboxSubscriptionTextOnlyUnavailabilityReason(
         AgentCredential? credential,
-        string missingCredentialMessage)
+        string authJsonEnvVarName)
     {
-        return credential is null ? missingCredentialMessage : null;
+        if (credential is null)
+            return null;
+
+        if (credential.EnvironmentVariables is not { Count: > 0 })
+            return $"{authJsonEnvVarName} is required when a credential bundle is supplied";
+
+        if (credential.EnvironmentVariables.TryGetValue(authJsonEnvVarName, out var json)
+            && !string.IsNullOrWhiteSpace(json))
+            return null;
+
+        // Bundle present but auth JSON absent — PrepareSandboxAsync no-ops; image auth may suffice.
+        return null;
     }
 
     /// <summary>
     /// Runs a one-shot print-mode CLI invocation inside the sandbox for
-    /// text-only resolver/review calls. The VM boundary is the security
-    /// perimeter, so sandbox invocations may use the runner's normal
-    /// non-interactive argv (including trust/force flags where applicable).
-    /// </summary>
-    /// <summary>
-    /// Host-side text-only is not permitted for subscription CLIs; resolver
-    /// paths must use <see cref="ExecuteTextOnlyInSandboxAsync"/>.
+    /// text-only resolver/review calls using <see cref="BuildTextOnlyInvocation"/>.
     /// </summary>
     protected Task<TextOnlyAgentResult> RunTextOnlyRequiresSandboxAsync(CancellationToken ct = default)
     {
@@ -173,13 +190,21 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (preparation is not null)
             return new TextOnlyAgentResult(false, preparation.Summary, preparation.Stdout, preparation.Stderr);
 
-        var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream: false);
+        var invocation = BuildTextOnlyInvocation(prompt, credential, modelId, reasoningMode);
+        if (invocation is null)
+        {
+            return new TextOnlyAgentResult(
+                false,
+                $"{Kind.Value} text-only is not supported inside the sandbox",
+                null,
+                null);
+        }
+
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
             Stdin = invocation.Stdin,
-            ExtraEnvironment = MergeCredentialEnvironment(invocation.ExtraEnvironment, credential),
         }, ct);
 
         if (!result.Success)
