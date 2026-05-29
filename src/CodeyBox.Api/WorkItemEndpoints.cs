@@ -1090,9 +1090,13 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
-    /// Partially update a Queued work item's editable fields (title, prompt,
-    /// agent, work/merge timeouts, min model score). Returns 409 Conflict when
-    /// the item is no longer in Queued state.
+    /// Partially update a work item's editable fields. Most fields (title,
+    /// prompt, agent, work/merge timeouts, min model score, required
+    /// capabilities) are Queued-only — they affect a running pipeline so the
+    /// endpoint rejects 409 once dispatch starts. <see cref="PatchWorkItemRequest.DependsOn"/>
+    /// is the exception: it's a replace-set edit allowed on any non-terminal
+    /// state (Queued / Working / Auditing / …), persisted via a partial
+    /// UPDATE that does not stomp <c>state</c> and friends.
     ///
     /// Timeout / score fields are clamped using the same bounds as creation —
     /// out-of-range values do not error, they pin to the boundary so an
@@ -1107,18 +1111,50 @@ internal static class WorkItemEndpoints
         string id,
         PatchWorkItemRequest body,
         IWorkItemStore store,
+        ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
-        var workItemId = item!.Id;
 
-        if (item.State != WorkItemState.Queued)
-            return Results.Conflict(new { error = $"cannot edit item in state {item.State}; only Queued items are editable" });
+        var depsPatch = body.DependsOn is not null;
+        var nonDepPatch =
+            body.Title is not null
+            || body.Prompt is not null
+            || body.Agent is not null
+            || body.WorkTimeoutMinutes is not null
+            || body.MergeTimeoutMinutes is not null
+            || body.MinModelScore is not null
+            || body.RequiredCapabilities is not null;
 
-        var updated = item;
+        // ── State pre-checks: surface 409 before any write ────────────────────
+        // DependsOn is allowed on any non-terminal state — adding a dependency
+        // post-hoc is the whole reason this field exists. Other fields stay
+        // Queued-only because they affect a running pipeline.
+        if (depsPatch && WorkItemDependencies.TerminalStates.Contains(item!.State))
+            return Results.Conflict(new
+            {
+                error = $"cannot edit dependencies of work item in terminal state '{item.State}'",
+            });
+        if (nonDepPatch && item!.State != WorkItemState.Queued)
+            return Results.Conflict(new
+            {
+                error = $"cannot edit item in state {item.State}; only Queued items are editable",
+            });
+
+        // ── DependsOn resolution + cycle check (no writes yet, may 400) ──────
+        List<WorkItemId>? newDependsOn = null;
+        if (depsPatch)
+        {
+            var (depErr, ids) = await ResolveAndValidateDependsOnAsync(
+                body.DependsOn!, item!.Id, item.ProjectId, store, ct);
+            if (depErr is not null) return depErr;
+            newDependsOn = ids;
+        }
+
+        var updated = item!;
         var now = DateTimeOffset.UtcNow;
 
         if (body.Title is not null)
@@ -1176,21 +1212,52 @@ internal static class WorkItemEndpoints
             updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
         }
 
-        // TryUpdateIfStateAsync guards against a race where the orchestrator picks
-        // up the item between the GetAsync above and this write.
-        var written = await store.TryUpdateIfStateAsync(updated, WorkItemState.Queued, ct);
-        if (!written)
-            return Results.Conflict(new { error = "item transitioned out of Queued state before the update could be written" });
+        IReadOnlyList<WorkItemId> oldDependsOn = updated.DependsOn;
+        if (depsPatch)
+            updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
 
-        AuditLog.WorkItemPatched(
-            updated.Id,
-            titleChanged: body.Title is not null,
-            promptChanged: body.Prompt is not null,
-            agentChanged: body.Agent is not null,
-            workTimeoutChanged: body.WorkTimeoutMinutes is not null,
-            mergeTimeoutChanged: body.MergeTimeoutMinutes is not null,
-            minModelScoreChanged: body.MinModelScore is not null,
-            requiredCapabilitiesChanged: body.RequiredCapabilities is not null);
+        // ── Persist ──────────────────────────────────────────────────────────
+        // Non-dep fields are Queued-only and go through the full-row UPDATE.
+        // A dep-only edit on a non-Queued non-terminal item (Working, Auditing,
+        // etc.) takes the partial-UPDATE path so we don't stomp state/started_at.
+        if (nonDepPatch)
+        {
+            // TryUpdateIfStateAsync guards against a race where the orchestrator picks
+            // up the item between the GetAsync above and this write.
+            var written = await store.TryUpdateIfStateAsync(updated, WorkItemState.Queued, ct);
+            if (!written)
+                return Results.Conflict(new { error = "item transitioned out of Queued state before the update could be written" });
+        }
+        else if (depsPatch)
+        {
+            var depResult = await store.UpdateDependsOnAsync(updated.Id, newDependsOn!, now, ct);
+            switch (depResult.Outcome)
+            {
+                case DependsOnUpdateOutcome.NotFound:
+                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+                case DependsOnUpdateOutcome.TerminalState:
+                    return Results.Conflict(new
+                    {
+                        error = $"work item transitioned to terminal state '{depResult.Item!.State}' before dependencies could be updated",
+                    });
+            }
+            oldDependsOn = depResult.OldDependsOn ?? oldDependsOn;
+        }
+
+        if (nonDepPatch)
+        {
+            AuditLog.WorkItemPatched(
+                updated.Id,
+                titleChanged: body.Title is not null,
+                promptChanged: body.Prompt is not null,
+                agentChanged: body.Agent is not null,
+                workTimeoutChanged: body.WorkTimeoutMinutes is not null,
+                mergeTimeoutChanged: body.MergeTimeoutMinutes is not null,
+                minModelScoreChanged: body.MinModelScore is not null,
+                requiredCapabilitiesChanged: body.RequiredCapabilities is not null);
+        }
+        if (depsPatch)
+            AuditLog.WorkItemDependenciesChanged(updated.Id, oldDependsOn, newDependsOn!);
 
         var statesById = new Dictionary<WorkItemId, WorkItemState>();
         var depExternalIds = new Dictionary<WorkItemId, string?>();
@@ -1204,8 +1271,107 @@ internal static class WorkItemEndpoints
             }
         }
 
+        // If the dep edit on a Queued item left all deps satisfied (typical for
+        // dependsOn=[]), kick the dispatcher so it picks the item up immediately
+        // instead of waiting for the next scan tick. Mirrors the Create path.
+        if (depsPatch
+            && updated.State == WorkItemState.Queued
+            && WorkItemDependencies.AreSatisfied(updated.DependsOn, statesById))
+        {
+            await queue.EnqueueAsync(updated.Id, ct);
+        }
+
         var project = await projects.GetAsync(updated.ProjectId, ct);
         return Results.Ok(ToDto(updated, project, statesById, depExternalIds));
+    }
+
+    /// <summary>
+    /// Resolves and validates a <c>dependsOn</c> string array for a PATCH-time
+    /// dependency edit. Each entry is a GUID, a namespaced <c>'ns:value'</c>
+    /// externalId, or a bare externalId (unambiguous within the project). Caps
+    /// at 100 entries, rejects self-loops and missing deps, and runs full
+    /// cycle detection over the proposed graph.
+    ///
+    /// Returns either the validated WorkItemId list, or an IResult ready to
+    /// short-circuit the endpoint with a 400. Mirrors the inline validation
+    /// block in CreateAsync — the two paths must keep the same shape so
+    /// invariants do not drift.
+    /// </summary>
+    private static async Task<(IResult? Error, List<WorkItemId>? Ids)> ResolveAndValidateDependsOnAsync(
+        string[] rawDeps,
+        WorkItemId targetId,
+        ProjectId projectId,
+        IWorkItemStore store,
+        CancellationToken ct)
+    {
+        if (rawDeps.Length > 100)
+            return (Results.BadRequest(new { error = "dependsOn must contain at most 100 entries" }), null);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
+
+        var byNamespacedExternalId = new Dictionary<(string Namespace, string Value), WorkItem>();
+        var byBareExternalId = new Dictionary<string, List<(string Namespace, WorkItem Item)>>(StringComparer.Ordinal);
+        foreach (var existing in allItems.Where(i => i.ProjectId == projectId))
+        {
+            foreach (var (ns, value) in existing.ExternalIds)
+            {
+                byNamespacedExternalId[(ns, value)] = existing;
+                if (!byBareExternalId.TryGetValue(value, out var list))
+                    byBareExternalId[value] = list = new List<(string, WorkItem)>();
+                list.Add((ns, existing));
+            }
+        }
+
+        var dependsOnIds = new List<WorkItemId>(rawDeps.Length);
+        foreach (var rawId in rawDeps)
+        {
+            if (rawId is null)
+                return (Results.BadRequest(new { error = "dependency could not be resolved: null entry in dependsOn array" }), null);
+            if (Guid.TryParse(rawId, out var g))
+            {
+                dependsOnIds.Add(new WorkItemId(g));
+                continue;
+            }
+            if (Validation.TryParseNamespacedExternalId(rawId, out var depNs, out var depValue) && depNs is not null)
+            {
+                if (!byNamespacedExternalId.TryGetValue((depNs, depValue), out var depByNs))
+                    return (Results.BadRequest(new
+                    {
+                        error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{depValue}' in namespace '{depNs}' in project '{projectId}'",
+                    }), null);
+                dependsOnIds.Add(depByNs.Id);
+                continue;
+            }
+            if (!byBareExternalId.TryGetValue(rawId, out var matches) || matches.Count == 0)
+                return (Results.BadRequest(new
+                {
+                    error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{rawId}' in project '{projectId}'",
+                }), null);
+            var distinctItems = matches.Select(m => m.Item.Id).Distinct().ToList();
+            if (distinctItems.Count > 1)
+                return (Results.BadRequest(new
+                {
+                    error = $"dependency '{rawId}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} — qualify as 'namespace:value'",
+                }), null);
+            dependsOnIds.Add(distinctItems[0]);
+        }
+
+        if (dependsOnIds.Contains(targetId))
+            return (Results.BadRequest(new { error = "a work item cannot depend on itself" }), null);
+
+        var missingDep = WorkItemDependencies.FindMissingDependency(dependsOnIds, allItems);
+        if (missingDep is not null)
+            return (Results.BadRequest(new { error = $"dependency {missingDep} not found" }), null);
+
+        // Cycle detection: FindCycle overrides adj[targetId] = dependsOnIds in
+        // the existing graph, so passing the existing item's own id correctly
+        // models the edit case (its old deps are replaced before DFS).
+        var cyclePath = WorkItemDependencies.FindCycle(targetId, dependsOnIds, allItems);
+        if (cyclePath is not null)
+            return (Results.BadRequest(new { error = $"circular dependency detected: {cyclePath}" }), null);
+
+        return (null, dependsOnIds);
     }
 
     /// <summary>
@@ -2091,7 +2257,13 @@ public sealed record PatchWorkItemRequest(
     int? WorkTimeoutMinutes = null,
     int? MergeTimeoutMinutes = null,
     int? MinModelScore = null,
-    IReadOnlyList<string>? RequiredCapabilities = null);
+    IReadOnlyList<string>? RequiredCapabilities = null,
+    // Replace-set dependency edit. Same string-format and validation rules
+    // as the create handler: each entry is a GUID, a namespaced
+    // 'ns:value' externalId, or a bare externalId (unambiguous within the
+    // project). Cap at 100 entries; cycle-checked; allowed on any non-terminal
+    // item. Passing an empty array clears all dependencies.
+    string[]? DependsOn = null);
 
 public sealed record PatchPriorityRequest(int Priority);
 

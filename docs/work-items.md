@@ -350,6 +350,23 @@ across `/replay`.
 
 ---
 
-## Immutability
+## Editing dependencies post-hoc
 
-`dependsOn` is immutable after creation. There is no endpoint to add, remove, or reorder dependencies. Mutating the dependency graph of an in-flight DAG is a footgun (a running worker could be blocked by a newly-added dependency it never knew about); out of scope for this release.
+`dependsOn` is editable via `PATCH /workitems/{id}` with replace-set
+semantics — pass the full new array (a GUID, a namespaced `ns:value`
+externalId, or a bare externalId for each entry) and it overwrites the
+item's dependency list. Same validation as the create path: cap at 100,
+existence check, self-loop and cycle rejection.
+
+Allowed on any **non-terminal** state. Terminal items
+(`Done` / `Cancelled` / `Failed` / `AuditFailed` /
+`MergeConflictResolutionFailed` / `AbandonedAfterRecoveryAttempts`)
+reject with `409` because dependencies on closed work are moot. Editing
+an in-flight item (`Working` / `Auditing` / …) does not affect the
+current iteration — the gate has already passed — but is recorded for
+any future re-dispatch (recovery / retry paths).
+
+The change is persisted via a partial UPDATE that touches only
+`depends_on_json` and `updated_at`, so a concurrent worker mid-pipeline
+is not stomped. An audit-log entry (`work_item.dependencies_changed`)
+records the pre- and post-edit ID sets.

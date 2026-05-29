@@ -556,4 +556,206 @@ public sealed class PatchWorkItemHttpTests : IDisposable
         // ordering when bulk-bumping the queue.
         Assert.Equal(item.QueuePosition, ready.QueuePosition);
     }
+
+    // ── DependsOn replace-set ───────────────────────────────────────────────
+    //
+    // PATCH /workitems/{id} accepts an optional dependsOn array. Unlike the
+    // other fields it is allowed on any non-terminal item — adding a dep to a
+    // Queued item that's still waiting is the whole reason this field exists,
+    // and avoids the cancel-and-recreate workaround.
+
+    [Fact]
+    public async Task PatchDependsOn_OnQueuedItem_AddDep_BlocksDispatchUntilDepCompletes()
+    {
+        // Dep A is still Working; B's dependsOn gate stays unsatisfied. Once A
+        // reaches Done, the gate opens — same semantics as create-time deps.
+        var depA = QueuedItem() with { State = WorkItemState.Working, Title = "A" };
+        var itemB = QueuedItem() with { Title = "B" };
+        await _factory.Store.CreateAsync(depA);
+        await _factory.Store.CreateAsync(itemB);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{itemB.Id}",
+            new { dependsOn = new[] { depA.Id.ToString() } });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var storedB = await _factory.Store.GetAsync(itemB.Id);
+        Assert.Single(storedB!.DependsOn);
+        Assert.Equal(depA.Id, storedB.DependsOn[0]);
+
+        // Gate evaluation: A is still Working, so B is NOT dispatch-eligible.
+        var states = new Dictionary<CodeyBox.Core.WorkItemId, WorkItemState>
+        {
+            [depA.Id] = WorkItemState.Working,
+        };
+        Assert.False(WorkItemDependencies.AreSatisfied(storedB.DependsOn, states));
+
+        // Flip A to Done — the gate opens and B becomes dispatch-eligible.
+        states[depA.Id] = WorkItemState.Done;
+        Assert.True(WorkItemDependencies.AreSatisfied(storedB.DependsOn, states));
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_SelfDependency_Returns400()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { dependsOn = new[] { item.Id.ToString() } });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_TransitiveCycle_Returns400()
+    {
+        // Pre-existing graph: B → A (B depends on A). PATCH A to depend on B
+        // would create the cycle A → B → A, which must be rejected.
+        var itemA = QueuedItem() with { Title = "A" };
+        var itemB = QueuedItem() with { Title = "B", DependsOn = new[] { itemA.Id } };
+        await _factory.Store.CreateAsync(itemA);
+        await _factory.Store.CreateAsync(itemB);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{itemA.Id}",
+            new { dependsOn = new[] { itemB.Id.ToString() } });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+        // Confirm A's deps did NOT get written by the rejected request.
+        var storedA = await _factory.Store.GetAsync(itemA.Id);
+        Assert.Empty(storedA!.DependsOn);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_NonExistentDepId_Returns400()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { dependsOn = new[] { Guid.NewGuid().ToString() } });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_OversizedArray_Returns400()
+    {
+        var item = QueuedItem();
+        await _factory.Store.CreateAsync(item);
+
+        var tooMany = Enumerable.Range(0, 101).Select(_ => Guid.NewGuid().ToString()).ToArray();
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { dependsOn = tooMany });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Done)]
+    [InlineData(WorkItemState.Failed)]
+    [InlineData(WorkItemState.Cancelled)]
+    [InlineData(WorkItemState.AuditFailed)]
+    [InlineData(WorkItemState.MergeConflictResolutionFailed)]
+    [InlineData(WorkItemState.AbandonedAfterRecoveryAttempts)]
+    public async Task PatchDependsOn_OnTerminalItem_Returns409(WorkItemState terminal)
+    {
+        var dep = QueuedItem() with { Title = "dep" };
+        var item = QueuedItem() with { State = terminal };
+        await _factory.Store.CreateAsync(dep);
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { dependsOn = new[] { dep.Id.ToString() } });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        // Confirm the partial UPDATE did NOT touch the row.
+        var fetched = await _factory.Store.GetAsync(item.Id);
+        Assert.Empty(fetched!.DependsOn);
+        Assert.Equal(terminal, fetched.State);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_OnWorkingItem_Succeeds_StateUntouched()
+    {
+        // Non-terminal non-Queued items go through the partial UPDATE path,
+        // which must not stomp state/started_at/etc.
+        var dep = QueuedItem() with { Title = "dep" };
+        var working = QueuedItem() with
+        {
+            Title = "working",
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+        };
+        await _factory.Store.CreateAsync(dep);
+        await _factory.Store.CreateAsync(working);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{working.Id}",
+            new { dependsOn = new[] { dep.Id.ToString() } });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var fetched = await _factory.Store.GetAsync(working.Id);
+        Assert.Equal(WorkItemState.Working, fetched!.State);
+        Assert.NotNull(fetched.StartedAt);
+        Assert.Single(fetched.DependsOn);
+        Assert.Equal(dep.Id, fetched.DependsOn[0]);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_EmptyArray_ClearsDependencies_OnQueuedItem()
+    {
+        var depA = QueuedItem() with { State = WorkItemState.Working, Title = "A" };
+        var itemB = QueuedItem() with
+        {
+            Title = "B",
+            DependsOn = new[] { depA.Id },
+        };
+        await _factory.Store.CreateAsync(depA);
+        await _factory.Store.CreateAsync(itemB);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{itemB.Id}",
+            new { dependsOn = Array.Empty<string>() });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var storedB = await _factory.Store.GetAsync(itemB.Id);
+        Assert.Empty(storedB!.DependsOn);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_CombinedWithTitle_OnWorkingItem_Returns409()
+    {
+        // dependsOn is allowed on non-terminal; title is Queued-only. A
+        // combined PATCH that hits both on a Working item must 409 BEFORE any
+        // partial write lands — no half-applied state.
+        var dep = QueuedItem() with { Title = "dep" };
+        var working = QueuedItem() with
+        {
+            Title = "working",
+            State = WorkItemState.Working,
+        };
+        await _factory.Store.CreateAsync(dep);
+        await _factory.Store.CreateAsync(working);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{working.Id}",
+            new { dependsOn = new[] { dep.Id.ToString() }, title = "new title" });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        // Neither the deps nor the title should have been written.
+        var fetched = await _factory.Store.GetAsync(working.Id);
+        Assert.Empty(fetched!.DependsOn);
+        Assert.Equal("working", fetched.Title);
+    }
 }

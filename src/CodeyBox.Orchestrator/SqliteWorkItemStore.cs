@@ -580,6 +580,62 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    public async Task<DependsOnUpdateResult> UpdateDependsOnAsync(
+        WorkItemId id,
+        IReadOnlyList<WorkItemId> dependsOn,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            // Read under the write lock so a concurrent worker cannot transition the
+            // row between the read and the partial UPDATE below — same TOCTOU posture
+            // as UpdatePriorityAsync.
+            WorkItem? current;
+            using (var read = _conn.CreateCommand())
+            {
+                read.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                read.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await read.ExecuteReaderAsync(ct);
+                current = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+
+            if (current is null)
+                return new DependsOnUpdateResult(DependsOnUpdateOutcome.NotFound, null, null);
+
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+
+            if (WorkItemDependencies.TerminalStates.Contains(current.State))
+                return new DependsOnUpdateResult(DependsOnUpdateOutcome.TerminalState, current, current.DependsOn);
+
+            // Partial UPDATE: touch only depends_on_json + updated_at. Crucially does
+            // NOT write state/started_at/recovery_attempts/etc, so a worker that picks
+            // the item up concurrently isn't stomped.
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET depends_on_json = $deps, updated_at = $updated_at
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$deps",
+                JsonSerializer.Serialize(dependsOn.Select(d => d.ToString()).ToList()));
+            cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            var updated = current with { DependsOn = dependsOn, UpdatedAt = updatedAt };
+            return new DependsOnUpdateResult(DependsOnUpdateOutcome.Updated, updated, current.DependsOn);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("UpdateDependsOnAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();

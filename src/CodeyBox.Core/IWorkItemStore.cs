@@ -30,6 +30,32 @@ public readonly record struct PromptReplaceResult(PromptReplaceOutcome Outcome, 
 public enum PromptReplaceOutcome { Updated, NotFound, TerminalState }
 
 /// <summary>
+/// Outcome of <see cref="IWorkItemStore.UpdateDependsOnAsync"/>.
+/// </summary>
+public enum DependsOnUpdateOutcome
+{
+    /// <summary>The row was updated and the new dependency set is persisted.</summary>
+    Updated,
+    /// <summary>The row no longer exists.</summary>
+    NotFound,
+    /// <summary>The row exists but is in a terminal state; no write was issued.</summary>
+    TerminalState,
+}
+
+/// <summary>
+/// Result returned by <see cref="IWorkItemStore.UpdateDependsOnAsync"/>.
+/// <see cref="Item"/> is populated on <see cref="DependsOnUpdateOutcome.Updated"/>
+/// and on <see cref="DependsOnUpdateOutcome.TerminalState"/> (so callers can
+/// surface the current state to the client); null on <see cref="DependsOnUpdateOutcome.NotFound"/>.
+/// <see cref="OldDependsOn"/> is the pre-update dependency list, captured so
+/// the caller can emit a meaningful audit-log entry without re-reading the row.
+/// </summary>
+public readonly record struct DependsOnUpdateResult(
+    DependsOnUpdateOutcome Outcome,
+    WorkItem? Item,
+    IReadOnlyList<WorkItemId>? OldDependsOn);
+
+/// <summary>
 /// Snapshot of a single dispatched iteration. <see cref="PromptRevisionAtDispatch"/>
 /// is the value of <see cref="WorkItem.PromptRevision"/> at the moment the iteration
 /// was handed to the agent; the orchestrator compares it against the trailer on the
@@ -76,6 +102,24 @@ public interface IWorkItemStore
     /// not modified.
     /// </summary>
     Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default);
+
+    /// <summary>
+    /// Partial UPDATE that touches only the <c>depends_on_json</c> and
+    /// <c>updated_at</c> columns for the row identified by <paramref name="id"/>.
+    /// Used by PATCH /workitems/{id} when an operator edits the dependency set
+    /// post-hoc — the full-row <see cref="UpdateAsync"/> would otherwise stomp
+    /// <c>state</c>, <c>started_at</c>, and friends when applied to an
+    /// in-flight item (Working/Auditing/etc).
+    ///
+    /// Returns <see cref="DependsOnUpdateOutcome.TerminalState"/> when the row
+    /// is in a terminal state — dependency edits are meaningless once an item
+    /// is Done/Cancelled/Failed.
+    /// </summary>
+    Task<DependsOnUpdateResult> UpdateDependsOnAsync(
+        WorkItemId id,
+        IReadOnlyList<WorkItemId> dependsOn,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default);
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);

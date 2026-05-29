@@ -153,6 +153,22 @@ public static class AuditLog
             .Information("Work item {WorkItemId} priority changed: {OldPriority} → {NewPriority}",
                 id.ToString(), oldPriority, newPriority);
 
+    /// <summary>
+    /// Distinct audit event for post-hoc dependency edits via PATCH /workitems/{id}.
+    /// Records the previous and new dependency-id sets explicitly so the audit
+    /// trail captures the mutation; <see cref="WorkItemPatched"/>'s flags-only
+    /// shape would otherwise erase it.
+    /// </summary>
+    public static void WorkItemDependenciesChanged(
+        WorkItemId id,
+        IReadOnlyList<WorkItemId> oldDependsOn,
+        IReadOnlyList<WorkItemId> newDependsOn) =>
+        Audit("work_item.dependencies_changed")
+            .Information("Work item {WorkItemId} dependencies changed: [{OldDependsOn}] → [{NewDependsOn}]",
+                id.ToString(),
+                string.Join(",", oldDependsOn.Select(d => d.ToString())),
+                string.Join(",", newDependsOn.Select(d => d.ToString())));
+
     public static void WorkItemReordered(int count) =>
         Audit("work_item.reordered")
             .Information("Queue reordered: {Count} items repositioned", count);
