@@ -465,9 +465,11 @@ public static class AuditLog
 
     /// <summary>
     /// Emitted when the pickup-time rebase resolver routed past a candidate
-    /// whose credential, quota, or availability gates rejected it.
-    /// <paramref name="rejectedAgent"/> is the configured primary candidate;
-    /// <paramref name="chosenAgent"/> is the class-chain member that took over.
+    /// whose non-cap pre-dispatch gate rejected it. <paramref name="reason"/>
+    /// carries the actual gate reason (for example
+    /// <c>quota exhausted (6.0%)</c>) so operators are not misled into reading
+    /// a quota steer as a credential problem. Cap-driven reroutes use
+    /// <see cref="RebaseResolverAgentCapReroute"/> instead.
     /// </summary>
     public static void RebaseResolverAgentRerouted(
         AgentKind rejectedAgent, AgentKind chosenAgent, string reason) =>
@@ -482,12 +484,14 @@ public static class AuditLog
     /// could not run at all. The work item is failed with
     /// <c>failureKind=agent_unavailable</c>; distinct from resolver failures
     /// where an agent ran but produced an unmergeable answer.
+    /// <paramref name="candidateReasons"/> carries the per-agent gate reasons
+    /// so operators can tell a credential gap from a quota steer.
     /// </summary>
     public static void RebaseResolverAgentUnavailable(
         WorkItemId workItemId, string candidateReasons) =>
         Audit("rebase_resolver.agent_unavailable")
             .Warning(
-                "Pickup-time rebase resolver could not run for {WorkItemId}: no candidate agent was viable ({CandidateReasons})",
+                "Pickup-time rebase resolver could not run for {WorkItemId}: no candidate agent passed the resolver gates ({CandidateReasons})",
                 workItemId.ToString(), candidateReasons);
 
     /// <summary>

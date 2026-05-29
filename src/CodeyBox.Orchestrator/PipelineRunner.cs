@@ -853,9 +853,10 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (AgentUnavailableException ex)
         {
             // Distinct from MergeConflictResolutionFailed: the resolver never
-            // ran because no text-only-capable agent had viable credentials.
+            // ran because no candidate passed the pre-dispatch resolver gates.
             // Failure is structured so operators can grep failureKind=agent_unavailable
-            // and fix the credential gap rather than chasing a phantom merge bug.
+            // and fix the routing, quota, or credential gap rather than chasing
+            // a phantom merge bug.
             _log.LogWarning("Work item {Id} agent unavailable: {Error}", item.Id, ex.Message);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "agent_unavailable");
         }
@@ -1540,6 +1541,9 @@ public sealed class PipelineRunner : IPipelineRunner
     /// registered, falling back to the work runner otherwise. Candidates are
     /// quota-gated with the same audit quota router path, then at-cap agents are
     /// pushed to the back while retaining them as last-resort candidates.
+    /// Gate rejection reasons are preserved so reroute and unavailable events
+    /// report the real cause, such as quota exhaustion, rather than a generic
+    /// credential failure.
     /// </summary>
     internal async Task<IReadOnlyList<AgenticConflictResolverCandidate>> BuildAgenticConflictCandidatesAsync(
         WorkItem item,
@@ -1610,7 +1614,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 : string.Join("; ", skipReasons);
             AuditLog.RebaseResolverAgentUnavailable(item.Id, reasons);
             throw new AgentUnavailableException(
-                $"pickup-time rebase resolver could not run: no agent has viable credentials ({reasons})",
+                $"pickup-time rebase resolver could not run: no agent has viable credentials or quota ({reasons})",
                 reasons);
         }
 
@@ -1642,7 +1646,7 @@ public sealed class PipelineRunner : IPipelineRunner
             else if (resolverPrimaryRejectedReason is not null)
             {
                 AuditLog.RebaseResolverAgentRerouted(
-                    resolverPrimary.Kind, first.Runner.Kind, resolverPrimaryRejectedReason);
+                    resolverPrimary.Kind, first.Runner.Kind, $"{resolverPrimaryRejectedReason}; using class member");
             }
         }
         if (auditRebaseRouting && ordered.All(c => IsAtAgentCap(c.Runner.Kind)))
