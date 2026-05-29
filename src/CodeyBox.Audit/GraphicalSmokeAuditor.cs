@@ -77,7 +77,7 @@ public sealed class GraphicalSmokeAuditor : IAuditor
     }
 }
 
-public readonly record struct PngPixelStats(
+internal readonly record struct PngPixelStats(
     int Width,
     int Height,
     int PixelCount,

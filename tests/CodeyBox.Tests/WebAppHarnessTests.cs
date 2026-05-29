@@ -472,33 +472,15 @@ public sealed class WebAppHarnessTests
     }
 
     [Fact]
-    public void ScreenshotReadinessProbe_RejectsUniformPng()
-    {
-        Assert.False(ScreenshotReadinessProbe.LooksLikeRenderedUi(UniformPng));
-    }
-
-    [Fact]
     public void PngRenderedUiReadiness_RejectsNonPng()
     {
         Assert.False(PngRenderedUiReadiness.LooksLikeRenderedUi([0x01, 0x02, 0x03, 0x04]));
     }
 
     [Fact]
-    public void ScreenshotReadinessProbe_RejectsNonPng()
-    {
-        Assert.False(ScreenshotReadinessProbe.LooksLikeRenderedUi([0x01, 0x02, 0x03, 0x04]));
-    }
-
-    [Fact]
     public void PngRenderedUiReadiness_AcceptsNonUniformPng()
     {
         Assert.True(PngRenderedUiReadiness.LooksLikeRenderedUi(NonUniformPng));
-    }
-
-    [Fact]
-    public void ScreenshotReadinessProbe_AcceptsNonUniformPng()
-    {
-        Assert.True(ScreenshotReadinessProbe.LooksLikeRenderedUi(NonUniformPng));
     }
 
     [Fact]

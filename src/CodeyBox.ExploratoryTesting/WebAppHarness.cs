@@ -38,27 +38,26 @@ public sealed class WebAppHarness : IAppUnderTestHarness
     {
         ArgumentNullException.ThrowIfNull(recipe);
         ValidateRecipe(recipe);
-        var web = recipe;
 
         _log.LogInformation(
             "WebAppHarness.LaunchAsync: target={Target} entryUrl={EntryUrl} buildSteps={BuildCount} seedSteps={SeedCount}",
-            web.TargetName, web.EntryUrl, web.BuildSteps.Count, web.SeedSteps.Count);
+            recipe.TargetName, recipe.EntryUrl, recipe.BuildSteps.Count, recipe.SeedSteps.Count);
 
-        var spec = BuildSandboxSpec(web);
+        var spec = BuildSandboxSpec(recipe);
         var sandbox = await _provider.CreateAsync(spec, ct);
         try
         {
             await PrepareInVmLogDirAsync(sandbox, ct);
-            await RunSerialAsync(sandbox, web, web.BuildSteps, "build", ct);
-            await RunSerialAsync(sandbox, web, web.SeedSteps, "seed", ct);
-            await StartRunCommandAsync(sandbox, web, ct);
-            await WaitForHttpReachableAsync(sandbox, web, ct);
-            await OpenBrowserAsync(sandbox, web, ct);
-            var screenshot = await WaitForRenderedUiAsync(sandbox, web, ct);
+            await RunSerialAsync(sandbox, recipe, recipe.BuildSteps, "build", ct);
+            await RunSerialAsync(sandbox, recipe, recipe.SeedSteps, "seed", ct);
+            await StartRunCommandAsync(sandbox, recipe, ct);
+            await WaitForHttpReachableAsync(sandbox, recipe, ct);
+            await OpenBrowserAsync(sandbox, recipe, ct);
+            var screenshot = await WaitForRenderedUiAsync(sandbox, recipe, ct);
             var bridge = _computerUseFactory(sandbox);
             _log.LogInformation("WebAppHarness.LaunchAsync: target={Target} ready ({Bytes} byte screenshot)",
-                web.TargetName, screenshot.Length);
-            return new AppUnderTestSession(sandbox, bridge, web.EntryUrl, screenshot);
+                recipe.TargetName, screenshot.Length);
+            return new AppUnderTestSession(sandbox, bridge, recipe.EntryUrl, screenshot);
         }
         catch
         {
@@ -69,7 +68,7 @@ public sealed class WebAppHarness : IAppUnderTestHarness
             {
                 _log.LogWarning(disposeEx,
                     "WebAppHarness.LaunchAsync: target={Target} dispose-after-failure threw; sandbox may leak",
-                    web.TargetName);
+                    recipe.TargetName);
             }
             throw;
         }

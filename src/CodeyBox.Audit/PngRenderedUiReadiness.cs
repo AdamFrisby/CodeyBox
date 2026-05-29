@@ -30,7 +30,25 @@ public static class PngRenderedUiReadiness
         }
     }
 
-    public static bool LooksLikeRenderedUi(byte[] png) => LooksLikeRenderedUi(png.AsSpan());
+    /// <summary>
+    /// Returns true when <paramref name="png"/> decodes as a supported PNG and
+    /// has at least two distinct colors with sufficient luma range.
+    /// </summary>
+    public static bool LooksLikeRenderedUi(byte[] png)
+    {
+        try
+        {
+            return PassesPixelDiversity(PngPixelStats.FromPng(png));
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+    }
 
     internal static bool PassesPixelDiversity(PngPixelStats stats) =>
         stats.PixelCount > 0
