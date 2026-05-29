@@ -141,6 +141,15 @@ public sealed class PipelineRunnerTimingTests : IDisposable
             "expected a codeybox.agent.invocations measurement for the successful work invocation");
         Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "work")),
             "expected a codeybox.phase.duration_ms{phase=work} measurement");
+
+        // The merge phase (RealMerge, non-empty merge path) opens its own
+        // phase.merge span and records a phase=merge duration sample. Asserting
+        // only phase.work would let a regression that dropped or mis-tagged the
+        // merge scope pass unnoticed on this full Done pipeline.
+        Assert.True(spans.Any("phase.merge", ("codeybox.phase", "merge")),
+            "expected a phase.merge span on the full Done pipeline");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "merge")),
+            "expected a codeybox.phase.duration_ms{phase=merge} measurement");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

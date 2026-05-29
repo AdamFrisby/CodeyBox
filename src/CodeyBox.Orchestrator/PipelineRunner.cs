@@ -3133,7 +3133,6 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        using var auditPhaseScope = BeginPhaseScope(item, "audit");
         for (var iteration = 1; iteration <= project.Audit.MaxIterations; iteration++)
         {
             if (hostShutdownToken.IsCancellationRequested)
@@ -3141,6 +3140,13 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (iteration > 1)
                 await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
+
+            // Per-iteration audit phase scope. Disposed explicitly before the
+            // rework scope (below) so codeybox.phase.duration_ms{phase=audit}
+            // measures only the auditing work — not nested rework or later
+            // iterations. The `using` still guarantees disposal on the pass
+            // (return) and exhausted (throw) paths.
+            using var auditPhaseScope = BeginPhaseScope(item, "audit");
 
             await PublishAuditStartedAsync(item, project, iteration, auditors, ct);
             var auditPhaseStart = DateTimeOffset.UtcNow;
@@ -3231,6 +3237,9 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "reworking"));
+            // Close the audit phase scope before the incremental rebase and
+            // rework begins; neither should contribute to audit duration.
+            auditPhaseScope.Dispose();
 
             // Keep the work branch close to base BETWEEN audit/rework
             // iterations so the merge-time rebase has less to consolidate
@@ -3606,7 +3615,8 @@ public sealed class PipelineRunner : IPipelineRunner
             _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
             iteration: ctx.Iteration,
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-            log: _log);
+            log: _log,
+            activitySource: CodeyBoxActivities.Audit);
         // Record one involvement row per auditor sandbox run. ExecAuditorAsync is
         // the single chokepoint for every auditor (tool + LLM, including the LLM
         // transient retry), so recording here gives a 1:1 mapping between the
@@ -3634,6 +3644,11 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         sw.Stop();
         await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner.Kind, result));
+        CodeyBoxMeters.AuditorDuration.Record(
+            (long)sw.Elapsed.TotalMilliseconds,
+            new KeyValuePair<string, object?>("auditor.name", auditor.Name),
+            new KeyValuePair<string, object?>("auditor.kind", auditor.Kind),
+            new KeyValuePair<string, object?>("iteration", ctx.Iteration.ToString()));
         return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs, streamCapture is not null);
     }
 
@@ -7892,16 +7907,18 @@ Original merge-phase failure (for context):
     /// </summary>
     private static PhaseScope BeginPhaseScope(WorkItem item, string phase) => new(item, phase);
 
-    private readonly struct PhaseScope : IDisposable
+    private struct PhaseScope : IDisposable
     {
         private readonly Activity? _activity;
         private readonly long _startTs;
         private readonly string _phase;
+        private bool _disposed;
 
         public PhaseScope(WorkItem item, string phase)
         {
             _phase = phase;
             _startTs = Stopwatch.GetTimestamp();
+            _disposed = false;
             _activity = CodeyBoxActivities.Pipeline.StartActivity($"phase.{phase}", ActivityKind.Internal);
             if (_activity is not null)
             {
@@ -7911,8 +7928,14 @@ Original merge-phase failure (for context):
             }
         }
 
+        // Idempotent. The audit loop disposes its audit scope early — before the
+        // rework scope opens — so phase.audit duration excludes nested rework;
+        // the enclosing `using` then disposes again at iteration end. Recording
+        // the histogram / stopping the span exactly once keeps both correct.
         public void Dispose()
         {
+            if (_disposed) return;
+            _disposed = true;
             CodeyBoxMeters.PhaseDuration.Record(
                 (long)Stopwatch.GetElapsedTime(_startTs).TotalMilliseconds,
                 new KeyValuePair<string, object?>("phase", _phase));
