@@ -13,6 +13,17 @@ namespace CodeyBox.Core;
 ///
 /// <para>Implementations should be cheap to invoke repeatedly (results are
 /// only fetched once per process at startup, so caching is optional).</para>
+///
+/// <para>For per-call (hot-path) credential resolution — e.g. the text-only
+/// runner mapping an undated alias to the canonical Messages-API id — provider
+/// adapters expose a credential-scoped sub-interface (see
+/// <c>IClaudeModelListProbe</c>) rather than reusing the ambient-credential
+/// <see cref="GetModelListAsync(CancellationToken)"/>. That keeps both surfaces
+/// behind a single DI-injectable, mockable abstraction owned by the provider
+/// adapter — no static helpers on the concrete probe — and ensures hot-path
+/// calls flow through the same <c>IHttpClientFactory</c> policy (timeout,
+/// AllowAutoRedirect=false) as startup validation, instead of an ad-hoc
+/// <c>HttpClient</c> in the runner.</para>
 /// </summary>
 public interface IAgentModelListProbe
 {

@@ -1056,7 +1056,12 @@ builder.Services.AddHostedService<InVmSmokeProbeCoverageValidator>();
 // Registered as IEnumerable<IAgentModelListProbe>; the validator resolves by Kind.
 // Copilot has no probe — its CLI does not accept a --model flag, so AgentClass
 // members never carry a Copilot ModelId in the first place.
-builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
+//
+// Claude's probe is also exposed as IClaudeModelListProbe so provider-scoped
+// callers can reuse the same DI-registered singleton: same named HttpClient
+// policy (5 s timeout, AllowAutoRedirect=false), same URL/header/version
+// handling, same response cap.
+builder.Services.AddSingleton<ClaudeModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var source = sp.GetRequiredService<ClaudeCredentialFileSource>();
@@ -1068,6 +1073,8 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         loggerFactory.CreateLogger<ClaudeModelListProbe>());
 });
+builder.Services.AddSingleton<IAgentModelListProbe>(sp => sp.GetRequiredService<ClaudeModelListProbe>());
+builder.Services.AddSingleton<IClaudeModelListProbe>(sp => sp.GetRequiredService<ClaudeModelListProbe>());
 builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();

@@ -337,6 +337,27 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? reasoningMode = null)
         => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: true, captureStructuredStream: false);
 
+    /// <summary>
+    /// Picks the latest date-stamped variant whose id is
+    /// <c>requested + "-" + &lt;date&gt;</c>; otherwise an exact match;
+    /// otherwise the requested id unchanged.
+    /// </summary>
+    internal static string ResolveCanonicalModelId(string requested, IReadOnlyList<string> available)
+    {
+        var prefix = requested + "-";
+        var datedMatch = available
+            .Where(id => id.StartsWith(prefix, StringComparison.Ordinal))
+            .OrderByDescending(static id => id, StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (datedMatch is not null)
+            return datedMatch;
+
+        if (available.Contains(requested, StringComparer.Ordinal))
+            return requested;
+
+        return requested;
+    }
+
     private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, bool resume, bool captureStructuredStream)
     {
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };

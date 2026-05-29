@@ -21,7 +21,7 @@ namespace CodeyBox.Agents.Claude;
 ///
 /// <para>Never logs the Authorization header or credential values.</para>
 /// </summary>
-public sealed class ClaudeModelListProbe : IAgentModelListProbe
+public sealed class ClaudeModelListProbe : IClaudeModelListProbe
 {
     internal const string ModelsEndpoint = "https://api.anthropic.com/v1/models";
     internal const string AnthropicVersion = "2023-06-01";
@@ -44,12 +44,25 @@ public sealed class ClaudeModelListProbe : IAgentModelListProbe
         _log = log;
     }
 
-    public async Task<AgentModelListResult> GetModelListAsync(CancellationToken ct)
+    public Task<AgentModelListResult> GetModelListAsync(CancellationToken ct)
     {
         var (oauth, apiKey) = _credentialsProvider();
+        return GetModelListAsync(oauth, apiKey, ct);
+    }
+
+    /// <summary>
+    /// Credential-scoped overload used by callers that need to validate a
+    /// specific Claude credential rather than the ambient provider. Goes
+    /// through the same named <c>agent-modellist</c> HttpClient as the ambient
+    /// overload — 5 s timeout, <c>AllowAutoRedirect=false</c> — so both surfaces
+    /// share the configured policy.
+    /// </summary>
+    public async Task<AgentModelListResult> GetModelListAsync(
+        string? oauthToken, string? apiKey, CancellationToken ct)
+    {
         if (string.IsNullOrEmpty(apiKey))
         {
-            return string.IsNullOrEmpty(oauth)
+            return string.IsNullOrEmpty(oauthToken)
                 ? AgentModelListResult.Failed("no credential configured")
                 : AgentModelListResult.Failed(OAuthDeclinedReason);
         }
