@@ -370,29 +370,43 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     private async Task EmitTransitionWebhookAsync(
         AgentKind kind, AgentSmokeResult result, AvailabilityTransition transition)
     {
-        if (!transition.PreviouslyExcluded && transition.NowExcluded)
+        // Webhook emission is a side-effect of an already-recorded verdict, never
+        // an input to it. The availability registry was mutated before we got
+        // here (MarkSmokeResult / BenchTransientFaultIfRequested), so a publish
+        // fault must not propagate: on the dispatch gate it would surface in
+        // EnsureProbedAsync's catch and, under FailClosedOnProbeFault, bench an
+        // agent whose probe just passed — overwriting a fresh pass with an
+        // inconclusive failure. Isolate it like the sweep path: log and continue.
+        try
         {
-            await _webhooks.PublishAsync(new WebhookEvent
+            if (!transition.PreviouslyExcluded && transition.NowExcluded)
             {
-                Event = "agent.smoke_failed",
-                Details = new AgentSmokeFailedDetails
+                await _webhooks.PublishAsync(new WebhookEvent
                 {
-                    AgentKind = kind.Value,
-                    Reason = result.FailureReason,
-                },
-            }, CancellationToken.None);
+                    Event = "agent.smoke_failed",
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = kind.Value,
+                        Reason = result.FailureReason,
+                    },
+                }, CancellationToken.None);
+            }
+            else if (transition.PreviouslyExcluded && !transition.NowExcluded)
+            {
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.smoke_recovered",
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = kind.Value,
+                        Reason = null,
+                    },
+                }, CancellationToken.None);
+            }
         }
-        else if (transition.PreviouslyExcluded && !transition.NowExcluded)
+        catch (Exception ex)
         {
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "agent.smoke_recovered",
-                Details = new AgentSmokeFailedDetails
-                {
-                    AgentKind = kind.Value,
-                    Reason = null,
-                },
-            }, CancellationToken.None);
+            _log.LogWarning(ex, "In-VM smoke: failed to publish availability-transition webhook for {Agent}", kind.Value);
         }
     }
 }

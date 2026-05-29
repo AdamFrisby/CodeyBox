@@ -304,35 +304,6 @@ public enum SmokeExclusionSource
 }
 
 /// <summary>
-/// Narrow availability port for cross-cutting routing/dispatch consumers
-/// (<see cref="AgentClassRouter"/>, <see cref="PipelineRunner"/>, the admin
-/// availability endpoints). Exposes only the read / run-outcome / snapshot /
-/// reset surface those callers need, so they depend on this rather than the
-/// concrete <see cref="AgentAvailabilityRegistry"/>.
-///
-/// <para>The smoke-subsystem-internal mutators that carry the exclusion
-/// taxonomy — <see cref="AgentAvailabilityRegistry.MarkSmokeResult"/> (source +
-/// clearsFastFail) and <see cref="AgentAvailabilityRegistry.ExcludeForMissingProbe"/> —
-/// are deliberately kept off this port so the exclusion model stays
-/// encapsulated to the host/in-VM smoke services and coverage policy that own
-/// it.</para>
-/// </summary>
-public interface IAgentAvailabilityRegistry
-{
-    /// <summary>Whether the agent is currently routable, with an exclusion reason when not.</summary>
-    AgentAvailability GetAvailability(AgentKind kind);
-
-    /// <summary>Feeds a real agent-run outcome into the fast-fail circuit breaker.</summary>
-    AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration);
-
-    /// <summary>Snapshot of every tracked agent's current state.</summary>
-    IReadOnlyList<AgentAvailabilitySnapshot> Snapshot();
-
-    /// <summary>Clears all exclusion state and counters for an agent (operator reset).</summary>
-    void Reset(AgentKind kind);
-}
-
-/// <summary>
 /// Smoke-subsystem port over <see cref="AgentAvailabilityRegistry"/>. Carries
 /// the exclusion-taxonomy mutators that the in-VM prober
 /// (<see cref="InVmSmokeProber"/>), the coverage policy
@@ -362,24 +333,6 @@ public interface ISmokeAvailabilityRegistry
     /// <summary>Benches an agent named in a class but with no registered in-VM probe.</summary>
     AvailabilityTransition ExcludeForMissingProbe(AgentKind kind, string reason);
 }
-
-/// <summary>
-/// State transition returned by registry mutators. Callers use
-/// <c>!PreviouslyExcluded &amp;&amp; NowExcluded</c> to fire "agent newly
-/// excluded" webhook events and <c>PreviouslyExcluded &amp;&amp; !NowExcluded</c>
-/// to fire "agent recovered" events without duplicates on steady state.
-/// </summary>
-public sealed record AvailabilityTransition(bool PreviouslyExcluded, bool NowExcluded, string? Reason);
-
-/// <summary>Per-agent state surfaced via the admin / concurrency endpoints.</summary>
-public sealed record AgentAvailabilitySnapshot(
-    AgentKind Agent,
-    bool Excluded,
-    string? Reason,
-    int ConsecutiveFastFails,
-    DateTimeOffset? LastSmokePassedAt,
-    DateTimeOffset? LastSmokeFailedAt,
-    DateTimeOffset? LastFastFailAt);
 
 /// <summary>
 /// Tuning for <see cref="AgentAvailabilityRegistry"/> and
