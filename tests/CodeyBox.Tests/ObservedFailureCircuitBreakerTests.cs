@@ -131,11 +131,11 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
         var defaults = new AgentDefaultsSnapshot(
             new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
             {
-                ["claude"] = "claude-opus-4-8",
+                ["claude"] = "claude-opus-4-7",
                 ["codex"] = "gpt-5.5",
             });
         Assert.Equal(
-            "claude-opus-4-8",
+            "claude-opus-4-7",
             PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(defaults), modelId: null));
         Assert.Equal(
             "gpt-5.5",
