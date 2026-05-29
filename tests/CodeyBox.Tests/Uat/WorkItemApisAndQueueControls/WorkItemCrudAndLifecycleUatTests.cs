@@ -193,4 +193,112 @@ public sealed class WorkItemCrudAndLifecycleUatTests : IDisposable
         Assert.Null(stored.LastError);
         Assert.Null(stored.FailureKind);
     }
+
+    [Theory]
+    [InlineData(WorkItemState.MergeConflictResolutionFailed)]
+    [InlineData(WorkItemState.Failed)]
+    [InlineData(WorkItemState.AuditFailed)]
+    [InlineData(WorkItemState.AbandonedAfterRecoveryAttempts)]
+    public async Task Cancel_TerminalFailureState_TransitionsToCancelledForBookkeeping(WorkItemState priorState)
+    {
+        var item = WorkItemApisAndQueueControlsHelpers.Item(priorState) with
+        {
+            LastError = "prior failure detail",
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.DeleteAsync(
+            $"/workitems/{item.Id}?reason=manually%20merged%20outside%20pipeline&resolutionSha=b15a69e0");
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Cancelled, stored!.State);
+        Assert.Equal(WorkItemCancellationReason.OperatorRequested, stored.CancellationReason);
+        Assert.NotNull(stored.LastError);
+        Assert.Contains(priorState.ToString(), stored.LastError);
+        Assert.Contains("manually merged outside pipeline", stored.LastError);
+        Assert.Contains("b15a69e0", stored.LastError);
+    }
+
+    [Fact]
+    public async Task Cancel_MergeConflictResolutionFailed_DoesNotReDispatch()
+    {
+        var item = WorkItemApisAndQueueControlsHelpers.Item(WorkItemState.MergeConflictResolutionFailed);
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.DeleteAsync($"/workitems/{item.Id}");
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Cancelled, stored!.State);
+
+        // Cancelled is excluded from the dispatcher's pickup query alongside the
+        // other terminal states, so listing pickup candidates must not include
+        // this item.
+        var candidates = new List<WorkItem>();
+        await foreach (var c in _factory.Store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))
+            candidates.Add(c);
+        Assert.DoesNotContain(candidates, c => c.Id == item.Id);
+    }
+
+    [Fact]
+    public async Task Cancel_AlreadyCancelled_IsIdempotent()
+    {
+        var item = WorkItemApisAndQueueControlsHelpers.Item(WorkItemState.Cancelled) with
+        {
+            CancellationReason = WorkItemCancellationReason.OperatorRequested,
+            LastError = "cancelled via API",
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var first = await _client.DeleteAsync($"/workitems/{item.Id}");
+        var second = await _client.DeleteAsync($"/workitems/{item.Id}");
+
+        Assert.Equal(HttpStatusCode.Accepted, first.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, second.StatusCode);
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Cancelled, stored!.State);
+        // LastError preserved from the original cancel — idempotent close does
+        // not rewrite the record.
+        Assert.Equal("cancelled via API", stored.LastError);
+    }
+
+    [Fact]
+    public async Task Cancel_DoneItem_ReturnsConflict()
+    {
+        var item = WorkItemApisAndQueueControlsHelpers.Item(WorkItemState.Done);
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.DeleteAsync($"/workitems/{item.Id}");
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, stored!.State);
+    }
+
+    [Theory]
+    [InlineData("reason=" + "x", "resolutionSha=not-hex", "resolutionSha")]
+    [InlineData("reason=" + "x", "resolutionSha=abc", "resolutionSha")] // too short (<7)
+    public async Task Cancel_InvalidResolutionSha_ReturnsBadRequest(string reasonPart, string shaPart, string expectedField)
+    {
+        var item = WorkItemApisAndQueueControlsHelpers.Item(WorkItemState.MergeConflictResolutionFailed);
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.DeleteAsync($"/workitems/{item.Id}?{reasonPart}&{shaPart}");
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains(expectedField, await response.Content.ReadAsStringAsync(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Cancel_OversizedReason_ReturnsBadRequest()
+    {
+        var item = WorkItemApisAndQueueControlsHelpers.Item(WorkItemState.MergeConflictResolutionFailed);
+        await _factory.Store.CreateAsync(item);
+
+        var longReason = new string('r', 501);
+        var response = await _client.DeleteAsync($"/workitems/{item.Id}?reason={longReason}");
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
 }
