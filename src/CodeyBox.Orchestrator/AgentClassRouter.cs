@@ -1110,17 +1110,6 @@ public sealed class QuotaRouterOptions
     /// fails after the router's pre-check).
     /// </summary>
     public TimeSpan CapRetryInterval { get; set; } = TimeSpan.FromSeconds(15);
-
-    /// <summary>
-    /// Probe retry/staleness tuning. Probes that support snapshot retention read
-    /// these on every call (via an injected <see cref="Func{T}"/>) so values
-    /// hot-reload through <see cref="Microsoft.Extensions.Options.IOptionsMonitor{T}"/>
-    /// without restarting the process.
-    /// </summary>
-    public int ProbeMaxRetries { get; set; } = 2;
-    public TimeSpan ProbeRetryInitialDelay { get; set; } = TimeSpan.FromMilliseconds(250);
-    public int ProbeMaxConsecutiveFailures { get; set; } = 3;
-    public TimeSpan ProbeMaxStaleness { get; set; } = TimeSpan.FromMinutes(5);
 }
 
 public enum QuotaUnknownPolicy

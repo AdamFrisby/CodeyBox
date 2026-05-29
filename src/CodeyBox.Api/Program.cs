@@ -705,10 +705,6 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
         CapRetryInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
-        ProbeMaxRetries = qr.ProbeMaxRetries,
-        ProbeRetryInitialDelay = TimeSpan.FromMilliseconds(qr.ProbeRetryInitialDelayMs),
-        ProbeMaxConsecutiveFailures = qr.ProbeMaxConsecutiveFailures,
-        ProbeMaxStaleness = TimeSpan.FromSeconds(qr.ProbeMaxStalenessSeconds),
     };
 });
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>

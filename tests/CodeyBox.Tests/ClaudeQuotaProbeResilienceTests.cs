@@ -161,9 +161,10 @@ public sealed class ClaudeQuotaProbeResilienceTests
         // After the configured number of consecutive end-to-end probe failures,
         // the retained snapshot is dropped and the next call returns -1.
         var time = new TestTimeProvider(DateTimeOffset.UtcNow);
+        // First call seeds last-known-good at available=71. Three end-to-end
+        // probes follow, each MaxRetries=0 -> one attempt apiece.
         var handler = new SequenceHandler(
-            (HttpStatusCode.OK, Rollup(29)),                  // available = 71
-            // Three end-to-end probes, each MaxRetries=0 → one attempt apiece.
+            (HttpStatusCode.OK, Rollup(29)),
             (HttpStatusCode.InternalServerError, ""),
             (HttpStatusCode.InternalServerError, ""),
             (HttpStatusCode.InternalServerError, ""));
