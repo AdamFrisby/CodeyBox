@@ -10,41 +10,21 @@ internal static class CliApp
 {
     internal const string CliVersion = "1.0.0";
 
-    /// <summary>
-    /// Linked into <see cref="QueueWatch"/> when set (System.CommandLine beta4 has no InvokeAsync CT).
-    /// </summary>
-    internal static CancellationToken TestCancellationToken { get; set; }
-
     internal static Task<int> InvokeAsync(
         string[] args,
         Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null,
         CancellationToken cancellationToken = default)
     {
-        var parser = new CommandLineBuilder(BuildRootCommand(clientFactory))
+        var parser = new CommandLineBuilder(BuildRootCommand(clientFactory, cancellationToken))
             .UseDefaults()
             .Build();
 
-        if (!cancellationToken.CanBeCanceled)
-            return parser.InvokeAsync(args);
-
-        return InvokeWithTestCancellationAsync(parser, args, cancellationToken);
+        return parser.InvokeAsync(args);
     }
 
-    private static async Task<int> InvokeWithTestCancellationAsync(
-        Parser parser, string[] args, CancellationToken cancellationToken)
-    {
-        TestCancellationToken = cancellationToken;
-        try
-        {
-            return await parser.InvokeAsync(args);
-        }
-        finally
-        {
-            TestCancellationToken = default;
-        }
-    }
-
-    internal static RootCommand BuildRootCommand(Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null)
+    internal static RootCommand BuildRootCommand(
+        Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null,
+        CancellationToken externalCancellation = default)
     {
         clientFactory ??= CodeyBoxClient.Create;
 
@@ -62,7 +42,7 @@ internal static class CliApp
         queueCmd.AddCommand(QueueShow.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueCancel.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueRetry.Build(apiUrlOpt, apiKeyOpt, clientFactory));
-        queueCmd.AddCommand(QueueWatch.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueueWatch.Build(apiUrlOpt, apiKeyOpt, clientFactory, externalCancellation));
 
         root.AddCommand(queueCmd);
         root.AddCommand(ConfigureCommand.Build());

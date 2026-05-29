@@ -47,7 +47,7 @@ internal sealed class CodeyBoxClient
         var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
 
         var resp = await _http.GetAsync($"/workitems{qs}", ct);
-        await EnsureSuccessAsync(resp, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.ListWorkItemDto, ct) ?? [];
     }
 
@@ -55,21 +55,21 @@ internal sealed class CodeyBoxClient
     {
         var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}", ct);
         if (resp.StatusCode == HttpStatusCode.NotFound) return null;
-        await EnsureSuccessAsync(resp, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct);
     }
 
     internal async Task<WorkItemDto> CreateWorkItemAsync(CreateWorkItemRequest req, CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync("/workitems", req, CliJsonContext.Default.CreateWorkItemRequest, ct);
-        await EnsureSuccessAsync(resp, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }
 
     internal async Task DeleteWorkItemAsync(string id, CancellationToken ct = default)
     {
         var resp = await _http.DeleteAsync($"/workitems/{Uri.EscapeDataString(id)}", ct);
-        await EnsureSuccessAsync(resp, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
     internal async Task<SseWatchResult> TryWatchWorkItemEventsAsync(
@@ -100,17 +100,8 @@ internal sealed class CodeyBoxClient
                 new RetryRequest { From = requestedFrom },
                 CliJsonContext.Default.RetryRequest,
                 ct);
-        await EnsureSuccessAsync(resp, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }
 
-    internal static async Task EnsureSuccessAsync(HttpResponseMessage resp, CancellationToken ct)
-    {
-        if (resp.IsSuccessStatusCode) return;
-        var body = await resp.Content.ReadAsStringAsync(ct);
-        // Truncate verbose 5xx bodies to avoid leaking server internals (stack traces, hostnames).
-        if ((int)resp.StatusCode >= 500 && body.Length > 200)
-            body = body[..200] + "... (truncated)";
-        throw new CodeyBoxApiException((int)resp.StatusCode, body);
-    }
 }

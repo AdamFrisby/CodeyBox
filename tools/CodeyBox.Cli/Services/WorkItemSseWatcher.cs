@@ -11,6 +11,7 @@ namespace CodeyBox.Cli.Services;
 internal sealed class WorkItemSseWatcher
 {
     internal const int MaxDataPayloadBytes = 64 * 1024;
+    internal const int MaxSseLineChars = 256 * 1024;
 
     private readonly HttpClient _sseHttp;
 
@@ -39,17 +40,16 @@ internal sealed class WorkItemSseWatcher
             return SseWatchResult.ShouldFallback;
         }
 
-        if (!resp.IsSuccessStatusCode)
+        using (resp)
         {
-            if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                await CodeyBoxClient.EnsureSuccessAsync(resp, ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                    await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
 
-            resp.Dispose();
-            return SseWatchResult.ShouldFallback;
-        }
+                return SseWatchResult.ShouldFallback;
+            }
 
-        try
-        {
             await using var stream = await resp.Content.ReadAsStreamAsync(ct);
             using var reader = new StreamReader(stream);
             string? lastState = null;
@@ -76,6 +76,9 @@ internal sealed class WorkItemSseWatcher
 
                 if (line is null)
                     break;
+
+                if (line.Length > MaxSseLineChars)
+                    return SseWatchResult.ShouldFallback;
 
                 if (!line.StartsWith("data: ", StringComparison.Ordinal))
                     continue;
@@ -104,10 +107,6 @@ internal sealed class WorkItemSseWatcher
                 throw new OperationCanceledException(ct);
 
             return SseWatchResult.ShouldFallback;
-        }
-        finally
-        {
-            resp.Dispose();
         }
     }
 

@@ -1,7 +1,6 @@
 using System.CommandLine;
 using System.CommandLine.Invocation;
 using CodeyBox.Cli.Services;
-using CliApp = CodeyBox.Cli.CliApp;
 
 namespace CodeyBox.Cli.Commands;
 
@@ -12,7 +11,8 @@ internal static class QueueWatch
     internal static Command Build(
         Option<string?> apiUrlOpt,
         Option<string?> apiKeyOpt,
-        Func<ResolvedConfig, CodeyBoxClient> clientFactory)
+        Func<ResolvedConfig, CodeyBoxClient> clientFactory,
+        CancellationToken externalCancellation = default)
     {
         var cmd = new Command("watch", "Watch a work item and print each state transition");
 
@@ -29,10 +29,10 @@ internal static class QueueWatch
         cmd.SetHandler(async (InvocationContext ctx) =>
         {
             var ct = ctx.GetCancellationToken();
-            if (CliApp.TestCancellationToken.CanBeCanceled)
+            if (externalCancellation.CanBeCanceled)
             {
                 using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-                    ct, CliApp.TestCancellationToken);
+                    ct, externalCancellation);
                 await RunWatchAsync(
                     ctx, idArg, pollOpt, streamOpt, apiUrlOpt, apiKeyOpt, clientFactory, linked.Token);
                 return;

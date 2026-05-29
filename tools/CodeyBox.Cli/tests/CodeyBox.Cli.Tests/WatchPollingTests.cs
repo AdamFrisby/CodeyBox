@@ -109,6 +109,42 @@ public sealed class WatchPollingTests
     }
 
     [Fact]
+    public async Task Watch_Poll_SanitizesControlCharactersInStateOutput()
+    {
+        const string dirtyState = "Working\u0007Injected";
+        var callIndex = 0;
+        Func<ResolvedConfig, CodeyBoxClient> factory = config =>
+            new CodeyBoxClient(
+                new HttpClient(new FakeHttpMessageHandler(_ =>
+                {
+                    var state = callIndex++ == 0 ? dirtyState : "Done";
+                    return SampleData.WorkItemResponse(SampleData.WorkItem(state));
+                }))
+                { BaseAddress = new Uri(config.ApiBaseUrl) });
+
+        QueueWatch.PollingInterval = TimeSpan.Zero;
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000", "--poll"],
+                factory);
+
+            var stdout = output.Out.ToString();
+            Assert.Contains("WorkingInjected", stdout);
+            Assert.DoesNotContain('\u0007', stdout);
+            foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                Assert.DoesNotContain('\u0007', line);
+        }
+        finally
+        {
+            QueueWatch.PollingInterval = TimeSpan.FromSeconds(2);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
     public async Task Watch_DeduplicatesStateLines()
     {
         var states = new[] { "Working", "Working", "Done" };

@@ -599,6 +599,70 @@ public sealed class WatchSseTests
     }
 
     [Fact]
+    public async Task Watch_SseSanitizesControlCharactersInStateOutput()
+    {
+        const string dirtyState = "Working\u0007Injected";
+        var stateJson = System.Text.Json.JsonSerializer.Serialize(dirtyState);
+        var json =
+            "{\"event\":\"work_item.state\",\"workItem\":{\"id\":\"aabbccdd-0000-0000-0000-000000000000\",\"state\":" +
+            stateJson + "}}";
+        var factory = MakeFactory(req =>
+        {
+            if (req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
+                return SampleData.SseEventsResponse($"raw:{json}", "Done");
+
+            return SampleData.WorkItemResponse(SampleData.WorkItem("Done"));
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                factory);
+
+            Assert.Equal(0, code);
+            var stdout = output.Out.ToString();
+            Assert.Contains("WorkingInjected", stdout);
+            Assert.DoesNotContain('\u0007', stdout);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Watch_SseForbidden_DoesNotPrintFallbackNote()
+    {
+        var factory = MakeFactory(req =>
+        {
+            if (req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
+                return new HttpResponseMessage(System.Net.HttpStatusCode.Forbidden);
+
+            return SampleData.WorkItemResponse();
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                factory);
+
+            Assert.Equal(1, code);
+            Assert.DoesNotContain("SSE unavailable", output.Error.ToString());
+            Assert.Contains("403", output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
     public async Task Watch_SseUnauthorized_DoesNotPrintFallbackNote()
     {
         var factory = MakeFactory(req =>
