@@ -37,6 +37,17 @@ public sealed class SandboxLeakReaper : BackgroundService
     private readonly Func<SandboxLeakOptions> _optsAccessor;
     private readonly ILogger<SandboxLeakReaper> _log;
     private readonly IWorkItemStore? _store;
+    private readonly Func<DateTimeOffset> _clock;
+
+    // First time THIS reaper observed each VM in a suspend-lifecycle state with no
+    // live mapping. The suspend-orphan grace is measured from this timestamp, NOT
+    // from CreatedAt: a long-running in-flight VM has an old CreatedAt, so a
+    // CreatedAt-based age gate would purge it on the first sweep after it enters
+    // Suspending — mid-snapshot, while multipassd may still be writing the RAM
+    // image. Pruned each sweep to the set of names still observed as orphans, so it
+    // does not grow without bound. ConcurrentDictionary because the operator-dispose
+    // endpoint and the sweep can touch reaper state from different threads.
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _suspendOrphanFirstSeen = new();
 
     // Latest detected leaks, snapshotted after each sweep. Thread-safe via
     // Interlocked-style replace; the API endpoint reads this without locking.
@@ -69,13 +80,15 @@ public sealed class SandboxLeakReaper : BackgroundService
         IWebhookDispatcher webhooks,
         Func<SandboxLeakOptions> optionsAccessor,
         ILogger<SandboxLeakReaper> log,
-        IWorkItemStore? store)
+        IWorkItemStore? store,
+        Func<DateTimeOffset>? clock = null)
     {
         _provider = provider;
         _webhooks = webhooks;
         _optsAccessor = optionsAccessor;
         _log = log;
         _store = store;
+        _clock = clock ?? (() => DateTimeOffset.UtcNow);
     }
 
     /// <summary>
@@ -132,7 +145,8 @@ public sealed class SandboxLeakReaper : BackgroundService
         try
         {
             var allManaged = await _provider.ListAllManagedAsync(ct);
-            var now = DateTimeOffset.UtcNow;
+            var now = _clock();
+            var observedSuspendOrphans = new HashSet<string>();
 
             // R8-core: any VM named in a work item's SuspendedVmName is being
             // held across an orchestrator restart and MUST NOT be reaped — the
@@ -161,24 +175,45 @@ public sealed class SandboxLeakReaper : BackgroundService
                 // will never reattach it — it is an orphan from a crash between
                 // suspend and the bookkeeping write, or from a cleared/expired
                 // mapping. SuspendAsync drops a .codeybox-preempt marker, so without
-                // this branch such a VM would inherit the 24h PreemptRetention grace
-                // and leak for a day. The provider abstracts its own lifecycle
+                // a dedicated branch such a VM would inherit the 24h PreemptRetention
+                // grace and leak for a day. The provider abstracts its own lifecycle
                 // vocabulary into IsSuspendLifecycleOrFrozen so the reaper does not
-                // depend on any backend's state strings. Treat it as a leak subject
-                // only to the normal age grace.
+                // depend on any backend's state strings.
                 var isSuspendOrphan = info.IsSuspendLifecycleOrFrozen;
 
-                if (info.HasPreemptMarker && !isSuspendOrphan && age < _opts.PreemptRetention)
-                    continue;
+                if (isSuspendOrphan)
+                {
+                    // Dedicated suspend grace, NOT the CreatedAt-based age gate. A
+                    // VM that just entered Suspending may still be writing its RAM
+                    // image to disk — multipass routinely takes many minutes for a
+                    // loaded VM. Measure the grace from when this reaper FIRST saw
+                    // the VM in a suspend state (a long-running VM's old CreatedAt
+                    // would otherwise clear LeakAgeThreshold immediately and we'd
+                    // purge mid-snapshot). Only once the grace elapses with still no
+                    // live mapping is it a true orphan eligible for delete --purge.
+                    observedSuspendOrphans.Add(info.Name);
+                    var firstSeen = _suspendOrphanFirstSeen.GetOrAdd(info.Name, now);
+                    if (now - firstSeen < _opts.SuspendOrphanGrace)
+                        continue;
+                }
+                else
+                {
+                    if (info.HasPreemptMarker && age < _opts.PreemptRetention)
+                        continue;
 
-                if (age < _opts.LeakAgeThreshold)
-                    continue;
+                    if (age < _opts.LeakAgeThreshold)
+                        continue;
+                }
 
                 var diskMb = info.DiskBytes.HasValue ? info.DiskBytes.Value / (1024 * 1024) : (long?)null;
-                var reason = missingCreationMetadata
-                    ? SandboxLeakReasons.UntrackedSandboxMissingCreationMetadata
-                    : (isSuspendOrphan
-                        ? SandboxLeakReasons.OrphanedSuspendingVm
+                // Suspend orphans are gated on the dedicated grace above, not on
+                // CreatedAt, so classify them first — a suspend orphan whose staging
+                // metadata is also missing is still a suspend orphan, not a generic
+                // missing-metadata leak.
+                var reason = isSuspendOrphan
+                    ? SandboxLeakReasons.OrphanedSuspendingVm
+                    : (missingCreationMetadata
+                        ? SandboxLeakReasons.UntrackedSandboxMissingCreationMetadata
                         : (info.HasPreemptMarker
                             ? SandboxLeakReasons.ExpiredPreemptRetention
                             : SandboxLeakReasons.UntrackedSandbox));
@@ -196,6 +231,13 @@ public sealed class SandboxLeakReaper : BackgroundService
                     },
                 }, ct);
             }
+
+            // Drop first-seen entries for VMs that are no longer suspend orphans
+            // (resumed, reaped, or gone) so the map tracks only currently-orphaned
+            // VMs and cannot grow without bound across the process lifetime.
+            foreach (var name in _suspendOrphanFirstSeen.Keys)
+                if (!observedSuspendOrphans.Contains(name))
+                    _suspendOrphanFirstSeen.TryRemove(name, out _);
 
             _latestLeaks = leaks;
 
@@ -379,6 +421,22 @@ public sealed class SandboxLeakOptions
     /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public TimeSpan PreemptRetention { get; set; } = TimeSpan.FromHours(24);
+
+    /// <summary>
+    /// Dedicated grace before a suspend-lifecycle VM (multipass
+    /// <c>Suspending</c>/<c>Suspended</c>) with no live <c>SuspendedVmName</c>
+    /// mapping is treated as a leak and purged. Measured from when the reaper first
+    /// observes the VM in a suspend state — NOT from the VM's creation time — so a
+    /// long-running in-flight VM that has just begun freezing is not purged while
+    /// multipassd may still be writing its RAM image. Sized to the worst-case
+    /// RAM-snapshot budget for the default VM profile so a slow snapshot completes
+    /// (or the orchestrator restarts and reclaims the mapping) before the reaper
+    /// acts. Default ~30 minutes (<see cref="SuspendTimeoutPolicy.For(long?, System.TimeSpan?, System.TimeSpan?)"/>
+    /// of the default profile RAM).
+    /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
+    /// </summary>
+    public TimeSpan SuspendOrphanGrace { get; set; } =
+        SuspendTimeoutPolicy.For(SandboxResourceLimits.Default.MemoryBytes);
 
     /// <summary>
     /// When true, automatically dispose each detected leak after logging it.

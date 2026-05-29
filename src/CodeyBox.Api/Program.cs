@@ -2555,8 +2555,10 @@ public partial class Program
     /// budget — 30 min for the default 12 GiB VM) and drains in parallel batches,
     /// so a deployment with more in-flight VMs than the batch cap spans
     /// <c>ceil(N/batch)</c> sequential waves. The ceiling must cover the slowest
-    /// wave-chain, not one VM, or the host SIGKILLs us mid-snapshot on a later
-    /// wave. ShutdownTimeout is a CEILING, not a fixed wait: a shutdown with
+    /// wave-chain PLUS the post-suspend drain grace (suspend runs in StoppingAsync,
+    /// the preempt-checkpoint / listener-drain window runs after), not one VM, or
+    /// the host SIGKILLs us mid-snapshot on a later wave or mid-drain.
+    /// ShutdownTimeout is a CEILING, not a fixed wait: a shutdown with
     /// nothing to suspend still returns as soon as every hosted service's
     /// StoppingAsync completes, so raising it only affects the suspend case.
     ///

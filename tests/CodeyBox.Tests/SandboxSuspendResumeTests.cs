@@ -398,19 +398,21 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             SuspendTimeoutPolicy.ResolveHostShutdownTimeout(false, grace, 32));
 
         // Suspend-capable provider with a single worker → one wave of the default
-        // 12 GiB profile budget (30 min), which dwarfs the 60s grace.
-        Assert.Equal(TimeSpan.FromMinutes(30),
+        // 12 GiB profile budget (30 min), STACKED on top of the 60s drain grace:
+        // the suspend drain (StoppingAsync) and the post-suspend preempt-checkpoint
+        // / listener drain are sequential windows, not overlapping.
+        Assert.Equal(TimeSpan.FromMinutes(30) + grace,
             SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, grace, 1));
 
-        // More workers than the parallel-suspend cap (8) → the ceiling scales by
-        // wave count (16 workers → 2 waves → 60 min).
-        Assert.Equal(TimeSpan.FromMinutes(60),
+        // More workers than the parallel-suspend cap (8) → the reserve scales by
+        // wave count (16 workers → 2 waves → 60 min), again plus the drain grace.
+        Assert.Equal(TimeSpan.FromMinutes(60) + grace,
             SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, grace, 16));
 
-        // If the configured grace ever exceeds the suspend reserve, the larger
-        // grace wins (max(), not a blind overwrite).
+        // A long configured grace is ADDED to the suspend reserve, not max()'d
+        // against it: 4h grace + one 30-min wave = 4h30m.
         var hugeGrace = TimeSpan.FromHours(4);
-        Assert.Equal(hugeGrace,
+        Assert.Equal(hugeGrace + TimeSpan.FromMinutes(30),
             SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, hugeGrace, 1));
     }
 
@@ -966,33 +968,48 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task LeakReaper_OrphanedSuspendingVm_WithoutMapping_IsReapedDespitePreemptMarker()
+    public async Task LeakReaper_OrphanedSuspendingVm_WithoutMapping_IsReapedAfterSuspendGrace()
     {
         // A crash (or per-VM suspend timeout followed by SIGKILL) can leave a VM
         // in multipass `Suspending`/`Suspended` state with NO live SuspendedVmName
         // mapping. SuspendAsync drops a .codeybox-preempt marker, so without
         // suspend-state awareness the reaper would grant such a VM the full 24h
-        // PreemptRetention grace and it would leak for a day. With the marker but
-        // an age past the normal LeakAgeThreshold and no mapping, it must be
-        // reaped now, classified as an orphaned suspending VM.
+        // PreemptRetention grace and it would leak for a day. But the reaper must
+        // ALSO not purge it the instant it appears: multipassd may still be writing
+        // the RAM image. The dedicated suspend grace is measured from when the
+        // reaper first observes the VM Suspending, NOT from its (here hour-old)
+        // CreatedAt — so the first sweep leaves it alone and only a later sweep,
+        // once the grace has elapsed, reaps it as an orphaned suspending VM.
         var provider = new FakeSandboxLeakProvider();
-        // Aged past LeakAgeThreshold (30m) but well within PreemptRetention (24h).
+        // CreatedAt an hour ago: past LeakAgeThreshold (30m) and within
+        // PreemptRetention (24h). A CreatedAt-based gate would purge it immediately.
         var aged = DateTimeOffset.UtcNow.AddHours(-1);
         provider.SeedManaged(new("vm-orphan-suspending", aged, 1024L * 1024,
             IsTrackedActive: false, HasPreemptMarker: true, IsSuspendLifecycleOrFrozen: true));
 
         var webhooks = new CapturingWebhookDispatcher();
+        var clockNow = DateTimeOffset.UtcNow;
         var reaper = new SandboxLeakReaper(
             provider, webhooks,
             () => new SandboxLeakOptions
             {
                 LeakAgeThreshold = TimeSpan.FromMinutes(30),
                 PreemptRetention = TimeSpan.FromHours(24),
+                SuspendOrphanGrace = TimeSpan.FromMinutes(10),
                 AutoDispose = true,
             },
             NullLogger<SandboxLeakReaper>.Instance,
-            _store);
+            _store,
+            () => clockNow);
 
+        // First sweep: just observed Suspending → within the dedicated grace
+        // despite the hour-old CreatedAt → must NOT be purged mid-snapshot.
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.DoesNotContain("vm-orphan-suspending", provider.DisposedNames);
+
+        // Advance past the suspend grace: multipassd had its snapshot window and the
+        // VM is still orphaned with no live mapping → reap it now.
+        clockNow = clockNow.AddMinutes(11);
         await reaper.RunSweepAsync(CancellationToken.None);
 
         Assert.Contains("vm-orphan-suspending", provider.DisposedNames);
@@ -1006,6 +1023,41 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Equal(
             SandboxLeakReasons.OrphanedSuspendingVm,
             ((SandboxLeakDetails)leakEvent.Details!).Reason);
+    }
+
+    [Fact]
+    public async Task LeakReaper_OrphanedSuspendingVm_WithinSuspendGrace_IsNotReaped()
+    {
+        // Negative control for the suspend-orphan path: a Suspending VM with a
+        // preempt marker, no live mapping, and a CreatedAt well past LeakAgeThreshold
+        // must STILL be left alone while it is inside the dedicated suspend grace.
+        // A regression that purged every IsSuspendLifecycleOrFrozen VM immediately
+        // (ignoring the grace) would kill it mid-snapshot — this test fails if that
+        // grace gate is dropped.
+        var provider = new FakeSandboxLeakProvider();
+        provider.SeedManaged(new("vm-fresh-suspending", DateTimeOffset.UtcNow.AddHours(-2),
+            1024L * 1024, IsTrackedActive: false, HasPreemptMarker: true, IsSuspendLifecycleOrFrozen: true));
+
+        var webhooks = new CapturingWebhookDispatcher();
+        var reaper = new SandboxLeakReaper(
+            provider, webhooks,
+            () => new SandboxLeakOptions
+            {
+                LeakAgeThreshold = TimeSpan.FromMinutes(30),
+                PreemptRetention = TimeSpan.FromHours(24),
+                SuspendOrphanGrace = TimeSpan.FromMinutes(30),
+                AutoDispose = true,
+            },
+            NullLogger<SandboxLeakReaper>.Instance,
+            _store);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("vm-fresh-suspending", provider.DisposedNames);
+        Assert.DoesNotContain(
+            webhooks.Events,
+            e => e.Event == "sandbox.leak_detected" &&
+                 e.Details is SandboxLeakDetails d && d.Name == "vm-fresh-suspending");
     }
 
     [Fact]

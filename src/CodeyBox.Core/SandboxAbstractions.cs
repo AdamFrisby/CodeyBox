@@ -253,11 +253,18 @@ public static class SuspendTimeoutPolicy
     /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Providers
     /// that suspend on shutdown must not have a healthy RAM snapshot truncated by
     /// a SIGKILL, so when <paramref name="providerSuspendsOnShutdown"/> is set the
-    /// ceiling is raised to the worst-case suspend drain
+    /// ceiling is the worst-case suspend drain
     /// (<see cref="HostShutdownReserve"/>:
     /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
-    /// per-VM budget) or the requested <paramref name="grace"/>, whichever is
-    /// larger. Providers that don't suspend keep the tighter <paramref name="grace"/>.
+    /// per-VM budget) STACKED ON TOP OF the requested <paramref name="grace"/>.
+    /// The two windows are sequential, not overlapping: suspend-on-shutdown runs
+    /// in <c>IHostedLifecycleService.StoppingAsync</c> (before BackgroundService
+    /// cancellation), and the preempt-checkpoint / listener-drain window still
+    /// needs the full <paramref name="grace"/> AFTERWARD. Taking the max of the
+    /// two would let a suspend that consumes its whole reserve leave zero room for
+    /// the post-suspend drain, so the host could SIGKILL the process while
+    /// PipelineRunner is still shutting down. Providers that don't suspend keep the
+    /// tighter <paramref name="grace"/> alone.
     ///
     /// <para>This is deliberately capability-driven, not provider-name-driven:
     /// the caller passes whether the configured provider implements
@@ -290,7 +297,7 @@ public static class SuspendTimeoutPolicy
             maxConcurrentSandboxes,
             maxParallelSuspends,
             maxVmMemoryBytes ?? SandboxResourceLimits.Default.MemoryBytes);
-        return grace > reserve ? grace : reserve;
+        return grace + reserve;
     }
 }
 
