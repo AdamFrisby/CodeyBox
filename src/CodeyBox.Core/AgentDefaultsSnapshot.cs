@@ -8,10 +8,9 @@ namespace CodeyBox.Core;
 /// defaults without a process restart.
 ///
 /// <para>
-/// Mirrors the <see cref="CodeyBox.Orchestrator.AgentConcurrencySnapshot"/>
-/// pattern: Volatile read/write so a concurrent <see cref="Replace"/> cannot
-/// tear the reference; callers should bind once into a local for any compound
-/// read.
+/// Mirrors the <c>AgentConcurrencySnapshot</c> pattern: Volatile read/write
+/// so a concurrent <see cref="Replace"/> cannot tear the reference; callers
+/// should bind once into a local for any compound read.
 /// </para>
 /// </summary>
 public sealed class AgentDefaultsSnapshot
