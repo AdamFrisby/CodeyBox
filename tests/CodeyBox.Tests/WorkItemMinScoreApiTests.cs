@@ -60,7 +60,7 @@ public sealed class WorkItemMinScoreApiTests : IDisposable
     }
 
     [Fact]
-    public async Task Create_WithoutMinModelScore_DefaultsTo95()
+    public async Task Create_WithoutMinModelScore_DefaultsToOpen()
     {
         var resp = await _client.PostAsJsonAsync("/workitems", new
         {
@@ -71,7 +71,7 @@ public sealed class WorkItemMinScoreApiTests : IDisposable
 
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         var body = await resp.Content.ReadFromJsonAsync<WorkItemWithScoreResponse>();
-        Assert.Equal(95, body!.MinModelScore);
+        Assert.Equal(0, body!.MinModelScore);
     }
 
     // ── GET /workitems/{id} — minModelScore present ───────────────────────────

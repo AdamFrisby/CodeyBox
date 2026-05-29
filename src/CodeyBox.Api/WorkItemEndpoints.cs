@@ -2007,7 +2007,7 @@ public sealed record WorkItemDto(
     int? AuditIterations = null,
     int? FinalAuditBlockingFindings = null,
     string? MergeSha = null,
-    int MinModelScore = 95,
+    int MinModelScore = 0,
     string? ReleaseId = null,
     string? FailureKind = null,
     DateTimeOffset? QuotaResetAt = null,

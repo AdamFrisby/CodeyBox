@@ -196,11 +196,13 @@ public sealed record WorkItem
     /// <summary>
     /// Minimum acceptable <see cref="AgentMembership.QualityScore"/> for this work item.
     /// The router picks any member whose base score is at or above this floor.
-    /// Default 95: Gemini-3-Flash-high-reasoning is allowed as a frontier-adjacent fallback.
-    /// Set lower (e.g. 70) for low-stakes work that can tolerate a weaker model.
-    /// Persisted; existing records without the column default to 95 on read.
+    /// Default 0: open to ANY agent — most tasks should run on whatever agent is
+    /// available, and the quality-score-preferred router still picks the strongest
+    /// free member first. Set a high floor (e.g. 95) only for the few sensitive or
+    /// major-architectural items that must be restricted to frontier agents.
+    /// Persisted; existing records without the column default to 95 on read (legacy backfill).
     /// </summary>
-    public int MinModelScore { get; init; } = 95;
+    public int MinModelScore { get; init; } = 0;
 
     /// <summary>
     /// Display and pickup ordering for Queued items. Set to <c>CreatedAt.Ticks</c> on
