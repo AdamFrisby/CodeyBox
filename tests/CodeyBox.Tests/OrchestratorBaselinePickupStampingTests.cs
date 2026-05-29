@@ -218,6 +218,76 @@ public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
         Assert.Equal("cb-baseline-original-pin", persisted!.BaselineImageRef);
     }
 
+    /// <summary>
+    /// The pickup path must pin <see cref="WorkItem.BaselineImageRef"/> BEFORE it
+    /// calls the router, so the in-VM smoke gate probes the image this dispatch
+    /// will actually clone rather than the active baseline. The other tests here
+    /// only assert the persisted/pipeline ref <em>after</em> pickup completes —
+    /// they would still pass if the pre-routing pin were removed and only the
+    /// later SQL stamp remained, while the router silently gated on a null ref.
+    /// This test wires a real <see cref="AgentClassRouter"/> with a recording
+    /// in-VM gate and asserts the gate saw the resolver's ref (never null),
+    /// proving the pin lands before routing (AC#1).
+    /// </summary>
+    [Fact]
+    public async Task Pickup_PinsBaselineRef_BeforeRouterGatesInVmSmoke()
+    {
+        var resolver = new StubResolver("cb-pin-before-routing");
+        var gate = new RecordingInVmSmokeGate();
+        var router = BuildRouterWithGate(gate);
+        var pipeline = new CapturingPipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 1 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            baselineResolver: resolver);
+
+        var item = MakeItem() with { AgentClassId = "frontier" };
+        await _store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+        await pipeline.RunAttempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await svc.StopAsync(CancellationToken.None);
+
+        // The router forwards item.BaselineImageRef to the gate per scored member.
+        // If the orchestrator pinned before routing, the gate saw the resolver's
+        // ref; if the pre-routing pin were dropped it would have seen null.
+        Assert.NotEmpty(gate.SeenBaselineRefs);
+        Assert.Contains("cb-pin-before-routing", gate.SeenBaselineRefs);
+        Assert.DoesNotContain(null, gate.SeenBaselineRefs);
+    }
+
+    private static AgentClassRouter BuildRouterWithGate(IInVmSmokeGate gate)
+    {
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new() { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+        };
+        return new AgentClassRouter(
+            [cls],
+            [new FakeProbe(AgentKind.Claude, 90.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, QuotaRecheckInterval = TimeSpan.FromMinutes(5) },
+            NullLogger<AgentClassRouter>.Instance,
+            timeProvider: null,
+            todModifiers: null,
+            quotaFailures: null,
+            burnEstimator: null,
+            runningCounters: null,
+            availability: new AgentAvailabilityRegistry(
+                new AvailabilityOptions(), TimeProvider.System,
+                NullLogger<AgentAvailabilityRegistry>.Instance),
+            inVmSmokeGate: gate);
+    }
+
     private sealed class StubResolver : IBaselineImageResolver
     {
         private readonly string? _returns;

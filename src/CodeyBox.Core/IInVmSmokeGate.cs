@@ -27,10 +27,26 @@ public interface IInVmSmokeGate
     /// actually be cloned from is reflected in it. The gate owns the full
     /// read→probe→re-read sequence so routing consumers get a verdict from this
     /// one call and never have to bind to the availability registry alongside the
-    /// gate. A cache hit (or an already-excluded agent) provisions nothing; only
-    /// a cache miss on an otherwise-available agent runs a probe. Never throws — a
-    /// probe fault must not take down dispatch; on an inconclusive fault the prior
-    /// availability is returned unchanged (subject to <c>FailClosedOnProbeFault</c>).
+    /// gate.
+    ///
+    /// <para><b>What provisions a VM.</b> Only a cache <em>miss</em> for the
+    /// target <paramref name="baselineRef"/> provisions a VM. A cache hit never
+    /// does — but a hit is not a no-op: the cached passing verdict is re-applied
+    /// to the registry (reconciliation), so a cache-hit call can still <em>clear</em>
+    /// an exclusion. An already-excluded agent normally short-circuits with no
+    /// probe; the one exception is B1 pinning — when the agent is globally benched
+    /// but this work item's pinned ref has its own cached pass, the gate re-enters
+    /// to reconcile that per-ref pass (still a free cache hit, no VM) rather than
+    /// returning the unrelated active-image bench.</para>
+    ///
+    /// <para><b>On an inconclusive probe fault</b> (provisioning, exec, timeout, or
+    /// credential resolution) the behaviour follows the operator's
+    /// <c>FailClosedOnProbeFault</c> policy: under the default fail-closed policy
+    /// the agent is benched and a <em>new excluded</em> availability is returned
+    /// (the failing verdict is never cached, so it self-heals on the next clean
+    /// probe); under the opt-out fail-open policy the prior availability is
+    /// returned unchanged. Never throws — a probe fault must not take down
+    /// dispatch.</para>
     ///
     /// <para><paramref name="baselineRef"/> is the work item's pinned
     /// <see cref="WorkItem.BaselineImageRef"/> (B1 pinning) — the image the

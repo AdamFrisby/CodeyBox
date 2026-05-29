@@ -37,6 +37,29 @@ internal sealed class ScriptedSandboxProvider : ISandboxProvider
     }
 }
 
+/// <summary>
+/// In-VM smoke gate stub that records every baselineRef the router forwards and
+/// reports every agent as available, so routing proceeds normally. Used to assert
+/// that a caller pinned the work item's <see cref="WorkItem.BaselineImageRef"/>
+/// before the router gated on it.
+/// </summary>
+internal sealed class RecordingInVmSmokeGate : IInVmSmokeGate
+{
+    public List<string?> SeenBaselineRefs { get; } = [];
+    public bool Enabled => true;
+
+    public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    {
+        SeenBaselineRefs.Add(baselineRef);
+        return Task.FromResult(new AgentAvailability(true, null, null));
+    }
+
+    public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+        Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
+}
+
 /// <summary>Baseline resolver returning a fixed ref; can be made to throw.</summary>
 internal sealed class StubBaselineResolver : IBaselineImageResolver
 {
