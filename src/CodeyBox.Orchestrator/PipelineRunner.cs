@@ -2357,6 +2357,9 @@ public sealed class PipelineRunner : IPipelineRunner
             if (hostShutdownToken.IsCancellationRequested)
                 throw new OperationCanceledException(hostShutdownToken);
 
+            if (iteration > 1)
+                await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
+
             await PublishAuditStartedAsync(item, project, iteration, auditors, ct);
             var auditPhaseStart = DateTimeOffset.UtcNow;
             await Transition(item, WorkItemState.Auditing, ct, project);
