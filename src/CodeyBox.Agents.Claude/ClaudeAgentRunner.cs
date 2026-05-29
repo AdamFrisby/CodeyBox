@@ -242,6 +242,17 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         if (string.IsNullOrEmpty(oauthToken) && string.IsNullOrEmpty(apiKey))
             return new TextOnlyAgentResult(false, "missing Claude text-only credential", null, "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required");
 
+        // A subscription OAuth token must NOT be used for a raw /v1/messages call:
+        // Anthropic can flag subscription credentials used outside the Claude-Code
+        // client shape and terminate the account (it also 404/429s). Decline the
+        // text-only path for OAuth — the rebase/merge resolver cascade then parks
+        // the conflict as MergeConflictResolutionFailed instead of making a raw
+        // call. A real ANTHROPIC_API_KEY (x-api-key) is a legitimate raw-API
+        // credential and is still used below. The proper fix is the agentic in-VM
+        // resolver (work items 4f435279/8ec0d914), which never needs this path.
+        if (!string.IsNullOrEmpty(oauthToken))
+            return new TextOnlyAgentResult(false, "Claude text-only via subscription OAuth disabled (account-termination risk; agentic in-VM resolver pending)", null, null);
+
         try
         {
             var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? DefaultModelId : modelId;

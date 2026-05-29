@@ -21,6 +21,11 @@ namespace CodeyBox.Agents.Claude;
 public sealed class ClaudeSmokeProbe : IAgentSmokeProbe
 {
     internal const string MessagesEndpoint = "https://api.anthropic.com/v1/messages";
+    // OAuth-native usage endpoint — the same one ClaudeQuotaProbe and the Claude
+    // Code client use. Validates a subscription OAuth token WITHOUT a raw inference
+    // call, so it carries no account-termination risk (unlike /v1/messages with a
+    // subscription Bearer token).
+    internal const string OAuthUsageEndpoint = "https://api.anthropic.com/api/oauth/usage";
     internal const string AnthropicVersion = "2023-06-01";
     // Smallest widely-available Claude model; used only for the 1-token probe.
     internal const string ProbeModel = "claude-haiku-4-5-20251001";
@@ -49,33 +54,45 @@ public sealed class ClaudeSmokeProbe : IAgentSmokeProbe
                 return Fail("no token in credential bundle", sw);
 
             var client = _httpClientFactory.CreateClient("agent-smoke");
-            using var request = new HttpRequestMessage(HttpMethod.Post, MessagesEndpoint);
-
-            // Do NOT log the Authorization header — it contains the credential.
+            HttpRequestMessage request;
             if (!string.IsNullOrEmpty(oauthToken))
+            {
+                // Subscription OAuth token: validate via the OAuth-native usage
+                // endpoint (what ClaudeQuotaProbe / the Claude Code client use). A
+                // raw /v1/messages call with the subscription Bearer token would risk
+                // account termination (wrong client shape) and is never made here.
+                request = new HttpRequestMessage(HttpMethod.Get, OAuthUsageEndpoint);
+                // Do NOT log the Authorization header — it contains the credential.
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", oauthToken);
+            }
             else
+            {
+                // A real ANTHROPIC_API_KEY (x-api-key) is a legitimate raw-API
+                // credential, so a 1-token /v1/messages probe is appropriate.
+                request = new HttpRequestMessage(HttpMethod.Post, MessagesEndpoint);
                 request.Headers.Add("x-api-key", apiKey!);
+                request.Headers.Add("anthropic-version", AnthropicVersion);
+                request.Content = new StringContent(
+                    $$"""{"model":"{{ProbeModel}}","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}""",
+                    Encoding.UTF8, "application/json");
+            }
 
-            request.Headers.Add("anthropic-version", AnthropicVersion);
+            using (request)
+            {
+                using var response = await client.SendAsync(request, ct);
+                sw.Stop();
 
-            request.Content = new StringContent(
-                $$"""{"model":"{{ProbeModel}}","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}""",
-                Encoding.UTF8, "application/json");
+                if (response.IsSuccessStatusCode)
+                    return new AgentSmokeResult(true, null, sw.Elapsed);
 
-            using var response = await client.SendAsync(request, ct);
-            sw.Stop();
+                if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                    return new AgentSmokeResult(false, "auth", sw.Elapsed);
 
-            if (response.IsSuccessStatusCode)
-                return new AgentSmokeResult(true, null, sw.Elapsed);
+                if ((int)response.StatusCode >= 500)
+                    return new AgentSmokeResult(false, "transient: try later", sw.Elapsed);
 
-            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                return new AgentSmokeResult(false, "auth", sw.Elapsed);
-
-            if ((int)response.StatusCode >= 500)
-                return new AgentSmokeResult(false, "transient: try later", sw.Elapsed);
-
-            return new AgentSmokeResult(false, $"HTTP {(int)response.StatusCode}", sw.Elapsed);
+                return new AgentSmokeResult(false, $"HTTP {(int)response.StatusCode}", sw.Elapsed);
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

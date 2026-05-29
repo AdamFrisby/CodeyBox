@@ -38,20 +38,29 @@ public sealed class ClaudeSmokeProbeTests
     {
         Uri? captured = null;
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req => captured = req.RequestUri);
-        await BuildProbe(handler).SmokeTestAsync(OAuthCred(), CancellationToken.None);
+        await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.Equal(new Uri(ClaudeSmokeProbe.MessagesEndpoint), captured);
     }
 
     // ── Authorization header ──────────────────────────────────────────────────
 
     [Fact]
-    public async Task OAuthToken_SendsBearerHeader()
+    public async Task OAuthToken_ProbesUsageEndpoint_NotRawMessages()
     {
+        // A subscription OAuth token is validated via the OAuth-native usage
+        // endpoint (Bearer), NOT a raw /v1/messages inference call (ToS/account risk).
+        Uri? captured = null;
         string? auth = null;
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req =>
-            auth = req.Headers.Authorization?.ToString());
-        await BuildProbe(handler).SmokeTestAsync(OAuthCred("my-oauth"), CancellationToken.None);
+        {
+            captured = req.RequestUri;
+            auth = req.Headers.Authorization?.ToString();
+        });
+        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred("my-oauth"), CancellationToken.None);
+        Assert.Equal(new Uri(ClaudeSmokeProbe.OAuthUsageEndpoint), captured);
         Assert.Equal("Bearer my-oauth", auth);
+        Assert.True(result.Ok);
+        Assert.Null(result.FailureReason);
     }
 
     [Fact]
@@ -65,9 +74,12 @@ public sealed class ClaudeSmokeProbeTests
     }
 
     [Fact]
-    public async Task OAuthTokenPreferredOverApiKey()
+    public async Task OAuthPresent_UsesUsageEndpoint_NotRawMessages_EvenWithApiKey()
     {
-        string? auth = null;
+        // When an OAuth subscription token is present it takes precedence: validate
+        // via the usage endpoint, never POST /v1/messages (with the OAuth token or
+        // by falling through to the API key).
+        Uri? captured = null;
         var cred = new AgentCredential(AgentKind.Claude,
             new Dictionary<string, string>
             {
@@ -76,10 +88,11 @@ public sealed class ClaudeSmokeProbeTests
             },
             new Dictionary<string, string>());
 
-        var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req =>
-            auth = req.Headers.Authorization?.ToString());
-        await BuildProbe(handler).SmokeTestAsync(cred, CancellationToken.None);
-        Assert.Equal("Bearer oauth-tok", auth);
+        var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req => captured = req.RequestUri);
+        var result = await BuildProbe(handler).SmokeTestAsync(cred, CancellationToken.None);
+        Assert.Equal(new Uri(ClaudeSmokeProbe.OAuthUsageEndpoint), captured);
+        Assert.NotEqual(new Uri(ClaudeSmokeProbe.MessagesEndpoint), captured);
+        Assert.True(result.Ok);
     }
 
     // ── Status-code classification ─────────────────────────────────────────────
@@ -88,7 +101,7 @@ public sealed class ClaudeSmokeProbeTests
     public async Task Http200_ReturnsOk()
     {
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", _ => { });
-        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred(), CancellationToken.None);
+        var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.True(result.Ok);
         Assert.Null(result.FailureReason);
     }
@@ -97,7 +110,7 @@ public sealed class ClaudeSmokeProbeTests
     public async Task Http401_ReturnsFail_Auth()
     {
         var handler = new SmokeCapturingHandler(HttpStatusCode.Unauthorized, "", _ => { });
-        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred(), CancellationToken.None);
+        var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Equal("auth", result.FailureReason);
     }
@@ -106,7 +119,7 @@ public sealed class ClaudeSmokeProbeTests
     public async Task Http403_ReturnsFail_Auth()
     {
         var handler = new SmokeCapturingHandler(HttpStatusCode.Forbidden, "", _ => { });
-        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred(), CancellationToken.None);
+        var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Equal("auth", result.FailureReason);
     }
@@ -115,7 +128,7 @@ public sealed class ClaudeSmokeProbeTests
     public async Task Http500_ReturnsFail_Transient()
     {
         var handler = new SmokeCapturingHandler(HttpStatusCode.InternalServerError, "", _ => { });
-        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred(), CancellationToken.None);
+        var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("transient", result.FailureReason);
     }
@@ -124,7 +137,7 @@ public sealed class ClaudeSmokeProbeTests
     public async Task Http429_ReturnsFail_WithStatusCode()
     {
         var handler = new SmokeCapturingHandler(HttpStatusCode.TooManyRequests, "", _ => { });
-        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred(), CancellationToken.None);
+        var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("429", result.FailureReason);
     }
@@ -135,7 +148,7 @@ public sealed class ClaudeSmokeProbeTests
     public async Task NetworkException_ReturnsFail_Transient()
     {
         var handler = new SmokeThrowingHandler(new HttpRequestException("network failure"));
-        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred(), CancellationToken.None);
+        var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("transient", result.FailureReason);
     }
@@ -147,7 +160,7 @@ public sealed class ClaudeSmokeProbeTests
     {
         var handler = new SmokeHangingHandler();
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
-        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred(), cts.Token);
+        var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), cts.Token);
         Assert.False(result.Ok);
         Assert.Equal("timeout", result.FailureReason);
     }
@@ -171,7 +184,7 @@ public sealed class ClaudeSmokeProbeTests
     public async Task Duration_IsPopulated()
     {
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", _ => { });
-        var result = await BuildProbe(handler).SmokeTestAsync(OAuthCred(), CancellationToken.None);
+        var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.True(result.Duration >= TimeSpan.Zero);
     }
 }
