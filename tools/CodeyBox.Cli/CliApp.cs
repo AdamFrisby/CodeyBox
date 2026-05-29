@@ -10,14 +10,38 @@ internal static class CliApp
 {
     internal const string CliVersion = "1.0.0";
 
+    /// <summary>
+    /// Linked into <see cref="QueueWatch"/> when set (System.CommandLine beta4 has no InvokeAsync CT).
+    /// </summary>
+    internal static CancellationToken TestCancellationToken { get; set; }
+
     internal static Task<int> InvokeAsync(
         string[] args,
-        Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null)
+        Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null,
+        CancellationToken cancellationToken = default)
     {
         var parser = new CommandLineBuilder(BuildRootCommand(clientFactory))
             .UseDefaults()
             .Build();
-        return parser.InvokeAsync(args);
+
+        if (!cancellationToken.CanBeCanceled)
+            return parser.InvokeAsync(args);
+
+        return InvokeWithTestCancellationAsync(parser, args, cancellationToken);
+    }
+
+    private static async Task<int> InvokeWithTestCancellationAsync(
+        Parser parser, string[] args, CancellationToken cancellationToken)
+    {
+        TestCancellationToken = cancellationToken;
+        try
+        {
+            return await parser.InvokeAsync(args);
+        }
+        finally
+        {
+            TestCancellationToken = default;
+        }
     }
 
     internal static RootCommand BuildRootCommand(Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null)

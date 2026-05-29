@@ -504,6 +504,138 @@ public sealed class WatchSseTests
     }
 
     [Fact]
+    public async Task Watch_CancellationDuringSse_ExitsZeroWithoutFallbackNote()
+    {
+        using var cts = new CancellationTokenSource();
+        var factory = MakeFactory(req =>
+        {
+            if (req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
+            {
+                return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new StreamContent(new SseTestHttp.BlockUntilCancelledStream()),
+                };
+            }
+
+            return SampleData.WorkItemResponse(SampleData.WorkItem("Done"));
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var invokeTask = CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                factory,
+                cts.Token);
+            await Task.Delay(100);
+            cts.Cancel();
+            var code = await invokeTask;
+
+            Assert.Equal(0, code);
+            Assert.DoesNotContain("SSE unavailable", output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Watch_SseUnauthorized_DoesNotPrintFallbackNote()
+    {
+        var factory = MakeFactory(req =>
+        {
+            if (req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
+                return new HttpResponseMessage(System.Net.HttpStatusCode.Unauthorized);
+
+            return SampleData.WorkItemResponse();
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                factory);
+
+            Assert.Equal(1, code);
+            Assert.DoesNotContain("SSE unavailable", output.Error.ToString());
+            Assert.Contains("401", output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Watch_SseFallback_DoesNotReprintLastSseState()
+    {
+        var pollStates = new[] { "Working", "Done" };
+        var pollIndex = 0;
+        var factory = MakeFactory(req =>
+        {
+            if (req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
+                return SampleData.SseEventsResponse("Working");
+
+            var state = pollStates[Math.Min(pollIndex++, pollStates.Length - 1)];
+            return SampleData.WorkItemResponse(SampleData.WorkItem(state));
+        });
+
+        QueueWatch.PollingInterval = TimeSpan.Zero;
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                factory);
+
+            Assert.Equal(0, code);
+            var workingLines = output.Out.ToString()
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Count(l => l.Contains("Working"));
+            Assert.Equal(1, workingLines);
+            Assert.Contains("Done", output.Out.ToString());
+        }
+        finally
+        {
+            QueueWatch.PollingInterval = TimeSpan.FromSeconds(2);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Watch_SseMergedThenDone_ContinuesUntilTerminal()
+    {
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                MakeFactory(req =>
+                {
+                    if (req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
+                        return SampleData.SseEventsResponse("Working", "Merged", "Done");
+
+                    return SampleData.WorkItemResponse();
+                }));
+
+            Assert.Equal(0, code);
+            var stdout = output.Out.ToString();
+            Assert.Contains("Merged", stdout);
+            Assert.Contains("Done", stdout);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
     public async Task Watch_Poll_SkipsSseEndpoint()
     {
         var sseAttempted = false;

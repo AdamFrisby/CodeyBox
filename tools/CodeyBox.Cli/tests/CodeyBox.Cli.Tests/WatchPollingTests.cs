@@ -75,6 +75,39 @@ public sealed class WatchPollingTests
         }
     }
 
+    [Theory]
+    [InlineData("Failed")]
+    [InlineData("Cancelled")]
+    [InlineData("AuditFailed")]
+    public async Task Watch_Poll_StopsAtEachTerminalState(string terminalState)
+    {
+        var callCount = 0;
+        Func<ResolvedConfig, CodeyBoxClient> factory = config =>
+            new CodeyBoxClient(
+                new HttpClient(new FakeHttpMessageHandler(_ =>
+                {
+                    callCount++;
+                    return SampleData.WorkItemResponse(SampleData.WorkItem(terminalState));
+                }))
+                { BaseAddress = new Uri(config.ApiBaseUrl) });
+
+        QueueWatch.PollingInterval = TimeSpan.Zero;
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        try
+        {
+            await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000", "--poll"],
+                factory);
+
+            Assert.Equal(1, callCount);
+        }
+        finally
+        {
+            QueueWatch.PollingInterval = TimeSpan.FromSeconds(2);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
     [Fact]
     public async Task Watch_DeduplicatesStateLines()
     {

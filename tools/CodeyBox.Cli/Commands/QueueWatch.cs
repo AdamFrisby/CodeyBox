@@ -1,6 +1,7 @@
 using System.CommandLine;
 using System.CommandLine.Invocation;
 using CodeyBox.Cli.Services;
+using CliApp = CodeyBox.Cli.CliApp;
 
 namespace CodeyBox.Cli.Commands;
 
@@ -28,6 +29,32 @@ internal static class QueueWatch
         cmd.SetHandler(async (InvocationContext ctx) =>
         {
             var ct = ctx.GetCancellationToken();
+            if (CliApp.TestCancellationToken.CanBeCanceled)
+            {
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                    ct, CliApp.TestCancellationToken);
+                await RunWatchAsync(
+                    ctx, idArg, pollOpt, streamOpt, apiUrlOpt, apiKeyOpt, clientFactory, linked.Token);
+                return;
+            }
+
+            await RunWatchAsync(
+                ctx, idArg, pollOpt, streamOpt, apiUrlOpt, apiKeyOpt, clientFactory, ct);
+        });
+
+        return cmd;
+    }
+
+    private static async Task RunWatchAsync(
+        InvocationContext ctx,
+        Argument<string> idArg,
+        Option<bool> pollOpt,
+        Option<bool> streamOpt,
+        Option<string?> apiUrlOpt,
+        Option<string?> apiKeyOpt,
+        Func<ResolvedConfig, CodeyBoxClient> clientFactory,
+        CancellationToken ct)
+    {
 
             var id = ctx.ParseResult.GetValueForArgument(idArg);
             var forcePoll = ctx.ParseResult.GetValueForOption(pollOpt);
@@ -58,7 +85,7 @@ internal static class QueueWatch
 
                 if (!forcePoll)
                 {
-                    var sseResult = await WatchViaSseAsync(client, id, state =>
+                    var sseResult = await client.TryWatchWorkItemEventsAsync(id, state =>
                     {
                         PrintStateTransition(state);
                         lastPrintedState = state;
@@ -88,17 +115,7 @@ internal static class QueueWatch
                 await Console.Error.WriteLineAsync($"Connection error: {ex.Message}");
                 ctx.ExitCode = 1;
             }
-        });
-
-        return cmd;
     }
-
-    private static Task<SseWatchResult> WatchViaSseAsync(
-        CodeyBoxClient client,
-        string id,
-        Action<string> onStateTransition,
-        CancellationToken ct) =>
-        client.TryWatchWorkItemEventsAsync(id, onStateTransition, ct);
 
     /// <returns><c>false</c> when the work item was not found.</returns>
     private static async Task<bool> WatchViaPollingAsync(
@@ -135,6 +152,9 @@ internal static class QueueWatch
     private static void PrintStateTransition(string state)
     {
         var timestamp = DateTimeOffset.UtcNow.ToString("HH:mm:ss");
-        Console.WriteLine($"[{timestamp}] {state}");
+        Console.WriteLine($"[{timestamp}] {SanitizeStateForOutput(state)}");
     }
+
+    private static string SanitizeStateForOutput(string state) =>
+        string.Concat(state.Where(static c => !char.IsControl(c)));
 }

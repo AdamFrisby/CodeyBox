@@ -1,7 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Text.Json;
 using CodeyBox.Cli.Models;
 
 namespace CodeyBox.Cli.Services;
@@ -15,24 +14,33 @@ internal sealed class CodeyBoxApiException(int statusCode, string body)
 internal sealed class CodeyBoxClient
 {
     private readonly HttpClient _http;
-    private readonly HttpClient _sseHttp;
+    private readonly HttpClient? _sseHttp;
+    private readonly ResolvedConfig? _lazySseConfig;
+    private HttpClient? _lazySseHttp;
 
-    internal CodeyBoxClient(HttpClient http) : this(http, http) { }
+    internal CodeyBoxClient(HttpClient http)
+        : this(http, sseHttp: null, lazySseConfig: null) { }
 
     internal CodeyBoxClient(HttpClient http, HttpClient sseHttp)
+        : this(http, sseHttp, lazySseConfig: null) { }
+
+    private CodeyBoxClient(HttpClient http, HttpClient? sseHttp, ResolvedConfig? lazySseConfig)
     {
         _http = http;
         _sseHttp = sseHttp;
+        _lazySseConfig = lazySseConfig;
     }
 
     internal static CodeyBoxClient Create(ResolvedConfig config)
     {
         var http = CreateHttpClient(config, TimeSpan.FromSeconds(30));
-        var sseHttp = CreateHttpClient(config, Timeout.InfiniteTimeSpan);
-        return new CodeyBoxClient(http, sseHttp);
+        return new CodeyBoxClient(http, sseHttp: null, lazySseConfig: config);
     }
 
-    private static HttpClient CreateHttpClient(ResolvedConfig config, TimeSpan timeout)
+    internal static HttpClient CreateHttpClient(ResolvedConfig config, TimeSpan timeout) =>
+        CreateHttpClientImpl(config, timeout);
+
+    private static HttpClient CreateHttpClientImpl(ResolvedConfig config, TimeSpan timeout)
     {
         var http = new HttpClient
         {
@@ -81,107 +89,20 @@ internal sealed class CodeyBoxClient
         await EnsureSuccessAsync(resp, ct);
     }
 
-    /// <summary>
-    /// Watches a work item via SSE (<c>GET /workitems/{id}/events</c>).
-    /// </summary>
     internal async Task<SseWatchResult> TryWatchWorkItemEventsAsync(
         string id,
         Action<string> onStateTransition,
         CancellationToken ct = default)
     {
-        using var req = new HttpRequestMessage(
-            HttpMethod.Get, $"/workitems/{Uri.EscapeDataString(id)}/events");
-        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-
-        HttpResponseMessage resp;
-        try
-        {
-            resp = await _sseHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-        }
-        catch (HttpRequestException)
-        {
-            return SseWatchResult.ShouldFallback;
-        }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
-        {
-            return SseWatchResult.ShouldFallback;
-        }
-
-        if (!resp.IsSuccessStatusCode)
-        {
-            resp.Dispose();
-            return SseWatchResult.ShouldFallback;
-        }
-
-        try
-        {
-            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
-            using var reader = new StreamReader(stream);
-            string? lastState = null;
-
-            while (!ct.IsCancellationRequested)
-            {
-                string? line;
-                try
-                {
-                    line = await reader.ReadLineAsync(ct);
-                }
-                catch (TaskCanceledException) when (!ct.IsCancellationRequested)
-                {
-                    return SseWatchResult.ShouldFallback;
-                }
-
-                if (line is null)
-                    break;
-
-                if (!line.StartsWith("data: ", StringComparison.Ordinal))
-                    continue;
-
-                var json = line["data: ".Length..];
-                if (string.IsNullOrWhiteSpace(json))
-                    continue;
-
-                if (!TryParseWorkItemState(json, out var state) || state is null)
-                    continue;
-
-                if (state != lastState)
-                {
-                    onStateTransition(state);
-                    lastState = state;
-                }
-
-                if (WorkItemDto.IsTerminalState(state))
-                    return SseWatchResult.Completed;
-            }
-
-            if (ct.IsCancellationRequested)
-                throw new OperationCanceledException(ct);
-
-            return SseWatchResult.ShouldFallback;
-        }
-        finally
-        {
-            resp.Dispose();
-        }
+        var watcher = new WorkItemSseWatcher(GetSseHttp());
+        return await watcher.WatchAsync(id, onStateTransition, ct);
     }
 
-    private static bool TryParseWorkItemState(string json, out string? state)
+    private HttpClient GetSseHttp()
     {
-        state = null;
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (!doc.RootElement.TryGetProperty("workItem", out var workItem)
-                || !workItem.TryGetProperty("state", out var stateEl))
-                return false;
-
-            state = stateEl.GetString();
-            return state is not null;
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
+        if (_sseHttp is not null)
+            return _sseHttp;
+        return _lazySseHttp ??= WorkItemSseWatcher.CreateHttpClient(_lazySseConfig!);
     }
 
     internal async Task<WorkItemDto> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)
@@ -199,7 +120,7 @@ internal sealed class CodeyBoxClient
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }
 
-    private static async Task EnsureSuccessAsync(HttpResponseMessage resp, CancellationToken ct)
+    internal static async Task EnsureSuccessAsync(HttpResponseMessage resp, CancellationToken ct)
     {
         if (resp.IsSuccessStatusCode) return;
         var body = await resp.Content.ReadAsStringAsync(ct);
