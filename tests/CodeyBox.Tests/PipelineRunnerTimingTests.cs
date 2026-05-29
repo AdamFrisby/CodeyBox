@@ -136,11 +136,20 @@ public sealed class PipelineRunnerTimingTests : IDisposable
         Assert.True(spans.Any("agent.invoke", ("codeybox.phase", "work"), ("codeybox.outcome", "success")),
             "expected a successful agent.invoke span in the work phase");
 
+        // The pickup phase wraps the pre-work rebase/reset that every fresh
+        // Queued run executes. Asserting it here prevents a regression that
+        // dropped or renamed the BeginPhaseScope(item, "pickup") wrapper from
+        // silently passing the rest of this suite.
+        Assert.True(spans.Any("phase.pickup", ("codeybox.phase", "pickup")),
+            "expected a phase.pickup span on a fresh Queued pipeline entry");
+
         // Invocation counter + phase-duration histogram fired on the real run.
         Assert.True(metrics.Any("codeybox.agent.invocations", ("phase", "work"), ("outcome", "success")),
             "expected a codeybox.agent.invocations measurement for the successful work invocation");
         Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "work")),
             "expected a codeybox.phase.duration_ms{phase=work} measurement");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "pickup")),
+            "expected a codeybox.phase.duration_ms{phase=pickup} measurement");
 
         // The merge phase (RealMerge, non-empty merge path) opens its own
         // phase.merge span and records a phase=merge duration sample. Asserting

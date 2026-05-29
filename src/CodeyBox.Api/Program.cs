@@ -3008,7 +3008,13 @@ namespace CodeyBox.Api
                 throw new InvalidOperationException(
                     $"CodeyBox:Otel:OtlpEndpoint '{opts.OtlpEndpoint}' is not a valid http/https URL.");
 
-            if (opts.ExportProtocol is not "grpc" and not "httpprotobuf")
+            // Skip appsettings ExportProtocol validation when OTEL_EXPORTER_OTLP_PROTOCOL
+            // is set: ConfigureOtlp defers to the env var at export time (the SDK reads
+            // it directly), so a stale/invalid appsettings value is harmless and must
+            // not block startup of an env-only bootstrap.
+            var envProtocol = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_PROTOCOL");
+            if (string.IsNullOrWhiteSpace(envProtocol)
+                && opts.ExportProtocol is not "grpc" and not "httpprotobuf")
                 throw new InvalidOperationException(
                     $"CodeyBox:Otel:ExportProtocol '{opts.ExportProtocol}' is not valid. " +
                     "Expected 'grpc' or 'httpprotobuf'.");

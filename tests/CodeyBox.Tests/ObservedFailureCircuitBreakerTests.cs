@@ -126,17 +126,26 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     }
 
     [Fact]
-    public void PipelineRunner_UsesConcreteRunnerDefaultForObservedFailureKey()
+    public void PipelineRunner_UsesConfiguredRunnerDefaultForObservedFailureKey()
     {
         var defaults = new AgentDefaultsSnapshot(
             new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
             {
-                ["claude"] = "claude-opus-4-8",
+                ["claude"] = "claude-opus-4-7",
                 ["codex"] = "gpt-5.5",
             });
+        var overrideDefaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-opus-4-8",
+            });
+
+        Assert.Equal(
+            "claude-opus-4-7",
+            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(defaults), modelId: null));
         Assert.Equal(
             "claude-opus-4-8",
-            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(defaults), modelId: null));
+            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(overrideDefaults), modelId: null));
         Assert.Equal(
             "gpt-5.5",
             PipelineRunner.ResolveObservedModelId(new CodexAgentRunner(defaults), modelId: null));

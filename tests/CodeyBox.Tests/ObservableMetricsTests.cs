@@ -83,6 +83,56 @@ public sealed class ObservableMetricsTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxActiveGauge_ReportsSandboxLiveCounter_ForEphemeralProvider()
+    {
+        // Non-suspending provider (process/bubblewrap fallback path) is expected
+        // to surface SandboxLiveCounter.Active. Without this assertion, a
+        // regression that always took the suspendable branch — or skipped the
+        // Increment/Decrement calls in the ephemeral providers — would still
+        // pass SandboxActiveGauge_ReportsSuspendableCount.
+        var store = new SqliteWorkItemStore(_dbPath);
+
+        // Reset to a known starting value so concurrent tests cannot perturb the
+        // counter; snapshot the baseline to keep this test independent of
+        // unrelated callers that might also push values.
+        var baseline = SandboxLiveCounter.Active;
+        SandboxLiveCounter.Increment();
+        SandboxLiveCounter.Increment();
+        SandboxLiveCounter.Increment();
+        try
+        {
+            using var svc = new CodeyBoxObservableMetrics(
+                store,
+                new InertSandboxProvider(),
+                new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+                NullLogger<CodeyBoxObservableMetrics>.Instance,
+                workerPool: new FakeWorkerPool(0),
+                quotaSnapshot: null,
+                refreshInterval: TimeSpan.FromMinutes(10));
+            await svc.StartAsync(CancellationToken.None);
+
+            var observed = CollectLong(svc, "provider", "codeybox.sandbox.active");
+            Assert.Contains(observed,
+                m => m.Instrument == "codeybox.sandbox.active"
+                    && m.Tag == "inert"
+                    && m.Value == baseline + 3);
+
+            SandboxLiveCounter.Decrement();
+            observed = CollectLong(svc, "provider", "codeybox.sandbox.active");
+            Assert.Contains(observed,
+                m => m.Instrument == "codeybox.sandbox.active"
+                    && m.Tag == "inert"
+                    && m.Value == baseline + 2);
+
+            await svc.StopAsync(CancellationToken.None);
+        }
+        finally
+        {
+            while (SandboxLiveCounter.Active > baseline) SandboxLiveCounter.Decrement();
+        }
+    }
+
+    [Fact]
     public async Task SandboxActiveGauge_ReportsSuspendableCount()
     {
         var store = new SqliteWorkItemStore(_dbPath);

@@ -74,7 +74,7 @@ Four `ActivitySource` instances produce spans:
 
 | Source name | What it traces |
 |---|---|
-| `CodeyBox.Pipeline` | The work-item pipeline tree: a root `pipeline.run` span per work item → `phase.<name>` spans (work / rework / audit / merge / upstream) → `agent.invoke` spans per agent attempt → `agent.exec` / clone steps. |
+| `CodeyBox.Pipeline` | The work-item pipeline tree: a root `pipeline.run` span per work item → `phase.<name>` spans (pickup / work / rework / audit / merge / upstream) → `agent.invoke` spans per agent attempt → `agent.exec` / clone steps. |
 | `CodeyBox.Sandbox` | Sandbox lifecycle — `git.clone_into_sandbox`, `git.commit`, `git.push_back_to_bare_repo`, sandbox start. |
 | `CodeyBox.Audit` | Per-auditor invocation (`auditor.<name>` per iteration). |
 | `CodeyBox.Upstream` | Upstream remote spans (reserved; upstream timing is currently captured by the `codeybox.upstream.*` metric and the `phase.upstream` span). |
@@ -89,7 +89,7 @@ CodeyBox-produced spans carry these attributes (where applicable):
 |---|---|
 | `codeybox.work_item_id` | UUID of the work item |
 | `codeybox.project_id` | Project id (root span) |
-| `codeybox.phase` | Pipeline phase: `work`, `rework`, `audit`, `merge`, `upstream` |
+| `codeybox.phase` | Pipeline phase: `pickup`, `work`, `rework`, `audit`, `merge`, `upstream` |
 | `codeybox.iteration` | Audit iteration number (audit/rework/invoke spans only) |
 | `codeybox.agent` | Agent kind value, e.g. `claude`, `codex` |
 | `codeybox.model` | Model id for the invocation (`(default)` when unset) |
@@ -127,7 +127,7 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.audit.findings.blocking` | `{finding}` | `iteration` | Blocking-finding count per audit iteration. |
 | `codeybox.auditor.duration_ms` | `ms` | `auditor.name`, `auditor.kind`, `iteration` | Wall-clock time per auditor invocation. |
 | `codeybox.agent.duration_ms` | `ms` | `agent.kind`, `phase` | Agent execution time per phase. |
-| `codeybox.phase.duration_ms` | `ms` | `phase` (`work` \| `rework` \| `audit` \| `merge` \| `upstream`) | Whole-phase wall-clock duration. |
+| `codeybox.phase.duration_ms` | `ms` | `phase` (`pickup` \| `work` \| `rework` \| `audit` \| `merge` \| `upstream`) | Whole-phase wall-clock duration. |
 | `codeybox.sandbox.lifecycle.duration_ms` | `ms` | `step` (`start` \| `clone`) | Sandbox step durations. |
 | `codeybox.upstream.api_call.duration_ms` | `ms` | `endpoint`, `status_code` | Upstream forge API call durations. |
 
@@ -140,7 +140,7 @@ Polled at collection time; registered only when OTel is enabled.
 | `codeybox.work_item.active` | `{work_item}` | `state` | Work items currently persisted in each state (refreshed on a 15 s background cadence so the collection thread never blocks on SQLite). |
 | `codeybox.workers.in_use` | `{worker}` | — | Worker slots currently occupied by an in-flight pipeline run. |
 | `codeybox.workers.max` | `{worker}` | — | Configured `MaxConcurrentWorkers` ceiling. |
-| `codeybox.sandbox.active` | `{sandbox}` | `provider` | Sandboxes/VMs the process is actively tracking (0 for the ephemeral process/bubblewrap providers, which have no persistent VM lifecycle). |
+| `codeybox.sandbox.active` | `{sandbox}` | `provider` | Sandboxes/VMs the process is actively tracking. Suspend-capable providers (e.g. Multipass) report from `ISuspendingSandboxProvider.SnapshotSuspendableActive()`; ephemeral providers (process, bubblewrap) report in-flight created-but-not-disposed sandboxes via the process-wide `SandboxLiveCounter`. |
 | `codeybox.agent.quota.available_pct` | `%` | `agent.kind`, `model` | Most-recent subscription quota headroom observed per agent/model during routing (`-1` = unknown). |
 
 In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automatically via `AddRuntimeInstrumentation`.

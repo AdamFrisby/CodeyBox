@@ -119,6 +119,31 @@ public sealed class OtelOptionsValidationTests
     }
 
     [Fact]
+    public void Enabled_InvalidAppsettingsProtocol_DoesNotThrow_WhenEnvProtocolSet()
+    {
+        // ConfigureOtlp defers to OTEL_EXPORTER_OTLP_PROTOCOL at export time, so
+        // an env-only bootstrap that ships a valid protocol via env must not be
+        // blocked by a stale/invalid CodeyBox:Otel:ExportProtocol value.
+        const string envVar = "OTEL_EXPORTER_OTLP_PROTOCOL";
+        var prior = Environment.GetEnvironmentVariable(envVar);
+        Environment.SetEnvironmentVariable(envVar, "http/protobuf");
+        try
+        {
+            var opts = new OtelOptions
+            {
+                Enabled = true,
+                OtlpEndpoint = "http://localhost:4318",
+                ExportProtocol = "totally-bogus",
+            };
+            OtelOptions.Validate(opts); // must not throw
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(envVar, prior);
+        }
+    }
+
+    [Fact]
     public void ParseResourceAttributesEnv_ParsesPairs_AndSkipsMalformed()
     {
         var parsed = OtelOptions.ParseResourceAttributesEnv("service.namespace=team-a, host.name=worker-1 ,bogus,=novalue,k=");
