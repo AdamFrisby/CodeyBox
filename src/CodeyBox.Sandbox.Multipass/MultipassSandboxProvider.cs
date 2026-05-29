@@ -2388,6 +2388,9 @@ internal static class MultipassDaemonRetry
         var stderr = result.Stderr ?? "";
         if (stderr.Contains("qemu-system-x86_64; error: Process crashed", StringComparison.OrdinalIgnoreCase))
             return "qemu-process-crashed";
+        if (stderr.Contains("Could not acquire lock", StringComparison.OrdinalIgnoreCase)
+            && stderr.Contains("multipassd-vm-instances", StringComparison.OrdinalIgnoreCase))
+            return "multipass-instance-lock-contention";
         if (stderr.Contains("cannot connect to the multipass socket", StringComparison.OrdinalIgnoreCase))
             return "multipass-socket-unreachable";
         if ((command == "launch" || command == "start")
