@@ -36,4 +36,25 @@ internal static class SampleData
         {
             Content = JsonContent.Create(item ?? WorkItem(), CliJsonContext.Default.WorkItemDto),
         };
+
+    internal static HttpResponseMessage SseEventsResponse(params string[] states)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var state in states)
+        {
+            var item = WorkItem(state);
+            sb.Append("id: 1\n");
+            sb.Append("event: work_item.state\n");
+            sb.Append("data: {\"event\":\"work_item.state\",\"workItem\":{\"id\":\"")
+                .Append(item.Id)
+                .Append("\",\"state\":\"")
+                .Append(state)
+                .Append("\"}}\n\n");
+        }
+
+        return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(sb.ToString(), System.Text.Encoding.UTF8, "text/event-stream"),
+        };
+    }
 }

@@ -27,7 +27,11 @@ internal sealed class WorkItemDto
     public Dictionary<string, string?> DependsOnExternalIds { get; set; } = [];
     public long QueuePosition { get; set; }
 
-    internal bool IsTerminal => State is "Done" or "Failed" or "Cancelled" or "AuditFailed";
+    internal static bool IsTerminalState(string state) =>
+        state is "Done" or "Merged" or "Failed" or "Cancelled" or "AuditFailed"
+            or "MergeConflictResolutionFailed" or "AbandonedAfterRecoveryAttempts";
+
+    internal bool IsTerminal => IsTerminalState(State);
 
     internal string ShortId => Id.Length >= 8 ? Id[..8] : Id;
 

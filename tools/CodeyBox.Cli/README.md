@@ -24,7 +24,7 @@ Prompts for API base URL and key, saved to `~/.config/codeybox/config.json`:
 
 ```json
 {
-  "apiBaseUrl": "http://localhost:5050",
+  "apiBaseUrl": "http://localhost:5036",
   "apiKey": "..."
 }
 ```
@@ -36,7 +36,7 @@ For every call the CLI resolves credentials in this priority order:
 1. `--api-url` / `--api-key` command-line flags
 2. `CODEYBOX_CLI_API_URL` / `CODEYBOX_CLI_API_KEY` environment variables
 3. `~/.config/codeybox/config.json`
-4. Default base URL `http://localhost:5050`; missing key → error with hint
+4. Default base URL `http://localhost:5036`; missing key → error with hint
 
 ### Global flags
 
@@ -130,14 +130,15 @@ codeybox queue retry aabbccdd-... --from merge
 
 ### `codeybox queue watch <id>`
 
-Long-poll a work item, printing each state transition:
+Watch a work item via SSE (`GET /workitems/{id}/events`), printing each state transition as events arrive. Falls back to 2s HTTP polling when SSE is unavailable (older server, connect error, non-200).
 
 ```bash
 codeybox queue watch aabbccdd-...
-codeybox queue watch aabbccdd-... --stream   # enable stdout streaming if available
+codeybox queue watch aabbccdd-... --poll     # force HTTP polling
+codeybox queue watch aabbccdd-... --stream   # also stream agent stdout when available
 ```
 
-Exits when the item reaches a terminal state (`Done`, `Failed`, `Cancelled`, `AuditFailed`).
+Exits when the item reaches a terminal state (`Done`, `Merged`, `Failed`, `Cancelled`, `AuditFailed`, `MergeConflictResolutionFailed`, `AbandonedAfterRecoveryAttempts`).
 Press `Ctrl+C` to stop early.
 
 ### `codeybox version`

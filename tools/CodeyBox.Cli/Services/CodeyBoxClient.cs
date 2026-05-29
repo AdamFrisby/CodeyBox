@@ -1,4 +1,6 @@
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text.Json;
 using CodeyBox.Cli.Models;
 
 namespace CodeyBox.Cli.Services;
@@ -62,6 +64,95 @@ internal sealed class CodeyBoxClient
     {
         var resp = await _http.DeleteAsync($"/workitems/{Uri.EscapeDataString(id)}", ct);
         await EnsureSuccessAsync(resp, ct);
+    }
+
+    /// <summary>
+    /// Watches a work item via SSE (<c>GET /workitems/{id}/events</c>).
+    /// Returns <c>true</c> when the stream ends after a terminal state (or closes);
+    /// returns <c>false</c> when the caller should fall back to polling (connect error, non-200).
+    /// </summary>
+    internal async Task<bool> TryWatchWorkItemEventsAsync(
+        string id,
+        Action<string> onStateTransition,
+        CancellationToken ct = default)
+    {
+        using var req = new HttpRequestMessage(
+            HttpMethod.Get, $"/workitems/{Uri.EscapeDataString(id)}/events");
+        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+
+        HttpResponseMessage resp;
+        try
+        {
+            resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        }
+        catch (HttpRequestException)
+        {
+            return false;
+        }
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            resp.Dispose();
+            return false;
+        }
+
+        try
+        {
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            using var reader = new StreamReader(stream);
+            string? lastState = null;
+
+            while (!ct.IsCancellationRequested)
+            {
+                var line = await reader.ReadLineAsync(ct);
+                if (line is null)
+                    break;
+
+                if (!line.StartsWith("data: ", StringComparison.Ordinal))
+                    continue;
+
+                var json = line["data: ".Length..];
+                if (string.IsNullOrWhiteSpace(json))
+                    continue;
+
+                if (!TryParseWorkItemState(json, out var state) || state is null)
+                    continue;
+
+                if (state != lastState)
+                {
+                    onStateTransition(state);
+                    lastState = state;
+                }
+
+                if (WorkItemDto.IsTerminalState(state))
+                    return true;
+            }
+
+            return true;
+        }
+        finally
+        {
+            resp.Dispose();
+        }
+    }
+
+    private static bool TryParseWorkItemState(string json, out string? state)
+    {
+        state = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("workItem", out var workItem)
+                || !workItem.TryGetProperty("state", out var stateEl))
+                return false;
+
+            state = stateEl.GetString();
+            return state is not null;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     internal async Task<WorkItemDto> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)

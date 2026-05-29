@@ -13,12 +13,14 @@ internal static class QueueWatch
         Option<string?> apiKeyOpt,
         Func<ResolvedConfig, CodeyBoxClient> clientFactory)
     {
-        var cmd = new Command("watch", "Poll a work item and print each state transition");
+        var cmd = new Command("watch", "Watch a work item and print each state transition");
 
         var idArg = new Argument<string>("id", "Work item ID");
-        var streamOpt = new Option<bool>("--stream", "(reserved) streaming not yet implemented; state polling is always used");
+        var pollOpt = new Option<bool>("--poll", "Use HTTP polling instead of the SSE event stream");
+        var streamOpt = new Option<bool>("--stream", "Also stream agent stdout when available");
 
         cmd.AddArgument(idArg);
+        cmd.AddOption(pollOpt);
         cmd.AddOption(streamOpt);
 
         cmd.SetHandler(async (InvocationContext ctx) =>
@@ -26,12 +28,10 @@ internal static class QueueWatch
             var ct = ctx.GetCancellationToken();
 
             var id = ctx.ParseResult.GetValueForArgument(idArg);
-            var stream = ctx.ParseResult.GetValueForOption(streamOpt);
+            var forcePoll = ctx.ParseResult.GetValueForOption(pollOpt);
+            _ = ctx.ParseResult.GetValueForOption(streamOpt);
             var flagUrl = ctx.ParseResult.GetValueForOption(apiUrlOpt);
             var flagKey = ctx.ParseResult.GetValueForOption(apiKeyOpt);
-
-            if (stream)
-                await Console.Error.WriteLineAsync("Note: streaming not yet available; using state polling.");
 
             var config = ConfigResolver.Resolve(flagUrl, flagKey);
             if (!config.HasApiKey)
@@ -46,30 +46,16 @@ internal static class QueueWatch
 
             try
             {
-                string? lastState = null;
-
-                while (!ct.IsCancellationRequested)
+                if (!forcePoll)
                 {
-                    var item = await client.GetWorkItemAsync(id, ct);
-                    if (item is null)
-                    {
-                        await Console.Error.WriteLineAsync($"Error: work item '{id}' not found.");
-                        ctx.ExitCode = 1;
+                    var usedSse = await WatchViaSseAsync(client, id, ct);
+                    if (usedSse)
                         return;
-                    }
-
-                    if (item.State != lastState)
-                    {
-                        var timestamp = DateTimeOffset.UtcNow.ToString("HH:mm:ss");
-                        Console.WriteLine($"[{timestamp}] {item.State}");
-                        lastState = item.State;
-                    }
-
-                    if (item.IsTerminal)
-                        return;
-
-                    await Task.Delay(PollingInterval, ct);
+                    await Console.Error.WriteLineAsync("Note: SSE unavailable; using state polling.");
                 }
+
+                if (!await WatchViaPollingAsync(client, id, ct))
+                    ctx.ExitCode = 1;
             }
             catch (OperationCanceledException)
             {
@@ -88,5 +74,45 @@ internal static class QueueWatch
         });
 
         return cmd;
+    }
+
+    private static async Task<bool> WatchViaSseAsync(CodeyBoxClient client, string id, CancellationToken ct)
+    {
+        return await client.TryWatchWorkItemEventsAsync(id, PrintStateTransition, ct);
+    }
+
+    /// <returns><c>false</c> when the work item was not found.</returns>
+    private static async Task<bool> WatchViaPollingAsync(CodeyBoxClient client, string id, CancellationToken ct)
+    {
+        string? lastState = null;
+
+        while (!ct.IsCancellationRequested)
+        {
+            var item = await client.GetWorkItemAsync(id, ct);
+            if (item is null)
+            {
+                await Console.Error.WriteLineAsync($"Error: work item '{id}' not found.");
+                return false;
+            }
+
+            if (item.State != lastState)
+            {
+                PrintStateTransition(item.State);
+                lastState = item.State;
+            }
+
+            if (item.IsTerminal)
+                return true;
+
+            await Task.Delay(PollingInterval, ct);
+        }
+
+        return true;
+    }
+
+    private static void PrintStateTransition(string state)
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToString("HH:mm:ss");
+        Console.WriteLine($"[{timestamp}] {state}");
     }
 }
