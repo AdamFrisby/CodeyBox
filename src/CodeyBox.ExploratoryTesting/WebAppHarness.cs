@@ -34,30 +34,35 @@ public sealed class WebAppHarness : IAppUnderTestHarness
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    public async Task<AppUnderTestSession> LaunchAsync(WebAppRecipe recipe, CancellationToken ct = default)
+    public async Task<AppUnderTestSession> LaunchAsync(AppUnderTestRecipe recipe, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(recipe);
-        ValidateRecipe(recipe);
+        if (recipe is not WebAppRecipe web)
+            throw new NotSupportedException(
+                $"WebAppHarness only handles WebAppRecipe; received {recipe.GetType().Name}. " +
+                "Add a per-modality harness when the next recipe type lands.");
+
+        ValidateRecipe(web);
 
         _log.LogInformation(
             "WebAppHarness.LaunchAsync: target={Target} entryUrl={EntryUrl} buildSteps={BuildCount} seedSteps={SeedCount}",
-            recipe.TargetName, recipe.EntryUrl, recipe.BuildSteps.Count, recipe.SeedSteps.Count);
+            web.TargetName, web.EntryUrl, web.BuildSteps.Count, web.SeedSteps.Count);
 
-        var spec = BuildSandboxSpec(recipe);
+        var spec = BuildSandboxSpec(web);
         var sandbox = await _provider.CreateAsync(spec, ct);
         try
         {
             await PrepareInVmLogDirAsync(sandbox, ct);
-            await RunSerialAsync(sandbox, recipe, recipe.BuildSteps, "build", ct);
-            await RunSerialAsync(sandbox, recipe, recipe.SeedSteps, "seed", ct);
-            await StartRunCommandAsync(sandbox, recipe, ct);
-            await WaitForHttpReachableAsync(sandbox, recipe, ct);
-            await OpenBrowserAsync(sandbox, recipe, ct);
-            var screenshot = await WaitForRenderedUiAsync(sandbox, recipe, ct);
+            await RunSerialAsync(sandbox, web, web.BuildSteps, "build", ct);
+            await RunSerialAsync(sandbox, web, web.SeedSteps, "seed", ct);
+            await StartRunCommandAsync(sandbox, web, ct);
+            await WaitForHttpReachableAsync(sandbox, web, ct);
+            await OpenBrowserAsync(sandbox, web, ct);
+            var screenshot = await WaitForRenderedUiAsync(sandbox, web, ct);
             var bridge = _computerUseFactory(sandbox);
             _log.LogInformation("WebAppHarness.LaunchAsync: target={Target} ready ({Bytes} byte screenshot)",
-                recipe.TargetName, screenshot.Length);
-            return new AppUnderTestSession(sandbox, bridge, recipe.EntryUrl, screenshot);
+                web.TargetName, screenshot.Length);
+            return new AppUnderTestSession(sandbox, bridge, web.EntryUrl, screenshot);
         }
         catch
         {
@@ -68,7 +73,7 @@ public sealed class WebAppHarness : IAppUnderTestHarness
             {
                 _log.LogWarning(disposeEx,
                     "WebAppHarness.LaunchAsync: target={Target} dispose-after-failure threw; sandbox may leak",
-                    recipe.TargetName);
+                    web.TargetName);
             }
             throw;
         }
