@@ -10,8 +10,9 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Tests for <see cref="InVmSmokeProbeService"/> — the background driver of the
 /// in-VM smoke sweeps. Covers the Enabled gate, the single-sweep
-/// (<c>SweepIntervalSeconds &lt;= 0</c>) path, and that a sweep fault is
-/// swallowed instead of escaping <c>ExecuteAsync</c>.
+/// (<c>SweepIntervalSeconds &lt;= 0</c>) path, the repeating interval loop
+/// (<c>SweepIntervalSeconds &gt; 0</c>), and that a sweep fault is swallowed
+/// instead of escaping <c>ExecuteAsync</c>.
 /// </summary>
 public sealed class InVmSmokeProbeServiceTests
 {
@@ -103,5 +104,66 @@ public sealed class InVmSmokeProbeServiceTests
         await service.StopAsync(CancellationToken.None);
 
         Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_RepeatsOnInterval_UntilStopped()
+    {
+        // SweepIntervalSeconds > 0 takes the while-loop path: a startup sweep
+        // plus at least one interval-driven re-invocation of SafeSweepAsync. The
+        // one-shot tests above never exercise the Task.Delay loop, so a
+        // regression that dropped the re-sweep (or the delay wiring) would slip
+        // past them. A counting gate proves ProbeAllAsync fires more than once.
+        var gate = new CountingGate();
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 1 },
+            NullLogger<InVmSmokeProbeService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+        var reachedTwo = await gate.WaitForAtLeastAsync(2, TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        Assert.True(reachedTwo, $"expected the interval loop to sweep >=2 times, saw {gate.SweepCount}");
+    }
+
+    /// <summary>
+    /// In-VM smoke gate stub that counts <see cref="ProbeAllAsync"/> invocations
+    /// and lets a test await a target count, so the repeating-interval loop can
+    /// be observed without sleeping a fixed duration.
+    /// </summary>
+    private sealed class CountingGate : IInVmSmokeGate
+    {
+        private readonly object _sync = new();
+        private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _count;
+        private int _target = int.MaxValue;
+
+        public bool Enabled => true;
+        public int SweepCount { get { lock (_sync) return _count; } }
+
+        public Task ProbeAllAsync(CancellationToken ct)
+        {
+            lock (_sync)
+            {
+                _count++;
+                if (_count >= _target) _reached.TrySetResult();
+            }
+            return Task.CompletedTask;
+        }
+
+        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct)
+            => Task.FromResult(new AgentAvailability(true, null, null));
+
+        public async Task<bool> WaitForAtLeastAsync(int target, TimeSpan timeout)
+        {
+            lock (_sync)
+            {
+                _target = target;
+                if (_count >= target) return true;
+            }
+            var winner = await Task.WhenAny(_reached.Task, Task.Delay(timeout));
+            return winner == _reached.Task;
+        }
     }
 }

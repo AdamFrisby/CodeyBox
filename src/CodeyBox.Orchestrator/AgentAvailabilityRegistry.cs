@@ -36,7 +36,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -303,8 +303,34 @@ public enum SmokeExclusionSource
     MissingProbe,
 }
 
-/// <summary>Result of <see cref="AgentAvailabilityRegistry.GetAvailability"/>.</summary>
-public sealed record AgentAvailability(bool Available, string? Reason, DateTimeOffset? LastSmokePassedAt);
+/// <summary>
+/// Narrow availability port for cross-cutting routing/dispatch consumers
+/// (<see cref="AgentClassRouter"/>, <see cref="PipelineRunner"/>, the admin
+/// availability endpoints). Exposes only the read / run-outcome / snapshot /
+/// reset surface those callers need, so they depend on this rather than the
+/// concrete <see cref="AgentAvailabilityRegistry"/>.
+///
+/// <para>The smoke-subsystem-internal mutators that carry the exclusion
+/// taxonomy — <see cref="AgentAvailabilityRegistry.MarkSmokeResult"/> (source +
+/// clearsFastFail) and <see cref="AgentAvailabilityRegistry.ExcludeForMissingProbe"/> —
+/// are deliberately kept off this port so the exclusion model stays
+/// encapsulated to the host/in-VM smoke services and coverage policy that own
+/// it.</para>
+/// </summary>
+public interface IAgentAvailabilityRegistry
+{
+    /// <summary>Whether the agent is currently routable, with an exclusion reason when not.</summary>
+    AgentAvailability GetAvailability(AgentKind kind);
+
+    /// <summary>Feeds a real agent-run outcome into the fast-fail circuit breaker.</summary>
+    AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration);
+
+    /// <summary>Snapshot of every tracked agent's current state.</summary>
+    IReadOnlyList<AgentAvailabilitySnapshot> Snapshot();
+
+    /// <summary>Clears all exclusion state and counters for an agent (operator reset).</summary>
+    void Reset(AgentKind kind);
+}
 
 /// <summary>
 /// State transition returned by registry mutators. Callers use

@@ -64,7 +64,11 @@ public sealed class InVmSmokeProbeService : BackgroundService
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "In-VM smoke sweep failed; will retry next interval");
+            // Warning, not Debug: a sustained sweep failure (bad image ref,
+            // provider outage, misconfiguration) leaves agents on their last
+            // verdict under the fail-open default and must be visible in prod,
+            // not buried at Debug. The sweep still continues next interval.
+            _log.LogWarning(ex, "In-VM smoke sweep failed; will retry next interval");
         }
     }
 }

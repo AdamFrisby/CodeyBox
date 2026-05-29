@@ -44,7 +44,7 @@ public sealed class AgentClassRouter
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IAgentBurnEstimator? _burnEstimator;
     private readonly IAgentRunningCounters? _runningCounters;
-    private readonly AgentAvailabilityRegistry? _availability;
+    private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IAgentBudgetProvider? _budgetProvider;
     // Shared swappable holder for per-agent operator caps. Same instance is
     // held by OrchestratorService and PipelineRunner so hot-reload writes
@@ -74,7 +74,7 @@ public sealed class AgentClassRouter
         IQuotaFailureStore? quotaFailures = null,
         IAgentBurnEstimator? burnEstimator = null,
         IAgentRunningCounters? runningCounters = null,
-        AgentAvailabilityRegistry? availability = null,
+        IAgentAvailabilityRegistry? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
         AgentConcurrencySnapshot? concurrencySnapshot = null,
         IInVmSmokeGate? inVmSmokeGate = null)
@@ -324,29 +324,19 @@ public sealed class AgentClassRouter
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "in-process exhaustion cache"));
                 continue;
             }
-            // Smoke gate / fast-fail circuit breaker excluded this agent. Skip
-            // it without probing — the binary or credentials are known-broken
-            // and a dispatch would either exit 127 immediately or fail auth.
-            if (_availability is { } reg)
+            // Smoke gate / fast-fail circuit breaker excluded this agent? Skip
+            // it — the binary or credentials are known-broken and a dispatch
+            // would either exit 127 immediately or fail auth. The in-VM gate
+            // (when wired) also probes an apparently-Available-but-never-probed
+            // agent here so the exit-127 / auth cascade is caught on the FIRST
+            // dispatch, not on first run; a cache hit is free.
+            var availability = await GetGatedAvailabilityAsync(member.Agent, ct);
+            if (availability is { Available: false })
             {
-                var av = reg.GetAvailability(member.Agent);
-                // An agent that looks Available may simply not have been in-VM
-                // probed yet (cold start / fresh baseline). Gate the FIRST such
-                // dispatch on a real in-sandbox CLI check (cache hit = free) so
-                // the exit-127 / auth cascade is caught here, not on first run.
-                // Already-excluded agents are skipped above without re-probing.
-                if (av.Available && _inVmSmokeGate is not null)
-                {
-                    await _inVmSmokeGate.EnsureProbedAsync(member.Agent, ct);
-                    av = reg.GetAvailability(member.Agent);
-                }
-                if (!av.Available)
-                {
-                    var smokeReason = $"smoke gate: {av.Reason}";
-                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
-                    rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
-                    continue;
-                }
+                var smokeReason = $"smoke gate: {availability.Reason}";
+                _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
+                continue;
             }
             if (member.Billing == AgentBilling.Subscription && _quotaFailures is not null)
             {
@@ -715,27 +705,38 @@ public sealed class AgentClassRouter
             .Select(x => x.Member)
             .ToList();
 
-        if (_availability is not { } reg)
+        if (_availability is null && _inVmSmokeGate is null)
             return ordered;
 
+        // Apply the same gate-or-registry verdict ResolveAsync uses, so a
+        // mid-iteration / audit / rebase fallback never hands work to an agent
+        // whose CLI was never in-VM smoke-checked (cache hit = free).
         var result = new List<AgentMembership>(ordered.Count);
         foreach (var member in ordered)
         {
-            var av = reg.GetAvailability(member.Agent);
-            // An agent that looks Available may simply not have been in-VM probed
-            // yet (cold start / fresh baseline). Gate the FIRST such selection on
-            // a real in-sandbox CLI check (cache hit = free) so the exit-127 /
-            // auth cascade is caught here, exactly as ResolveAsync does on the
-            // primary path. Already-excluded agents are skipped without re-probing.
-            if (av.Available && _inVmSmokeGate is not null)
-            {
-                await _inVmSmokeGate.EnsureProbedAsync(member.Agent, ct);
-                av = reg.GetAvailability(member.Agent);
-            }
-            if (av.Available)
+            var av = await GetGatedAvailabilityAsync(member.Agent, ct);
+            if (av is null || av.Available)
                 result.Add(member);
         }
         return result;
+    }
+
+    /// <summary>
+    /// Single source of truth for an agent's routable verdict on the dispatch
+    /// path. When the in-VM smoke gate is wired it owns the read→probe→re-read
+    /// (so an apparently-Available-but-never-probed agent is verified in-sandbox
+    /// before it is trusted); otherwise the availability registry is read
+    /// directly. Returns null only when neither is wired (no availability
+    /// tracking → legacy behaviour, every candidate is routable). Centralised
+    /// so primary routing and fallback selection cannot drift in gate semantics.
+    /// </summary>
+    private async Task<AgentAvailability?> GetGatedAvailabilityAsync(AgentKind kind, CancellationToken ct)
+    {
+        if (_inVmSmokeGate is not null)
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, ct);
+        if (_availability is not null)
+            return _availability.GetAvailability(kind);
+        return null;
     }
 
     /// <summary>

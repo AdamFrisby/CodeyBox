@@ -22,11 +22,17 @@ public interface IInVmSmokeGate
     bool Enabled { get; }
 
     /// <summary>
-    /// Ensures the in-VM smoke verdict for <paramref name="kind"/> against the
-    /// active baseline is reflected in the availability registry. A no-op when
-    /// the prober is disabled or no in-VM probe is registered for the kind.
+    /// Returns <paramref name="kind"/>'s current availability, having first
+    /// ensured the in-VM smoke verdict against the active baseline is reflected
+    /// in it. The gate owns the full read→probe→re-read sequence so routing
+    /// consumers get a verdict from this one call and never have to bind to the
+    /// availability registry alongside the gate. A cache hit (or an
+    /// already-excluded agent) provisions nothing; only a cache miss on an
+    /// otherwise-available agent runs a probe. Never throws — a probe fault must
+    /// not take down dispatch; on an inconclusive fault the prior availability
+    /// is returned unchanged (subject to <c>FailClosedOnProbeFault</c>).
     /// </summary>
-    Task EnsureProbedAsync(AgentKind kind, CancellationToken ct);
+    Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct);
 
     /// <summary>
     /// Probes every registered agent against the active baseline. Driven by the
@@ -40,7 +46,7 @@ public interface IInVmSmokeGate
 /// Startup/hot-reload coverage policy for the in-VM smoke subsystem. Kept
 /// separate from <see cref="IInVmSmokeGate"/> (interface segregation): coverage
 /// enforcement is a pure config-driven decision that never provisions a VM,
-/// whereas the gate's <see cref="IInVmSmokeGate.EnsureProbedAsync"/> /
+/// whereas the gate's <see cref="IInVmSmokeGate.EnsureAvailableAsync"/> /
 /// <see cref="IInVmSmokeGate.ProbeAllAsync"/> are runtime hooks that may. Callers
 /// that only enforce coverage (startup validator, hot-reload bridge) depend on
 /// this narrow port rather than the full dispatch-gate contract.

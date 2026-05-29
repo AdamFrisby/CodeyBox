@@ -62,6 +62,19 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     public const string WorkspaceTrustFlag = "--trust";
 
     /// <summary>
+    /// The leading argv every real workspace invocation uses:
+    /// <c>agent --print --trust --force</c>. Extracted as a single builder so
+    /// <see cref="BuildInvocation"/> (real dispatch) and
+    /// <c>CursorInVmSmokeProbe</c> (stage-3 in-VM trust check) construct the
+    /// exact same trust-bearing prefix — if <see cref="WorkspaceTrustFlag"/> is
+    /// ever dropped here, both the dispatch path and the smoke step lose it, so
+    /// the smoke step surfaces "Workspace Trust Required" at smoke time instead
+    /// of letting it cascade on first dispatch.
+    /// </summary>
+    public static IReadOnlyList<string> WorkspaceTrustInvocationPrefix(string binary) =>
+        [binary, "--print", WorkspaceTrustFlag, "--force"];
+
+    /// <summary>
     /// Bash that materialises Cursor's subscription credentials into the
     /// sandbox at <c>~/.config/cursor/auth.json</c> from
     /// <c>CODEYBOX_CURSOR_AUTH_JSON</c>. Shared verbatim with
@@ -140,7 +153,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         // noise. --force is the same idea for per-command tool prompts (see
         // Claude's --dangerously-skip-permissions for the equivalent
         // rationale on that runner).
-        var argv = new List<string> { Binary, "--print", WorkspaceTrustFlag, "--force" };
+        var argv = new List<string>(WorkspaceTrustInvocationPrefix(Binary));
 
         var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))

@@ -64,15 +64,22 @@ public sealed class InVmSmokeProbeBuildStepsTests
     }
 
     [Fact]
-    public void Cursor_WithAuthEnv_EmitsVersionMaterialiseStatus()
+    public void Cursor_WithAuthEnv_EmitsVersionMaterialiseStatusTrust()
     {
         var steps = new CursorInVmSmokeProbe().BuildSteps(Cred(AgentKind.Cursor, "CODEYBOX_CURSOR_AUTH_JSON"));
 
-        Assert.Equal(3, steps.Count);
+        Assert.Equal(4, steps.Count);
         Assert.Equal([CursorAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
         // Probe must reuse the runner's exact materialisation script (PR #138).
         Assert.Equal(["bash", "-c", CursorAgentRunner.AuthMaterialiseScript], steps[1].Argv);
         Assert.Equal([CursorAgentRunner.DefaultBinary, "status"], steps[2].Argv);
+        // Stage 3 — the trust-bearing prefix must be the SAME builder real
+        // dispatch uses, so a dropped --trust regresses both paths together.
+        Assert.Equal(
+            CursorAgentRunner.WorkspaceTrustInvocationPrefix(CursorAgentRunner.DefaultBinary),
+            steps[3].Argv);
+        Assert.Contains(CursorAgentRunner.WorkspaceTrustFlag, steps[3].Argv);
+        Assert.NotNull(steps[3].Stdin);
     }
 
     [Fact]

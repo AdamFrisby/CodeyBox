@@ -103,7 +103,7 @@ public sealed class AgentClassRouterAvailabilityTests
         // selection, and dropped if that probe benches it (exit 127 / auth drift).
         var cls = FrontierClass(Sub(Cursor, score: 150), Sub(Claude, score: 100));
         var reg = NewRegistry();
-        var gate = new FakeInVmSmokeGate(kind =>
+        var gate = new FakeInVmSmokeGate(reg, kind =>
         {
             if (kind == Cursor)
                 reg.MarkSmokeResult(Cursor,
@@ -126,17 +126,22 @@ public sealed class AgentClassRouterAvailabilityTests
 
     private sealed class FakeInVmSmokeGate : IInVmSmokeGate
     {
+        private readonly AgentAvailabilityRegistry _reg;
         private readonly Action<AgentKind> _onProbe;
         public List<AgentKind> Probed { get; } = [];
-        public FakeInVmSmokeGate(Action<AgentKind> onProbe) => _onProbe = onProbe;
+        public FakeInVmSmokeGate(AgentAvailabilityRegistry reg, Action<AgentKind> onProbe)
+        {
+            _reg = reg;
+            _onProbe = onProbe;
+        }
 
         public bool Enabled => true;
 
-        public Task EnsureProbedAsync(AgentKind kind, CancellationToken ct)
+        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct)
         {
             Probed.Add(kind);
             _onProbe(kind);
-            return Task.CompletedTask;
+            return Task.FromResult(_reg.GetAvailability(kind));
         }
 
         public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;

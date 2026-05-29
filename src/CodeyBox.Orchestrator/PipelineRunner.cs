@@ -68,7 +68,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly QuotaRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
-    private readonly AgentAvailabilityRegistry? _availability;
+    private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly IPreMergeVerifier? _preMergeVerifier;
     // Hot-reloadable feature flag for the between-iteration incremental
@@ -183,7 +183,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         ITaskQueue? taskQueue = null,
         OrchestratorOptions? orchestratorOptions = null,
-        AgentAvailabilityRegistry? availability = null,
+        IAgentAvailabilityRegistry? availability = null,
         IAgentRunningCounters? agentRunningCounters = null,
         AgentConcurrencyOptions? agentConcurrency = null,
         IPreMergeVerifier? preMergeVerifier = null,
@@ -352,6 +352,35 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (smokeResult is { Ok: true })
                 AuditLog.AgentSmokeSucceeded(agentKind, smokeResult.Duration);
+        }
+
+        // ── In-VM smoke gate ─────────────────────────────────────────────────────
+        // The host credential gate above only proves the host holds the right
+        // env-vars; it cannot see whether the agent CLI actually runs inside the
+        // sandbox. On the class-routed path the router already gated the chosen
+        // member, but a direct-agent work item (no AgentClass / DefaultAgentClass)
+        // would otherwise reach the runner without any in-VM check and reproduce
+        // the exit-127 / auth cascade. Gate the work-phase agent here too — a
+        // cache hit is free, so a class-routed item just re-asserts its verdict.
+        if (!project.SkipCredentialSmokeTest && !await EnsureAgentSmokeAvailableAsync(agentKind, ct))
+        {
+            var reason = _availability?.GetAvailability(agentKind).Reason ?? "in-VM smoke gate excluded agent";
+            AuditLog.AgentSmokeFailed(agentKind, reason, TimeSpan.Zero);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "agent.smoke_failed",
+                WorkItem = item,
+                Project = project,
+                Details = new AgentSmokeFailedDetails
+                {
+                    AgentKind = agentKind.Value,
+                    Reason = reason,
+                },
+            }, CancellationToken.None);
+            await TransitionFailed(item,
+                $"in-VM smoke gate: {reason}",
+                CancellationToken.None, project, failureKind: "infrastructure");
+            return;
         }
 
         // ── check-and-act branch ─────────────────────────────────────────────
@@ -3606,14 +3635,15 @@ public sealed class PipelineRunner : IPipelineRunner
     /// </summary>
     private async Task<bool> EnsureAgentSmokeAvailableAsync(AgentKind kind, CancellationToken ct)
     {
-        if (_availability is not { } reg) return true;
-        var av = reg.GetAvailability(kind);
-        if (av.Available && _inVmSmokeGate is not null)
-        {
-            await _inVmSmokeGate.EnsureProbedAsync(kind, ct);
-            av = reg.GetAvailability(kind);
-        }
-        return av.Available;
+        // The in-VM gate (when wired) owns the read→probe→re-read so the audit
+        // and work paths share one definition of "available". Falls back to a
+        // plain registry read, then to "available" when neither is wired
+        // (legacy callers preserve their prior behaviour).
+        if (_inVmSmokeGate is not null)
+            return (await _inVmSmokeGate.EnsureAvailableAsync(kind, ct)).Available;
+        if (_availability is not null)
+            return _availability.GetAvailability(kind).Available;
+        return true;
     }
 
     private Task<AgentCredential?> ResolveAgentCredentialAsync(AgentKind kind, Project project, CancellationToken ct)

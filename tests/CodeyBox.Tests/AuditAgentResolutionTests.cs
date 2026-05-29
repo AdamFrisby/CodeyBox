@@ -357,7 +357,7 @@ internal sealed class SelectiveCredentialProvider : ICredentialProvider
 }
 
 /// <summary>
-/// In-VM smoke gate stub that records every <see cref="EnsureProbedAsync"/> call
+/// In-VM smoke gate stub that records every <see cref="EnsureAvailableAsync"/> call
 /// and, for one target kind, benches it in the availability registry on probe —
 /// modelling an in-sandbox CLI that fails (exit 127 / auth). Lets the audit-path
 /// test assert both that the gate ran before audit dispatch and that a benched
@@ -377,7 +377,7 @@ internal sealed class BenchOnProbeGate : IInVmSmokeGate
 
     public bool Enabled => true;
 
-    public Task EnsureProbedAsync(AgentKind kind, CancellationToken ct)
+    public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct)
     {
         Probed.Add(kind);
         if (kind == _benchKind)
@@ -386,7 +386,7 @@ internal sealed class BenchOnProbeGate : IInVmSmokeGate
                 new AgentSmokeResult(false, "in-VM agent --version exit 127", TimeSpan.Zero),
                 SmokeExclusionSource.InVmSmoke,
                 clearsFastFail: false);
-        return Task.CompletedTask;
+        return Task.FromResult(_registry.GetAvailability(kind));
     }
 
     public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;

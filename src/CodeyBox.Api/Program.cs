@@ -1110,6 +1110,10 @@ builder.Services.AddSingleton<AgentAvailabilityRegistry>(sp => new AgentAvailabi
     sp.GetRequiredService<AvailabilityOptions>(),
     TimeProvider.System,
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentAvailabilityRegistry>()));
+// The narrow availability port routing/dispatch/admin consumers bind to —
+// same singleton, exposed as the read/run-outcome/snapshot/reset surface.
+builder.Services.AddSingleton<IAgentAvailabilityRegistry>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
 {
     var opts = sp.GetRequiredService<SmokeOptions>();
@@ -2103,7 +2107,7 @@ app.MapGet("/concurrency", async (
     OrchestratorService orchestrator,
     AgentClassRouter router,
     IAgentBurnEstimator burnEstimator,
-    AgentAvailabilityRegistry? availability,
+    IAgentAvailabilityRegistry? availability,
     CancellationToken ct) =>
 {
     var state = orchestrator.GetConcurrencyState();
@@ -2179,7 +2183,7 @@ app.MapGet("/concurrency", async (
 app.MapPost("/admin/agent/{name}/smoke", async (
     string name,
     PeriodicSmokeProbeService periodic,
-    AgentAvailabilityRegistry registry,
+    IAgentAvailabilityRegistry registry,
     CancellationToken ct) =>
 {
     // Canonical AgentKind values are lowercase ("cursor", "claude", ...) so a
@@ -2208,7 +2212,7 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     });
 });
 
-app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry registry, IAgentRegistry agents, IInVmSmokeCache inVmCache) =>
+app.MapPost("/admin/agent/{name}/reset", (string name, IAgentAvailabilityRegistry registry, IAgentRegistry agents, IInVmSmokeCache inVmCache) =>
 {
     // Mirror /smoke: normalise to lowercase so case-mismatched names match the
     // canonical kinds returned by IAgentRegistry.Available.
@@ -2234,7 +2238,7 @@ app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry
     });
 });
 
-app.MapGet("/admin/agents/availability", (AgentAvailabilityRegistry registry) =>
+app.MapGet("/admin/agents/availability", (IAgentAvailabilityRegistry registry) =>
 {
     return Results.Ok(new
     {

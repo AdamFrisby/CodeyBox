@@ -16,7 +16,7 @@ first dispatched work item. Each stage is now caught at smoke time:
 |---|---|---|
 | 1. Binary not on PATH | `agent: command not found` (exit 127) | `agent --version` exits non-zero → agent excluded |
 | 2. Auth materialised to wrong path | exit 1, "Authentication required" | runner's `AuthMaterialiseScript` + `agent status` exits non-zero → agent excluded |
-| 3. Workspace trust required | exit 1, "Workspace Trust Required" | not a smoke-time check — caught at dispatch because the runner always passes `--trust` (pinned by `CursorAgentRunnerTrustRegressionTests`); `--version`/`status` do not engage workspace trust |
+| 3. Workspace trust required | exit 1, "Workspace Trust Required" | a real `agent --print --trust --force` turn (built from `CursorAgentRunner.WorkspaceTrustInvocationPrefix`, the same prefix dispatch uses) exits non-zero → agent excluded. Engages workspace trust, which `--version`/`status` cannot. `CursorAgentRunnerTrustRegressionTests` stays as a fast argv-level guard on the runner |
 
 The probe steps reuse the runner's **exact** binary name
 (`CursorAgentRunner.DefaultBinary`) and auth-materialisation script
@@ -33,10 +33,14 @@ A failing probe marks the agent excluded in `AgentAvailabilityRegistry` under
 `SmokeExclusionSource.InVmSmoke`. `AgentClassRouter` already skips excluded
 members, so the work item routes to a working alternative — no router change.
 
-The router also calls `IInVmSmokeGate.EnsureProbedAsync` for any
-still-`Available` member **before trusting it**, so the *first* dispatch after
-startup or a baseline rebake is gated by a real in-sandbox check rather than
-racing the background sweep. A new `AgentClass` member whose agent has no
+The router (and the work/audit dispatch paths) call
+`IInVmSmokeGate.EnsureAvailableAsync` for any still-`Available` member **before
+trusting it** — the gate owns the read→probe→re-read and returns the verdict, so
+callers never bind to the availability registry alongside it. The *first*
+dispatch after startup or a baseline rebake is therefore gated by a real
+in-sandbox check rather than racing the background sweep. This covers the
+direct-agent work path too (a project with no `AgentClass`), not just
+class-routed items. A new `AgentClass` member whose agent has no
 registered `IInVmSmokeProbe` is **benched at startup** by
 `InVmSmokeProbeCoverageValidator` (under `SmokeExclusionSource.MissingProbe`),
 so its unverified CLI is routed past at smoke time rather than discovered at

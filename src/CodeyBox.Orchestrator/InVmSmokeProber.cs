@@ -110,14 +110,31 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _resolver.ResolveBaselineRef(_opts.NetworkProfile, SandboxProfileFlavor.Headless) ?? LiveRefSentinel;
 
     /// <summary>
-    /// <see cref="IInVmSmokeGate.EnsureProbedAsync"/>. Called on the dispatch
-    /// path (router) before an agent's <c>Available</c> state is trusted, so the
-    /// very first work item after startup or a baseline rebake is gated by a
-    /// real in-sandbox CLI check rather than racing the background sweep. A
-    /// cache hit is free (no VM); a miss provisions one VM and feeds the
-    /// registry, after which the router re-reads availability and skips a newly
-    /// excluded agent. Never throws — the dispatch path must not be taken down
-    /// by a probe fault.
+    /// <see cref="IInVmSmokeGate.EnsureAvailableAsync"/>. Owns the full
+    /// read→probe→re-read sequence so routing consumers get a verdict from this
+    /// one call. Returns the agent's prior availability untouched when the gate
+    /// is disabled or the agent is already excluded (no point probing a binary
+    /// the router will skip regardless); otherwise probes and returns the
+    /// reconciled availability. A cache hit is free.
+    /// </summary>
+    public async Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct)
+    {
+        var current = _availability.GetAvailability(kind);
+        if (!Enabled || !current.Available)
+            return current;
+        await EnsureProbedAsync(kind, ct);
+        return _availability.GetAvailability(kind);
+    }
+
+    /// <summary>
+    /// Ensures the in-VM smoke verdict for <paramref name="kind"/> is reflected
+    /// in the availability registry. Called on the dispatch path (via
+    /// <see cref="EnsureAvailableAsync"/>) before an agent's <c>Available</c>
+    /// state is trusted, so the very first work item after startup or a baseline
+    /// rebake is gated by a real in-sandbox CLI check rather than racing the
+    /// background sweep. A cache hit is free (no VM); a miss provisions one VM
+    /// and feeds the registry. Never throws — the dispatch path must not be
+    /// taken down by a probe fault.
     /// </summary>
     public async Task EnsureProbedAsync(AgentKind kind, CancellationToken ct)
     {

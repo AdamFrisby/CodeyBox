@@ -297,18 +297,21 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
-    public async Task AllStepsPass_ExecutesVersionMaterialiseStatusInOrder()
+    public async Task AllStepsPass_ExecutesVersionMaterialiseStatusTrustInOrder()
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
         var prober = Build(provider, NewRegistry(), NewCache(), new FakeBaselineResolver("base-A"));
 
         await prober.ProbeAllAsync(CancellationToken.None);
 
-        // Pins the smoke contract: same binary + auth script the runner uses.
-        Assert.Equal(3, provider.ExecutedArgv.Count);
+        // Pins the smoke contract: same binary + auth script + trust prefix the runner uses.
+        Assert.Equal(4, provider.ExecutedArgv.Count);
         Assert.Equal([CursorAgentRunner.DefaultBinary, "--version"], provider.ExecutedArgv[0]);
         Assert.Equal(["bash", "-c", CursorAgentRunner.AuthMaterialiseScript], provider.ExecutedArgv[1]);
         Assert.Equal([CursorAgentRunner.DefaultBinary, "status"], provider.ExecutedArgv[2]);
+        Assert.Equal(
+            CursorAgentRunner.WorkspaceTrustInvocationPrefix(CursorAgentRunner.DefaultBinary),
+            provider.ExecutedArgv[3]);
     }
 
     [Fact]
@@ -334,18 +337,21 @@ public sealed class InVmSmokeProberTests
         Assert.False(r2.GetAvailability(AgentKind.Cursor).Available);
         Assert.Contains("agent status failed", r2.GetAvailability(AgentKind.Cursor).Reason);
 
-        // Stage 3 (workspace trust) is NOT a smoke-time check — the version/status
-        // probe steps do not engage workspace trust — so with both prior stages
-        // fixed the agent smokes clean and is routable.
-        var s3 = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        // Stage 3 — "Workspace Trust Required": the trust-bearing turn
+        // (`agent --print --trust --force`) exits non-zero, so cursor is benched
+        // at SMOKE TIME (AC#5), not on first dispatch. The trust step is the
+        // only one whose argv[1] is "--print".
+        var s3 = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "--print") ? new SandboxExecResult(1, "", "Workspace Trust Required")
+                                     : new SandboxExecResult(0, "", ""));
         var r3 = NewRegistry();
         await Build(s3, r3, NewCache(), new FakeBaselineResolver("base-A")).ProbeAllAsync(CancellationToken.None);
-        Assert.True(r3.GetAvailability(AgentKind.Cursor).Available);
+        Assert.False(r3.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Contains("workspace turn failed", r3.GetAvailability(AgentKind.Cursor).Reason);
 
-        // Stage 3 is instead guaranteed at dispatch: the runner must always pass
-        // --trust. Assert that here too (and see CursorAgentRunnerTrustRegressionTests
-        // for the exhaustive sweep) so this cascade test fails if the --trust pin
-        // is removed and the agent would otherwise smoke clean yet fail first run.
+        // The trust step couples to the SAME prefix builder real dispatch uses,
+        // so dropping --trust regresses both together. Keep the fast argv-level
+        // runner pin too (CursorAgentRunnerTrustRegressionTests is exhaustive).
         var trustSandbox = new TrustRecordingSandbox();
         await new CursorAgentRunner().RunAsync(trustSandbox, "/work", "p", credential: null);
         var agentExec = Assert.Single(trustSandbox.Execs,
