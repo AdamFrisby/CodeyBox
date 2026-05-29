@@ -1539,6 +1539,77 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void MultipassSandboxOptions_VmTimeouts_DefaultToSpecValues()
+    {
+        // Defaults match the values previously hardcoded in WaitForRunningAsync
+        // and WaitForStoppedAsync, so behaviour is unchanged when operators do
+        // not override either knob.
+        var options = new MultipassSandboxOptions();
+
+        Assert.Equal(TimeSpan.FromMinutes(3), options.VmStartTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(2), options.VmStopTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(3), MultipassSandboxOptions.DefaultVmStartTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(2), MultipassSandboxOptions.DefaultVmStopTimeout);
+    }
+
+    [Fact]
+    public async Task CreateAsync_VmStartTimeout_AppliesConfiguredDeadlineWhenInfoNeverReportsRunning()
+    {
+        var staging = Path.Combine(_workspace, "staging-vm-start-timeout");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        string? launchedName = null;
+        string? deletedName = null;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                // Stay in "Starting" forever so the WaitForRunning loop exhausts
+                // the configured deadline rather than ever observing Running.
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                launchedName = argv[3];
+                states[launchedName] = "Starting";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deletedName = deleteName;
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var configuredTimeout = TimeSpan.FromMilliseconds(250);
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: runner,
+            vmStartTimeout: configuredTimeout);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        Assert.Contains("did not reach Running state", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(configuredTimeout.ToString(), ex.Message, StringComparison.Ordinal);
+        Assert.NotNull(launchedName);
+        Assert.Equal(launchedName, deletedName);
+    }
+
+    [Fact]
     public async Task RetryHelper_RetriesTransientSshReadinessWithoutRealDelays()
     {
         var attempts = 0;
@@ -1572,7 +1643,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         RecordingLogger<MultipassSandboxProvider>? logger = null,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         int? cloudInitReadyRetryAttempts = null,
-        TimeSpan? cloudInitReadyRetryDelay = null)
+        TimeSpan? cloudInitReadyRetryDelay = null,
+        TimeSpan? vmStartTimeout = null,
+        TimeSpan? vmStopTimeout = null)
     {
         var options = new MultipassSandboxOptions
         {
@@ -1585,6 +1658,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 ?? MultipassSandboxOptions.DefaultCloudInitReadyRetryAttempts,
             CloudInitReadyRetryDelay = cloudInitReadyRetryDelay
                 ?? MultipassSandboxOptions.DefaultCloudInitReadyRetryDelay,
+            VmStartTimeout = vmStartTimeout
+                ?? MultipassSandboxOptions.DefaultVmStartTimeout,
+            VmStopTimeout = vmStopTimeout
+                ?? MultipassSandboxOptions.DefaultVmStopTimeout,
         };
         Microsoft.Extensions.Logging.ILogger<MultipassSandboxProvider> resolvedLogger = logger is not null
             ? logger
