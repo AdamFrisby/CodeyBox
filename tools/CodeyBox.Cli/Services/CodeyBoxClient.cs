@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using CodeyBox.Cli.Models;
 
@@ -33,24 +32,8 @@ internal sealed class CodeyBoxClient
 
     internal static CodeyBoxClient Create(ResolvedConfig config)
     {
-        var http = CreateHttpClient(config, TimeSpan.FromSeconds(30));
+        var http = CodeyBoxHttpFactory.CreateClient(config, TimeSpan.FromSeconds(30));
         return new CodeyBoxClient(http, sseHttp: null, lazySseConfig: config);
-    }
-
-    internal static HttpClient CreateHttpClient(ResolvedConfig config, TimeSpan timeout) =>
-        CreateHttpClientImpl(config, timeout);
-
-    private static HttpClient CreateHttpClientImpl(ResolvedConfig config, TimeSpan timeout)
-    {
-        var http = new HttpClient
-        {
-            BaseAddress = new Uri(config.ApiBaseUrl),
-            Timeout = timeout,
-        };
-        if (!string.IsNullOrEmpty(config.ApiKey))
-            http.DefaultRequestHeaders.Authorization =
-                new AuthenticationHeaderValue("Bearer", config.ApiKey);
-        return http;
     }
 
     internal async Task<List<WorkItemDto>> GetWorkItemsAsync(
@@ -102,7 +85,8 @@ internal sealed class CodeyBoxClient
     {
         if (_sseHttp is not null)
             return _sseHttp;
-        return _lazySseHttp ??= WorkItemSseWatcher.CreateHttpClient(_lazySseConfig!);
+        return _lazySseHttp ??= CodeyBoxHttpFactory.CreateClient(
+            _lazySseConfig!, Timeout.InfiniteTimeSpan);
     }
 
     internal async Task<WorkItemDto> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)

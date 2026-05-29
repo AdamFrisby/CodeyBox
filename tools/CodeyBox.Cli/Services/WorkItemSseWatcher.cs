@@ -16,9 +16,6 @@ internal sealed class WorkItemSseWatcher
 
     internal WorkItemSseWatcher(HttpClient sseHttp) => _sseHttp = sseHttp;
 
-    internal static HttpClient CreateHttpClient(ResolvedConfig config) =>
-        CodeyBoxClient.CreateHttpClient(config, Timeout.InfiniteTimeSpan);
-
     internal async Task<SseWatchResult> WatchAsync(
         string id,
         Action<string> onStateTransition,

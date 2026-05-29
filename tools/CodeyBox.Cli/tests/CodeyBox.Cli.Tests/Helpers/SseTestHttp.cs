@@ -86,6 +86,46 @@ internal static class SseTestHttp
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
+    internal sealed class IoExceptionOnSecondReadStream : Stream
+    {
+        private readonly byte[] _firstLine;
+        private int _readCount;
+
+        internal IoExceptionOnSecondReadStream(string firstState)
+        {
+            _firstLine = Encoding.UTF8.GetBytes(
+                "data: {\"event\":\"work_item.state\",\"workItem\":{\"id\":\"aabbccdd-0000-0000-0000-000000000000\",\"state\":\"" +
+                firstState + "\"}}\n\n");
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (_readCount == 0)
+            {
+                _readCount++;
+                _firstLine.CopyTo(buffer.Span);
+                return ValueTask.FromResult(_firstLine.Length);
+            }
+
+            throw new IOException("SSE stream disconnected");
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     internal sealed class TimeoutOnSecondReadStream : Stream
     {
         private readonly byte[] _firstLine;

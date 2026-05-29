@@ -406,6 +406,63 @@ public sealed class WatchSseTests
     }
 
     [Fact]
+    public async Task TryWatchWorkItemEventsAsync_OversizedDataPayload_ReturnsShouldFallback()
+    {
+        var padding = new string('x', WorkItemSseWatcher.MaxDataPayloadBytes);
+        var oversizedLine =
+            "data: {\"workItem\":{\"state\":\"Working\",\"pad\":\"" + padding + "\"}}\n\n";
+        var client = MakeFactory(req =>
+        {
+            if (req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
+            {
+                return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new StringContent(oversizedLine, System.Text.Encoding.UTF8, "text/event-stream"),
+                };
+            }
+
+            return SampleData.WorkItemResponse();
+        })(new ResolvedConfig
+        {
+            ApiBaseUrl = "http://localhost:5036",
+            ApiKey = "test-key",
+        });
+
+        var result = await client.TryWatchWorkItemEventsAsync(
+            "aabbccdd-0000-0000-0000-000000000000",
+            _ => { });
+
+        Assert.Equal(SseWatchResult.ShouldFallback, result);
+    }
+
+    [Fact]
+    public async Task TryWatchWorkItemEventsAsync_IOExceptionDuringRead_ReturnsShouldFallback()
+    {
+        var client = MakeFactory(req =>
+        {
+            if (req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
+            {
+                return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new StreamContent(new SseTestHttp.IoExceptionOnSecondReadStream("Working")),
+                };
+            }
+
+            return SampleData.WorkItemResponse();
+        })(new ResolvedConfig
+        {
+            ApiBaseUrl = "http://localhost:5036",
+            ApiKey = "test-key",
+        });
+
+        var result = await client.TryWatchWorkItemEventsAsync(
+            "aabbccdd-0000-0000-0000-000000000000",
+            _ => { });
+
+        Assert.Equal(SseWatchResult.ShouldFallback, result);
+    }
+
+    [Fact]
     public async Task TryWatchWorkItemEventsAsync_ReadTimeout_ReturnsShouldFallback()
     {
         var config = new ResolvedConfig
