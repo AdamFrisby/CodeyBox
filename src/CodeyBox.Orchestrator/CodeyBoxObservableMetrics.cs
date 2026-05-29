@@ -20,8 +20,8 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 {
     private readonly IWorkItemStore _store;
     private readonly ISandboxProvider _sandboxes;
-    private readonly IAgentRunningCounters? _running;
-    private readonly AgentClassRouter? _router;
+    private readonly IWorkerPoolOccupancy? _workerPool;
+    private readonly IAgentQuotaAvailabilitySnapshot? _quotaSnapshot;
     private readonly int _maxWorkers;
     private readonly ILogger<CodeyBoxObservableMetrics> _log;
     private readonly TimeSpan _refreshInterval;
@@ -43,14 +43,14 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         ISandboxProvider sandboxes,
         OrchestratorOptions orchestratorOptions,
         ILogger<CodeyBoxObservableMetrics> log,
-        IAgentRunningCounters? running = null,
-        AgentClassRouter? router = null,
+        IWorkerPoolOccupancy? workerPool = null,
+        IAgentQuotaAvailabilitySnapshot? quotaSnapshot = null,
         TimeSpan? refreshInterval = null)
     {
         _store = store;
         _sandboxes = sandboxes;
-        _running = running;
-        _router = router;
+        _workerPool = workerPool;
+        _quotaSnapshot = quotaSnapshot;
         _maxWorkers = orchestratorOptions.MaxConcurrentWorkers;
         _log = log;
         _refreshInterval = refreshInterval ?? TimeSpan.FromSeconds(15);
@@ -79,7 +79,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
             unit: "{sandbox}",
             description: "Sandboxes/VMs the current process is actively tracking.");
 
-        if (_router is not null)
+        if (_quotaSnapshot is not null)
         {
             _quotaAvailable = CodeyBoxMeters.CreatePipelineObservableGauge<double>(
                 "codeybox.agent.quota.available_pct",
@@ -89,13 +89,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         }
     }
 
-    private long CurrentWorkersInUse()
-    {
-        if (_running is null) return 0;
-        long total = 0;
-        foreach (var n in _running.Snapshot().Values) total += n;
-        return total;
-    }
+    private long CurrentWorkersInUse() => _workerPool?.CurrentlyRunningTotal ?? 0;
 
     private IEnumerable<Measurement<long>> ObserveActiveSandboxes()
     {
@@ -110,8 +104,8 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
     private IEnumerable<Measurement<double>> ObserveQuotaAvailability()
     {
-        if (_router is null) yield break;
-        foreach (var (agent, model, pct) in _router.SnapshotQuotaAvailability())
+        if (_quotaSnapshot is null) yield break;
+        foreach (var (agent, model, pct) in _quotaSnapshot.SnapshotQuotaAvailability())
         {
             yield return new Measurement<double>(
                 pct,
@@ -143,7 +137,10 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "Observable metrics: failed to refresh work-item state counts");
+            // Keep serving the last good snapshot (we only overwrite on success
+            // above) but surface the boundary failure at Warning so a persistently
+            // failing store doesn't silently export stale fleet-state gauges.
+            _log.LogWarning(ex, "Observable metrics: failed to refresh work-item state counts; serving last known values");
         }
     }
 

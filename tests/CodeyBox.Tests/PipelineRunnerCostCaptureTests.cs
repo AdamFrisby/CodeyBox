@@ -173,6 +173,34 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     }
 
     [Fact]
+    public async Task SuccessfulRun_EmitsTokenAndCostCounters()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("cost-otel.txt", "cost\n"));
+
+        using var metrics = new MetricCapture("codeybox.agent.tokens", "codeybox.agent.cost_usd");
+
+        var item = NewItem("feature/cost-otel");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        // Counters are emitted from the same cost-capture path that writes the DB
+        // rows (one emit per row, model tagged from the extractor snapshot).
+        Assert.True(metrics.Any("codeybox.agent.tokens",
+            ("agent.kind", "claude"), ("model", "fake-model"), ("token_type", "input")));
+        Assert.True(metrics.Any("codeybox.agent.tokens",
+            ("agent.kind", "claude"), ("token_type", "output")));
+        Assert.Contains(metrics.Items, m => m.Instrument == "codeybox.agent.cost_usd"
+            && m.Tags.Any(t => t.Key == "agent.kind" && t.Value?.ToString() == "claude"));
+    }
+
+    [Fact]
     public async Task UsageStoreFailure_DoesNotAbortPipeline()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

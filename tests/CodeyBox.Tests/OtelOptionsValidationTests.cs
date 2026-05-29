@@ -96,4 +96,43 @@ public sealed class OtelOptionsValidationTests
         var opts = new OtelOptions { Enabled = true, OtlpEndpoint = "https://api.honeycomb.io" };
         OtelOptions.Validate(opts); // must not throw
     }
+
+    // ── Standard OTEL_* env contract ─────────────────────────────────────────
+
+    [Fact]
+    public void Enabled_NoAppsettingsEndpoint_ButEnvEndpointSet_DoesNotThrow()
+    {
+        const string envVar = "OTEL_EXPORTER_OTLP_ENDPOINT";
+        var prior = Environment.GetEnvironmentVariable(envVar);
+        Environment.SetEnvironmentVariable(envVar, "http://collector:4317");
+        try
+        {
+            // Telemetry can be enabled from the conventional env-only bootstrap
+            // without duplicating the endpoint under CodeyBox:Otel.
+            var opts = new OtelOptions { Enabled = true, OtlpEndpoint = null };
+            OtelOptions.Validate(opts); // must not throw
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(envVar, prior);
+        }
+    }
+
+    [Fact]
+    public void ParseResourceAttributesEnv_ParsesPairs_AndSkipsMalformed()
+    {
+        var parsed = OtelOptions.ParseResourceAttributesEnv("service.namespace=team-a, host.name=worker-1 ,bogus,=novalue,k=");
+        Assert.Equal("team-a", parsed.Single(p => p.Key == "service.namespace").Value);
+        Assert.Equal("worker-1", parsed.Single(p => p.Key == "host.name").Value);
+        Assert.Equal("", parsed.Single(p => p.Key == "k").Value);
+        Assert.DoesNotContain(parsed, p => p.Key == "bogus");
+        Assert.DoesNotContain(parsed, p => p.Key.Length == 0);
+    }
+
+    [Fact]
+    public void ParseResourceAttributesEnv_NullOrBlank_ReturnsEmpty()
+    {
+        Assert.Empty(OtelOptions.ParseResourceAttributesEnv(null));
+        Assert.Empty(OtelOptions.ParseResourceAttributesEnv("   "));
+    }
 }

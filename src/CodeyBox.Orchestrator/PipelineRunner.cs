@@ -3247,6 +3247,11 @@ public sealed class PipelineRunner : IPipelineRunner
             // Rework following audit iteration N is the input that will be
             // evaluated by audit iteration N+1, so emit it as iteration N+1.
             var reworkIterationNumber = iteration + 1;
+            // Audit-driven rework is the primary rework path; open a phase.rework
+            // span and record codeybox.phase.duration_ms{phase=rework} so rework
+            // telemetry matches the documented trace tree (the resume-preempt
+            // path opens its own scope independently).
+            using var reworkPhaseScope = BeginPhaseScope(item, "rework");
             await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
             var reworkStart = DateTimeOffset.UtcNow;
             // Snapshot the prompt and revision now, before the rework agent runs.
@@ -7879,9 +7884,11 @@ Original merge-phase failure (for context):
 
     /// <summary>
     /// Opens a per-phase trace span and records the phase wall-clock duration to
-    /// <see cref="CodeyBoxMeters.PhaseDuration"/> on disposal. Inert (no span, the
-    /// histogram still records but is discarded) when no MeterProvider/listener is
-    /// registered, so the disabled OTel path stays a no-op.
+    /// <see cref="CodeyBoxMeters.PhaseDuration"/> on disposal. When no listener is
+    /// registered no span is started; the histogram <c>Record</c> still runs on
+    /// every phase exit but the SDK discards it cheaply (a tag-array build plus a
+    /// no-op store), so the disabled path stays near-free rather than literally
+    /// zero work.
     /// </summary>
     private static PhaseScope BeginPhaseScope(WorkItem item, string phase) => new(item, phase);
 

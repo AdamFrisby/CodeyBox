@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,
@@ -667,20 +667,6 @@ public sealed class AgentClassRouter
     /// ReasoningMode) instead of fabricating a placeholder.
     /// </para>
     /// </summary>
-    /// <summary>
-    /// Synchronous snapshot of the most-recent quota-availability percentage
-    /// observed per (agent, model) during routing. Consumed by the OpenTelemetry
-    /// observable gauge. A percentage of <c>-1</c> indicates the probe could not
-    /// determine availability. Returns an empty list before any probe has run.
-    /// </summary>
-    public IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability()
-    {
-        var snap = new List<(AgentKind, string?, double)>(_lastAvailablePct.Count);
-        foreach (var kv in _lastAvailablePct)
-            snap.Add((kv.Key.Agent, kv.Key.ModelId.Length == 0 ? null : kv.Key.ModelId, kv.Value));
-        return snap;
-    }
-
     public AgentMembership? FindMember(string classId, AgentKind agent, string? modelId)
     {
         var cfg = Volatile.Read(ref _routingConfig);
@@ -694,6 +680,15 @@ public sealed class AgentClassRouter
                 return m;
         }
         return null;
+    }
+
+    /// <inheritdoc />
+    public IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability()
+    {
+        var snap = new List<(AgentKind, string?, double)>(_lastAvailablePct.Count);
+        foreach (var kv in _lastAvailablePct)
+            snap.Add((kv.Key.Agent, kv.Key.ModelId.Length == 0 ? null : kv.Key.ModelId, kv.Value));
+        return snap;
     }
 
     /// <summary>

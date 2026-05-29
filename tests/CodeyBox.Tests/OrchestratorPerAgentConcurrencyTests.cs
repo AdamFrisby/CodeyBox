@@ -165,6 +165,43 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
     }
 
     [Fact]
+    public async Task Dispatch_EmitsDispatchCountMeasurement()
+    {
+        var probes = new IAgentQuotaProbe[] { new FakeProbe(Codex, 100.0) };
+        var router = new AgentClassRouter(
+            [SingleAgentClass("codex-cls", Codex)],
+            probes,
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var pipeline = new PinnedPipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var orchestrator = new OrchestratorService(
+            queue, _store, pipeline, new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 2 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router);
+
+        var item = Item("dispatch-metric") with { AgentClassId = "codex-cls" };
+        await _store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        // Capture must be live before the dispatch loop spawns the worker.
+        using var metrics = new MetricCapture("codeybox.dispatch.count");
+        await orchestrator.StartAsync(CancellationToken.None);
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+        while (DateTimeOffset.UtcNow < deadline && orchestrator.CurrentlyRunningTotal < 1)
+            await Task.Delay(25);
+
+        Assert.True(metrics.Items.Any(m => m.Instrument == "codeybox.dispatch.count"),
+            "expected a codeybox.dispatch.count measurement when a worker is spawned");
+
+        pipeline.Release();
+        await orchestrator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task TryReserveAgentSlot_AfterRelease_AllowsReReservation()
     {
         // Regression: an earlier revision of TryReserveAgentSlot used TryAdd

@@ -195,124 +195,18 @@ public sealed class MetricsEmissionTests
         }
     }
 
-    // ── Dispatch counter ──────────────────────────────────────────────────────
-
-    [Fact]
-    public void Dispatches_Counter_Emits()
-    {
-        var (listener, measurements) = CreateLongListener("CodeyBox.Pipeline", "codeybox.dispatch.count");
-        using (listener)
-        {
-            CodeyBoxMeters.Dispatches.Add(1);
-            AssertEventuallyContains(measurements, m => m.Value == 1L);
-        }
-    }
-
-    // ── AgentInvocations ──────────────────────────────────────────────────────
-
-    [Fact]
-    public void AgentInvocations_Counter_EmitsWithOutcomeTag()
-    {
-        var (listener, measurements) = CreateLongListener("CodeyBox.Pipeline", "codeybox.agent.invocations", "outcome");
-        using (listener)
-        {
-            CodeyBoxMeters.AgentInvocations.Add(1,
-                new KeyValuePair<string, object?>("agent.kind", "claude"),
-                new KeyValuePair<string, object?>("model", "claude-opus-4-8"),
-                new KeyValuePair<string, object?>("agent_class", "default"),
-                new KeyValuePair<string, object?>("phase", "work"),
-                new KeyValuePair<string, object?>("outcome", "success"));
-            AssertEventuallyContains(measurements, m => m.Value == 1L && m.TagValue == "success");
-        }
-    }
-
-    // ── AgentFallbacks ────────────────────────────────────────────────────────
-
-    [Fact]
-    public void AgentFallbacks_Counter_EmitsWithKindTag()
-    {
-        var (listener, measurements) = CreateLongListener("CodeyBox.Pipeline", "codeybox.agent.fallbacks", "kind");
-        using (listener)
-        {
-            CodeyBoxMeters.AgentFallbacks.Add(1,
-                new KeyValuePair<string, object?>("from_agent", "claude"),
-                new KeyValuePair<string, object?>("to_agent", "codex"),
-                new KeyValuePair<string, object?>("kind", "quota"),
-                new KeyValuePair<string, object?>("phase", "work"));
-            AssertEventuallyContains(measurements, m => m.Value == 1L && m.TagValue == "quota");
-        }
-    }
-
-    // ── PhaseDuration ─────────────────────────────────────────────────────────
-
-    [Fact]
-    public void PhaseDuration_Histogram_EmitsWithPhaseTag()
-    {
-        var (listener, measurements) = CreateLongListener("CodeyBox.Pipeline", "codeybox.phase.duration_ms", "phase");
-        using (listener)
-        {
-            CodeyBoxMeters.PhaseDuration.Record(1234, new KeyValuePair<string, object?>("phase", "merge"));
-            AssertEventuallyContains(measurements, m => m.Value == 1234L && m.TagValue == "merge");
-        }
-    }
-
-    // ── AgentTokens ───────────────────────────────────────────────────────────
-
-    [Fact]
-    public void AgentTokens_Counter_EmitsPerTokenType()
-    {
-        var (listener, measurements) = CreateLongListener("CodeyBox.Pipeline", "codeybox.agent.tokens", "token_type");
-        using (listener)
-        {
-            CodeyBoxMeters.AgentTokens.Add(100,
-                new KeyValuePair<string, object?>("agent.kind", "claude"),
-                new KeyValuePair<string, object?>("model", "claude-opus-4-8"),
-                new KeyValuePair<string, object?>("token_type", "input"));
-            CodeyBoxMeters.AgentTokens.Add(50,
-                new KeyValuePair<string, object?>("agent.kind", "claude"),
-                new KeyValuePair<string, object?>("model", "claude-opus-4-8"),
-                new KeyValuePair<string, object?>("token_type", "output"));
-            AssertEventuallyContains(measurements, m => m.Value == 100L && m.TagValue == "input");
-            AssertEventuallyContains(measurements, m => m.Value == 50L && m.TagValue == "output");
-        }
-    }
-
-    // ── AgentCostUsd ──────────────────────────────────────────────────────────
-
-    [Fact]
-    public void AgentCostUsd_Counter_EmitsDoubleMeasurement()
-    {
-        var observed = new ConcurrentQueue<double>();
-        using var listener = new MeterListener();
-        listener.InstrumentPublished = (instrument, l) =>
-        {
-            if (instrument.Meter.Name == "CodeyBox.Pipeline" && instrument.Name == "codeybox.agent.cost_usd")
-                l.EnableMeasurementEvents(instrument);
-        };
-        listener.SetMeasurementEventCallback<double>((_, value, _, _) => observed.Enqueue(value));
-        listener.Start();
-
-        CodeyBoxMeters.AgentCostUsd.Add(1.25,
-            new KeyValuePair<string, object?>("agent.kind", "claude"),
-            new KeyValuePair<string, object?>("model", "claude-opus-4-8"));
-
-        var found = SpinWait.SpinUntil(() => observed.ToArray().Any(v => Math.Abs(v - 1.25) < 1e-9), TimeSpan.FromSeconds(2));
-        Assert.True(found, "Expected cost measurement was not observed.");
-    }
-
-    // ── WebhookDeliveries ─────────────────────────────────────────────────────
-
-    [Fact]
-    public void WebhookDeliveries_Counter_EmitsWithOutcomeTag()
-    {
-        var (listener, measurements) = CreateLongListener("CodeyBox.Pipeline", "codeybox.webhook.deliveries", "outcome");
-        using (listener)
-        {
-            CodeyBoxMeters.WebhookDeliveries.Add(1,
-                new KeyValuePair<string, object?>("endpoint", "tracker"),
-                new KeyValuePair<string, object?>("event", "work_item.done"),
-                new KeyValuePair<string, object?>("outcome", "delivered"));
-            AssertEventuallyContains(measurements, m => m.Value == 1L && m.TagValue == "delivered");
-        }
-    }
+    // NOTE: codeybox.dispatch.count, codeybox.agent.invocations,
+    // codeybox.agent.fallbacks, codeybox.phase.duration_ms, codeybox.agent.tokens,
+    // codeybox.agent.cost_usd, and codeybox.webhook.deliveries are intentionally
+    // NOT asserted here by calling the static instrument directly — that would
+    // only verify MeterListener plumbing. They are instead covered by
+    // operation-driven tests that drive the real production call sites:
+    //   - OrchestratorPerAgentConcurrencyTests.Dispatch_EmitsDispatchCountMeasurement
+    //   - PipelineRunnerTimingTests.SuccessfulRun_EmitsPipelineSpansAndInvocationMetrics
+    //   - PipelineRunnerQuotaFallbackTests.Codex_HitsQuota_FallsBackToClaude_EmitsFallbackAndInvocationMetrics
+    //   - PipelineRunnerQuotaFallbackTests.AuditDrivenRework_EmitsReworkPhaseSpanAndDuration
+    //   - PipelineRunnerCostCaptureTests.SuccessfulRun_EmitsTokenAndCostCounters
+    //   - WebhookDispatcherTests.SuccessfulDelivery_EmitsDeliveredMeasurement / GivingUpAfterMaxAttempts_EmitsFailedMeasurement
+    // The instrument-shape tests retained above cover instruments whose emission
+    // is already asserted through their own subsystem suites.
 }

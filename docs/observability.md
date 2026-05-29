@@ -25,6 +25,17 @@ All options live under the `CodeyBox:Otel` section.
 | `ExportProtocol` | `"grpc"` \| `"httpprotobuf"` | `"grpc"` | OTLP wire format. |
 | `ResourceAttributes` | `{ key: value }` | `{}` | Extra OTel resource attributes merged into every span, metric point, and log record. Applied last, so they override the auto-derived attributes on key collision. |
 
+### Standard `OTEL_*` environment variables
+
+CodeyBox honors the conventional OpenTelemetry environment variables so a deployment can be configured with the standard env-only bootstrap (the same contract the paired JobTrack service follows). **Environment variables override the `CodeyBox:Otel` appsettings values** on collision:
+
+| Env var | Overrides | Notes |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `OtlpEndpoint` | When set, telemetry can be enabled without an appsettings endpoint (`Enabled=true` alone suffices). The OTel SDK reads it directly, including the `httpprotobuf` path-append semantics. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | `OtlpHeaders` | Same `key=value,key2=value2` format as the appsettings CSV. |
+| `OTEL_SERVICE_NAME` | `ServiceName` | Sets the `service.name` resource attribute. |
+| `OTEL_RESOURCE_ATTRIBUTES` | `ResourceAttributes` | `key=value,key2=value2` pairs; applied last so env pairs win over appsettings on key collision. |
+
 ### Resource attributes
 
 Every signal (trace, metric, log) carries a shared resource so the three correlate on identical service identity:
@@ -40,7 +51,7 @@ Every signal (trace, metric, log) carries a shared resource so the three correla
 
 If `Enabled=true` and the configuration is invalid, the process refuses to start with a clear error message:
 
-- `OtlpEndpoint` must be set and parse as an absolute URL.
+- `OtlpEndpoint` must be set (in appsettings **or** via `OTEL_EXPORTER_OTLP_ENDPOINT`); the appsettings value, when present, must parse as an absolute http/https URL.
 - `ExportProtocol` must be exactly `"grpc"` or `"httpprotobuf"`.
 
 ---

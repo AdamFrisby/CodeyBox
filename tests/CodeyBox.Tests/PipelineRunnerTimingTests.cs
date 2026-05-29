@@ -106,6 +106,43 @@ public sealed class PipelineRunnerTimingTests : IDisposable
         Assert.All(timings.CompletedRows, r => Assert.Equal(item.Id, r.WorkItemId));
     }
 
+    [Fact]
+    public async Task SuccessfulRun_EmitsPipelineSpansAndInvocationMetrics()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var timings = new RecordingTimingStore();
+        using var tp = BuildPipelineWithTimings(_workspace, seed, timings);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("otel.txt", "otel\n"));
+
+        // Captures must be live before RunAsync — an ActivitySource emits no
+        // Activity unless a listener is sampling, and the MeterListener only sees
+        // measurements recorded after Start.
+        using var spans = new SpanCapture("CodeyBox.Pipeline");
+        using var metrics = new MetricCapture("codeybox.agent.invocations", "codeybox.phase.duration_ms");
+
+        var item = NewItem("feature/otel-spans");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        // Root span + work-phase span + at least one agent.invoke span, tagged.
+        Assert.True(spans.Any("pipeline.run", ("codeybox.work_item_id", item.Id.ToString())),
+            "expected a pipeline.run root span for the work item");
+        Assert.True(spans.Any("phase.work", ("codeybox.phase", "work")),
+            "expected a phase.work span");
+        Assert.True(spans.Any("agent.invoke", ("codeybox.phase", "work"), ("codeybox.outcome", "success")),
+            "expected a successful agent.invoke span in the work phase");
+
+        // Invocation counter + phase-duration histogram fired on the real run.
+        Assert.True(metrics.Any("codeybox.agent.invocations", ("phase", "work"), ("outcome", "success")),
+            "expected a codeybox.agent.invocations measurement for the successful work invocation");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "work")),
+            "expected a codeybox.phase.duration_ms{phase=work} measurement");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static WorkItem NewItem(string branch) => new()

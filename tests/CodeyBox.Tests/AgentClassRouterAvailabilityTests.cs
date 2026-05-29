@@ -297,4 +297,28 @@ public sealed class AgentClassRouterAvailabilityTests
         var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
         Assert.Equal(Cursor, decision.Chosen!.Agent);
     }
+
+    // ── Quota-availability snapshot (drives the OTel observable gauge) ────────
+
+    [Fact]
+    public async Task SnapshotQuotaAvailability_ReflectsProbedHeadroom_AfterResolve()
+    {
+        // The codeybox.agent.quota.available_pct gauge reads the IAgentQuotaAvailabilitySnapshot
+        // contract. Resolving routes through the probes, which records each
+        // member's observed headroom; the snapshot must then surface it without
+        // re-probing.
+        var cls = FrontierClass(Sub(Cursor, score: 150), Sub(Claude, score: 100));
+        var reg = NewRegistry();
+        var router = BuildRouter(cls, [new FakeProbe(Cursor, 64.0), new FakeProbe(Claude, 90.0)], reg);
+
+        // Before any probe runs the snapshot is empty.
+        Assert.Empty(router.SnapshotQuotaAvailability());
+
+        await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
+
+        var snap = router.SnapshotQuotaAvailability();
+        // Cursor is highest-quality and at/above the floor, so it is probed first
+        // and chosen; its observed headroom is recorded.
+        Assert.Contains(snap, s => s.Agent == Cursor && s.ModelId is null && Math.Abs(s.AvailablePct - 64.0) < 1e-9);
+    }
 }

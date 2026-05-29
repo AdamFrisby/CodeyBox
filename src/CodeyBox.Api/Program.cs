@@ -142,20 +142,33 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
         var serviceVersion = otelOpts.ServiceVersion
             ?? typeof(Program).Assembly.GetName().Version?.ToString();
 
+        // service.name honours the standard OTEL_SERVICE_NAME env var, falling
+        // back to the CodeyBox:Otel appsettings value — env wins so the standard
+        // OTel bootstrap can retarget identity without editing appsettings.
+        var serviceName = Environment.GetEnvironmentVariable("OTEL_SERVICE_NAME") is { Length: > 0 } envServiceName
+            ? envServiceName
+            : otelOpts.ServiceName;
+
         // Resource attributes shared by traces, metrics, and logs so the three
         // signals correlate on identical service identity. service.instance.id
-        // and deployment.environment are added automatically; operator-supplied
-        // ResourceAttributes are applied last so they win on key collision.
+        // and deployment.environment are added automatically; appsettings
+        // ResourceAttributes are applied, then any OTEL_RESOURCE_ATTRIBUTES env
+        // pairs last so the standard env contract overrides appsettings on key
+        // collision.
         var instanceId = $"{Environment.MachineName}:{Environment.ProcessId}";
         var deploymentEnv = builder.Environment.EnvironmentName;
         void ConfigureResource(ResourceBuilder r)
         {
-            r.AddService(otelOpts.ServiceName, serviceVersion: serviceVersion, serviceInstanceId: instanceId);
+            r.AddService(serviceName, serviceVersion: serviceVersion, serviceInstanceId: instanceId);
             if (!string.IsNullOrWhiteSpace(deploymentEnv))
                 r.AddAttributes(new[] { new KeyValuePair<string, object>("deployment.environment", deploymentEnv) });
             if (otelOpts.ResourceAttributes.Count > 0)
                 r.AddAttributes(otelOpts.ResourceAttributes.Select(
                     kv => new KeyValuePair<string, object>(kv.Key, kv.Value)));
+            var envAttrs = OtelOptions.ParseResourceAttributesEnv(
+                Environment.GetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES"));
+            if (envAttrs.Count > 0)
+                r.AddAttributes(envAttrs);
         }
 
         builder.Services.AddOpenTelemetry()
@@ -274,11 +287,21 @@ builder.Services.AddSingleton(sp =>
 
 static void ConfigureOtlp(OtlpExporterOptions o, OtelOptions opts)
 {
-    o.Endpoint = new Uri(opts.OtlpEndpoint!);
+    // Honour the standard OTel env contract: when OTEL_EXPORTER_OTLP_ENDPOINT /
+    // OTEL_EXPORTER_OTLP_HEADERS are set we leave the exporter's SDK defaults in
+    // place (the SDK reads those vars itself, including the http path-append
+    // semantics), so env overrides appsettings. We only assign from
+    // CodeyBox:Otel when the corresponding env var is absent.
+    var envEndpoint = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT");
+    if (string.IsNullOrWhiteSpace(envEndpoint) && !string.IsNullOrWhiteSpace(opts.OtlpEndpoint))
+        o.Endpoint = new Uri(opts.OtlpEndpoint);
+
     o.Protocol = opts.ExportProtocol == "httpprotobuf"
         ? OtlpExportProtocol.HttpProtobuf
         : OtlpExportProtocol.Grpc;
-    if (!string.IsNullOrEmpty(opts.OtlpHeaders))
+
+    var envHeaders = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS");
+    if (string.IsNullOrWhiteSpace(envHeaders) && !string.IsNullOrEmpty(opts.OtlpHeaders))
         o.Headers = opts.OtlpHeaders;
 }
 
@@ -1061,6 +1084,17 @@ builder.Services.AddSingleton<IAgentBudgetConfigReloadable>(sp =>
 // first read, after both have been constructed.
 builder.Services.AddSingleton<IAgentRunningCounters>(sp =>
     new DeferredAgentRunningCounters(() => sp.GetRequiredService<OrchestratorService>()));
+// Worker-pool occupancy for the codeybox.workers.in_use gauge. OrchestratorService
+// owns the semaphore-backed pool; resolve it lazily (same cycle-break rationale as
+// IAgentRunningCounters) so the observable-metrics hosted service can read the live
+// pool total without coupling to the concrete service.
+builder.Services.AddSingleton<IWorkerPoolOccupancy>(sp =>
+    new DeferredWorkerPoolOccupancy(() => sp.GetRequiredService<OrchestratorService>()));
+// Quota-availability snapshot for the codeybox.agent.quota.available_pct gauge.
+// Surfaced as a focused contract implemented by AgentClassRouter so telemetry
+// does not depend on the concrete router type.
+builder.Services.AddSingleton<IAgentQuotaAvailabilitySnapshot>(sp =>
+    sp.GetRequiredService<AgentClassRouter>());
 
 // --- Credential smoke probes -------------------------------------------------
 // Registered as IEnumerable<IAgentSmokeProbe>; the gate resolves by Kind.
@@ -2947,12 +2981,23 @@ namespace CodeyBox.Api
         {
             if (!opts.Enabled) return;
 
-            if (string.IsNullOrWhiteSpace(opts.OtlpEndpoint))
-                throw new InvalidOperationException(
-                    "CodeyBox:Otel:OtlpEndpoint must be set when CodeyBox:Otel:Enabled=true.");
+            // The endpoint may come from appsettings OR the standard
+            // OTEL_EXPORTER_OTLP_ENDPOINT env var, so telemetry can be enabled
+            // from the conventional env-only bootstrap without duplicating it
+            // under CodeyBox:Otel. Only one of the two is required.
+            var envEndpoint = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT");
+            var hasEnvEndpoint = !string.IsNullOrWhiteSpace(envEndpoint);
 
-            if (!Uri.TryCreate(opts.OtlpEndpoint, UriKind.Absolute, out var endpointUri)
-                || endpointUri.Scheme is not "http" and not "https")
+            if (string.IsNullOrWhiteSpace(opts.OtlpEndpoint) && !hasEnvEndpoint)
+                throw new InvalidOperationException(
+                    "CodeyBox:Otel:OtlpEndpoint or the OTEL_EXPORTER_OTLP_ENDPOINT environment " +
+                    "variable must be set when CodeyBox:Otel:Enabled=true.");
+
+            // Validate the appsettings endpoint when supplied; an env-only
+            // endpoint is validated by the OTel SDK at export time.
+            if (!string.IsNullOrWhiteSpace(opts.OtlpEndpoint)
+                && (!Uri.TryCreate(opts.OtlpEndpoint, UriKind.Absolute, out var endpointUri)
+                    || endpointUri.Scheme is not "http" and not "https"))
                 throw new InvalidOperationException(
                     $"CodeyBox:Otel:OtlpEndpoint '{opts.OtlpEndpoint}' is not a valid http/https URL.");
 
@@ -2960,6 +3005,28 @@ namespace CodeyBox.Api
                 throw new InvalidOperationException(
                     $"CodeyBox:Otel:ExportProtocol '{opts.ExportProtocol}' is not valid. " +
                     "Expected 'grpc' or 'httpprotobuf'.");
+        }
+
+        /// <summary>
+        /// Parses an <c>OTEL_RESOURCE_ATTRIBUTES</c>-style value
+        /// (<c>key1=val1,key2=val2</c>) into resource attribute pairs. Returns an
+        /// empty list for null/blank input. Malformed entries (no <c>=</c>, blank
+        /// key) are skipped.
+        /// </summary>
+        public static IReadOnlyList<KeyValuePair<string, object>> ParseResourceAttributesEnv(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return [];
+            var result = new List<KeyValuePair<string, object>>();
+            foreach (var pair in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var idx = pair.IndexOf('=');
+                if (idx <= 0) continue;
+                var key = pair[..idx].Trim();
+                var value = pair[(idx + 1)..].Trim();
+                if (key.Length == 0) continue;
+                result.Add(new KeyValuePair<string, object>(key, value));
+            }
+            return result;
         }
     }
 

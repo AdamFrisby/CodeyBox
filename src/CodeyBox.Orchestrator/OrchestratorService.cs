@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy
 {
     // Flipped by PauseDispatch() — the SandboxSuspendOnShutdownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -291,6 +291,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// Snapshot of concurrency state for the <c>/concurrency</c> endpoint:
     /// global cap, configured per-agent caps, and live per-agent in-flight counts.
     /// </summary>
+    /// <inheritdoc />
+    public int CurrentlyRunningTotal => Volatile.Read(ref _currentlyRunning);
+
     public ConcurrencyStateSnapshot GetConcurrencyState()
     {
         var opts = _concurrencySnapshot.Current;

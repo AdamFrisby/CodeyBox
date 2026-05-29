@@ -31,6 +31,70 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
 
     [Fact]
+    public async Task Codex_HitsQuota_FallsBackToClaude_EmitsFallbackAndInvocationMetrics()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks", "codeybox.agent.invocations");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // The quota fallback counter must record the codex→claude swap with the
+        // quota kind on the work phase — driven by the real routing path, not a
+        // hand-rolled Add.
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+            ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "work")));
+
+        // Codex's failed attempt records an error-outcome invocation; Claude's
+        // retry records a success-outcome invocation.
+        Assert.True(metrics.Any("codeybox.agent.invocations",
+            ("agent.kind", "codex"), ("phase", "work"), ("outcome", "error")));
+        Assert.True(metrics.Any("codeybox.agent.invocations",
+            ("agent.kind", "claude"), ("phase", "work"), ("outcome", "success")));
+    }
+
+    [Fact]
+    public async Task AuditDrivenRework_EmitsReworkPhaseSpanAndDuration()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        // Initial work + rework both pull from WorkPlan (rework re-uses it once
+        // the scripted-failure queues drain), so enqueue two writes.
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
+
+        using var spans = new SpanCapture("CodeyBox.Pipeline");
+        using var metrics = new MetricCapture("codeybox.phase.duration_ms");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        // The audit-driven rework path (not just the resume-preempt branch) must
+        // open a phase.rework span and record the rework phase duration.
+        Assert.True(spans.Any("phase.rework", ("codeybox.phase", "rework")),
+            "expected a phase.rework span on the audit-loop rework path");
+        Assert.True(spans.Any("agent.invoke", ("codeybox.phase", "rework")),
+            "expected the rework agent.invoke span nested under phase.rework");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "rework")),
+            "expected a codeybox.phase.duration_ms{phase=rework} measurement");
+    }
+
+    [Fact]
     public async Task Codex_HitsQuota_FallsBackToClaude_SameIteration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
