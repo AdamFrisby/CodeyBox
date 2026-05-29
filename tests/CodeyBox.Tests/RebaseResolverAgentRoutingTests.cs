@@ -335,7 +335,7 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             Kind = AgentKind.Codex,
             TextOnlyUnavailabilityReason = "OPENAI_API_KEY is required for text-only calls",
         };
-        var cursor = new ScriptedAgent([MergeStrategy.RealMerge])
+        var cursor = new SandboxTextOnlyScriptedAgent([MergeStrategy.RealMerge])
         {
             Kind = AgentKind.Cursor,
         };
@@ -364,8 +364,98 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Empty(codex.TextOnlyInvocations);
-        Assert.Single(cursor.TextOnlyInvocations);
-        Assert.StartsWith("# Merge conflict resolver", cursor.TextOnlyInvocations[0]);
+        Assert.Single(cursor.SandboxTextOnlyInvocations);
+        Assert.StartsWith("# Merge conflict resolver", cursor.SandboxTextOnlyInvocations[0]);
+    }
+
+    [Fact]
+    public async Task ClaudeExcluded_ResolverRoutesToSandboxCursor()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+            TextOnlyUnavailabilityReason = "OPENAI_API_KEY is required for text-only calls",
+        };
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Claude,
+            TextOnlyUnavailabilityReason = "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required",
+        };
+        var cursor = new SandboxTextOnlyScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Cursor,
+        };
+
+        cursor.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildFixture(seed, [codex, claude, cursor]);
+
+        var item = NewItem(AgentKind.Codex) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(codex.TextOnlyInvocations);
+        Assert.Empty(claude.TextOnlyInvocations);
+        Assert.Single(cursor.SandboxTextOnlyInvocations);
+        Assert.StartsWith("# Merge conflict resolver", cursor.SandboxTextOnlyInvocations[0]);
+    }
+
+    [Fact]
+    public async Task NonTextOnlyClassMemberSkipped_ResolverUsesNextMember()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Codex,
+            TextOnlyUnavailabilityReason = "OPENAI_API_KEY is required for text-only calls",
+        };
+        var gemini = new WorkOnlyFakeRunner { Kind = AgentKind.Gemini };
+        var cursor = new SandboxTextOnlyScriptedAgent([MergeStrategy.RealMerge])
+        {
+            Kind = AgentKind.Cursor,
+        };
+        cursor.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildFixture(seed, [codex, gemini, cursor]);
+
+        var item = NewItem(AgentKind.Codex) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Single(cursor.SandboxTextOnlyInvocations);
     }
 
     [Fact]
@@ -589,7 +679,7 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
 
     private RoutingFixture BuildFixture(
         string seedRepoUrl,
-        IReadOnlyList<ScriptedAgent> agents,
+        IReadOnlyList<IAgentRunner> agents,
         IAgentRunningCounters? runningCounters = null,
         AgentConcurrencyOptions? agentConcurrency = null)
     {
@@ -722,6 +812,26 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         LocalGitHost GitHost) : IDisposable
     {
         public void Dispose() => Store.Dispose();
+    }
+
+    /// <summary>
+    /// Runner with no text-only interface — exercises cascade skip reasons.
+    /// </summary>
+    private sealed class WorkOnlyFakeRunner : IAgentRunner
+    {
+        public required AgentKind Kind { get; init; }
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+            => Task.FromResult(new AgentResult(true, "ok", null, null));
     }
 
     /// <summary>

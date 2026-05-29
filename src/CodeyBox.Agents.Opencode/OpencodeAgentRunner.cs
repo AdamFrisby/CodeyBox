@@ -21,7 +21,7 @@ namespace CodeyBox.Agents.Opencode;
 /// materialises the file from <c>OPENCODE_AUTH_JSON</c> in the credential
 /// bundle before invoking the CLI, mirroring the Codex pattern.</para>
 /// </summary>
-public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ISandboxTextOnlyAgentRunner
+public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, ISandboxTextOnlyAgentRunner
 {
     public override AgentKind Kind => AgentKind.Opencode;
 
@@ -89,6 +89,7 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         var write = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["bash", "-c", script],
+            ExtraEnvironment = MergeCredentialEnvironment(null, credential),
         }, ct);
         if (!write.Success)
         {
@@ -155,6 +156,20 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
             credential,
             "opencode text-only requires a credential bundle");
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        _ = prompt;
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        return RunTextOnlyRequiresSandboxAsync(ct);
+    }
 
     public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
         ISandbox sandbox,

@@ -1448,7 +1448,7 @@ public sealed class PipelineRunner : IPipelineRunner
         return (lastResult ?? new AgentResult(false, "no text-only resolver candidates", null, null), chosen, null);
     }
 
-    private static async Task<TextOnlyAgentResult> InvokeTextOnlyAsync(
+    internal static async Task<TextOnlyAgentResult> InvokeTextOnlyAsync(
         IAgentRunner runner,
         ISandbox? sandbox,
         string? workingDirectory,

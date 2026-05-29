@@ -28,7 +28,7 @@ namespace CodeyBox.Agents.Cursor;
 /// CLI is expected to use whatever auth path the operator provisioned in the
 /// image.</para>
 /// </summary>
-public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ISandboxTextOnlyAgentRunner
+public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, ISandboxTextOnlyAgentRunner
 {
     public override AgentKind Kind => AgentKind.Cursor;
 
@@ -70,6 +70,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         var write = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["bash", "-c", "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; fi"],
+            ExtraEnvironment = MergeCredentialEnvironment(null, credential),
         }, ct);
         if (!write.Success)
         {
@@ -147,6 +148,20 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
             credential,
             "cursor text-only requires a credential bundle");
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default)
+    {
+        _ = prompt;
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        return RunTextOnlyRequiresSandboxAsync(ct);
+    }
 
     public Task<TextOnlyAgentResult> RunTextOnlyInSandboxAsync(
         ISandbox sandbox,

@@ -223,6 +223,23 @@ public sealed class CursorAgentRunnerTests
         Assert.Contains("--model", agentExec.Argv);
         Assert.Contains("composer-2.5", agentExec.Argv);
         Assert.Equal(prompt, agentExec.Stdin);
+        Assert.NotNull(agentExec.ExtraEnvironment);
+        Assert.Equal("""{"token":"x"}""", agentExec.ExtraEnvironment["CODEYBOX_CURSOR_AUTH_JSON"]);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_RequiresSandbox()
+    {
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("prompt", cred);
+
+        Assert.False(result.Success);
+        Assert.Contains("sandbox", result.Summary, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

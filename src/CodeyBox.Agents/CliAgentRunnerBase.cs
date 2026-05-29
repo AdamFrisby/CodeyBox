@@ -131,6 +131,35 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// perimeter, so sandbox invocations may use the runner's normal
     /// non-interactive argv (including trust/force flags where applicable).
     /// </summary>
+    /// <summary>
+    /// Host-side text-only is not permitted for subscription CLIs; resolver
+    /// paths must use <see cref="ExecuteTextOnlyInSandboxAsync"/>.
+    /// </summary>
+    protected Task<TextOnlyAgentResult> RunTextOnlyRequiresSandboxAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(new TextOnlyAgentResult(
+            false,
+            $"{Kind.Value} text-only must run inside the work-item sandbox",
+            null,
+            null));
+    }
+
+    protected static IReadOnlyDictionary<string, string>? MergeCredentialEnvironment(
+        IReadOnlyDictionary<string, string>? baseEnvironment,
+        AgentCredential? credential)
+    {
+        if (credential?.EnvironmentVariables is not { Count: > 0 } env)
+            return baseEnvironment;
+
+        var merged = baseEnvironment is null
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : new Dictionary<string, string>(baseEnvironment, StringComparer.Ordinal);
+        foreach (var (key, value) in env)
+            merged[key] = value;
+        return merged;
+    }
+
     protected async Task<TextOnlyAgentResult> ExecuteTextOnlyInSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -150,6 +179,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
             Stdin = invocation.Stdin,
+            ExtraEnvironment = MergeCredentialEnvironment(invocation.ExtraEnvironment, credential),
         }, ct);
 
         if (!result.Success)
